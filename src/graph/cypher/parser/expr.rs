@@ -96,12 +96,26 @@ impl<'a> Parser<'a> {
                 Some(BinaryOperator::GreaterEqual)
             } else if self.peek_is(|t| matches!(t, Token::RegexMatch)) {
                 Some(BinaryOperator::RegexMatch)
+            } else if self.peek_is(|t| matches!(t, Token::Contains)) {
+                Some(BinaryOperator::Contains)
+            } else if self.peek_is(|t| matches!(t, Token::Starts))
+                && self.peek2_is(|t| matches!(t, Token::With))
+            {
+                Some(BinaryOperator::StartsWith)
+            } else if self.peek_is(|t| matches!(t, Token::Ends))
+                && self.peek2_is(|t| matches!(t, Token::With))
+            {
+                Some(BinaryOperator::EndsWith)
             } else {
                 None
             };
 
             if let Some(op) = op {
                 self.advance();
+                // STARTS WITH / ENDS WITH are two keywords -- consume WITH too.
+                if matches!(op, BinaryOperator::StartsWith | BinaryOperator::EndsWith) {
+                    self.advance();
+                }
                 let right = self.parse_addition()?;
                 left = Expr::BinaryOp {
                     left: Box::new(left),

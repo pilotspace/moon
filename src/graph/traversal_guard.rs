@@ -5,10 +5,32 @@
 //! configurable timeout (default 30s). Multi-hop traversals check the guard at
 //! each hop to ensure the timeout has not been exceeded.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default traversal timeout: 30 seconds.
 pub const DEFAULT_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Process-wide default traversal timeout in milliseconds (0 = unlimited).
+///
+/// Set once at startup from `--graph-timeout-ms`; read by
+/// `with_default_timeout`. Per-query `TIMEOUT <ms>` overrides it for one
+/// query via `TraversalGuard::new`.
+static DEFAULT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(DEFAULT_TRAVERSAL_TIMEOUT.as_millis() as u64);
+
+/// Set the process-wide default traversal timeout (`--graph-timeout-ms`).
+/// `0` disables the timeout entirely.
+pub fn set_default_traversal_timeout_ms(ms: u64) {
+    DEFAULT_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The configured default traversal timeout (`Duration::MAX` = unlimited).
+pub fn default_traversal_timeout() -> Duration {
+    match DEFAULT_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => Duration::MAX,
+        ms => Duration::from_millis(ms),
+    }
+}
 
 /// Error returned when a traversal exceeds its time budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +76,10 @@ impl TraversalGuard {
         }
     }
 
-    /// Create a guard with the default 30-second timeout.
+    /// Create a guard with the configured process-wide default timeout
+    /// (`--graph-timeout-ms`; 30s unless overridden, 0 = unlimited).
     pub fn with_default_timeout(snapshot_lsn: u64) -> Self {
-        Self::new(snapshot_lsn, DEFAULT_TRAVERSAL_TIMEOUT)
+        Self::new(snapshot_lsn, default_traversal_timeout())
     }
 
     /// The snapshot LSN captured at traversal start.
@@ -101,9 +124,26 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_default_timeout() {
+    fn test_guard_default_timeout_is_configurable() {
+        // Single test owns the global (parallel tests share the process);
+        // every transient value here is still "generous" for concurrent
+        // with_default_timeout users.
         let guard = TraversalGuard::with_default_timeout(100);
         assert_eq!(guard.snapshot_lsn(), 100);
+        assert_eq!(guard.timeout, DEFAULT_TRAVERSAL_TIMEOUT);
+
+        set_default_traversal_timeout_ms(12_345);
+        let guard = TraversalGuard::with_default_timeout(7);
+        assert_eq!(guard.timeout, Duration::from_millis(12_345));
+
+        // 0 = unlimited.
+        set_default_traversal_timeout_ms(0);
+        let guard = TraversalGuard::with_default_timeout(7);
+        assert_eq!(guard.timeout, Duration::MAX);
+        assert!(guard.check_timeout().is_ok());
+
+        set_default_traversal_timeout_ms(DEFAULT_TRAVERSAL_TIMEOUT.as_millis() as u64);
+        let guard = TraversalGuard::with_default_timeout(7);
         assert_eq!(guard.timeout, DEFAULT_TRAVERSAL_TIMEOUT);
     }
 

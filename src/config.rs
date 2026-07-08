@@ -619,6 +619,18 @@ pub struct ServerConfig {
     #[arg(long = "graph-dead-edge-trigger", default_value_t = 0.20)]
     pub graph_dead_edge_trigger: f64,
 
+    /// Default graph traversal timeout in milliseconds (0 = unlimited).
+    ///
+    /// Bounds how long a single Cypher traversal (variable-length expand,
+    /// shortestPath, GRAPH.TRAVERSE hop loop) may run — and therefore how long
+    /// it may hold a graph snapshot. A per-query `TIMEOUT <ms>` argument on
+    /// GRAPH.QUERY / GRAPH.RO_QUERY / GRAPH.PROFILE / GRAPH.TRAVERSE overrides
+    /// this for one query (RedisGraph parity).
+    ///
+    /// Default: 30_000 (30 s).
+    #[arg(long = "graph-timeout-ms", default_value_t = 30_000)]
+    pub graph_timeout_ms: u64,
+
     // ── MA4: Weighted compaction scheduling ───────────────────────────────
     /// Minimum seconds before a stale entity is forced to be scheduled by the
     /// autovacuum daemon regardless of its compaction weight (anti-starvation cap).

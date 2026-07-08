@@ -40,6 +40,21 @@ enum GraphCommand {
     RemoveNode { graph_name: Bytes, node_id: u64 },
     /// GRAPH.REMOVEEDGE <name> <edge_id>
     RemoveEdge { graph_name: Bytes, edge_id: u64 },
+    /// GRAPH.SETPROP <name> <N|E> <entity_id> <key> <type> <val> (W2-9:
+    /// Cypher SET durability — replayed after inserts, before removes).
+    SetProp {
+        graph_name: Bytes,
+        entity_id: u64,
+        is_node: bool,
+        key: u16,
+        value: PropertyValue,
+    },
+    /// GRAPH.SETLABEL <name> <node_id> <label> (W2-9: `SET n:Label`).
+    SetLabel {
+        graph_name: Bytes,
+        node_id: u64,
+        label: u16,
+    },
     /// GRAPH.DROP <name>
     Drop { name: Bytes },
 }
@@ -64,6 +79,8 @@ impl GraphReplayCollector {
             || cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE")
             || cmd.eq_ignore_ascii_case(b"GRAPH.REMOVENODE")
             || cmd.eq_ignore_ascii_case(b"GRAPH.REMOVEEDGE")
+            || cmd.eq_ignore_ascii_case(b"GRAPH.SETPROP")
+            || cmd.eq_ignore_ascii_case(b"GRAPH.SETLABEL")
             || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
     }
 
@@ -117,6 +134,52 @@ impl GraphReplayCollector {
                 self.commands.push(GraphCommand::RemoveEdge {
                     graph_name: Bytes::copy_from_slice(args[0]),
                     edge_id,
+                });
+                true
+            }
+            b"GRAPH.SETPROP" => {
+                // Format: <graph> <N|E> <entity_id> <key> <type> <val>
+                if args.len() < 6 {
+                    return false;
+                }
+                let is_node = match args[1] {
+                    b"N" => true,
+                    b"E" => false,
+                    _ => return false,
+                };
+                let Some(entity_id) = parse_u64(args[2]) else {
+                    return false;
+                };
+                let Some(key) = parse_u16(args[3]) else {
+                    return false;
+                };
+                let Some(value) = parse_property_value(args[4], args[5]) else {
+                    return false;
+                };
+                self.commands.push(GraphCommand::SetProp {
+                    graph_name: Bytes::copy_from_slice(args[0]),
+                    entity_id,
+                    is_node,
+                    key,
+                    value,
+                });
+                true
+            }
+            b"GRAPH.SETLABEL" => {
+                // Format: <graph> <node_id> <label>
+                if args.len() < 3 {
+                    return false;
+                }
+                let Some(node_id) = parse_u64(args[1]) else {
+                    return false;
+                };
+                let Some(label) = parse_u16(args[2]) else {
+                    return false;
+                };
+                self.commands.push(GraphCommand::SetLabel {
+                    graph_name: Bytes::copy_from_slice(args[0]),
+                    node_id,
+                    label,
                 });
                 true
             }
@@ -273,6 +336,13 @@ impl GraphReplayCollector {
     pub fn replay_into(&self, store: &mut GraphStore) -> usize {
         let mut replayed = 0;
         self.replay_epoch_aware(store, &mut replayed);
+        // Replayed state lives only in the write buffer + the WAL records
+        // that produced it; the next checkpoint recycles those records, so
+        // it must re-snapshot the graph first (same contract as a live
+        // mutation's drain_wal).
+        if replayed > 0 {
+            store.mark_dirty();
+        }
         replayed
     }
 
@@ -297,9 +367,30 @@ impl GraphReplayCollector {
             create_idx: Option<usize>,
             node_indices: Vec<usize>,
             edge_indices: Vec<usize>,
+            /// SETPROP + SETLABEL in WAL order (W2-9) — applied after
+            /// inserts (targets must exist) and before removes (a later
+            /// DELETE tombstones the set like the live execution did).
+            set_indices: Vec<usize>,
             remove_node_indices: Vec<usize>,
             remove_edge_indices: Vec<usize>,
             drop_idx: Option<usize>,
+        }
+
+        fn new_epoch(
+            graph_name: Bytes,
+            create_idx: Option<usize>,
+            drop_idx: Option<usize>,
+        ) -> Epoch {
+            Epoch {
+                graph_name,
+                create_idx,
+                node_indices: Vec::new(),
+                edge_indices: Vec::new(),
+                set_indices: Vec::new(),
+                remove_node_indices: Vec::new(),
+                remove_edge_indices: Vec::new(),
+                drop_idx,
+            }
         }
 
         // Track current open epoch per graph name.
@@ -319,28 +410,12 @@ impl GraphReplayCollector {
                         } else {
                             // Previous epoch already has a Create — start a new one.
                             let epoch_idx = epochs.len();
-                            epochs.push(Epoch {
-                                graph_name: name.clone(),
-                                create_idx: Some(idx),
-                                node_indices: Vec::new(),
-                                edge_indices: Vec::new(),
-                                remove_node_indices: Vec::new(),
-                                remove_edge_indices: Vec::new(),
-                                drop_idx: None,
-                            });
+                            epochs.push(new_epoch(name.clone(), Some(idx), None));
                             current_epoch.insert(name.clone(), epoch_idx);
                         }
                     } else {
                         let epoch_idx = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: name.clone(),
-                            create_idx: Some(idx),
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: None,
-                        });
+                        epochs.push(new_epoch(name.clone(), Some(idx), None));
                         current_epoch.insert(name.clone(), epoch_idx);
                     }
                 }
@@ -352,15 +427,7 @@ impl GraphReplayCollector {
                         // Drop without a preceding Create in this WAL.
                         // Still record it so the graph gets dropped.
                         let epoch_idx = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: name.clone(),
-                            create_idx: None,
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: Some(idx),
-                        });
+                        epochs.push(new_epoch(name.clone(), None, Some(idx)));
                         // Don't insert into current_epoch — it's immediately closed.
                         let _ = epoch_idx;
                     }
@@ -368,15 +435,7 @@ impl GraphReplayCollector {
                 GraphCommand::AddNode { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: graph_name.clone(),
-                            create_idx: None,
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: None,
-                        });
+                        epochs.push(new_epoch(graph_name.clone(), None, None));
                         i
                     });
                     epochs[*eidx].node_indices.push(idx);
@@ -384,31 +443,24 @@ impl GraphReplayCollector {
                 GraphCommand::AddEdge { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: graph_name.clone(),
-                            create_idx: None,
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: None,
-                        });
+                        epochs.push(new_epoch(graph_name.clone(), None, None));
                         i
                     });
                     epochs[*eidx].edge_indices.push(idx);
                 }
+                GraphCommand::SetProp { graph_name, .. }
+                | GraphCommand::SetLabel { graph_name, .. } => {
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(new_epoch(graph_name.clone(), None, None));
+                        i
+                    });
+                    epochs[*eidx].set_indices.push(idx);
+                }
                 GraphCommand::RemoveNode { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: graph_name.clone(),
-                            create_idx: None,
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: None,
-                        });
+                        epochs.push(new_epoch(graph_name.clone(), None, None));
                         i
                     });
                     epochs[*eidx].remove_node_indices.push(idx);
@@ -416,15 +468,7 @@ impl GraphReplayCollector {
                 GraphCommand::RemoveEdge { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
-                        epochs.push(Epoch {
-                            graph_name: graph_name.clone(),
-                            create_idx: None,
-                            node_indices: Vec::new(),
-                            edge_indices: Vec::new(),
-                            remove_node_indices: Vec::new(),
-                            remove_edge_indices: Vec::new(),
-                            drop_idx: None,
-                        });
+                        epochs.push(new_epoch(graph_name.clone(), None, None));
                         i
                     });
                     epochs[*eidx].remove_edge_indices.push(idx);
@@ -448,6 +492,7 @@ impl GraphReplayCollector {
             // 2. Replay mutations (nodes → edges → removes) if graph exists.
             if !epoch.node_indices.is_empty()
                 || !epoch.edge_indices.is_empty()
+                || !epoch.set_indices.is_empty()
                 || !epoch.remove_node_indices.is_empty()
                 || !epoch.remove_edge_indices.is_empty()
             {
@@ -458,12 +503,16 @@ impl GraphReplayCollector {
 
                 // Seed node_maps from immutable CSR segments so edges referencing
                 // CSR-resident nodes (loaded during recovery) can be resolved.
+                // Also raise the id-allocation floor past every frozen
+                // external_id so fresh post-replay inserts can never alias
+                // a frozen row.
                 let mut node_map: HashMap<u64, crate::graph::types::NodeKey> = HashMap::new();
                 for csr_seg in &immutable {
                     for nm in csr_seg.node_meta() {
                         let key_data = slotmap::KeyData::from_ffi(nm.external_id);
                         let node_key = crate::graph::types::NodeKey::from(key_data);
                         node_map.insert(nm.external_id, node_key);
+                        mg.ensure_node_id_floor(nm.external_id);
                     }
                 }
 
@@ -480,23 +529,21 @@ impl GraphReplayCollector {
                         ..
                     } = &self.commands[idx]
                     {
-                        // Dedup skip (P0 fix: graph NodeKey aliasing across
-                        // restart). `node_map` is seeded from loaded CSR
-                        // segments above; if `node_id` is already present,
-                        // this AddNode is a full-history replay of a node
-                        // that is ALREADY resident in the frozen tier (the
-                        // pre-crash WAL was never truncated for it). Calling
-                        // `mg.add_node` again would duplicate the node in
-                        // the mutable tier (double enumeration via
-                        // `for_each_visible_node`, which has no dedup) even
-                        // though the fresh-vs-persisted key collision itself
-                        // is now impossible (see `node_id_watermark` /
-                        // `MemGraph::with_id_offset`). Keep the CSR-seeded
+                        // Re-materialize under the ORIGINAL logged id so
+                        // client-cached node handles survive a restart
+                        // (W2-1) — UNLESS the id is already resident in a
+                        // loaded CSR segment: this AddNode is then a
+                        // full-history replay of a node that is ALREADY in
+                        // the frozen tier (the pre-crash WAL was never
+                        // truncated for it), and re-inserting would shadow
+                        // the frozen row with a redundant mutable copy (P0:
+                        // restart NodeKey aliasing). Keep the CSR-seeded
                         // identity and skip the insert.
                         let nk = if let Some(&existing) = node_map.get(node_id) {
                             existing
                         } else {
-                            let nk = mg.add_node(
+                            let nk = mg.add_node_with_id(
+                                *node_id,
                                 labels.clone(),
                                 properties.clone(),
                                 embedding.clone(),
@@ -525,6 +572,7 @@ impl GraphReplayCollector {
                 // Insert edges.
                 for &idx in &epoch.edge_indices {
                     if let GraphCommand::AddEdge {
+                        edge_id,
                         src_id,
                         dst_id,
                         edge_type,
@@ -540,9 +588,13 @@ impl GraphReplayCollector {
                             // segments are non-resident in `mg` — a plain
                             // add_edge would silently drop the edge on
                             // replay. node_map membership IS the existence
-                            // proof (replayed node or CSR row).
+                            // proof (replayed node or CSR row). The ORIGINAL
+                            // logged edge id is preserved so client-cached
+                            // edge handles (and later REMOVEEDGE records)
+                            // resolve after restart.
                             if mg
-                                .add_edge_across_tiers(
+                                .add_edge_across_tiers_with_id(
+                                    *edge_id,
                                     src,
                                     dst,
                                     *edge_type,
@@ -565,12 +617,108 @@ impl GraphReplayCollector {
                     }
                 }
 
+                // Apply SETs (W2-9) in WAL order: after inserts (targets must
+                // exist), before removes (a later DELETE tombstones the set
+                // like the live execution did). Repeated sets of one key keep
+                // last-write-wins by ordering.
+                for &idx in &epoch.set_indices {
+                    match &self.commands[idx] {
+                        GraphCommand::SetProp {
+                            entity_id,
+                            is_node: true,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            let Some(nk) = node_map.get(entity_id).copied() else {
+                                tracing::warn!(
+                                    "WAL replay: SETPROP node_id={} not found in WAL or CSR",
+                                    entity_id
+                                );
+                                continue;
+                            };
+                            // CSR-resident target (frozen before the SET was
+                            // logged): copy the row up first, like live W2-2.
+                            if mg.get_node(nk).is_none()
+                                && !crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                            {
+                                tracing::warn!(
+                                    "WAL replay: SETPROP copy-up failed for node_id={}",
+                                    entity_id
+                                );
+                                continue;
+                            }
+                            if mg.get_node(nk).is_some() {
+                                // `set_node_property` is the single source of
+                                // truth for node-property mutation — it keeps
+                                // the mutable-tier property index (Task #31)
+                                // in sync so a restarted server's index
+                                // matches live-traffic state exactly.
+                                mg.set_node_property(nk, *key, value.clone());
+                                *replayed += 1;
+                            }
+                        }
+                        GraphCommand::SetProp {
+                            entity_id,
+                            is_node: false,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            // Edge SET is not producible by the executor today
+                            // (SetItem::Property matches nodes only) — apply
+                            // defensively if the edge is resident.
+                            let ek = crate::graph::types::EdgeKey::from(
+                                slotmap::KeyData::from_ffi(*entity_id),
+                            );
+                            if let Some(edge) = mg.get_edge_mut(ek) {
+                                let props = edge.properties.get_or_insert_with(SmallVec::new);
+                                match props.iter_mut().find(|(k, _)| k == key) {
+                                    Some(entry) => entry.1 = value.clone(),
+                                    None => props.push((*key, value.clone())),
+                                }
+                                *replayed += 1;
+                            }
+                        }
+                        GraphCommand::SetLabel { node_id, label, .. } => {
+                            let Some(nk) = node_map.get(node_id).copied() else {
+                                tracing::warn!(
+                                    "WAL replay: SETLABEL node_id={} not found in WAL or CSR",
+                                    node_id
+                                );
+                                continue;
+                            };
+                            if mg.get_node(nk).is_none()
+                                && !crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                            {
+                                continue;
+                            }
+                            if let Some(node) = mg.get_node_mut(nk) {
+                                if !node.labels.contains(label) {
+                                    node.labels.push(*label);
+                                }
+                                *replayed += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Remove nodes.
                 for &idx in &epoch.remove_node_indices {
                     if let GraphCommand::RemoveNode { node_id, .. } = &self.commands[idx] {
                         if let Some(nk) = node_map.get(node_id).copied() {
                             if mg.remove_node(nk, 0) {
                                 *replayed += 1;
+                            } else if mg.get_node(nk).is_none() {
+                                // CSR-resident node (copy-up delete, W2-2):
+                                // materialize a tombstone shadow so the frozen
+                                // row stays hidden after replay.
+                                if crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                                    && mg.remove_node(nk, 0)
+                                {
+                                    *replayed += 1;
+                                }
                             }
                         }
                     }
@@ -590,7 +738,7 @@ impl GraphReplayCollector {
                     }
                 }
 
-                put_memgraph(graph, mg, immutable);
+                put_memgraph(graph, mg);
 
                 // Register _key→NodeKey mappings on the NamedGraph (survives restart).
                 for (redis_key, node_key) in key_registrations {
@@ -613,50 +761,24 @@ impl GraphReplayCollector {
     }
 }
 
-/// Take the MemGraph out of the segment holder for mutation during replay.
-/// Swaps in `None` for the mutable segment, returning the owned MemGraph.
+/// Take the mutable write buffer out of the graph for mutation during
+/// replay, along with the immutable CSR segment list (for node re-seeding).
+///
+/// Replay mutates `write_buf` — the authoritative store every command
+/// handler reads. (An earlier version replayed into `segments.mutable`,
+/// which no handler consults: replayed unfrozen data was INVISIBLE after
+/// restart.)
 fn take_memgraph(
     graph: &mut crate::graph::store::NamedGraph,
 ) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>) {
-    use crate::graph::segment::GraphSegmentList;
-
-    // Clone the immutable list and extract the mutable Arc
-    let old_list = graph.segments.load().as_ref().clone();
-    let immutable = old_list.immutable;
-
-    // Swap in a list with no mutable segment to release the ArcSwap's reference
-    graph.segments.swap(GraphSegmentList {
-        mutable: None,
-        immutable: immutable.clone(),
-    });
-
-    // Now the only remaining Arc reference is in old_list.mutable
-    let mg = match old_list.mutable {
-        Some(arc_mg) => match std::sync::Arc::try_unwrap(arc_mg) {
-            Ok(mg) => mg,
-            Err(_arc) => {
-                // Fallback: create fresh MemGraph (shouldn't happen at startup)
-                tracing::warn!("MemGraph Arc has extra owners during replay, creating fresh");
-                MemGraph::new(graph.edge_threshold)
-            }
-        },
-        None => MemGraph::new(graph.edge_threshold),
-    };
-
+    let immutable = graph.segments.load().immutable.clone();
+    let mg = std::mem::replace(&mut graph.write_buf, MemGraph::new(graph.edge_threshold));
     (mg, immutable)
 }
 
-/// Put the MemGraph back into the segment holder after mutation.
-fn put_memgraph(
-    graph: &mut crate::graph::store::NamedGraph,
-    mg: MemGraph,
-    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>,
-) {
-    use crate::graph::segment::GraphSegmentList;
-    graph.segments.swap(GraphSegmentList {
-        mutable: Some(std::sync::Arc::new(mg)),
-        immutable,
-    });
+/// Put the write buffer back after mutation.
+fn put_memgraph(graph: &mut crate::graph::store::NamedGraph, mg: MemGraph) {
+    graph.write_buf = mg;
 }
 
 // --- Parsing helpers ---
@@ -795,10 +917,8 @@ mod tests {
         assert_eq!(replayed, 4);
 
         let graph = store.get_graph(b"social").expect("graph should exist");
-        let segments = graph.segments.load();
-        let mg = segments.mutable.as_ref().expect("mutable exists");
-        assert_eq!(mg.node_count(), 2);
-        assert_eq!(mg.edge_count(), 1);
+        assert_eq!(graph.write_buf.node_count(), 2);
+        assert_eq!(graph.write_buf.edge_count(), 1);
     }
 
     #[test]
@@ -836,9 +956,272 @@ mod tests {
 
         // Final state: graph "g" exists with exactly 1 node (from second epoch).
         let graph = store.get_graph(b"g").expect("graph should exist");
-        let segments = graph.segments.load();
-        let mg = segments.mutable.as_ref().expect("mutable exists");
-        assert_eq!(mg.node_count(), 1);
+        assert_eq!(graph.write_buf.node_count(), 1);
+    }
+
+    /// P0-2 stable ids: WAL-logged node/edge ids are the PUBLIC handles
+    /// clients cache (ADDNODE/ADDEDGE return them). Replay must re-insert
+    /// entities under the SAME ids, into the AUTHORITATIVE write_buf that
+    /// every read/write path uses.
+    #[test]
+    fn test_replay_preserves_node_and_edge_ids_in_write_buf() {
+        // Ids as an original session would have logged them (slotmap as_ffi
+        // values always carry an odd version word).
+        let n1 = (1u64 << 32) | 100;
+        let n2 = (1u64 << 32) | 200;
+        let e1 = (1u64 << 32) | 300;
+        let n1s = n1.to_string();
+        let n2s = n2.to_string();
+        let e1s = e1.to_string();
+
+        let mut collector = GraphReplayCollector::new();
+        collector.collect_command(b"GRAPH.CREATE", &[b"g"]);
+        collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n1s.as_bytes(), b"1", b"7", b"0"]);
+        collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n2s.as_bytes(), b"1", b"7", b"0"]);
+        collector.collect_command(
+            b"GRAPH.ADDEDGE",
+            &[
+                b"g",
+                e1s.as_bytes(),
+                n1s.as_bytes(),
+                n2s.as_bytes(),
+                b"3",
+                b"1.5",
+                b"0",
+            ],
+        );
+
+        let mut store = GraphStore::new();
+        collector.replay_into(&mut store);
+
+        let graph = store.get_graph(b"g").expect("graph");
+        // Replayed data must live in write_buf — the tier every handler
+        // (Cypher, NEIGHBORS, freeze) actually reads — not in a side copy.
+        assert_eq!(
+            graph.write_buf.node_count(),
+            2,
+            "nodes must land in write_buf"
+        );
+        assert_eq!(
+            graph.write_buf.edge_count(),
+            1,
+            "edge must land in write_buf"
+        );
+
+        let nk1 = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(n1));
+        let nk2 = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(n2));
+        let ek1 = crate::graph::types::EdgeKey::from(slotmap::KeyData::from_ffi(e1));
+        assert!(
+            graph.write_buf.get_node(nk1).is_some(),
+            "pre-restart node handle {n1} must resolve after replay"
+        );
+        assert!(graph.write_buf.get_node(nk2).is_some());
+        let edge = graph
+            .write_buf
+            .get_edge(ek1)
+            .expect("pre-restart edge handle must resolve after replay");
+        assert_eq!(edge.src, nk1);
+        assert_eq!(edge.dst, nk2);
+        assert_eq!(edge.edge_type, 3);
+    }
+
+    #[test]
+    fn test_replay_remove_edge_by_original_id() {
+        let n1 = ((1u64 << 32) | 10).to_string();
+        let n2 = ((1u64 << 32) | 11).to_string();
+        let e1 = (1u64 << 32) | 12;
+        let e1s = e1.to_string();
+
+        let mut collector = GraphReplayCollector::new();
+        collector.collect_command(b"GRAPH.CREATE", &[b"g"]);
+        collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n1.as_bytes(), b"1", b"0", b"0"]);
+        collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n2.as_bytes(), b"1", b"0", b"0"]);
+        collector.collect_command(
+            b"GRAPH.ADDEDGE",
+            &[
+                b"g",
+                e1s.as_bytes(),
+                n1.as_bytes(),
+                n2.as_bytes(),
+                b"0",
+                b"1.0",
+                b"0",
+            ],
+        );
+        collector.collect_command(b"GRAPH.REMOVEEDGE", &[b"g", e1s.as_bytes()]);
+
+        let mut store = GraphStore::new();
+        collector.replay_into(&mut store);
+
+        let graph = store.get_graph(b"g").expect("graph");
+        assert_eq!(
+            graph.write_buf.edge_count(),
+            0,
+            "REMOVEEDGE by the WAL-logged id must delete the replayed edge"
+        );
+    }
+
+    #[test]
+    fn test_post_replay_inserts_do_not_alias_replayed_ids() {
+        let n1 = (1u64 << 32) | 500;
+        let n1s = n1.to_string();
+
+        let mut collector = GraphReplayCollector::new();
+        collector.collect_command(b"GRAPH.CREATE", &[b"g"]);
+        collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n1s.as_bytes(), b"1", b"0", b"0"]);
+
+        let mut store = GraphStore::new();
+        collector.replay_into(&mut store);
+
+        let graph = store.get_graph_mut(b"g").expect("graph");
+        let nk1 = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(n1));
+        let new_key = graph
+            .write_buf
+            .add_node(SmallVec::new(), SmallVec::new(), None, 9);
+        assert_ne!(
+            new_key, nk1,
+            "post-restart insert must never re-issue a replayed id"
+        );
+        use slotmap::Key;
+        assert!(
+            new_key.data().as_ffi() > n1,
+            "new ids must be allocated above the replayed high-water mark"
+        );
+    }
+
+    /// W2-2 copy-up delete: a WAL REMOVENODE whose target lives in a
+    /// frozen CSR segment must materialize a TOMBSTONE shadow in write_buf
+    /// (the frozen row itself is immutable).
+    #[test]
+    fn test_replay_removenode_on_frozen_node_creates_tombstone() {
+        use slotmap::Key;
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 4, 0)
+            .expect("create");
+        let g = store.get_graph_mut(b"g").expect("graph");
+        let a = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        let b = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        g.write_buf.add_edge(a, b, 0, 1.0, None, 2).expect("edge");
+        assert!(g.freeze_and_compact(10), "freeze must succeed");
+        assert!(g.write_buf.get_node(a).is_none(), "freeze drains node a");
+
+        let mut collector = GraphReplayCollector::new();
+        let id = a.data().as_ffi().to_string();
+        assert!(collector.collect_command(b"GRAPH.REMOVENODE", &[b"g", id.as_bytes()]));
+        let replayed = collector.replay_into(&mut store);
+        assert_eq!(replayed, 1, "REMOVENODE of a frozen node must replay");
+
+        let g = store.get_graph(b"g").expect("graph");
+        let shadow = g
+            .write_buf
+            .get_node(a)
+            .expect("tombstone shadow must exist in write_buf");
+        assert_ne!(shadow.deleted_lsn, u64::MAX, "shadow must be soft-deleted");
+    }
+
+    /// W2-9: SETPROP/SETLABEL replay — sets applied after inserts in WAL
+    /// order (last-write-wins), labels idempotent.
+    #[test]
+    fn test_replay_setprop_and_setlabel() {
+        let n1 = (1u64 << 32) | 7;
+        let n1s = n1.to_string();
+
+        let mut collector = GraphReplayCollector::new();
+        assert!(collector.collect_command(b"GRAPH.CREATE", &[b"g"]));
+        assert!(
+            collector.collect_command(b"GRAPH.ADDNODE", &[b"g", n1s.as_bytes(), b"1", b"3", b"0"])
+        );
+        // Two sets of the same key: the later one must win.
+        assert!(collector.collect_command(
+            b"GRAPH.SETPROP",
+            &[b"g", b"N", n1s.as_bytes(), b"9", b"i", b"1"]
+        ));
+        assert!(collector.collect_command(
+            b"GRAPH.SETPROP",
+            &[b"g", b"N", n1s.as_bytes(), b"9", b"i", b"42"]
+        ));
+        assert!(collector.collect_command(b"GRAPH.SETLABEL", &[b"g", n1s.as_bytes(), b"5"]));
+
+        let mut store = GraphStore::new();
+        let replayed = collector.replay_into(&mut store);
+        assert_eq!(replayed, 5, "create + addnode + 2 setprops + setlabel");
+
+        let g = store.get_graph(b"g").expect("graph");
+        let nk = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(n1));
+        let node = g.write_buf.get_node(nk).expect("node replayed");
+        assert_eq!(
+            node.properties
+                .iter()
+                .find(|(k, _)| *k == 9)
+                .map(|(_, v)| v),
+            Some(&PropertyValue::Int(42)),
+            "last SETPROP wins"
+        );
+        assert!(node.labels.contains(&3), "original label kept");
+        assert!(node.labels.contains(&5), "SETLABEL applied");
+    }
+
+    /// W2-9 + W2-2: a SETPROP whose target froze before the crash must copy
+    /// the row up into write_buf (frozen rows are immutable) and mutate the
+    /// shadow.
+    #[test]
+    fn test_replay_setprop_on_frozen_node_copies_up() {
+        use slotmap::Key;
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 4, 0)
+            .expect("create");
+        let g = store.get_graph_mut(b"g").expect("graph");
+        let a = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        let b = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        g.write_buf.add_edge(a, b, 0, 1.0, None, 2).expect("edge");
+        assert!(g.freeze_and_compact(10), "freeze must succeed");
+        assert!(g.write_buf.get_node(a).is_none(), "freeze drains node a");
+
+        let mut collector = GraphReplayCollector::new();
+        let id = a.data().as_ffi().to_string();
+        assert!(collector.collect_command(
+            b"GRAPH.SETPROP",
+            &[b"g", b"N", id.as_bytes(), b"4", b"s", b"hot"]
+        ));
+        let replayed = collector.replay_into(&mut store);
+        assert_eq!(replayed, 1, "SETPROP on a frozen node must replay");
+
+        let g = store.get_graph(b"g").expect("graph");
+        let shadow = g
+            .write_buf
+            .get_node(a)
+            .expect("copy-up shadow must exist in write_buf");
+        assert_eq!(
+            shadow
+                .properties
+                .iter()
+                .find(|(k, _)| *k == 4)
+                .map(|(_, v)| v),
+            Some(&PropertyValue::String(Bytes::from_static(b"hot"))),
+            "SETPROP applied to the copy-up shadow"
+        );
     }
 
     #[test]

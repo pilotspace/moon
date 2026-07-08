@@ -7,6 +7,7 @@
 //! The cost estimator selects between graph-first and vector-first strategies
 //! based on per-graph `GraphStats` (degree distribution, node/edge counts).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::graph::cypher::ast::*;
@@ -18,6 +19,31 @@ use crate::graph::stats::GraphStats;
 #[derive(Debug, Clone)]
 pub struct PhysicalPlan {
     pub operators: Vec<PhysicalOp>,
+}
+
+/// Ordering comparison for an `IndexScan` range conjunct (W2-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeCmp {
+    /// `prop > threshold`
+    Gt,
+    /// `prop >= threshold`
+    Gte,
+    /// `prop < threshold`
+    Lt,
+    /// `prop <= threshold`
+    Lte,
+}
+
+impl RangeCmp {
+    /// Flip for the mirrored form (`threshold < prop` ⇔ `prop > threshold`).
+    fn flipped(self) -> Self {
+        match self {
+            RangeCmp::Gt => RangeCmp::Lt,
+            RangeCmp::Gte => RangeCmp::Lte,
+            RangeCmp::Lt => RangeCmp::Gt,
+            RangeCmp::Lte => RangeCmp::Gte,
+        }
+    }
 }
 
 /// Individual physical operators in the execution pipeline.
@@ -43,6 +69,22 @@ pub enum PhysicalOp {
         /// (property name, value expression) equality conjuncts. Expressions
         /// are literals or parameters, resolved by the executor per run.
         prop_eq: Vec<(String, Expr)>,
+        /// (property name, comparison, threshold expression) range conjuncts
+        /// extracted from top-level `WHERE` AND-chains (`n.p > 5`,
+        /// `10 > n.p`, `n.p >= $t`). Numeric-index pruning hints with the
+        /// same SUPERSET contract as `prop_eq` — the residual Filter
+        /// downstream stays authoritative. W2-3.
+        prop_range: Vec<(String, RangeCmp, Expr)>,
+        /// (property name, text operator, pattern expression) text-predicate
+        /// conjuncts extracted from top-level `WHERE` AND-chains
+        /// (`n.p CONTAINS 'x'`, `n.p STARTS WITH $prefix`, `n.p =~ '.*x.*'`).
+        /// P3 design part B. Pruned via `SegmentTextIndex::candidate_rows` —
+        /// a PRESENCE-only superset (see `text_index.rs` module docs for why
+        /// token-level pruning is unsound for substring/prefix/suffix
+        /// predicates), same SUPERSET contract as `prop_eq`/`prop_range`;
+        /// the pattern expression itself is carried for documentation/future
+        /// use but is NOT evaluated for pruning purposes.
+        text_pred: Vec<(String, BinaryOperator, Expr)>,
     },
     /// Expand along edges from a source variable.
     ///
@@ -60,6 +102,11 @@ pub enum PhysicalOp {
         direction: EdgeDirection,
         min_hops: u32,
         max_hops: u32,
+        /// W2-13 OPTIONAL MATCH: a source row whose expansion yields zero
+        /// matches survives with `target` (and `edge_variable`) bound to
+        /// Null instead of being dropped. A Null/unbound source also
+        /// null-pads instead of being filtered out.
+        optional: bool,
     },
     /// Filter rows by a predicate expression.
     Filter { expr: Expr },
@@ -67,6 +114,11 @@ pub enum PhysicalOp {
     Project {
         items: Vec<ReturnItem>,
         distinct: bool,
+        /// W2-13 WITH: instead of terminating the pipeline into positional
+        /// output rows, re-seed the variable-binding row stream with the
+        /// projection's outputs (alias or expression text) so later
+        /// MATCH/WHERE/RETURN clauses keep running. RETURN keeps `false`.
+        rebind: bool,
     },
     /// Sort by expressions.
     Sort { items: Vec<(Expr, bool)> },
@@ -141,12 +193,16 @@ pub struct CachedPlan {
     /// literal values and are always empty here -- callers must re-derive
     /// params for that specific query text via `parameterize()`.
     pub auto_params: Arc<Vec<(String, Value)>>,
+    /// Whether the cached plan is read-only (W2-7 caches WRITE plans too) —
+    /// callers MUST route on this flag (see `PlanCache` docs).
+    pub read_only: bool,
 }
 
 struct CacheEntry {
     plan: Arc<PhysicalPlan>,
     slots: Arc<SlotTable>,
     auto_params: Arc<Vec<(String, Value)>>,
+    read_only: bool,
     used: u64,
 }
 
@@ -168,9 +224,12 @@ struct CacheEntry {
 /// deliberately hash-flooded cache degrades to O(max_entries) per lookup,
 /// not unbounded blowup.
 ///
-/// Invariant: only READ-ONLY plans may be inserted. A cache hit in
-/// `graph_query_or_write` routes straight to the read path without
-/// re-parsing, so a cached write plan would mis-route.
+/// Entries carry a `read_only` flag (W2-7 caches WRITE plans too). The
+/// safety invariant moved from "only read-only plans may be inserted" to
+/// "a read-path hit must check the flag": `graph_query_or_write` routes a
+/// read-only hit to the read path and a write hit to the write path, both
+/// with zero parse/compile work; the pure read handlers treat a write hit
+/// as a miss.
 pub struct PlanCache {
     cache: FxHashMap<u64, CacheEntry>,
     max_entries: usize,
@@ -198,6 +257,7 @@ impl PlanCache {
                 plan: e.plan.clone(),
                 slots: e.slots.clone(),
                 auto_params: e.auto_params.clone(),
+                read_only: e.read_only,
             }
         })
     }
@@ -205,12 +265,18 @@ impl PlanCache {
     /// Insert a plan under the literal-normalized hash, evicting the
     /// least-recently-used entry at capacity. No `auto_params` are cached
     /// (see `PlanCache` docs) -- callers re-derive them per query text.
+    /// `read_only` marks whether the plan may run on the read path (W2-7).
     ///
     /// Returns the freshly-built `SlotTable` so the caller can execute
     /// immediately without rebuilding it a second time.
-    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) -> Arc<SlotTable> {
+    pub fn insert(
+        &mut self,
+        hash: u64,
+        plan: Arc<PhysicalPlan>,
+        read_only: bool,
+    ) -> Arc<SlotTable> {
         let slots = Arc::new(SlotTable::from_plan(&plan));
-        self.put(hash, plan, slots.clone(), Arc::new(Vec::new()));
+        self.put(hash, plan, slots.clone(), Arc::new(Vec::new()), read_only);
         slots
     }
 
@@ -227,6 +293,7 @@ impl PlanCache {
         normalized_hash: u64,
         plan: Arc<PhysicalPlan>,
         raw_auto_params: Vec<(String, Value)>,
+        read_only: bool,
     ) -> Arc<SlotTable> {
         let slots = Arc::new(SlotTable::from_plan(&plan));
         self.put(
@@ -234,9 +301,16 @@ impl PlanCache {
             plan.clone(),
             slots.clone(),
             Arc::new(raw_auto_params),
+            read_only,
         );
         if normalized_hash != raw_hash {
-            self.put(normalized_hash, plan, slots.clone(), Arc::new(Vec::new()));
+            self.put(
+                normalized_hash,
+                plan,
+                slots.clone(),
+                Arc::new(Vec::new()),
+                read_only,
+            );
         }
         slots
     }
@@ -247,6 +321,7 @@ impl PlanCache {
         plan: Arc<PhysicalPlan>,
         slots: Arc<SlotTable>,
         auto_params: Arc<Vec<(String, Value)>>,
+        read_only: bool,
     ) {
         self.tick += 1;
         if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
@@ -267,6 +342,7 @@ impl PlanCache {
                 plan,
                 slots,
                 auto_params,
+                read_only,
                 used: self.tick,
             },
         );
@@ -434,16 +510,39 @@ pub fn select_strategy(
 /// Strategy selection is done separately via `select_strategy()`.
 pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
     let mut ops = Vec::new();
+    // W2-13: variables bound so far, for OPTIONAL MATCH shape validation.
+    // WITH resets this set to its own outputs (Cypher scoping).
+    let mut bound: HashSet<String> = HashSet::new();
+    // W2-13: once a WITH has run, range-conjunct extraction must stop — a
+    // post-WITH WHERE is a HAVING over (possibly aggregated) projections
+    // and must never prune pre-aggregation scans.
+    let mut saw_with = false;
 
     for clause in &query.clauses {
         match clause {
             Clause::Match(m) => {
-                compile_match(m, &mut ops)?;
+                compile_match(m, &mut ops, &mut bound)?;
             }
             Clause::ShortestPathMatch(sp) => {
                 compile_shortest_path_match(sp, &mut ops);
+                for node in [&sp.src, &sp.dst] {
+                    if let Some(v) = &node.variable {
+                        bound.insert(v.clone());
+                    }
+                }
+                bound.insert(sp.path_var.clone());
             }
             Clause::Where(w) => {
+                // W2-3: top-level AND conjuncts of the form
+                // `var.prop <cmp> literal|param` upgrade var's scan to a
+                // range IndexScan BEFORE the residual Filter is pushed
+                // (the full WHERE stays — the index only prunes).
+                if !saw_with {
+                    extract_range_conjuncts(&w.expr, &mut ops);
+                    // P3 design part B: same treatment for text-predicate
+                    // conjuncts (`CONTAINS`/`STARTS WITH`/`ENDS WITH`/`=~`).
+                    extract_text_conjuncts(&w.expr, &mut ops);
+                }
                 ops.push(PhysicalOp::Filter {
                     expr: w.expr.clone(),
                 });
@@ -452,12 +551,16 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                 ops.push(PhysicalOp::Project {
                     items: r.items.clone(),
                     distinct: r.distinct,
+                    rebind: false,
                 });
             }
             Clause::Create(c) => {
                 ops.push(PhysicalOp::CreatePattern {
                     patterns: c.patterns.clone(),
                 });
+                for p in &c.patterns {
+                    bind_pattern_vars(p, &mut bound);
+                }
             }
             Clause::Delete(d) => {
                 ops.push(PhysicalOp::DeleteEntities {
@@ -476,18 +579,36 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                     on_create: m.on_create.clone(),
                     on_match: m.on_match.clone(),
                 });
+                bind_pattern_vars(&m.pattern, &mut bound);
             }
             Clause::With(w) => {
+                // W2-13: WITH is a rebinding projection — later clauses keep
+                // executing on the projected variable stream.
+                if w.items.iter().any(|it| matches!(it.expr, Expr::Star)) {
+                    return Err(PlanError::Unsupported(
+                        "WITH * is not yet supported — list the variables explicitly".to_string(),
+                    ));
+                }
                 ops.push(PhysicalOp::Project {
                     items: w.items.clone(),
                     distinct: w.distinct,
+                    rebind: true,
                 });
+                // Cypher scoping: only the WITH outputs remain in scope.
+                bound.clear();
+                for item in &w.items {
+                    if let Some(name) = with_output_name(item) {
+                        bound.insert(name);
+                    }
+                }
+                saw_with = true;
             }
             Clause::Unwind(u) => {
                 ops.push(PhysicalOp::Unwind {
                     expr: u.expr.clone(),
                     alias: u.alias.clone(),
                 });
+                bound.insert(u.alias.clone());
             }
             Clause::Call(c) => {
                 ops.push(PhysicalOp::ProcedureCall {
@@ -517,6 +638,35 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
     Ok(PhysicalPlan { operators: ops })
 }
 
+/// The scope name a WITH item introduces, for OPTIONAL MATCH validation.
+///
+/// Alias wins; a bare identifier passes through under its own name. Any
+/// other unaliased expression produces an output column that no later
+/// identifier can reference, so it contributes nothing to the bound set.
+fn with_output_name(item: &ReturnItem) -> Option<String> {
+    if let Some(alias) = &item.alias {
+        return Some(alias.clone());
+    }
+    if let Expr::Ident(name) = &item.expr {
+        return Some(name.clone());
+    }
+    None
+}
+
+/// Record every variable a pattern binds (nodes and edges).
+fn bind_pattern_vars(pattern: &Pattern, bound: &mut HashSet<String>) {
+    for node in &pattern.nodes {
+        if let Some(v) = &node.variable {
+            bound.insert(v.clone());
+        }
+    }
+    for edge in &pattern.edges {
+        if let Some(v) = &edge.variable {
+            bound.insert(v.clone());
+        }
+    }
+}
+
 /// Compile a MATCH clause into scan + expand operators.
 ///
 /// Returns `Err(PlanError::Unsupported)` if a variable-length edge pattern
@@ -525,11 +675,27 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
 /// predicates silently evaluate against Null — producing wrong results.
 /// This gate is temporary: Phase 179 (MVCC-02) will implement `Value::Path`
 /// binding and remove this restriction.
-fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanError> {
+///
+/// W2-13 OPTIONAL MATCH compiles to an `Expand { optional: true }` and is
+/// restricted to its dominant shape — a single relationship expanding from
+/// a previously bound bare variable, no inline properties on the optional
+/// target. Everything else (standalone patterns, multi-relationship chains
+/// whose whole-pattern null semantics need grouped execution, inline
+/// property predicates that must not drop null-padded rows) is rejected
+/// loudly instead of silently behaving like an inner MATCH.
+fn compile_match(
+    m: &MatchClause,
+    ops: &mut Vec<PhysicalOp>,
+    bound: &mut HashSet<String>,
+) -> Result<(), PlanError> {
+    if m.optional {
+        return compile_optional_match(m, ops, bound);
+    }
     for pattern in &m.patterns {
         if pattern.nodes.is_empty() {
             continue;
         }
+        bind_pattern_vars(pattern, bound);
 
         // First node becomes a scan (index-backed when inline equality
         // properties can drive a lookup).
@@ -575,6 +741,7 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
                 direction: edge.direction,
                 min_hops,
                 max_hops,
+                optional: false,
             });
             // Inline properties on the expanded target node — filter right after
             // the Expand that BINDS it (after, never before: the var is unbound
@@ -584,6 +751,97 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
                     expr: properties_to_filter(&target_var, &target.properties),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Compile `OPTIONAL MATCH` (W2-13). See [`compile_match`] for the supported
+/// shape and the rationale for each rejection.
+fn compile_optional_match(
+    m: &MatchClause,
+    ops: &mut Vec<PhysicalOp>,
+    bound: &mut HashSet<String>,
+) -> Result<(), PlanError> {
+    for pattern in &m.patterns {
+        let Some(first) = pattern.nodes.first() else {
+            continue;
+        };
+        let Some(first_var) = &first.variable else {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH must expand from a previously bound variable — \
+                 name the first pattern node"
+                    .to_string(),
+            ));
+        };
+        if !bound.contains(first_var) {
+            return Err(PlanError::Unsupported(format!(
+                "OPTIONAL MATCH must expand from a previously bound variable; \
+                 '{first_var}' is not bound. Standalone OPTIONAL MATCH patterns \
+                 are not yet supported."
+            )));
+        }
+        if !first.labels.is_empty() || !first.properties.is_empty() {
+            return Err(PlanError::Unsupported(format!(
+                "OPTIONAL MATCH: labels/properties on the already-bound variable \
+                 '{first_var}' are not yet supported — constrain it in the \
+                 binding MATCH instead."
+            )));
+        }
+        // `OPTIONAL MATCH (a)` with `a` bound re-matches an existing row:
+        // a no-op.
+        if pattern.edges.is_empty() {
+            continue;
+        }
+        if pattern.edges.len() > 1 {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH with more than one relationship is not yet \
+                 supported (whole-pattern null semantics need grouped \
+                 execution) — split into single-hop OPTIONAL MATCH clauses"
+                    .to_string(),
+            ));
+        }
+        let edge = &pattern.edges[0];
+        // CYP-06 gate applies here too (see compile_match).
+        if edge.var_length.is_some() && edge.variable.is_some() {
+            let var_name = edge.variable.as_deref().unwrap_or("?");
+            return Err(PlanError::Unsupported(format!(
+                "CYP-06: Multi-hop edge variable binding -[{var_name}*m..n]- is not yet \
+                 supported. Remove the edge variable '{var_name}' or use a single-hop \
+                 pattern. Tracked: MVCC-02 (Phase 179)."
+            )));
+        }
+        // Parser invariant: nodes.len() == edges.len() + 1; stay panic-free
+        // on a malformed AST anyway.
+        let Some(target) = pattern.nodes.get(1) else {
+            continue;
+        };
+        if !target.properties.is_empty() {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH: inline properties on the optional target are \
+                 not yet supported (a post-filter would drop null-padded rows) \
+                 — use WHERE with an explicit null check"
+                    .to_string(),
+            ));
+        }
+        let target_var = target
+            .variable
+            .clone()
+            .unwrap_or_else(|| "_anon_1".to_string());
+        let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
+        ops.push(PhysicalOp::Expand {
+            source: first_var.clone(),
+            target: target_var.clone(),
+            edge_variable: edge.variable.clone(),
+            edge_types: edge.edge_types.clone(),
+            direction: edge.direction,
+            min_hops,
+            max_hops,
+            optional: true,
+        });
+        bound.insert(target_var);
+        if let Some(evar) = &edge.variable {
+            bound.insert(evar.clone());
         }
     }
     Ok(())
@@ -644,6 +902,8 @@ fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
             variable: var.to_string(),
             label: node.labels.first().cloned(),
             prop_eq: node.properties.clone(),
+            prop_range: Vec::new(),
+            text_pred: Vec::new(),
         });
     } else {
         ops.push(PhysicalOp::NodeScan {
@@ -656,6 +916,168 @@ fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
             expr: properties_to_filter(var, &node.properties),
         });
     }
+}
+
+/// Walk a WHERE expression's top-level AND-chain and push every
+/// `var.prop <cmp> literal|param` conjunct (either orientation) into the
+/// scan op that BINDS `var` (upgrading a plain `NodeScan` to an
+/// `IndexScan` when needed). W2-3.
+///
+/// Soundness: a top-level AND conjunct must hold for every result row, so
+/// restricting var's scan to a SUPERSET of rows satisfying it can never
+/// drop a valid row — provided the executor's index lookup is a superset
+/// of the residual Filter's semantics for that conjunct (see
+/// `index_scan_keys`). Disjunctions (`OR`) are never extracted.
+fn extract_range_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            extract_range_conjuncts(left, ops);
+            extract_range_conjuncts(right, ops);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let cmp = match op {
+                BinaryOperator::GreaterThan => RangeCmp::Gt,
+                BinaryOperator::GreaterEqual => RangeCmp::Gte,
+                BinaryOperator::LessThan => RangeCmp::Lt,
+                BinaryOperator::LessEqual => RangeCmp::Lte,
+                _ => return,
+            };
+            // `var.prop <cmp> value` or the mirrored `value <cmp> var.prop`.
+            let (var, prop, value, cmp) = match (as_prop_access(left), as_prop_access(right)) {
+                (Some((var, prop)), None) if is_range_value(right) => {
+                    (var, prop, (**right).clone(), cmp)
+                }
+                (None, Some((var, prop))) if is_range_value(left) => {
+                    (var, prop, (**left).clone(), cmp.flipped())
+                }
+                _ => return,
+            };
+            // Find the scan that binds `var` and attach the conjunct.
+            for op in ops.iter_mut().rev() {
+                match op {
+                    PhysicalOp::IndexScan {
+                        variable,
+                        prop_range,
+                        ..
+                    } if variable == var => {
+                        prop_range.push((prop.to_owned(), cmp, value));
+                        return;
+                    }
+                    PhysicalOp::NodeScan { variable, label } if variable == var => {
+                        *op = PhysicalOp::IndexScan {
+                            variable: variable.clone(),
+                            label: label.clone(),
+                            prop_eq: Vec::new(),
+                            prop_range: vec![(prop.to_owned(), cmp, value)],
+                            text_pred: Vec::new(),
+                        };
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a WHERE expression's top-level AND-chain and push every
+/// `var.prop <CONTAINS|STARTS WITH|ENDS WITH|=~> literal|param` conjunct
+/// into the scan op that BINDS `var` (upgrading a plain `NodeScan` to an
+/// `IndexScan` when needed), mirroring `extract_range_conjuncts` (W2-3) for
+/// text predicates (P3 design part B).
+///
+/// Soundness: identical argument to `extract_range_conjuncts` — a top-level
+/// AND conjunct must hold for every result row, so restricting `var`'s scan
+/// to a SUPERSET of rows satisfying it can never drop a valid row. The
+/// index probe (`SegmentTextIndex::candidate_rows`) is a presence-only
+/// superset for ANY string predicate on that property — see `text_index.rs`
+/// module docs for why token-level pruning is unsound here. Disjunctions
+/// (`OR`) are never extracted.
+fn extract_text_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            extract_text_conjuncts(left, ops);
+            extract_text_conjuncts(right, ops);
+        }
+        Expr::BinaryOp {
+            left,
+            op: text_op,
+            right,
+        } => {
+            if !matches!(
+                text_op,
+                BinaryOperator::Contains
+                    | BinaryOperator::StartsWith
+                    | BinaryOperator::EndsWith
+                    | BinaryOperator::RegexMatch
+            ) {
+                return;
+            }
+            let Some((var, prop)) = as_prop_access(left) else {
+                return;
+            };
+            if !is_text_value(right) {
+                return;
+            }
+            for op in ops.iter_mut().rev() {
+                match op {
+                    PhysicalOp::IndexScan {
+                        variable,
+                        text_pred,
+                        ..
+                    } if variable == var => {
+                        text_pred.push((prop.to_owned(), *text_op, (**right).clone()));
+                        return;
+                    }
+                    PhysicalOp::NodeScan { variable, label } if variable == var => {
+                        *op = PhysicalOp::IndexScan {
+                            variable: variable.clone(),
+                            label: label.clone(),
+                            prop_eq: Vec::new(),
+                            prop_range: Vec::new(),
+                            text_pred: vec![(prop.to_owned(), *text_op, (**right).clone())],
+                        };
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Is this expression usable as a text-predicate pattern (resolvable
+/// without a row, mirroring `is_range_value`)? String literals and
+/// parameters only.
+fn is_text_value(expr: &Expr) -> bool {
+    matches!(expr, Expr::StringLit(_) | Expr::Parameter(_))
+}
+
+/// `n.prop` accessor on a plain variable, if the expression is one.
+fn as_prop_access(expr: &Expr) -> Option<(&str, &str)> {
+    if let Expr::PropertyAccess { object, property } = expr {
+        if let Expr::Ident(var) = object.as_ref() {
+            return Some((var.as_str(), property.as_str()));
+        }
+    }
+    None
+}
+
+/// Is this expression usable as an index range threshold (resolvable
+/// without a row)? Numeric literals and parameters only — the executor
+/// skips conjuncts whose parameter resolves to a non-number.
+fn is_range_value(expr: &Expr) -> bool {
+    matches!(expr, Expr::Integer(_) | Expr::Float(_) | Expr::Parameter(_))
 }
 
 /// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
@@ -787,6 +1209,172 @@ mod tests {
         assert!(matches!(plan.operators[0], PhysicalOp::NodeScan { .. }));
     }
 
+    // ─── W2-3: WHERE range predicates drive the property index ────────────
+
+    #[test]
+    fn test_where_range_upgrades_scan_to_index_range() {
+        let query = parse_cypher(b"MATCH (n:Person) WHERE n.age > 30 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                ..
+            } => {
+                assert!(prop_eq.is_empty(), "no inline equality props");
+                assert_eq!(prop_range.len(), 1, "one range conjunct");
+                assert_eq!(prop_range[0].0, "age");
+                assert_eq!(prop_range[0].1, RangeCmp::Gt);
+            }
+            other => panic!("expected range IndexScan, got {other:?}"),
+        }
+        // The full WHERE stays as a residual Filter (index is superset-only).
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "residual Filter must remain"
+        );
+    }
+
+    #[test]
+    fn test_where_range_conjuncts_compose_and_flip() {
+        let query =
+            parse_cypher(b"MATCH (n:N {id:3}) WHERE n.a >= 1 AND 10 > n.b AND n.c = 2 RETURN n")
+                .expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                ..
+            } => {
+                assert_eq!(prop_eq.len(), 1, "inline {{id:3}} stays an eq conjunct");
+                assert_eq!(
+                    prop_range.len(),
+                    2,
+                    "two range conjuncts, got {prop_range:?}"
+                );
+                assert_eq!(prop_range[0].0, "a");
+                assert_eq!(prop_range[0].1, RangeCmp::Gte);
+                // `10 > n.b` flips to b < 10.
+                assert_eq!(prop_range[1].0, "b");
+                assert_eq!(prop_range[1].1, RangeCmp::Lt);
+            }
+            other => panic!("expected range IndexScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_where_or_is_not_range_extracted() {
+        // Disjunctions cannot prune a scan (a row failing one branch may
+        // satisfy the other).
+        let query = parse_cypher(b"MATCH (n:N) WHERE n.a > 1 OR n.b < 2 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        assert!(
+            matches!(plan.operators[0], PhysicalOp::NodeScan { .. }),
+            "OR predicate must not upgrade the scan; ops = {:?}",
+            plan.operators
+        );
+    }
+
+    // ─── P3 design part B: WHERE text predicates drive the text index ─────
+
+    #[test]
+    fn test_where_contains_upgrades_scan_to_index_text_pred() {
+        let query =
+            parse_cypher(b"MATCH (n:Person) WHERE n.bio CONTAINS 'rust' RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                text_pred,
+                ..
+            } => {
+                assert!(prop_eq.is_empty());
+                assert!(prop_range.is_empty());
+                assert_eq!(text_pred.len(), 1, "one text conjunct, got {text_pred:?}");
+                assert_eq!(text_pred[0].0, "bio");
+                assert_eq!(text_pred[0].1, BinaryOperator::Contains);
+            }
+            other => panic!("expected text IndexScan, got {other:?}"),
+        }
+        // The full WHERE stays as a residual Filter (index is superset-only).
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "residual Filter must remain"
+        );
+    }
+
+    #[test]
+    fn test_where_starts_with_and_ends_with_upgrade_scan() {
+        for (query_bytes, expect_op) in [
+            (
+                b"MATCH (n:N) WHERE n.name STARTS WITH 'Al' RETURN n".as_slice(),
+                BinaryOperator::StartsWith,
+            ),
+            (
+                b"MATCH (n:N) WHERE n.name ENDS WITH 'ce' RETURN n".as_slice(),
+                BinaryOperator::EndsWith,
+            ),
+            (
+                b"MATCH (n:N) WHERE n.name =~ '.*x.*' RETURN n".as_slice(),
+                BinaryOperator::RegexMatch,
+            ),
+        ] {
+            let query = parse_cypher(query_bytes).expect("parse");
+            let plan = compile(&query).expect("compile");
+            match &plan.operators[0] {
+                PhysicalOp::IndexScan { text_pred, .. } => {
+                    assert_eq!(text_pred.len(), 1, "ops = {:?}", plan.operators);
+                    assert_eq!(text_pred[0].1, expect_op);
+                }
+                other => panic!(
+                    "expected text IndexScan for {:?}, got {other:?}",
+                    core::str::from_utf8(query_bytes)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_where_text_and_range_conjuncts_compose() {
+        // A single WHERE mixing a numeric range and a text predicate on
+        // DIFFERENT properties of the same variable must upgrade the SAME
+        // IndexScan with both hints populated.
+        let query = parse_cypher(b"MATCH (n:N) WHERE n.age > 30 AND n.bio CONTAINS 'x' RETURN n")
+            .expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_range,
+                text_pred,
+                ..
+            } => {
+                assert_eq!(prop_range.len(), 1);
+                assert_eq!(text_pred.len(), 1);
+                assert_eq!(text_pred[0].0, "bio");
+            }
+            other => panic!("expected combined IndexScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_where_text_or_is_not_extracted() {
+        // Disjunctions cannot prune a scan, same rule as range conjuncts.
+        let query =
+            parse_cypher(b"MATCH (n:N) WHERE n.a CONTAINS 'x' OR n.b > 1 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        assert!(
+            matches!(plan.operators[0], PhysicalOp::NodeScan { .. }),
+            "OR predicate must not upgrade the scan; ops = {:?}",
+            plan.operators
+        );
+    }
+
     #[test]
     fn test_inline_prop_on_expanded_node_filters_after_expand() {
         // M2 — `MATCH (a {id:1})-[]->(b {id:3})`: a Filter after the NodeScan AND one after the Expand.
@@ -880,26 +1468,38 @@ mod tests {
         assert!(cache.is_empty());
 
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert(42, plan.clone());
+        cache.insert(42, plan.clone(), true);
         assert_eq!(cache.len(), 1);
         assert!(cache.get(42).is_some());
         assert!(cache.get(99).is_none());
 
         // Fill and evict
-        cache.insert(43, plan.clone());
-        cache.insert(44, plan.clone());
+        cache.insert(43, plan.clone(), true);
+        cache.insert(44, plan.clone(), true);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_read_only_flag_round_trips() {
+        // W2-7: write plans are cached too; the flag tells the read path to
+        // treat them as misses and the write path to execute them directly.
+        let mut cache = PlanCache::new(4);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert(1, plan.clone(), true);
+        cache.insert(2, plan.clone(), false);
+        assert_eq!(cache.get(1).map(|c| c.read_only), Some(true));
+        assert_eq!(cache.get(2).map(|c| c.read_only), Some(false));
     }
 
     #[test]
     fn test_plan_cache_lru_eviction_order() {
         let mut cache = PlanCache::new(2);
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert(1, plan.clone());
-        cache.insert(2, plan.clone());
+        cache.insert(1, plan.clone(), true);
+        cache.insert(2, plan.clone(), true);
         // Touch 1 so 2 becomes the least-recently-used entry.
         assert!(cache.get(1).is_some());
-        cache.insert(3, plan.clone());
+        cache.insert(3, plan.clone(), true);
         assert!(
             cache.get(1).is_some(),
             "recently-used entry must survive eviction"
@@ -927,7 +1527,13 @@ mod tests {
         let raw_hash = 100;
         let normalized_hash = 200;
         let auto_params = vec![("auto0".to_string(), Value::Int(42))];
-        cache.insert_both(raw_hash, normalized_hash, plan.clone(), auto_params.clone());
+        cache.insert_both(
+            raw_hash,
+            normalized_hash,
+            plan.clone(),
+            auto_params.clone(),
+            true,
+        );
         assert_eq!(cache.len(), 2, "raw + normalized keys are distinct entries");
 
         let raw_hit = cache.get(raw_hash).expect("raw-hash hit");
@@ -962,7 +1568,7 @@ mod tests {
         // raw_hash == normalized_hash -- must not create two entries.
         let mut cache = PlanCache::new(8);
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert_both(50, 50, plan, Vec::new());
+        cache.insert_both(50, 50, plan, Vec::new(), true);
         assert_eq!(cache.len(), 1);
     }
 
@@ -986,6 +1592,7 @@ mod tests {
                 normalized_hash,
                 plan.clone(),
                 vec![("auto0".to_string(), Value::Int(7))],
+                true,
             );
         }
         assert_eq!(reparse_count, 1);
@@ -1009,12 +1616,18 @@ mod tests {
         // in raw+normalized pairs.
         let mut cache = PlanCache::new(2);
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert_both(1, 2, plan.clone(), vec![("a".to_string(), Value::Int(1))]);
+        cache.insert_both(
+            1,
+            2,
+            plan.clone(),
+            vec![("a".to_string(), Value::Int(1))],
+            true,
+        );
         assert_eq!(cache.len(), 2);
         // Cache is now full (max_entries=2). A brand-new key must evict the
         // least-recently-used entry (raw key 1, since normalized key 2 was
         // inserted after it and is therefore more recently used).
-        cache.insert(3, plan);
+        cache.insert(3, plan, true);
         assert_eq!(cache.len(), 2);
         assert!(
             cache.get(1).is_none(),

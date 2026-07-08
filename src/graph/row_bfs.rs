@@ -25,6 +25,12 @@
 //! CSR edges (placeholder edge key, weight 1.0, segment-LSN timestamp).
 //! Within a level, PARALLEL discovery order is unspecified (the visited
 //! set and depths are deterministic; sequential levels keep FIFO order).
+//!
+//! MULTI-segment frozen graphs (W2-6) also stay in row space: cross-segment
+//! edges cannot exist (freeze retains them as mutable-tier delta edges, and
+//! the gate requires an empty mutable tier), so the only boundary is a
+//! NodeKey resident in several segments (stale copy-up rows) — handled by a
+//! key-level sync per emitted node. See `multi_row_bfs`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,10 +63,14 @@ pub enum BfsMode {
 /// Row-space BFS if the fast-path gate holds, else `None` (caller falls
 /// back to the `SegmentMergeReader` path).
 ///
-/// Gate: mutable tier absent-or-empty ∧ exactly one CSR segment ∧ segment
-/// visible at `snapshot_lsn`. Each condition the reader path handles
-/// generically (delta edges, cross-segment dedup, future segments) is a
-/// reason NOT to take the fast path — never a behavior fork.
+/// Gate: mutable tier absent-or-empty ∧ every CSR segment visible at
+/// `snapshot_lsn`. A single segment takes the full fast path (parallel
+/// levels + direction-optimizing pull); multiple segments take the W2-6
+/// multi-segment row path (sequential push, per-segment bitmaps, key-level
+/// boundary sync). Each condition the reader path handles generically that
+/// row space cannot (delta edges, a future segment needing per-segment
+/// snapshot skips) is a reason NOT to take the fast path — never a
+/// behavior fork.
 #[allow(clippy::too_many_arguments)]
 pub fn try_row_bfs(
     memgraph: Option<&MemGraph>,
@@ -77,22 +87,176 @@ pub fn try_row_bfs(
             return None;
         }
     }
-    let [seg] = csr_segments else {
-        return None;
-    };
-    if seg.created_lsn() > snapshot_lsn {
+    if csr_segments
+        .iter()
+        .any(|seg| seg.created_lsn() > snapshot_lsn)
+    {
         return None;
     }
-    Some(row_bfs(
-        seg,
-        direction,
-        snapshot_lsn,
-        edge_type_filter,
-        start,
-        depth_limit,
-        frontier_cap,
-        BfsMode::Auto,
-    ))
+    match csr_segments {
+        [] => None,
+        [seg] => Some(row_bfs(
+            seg,
+            direction,
+            snapshot_lsn,
+            edge_type_filter,
+            start,
+            depth_limit,
+            frontier_cap,
+            BfsMode::Auto,
+        )),
+        segs => Some(multi_row_bfs(
+            segs,
+            direction,
+            snapshot_lsn,
+            edge_type_filter,
+            start,
+            depth_limit,
+            frontier_cap,
+        )),
+    }
+}
+
+/// Multi-segment row-space BFS (W2-6).
+///
+/// The single-segment path keeps the parallel + direction-optimizing
+/// machinery; with several segments (and the gate's EMPTY mutable tier —
+/// so no delta edges exist) expansion is push-only and sequential, but
+/// still row-space: per-segment dense visited bitmaps, slice adjacency,
+/// NodeKey materialization once per RESULT node.
+///
+/// Cross-segment boundary: a NodeKey can be resident in several segments
+/// (a re-frozen copy-up shadow leaves a stale row in the older segment).
+/// On first emission every resident row is marked visited and enqueued in
+/// its own segment's frontier, so the node's edges from EVERY segment
+/// expand — parity with `SegmentMergeReader`, which unions a node's CSR
+/// adjacency across all segments. `emitted` (ffi-keyed) is the
+/// authoritative once-per-node dedup; the bitmaps remain the per-edge-probe
+/// fast reject.
+#[allow(clippy::too_many_arguments)]
+fn multi_row_bfs(
+    segs: &[Arc<CsrStorage>],
+    direction: Direction,
+    snapshot_lsn: u64,
+    edge_type_filter: Option<u16>,
+    start: NodeKey,
+    depth_limit: u32,
+    frontier_cap: usize,
+) -> Result<BfsResult, TraversalError> {
+    use slotmap::Key;
+
+    let visited: Vec<Vec<AtomicU64>> = segs
+        .iter()
+        .map(|s| {
+            (0..(s.node_count() as usize).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect()
+        })
+        .collect();
+
+    let mut emitted: crate::graph::fasthash::FxHashSet<u64> =
+        crate::graph::fasthash::FxHashSet::default();
+    let mut frontier: Vec<Vec<u32>> = vec![Vec::new(); segs.len()];
+    for (si, seg) in segs.iter().enumerate() {
+        if let Some(row) = seg.lookup_node(start) {
+            test_and_set(&visited[si], row);
+            frontier[si].push(row);
+        }
+    }
+    if frontier.iter().all(|f| f.is_empty()) {
+        return Err(TraversalError::NodeNotFound);
+    }
+    emitted.insert(start.data().as_ffi());
+    for seg in segs {
+        seg.madvise_sequential();
+    }
+
+    let mut result: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = vec![(start, 0, None)];
+    let mut visited_count: usize = 1;
+    let mut depth: u32 = 0;
+
+    while depth < depth_limit && frontier.iter().any(|f| !f.is_empty()) {
+        let next_depth = depth + 1;
+
+        let mut discovered: Vec<(usize, u32, EdgeMeta, u64)> = Vec::new();
+        for (si, seg) in segs.iter().enumerate() {
+            if frontier[si].is_empty() {
+                continue;
+            }
+            let node_meta = seg.node_meta();
+            let visited_si = &visited[si];
+            for &row in &frontier[si] {
+                let mut on_edge = |other: u32, meta: EdgeMeta, created_ms: u64| {
+                    if let Some(filter) = edge_type_filter {
+                        if meta.edge_type != filter {
+                            return;
+                        }
+                    }
+                    let Some(meta_n) = node_meta.get(other as usize) else {
+                        return;
+                    };
+                    if !row_visible(meta_n, snapshot_lsn) {
+                        return;
+                    }
+                    if test_and_set(visited_si, other) {
+                        discovered.push((si, other, meta, created_ms));
+                    }
+                };
+                if direction != Direction::Incoming {
+                    seg.for_each_neighbor_edge_ms(row, &mut on_edge);
+                }
+                if direction != Direction::Outgoing {
+                    seg.for_each_incoming_edge_ms(row, &mut on_edge);
+                }
+            }
+        }
+
+        let mut next: Vec<Vec<u32>> = vec![Vec::new(); segs.len()];
+        for (si, row, meta, created_ms) in discovered {
+            let ext = segs[si].node_meta()[row as usize].external_id;
+            if !emitted.insert(ext) {
+                continue; // stale copy of an already-emitted node
+            }
+            let key: NodeKey = slotmap::KeyData::from_ffi(ext).into();
+            result.push((
+                key,
+                next_depth,
+                Some(MergedNeighbor {
+                    node: key,
+                    edge: slotmap::KeyData::from_ffi(0).into(),
+                    edge_type: meta.edge_type,
+                    weight: 1.0,
+                    timestamp: segs[si].created_lsn(),
+                    created_ms,
+                }),
+            ));
+            visited_count += 1;
+            if visited_count >= frontier_cap {
+                return Err(TraversalError::FrontierCapExceeded {
+                    cap: frontier_cap,
+                    depth: next_depth,
+                });
+            }
+            // Boundary sync: enqueue EVERY resident row for this key so its
+            // adjacency in every segment expands next level.
+            for (ti, tseg) in segs.iter().enumerate() {
+                let trow = if ti == si {
+                    Some(row)
+                } else {
+                    tseg.lookup_node(key)
+                };
+                if let Some(trow) = trow {
+                    test_and_set(&visited[ti], trow);
+                    next[ti].push(trow);
+                }
+            }
+        }
+
+        frontier = next;
+        depth = next_depth;
+    }
+
+    Ok(BfsResult { visited: result })
 }
 
 /// A node discovered during one level: (row, discovery edge, edge wall-ms).
@@ -609,21 +773,34 @@ mod tests {
             .is_none()
         );
 
-        // Two segments → fall back.
+        // Two segments → the W2-6 multi-segment row path engages. Two
+        // clones of one segment = total key overlap; the boundary sync must
+        // dedup every node and match the single-segment answer exactly.
         let two = vec![seg.clone(), seg.clone()];
-        assert!(
-            try_row_bfs(
-                None,
-                &two,
-                Direction::Outgoing,
-                u64::MAX - 1,
-                None,
-                keys[0],
-                3,
-                usize::MAX
-            )
-            .is_none()
-        );
+        let multi = try_row_bfs(
+            None,
+            &two,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+            keys[0],
+            3,
+            usize::MAX,
+        )
+        .expect("multi-seg gate engages")
+        .expect("bfs ok");
+        let single = row_bfs(
+            &seg,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+            keys[0],
+            3,
+            usize::MAX,
+            BfsMode::ForcePush,
+        )
+        .expect("bfs ok");
+        assert_eq!(depth_map(&multi), depth_map(&single));
 
         // Segment newer than the snapshot → fall back.
         assert!(
@@ -731,5 +908,139 @@ mod tests {
         )
         .expect_err("unknown start");
         assert!(matches!(err, TraversalError::NodeNotFound));
+    }
+
+    /// Reader-path oracle over an arbitrary segment list.
+    fn reader_bfs_multi(
+        segs: &[Arc<CsrStorage>],
+        start: NodeKey,
+        direction: Direction,
+        depth_limit: u32,
+        filter: Option<u16>,
+    ) -> HashMap<NodeKey, u32> {
+        let reader = SegmentMergeReader::new(None, segs, direction, u64::MAX - 1, filter);
+        let mut depths = HashMap::new();
+        depths.insert(start, 0u32);
+        let mut frontier = vec![start];
+        let mut d = 0;
+        while !frontier.is_empty() && d < depth_limit {
+            let mut next = Vec::new();
+            for &node in &frontier {
+                for nb in reader.neighbors(node) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = depths.entry(nb.node) {
+                        e.insert(d + 1);
+                        next.push(nb.node);
+                    }
+                }
+            }
+            frontier = next;
+            d += 1;
+        }
+        depths
+    }
+
+    #[test]
+    fn test_multi_segment_disjoint_clusters_match_reader() {
+        // Freeze the SAME MemGraph twice (monotonic id cursors — no key
+        // aliasing across freezes): two disjoint clusters, one per segment.
+        let mut mg = MemGraph::new(usize::MAX >> 1);
+        let a: Vec<NodeKey> = (0..30)
+            .map(|_| mg.add_node(SmallVec::from_elem(1u16, 1), SmallVec::new(), None, 1))
+            .collect();
+        for i in 0..29 {
+            mg.add_edge(a[i], a[i + 1], 1, 1.0, None, 2).expect("edge");
+        }
+        let seg_old = Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(mg.freeze().expect("freeze"), 3).expect("csr"),
+        ));
+        mg.thaw();
+        let b: Vec<NodeKey> = (0..20)
+            .map(|_| mg.add_node(SmallVec::from_elem(1u16, 1), SmallVec::new(), None, 4))
+            .collect();
+        for i in 0..19 {
+            mg.add_edge(b[i], b[i + 1], 1, 1.0, None, 5).expect("edge");
+        }
+        let seg_new = Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(mg.freeze().expect("freeze"), 6).expect("csr"),
+        ));
+
+        // Newest-first, matching production segment ordering.
+        let segs = vec![seg_new, seg_old];
+        for start in [a[0], b[0]] {
+            let got = try_row_bfs(
+                None,
+                &segs,
+                Direction::Outgoing,
+                u64::MAX - 1,
+                None,
+                start,
+                50,
+                usize::MAX,
+            )
+            .expect("gate engages")
+            .expect("bfs ok");
+            let want = reader_bfs_multi(&segs, start, Direction::Outgoing, 50, None);
+            assert_eq!(depth_map(&got), want, "start {start:?}");
+        }
+    }
+
+    #[test]
+    fn test_multi_segment_overlapping_stale_copy_matches_reader() {
+        // The W2-2 aftermath the boundary sync exists for: node X frozen in
+        // an OLD segment (edge X->B), copied up, re-frozen into a NEW
+        // segment (edge X->C). X is resident in both; BFS from X must reach
+        // B (old segment's adjacency) AND C (new segment's) — exactly what
+        // SegmentMergeReader's per-node segment union produces.
+        use slotmap::Key;
+        let mut mg = MemGraph::new(usize::MAX >> 1);
+        let x = mg.add_node(SmallVec::from_elem(1u16, 1), SmallVec::new(), None, 1);
+        let b = mg.add_node(SmallVec::from_elem(1u16, 1), SmallVec::new(), None, 1);
+        mg.add_edge(x, b, 1, 1.0, None, 2).expect("edge");
+        let seg_old = Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(mg.freeze().expect("freeze"), 3).expect("csr"),
+        ));
+        mg.thaw();
+        // Copy-up: re-materialize X at its ORIGINAL key, wire a new edge.
+        let x2 = mg.add_node_with_id(
+            x.data().as_ffi(),
+            SmallVec::from_elem(1u16, 1),
+            SmallVec::new(),
+            None,
+            4,
+        );
+        assert_eq!(x2, x, "copy-up re-inserts at the same key");
+        let c = mg.add_node(SmallVec::from_elem(1u16, 1), SmallVec::new(), None, 4);
+        mg.add_edge(x, c, 1, 1.0, None, 5).expect("edge");
+        let seg_new = Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(mg.freeze().expect("freeze"), 6).expect("csr"),
+        ));
+
+        let segs = vec![seg_new, seg_old];
+        let got = try_row_bfs(
+            None,
+            &segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+            x,
+            10,
+            usize::MAX,
+        )
+        .expect("gate engages")
+        .expect("bfs ok");
+        let dm = depth_map(&got);
+        assert_eq!(dm.get(&b), Some(&1), "old segment's adjacency reached");
+        assert_eq!(dm.get(&c), Some(&1), "new segment's adjacency reached");
+        let want = reader_bfs_multi(&segs, x, Direction::Outgoing, 10, None);
+        assert_eq!(dm, want);
+
+        // Both directions across the boundary too.
+        for dir in [Direction::Incoming, Direction::Both] {
+            let got = try_row_bfs(None, &segs, dir, u64::MAX - 1, None, b, 10, usize::MAX)
+                .expect("gate engages")
+                .expect("bfs ok");
+            let want = reader_bfs_multi(&segs, b, dir, 10, None);
+            assert_eq!(depth_map(&got), want, "dir {dir:?}");
+        }
     }
 }

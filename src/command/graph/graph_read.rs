@@ -77,6 +77,118 @@ fn parse_decay(args: &[Frame]) -> Result<Option<crate::graph::scoring::DecayConf
     }
 }
 
+/// Parse an optional `TIMEOUT <ms>` argument (RedisGraph parity).
+///
+/// `TIMEOUT 0` disables the timeout for this query. Strict validation like
+/// `parse_decay` (new surface ⇒ malformed input is an error, not a silent
+/// no-op): a dangling keyword or non-integer value is rejected. Returns
+/// `Ok(None)` when the keyword is absent.
+pub(super) fn parse_timeout_ms(args: &[Frame]) -> Result<Option<u64>, &'static str> {
+    for i in 0..args.len() {
+        if let Frame::BulkString(ref bs) = args[i] {
+            if bs.eq_ignore_ascii_case(b"TIMEOUT") {
+                let Some(Frame::BulkString(val)) = args.get(i + 1) else {
+                    return Err("ERR TIMEOUT requires a value in milliseconds");
+                };
+                let parsed = std::str::from_utf8(val)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                return match parsed {
+                    Some(ms) => Ok(Some(ms)),
+                    None => Err("ERR TIMEOUT must be a non-negative integer (milliseconds)"),
+                };
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Build the traversal guard for one query: per-query `TIMEOUT <ms>` override
+/// if present (0 = unlimited), else the configured process default
+/// (`--graph-timeout-ms`, 30s unless overridden).
+fn query_guard(
+    args: &[Frame],
+    snapshot_lsn: u64,
+) -> Result<crate::graph::traversal_guard::TraversalGuard, &'static str> {
+    use crate::graph::traversal_guard::TraversalGuard;
+    Ok(match parse_timeout_ms(args)? {
+        Some(0) => TraversalGuard::new(snapshot_lsn, std::time::Duration::MAX),
+        Some(ms) => TraversalGuard::new(snapshot_lsn, std::time::Duration::from_millis(ms)),
+        None => TraversalGuard::with_default_timeout(snapshot_lsn),
+    })
+}
+
+/// Cheap pre-check for the Cypher result cache (Task #32): does this
+/// GRAPH.QUERY carry a `--decay` flag? Decay queries are wall-clock
+/// dependent (`TemporalDecayScorer::now` captures real time at query start,
+/// not derived from graph state) and must NEVER be cached regardless of
+/// `write_gen` -- two decay queries at different real times against an
+/// unchanged graph legitimately score/order differently. Byte-scan only
+/// (not a full `parse_decay`) so a miss on this check costs nothing on the
+/// hot path; `parse_decay`'s stricter validation still runs later in
+/// `run_read_query` regardless of this pre-check's answer.
+fn has_decay_flag(args: &[Frame]) -> bool {
+    args.iter()
+        .any(|f| matches!(f, Frame::BulkString(b) if b.as_ref() == b"--decay"))
+}
+
+/// Hash the "remaining args" (everything after the graph name and Cypher
+/// text -- `--params`, `VALID_AT`, `TIMEOUT`, `--decay`, `--time-weight`)
+/// for the Cypher result-cache key (Task #32). Allocation-free: each arg's
+/// logical byte content is hashed independently via `xxh64` and folded,
+/// rather than concatenated into one buffer first. Order-sensitive (a
+/// differently-ordered but semantically-identical arg list gets a different
+/// key) -- a harmless false split of the key space, never a correctness
+/// issue, since a miss just re-executes and re-populates.
+fn hash_query_args(args: &[Frame]) -> u64 {
+    let mut acc: u64 = 0;
+    for frame in args {
+        acc = acc.rotate_left(13) ^ hash_frame_bytes(frame);
+    }
+    acc
+}
+
+/// `xxh64` of a single `Frame`'s logical byte content, used only for
+/// result-cache key derivation -- NOT a wire format. Numeric/boolean
+/// variants hash their shortest text representation (stack-buffer
+/// `itoa`/`ryu`, no allocation) rather than their binary encoding; hash
+/// collisions across variants are harmless because `ResultCacheKey`
+/// equality is a plain struct compare, not the hash alone -- a collision
+/// only costs a wasted cache miss, never a wrong answer.
+fn hash_frame_bytes(frame: &Frame) -> u64 {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => cypher::planner::hash_query(b),
+        Frame::Integer(n) => {
+            let mut buf = itoa::Buffer::new();
+            cypher::planner::hash_query(buf.format(*n).as_bytes())
+        }
+        Frame::Double(f) => {
+            let mut buf = ryu::Buffer::new();
+            cypher::planner::hash_query(buf.format(*f).as_bytes())
+        }
+        Frame::Boolean(b) => {
+            cypher::planner::hash_query(if *b { b"\x01true" } else { b"\x01false" })
+        }
+        Frame::Null => cypher::planner::hash_query(b"\x01null"),
+        _ => cypher::planner::hash_query(b"\x01other"),
+    }
+}
+
+/// Build the Cypher result-cache key (Task #32) for `cypher_bytes` (the raw
+/// query text, `args[1]`) and `rest_args` (everything after it, `args[2..]`
+/// -- `--params`/`VALID_AT`/`TIMEOUT`/`--decay`/`--time-weight`). Shared by
+/// the pre-lookup in `graph_query_readonly` and the population step in
+/// `run_read_query` so both sides always compute the identical key.
+fn result_cache_key(
+    cypher_bytes: &[u8],
+    rest_args: &[Frame],
+) -> cypher::result_cache::ResultCacheKey {
+    cypher::result_cache::ResultCacheKey {
+        query_hash: cypher::planner::hash_query(cypher_bytes),
+        args_hash: hash_query_args(rest_args),
+    }
+}
+
 /// Parse `--params <json_object>` from GRAPH.QUERY args into executor `Value` map.
 ///
 /// Scans args for `--params` keyword followed by a JSON string. The JSON must be
@@ -116,7 +228,9 @@ fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
                 cypher::executor::Value::Float(n.as_f64().unwrap_or(0.0))
             }
         }
-        serde_json::Value::String(s) => cypher::executor::Value::String(s.clone()),
+        serde_json::Value::String(s) => {
+            cypher::executor::Value::String(Bytes::copy_from_slice(s.as_bytes()))
+        }
         serde_json::Value::Array(arr) => {
             cypher::executor::Value::List(arr.iter().map(json_to_graph_value).collect())
         }
@@ -237,8 +351,12 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
     let reader =
         SegmentMergeReader::new(Some(memgraph), csr_segs, direction, lsn, edge_type_filter);
 
-    // TraversalGuard enforces bounded epoch hold (30s default timeout).
-    let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
+    // TraversalGuard enforces bounded epoch hold (per-query TIMEOUT override,
+    // else the configured `--graph-timeout-ms` default).
+    let guard = match query_guard(args, lsn) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
 
     // BFS expansion using SegmentMergeReader for per-node neighbor lookup.
     let mut visited = std::collections::HashSet::new();
@@ -472,12 +590,22 @@ fn parse_effective(
 /// execute`, which rebuilds one every call) so plan-cache hits reuse the
 /// `SlotTable` cached alongside the plan (Fix 2 -- one `String` allocation
 /// per bound variable, per execution, otherwise).
+///
+/// `cache_protocol_version` (Task #32): `Some(v)` enables result-cache
+/// POPULATION after a successful execution, encoding the reply for RESP
+/// version `v` (2 or 3) into `graph.result_cache`. `None` means this call
+/// site is not wired into the result cache at all (e.g. `graph_query_or_
+/// write`'s read branches -- see module docs for the scope boundary): no
+/// lookup happens here regardless (a hit is handled entirely by the
+/// caller, BEFORE `run_read_query` is invoked at all -- this function only
+/// ever runs on a miss), so `None` just skips the population step.
 fn run_read_query(
     graph: &crate::graph::store::NamedGraph,
     args: &[Frame],
     plan: &cypher::PhysicalPlan,
     slots: &cypher::executor::SlotTable,
     auto_params: Vec<(String, cypher::executor::Value)>,
+    cache_protocol_version: Option<u8>,
 ) -> Frame {
     let mut params = parse_params(args);
     for (name, value) in auto_params {
@@ -488,14 +616,61 @@ fn run_read_query(
         Ok(d) => d,
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     };
+    let guard = match query_guard(args, 0) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
-        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+        guard: Some(guard),
         ..Default::default()
     };
+    // Race guard (Task #32): capture the write generation BEFORE execution,
+    // store only if it is still unchanged AFTER -- on this shard thread
+    // nothing else can mutate `graph` while this synchronous call is
+    // running, but capturing before/comparing after costs one extra `u64`
+    // read and keeps the invariant correct-by-construction even if this
+    // function ever grows a yield point.
+    let write_gen_before = graph.write_gen;
     match cypher::executor::execute_with_slots(graph, plan, slots, &params, &ctx) {
-        Ok(r) => exec_result_to_frame(&r),
+        Ok(r) => {
+            if let Some(protocol_version) = cache_protocol_version {
+                // Never cache decay queries (wall-clock dependent) or a
+                // result computed against a graph state that mutated
+                // mid-call (write_gen_before must still hold).
+                if decay.is_none()
+                    && graph.write_gen == write_gen_before
+                    && !args.is_empty()
+                    && args.len() >= 2
+                {
+                    if let Some(cypher_bytes) = extract_bulk(&args[1]) {
+                        let key = result_cache_key(cypher_bytes, &args[2..]);
+                        // Doorkeeper: admit only keys seen before, so a
+                        // scan/cycle workload's one-shot queries never pay
+                        // the serialize+insert+evict miss cost (measured
+                        // −21% qps on cycling without this gate).
+                        if graph.result_cache.lock().should_admit(key) {
+                            let frame = exec_result_to_frame(&r);
+                            let mut buf = bytes::BytesMut::new();
+                            if protocol_version >= 3 {
+                                crate::protocol::serialize_resp3(&frame, &mut buf);
+                            } else {
+                                crate::protocol::serialize(&frame, &mut buf);
+                            }
+                            graph.result_cache.lock().put(
+                                key,
+                                write_gen_before,
+                                protocol_version,
+                                buf.freeze(),
+                            );
+                            return frame;
+                        }
+                    }
+                }
+            }
+            exec_result_to_frame(&r)
+        }
         Err(e) => {
             let msg = format!("ERR Cypher execution error: {e}");
             Frame::Error(Bytes::from(msg))
@@ -508,15 +683,30 @@ fn run_read_query(
 /// Normalizes literals into auto-parameters, then executes via the plan
 /// cache: a cache hit runs with ZERO parse/compile work (the cache holds
 /// read-only plans only, so a hit is safe to execute directly).
-pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
-    graph_query_readonly(store, args, false)
+///
+/// `protocol_version` (Task #32): `Some(v)` is the caller's negotiated RESP
+/// version (2 or 3), threaded through to the Cypher result cache so a hit
+/// replays correctly-encoded wire bytes and a miss populates the right
+/// slot. `None` disables the result cache entirely for this call -- used by
+/// call sites that cannot reliably determine the originating connection's
+/// protocol version (e.g. the cross-shard `ShardMessage::GraphCommand` hop);
+/// serving a wrong-protocol cached reply would be a real correctness bug
+/// (RESP2/RESP3 wire formats differ), so those sites opt out rather than
+/// guess.
+pub fn graph_query(store: &GraphStore, args: &[Frame], protocol_version: Option<u8>) -> Frame {
+    graph_query_readonly(store, args, false, protocol_version)
 }
 
 /// Shared read-path core for GRAPH.QUERY / GRAPH.RO_QUERY.
 ///
 /// `reject_writes`: RO_QUERY refuses write clauses with an explicit error;
 /// GRAPH.QUERY lets the read-only executor report them (it has no write lock).
-fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool) -> Frame {
+fn graph_query_readonly(
+    store: &GraphStore,
+    args: &[Frame],
+    reject_writes: bool,
+    protocol_version: Option<u8>,
+) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
@@ -538,24 +728,58 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
+    // Task #32: Cypher result-cache lookup BEFORE any plan-cache/parse work
+    // -- a hit skips plan lookup, param parsing, guard construction, and
+    // execution entirely. Decay queries (wall-clock dependent) never
+    // consult the cache regardless of `write_gen` freshness.
+    if let Some(pv) = protocol_version {
+        if !has_decay_flag(&args[2..]) {
+            let key = result_cache_key(cypher_bytes, &args[2..]);
+            if let Some(bytes) = graph.result_cache.lock().get(key, graph.write_gen, pv) {
+                return Frame::PreSerialized(bytes);
+            }
+        }
+    }
+
     // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
     // already compiled hits here without ever calling `parameterize()` (a
     // full lexer pass + Vec/String allocations) — the raw-hash entry
     // carries this exact text's auto_params, cached at insert time.
     let raw_hash = cypher::planner::hash_query(cypher_bytes);
     if let Some(cached) = graph.plan_cache.lock().get(raw_hash) {
-        let auto_params = cached.auto_params.as_ref().clone();
-        return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+        // W2-7 caches WRITE plans too — a write hit falls through to the
+        // parse path, which reports it exactly like an uncached write query.
+        if cached.read_only {
+            let auto_params = cached.auto_params.as_ref().clone();
+            return run_read_query(
+                graph,
+                args,
+                &cached.plan,
+                &cached.slots,
+                auto_params,
+                protocol_version,
+            );
+        }
     }
 
     let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
 
-    // Normalized-hash hit ⇒ read-only plan (PlanCache invariant) ⇒ no parse.
-    // `parameterize()` above already ran (needed to derive THIS text's
-    // auto_params and the normalized hash), but parse+compile is skipped.
+    // Normalized-hash READ-ONLY hit ⇒ no parse. `parameterize()` above
+    // already ran (needed to derive THIS text's auto_params and the
+    // normalized hash), but parse+compile is skipped. A cached WRITE plan
+    // (W2-7) falls through to the parse path instead.
     let cached = graph.plan_cache.lock().get(query_hash);
     if let Some(cached) = cached {
-        return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+        if cached.read_only {
+            return run_read_query(
+                graph,
+                args,
+                &cached.plan,
+                &cached.slots,
+                auto_params,
+                protocol_version,
+            );
+        }
     }
 
     let (query, query_hash, auto_params) =
@@ -577,19 +801,23 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
             return Frame::Error(Bytes::from(msg));
         }
     };
-    // Cache read-only plans ONLY — a cache hit skips classification, so a
-    // cached write plan would execute on the read path. Insert under both
-    // the raw and normalized hash so a later exact repeat of this text hits
-    // the allocation-free raw-hash path above.
+    // Cache read-only plans only on this handler — write plans are cached
+    // (flagged read_only=false) by the write handlers (W2-7), and every hit
+    // above re-checks the flag. Insert under both the raw and normalized
+    // hash so a later exact repeat of this text hits the allocation-free
+    // raw-hash path above.
     let slots = if query.is_read_only() {
-        graph
-            .plan_cache
-            .lock()
-            .insert_both(raw_hash, query_hash, plan.clone(), auto_params.clone())
+        graph.plan_cache.lock().insert_both(
+            raw_hash,
+            query_hash,
+            plan.clone(),
+            auto_params.clone(),
+            true,
+        )
     } else {
         std::sync::Arc::new(cypher::executor::SlotTable::from_plan(&plan))
     };
-    run_read_query(graph, args, &plan, &slots, auto_params)
+    run_read_query(graph, args, &plan, &slots, auto_params, protocol_version)
 }
 
 /// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
@@ -613,11 +841,38 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
-    let query = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q,
-        Err(e) => {
-            let msg = format!("ERR Cypher parse error: {e}");
-            return Frame::Error(Bytes::from(msg));
+    // W2-7: literal-normalize + plan-cache for the write path too. A hit on
+    // a cached WRITE plan skips parse/compile entirely; per-run literal
+    // values arrive through the auto-extracted parameters.
+    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
+    let cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(query_hash));
+
+    let (plan, auto_params) = match cached {
+        Some(cached) if !cached.read_only => (cached.plan, auto_params),
+        // Read-only hit on the write handler is a dispatcher anomaly —
+        // treat as a miss so classification runs as before. Same for a
+        // genuine miss.
+        _ => {
+            let (query, query_hash, auto_params) =
+                match parse_effective(cypher_bytes, &effective, query_hash, auto_params) {
+                    Ok(t) => t,
+                    Err(msg) => return Frame::Error(Bytes::from(msg)),
+                };
+            let plan = match cypher::planner::compile(&query) {
+                Ok(p) => std::sync::Arc::new(p),
+                Err(e) => {
+                    let msg = format!("ERR Cypher plan error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            };
+            if let Some(g) = store.get_graph(graph_name) {
+                g.plan_cache
+                    .lock()
+                    .insert(query_hash, plan.clone(), query.is_read_only());
+            }
+            (plan, auto_params)
         }
     };
 
@@ -634,14 +889,6 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     }
 
-    let plan = match cypher::planner::compile(&query) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("ERR Cypher plan error: {e}");
-            return Frame::Error(Bytes::from(msg));
-        }
-    };
-
     let lsn = store.allocate_lsn();
 
     // Scoped borrow: get mutable graph, execute, release borrow before WAL push.
@@ -651,7 +898,12 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
         };
 
-        let params = parse_params(args);
+        // Merge auto-extracted literal values: the plan was compiled from
+        // the normalized text, so `$__pN` parameters must resolve.
+        let mut params = parse_params(args);
+        for (name, value) in auto_params {
+            params.insert(name, value);
+        }
         match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
             Ok(r) => r,
             Err(e) => {
@@ -700,19 +952,58 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                         properties.as_ref(),
                     ));
             }
-            // Phase 174 FIX-01: SET/DELETE/MERGE records are only relevant
-            // for TXN rollback (handled in graph_query_or_write). The non-txn
-            // path here does not need WAL records for these — the write_buf
-            // mutation is already durable via the forward WAL.
-            cypher::executor::MutationRecord::SetProperty { .. }
-            | cypher::executor::MutationRecord::DeleteNode { .. }
-            | cypher::executor::MutationRecord::DeleteEdge { .. } => {}
+            // W2-2: DELETEs must be WAL-logged or the entity RESURRECTS at
+            // restart (replay re-adds it from its CreateNode/AddNode record;
+            // frozen-tier tombstones are pure write-buf state otherwise).
+            cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_node(
+                        graph_name, *node_id,
+                    ));
+            }
+            cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_edge(
+                        graph_name, *edge_id,
+                    ));
+            }
+            // W2-9: SET must be WAL-logged or a restart replays the original
+            // ADDNODE property state (the crash suite's G1/G3 caught exactly
+            // this loss).
+            cypher::executor::MutationRecord::SetProperty {
+                entity_id,
+                is_node,
+                key,
+                new_value,
+                ..
+            } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_prop(
+                        graph_name, *entity_id, *is_node, *key, new_value,
+                    ));
+            }
+            cypher::executor::MutationRecord::SetLabel { node_id, label } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_label(
+                        graph_name, *node_id, *label,
+                    ));
+            }
         }
     }
 
     // Bump version if any mutations were executed (Cypher write query).
+    // Task #32: also invalidate the graph's cached query results -- gated
+    // on `!result.mutations.is_empty()` so an idempotent MERGE match-branch
+    // (zero mutation records) doesn't pay an invalidation for a no-op.
     if !result.mutations.is_empty() {
         store.bump_version();
+        if let Some(graph) = store.get_graph_mut(graph_name) {
+            graph.touch();
+        }
     }
 
     exec_result_to_frame(&result)
@@ -771,31 +1062,61 @@ pub fn graph_query_or_write(
 
     // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
     // already compiled hits here without ever calling `parameterize()`.
+    // W2-7: a read-only hit routes to the read path, a WRITE hit to the
+    // write path — both with zero parse/compile work.
     let raw_hash = cypher::planner::hash_query(cypher_bytes);
-    if let Some(graph) = store.get_graph(graph_name) {
-        if let Some(cached) = graph.plan_cache.lock().get(raw_hash) {
-            let auto_params = cached.auto_params.as_ref().clone();
+    let raw_cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(raw_hash));
+    if let Some(cached) = raw_cached {
+        let auto_params = cached.auto_params.as_ref().clone();
+        if cached.read_only {
+            let Some(graph) = store.get_graph(graph_name) else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            };
             return (
-                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                // Task #32: this auto-routing entry point is NOT wired into
+                // the result cache (`None`) -- see module docs for the
+                // scope boundary (protocol_version is not reliably
+                // available at every caller of `graph_query_or_write`,
+                // e.g. the cross-shard `ShardMessage::GraphCommand` hop).
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params, None),
                 Vec::new(),
                 Vec::new(),
             );
         }
+        return execute_write_plan(store, graph_name, args, &cached.plan, auto_params);
     }
 
     let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
 
-    // Fast path: normalized-hash plan-cache hit ⇒ read-only plan (PlanCache
-    // invariant) ⇒ route to the read path with ZERO parse/compile work.
-    if let Some(graph) = store.get_graph(graph_name) {
-        let cached = graph.plan_cache.lock().get(query_hash);
-        if let Some(cached) = cached {
+    // Fast path: normalized-hash plan-cache hit — a read-only plan routes to
+    // the read path, a WRITE plan (W2-7) to the write path; both with ZERO
+    // parse/compile work (per-run literal values arrive via the auto-params).
+    let cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(query_hash));
+    if let Some(cached) = cached {
+        if cached.read_only {
+            let Some(graph) = store.get_graph(graph_name) else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            };
             return (
-                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                // Task #32: see the raw-hash branch above -- not wired here.
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params, None),
                 Vec::new(),
                 Vec::new(),
             );
         }
+        return execute_write_plan(store, graph_name, args, &cached.plan, auto_params);
     }
 
     // Slow path: parse once (normalized text, raw fallback) and classify.
@@ -832,187 +1153,255 @@ pub fn graph_query_or_write(
             query_hash,
             plan.clone(),
             auto_params.clone(),
+            true,
         );
 
         (
-            run_read_query(graph, args, &plan, &slots, auto_params),
+            // Task #32: see the raw-hash branch above -- not wired here.
+            run_read_query(graph, args, &plan, &slots, auto_params, None),
             Vec::new(),
             Vec::new(),
         )
     } else {
-        // Decay biases read-path traversal cost only; a write query must not
-        // silently accept (or skip validating) the flag. Reject before any
-        // side effect (LSN allocation, mutation).
-        match parse_decay(args) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return (
-                    Frame::Error(Bytes::from_static(
-                        b"ERR --decay requires a read-only Cypher query",
-                    )),
-                    Vec::new(),
-                    Vec::new(),
-                );
-            }
-            Err(msg) => {
-                return (
-                    Frame::Error(Bytes::from_static(msg.as_bytes())),
-                    Vec::new(),
-                    Vec::new(),
-                );
-            }
-        }
-
-        // Write path: compile plan (no cache for writes), execute with mutations.
         let plan = match cypher::planner::compile(&query) {
-            Ok(p) => p,
+            Ok(p) => std::sync::Arc::new(p),
             Err(e) => {
                 let msg = format!("ERR Cypher plan error: {e}");
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
+        // W2-7: cache the write plan (flagged) so the next occurrence of
+        // this normalized text — or an exact repeat via the raw-hash
+        // pre-lookup — skips parse + compile entirely.
+        if let Some(g) = store.get_graph(graph_name) {
+            let _ = g.plan_cache.lock().insert_both(
+                raw_hash,
+                query_hash,
+                plan.clone(),
+                auto_params.clone(),
+                false,
+            );
+        }
+        execute_write_plan(store, graph_name, args, &plan, auto_params)
+    }
+}
 
-        let lsn = store.allocate_lsn();
+/// Write-execution tail shared by `graph_query_or_write`'s compile path and
+/// its W2-7 plan-cache hit path: decay validation (before any side effect),
+/// LSN allocation, `execute_mut` with auto-params merged, and the
+/// mutation → WAL / txn-intent / undo-op fan-out.
+fn execute_write_plan(
+    store: &mut GraphStore,
+    graph_name: &[u8],
+    args: &[Frame],
+    plan: &cypher::PhysicalPlan,
+    auto_params: Vec<(String, cypher::executor::Value)>,
+) -> (
+    Frame,
+    Vec<cypher::executor::GraphWriteIntent>,
+    Vec<crate::transaction::GraphUndoOp>,
+) {
+    // Decay biases read-path traversal cost only; a write query must not
+    // silently accept (or skip validating) the flag. Reject before any
+    // side effect (LSN allocation, mutation).
+    match parse_decay(args) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR --decay requires a read-only Cypher query",
+                )),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        Err(msg) => {
+            return (
+                Frame::Error(Bytes::from_static(msg.as_bytes())),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    }
 
-        // Phase 174 FIX-02: extract mutations regardless of Ok/Err so that
-        // partial writes from before the error are visible to TXN.ABORT.
-        let (result_or_err, mutations) = {
-            let graph = match store.get_graph_mut(graph_name) {
-                Some(g) => g,
-                None => {
-                    return (
-                        Frame::Error(Bytes::from_static(b"ERR graph not found")),
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                }
-            };
+    let lsn = store.allocate_lsn();
 
-            // Merge auto-extracted literal values: the write plan was
-            // compiled from the normalized text, so `$__pN` parameters must
-            // resolve or CREATE would store Nulls.
-            let mut params = parse_params(args);
-            for (name, value) in auto_params {
-                params.insert(name, value);
-            }
-            match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
-                Ok(r) => {
-                    let muts = r.mutations;
-                    (
-                        Ok(cypher::executor::ExecResult {
-                            columns: r.columns,
-                            rows: r.rows,
-                            nodes_created: r.nodes_created,
-                            nodes_deleted: r.nodes_deleted,
-                            properties_set: r.properties_set,
-                            execution_time_us: r.execution_time_us,
-                            mutations: Vec::new(), // moved out above
-                        }),
-                        muts,
-                    )
-                }
-                Err(e) => {
-                    let msg = format!("ERR Cypher execution error: {e}");
-                    (Err(msg), e.partial_mutations)
-                }
+    // Phase 174 FIX-02: extract mutations regardless of Ok/Err so that
+    // partial writes from before the error are visible to TXN.ABORT.
+    let (result_or_err, mutations) = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
             }
         };
 
-        // Phase 167: collect write intents for CrossStoreTxn rollback. Every
-        // CreateNode/CreateEdge mutation (from CreatePattern and the Merge
-        // create-branch) becomes an intent; MERGE match-branches produce no
-        // mutation and therefore no intent (idempotent rollback).
-        let mut intents: Vec<cypher::executor::GraphWriteIntent> =
-            Vec::with_capacity(mutations.len());
-
-        // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
-        let gname_bytes = Bytes::copy_from_slice(graph_name);
-        let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
-
-        // Generate WAL records for mutations + collect intents/undo ops.
-        for mutation in &mutations {
-            match mutation {
-                cypher::executor::MutationRecord::CreateNode {
-                    node_id,
-                    labels,
-                    properties,
-                    embedding,
-                } => {
-                    intents.push(cypher::executor::GraphWriteIntent {
-                        entity_id: *node_id,
-                        is_node: true,
-                    });
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_add_node(
-                            graph_name,
-                            *node_id,
-                            labels,
-                            properties,
-                            embedding.as_deref(),
-                        ));
-                }
-                cypher::executor::MutationRecord::CreateEdge {
-                    edge_id,
-                    src_id,
-                    dst_id,
-                    edge_type,
-                    weight,
-                    properties,
-                } => {
-                    intents.push(cypher::executor::GraphWriteIntent {
-                        entity_id: *edge_id,
-                        is_node: false,
-                    });
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_add_edge(
-                            graph_name,
-                            *edge_id,
-                            *src_id,
-                            *dst_id,
-                            *edge_type,
-                            *weight,
-                            properties.as_ref(),
-                        ));
-                }
-                // Phase 174 FIX-01: new variants for SET/DELETE/MERGE rollback.
-                cypher::executor::MutationRecord::SetProperty {
-                    entity_id,
-                    is_node,
-                    key,
-                    old_value,
-                } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
-                        graph_name: gname_bytes.clone(),
-                        entity_id: *entity_id,
-                        is_node: *is_node,
-                        prop_key: *key,
-                        old_value: old_value.clone(),
-                    });
-                }
-                cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {
-                        graph_name: gname_bytes.clone(),
-                        node_id: *node_id,
-                        delete_lsn: lsn,
-                    });
-                }
-                cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
-                        graph_name: gname_bytes.clone(),
-                        edge_id: *edge_id,
-                    });
-                }
+        // Merge auto-extracted literal values: the write plan was
+        // compiled from the normalized text, so `$__pN` parameters must
+        // resolve or CREATE would store Nulls.
+        let mut params = parse_params(args);
+        for (name, value) in auto_params {
+            params.insert(name, value);
+        }
+        match cypher::executor::execute_mut(graph, plan, &params, lsn) {
+            Ok(r) => {
+                let muts = r.mutations;
+                (
+                    Ok(cypher::executor::ExecResult {
+                        columns: r.columns,
+                        rows: r.rows,
+                        nodes_created: r.nodes_created,
+                        nodes_deleted: r.nodes_deleted,
+                        properties_set: r.properties_set,
+                        execution_time_us: r.execution_time_us,
+                        mutations: Vec::new(), // moved out above
+                    }),
+                    muts,
+                )
+            }
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                (Err(msg), e.partial_mutations)
             }
         }
+    };
 
-        // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
-        // so TXN.ABORT can roll back partial writes from before the error.
-        match result_or_err {
-            Ok(ref result) => (exec_result_to_frame(result), intents, undo_ops),
-            Err(msg) => (Frame::Error(Bytes::from(msg)), intents, undo_ops),
+    // Phase 167: collect write intents for CrossStoreTxn rollback. Every
+    // CreateNode/CreateEdge mutation (from CreatePattern and the Merge
+    // create-branch) becomes an intent; MERGE match-branches produce no
+    // mutation and therefore no intent (idempotent rollback).
+    let mut intents: Vec<cypher::executor::GraphWriteIntent> = Vec::with_capacity(mutations.len());
+
+    // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
+    let gname_bytes = Bytes::copy_from_slice(graph_name);
+    let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
+
+    // Generate WAL records for mutations + collect intents/undo ops.
+    for mutation in &mutations {
+        match mutation {
+            cypher::executor::MutationRecord::CreateNode {
+                node_id,
+                labels,
+                properties,
+                embedding,
+            } => {
+                intents.push(cypher::executor::GraphWriteIntent {
+                    entity_id: *node_id,
+                    is_node: true,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_node(
+                        graph_name,
+                        *node_id,
+                        labels,
+                        properties,
+                        embedding.as_deref(),
+                    ));
+            }
+            cypher::executor::MutationRecord::CreateEdge {
+                edge_id,
+                src_id,
+                dst_id,
+                edge_type,
+                weight,
+                properties,
+            } => {
+                intents.push(cypher::executor::GraphWriteIntent {
+                    entity_id: *edge_id,
+                    is_node: false,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_edge(
+                        graph_name,
+                        *edge_id,
+                        *src_id,
+                        *dst_id,
+                        *edge_type,
+                        *weight,
+                        properties.as_ref(),
+                    ));
+            }
+            // Phase 174 FIX-01: new variants for SET/DELETE/MERGE rollback.
+            cypher::executor::MutationRecord::SetProperty {
+                entity_id,
+                is_node,
+                key,
+                old_value,
+                new_value,
+            } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
+                    graph_name: gname_bytes.clone(),
+                    entity_id: *entity_id,
+                    is_node: *is_node,
+                    prop_key: *key,
+                    old_value: old_value.clone(),
+                });
+                // W2-9: WAL the SET or it is silently lost on kill -9 (replay
+                // re-runs the original ADDNODE property state).
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_prop(
+                        graph_name, *entity_id, *is_node, *key, new_value,
+                    ));
+            }
+            // W2-9: WAL-only — label rollback was never captured (pre-existing
+            // Phase 174 scope), so no undo op here.
+            cypher::executor::MutationRecord::SetLabel { node_id, label } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_label(
+                        graph_name, *node_id, *label,
+                    ));
+            }
+            cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {
+                    graph_name: gname_bytes.clone(),
+                    node_id: *node_id,
+                    delete_lsn: lsn,
+                });
+                // W2-2: WAL the delete or it resurrects at restart.
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_node(
+                        graph_name, *node_id,
+                    ));
+            }
+            cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
+                    graph_name: gname_bytes.clone(),
+                    edge_id: *edge_id,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_edge(
+                        graph_name, *edge_id,
+                    ));
+            }
         }
+    }
+
+    // Task #32: invalidate the graph's cached query results whenever this
+    // write actually produced mutations (mirrors the `graph_query_write`
+    // gate -- an idempotent MERGE match-branch must not pay an
+    // invalidation for a no-op). Runs on both Ok and Err (Phase 174 FIX-02:
+    // `mutations` already includes partial pre-error writes).
+    if !mutations.is_empty() {
+        if let Some(graph) = store.get_graph_mut(graph_name) {
+            graph.touch();
+        }
+    }
+
+    // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
+    // so TXN.ABORT can roll back partial writes from before the error.
+    match result_or_err {
+        Ok(ref result) => (exec_result_to_frame(result), intents, undo_ops),
+        Err(msg) => (Frame::Error(Bytes::from(msg)), intents, undo_ops),
     }
 }
 
@@ -1021,13 +1410,13 @@ pub fn graph_query_or_write(
 /// Like GRAPH.QUERY but rejects write clauses (CREATE, DELETE, SET, MERGE).
 /// Shares the single-parse read core with GRAPH.QUERY — a plan-cache hit is
 /// read-only by the cache invariant, so no classification re-parse is needed.
-pub fn graph_ro_query(store: &GraphStore, args: &[Frame]) -> Frame {
+pub fn graph_ro_query(store: &GraphStore, args: &[Frame], protocol_version: Option<u8>) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.RO_QUERY' command",
         ));
     }
-    graph_query_readonly(store, args, true)
+    graph_query_readonly(store, args, true, protocol_version)
 }
 
 /// GRAPH.EXPLAIN <graph> <cypher_string>
@@ -1149,10 +1538,14 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
         Ok(d) => d,
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     };
+    let guard = match query_guard(args, 0) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
-        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+        guard: Some(guard),
         ..Default::default()
     };
     let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {
@@ -1251,7 +1644,9 @@ fn value_to_frame(value: &cypher::executor::Value) -> Frame {
         Value::Null => Frame::Null,
         Value::Int(n) => Frame::Integer(*n),
         Value::Float(f) => Frame::Double(*f),
-        Value::String(s) => Frame::BulkString(Bytes::from(s.clone())),
+        // Zero-copy (W2-4): the stored property's Bytes flows straight into
+        // the reply frame — a refcount bump, not an allocation.
+        Value::String(s) => Frame::BulkString(s.clone()),
         Value::Bool(b) => Frame::Boolean(*b),
         Value::Node(key) => {
             // "node:" (5) + max u64 (20 digits) = 25 bytes max

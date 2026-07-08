@@ -47,9 +47,33 @@ pub struct NamedGraph {
     /// Redis key → NodeKey mapping for O(1) lookup during graph expansion.
     /// Populated when a node has a `_key` property linking it to a Redis HASH key.
     pub key_to_node: HashMap<Bytes, crate::graph::types::NodeKey>,
+    /// Per-graph write generation (Task #32, result cache Part A). Bumped by
+    /// every mutation that changes this graph's query-visible state:
+    /// `GRAPH.ADDNODE`, `GRAPH.ADDEDGE`, a Cypher write query that produced
+    /// at least one mutation record, `TEMPORAL.INVALIDATE`, and a
+    /// `TXN.ABORT` rollback that touched this graph. Deliberately NOT bumped
+    /// by `freeze_and_compact` (storage-tier reorg, identical logical
+    /// content) or `GRAPH.CREATE`/`GRAPH.DELETE` (no cached query can exist
+    /// yet, or the whole `NamedGraph` -- and its cache -- is dropped with
+    /// it). Plain `u64` (not atomic): `NamedGraph` is shard-owned and
+    /// single-threaded, matching every other field here.
+    pub write_gen: u64,
+    /// Cypher result cache: `(query hash, args hash) -> pre-encoded RESP
+    /// reply`, invalidated by `write_gen`. See
+    /// `crate::graph::cypher::result_cache` module docs for the full design.
+    pub result_cache: parking_lot::Mutex<crate::graph::cypher::result_cache::ResultCache>,
 }
 
 impl NamedGraph {
+    /// Bump the write generation after a mutation that changes this graph's
+    /// query-visible state. Called at exactly the sites enumerated in the
+    /// `write_gen` field doc comment -- see module docs for the full
+    /// enumeration and the "must NOT invalidate" freeze/compact exception.
+    #[inline]
+    pub fn touch(&mut self) {
+        self.write_gen = self.write_gen.wrapping_add(1);
+    }
+
     /// Returns true if the mutable write buffer has exceeded the edge threshold
     /// and should be frozen + compacted into an immutable CSR segment.
     pub fn should_compact(&self) -> bool {
@@ -73,10 +97,28 @@ impl NamedGraph {
 
     /// Freeze the current MemGraph, convert to CSR, and push the new immutable
     /// segment into the segment holder. Thaws write_buf in place afterwards
-    /// (same slot maps — see key-uniqueness note below).
+    /// (id-allocation cursors are monotonic — see key-uniqueness note below).
     ///
     /// Returns `true` if compaction succeeded, `false` if freeze/CSR build failed.
     pub fn freeze_and_compact(&mut self, lsn: u64) -> bool {
+        // Copy-up tombstones (dead write-buf nodes that shadow a frozen CSR
+        // row) must survive the freeze: freeze() drops dead nodes, which
+        // would RESURRECT the underlying frozen row. Collect them now and
+        // re-materialize after the thaw.
+        let dead_shadows: Vec<(crate::graph::types::NodeKey, u64)> = {
+            let seg_list = self.segments.load();
+            self.write_buf
+                .iter_dead_nodes()
+                .filter(|(k, _)| {
+                    seg_list
+                        .immutable
+                        .iter()
+                        .any(|s| s.lookup_node(*k).is_some())
+                })
+                .map(|(k, n)| (k, n.deleted_lsn))
+                .collect()
+        };
+
         // Freeze: drains all live nodes/edges from write_buf.
         let frozen = match self.write_buf.freeze() {
             Ok(f) => f,
@@ -88,15 +130,15 @@ impl NamedGraph {
         // per write attempt would churn the segment list.
         if frozen.nodes.is_empty() && frozen.edges.is_empty() {
             self.write_buf.thaw();
+            self.restore_dead_shadows(&dead_shadows);
             return false;
         }
 
         // Convert frozen MemGraph to a CSR segment. Either way, thaw the
-        // drained write_buf IN PLACE — reusing the slot maps keeps SlotMap
-        // generation continuity, so post-freeze NodeKeys can never collide
-        // with the external_ids of frozen CSR rows (a fresh MemGraph would
-        // restart allocation at the same keys and alias new nodes onto
-        // frozen rows).
+        // drained write_buf IN PLACE — the monotonic id cursors are never
+        // reset, so post-freeze NodeKeys can never collide with the
+        // external_ids of frozen CSR rows (a fresh MemGraph would restart
+        // allocation at the same keys and alias new nodes onto frozen rows).
         let ok = match CsrSegment::from_frozen(frozen, lsn) {
             Ok(csr) => {
                 self.segments.add_immutable(csr);
@@ -107,8 +149,89 @@ impl NamedGraph {
             Err(_) => false,
         };
         self.write_buf.thaw();
+        self.restore_dead_shadows(&dead_shadows);
         ok
     }
+
+    /// Re-materialize copy-up tombstones after a freeze drained them:
+    /// copy the frozen row's data back into the write buffer, then re-delete
+    /// it at its ORIGINAL deletion LSN (preserves MVCC time-travel).
+    fn restore_dead_shadows(&mut self, dead_shadows: &[(crate::graph::types::NodeKey, u64)]) {
+        if dead_shadows.is_empty() {
+            return;
+        }
+        let seg_list = self.segments.load();
+        for &(key, deleted_lsn) in dead_shadows {
+            if copy_up_into(&mut self.write_buf, &seg_list.immutable, key) {
+                self.write_buf.remove_node(key, deleted_lsn);
+            }
+        }
+    }
+
+    /// Copy a frozen node's data into the write buffer under the SAME key so
+    /// it can be mutated in place ("copy-up"). No-op if the key is already
+    /// resident. Returns `false` when the key is not in any segment or the
+    /// frozen row is itself deleted.
+    ///
+    /// The shadow takes read precedence over the frozen row everywhere
+    /// (`MergedNodeView` and `SegmentMergeReader` check the mutable tier
+    /// first), so a later soft-delete of the shadow tombstones the frozen row.
+    pub fn copy_up_node(&mut self, key: crate::graph::types::NodeKey) -> bool {
+        if self.write_buf.get_node(key).is_some() {
+            return true;
+        }
+        let seg_list = self.segments.load();
+        copy_up_into(&mut self.write_buf, &seg_list.immutable, key)
+    }
+}
+
+/// Shared copy-up core: materialize `key`'s newest frozen row (labels,
+/// properties, embedding, MVCC stamps) into `write_buf` under the same key.
+/// Used by [`NamedGraph::copy_up_node`] and WAL replay (which owns the
+/// MemGraph outside the graph during replay).
+pub(crate) fn copy_up_into(
+    write_buf: &mut crate::graph::memgraph::MemGraph,
+    segments: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    key: crate::graph::types::NodeKey,
+) -> bool {
+    use slotmap::Key;
+    if write_buf.get_node(key).is_some() {
+        return true;
+    }
+    // Newest segment wins (same precedence as MergedNodeView::segment_row;
+    // the list is ordered newest-first).
+    for seg in segments.iter() {
+        let Some(row) = seg.lookup_node(key) else {
+            continue;
+        };
+        let Some(meta) = seg.node_meta().get(row as usize) else {
+            continue;
+        };
+        if meta.deleted_lsn != u64::MAX {
+            return false;
+        }
+        let (created_lsn, valid_from, valid_to) =
+            (meta.created_lsn, meta.valid_from, meta.valid_to);
+        // Decode labels: bitmap (ids 0-31) + sparse overflow (ids >= 32).
+        let mut labels: smallvec::SmallVec<[u16; 4]> = smallvec::SmallVec::new();
+        let mut bm = meta.label_bitmap;
+        while bm != 0 {
+            labels.push(bm.trailing_zeros() as u16);
+            bm &= bm - 1;
+        }
+        if let Some(extra) = seg.label_overflow().get(&row) {
+            labels.extend_from_slice(extra);
+        }
+        let props = seg.node_properties(row);
+        let embedding = seg.node_embedding(row);
+        write_buf.add_node_with_id(key.data().as_ffi(), labels, props, embedding, created_lsn);
+        if let Some(n) = write_buf.get_node_mut(key) {
+            n.valid_from = valid_from;
+            n.valid_to = valid_to;
+        }
+        return true;
+    }
+    false
 }
 
 /// Per-shard graph store. No Arc, no Mutex -- fully owned by shard thread.
@@ -135,6 +258,17 @@ pub struct GraphStore {
     /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
     /// - Failed writes do NOT bump the counter.
     version_token: AtomicU64,
+    /// Set when a mutation's WAL record leaves via `drain_wal` (or when WAL
+    /// replay re-materialized data whose records may be recycled by the next
+    /// checkpoint). Cleared by `persist_graph_at_checkpoint` after a
+    /// successful freeze+save. Gates the per-checkpoint graph snapshot so a
+    /// KV-only workload never pays for graph saves.
+    dirty: bool,
+    /// WAL v3 LSN covered by the last persisted graph snapshot: every graph
+    /// record with `lsn <= snapshot_lsn` is materialized in the on-disk
+    /// segments, so recovery's graph replay skips it. Persisted in
+    /// `graph_metadata.json`; 0 = no snapshot (full replay).
+    snapshot_lsn: u64,
 }
 
 impl GraphStore {
@@ -145,7 +279,39 @@ impl GraphStore {
             next_lsn: 0,
             wal_pending: Vec::new(),
             version_token: AtomicU64::new(0),
+            dirty: false,
+            snapshot_lsn: 0,
         }
+    }
+
+    /// True when graph state has mutated since the last persisted snapshot.
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark the store as having un-persisted mutations (WAL replay path).
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Clear the dirty flag after a successful checkpoint snapshot.
+    #[inline]
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// WAL v3 LSN covered by the last persisted graph snapshot (0 = none).
+    #[inline]
+    pub fn snapshot_lsn(&self) -> u64 {
+        self.snapshot_lsn
+    }
+
+    /// Record the WAL v3 LSN the next `save_graph_store` call will cover.
+    #[inline]
+    pub fn set_snapshot_lsn(&mut self, lsn: u64) {
+        self.snapshot_lsn = lsn;
     }
 
     /// Return the current GRAPH engine version token for this shard.
@@ -179,7 +345,14 @@ impl GraphStore {
     }
 
     /// Drain all pending WAL records, returning them and leaving the vec empty.
+    ///
+    /// A non-empty drain means a mutation was just dispatched — mark the
+    /// store dirty so the next checkpoint snapshots the graph before it
+    /// advances the WAL replay floor past these records.
     pub fn drain_wal(&mut self) -> Vec<Vec<u8>> {
+        if !self.wal_pending.is_empty() {
+            self.dirty = true;
+        }
         std::mem::take(&mut self.wal_pending)
     }
 
@@ -207,6 +380,13 @@ impl GraphStore {
                     1024,
                 )),
                 key_to_node: HashMap::new(),
+                write_gen: 0,
+                result_cache: parking_lot::Mutex::new(
+                    crate::graph::cypher::result_cache::ResultCache::new(
+                        crate::graph::cypher::result_cache::DEFAULT_MAX_ENTRIES,
+                        crate::graph::cypher::result_cache::DEFAULT_MAX_BYTES,
+                    ),
+                ),
             },
         );
         // Bump version AFTER successful graph creation (monotonicity-on-success
@@ -266,7 +446,11 @@ impl GraphStore {
     /// Resident bytes across all named graphs on this shard.
     ///
     /// Sums mutable write-buffer (MemGraph slot maps) + immutable CSR segments
-    /// (row_offsets + col_indices + edge/node metadata). O(graph_count * segment_count).
+    /// (row_offsets + col_indices + edge/node metadata) + the Cypher result
+    /// cache (Task #32 -- see `csr/storage.rs::resident_bytes` doc comment
+    /// for why a lazily-populated, per-graph cache MUST be counted here: an
+    /// invisible cache is exactly the class of bug the RSS/OOM hardening
+    /// waves were built to catch). O(graph_count * segment_count).
     pub fn resident_bytes(&self) -> usize {
         let map = match &self.graphs {
             Some(m) => m,
@@ -276,6 +460,8 @@ impl GraphStore {
         for graph in map.values() {
             // Mutable write buffer.
             total += graph.write_buf.resident_bytes();
+            // Cypher result cache.
+            total += graph.result_cache.lock().resident_bytes();
             // Immutable CSR segments.
             let snapshot = graph.segments.load();
             for csr in &snapshot.immutable {
@@ -302,7 +488,10 @@ impl GraphStore {
             None => Vec::new(),
         };
 
-        let meta = GraphStoreMetadata { graphs: entries };
+        let meta = GraphStoreMetadata {
+            graphs: entries,
+            snapshot_lsn: self.snapshot_lsn,
+        };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, json.as_bytes())
@@ -323,6 +512,7 @@ impl GraphStore {
             // Ignore duplicate errors (shouldn't happen from valid metadata).
             let _ = store.create_graph(name, entry.edge_threshold, entry.created_lsn);
         }
+        store.snapshot_lsn = meta.snapshot_lsn;
         Ok(store)
     }
 }
@@ -339,6 +529,11 @@ struct GraphMetadataEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GraphStoreMetadata {
     graphs: Vec<GraphMetadataEntry>,
+    /// WAL v3 LSN covered by the snapshot this metadata belongs to.
+    /// `#[serde(default)]` keeps pre-snapshot-lsn dirs loadable (0 = full
+    /// graph WAL replay, the historical behavior).
+    #[serde(default)]
+    snapshot_lsn: u64,
 }
 
 #[cfg(test)]

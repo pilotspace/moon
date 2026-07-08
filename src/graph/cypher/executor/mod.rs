@@ -31,7 +31,11 @@ pub enum Value {
     Null,
     Int(i64),
     Float(f64),
-    String(String),
+    /// Cypher string values are RESP bulk strings — arbitrary bytes, held as
+    /// `Bytes` so a stored property flows to the reply frame without copying
+    /// (W2-4) and non-UTF8 payloads survive the round-trip. Text ops
+    /// (`toInteger`, `=~`) validate UTF-8 at their own boundary.
+    String(Bytes),
     Bool(bool),
     Node(NodeKey),
     Edge(EdgeKey),
@@ -93,9 +97,21 @@ impl SlotTable {
                     }
                 }
                 PhysicalOp::Merge { pattern, .. } => table.bind_pattern(pattern),
+                // W2-13: a rebinding projection (WITH) re-seeds the row
+                // stream with its output names; RETURN (rebind: false)
+                // still binds nothing.
+                PhysicalOp::Project { items, rebind, .. } => {
+                    if *rebind {
+                        for item in items {
+                            match &item.alias {
+                                Some(alias) => table.bind(alias),
+                                None => table.bind(&eval::expr_to_string(&item.expr)),
+                            }
+                        }
+                    }
+                }
                 // Reference-only operators bind nothing.
                 PhysicalOp::Filter { .. }
-                | PhysicalOp::Project { .. }
                 | PhysicalOp::Sort { .. }
                 | PhysicalOp::Limit { .. }
                 | PhysicalOp::Skip { .. }
@@ -201,6 +217,24 @@ impl<'a> Row<'a> {
     }
 }
 
+/// W2-13 OPTIONAL MATCH: emit `row` with the expansion's target (and edge
+/// variable, when the pattern binds one) set to Null — the survival row for
+/// a source that matched nothing. Free function (not a closure) so the
+/// `Row<'a>` lifetime unifies between the borrowed input and the output Vec.
+fn push_null_padded<'a>(
+    row: &Row<'a>,
+    target: &str,
+    edge_variable: &Option<String>,
+    out: &mut Vec<Row<'a>>,
+) {
+    let mut new_row = row.clone();
+    new_row.insert(target, Value::Null);
+    if let Some(evar) = edge_variable {
+        new_row.insert(evar, Value::Null);
+    }
+    out.push(new_row);
+}
+
 /// Execution error.
 ///
 /// Phase 174 FIX-02: carries `partial_mutations` so that even on Err, any
@@ -272,13 +306,20 @@ pub enum MutationRecord {
     // --- Phase 174 FIX-01: SET / DELETE / MERGE rollback records ---
     /// Property was changed by Cypher SET. `old_value` is the pre-SET value
     /// (None = property did not exist before SET and should be removed on
-    /// rollback).
+    /// rollback). `new_value` is the value written — serialized to the WAL
+    /// (W2-9: without it, SET was silently lost on kill -9 because replay
+    /// only re-ran the original ADDNODE property state).
     SetProperty {
         entity_id: u64,
         is_node: bool,
         key: u16,
         old_value: Option<PropertyValue>,
+        new_value: PropertyValue,
     },
+    /// Label was added by Cypher `SET n:Label` (W2-9: WAL durability; label
+    /// rollback was never captured — pre-existing Phase 174 scope — so this
+    /// record produces a WAL entry but no undo op).
+    SetLabel { node_id: u64, label: u16 },
     /// Node was soft-deleted by Cypher DETACH DELETE. Snapshot captures the
     /// full node state so rollback can un-soft-delete the node and its
     /// incident edges.
@@ -671,6 +712,67 @@ mod tests {
         ));
     }
 
+    /// P3 design part B (B0): CONTAINS / STARTS WITH / ENDS WITH must
+    /// produce results IDENTICAL to the equivalent `=~` dot-star shape
+    /// already supported (`eval.rs` "three recognized shapes").
+    #[test]
+    fn test_eval_contains_matches_regex_dotstar_equivalent() {
+        let text = Value::String("trusted rustacean".into());
+        let contains = eval_binary_op(
+            &text,
+            BinaryOperator::Contains,
+            &Value::String("rust".into()),
+        );
+        let regex_equiv = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String(".*rust.*".into()),
+        );
+        assert!(matches!(contains, Value::Bool(true)));
+        assert!(matches!(regex_equiv, Value::Bool(true)));
+
+        let starts = eval_binary_op(
+            &text,
+            BinaryOperator::StartsWith,
+            &Value::String("trust".into()),
+        );
+        let starts_regex = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String("trust.*".into()),
+        );
+        assert!(matches!(starts, Value::Bool(true)));
+        assert!(matches!(starts_regex, Value::Bool(true)));
+
+        let ends = eval_binary_op(
+            &text,
+            BinaryOperator::EndsWith,
+            &Value::String("rustacean".into()),
+        );
+        let ends_regex = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String(".*rustacean".into()),
+        );
+        assert!(matches!(ends, Value::Bool(true)));
+        assert!(matches!(ends_regex, Value::Bool(true)));
+
+        // Non-string operands and non-matches degrade to Null / false, same
+        // as `=~` already does -- never a wrong-type panic.
+        assert!(matches!(
+            eval_binary_op(&Value::Int(1), BinaryOperator::Contains, &text),
+            Value::Null
+        ));
+        assert!(matches!(
+            eval_binary_op(
+                &text,
+                BinaryOperator::StartsWith,
+                &Value::String("zzz".into())
+            ),
+            Value::Bool(false)
+        ));
+    }
+
     #[test]
     fn test_execute_merge_create_when_not_found() {
         let mut store = GraphStore::new();
@@ -774,5 +876,366 @@ mod tests {
         let graph_ref = store.get_graph(b"test").expect("graph");
         assert_eq!(graph_ref.write_buf.node_count(), 2);
         assert_eq!(graph_ref.write_buf.edge_count(), 1);
+    }
+
+    // --- Mutable-tier property index (Task #31) — executor-level correctness ---
+
+    fn run_point_match(store: &GraphStore, target: i64) -> ExecResult {
+        let query = format!("MATCH (a:N {{id: {target}}}) RETURN a.id");
+        let parsed = crate::graph::cypher::parse_cypher(query.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+        execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec")
+    }
+
+    /// Proves `MATCH (a:N {id:X})` returns exactly the one matching node at
+    /// several graph sizes — pure correctness regression guard for the
+    /// mutable-tier property index replacing the O(N) linear scan.
+    #[test]
+    fn test_index_scan_correctness_at_scale() {
+        for n in [1usize, 100, 5_000] {
+            let mut store = GraphStore::new();
+            store
+                .create_graph(Bytes::from_static(b"test"), n * 2 + 1, 0)
+                .expect("create ok");
+            let graph_mut = store.get_graph_mut(b"test").expect("graph");
+            let label_id = label_to_id(b"N");
+            let id_pid = label_to_id(b"id");
+            for i in 0..n {
+                let mut props = SmallVec::new();
+                props.push((id_pid, PropertyValue::Int(i as i64)));
+                graph_mut
+                    .write_buf
+                    .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+            }
+
+            let target = (n as i64) / 2; // arbitrary in-range id
+
+            // Probe hook proving the linear scan is gone: `index_scan_keys`
+            // seeds its mutable-tail candidate set from EXACTLY this same
+            // accessor (`prop_index_keys_eq`). A bucket cardinality of 1
+            // regardless of `n` is the structural proof that the seeded
+            // candidate set — and therefore the executor's residual-check
+            // loop — is O(bucket size), not O(live_node_count).
+            let candidate_count = graph_mut
+                .write_buf
+                .prop_index_keys_eq(id_pid, &PropertyValue::Int(target))
+                .len();
+            assert_eq!(
+                candidate_count, 1,
+                "n={n}: index probe must return exactly the matching bucket, \
+                 not scale with graph size"
+            );
+
+            let result = run_point_match(&store, target);
+            assert_eq!(result.rows.len(), 1, "n={n}: expected exactly one match");
+            match &result.rows[0][0] {
+                Value::Int(v) => assert_eq!(*v, target, "n={n}: wrong node matched"),
+                other => panic!("n={n}: expected Int, got {other:?}"),
+            }
+        }
+    }
+
+    /// After `SET n.id = newval`, the OLD value must no longer be
+    /// index-reachable and the NEW value must be. Guards the
+    /// `set_node_property` old-bucket-eviction path.
+    #[test]
+    fn test_index_scan_eq_after_property_update() {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 64_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"N");
+        let id_pid = label_to_id(b"id");
+        let mut props = SmallVec::new();
+        props.push((id_pid, PropertyValue::Int(1)));
+        graph_mut
+            .write_buf
+            .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+
+        let set_query =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:N {id: 1}) SET n.id = 2 RETURN n")
+                .expect("parse");
+        let set_plan = crate::graph::cypher::planner::compile(&set_query).expect("compile");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        let set_result = execute_mut(graph, &set_plan, &HashMap::new(), 0).expect("exec");
+        assert_eq!(set_result.properties_set, 1);
+
+        assert_eq!(
+            run_point_match(&store, 2).rows.len(),
+            1,
+            "new value must match"
+        );
+        assert_eq!(
+            run_point_match(&store, 1).rows.len(),
+            0,
+            "old value must not match"
+        );
+    }
+
+    /// W2-2 copy-up interaction: freeze a node with `id: 1` into a CSR
+    /// segment, then SET it to `id: 2` (triggers copy-up into the mutable
+    /// tier). `MATCH {id: 1}` must return EMPTY (the resident-but-updated
+    /// mutable copy shadows the frozen row) and `MATCH {id: 2}` must find it
+    /// via the new mutable-tier index.
+    #[test]
+    fn test_index_scan_after_copy_up_shadows_frozen_value() {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 1_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"N");
+        let id_pid = label_to_id(b"id");
+        let mut props = SmallVec::new();
+        props.push((id_pid, PropertyValue::Int(1)));
+        graph_mut
+            .write_buf
+            .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+
+        // Freeze into a CSR segment so the row lives only in the frozen tier.
+        assert!(graph_mut.freeze_and_compact(1));
+        assert_eq!(graph_mut.write_buf.node_count(), 0);
+
+        // SET copies the frozen row up into the mutable tier, then mutates.
+        let set_query =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:N {id: 1}) SET n.id = 2 RETURN n")
+                .expect("parse");
+        let set_plan = crate::graph::cypher::planner::compile(&set_query).expect("compile");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        let set_result = execute_mut(graph, &set_plan, &HashMap::new(), 2).expect("exec");
+        assert_eq!(set_result.properties_set, 1);
+
+        assert_eq!(
+            run_point_match(&store, 1).rows.len(),
+            0,
+            "frozen id=1 must be shadowed by the updated mutable copy"
+        );
+        assert_eq!(
+            run_point_match(&store, 2).rows.len(),
+            1,
+            "updated id=2 must be found via the mutable-tier index"
+        );
+    }
+
+    // --- P3 design part B: text predicates (CONTAINS/STARTS WITH/ENDS
+    // WITH/=~), SegmentTextIndex correctness across tiers -----------------
+
+    /// How the fixture's 7 nodes are distributed across tiers.
+    enum TierShape {
+        /// All 7 nodes stay in the mutable write buffer (no freeze).
+        MutableOnly,
+        /// All 7 nodes are frozen into one CSR segment.
+        FrozenOnly,
+        /// First 4 nodes frozen into a CSR segment; remaining 3 added to
+        /// the mutable tier AFTER the freeze (genuinely mixed tiers, not
+        /// just "freeze everything then leave it").
+        Mixed,
+    }
+
+    /// Fixture: (name, bio) pairs deliberately covering the edge cases the
+    /// SUPERSET-candidate contract must survive:
+    /// - "bob"/"trusted colleague": the substring-across-token-boundary
+    ///   crux -- "trusted" tokenizes differently than "rust", so a
+    ///   token-identity index would MISS it for `CONTAINS 'rust'`; the
+    ///   presence-only `SegmentTextIndex` must not.
+    /// - "carol"/"RUSTACEAN": case-sensitivity -- present (has a string
+    ///   bio) but must be excluded by the exact residual Filter, not by
+    ///   the index (index has no opinion on case at all).
+    /// - "dave": NO bio property at all -- must never appear in any bio
+    ///   predicate result, in any tier.
+    /// - "erin"/"" (empty bio): empty-string edge case.
+    /// - "frank"/"héllo wörld": Unicode multi-byte edge case.
+    /// - "grace"/"rust": exact single-token baseline.
+    const TEXT_FIXTURE: &[(&str, Option<&str>)] = &[
+        ("alice", Some("i love rust and graphs")),
+        ("bob", Some("trusted colleague")),
+        ("carol", Some("RUSTACEAN")),
+        ("dave", None),
+        ("erin", Some("")),
+        ("frank", Some("héllo wörld")),
+        ("grace", Some("rust")),
+    ];
+
+    fn add_text_fixture_nodes(
+        graph: &mut crate::graph::store::NamedGraph,
+        entries: &[(&str, Option<&str>)],
+        lsn: u64,
+    ) {
+        let label_id = label_to_id(b"N");
+        let name_pid = label_to_id(b"name");
+        let bio_pid = label_to_id(b"bio");
+        for (name, bio) in entries {
+            let mut props: SmallVec<[(u16, PropertyValue); 4]> = SmallVec::new();
+            props.push((
+                name_pid,
+                PropertyValue::String(Bytes::copy_from_slice(name.as_bytes())),
+            ));
+            if let Some(bio) = bio {
+                props.push((
+                    bio_pid,
+                    PropertyValue::String(Bytes::copy_from_slice(bio.as_bytes())),
+                ));
+            }
+            graph
+                .write_buf
+                .add_node(SmallVec::from_elem(label_id, 1), props, None, lsn);
+        }
+    }
+
+    fn build_text_fixture_store(shape: TierShape) -> GraphStore {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 1_000_000, 0)
+            .expect("create ok");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        match shape {
+            TierShape::MutableOnly => {
+                add_text_fixture_nodes(graph, TEXT_FIXTURE, 1);
+            }
+            TierShape::FrozenOnly => {
+                add_text_fixture_nodes(graph, TEXT_FIXTURE, 1);
+                assert!(graph.freeze_and_compact(1), "freeze must succeed");
+                assert_eq!(graph.write_buf.node_count(), 0);
+            }
+            TierShape::Mixed => {
+                add_text_fixture_nodes(graph, &TEXT_FIXTURE[..4], 1);
+                assert!(graph.freeze_and_compact(1), "freeze must succeed");
+                add_text_fixture_nodes(graph, &TEXT_FIXTURE[4..], 2);
+            }
+        }
+        store
+    }
+
+    /// Run a Cypher query returning `n.name` and collect the sorted set of
+    /// matched names.
+    fn run_text_query(store: &GraphStore, cypher: &str) -> Vec<String> {
+        let parsed = crate::graph::cypher::parse_cypher(cypher.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default())
+            .unwrap_or_else(|e| panic!("exec failed for {cypher:?}: {e:?}"));
+        let mut names: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::String(s) => String::from_utf8_lossy(s).into_owned(),
+                other => panic!("expected string name, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The single most important correctness gate for P3 design part B:
+    /// every text-predicate query must return the IDENTICAL result set
+    /// regardless of which tier(s) the matching data lives in. `IndexScan`
+    /// accelerates only the frozen tier (`SegmentTextIndex::candidate_rows`)
+    /// -- the mutable tier always falls back to an exact scan, and the
+    /// residual `Filter` is the sole authority either way, so tier
+    /// placement must be invisible to the result set.
+    #[test]
+    fn test_text_predicate_parity_across_tiers() {
+        let queries: &[(&str, &[&str])] = &[
+            (
+                "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name",
+                &["alice", "bob", "grace"],
+            ),
+            (
+                // Empty needle: matches every row that HAS a bio (bytes_contains
+                // treats "" as always-contained), but never `dave` (no bio at all).
+                "MATCH (n:N) WHERE n.bio CONTAINS '' RETURN n.name",
+                &["alice", "bob", "carol", "erin", "frank", "grace"],
+            ),
+            (
+                "MATCH (n:N) WHERE n.bio STARTS WITH 'trust' RETURN n.name",
+                &["bob"],
+            ),
+            (
+                // Unicode multi-byte suffix.
+                "MATCH (n:N) WHERE n.bio ENDS WITH 'ld' RETURN n.name",
+                &["frank"],
+            ),
+            (
+                "MATCH (n:N) WHERE n.bio =~ '.*rust.*' RETURN n.name",
+                &["alice", "bob", "grace"],
+            ),
+            (
+                // Case-sensitivity: 'RUSTACEAN' must NOT match lowercase 'rust'
+                // -- proves the residual Filter (not the presence-only index)
+                // makes the final call.
+                "MATCH (n:N) WHERE n.bio CONTAINS 'RUST' RETURN n.name",
+                &["carol"],
+            ),
+        ];
+
+        for shape in [
+            TierShape::MutableOnly,
+            TierShape::FrozenOnly,
+            TierShape::Mixed,
+        ] {
+            let shape_name = match shape {
+                TierShape::MutableOnly => "MutableOnly",
+                TierShape::FrozenOnly => "FrozenOnly",
+                TierShape::Mixed => "Mixed",
+            };
+            let store = build_text_fixture_store(shape);
+            for (cypher, expected) in queries {
+                let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+                expected.sort();
+                let actual = run_text_query(&store, cypher);
+                assert_eq!(
+                    actual, expected,
+                    "tier={shape_name} query={cypher:?}: got {actual:?}, want {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// B1 test #5/#6: the presence-only `candidate_rows` superset must
+    /// survive a query that a naive token-identity index would get wrong.
+    /// `IndexScan` is planned (via `CONTAINS`) but the residual Filter
+    /// still produces the exact, correct row set -- this is the same
+    /// assertion as `test_text_predicate_parity_across_tiers`'s first case,
+    /// isolated here with an explicit plan-shape check.
+    #[test]
+    fn test_text_scan_superset_semantics_frozen_tier() {
+        let store = build_text_fixture_store(TierShape::FrozenOnly);
+        let query = "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name";
+        let parsed = crate::graph::cypher::parse_cypher(query.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        assert!(
+            matches!(
+                plan.operators[0],
+                crate::graph::cypher::planner::PhysicalOp::IndexScan { .. }
+            ),
+            "CONTAINS must plan through IndexScan; ops = {:?}",
+            plan.operators
+        );
+        let mut actual = run_text_query(&store, query);
+        actual.sort();
+        // "bob" ("trusted colleague") is the false-negative-if-token-pruned
+        // case; it MUST be present because the index only prunes on
+        // presence, never on token identity.
+        assert_eq!(actual, vec!["alice", "bob", "grace"]);
+    }
+
+    /// B1 test #7: the mutable tier gets no acceleration for text
+    /// predicates (pre-approved scope decision) but must not regress
+    /// correctness -- covered by `test_text_predicate_parity_across_tiers`'s
+    /// `MutableOnly` shape; this test isolates the plan shape (still an
+    /// `IndexScan`, since the WHERE conjunct always upgrades the scan
+    /// regardless of tier -- the ACCELERATION difference is inside
+    /// `index_scan_keys`, not in the plan).
+    #[test]
+    fn test_text_scan_mutable_tier_falls_back_to_linear_scan() {
+        let store = build_text_fixture_store(TierShape::MutableOnly);
+        let mut actual = run_text_query(
+            &store,
+            "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name",
+        );
+        actual.sort();
+        assert_eq!(actual, vec!["alice", "bob", "grace"]);
     }
 }

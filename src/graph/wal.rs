@@ -165,6 +165,43 @@ pub fn serialize_add_edge(
     buf
 }
 
+/// Serialize `GRAPH.SETPROP <graph> <N|E> <entity_id> <key> <type> <val>`.
+///
+/// WAL-internal record for Cypher `SET n.prop = value` (W2-9: without it,
+/// SET mutations were silently lost on kill -9 — replay only re-ran the
+/// original ADDNODE property state). `entity_id` is the slotmap ffi id;
+/// `N`/`E` selects node vs edge.
+pub fn serialize_set_prop(
+    graph_name: &[u8],
+    entity_id: u64,
+    is_node: bool,
+    key: u16,
+    value: &PropertyValue,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(96);
+    write_array_header(&mut buf, 7);
+    write_bulk(&mut buf, b"GRAPH.SETPROP");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, if is_node { b"N" } else { b"E" });
+    write_bulk(&mut buf, itoa::Buffer::new().format(entity_id).as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(key).as_bytes());
+    serialize_property_value(&mut buf, value);
+    buf
+}
+
+/// Serialize `GRAPH.SETLABEL <graph> <node_id> <label>`.
+///
+/// WAL-internal record for Cypher `SET n:Label` (W2-9).
+pub fn serialize_set_label(graph_name: &[u8], node_id: u64, label: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    write_array_header(&mut buf, 4);
+    write_bulk(&mut buf, b"GRAPH.SETLABEL");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, itoa::Buffer::new().format(node_id).as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(label).as_bytes());
+    buf
+}
+
 /// Serialize a property value as two RESP bulk strings: type tag + value.
 fn serialize_property_value(buf: &mut Vec<u8>, val: &PropertyValue) {
     match val {
@@ -354,6 +391,41 @@ mod tests {
         assert_eq!(elems[6], b"0");
         assert_eq!(elems[7], b"b");
         assert_eq!(elems[8], b"1");
+    }
+
+    #[test]
+    fn test_serialize_set_prop() {
+        let data = serialize_set_prop(b"g", 77, true, 9, &PropertyValue::Int(42));
+        let elems = parse_resp_array(&data);
+        assert_eq!(
+            elems,
+            vec![
+                b"GRAPH.SETPROP".to_vec(),
+                b"g".to_vec(),
+                b"N".to_vec(),
+                b"77".to_vec(),
+                b"9".to_vec(),
+                b"i".to_vec(),
+                b"42".to_vec(),
+            ]
+        );
+        let edge = serialize_set_prop(b"g", 5, false, 1, &PropertyValue::Bool(true));
+        assert_eq!(parse_resp_array(&edge)[2], b"E");
+    }
+
+    #[test]
+    fn test_serialize_set_label() {
+        let data = serialize_set_label(b"g", 123, 7);
+        let elems = parse_resp_array(&data);
+        assert_eq!(
+            elems,
+            vec![
+                b"GRAPH.SETLABEL".to_vec(),
+                b"g".to_vec(),
+                b"123".to_vec(),
+                b"7".to_vec(),
+            ]
+        );
     }
 
     #[test]

@@ -614,6 +614,108 @@ pub fn replay_graph_wal(
     }
 }
 
+/// Replay graph commands from the WAL **v3** directory into graph stores
+/// (2026-07 graph durability P0, Bug A).
+///
+/// Under the default disk-offload configuration graph WAL records live in
+/// `<offload_base>/shard-<N>/wal-v3/` — NOT the legacy `shard-<N>.wal` that
+/// [`replay_graph_wal`] reads. `Shard::restore_from_persistence`'s v3 replay
+/// collects graph commands into a throwaway engine (its job is KV), so this
+/// dedicated pass re-scans the v3 WAL and applies graph records to
+/// `init.graph_store`.
+///
+/// Records with `lsn <= GraphStore::snapshot_lsn()` are skipped: they are
+/// already materialized in the CSR segments persisted by the checkpoint's
+/// graph snapshot (`persist_graph_at_checkpoint`, Bug B fix), and the WAL
+/// segments holding them may have been recycled anyway. The scan starts at
+/// LSN 0 rather than the KV checkpoint floor — graph coverage is governed
+/// by the GRAPH snapshot floor, never the KV one.
+#[cfg(feature = "graph")]
+pub fn replay_graph_wal_v3(
+    inits: &mut [crate::shard::slice::ShardSliceInit],
+    disk_offload_base: &std::path::Path,
+) {
+    use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
+    use crate::persistence::wal_v3::replay::replay_wal_v3_dir;
+
+    for init in inits.iter_mut() {
+        let shard_id = init.shard_id;
+        let wal_dir = disk_offload_base
+            .join(format!("shard-{shard_id}"))
+            .join("wal-v3");
+        if !wal_dir.exists() {
+            continue;
+        }
+        let floor = init.graph_store.snapshot_lsn();
+        let mut collector = crate::graph::replay::GraphReplayCollector::new();
+        let mut skipped_covered = 0usize;
+        let on_command = &mut |record: &WalRecord| {
+            if record.record_type != WalRecordType::Command {
+                return;
+            }
+            let mut buf = bytes::BytesMut::from(&record.payload[..]);
+            let parse_cfg = crate::protocol::ParseConfig::default();
+            while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+                let crate::protocol::Frame::Array(ref arr) = frame else {
+                    continue;
+                };
+                let Some(first) = arr.first() else { continue };
+                let cmd_name: &[u8] = match first {
+                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
+                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
+                    _ => continue,
+                };
+                if !crate::graph::replay::GraphReplayCollector::is_graph_command(cmd_name) {
+                    continue;
+                }
+                if record.lsn <= floor {
+                    skipped_covered += 1;
+                    continue;
+                }
+                // Args may mix BulkString and Integer frames (ids); the
+                // collector expects all-text slices.
+                let owned: smallvec::SmallVec<[Vec<u8>; 8]> = arr[1..]
+                    .iter()
+                    .filter_map(|f| match f {
+                        crate::protocol::Frame::BulkString(b) => Some(b.to_vec()),
+                        crate::protocol::Frame::Integer(i) => Some(i.to_string().into_bytes()),
+                        _ => None,
+                    })
+                    .collect();
+                let refs: smallvec::SmallVec<[&[u8]; 8]> =
+                    owned.iter().map(|v| v.as_slice()).collect();
+                if !collector.collect_command(cmd_name, &refs) {
+                    tracing::warn!(
+                        "graph WAL v3 replay: malformed {:?} record at LSN {} — skipping",
+                        String::from_utf8_lossy(cmd_name),
+                        record.lsn,
+                    );
+                }
+            }
+        };
+        let on_fpi = &mut |_record: &WalRecord| {};
+        match replay_wal_v3_dir(&wal_dir, 0, on_command, on_fpi) {
+            Ok(_) => {
+                let collected = collector.command_count();
+                if collected > 0 || skipped_covered > 0 {
+                    let applied = collector.replay_into(&mut init.graph_store);
+                    tracing::info!(
+                        "Shard {}: graph WAL v3 replay — {} command(s) applied, \
+                         {} covered by snapshot_lsn={} (skipped)",
+                        shard_id,
+                        applied,
+                        skipped_covered,
+                        floor,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("Shard {}: graph WAL v3 replay failed: {}", shard_id, e);
+            }
+        }
+    }
+}
+
 /// Replay temporal WAL records into per-shard TemporalKvIndex and GraphStore.
 pub fn replay_temporal_wal(
     inits: &mut [crate::shard::slice::ShardSliceInit],

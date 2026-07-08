@@ -145,6 +145,17 @@ impl<'a> SegmentMergeReader<'a> {
         self.neighbors_inner(node, seen, out);
     }
 
+    /// Is `key` shadow-deleted in the mutable tier at our snapshot? A dead
+    /// write-buf entry for a key that also has frozen CSR rows is a copy-up
+    /// TOMBSTONE — the mutable tier is authoritative, so the frozen rows (and
+    /// their edges) must be treated as gone.
+    #[inline]
+    fn shadow_deleted(&self, key: NodeKey) -> bool {
+        self.memgraph
+            .and_then(|mg| mg.get_node(key))
+            .is_some_and(|n| n.deleted_lsn != u64::MAX && n.deleted_lsn <= self.snapshot_lsn)
+    }
+
     /// Shared implementation for neighbors / neighbors_into.
     fn neighbors_inner(
         &self,
@@ -152,6 +163,13 @@ impl<'a> SegmentMergeReader<'a> {
         seen: &mut FxHashSet<NodeKey>,
         result: &mut Vec<MergedNeighbor>,
     ) {
+        // A deleted node has no neighbors — its mutable edges were
+        // cascade-deleted, and a copy-up tombstone must also sever the
+        // frozen rows' CSR adjacency.
+        if self.shadow_deleted(node) {
+            return;
+        }
+
         // 1. Read from mutable MemGraph (highest priority -- newest data).
         if let Some(mg) = self.memgraph {
             for (edge_key, neighbor_key) in mg.neighbors(node, self.direction, self.snapshot_lsn) {
@@ -208,6 +226,11 @@ impl<'a> SegmentMergeReader<'a> {
                             return;
                         }
                         let key: NodeKey = slotmap::KeyData::from_ffi(meta_n.external_id).into();
+                        // Copy-up tombstone in the mutable tier overrides the
+                        // frozen row's liveness.
+                        if self.shadow_deleted(key) {
+                            return;
+                        }
                         if seen.insert(key) {
                             result.push(MergedNeighbor {
                                 node: key,
@@ -316,9 +339,9 @@ impl BoundedBfs {
         reader: &SegmentMergeReader<'_>,
         start: NodeKey,
     ) -> Result<BfsResult, TraversalError> {
-        // CSR row-space fast path: a fully-frozen single-segment graph
-        // expands in u32 row space (dense visited bitmap, parallel levels,
-        // direction-optimizing pull) — see `row_bfs` module docs.
+        // CSR row-space fast path: a fully-frozen graph expands in u32 row
+        // space (dense visited bitmaps; single-segment adds parallel levels
+        // + direction-optimizing pull) — see `row_bfs` module docs.
         if let Some(res) = crate::graph::row_bfs::try_row_bfs(
             reader.memgraph,
             reader.csr_segments,
@@ -430,9 +453,9 @@ impl ParallelBfs {
         reader: &SegmentMergeReader<'_>,
         start: NodeKey,
     ) -> Result<BfsResult, TraversalError> {
-        // CSR row-space fast path: a fully-frozen single-segment graph
-        // expands in u32 row space (dense visited bitmap, parallel levels,
-        // direction-optimizing pull) — see `row_bfs` module docs.
+        // CSR row-space fast path: a fully-frozen graph expands in u32 row
+        // space (dense visited bitmaps; single-segment adds parallel levels
+        // + direction-optimizing pull) — see `row_bfs` module docs.
         if let Some(res) = crate::graph::row_bfs::try_row_bfs(
             reader.memgraph,
             reader.csr_segments,

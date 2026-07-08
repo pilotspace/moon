@@ -685,6 +685,35 @@ use crate::persistence::wal_v3::record::WalRecordType;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use std::path::Path;
 
+/// Build the per-checkpoint graph snapshot hook (2026-07 graph durability
+/// P0, Bug B). Resolves the shard's `GraphStore` via the `with_shard`
+/// thread-local at call time — the checkpoint always runs on the shard
+/// thread. Returns `true` (checkpoint may proceed) for non-graph builds and
+/// when there is nothing to snapshot.
+pub(crate) fn graph_checkpoint_hook(
+    persistence_dir: Option<&str>,
+    shard_id: usize,
+) -> impl FnMut(u64) -> bool + '_ {
+    move |snapshot_lsn: u64| {
+        #[cfg(feature = "graph")]
+        {
+            crate::shard::slice::with_shard(|s| {
+                crate::graph::recovery::persist_graph_at_checkpoint(
+                    &mut s.graph_store,
+                    persistence_dir.map(std::path::Path::new),
+                    shard_id,
+                    snapshot_lsn,
+                )
+            })
+        }
+        #[cfg(not(feature = "graph"))]
+        {
+            let _ = (snapshot_lsn, persistence_dir, shard_id);
+            true
+        }
+    }
+}
+
 /// Force a complete checkpoint synchronously (used by BGSAVE and shutdown).
 ///
 /// Calls `force_begin` to bypass trigger conditions, then drives the
@@ -701,6 +730,7 @@ pub(crate) fn force_checkpoint(
     shard_id: usize,
     tombstone_retain_epochs: u64,
     tombstone_retain_secs: u64,
+    graph_save: &mut dyn FnMut(u64) -> bool,
 ) {
     if checkpoint_mgr.is_active() {
         tracing::warn!(
@@ -715,7 +745,10 @@ pub(crate) fn force_checkpoint(
         return;
     }
     page_cache.arm_all_fpi_pending();
-    // Drive checkpoint to completion synchronously (tick loop)
+    // Drive checkpoint to completion synchronously (bounded tick loop: a
+    // persistently failing Finalize — manifest commit or graph snapshot —
+    // must not spin forever; the periodic tick path retries later).
+    let mut ticks = 0u32;
     loop {
         if handle_checkpoint_tick(
             checkpoint_mgr,
@@ -726,12 +759,23 @@ pub(crate) fn force_checkpoint(
             control_path,
             tombstone_retain_epochs,
             tombstone_retain_secs,
+            graph_save,
         ) {
             break; // Finalize completed
         }
         // If Nothing returned and not active, we're done (empty checkpoint)
         if !checkpoint_mgr.is_active() {
             break;
+        }
+        ticks += 1;
+        if ticks > 100_000 {
+            tracing::error!(
+                "Shard {}: forced checkpoint did not finalize after {} ticks; \
+                 giving up (will retry on the periodic tick path)",
+                shard_id,
+                ticks
+            );
+            return;
         }
     }
     info!("Shard {}: forced checkpoint complete", shard_id);
@@ -791,6 +835,7 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     shard_id: usize,
     last_checkpoint_at: std::time::Instant,
     max_checkpoint_lag_ms: u64,
+    graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
     // Condition 1: total on-disk WAL exceeds the configured ceiling.
     let total_wal = match wal.stats() {
@@ -849,6 +894,7 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
         shard_id,
         0, // tombstone_retain_epochs: no retention on emergency checkpoint
         0, // tombstone_retain_secs: no retention on emergency checkpoint
+        graph_save,
     );
 
     // Aggressive recycle — bypass min_wal_bytes floor.
@@ -907,6 +953,7 @@ pub(crate) fn handle_checkpoint_tick(
     control_path: &Path,
     tombstone_retain_epochs: u64,
     tombstone_retain_secs: u64,
+    graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
@@ -1040,6 +1087,25 @@ pub(crate) fn handle_checkpoint_tick(
                     .store(manifest.tombstone_count() as u64, Relaxed);
             }
 
+            // 3c. Graph snapshot (2026-07 durability P0, Bug B): every
+            // graph WAL record at or below the floor this checkpoint commits
+            // must be materialized on disk BEFORE the control-file update —
+            // step 4 advances the replay floor and step 6 recycles the WAL
+            // segments holding those records. `graph_save` receives the WAL
+            // LSN the snapshot covers (current head: the shard thread runs
+            // this between mutations, so no record can slip in). A `false`
+            // return aborts the finalize; the checkpoint retries next tick
+            // with the old floor still in force.
+            //
+            // `current_lsn()` is the NEXT-to-be-assigned LSN — the snapshot
+            // covers records strictly below it, so the floor is one less
+            // (the G5 crash test's first post-checkpoint record lands
+            // exactly on `current_lsn()` and must NOT be skipped).
+            if !graph_save(wal.current_lsn().saturating_sub(1)) {
+                tracing::error!("Checkpoint aborted: graph snapshot failed");
+                return false;
+            }
+
             // 4. Update control file with new checkpoint LSN
             control.last_checkpoint_lsn = redo_lsn;
             control.last_checkpoint_epoch = manifest.epoch();
@@ -1166,6 +1232,7 @@ mod tests {
                 &control_path,
                 2,
                 300,
+                &mut |_| true,
             );
             tick_count += 1;
             if finalized || !checkpoint_mgr.is_active() {
@@ -1252,6 +1319,7 @@ mod tests {
                 &control_path,
                 2,
                 300,
+                &mut |_| true,
             );
             tick_count += 1;
             if finalized || !checkpoint_mgr.is_active() {

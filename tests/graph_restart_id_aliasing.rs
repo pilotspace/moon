@@ -21,11 +21,14 @@
 //!
 //! ## The fix
 //!
-//! 1. `MemGraph::with_id_offset` (`src/graph/memgraph.rs`) -- `recover_graph_store`
-//!    (`src/graph/recovery.rs`) seeds the post-recovery mutable tier with a
-//!    watermark one past the largest persisted `external_id` across all
-//!    loaded segments, so freshly-minted keys can never numerically alias a
-//!    loaded segment's rows.
+//! 1. Monotonic id cursors + floors (`src/graph/memgraph.rs`) --
+//!    `recover_graph_store` (`src/graph/recovery.rs`) restores the persisted
+//!    `next_node_id`/`next_edge_id` cursors from the manifest and raises the
+//!    allocation floor past every loaded segment's `external_id`
+//!    (`ensure_node_id_floor`), so freshly-minted keys can never numerically
+//!    alias a loaded segment's rows. Replayed AddNode records re-materialize
+//!    under their ORIGINAL logged id via `add_node_with_id` (which also
+//!    raises the floor), preserving client-cached handles.
 //! 2. A dedup skip in the AddNode replay loop (`src/graph/replay.rs`) -- if a
 //!    replayed `node_id` is already resident in a loaded CSR segment (full
 //!    history replay after AOF fold / WAL truncation of pre-freeze history
@@ -44,14 +47,15 @@
 //!
 //! ## Confirming this is RED without the fix
 //!
-//! Reverting `MemGraph::with_id_offset` (memgraph.rs), the watermark-based
-//! `graph.segments.swap(..)` in `recover_graph_store` (recovery.rs), and the
-//! `node_map`-dedup skip in the AddNode replay loop (replay.rs) back to:
-//!   - `recover_graph_store` seeding `mutable: Some(Arc::new(MemGraph::new(graph.edge_threshold)))`
-//!     (no offset), and
+//! Reverting the cursor restore + floor raise in `recover_graph_store`
+//! (recovery.rs) and the `node_map`-dedup skip in the AddNode replay loop
+//! (replay.rs) back to:
+//!   - `recover_graph_store` skipping `restore_id_cursors` /
+//!     `ensure_node_id_floor` (fresh allocator, no floor), and
 //!   - the replay loop unconditionally calling
 //!     `mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0)`
-//!     for every AddNode record (no `node_map.get(node_id)` dedup check)
+//!     for every AddNode record (no `node_map.get(node_id)` dedup check, no
+//!     `add_node_with_id` identity preservation)
 //! reproduces exactly this failure: `test_restart_replay_does_not_alias_frozen_node`
 //! fails with
 //!   `assertion failed: replayed key must not equal the frozen node's key`
@@ -165,18 +169,17 @@ fn test_restart_replay_does_not_alias_frozen_node() {
     let replayed = collector.replay_into(&mut store);
     assert_eq!(replayed, 1, "exactly one AddNode command must replay");
 
-    // 4. Inspect the post-replay mutable + immutable tiers directly (the
-    // subsystem under test: `recovery.rs` + `replay.rs`'s own segment
-    // holder, matching their existing self-consistent test contract --
-    // see `recovery.rs` / `replay.rs` unit tests, which assert against
-    // `graph.segments.load()` the same way).
+    // 4. Inspect the post-replay mutable + immutable tiers directly. The
+    // live mutable tier is `NamedGraph::write_buf` (replay's
+    // `take_memgraph`/`put_memgraph` operate there); `segments.load()`
+    // carries the immutable CSR list. `MergedNodeView` is built exactly the
+    // way the query path builds it (write_buf + segment guard).
     let graph = store.get_graph(GRAPH.as_bytes()).expect("graph exists");
     let segs = graph.segments.load();
-    let mutable = segs.mutable.as_ref().expect("mutable tier present");
-    let view = MergedNodeView::new(mutable, &segs.immutable);
+    let view = MergedNodeView::new(&graph.write_buf, &segs.immutable);
 
     // (a) No replayed key equals the frozen segment's external_id.
-    let replayed_keys: Vec<NodeKey> = mutable.iter_nodes().map(|(k, _)| k).collect();
+    let replayed_keys: Vec<NodeKey> = graph.write_buf.iter_nodes().map(|(k, _)| k).collect();
     assert_eq!(
         replayed_keys.len(),
         1,
@@ -259,15 +262,14 @@ fn test_restart_replay_of_already_frozen_node_does_not_double_enumerate() {
 
     let graph = store.get_graph(GRAPH.as_bytes()).expect("graph exists");
     let segs = graph.segments.load();
-    let mutable = segs.mutable.as_ref().expect("mutable tier present");
 
     assert_eq!(
-        mutable.node_count(),
+        graph.write_buf.node_count(),
         0,
         "dedup skip must not insert an already-frozen node into the mutable tier"
     );
 
-    let view = MergedNodeView::new(mutable, &segs.immutable);
+    let view = MergedNodeView::new(&graph.write_buf, &segs.immutable);
     let marks = visible_marked_nodes(&view);
     assert_eq!(
         marks.len(),

@@ -117,545 +117,11 @@ pub fn select_strategy(candidate_count: usize, threshold: usize) -> FilterStrate
     }
 }
 
-// ---------------------------------------------------------------------------
-// HYB-01: Graph-filtered vector search
-// ---------------------------------------------------------------------------
-
-/// Configuration for graph-filtered vector search.
-pub struct GraphFilteredSearch {
-    /// Start node for graph traversal.
-    pub start_node: NodeKey,
-    /// Maximum traversal depth (hops).
-    pub hops: u32,
-    /// Optional edge type filter.
-    pub edge_type_filter: Option<u16>,
-    /// Query vector for similarity scoring.
-    pub query_vector: Vec<f32>,
-    /// Number of top results to return.
-    pub k: usize,
-    /// Strategy selection threshold (default 10K).
-    pub threshold: usize,
-    /// Maximum frontier size to prevent OOM.
-    pub frontier_cap: usize,
-}
-
-impl GraphFilteredSearch {
-    /// Create with defaults (threshold=10K, frontier_cap=100K).
-    pub fn new(start_node: NodeKey, hops: u32, query_vector: Vec<f32>, k: usize) -> Self {
-        Self {
-            start_node,
-            hops,
-            edge_type_filter: None,
-            query_vector,
-            k,
-            threshold: DEFAULT_STRATEGY_THRESHOLD,
-            frontier_cap: 100_000,
-        }
-    }
-
-    /// Execute graph-filtered vector search.
-    ///
-    /// 1. BFS N hops from start_node -> collect candidate NodeKeys
-    /// 2. Auto-select strategy (brute-force vs pre-filter)
-    /// 3. Score candidates by cosine similarity to query_vector
-    /// 4. Return top-K results
-    pub fn execute(
-        &self,
-        memgraph: &MemGraph,
-        csr_segs: &[Arc<CsrStorage>],
-        lsn: u64,
-    ) -> Result<Vec<HybridResult>, HybridError> {
-        if self.query_vector.is_empty() {
-            return Err(HybridError::EmptyQueryVector);
-        }
-
-        let view = MergedNodeView::new(memgraph, csr_segs);
-
-        // Verify start node exists in EITHER tier.
-        if !view.contains(self.start_node) {
-            return Err(HybridError::NodeNotFound);
-        }
-
-        // Step 1: BFS to collect candidates with graph distance.
-        let candidates = bfs_collect(
-            memgraph,
-            csr_segs,
-            self.start_node,
-            self.hops,
-            self.edge_type_filter,
-            self.frontier_cap,
-            lsn,
-        )?;
-
-        // Step 2: Select strategy.
-        let strategy = select_strategy(candidates.len(), self.threshold);
-
-        // Step 3: Score candidates. HnswPreFilter routes CSR-resident
-        // candidates through each segment's HNSW bridge and leaves the
-        // rest (mutable tier, bridge-less rows, dim mismatch) in
-        // `residual` for exact scoring below.
-        let mut scored: Vec<HybridResult> = Vec::with_capacity(candidates.len().min(4096));
-        let residual: Vec<(NodeKey, u32)> = match strategy {
-            FilterStrategy::BruteForce => candidates,
-            FilterStrategy::HnswPreFilter => hnsw_prefilter_score(
-                memgraph,
-                csr_segs,
-                candidates,
-                &self.query_vector,
-                self.k,
-                &mut scored,
-            ),
-        };
-
-        // Exact scoring for whatever the pre-filter did not cover
-        // (everything, under BruteForce): embedding resolved from the
-        // mutable tier or the CSR v5 blob.
-        for (node_key, graph_dist) in &residual {
-            let Some(embedding) = view.embedding(*node_key) else {
-                continue; // Skip nodes without embeddings.
-            };
-
-            let sim = simd::cosine_similarity(&embedding, &self.query_vector);
-            scored.push(HybridResult {
-                node: *node_key,
-                score: sim,
-                graph_distance: Some(*graph_dist),
-                context: Vec::new(),
-            });
-        }
-
-        // Step 4: Sort descending by score, take top-K.
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        scored.truncate(self.k);
-
-        Ok(scored)
-    }
-}
-
-/// Route candidates through per-segment HNSW bridges (HnswPreFilter).
-///
-/// Partitions `candidates` into per-segment groups (a candidate joins a
-/// group when its segment has a bridge covering its row at the query's
-/// dimension) and searches each bridge with an allow-filter over the
-/// group's rows. Bridge hits are pushed to `scored` with their EXACT
-/// cosine (bridge vectors are unit-normalized copies of the originals).
-/// Returns the residual candidates for exact scoring: mutable-tier nodes,
-/// bridge-less rows, dim mismatches, and any whole group whose beam
-/// under-filled k (approximate-search rescue — never silently truncate).
-fn hnsw_prefilter_score(
-    memgraph: &MemGraph,
-    csr_segs: &[Arc<CsrStorage>],
-    candidates: Vec<(NodeKey, u32)>,
-    query: &[f32],
-    k: usize,
-    scored: &mut Vec<HybridResult>,
-) -> Vec<(NodeKey, u32)> {
-    use crate::graph::fasthash::FxHashMap;
-
-    let mut residual: Vec<(NodeKey, u32)> = Vec::new();
-    let mut groups: Vec<FxHashMap<u32, (NodeKey, u32)>> =
-        (0..csr_segs.len()).map(|_| FxHashMap::default()).collect();
-
-    'cand: for (key, gdist) in candidates {
-        // Mutable tier wins (same precedence as MergedNodeView::embedding).
-        if memgraph.get_node(key).is_some() {
-            residual.push((key, gdist));
-            continue;
-        }
-        for (i, seg) in csr_segs.iter().enumerate() {
-            if let Some(row) = seg.lookup_node(key) {
-                if let Some(bridge) = seg.hnsw_bridge() {
-                    if bridge.dim() == query.len() && bridge.contains_row(row) {
-                        groups[i].insert(row, (key, gdist));
-                        continue 'cand;
-                    }
-                }
-                // Resident here but not bridge-searchable: score exactly.
-                residual.push((key, gdist));
-                continue 'cand;
-            }
-        }
-        residual.push((key, gdist));
-    }
-
-    for (i, group) in groups.iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        let Some(bridge) = csr_segs[i].hnsw_bridge() else {
-            // Unreachable by construction; stay exact if it ever isn't.
-            residual.extend(group.values().copied());
-            continue;
-        };
-        let hits = bridge.search(query, k, |row| group.contains_key(&row));
-        if hits.len() < k.min(group.len()) {
-            // Beam under-filled the ask: rescue with exact scoring.
-            residual.extend(group.values().copied());
-            continue;
-        }
-        for (row, sim) in hits {
-            if let Some(&(key, gdist)) = group.get(&row) {
-                scored.push(HybridResult {
-                    node: key,
-                    score: sim,
-                    graph_distance: Some(gdist),
-                    context: Vec::new(),
-                });
-            }
-        }
-    }
-
-    residual
-}
-
-// ---------------------------------------------------------------------------
-// HYB-02: Vector-to-graph expansion
-// ---------------------------------------------------------------------------
-
-/// Configuration for vector-to-graph expansion.
-pub struct VectorToGraphExpansion {
-    /// Query vector for initial similarity search.
-    pub query_vector: Vec<f32>,
-    /// Number of top vector results before expansion.
-    pub k: usize,
-    /// Expansion depth (hops from each result).
-    pub expansion_hops: u32,
-    /// Optional edge type filter for expansion.
-    pub edge_type_filter: Option<u16>,
-}
-
-impl VectorToGraphExpansion {
-    /// Create with defaults.
-    pub fn new(query_vector: Vec<f32>, k: usize, expansion_hops: u32) -> Self {
-        Self {
-            query_vector,
-            k,
-            expansion_hops,
-            edge_type_filter: None,
-        }
-    }
-
-    /// Execute vector-to-graph expansion.
-    ///
-    /// 1. Brute-force search all nodes with embeddings for top-K by similarity
-    /// 2. For each result, BFS expand N hops for context
-    /// 3. Return results with context neighbors
-    ///
-    /// `candidate_nodes` is a pre-collected list of all node keys to search.
-    /// The caller should provide this (e.g., from MemGraph iteration or label index).
-    pub fn execute(
-        &self,
-        memgraph: &MemGraph,
-        csr_segs: &[Arc<CsrStorage>],
-        candidate_nodes: &[NodeKey],
-        lsn: u64,
-    ) -> Result<Vec<HybridResult>, HybridError> {
-        if self.query_vector.is_empty() {
-            return Err(HybridError::EmptyQueryVector);
-        }
-
-        let view = MergedNodeView::new(memgraph, csr_segs);
-        let committed = roaring::RoaringBitmap::new();
-
-        // Step 1: Score all candidate nodes by cosine similarity.
-        let mut scored: Vec<(NodeKey, f64)> = Vec::with_capacity(candidate_nodes.len());
-
-        for &node_key in candidate_nodes {
-            if !view.is_visible(node_key, 0, 0, &committed, None) {
-                continue;
-            }
-            let Some(embedding) = view.embedding(node_key) else {
-                continue;
-            };
-
-            let sim = simd::cosine_similarity(&embedding, &self.query_vector);
-            scored.push((node_key, sim));
-        }
-
-        // Top-K by similarity.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        scored.truncate(self.k);
-
-        // Step 2: Expand each result by N hops.
-        let mut results: Vec<HybridResult> = Vec::with_capacity(scored.len());
-
-        for (node_key, score) in scored {
-            let context = if self.expansion_hops > 0 {
-                collect_context(
-                    memgraph,
-                    csr_segs,
-                    node_key,
-                    self.expansion_hops,
-                    self.edge_type_filter,
-                    lsn,
-                )
-            } else {
-                Vec::new()
-            };
-
-            results.push(HybridResult {
-                node: node_key,
-                score,
-                graph_distance: None,
-                context,
-            });
-        }
-
-        Ok(results)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HYB-03: Vector-guided walk (beam search)
-// ---------------------------------------------------------------------------
-
-/// Configuration for vector-guided graph walk.
-pub struct VectorGuidedWalk {
-    /// Seed node to start the walk.
-    pub seed_node: NodeKey,
-    /// Query vector: walk toward neighbors most similar to this.
-    pub query_vector: Vec<f32>,
-    /// Maximum walk depth.
-    pub max_depth: u32,
-    /// Beam width: how many candidates to expand at each step.
-    pub beam_width: usize,
-    /// Minimum similarity threshold: stop walking if best neighbor is below this.
-    pub min_similarity: f64,
-}
-
-impl VectorGuidedWalk {
-    /// Create with defaults (beam_width=5, min_similarity=0.0).
-    pub fn new(seed_node: NodeKey, query_vector: Vec<f32>, max_depth: u32) -> Self {
-        Self {
-            seed_node,
-            query_vector,
-            max_depth,
-            beam_width: 5,
-            min_similarity: 0.0,
-        }
-    }
-
-    /// Execute vector-guided walk.
-    ///
-    /// At each step, expand all neighbors of the current beam, score by cosine
-    /// similarity, and keep the top `beam_width` for the next step. Returns the
-    /// walk path: all visited nodes with their cumulative scores.
-    pub fn execute(
-        &self,
-        memgraph: &MemGraph,
-        csr_segs: &[Arc<CsrStorage>],
-        lsn: u64,
-    ) -> Result<Vec<HybridResult>, HybridError> {
-        if self.query_vector.is_empty() {
-            return Err(HybridError::EmptyQueryVector);
-        }
-
-        let view = MergedNodeView::new(memgraph, csr_segs);
-        let reader = SegmentMergeReader::new(Some(memgraph), csr_segs, Direction::Both, lsn, None);
-
-        if !view.contains(self.seed_node) {
-            return Err(HybridError::NodeNotFound);
-        }
-
-        let mut visited: HashSet<NodeKey> = HashSet::new();
-        visited.insert(self.seed_node);
-
-        // Score the seed node.
-        let seed_score = view
-            .embedding(self.seed_node)
-            .map(|emb| simd::cosine_similarity(&emb, &self.query_vector))
-            .unwrap_or(0.0);
-
-        let mut results: Vec<HybridResult> = Vec::new();
-        results.push(HybridResult {
-            node: self.seed_node,
-            score: seed_score,
-            graph_distance: Some(0),
-            context: Vec::new(),
-        });
-
-        // Current beam: (node_key, score).
-        let mut beam: Vec<(NodeKey, f64)> = vec![(self.seed_node, seed_score)];
-
-        for depth in 1..=self.max_depth {
-            let mut candidates: Vec<(NodeKey, f64)> = Vec::new();
-
-            for &(current, _) in &beam {
-                // Expand neighbors across both tiers.
-                for merged in reader.neighbors(current) {
-                    let neighbor_key = merged.node;
-                    if visited.contains(&neighbor_key) {
-                        continue;
-                    }
-
-                    let sim = view
-                        .embedding(neighbor_key)
-                        .map(|emb| simd::cosine_similarity(&emb, &self.query_vector))
-                        .unwrap_or(0.0);
-
-                    candidates.push((neighbor_key, sim));
-                }
-            }
-
-            if candidates.is_empty() {
-                break; // No more unvisited neighbors.
-            }
-
-            // Sort by similarity descending, take top beam_width.
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            candidates.truncate(self.beam_width);
-
-            // Check minimum similarity threshold.
-            let best_sim = candidates.first().map(|c| c.1).unwrap_or(0.0);
-            if best_sim < self.min_similarity {
-                break; // Best candidate below threshold.
-            }
-
-            // Add to results and prepare next beam.
-            beam.clear();
-            for (node_key, sim) in &candidates {
-                if visited.insert(*node_key) {
-                    results.push(HybridResult {
-                        node: *node_key,
-                        score: *sim,
-                        graph_distance: Some(depth),
-                        context: Vec::new(),
-                    });
-                    beam.push((*node_key, *sim));
-                }
-            }
-
-            if beam.is_empty() {
-                break;
-            }
-        }
-
-        Ok(results)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HYB-04: Graph-constrained re-ranking
-// ---------------------------------------------------------------------------
-
-/// Configuration for graph-constrained re-ranking.
-///
-/// Re-ranks ALL nodes with embeddings by a combined score:
-///   `alpha * vector_score + (1 - alpha) * 1 / (1 + graph_distance)`
-///
-/// Graph distances are computed via a single batch BFS from the reference node,
-/// giving O(frontier) cost instead of O(k * frontier) for per-candidate BFS.
-/// Nodes not reachable within `max_hops` receive a penalty distance of
-/// `max_hops + 1`.
-pub struct GraphConstrainedReRanker {
-    /// Reference node for graph distance computation.
-    pub reference_node: NodeKey,
-    /// Maximum BFS depth for distance computation.
-    pub max_hops: u32,
-    /// Weight for vector similarity score (0.0 = graph only, 1.0 = vector only).
-    pub alpha: f64,
-    /// Number of top results to return.
-    pub k: usize,
-    /// Query vector for cosine similarity scoring.
-    pub query_vector: Vec<f32>,
-    /// Maximum frontier size for BFS to prevent OOM.
-    pub frontier_cap: usize,
-}
-
-impl GraphConstrainedReRanker {
-    /// Create with defaults (frontier_cap=100K).
-    pub fn new(
-        reference_node: NodeKey,
-        max_hops: u32,
-        alpha: f64,
-        query_vector: Vec<f32>,
-        k: usize,
-    ) -> Self {
-        Self {
-            reference_node,
-            max_hops,
-            alpha,
-            k,
-            query_vector,
-            frontier_cap: 100_000,
-        }
-    }
-
-    /// Execute graph-constrained re-ranking.
-    ///
-    /// 1. Validate inputs (reference node exists, non-empty vector, alpha in range).
-    /// 2. Single batch BFS from reference node to compute graph distances.
-    /// 3. Iterate ALL nodes with embeddings, compute cosine similarity.
-    /// 4. Combine: `alpha * vector_score + (1-alpha) * 1/(1+graph_dist)`.
-    /// 5. Sort descending, return top-K.
-    pub fn execute(
-        &self,
-        memgraph: &MemGraph,
-        csr_segs: &[Arc<CsrStorage>],
-        lsn: u64,
-    ) -> Result<Vec<HybridResult>, HybridError> {
-        if self.query_vector.is_empty() {
-            return Err(HybridError::EmptyQueryVector);
-        }
-
-        let view = MergedNodeView::new(memgraph, csr_segs);
-
-        // Validate reference node exists in EITHER tier.
-        if !view.contains(self.reference_node) {
-            return Err(HybridError::NodeNotFound);
-        }
-
-        // Clamp alpha to [0.0, 1.0].
-        let alpha = self.alpha.clamp(0.0, 1.0);
-        let penalty_dist = self.max_hops + 1;
-
-        // Step 1: Single batch BFS from reference node — O(frontier).
-        let bfs_results = bfs_collect(
-            memgraph,
-            csr_segs,
-            self.reference_node,
-            self.max_hops,
-            None,
-            self.frontier_cap,
-            lsn,
-        )?;
-
-        // Build O(1) distance lookup map.
-        let mut distance_map: HashMap<NodeKey, u32> = HashMap::with_capacity(bfs_results.len() + 1);
-        distance_map.insert(self.reference_node, 0);
-        for (node_key, dist) in &bfs_results {
-            distance_map.insert(*node_key, *dist);
-        }
-
-        // Step 2: Score ALL nodes with embeddings, across both tiers.
-        let committed = roaring::RoaringBitmap::new();
-        let mut scored: Vec<HybridResult> = Vec::with_capacity(distance_map.len());
-
-        view.for_each_visible_node(None, 0, 0, &committed, None, |node_key| {
-            let Some(embedding) = view.embedding(node_key) else {
-                return; // Skip nodes without embeddings.
-            };
-
-            let vector_score = simd::cosine_similarity(&embedding, &self.query_vector);
-            let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
-            let graph_score = 1.0 / (1.0 + graph_dist as f64);
-            let combined = alpha * vector_score + (1.0 - alpha) * graph_score;
-
-            scored.push(HybridResult {
-                node: node_key,
-                score: combined,
-                graph_distance: Some(graph_dist),
-                context: Vec::new(),
-            });
-        });
-
-        // Step 3: Sort descending by combined score, take top-K.
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        scored.truncate(self.k);
-
-        Ok(scored)
-    }
-}
+mod search;
+mod walk_rerank;
+
+pub use search::*;
+pub use walk_rerank::*;
 
 // ---------------------------------------------------------------------------
 // BFS collect helper (shared by HYB-01, HYB-04)
@@ -1474,6 +940,102 @@ mod tests {
         assert!(
             total > scored.len() + residual.len(),
             "prefilter must prune"
+        );
+    }
+
+    #[test]
+    fn test_expansion_bridge_matches_brute_force() {
+        // HYB-02 (W2-5): at >= threshold candidates the expansion routes
+        // frozen rows through the segment bridge; scores stay REAL cosines
+        // and the top-k closely tracks exact scoring.
+        let (mg, seg, _center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        let candidates: Vec<NodeKey> = seg
+            .node_meta()
+            .iter()
+            .map(|m| slotmap::KeyData::from_ffi(m.external_id).into())
+            .collect();
+        let query = det_embedding(31337, 8);
+        let segs = vec![seg.clone()];
+
+        let mut bridged = VectorToGraphExpansion::new(query.clone(), 5, 1);
+        bridged.threshold = 1; // force HnswPreFilter
+        let mut brute = VectorToGraphExpansion::new(query.clone(), 5, 1);
+        brute.threshold = usize::MAX; // force BruteForce
+
+        let bres = bridged
+            .execute(&mg, &segs, &candidates, u64::MAX - 1)
+            .expect("bridged ok");
+        let xres = brute
+            .execute(&mg, &segs, &candidates, u64::MAX - 1)
+            .expect("brute ok");
+        assert_eq!(bres.len(), 5);
+        assert_eq!(xres.len(), 5);
+
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &bres {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!((r.score - exact).abs() < 1e-4);
+            assert_eq!(r.graph_distance, None, "HYB-02 has no graph distance");
+            assert!(!r.context.is_empty(), "expansion context must populate");
+        }
+        let brute_set: HashSet<NodeKey> = xres.iter().map(|r| r.node).collect();
+        let overlap = bres.iter().filter(|r| brute_set.contains(&r.node)).count();
+        assert!(overlap >= 4, "HYB-02 bridge/brute overlap {overlap}/5");
+    }
+
+    #[test]
+    fn test_rerank_bridge_matches_brute_force() {
+        // HYB-04 (W2-5): non-frontier nodes share the penalty graph term,
+        // so the bridged path answers with the segment's top-k by cosine;
+        // frontier + mutable nodes stay exact. Every returned score must
+        // still be the true combined formula.
+        let (mut mg, seg, center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        // A mutable-tier node too (must be scored exactly, never dropped).
+        let hot = mg.add_node(smallvec![0], empty_props(), Some(det_embedding(500, 8)), 20);
+
+        let query = det_embedding(4711, 8);
+        let segs = vec![seg.clone()];
+
+        let mut bridged = GraphConstrainedReRanker::new(center, 1, 0.7, query.clone(), 8);
+        bridged.threshold = 1; // force the bridge path
+        let mut brute = GraphConstrainedReRanker::new(center, 1, 0.7, query.clone(), 8);
+        brute.threshold = usize::MAX; // full exact scan
+
+        let bres = bridged.execute(&mg, &segs, u64::MAX - 1).expect("bridged");
+        let xres = brute.execute(&mg, &segs, u64::MAX - 1).expect("brute");
+        assert_eq!(bres.len(), 8);
+        assert_eq!(xres.len(), 8);
+
+        // Bridged scores must be the exact combined formula for that node.
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &bres {
+            let emb = view.embedding(r.node).expect("embedding");
+            let cos = simd::cosine_similarity(&emb, &query);
+            let gd = r.graph_distance.expect("distance always set") as f64;
+            let expect = 0.7 * cos + 0.3 * (1.0 / (1.0 + gd));
+            assert!(
+                (r.score - expect).abs() < 1e-4,
+                "node {:?}: {} vs {expect}",
+                r.node,
+                r.score
+            );
+        }
+        // The star is 1-hop from center: every spoke is IN the frontier, so
+        // bridge and brute must agree BIT-EXACTLY on the frontier class; the
+        // mutable node rides along in both.
+        let brute_set: HashSet<NodeKey> = xres.iter().map(|r| r.node).collect();
+        let overlap = bres.iter().filter(|r| brute_set.contains(&r.node)).count();
+        assert!(overlap >= 7, "HYB-04 bridge/brute overlap {overlap}/8");
+        let hot_in_bridged = bres.iter().any(|r| r.node == hot);
+        let hot_in_brute = xres.iter().any(|r| r.node == hot);
+        assert_eq!(
+            hot_in_bridged, hot_in_brute,
+            "mutable-tier node must rank identically in both paths"
         );
     }
 }

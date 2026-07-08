@@ -62,7 +62,18 @@ pub fn is_cypher_write_query(args: &[crate::protocol::Frame]) -> bool {
 }
 
 /// Dispatch read-only GRAPH.* commands. Takes &GraphStore (shared).
-pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
+///
+/// `protocol_version` (Task #32): forwarded to GRAPH.QUERY / GRAPH.RO_QUERY
+/// for the Cypher result cache. `None` when the caller cannot reliably
+/// determine the originating connection's negotiated RESP version (see
+/// `graph_query`'s doc comment) -- the result cache is simply not consulted
+/// or populated for that call, never a correctness risk.
+pub fn dispatch_graph_read(
+    store: &GraphStore,
+    cmd: &[u8],
+    args: &[Frame],
+    protocol_version: Option<u8>,
+) -> Frame {
     if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
         graph_neighbors(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.INFO") {
@@ -70,9 +81,9 @@ pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Fr
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
         graph_list(store)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        graph_query(store, args)
+        graph_query(store, args, protocol_version)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
-        graph_ro_query(store, args)
+        graph_ro_query(store, args, protocol_version)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
         graph_explain(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.PROFILE") {
@@ -152,7 +163,11 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
-        dispatch_graph_read(store, cmd, args)
+        // Task #32: `None` -- this dispatch path (cross-shard GraphCommand /
+        // handler_single) has no reliable access to the originating
+        // connection's negotiated protocol_version, so the result cache is
+        // not consulted here. See `graph_query`'s doc comment.
+        dispatch_graph_read(store, cmd, args, None)
     }
 }
 
@@ -172,7 +187,11 @@ pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
-        dispatch_graph_read(store, cmd, args)
+        // Task #32: `None` -- this dispatch path (cross-shard GraphCommand /
+        // handler_single) has no reliable access to the originating
+        // connection's negotiated protocol_version, so the result cache is
+        // not consulted here. See `graph_query`'s doc comment.
+        dispatch_graph_read(store, cmd, args, None)
     }
 }
 
@@ -225,6 +244,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_timeout_ms() {
+        let args = |parts: &[&[u8]]| -> Vec<Frame> {
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::from(p.to_vec())))
+                .collect()
+        };
+        // Absent keyword → None.
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"MATCH (n) RETURN n"])),
+            Ok(None)
+        );
+        // Present with value (case-insensitive keyword).
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"timeout", b"250"])),
+            Ok(Some(250))
+        );
+        // 0 is valid (= unlimited).
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT", b"0"])),
+            Ok(Some(0))
+        );
+        // Garbage values are errors, not silent no-ops.
+        for bad in [&b"abc"[..], b"-5", b"1.5", b""] {
+            assert!(
+                graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT", bad])).is_err(),
+                "TIMEOUT {bad:?} must be rejected"
+            );
+        }
+        // Dangling keyword is an error.
+        assert!(graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT"])).is_err());
+    }
+
+    #[test]
     fn test_plan_cache_shared_across_literal_variants() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
@@ -270,11 +323,15 @@ mod tests {
         );
 
         let graph = store.get_graph(b"g").expect("graph exists");
+        // Dual-key cache: each shape stores the first variant's raw-text hash
+        // plus the shared literal-normalized hash (2 entries/shape); the
+        // second variant hits the normalized entry, adding nothing. One WRITE
+        // plan for both CREATEs (W2-7) + one READ plan for both MATCHes.
         assert_eq!(
-            graph.plan_cache.lock().distinct_plan_count(),
-            1,
-            "queries differing only in literal values must share one cached plan \
-             (and write queries must not be cached)"
+            graph.plan_cache.lock().len(),
+            4,
+            "literal variants must share one cached plan per shape \
+             (raw + normalized key each for the CREATE and MATCH shapes)"
         );
     }
 
@@ -324,10 +381,14 @@ mod tests {
         );
 
         let graph = store.get_graph(b"g").expect("graph exists");
+        // Dual-key cache: 2 entries per shape (first variant's raw hash +
+        // shared normalized hash) — see test_plan_cache_shared_across_
+        // literal_variants for the breakdown.
         assert_eq!(
-            graph.plan_cache.lock().distinct_plan_count(),
-            1,
-            "string-literal variants must share one cached plan"
+            graph.plan_cache.lock().len(),
+            4,
+            "string-literal variants must share one cached plan per shape \
+             (one write, one read — W2-7 caches writes too)"
         );
     }
 

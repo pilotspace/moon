@@ -1465,6 +1465,76 @@ fn test_ft_config_unknown_index() {
 }
 
 #[test]
+fn test_insert_path_triggers_background_compact_without_search() {
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let mut text = crate::text::store::TextStore::new();
+
+    // COMPACT_THRESHOLD 100 (the minimum) so a modest bulk load crosses it.
+    let args = vec![
+        bulk(b"autoidx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"8"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"8"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+        bulk(b"COMPACT_THRESHOLD"),
+        bulk(b"100"),
+    ];
+    let result = ft_create(&mut store, &mut text, &args);
+    assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
+
+    let hset = |store: &mut VectorStore, text: &mut _, i: usize| {
+        let key = format!("doc:{i}");
+        let vec_bytes: Vec<u8> = (0..8u32)
+            .flat_map(|d| ((i as f32) * 0.37 + d as f32).to_le_bytes())
+            .collect();
+        let hset_args = vec![bulk(key.as_bytes()), bulk(b"vec"), bulk(&vec_bytes)];
+        crate::shard::spsc_handler::auto_index_hset_public(store, text, key.as_bytes(), &hset_args);
+    };
+
+    // Pure bulk load: ONLY the HSET auto-index hook runs. No FT.SEARCH, no
+    // FT.COMPACT, no autovacuum tick — before the insert-path trigger this
+    // left every vector in the brute-force mutable tier indefinitely.
+    for i in 0..150 {
+        hset(&mut store, &mut text, i);
+    }
+
+    // The background worker builds asynchronously; each further insert polls
+    // installs (same as the search path). Nudge until the immutable segment
+    // lands or we time out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut extra = 150usize;
+    let mut installed = false;
+    while std::time::Instant::now() < deadline {
+        hset(&mut store, &mut text, extra);
+        extra += 1;
+        #[allow(clippy::unwrap_used)] // index created above; unit-test context
+        let idx = store.get_index(b"autoidx").unwrap();
+        if !idx.segments.load().immutable.is_empty() {
+            installed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        installed,
+        "bulk insert never dispatched+installed a background compaction (insert-path trigger missing)"
+    );
+}
+
+#[test]
 fn test_ft_config_autocompact_guards_try_compact() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();

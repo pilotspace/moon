@@ -31,6 +31,75 @@ pub fn pin_to_core(core_id: usize) {
     }
 }
 
+/// Machine-wide logical CPU count, IGNORING the calling thread's affinity
+/// mask. Cached after first call.
+///
+/// `std::thread::available_parallelism()` respects `sched_getaffinity` on
+/// Linux: called from a core-pinned shard thread — or any thread spawned
+/// from one, which inherits the single-core mask — it returns 1. That
+/// silently serialized every "parallel" consumer sized from it (parallel
+/// HNSW builds ran at exactly sequential speed; the background-compactor
+/// pool sized itself to 1 worker). This reads the sysfs online-CPU list on
+/// Linux (unaffected by affinity) and falls back to
+/// `available_parallelism` elsewhere.
+pub fn system_parallelism() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        if let Some(n) = std::fs::read_to_string("/sys/devices/system/cpu/online")
+            .ok()
+            .and_then(|s| count_cpulist(s.trim()))
+        {
+            return n;
+        }
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+    })
+}
+
+/// Count the CPUs in a Linux cpulist string (e.g. `"0-3,8-11"` → 8).
+#[cfg(target_os = "linux")]
+fn count_cpulist(cpulist: &str) -> Option<usize> {
+    let mut count = 0usize;
+    for range_str in cpulist.split(',') {
+        let range_str = range_str.trim();
+        if range_str.is_empty() {
+            continue;
+        }
+        if let Some((start_s, end_s)) = range_str.split_once('-') {
+            let start = start_s.trim().parse::<usize>().ok()?;
+            let end = end_s.trim().parse::<usize>().ok()?;
+            count += end.checked_sub(start)? + 1;
+        } else {
+            range_str.parse::<usize>().ok()?;
+            count += 1;
+        }
+    }
+    (count > 0).then_some(count)
+}
+
+/// Pin the current (short-lived worker) thread to `core_id`, quietly.
+///
+/// Same mechanism as [`pin_to_core`] but logs at debug level without the
+/// shard wording — used by parallel-build workers to ESCAPE the single-core
+/// affinity mask they inherit when spawned from a pinned shard (or
+/// background-compactor) thread. No-op on non-Linux.
+pub fn pin_worker_to_core(core_id: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        use core_affinity::CoreId;
+        if !core_affinity::set_for_current(CoreId { id: core_id }) {
+            tracing::debug!("worker failed to pin to core {}", core_id);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core_id;
+    }
+}
+
 /// Detect which NUMA node owns the given CPU core (Linux only).
 ///
 /// Reads `/sys/devices/system/node/nodeN/cpulist` to find the node.
@@ -104,5 +173,21 @@ mod tests {
         assert!(cpu_in_cpulist(0, "0-3,8-11"));
         assert!(cpu_in_cpulist(9, "0-3,8-11"));
         assert!(!cpu_in_cpulist(5, "0-3,8-11"));
+    }
+
+    #[test]
+    fn test_count_cpulist() {
+        assert_eq!(count_cpulist("0"), Some(1));
+        assert_eq!(count_cpulist("0-5"), Some(6));
+        assert_eq!(count_cpulist("0-3,8-11"), Some(8));
+        assert_eq!(count_cpulist("0-1, 4"), Some(3));
+        assert_eq!(count_cpulist(""), None);
+        assert_eq!(count_cpulist("garbage"), None);
+        assert_eq!(count_cpulist("3-1"), None); // inverted range
+    }
+
+    #[test]
+    fn test_system_parallelism_at_least_one() {
+        assert!(system_parallelism() >= 1);
     }
 }

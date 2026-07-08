@@ -11,7 +11,26 @@ use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
-use crate::graph::types::{EdgeMeta, NodeKey, NodeMeta};
+use crate::graph::fasthash::FxHashMap;
+use crate::graph::types::{EdgeMeta, NodeKey, NodeMeta, PropertyMap, PropertyValue};
+
+/// Normalize a property value into f64 numeric space: `Int`/`Float` as-is,
+/// `Bool` as 0.0/1.0. `String`/`Bytes` return `None` (indexed by xxh64 hash
+/// instead — see [`SegmentPropertyIndexes`] / [`MutablePropertyIndex`]).
+///
+/// Single source of truth for "what counts as numerically equal" shared by
+/// BOTH the frozen tier (`SegmentPropertyIndexes::build`/`rows_eq`) and the
+/// mutable tier (`MutablePropertyIndex`) so the two tiers can never silently
+/// drift on equality semantics.
+#[inline]
+fn normalize_numeric(value: &PropertyValue) -> Option<f64> {
+    match value {
+        PropertyValue::Int(i) => Some(*i as f64),
+        PropertyValue::Float(f) => Some(*f),
+        PropertyValue::Bool(b) => Some(u8::from(*b) as f64),
+        PropertyValue::String(_) | PropertyValue::Bytes(_) => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LabelIndex
@@ -302,6 +321,16 @@ impl PropertyIndex {
         result
     }
 
+    /// Less-than-or-equal query: returns rows where property <= threshold.
+    pub fn lte(&self, threshold: f64) -> RoaringBitmap {
+        let key = OrderedFloat(threshold);
+        let mut result = RoaringBitmap::new();
+        for (_, bitmap) in self.tree.range(..=key) {
+            result |= bitmap;
+        }
+        result
+    }
+
     /// Number of distinct values in the index.
     pub fn distinct_values(&self) -> usize {
         self.tree.len()
@@ -360,7 +389,6 @@ pub struct SegmentPropertyIndexes {
 impl SegmentPropertyIndexes {
     /// Build from CSR node metadata + the v5 node-property blob.
     pub fn build(node_meta: &[NodeMeta], node_props_blob: &[u8]) -> Self {
-        use crate::graph::types::PropertyValue;
         let mut numeric: HashMap<u16, PropertyIndex> = HashMap::new();
         let mut strings: HashMap<u16, HashMap<u64, RoaringBitmap>> = HashMap::new();
         for (row, nm) in node_meta.iter().enumerate() {
@@ -370,13 +398,7 @@ impl SegmentPropertyIndexes {
             let props =
                 crate::graph::csr::props::decode_node_props(node_props_blob, nm.property_offset);
             for (pid, val) in &props {
-                let num = match val {
-                    PropertyValue::Int(i) => Some(*i as f64),
-                    PropertyValue::Float(f) => Some(*f),
-                    PropertyValue::Bool(b) => Some(u8::from(*b) as f64),
-                    PropertyValue::String(_) | PropertyValue::Bytes(_) => None,
-                };
-                if let Some(v) = num {
+                if let Some(v) = normalize_numeric(val) {
                     numeric
                         .entry(*pid)
                         .or_insert_with(|| PropertyIndex::new(*pid))
@@ -398,22 +420,20 @@ impl SegmentPropertyIndexes {
 
     /// Rows whose property `prop_id` equals `value` (superset semantics for
     /// hashed strings / Bool-Int aliasing — see type docs).
-    pub fn rows_eq(
-        &self,
-        prop_id: u16,
-        value: &crate::graph::types::PropertyValue,
-    ) -> RoaringBitmap {
-        use crate::graph::types::PropertyValue;
-        match value {
-            PropertyValue::Int(i) => self.numeric_eq(prop_id, *i as f64),
-            PropertyValue::Float(f) => self.numeric_eq(prop_id, *f),
-            PropertyValue::Bool(b) => self.numeric_eq(prop_id, u8::from(*b) as f64),
-            PropertyValue::String(s) | PropertyValue::Bytes(s) => self
-                .strings
-                .get(&prop_id)
-                .and_then(|m| m.get(&xxhash_rust::xxh64::xxh64(s, 0)))
-                .cloned()
-                .unwrap_or_default(),
+    pub fn rows_eq(&self, prop_id: u16, value: &PropertyValue) -> RoaringBitmap {
+        match normalize_numeric(value) {
+            Some(v) => self.numeric_eq(prop_id, v),
+            None => match value {
+                PropertyValue::String(s) | PropertyValue::Bytes(s) => self
+                    .strings
+                    .get(&prop_id)
+                    .and_then(|m| m.get(&xxhash_rust::xxh64::xxh64(s, 0)))
+                    .cloned()
+                    .unwrap_or_default(),
+                PropertyValue::Int(_) | PropertyValue::Float(_) | PropertyValue::Bool(_) => {
+                    RoaringBitmap::new()
+                }
+            },
         }
     }
 
@@ -451,11 +471,224 @@ impl SegmentPropertyIndexes {
         numeric + strings
     }
 
+    /// The numeric B-tree for `prop_id`, if any row indexed a numeric value
+    /// under it. `None` means no row can satisfy a numeric range on this
+    /// property (the build is exhaustive — see type docs).
+    pub fn numeric_index(&self, prop_id: u16) -> Option<&PropertyIndex> {
+        self.numeric.get(&prop_id)
+    }
+
     fn numeric_eq(&self, prop_id: u16, v: f64) -> RoaringBitmap {
         self.numeric
             .get(&prop_id)
             .map(|ix| ix.range_query(v, v))
             .unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MutablePropertyIndex
+// ---------------------------------------------------------------------------
+
+/// Incrementally-maintained property index over `MemGraph`'s mutable tier.
+///
+/// Mirrors [`SegmentPropertyIndexes`]'s numeric-BTree / string-hash split,
+/// but:
+///   - keys by [`NodeKey`] directly (the mutable tier has no stable dense
+///     row space — NodeKeys are slotmap ffi-encoded, sparse, and reused
+///     only within a generation; reusing a `RoaringBitmap`-of-row scheme
+///     here would reintroduce an ABA hazard the generational key design
+///     exists to prevent — see the mutable-property-index design doc,
+///     rejected alternatives).
+///   - is maintained INCREMENTALLY on every write (insert/remove) instead
+///     of built once, exhaustively, at freeze time (the mutable tier is, by
+///     definition, still being written to).
+///   - is NOT keyed by label, same as `SegmentPropertyIndexes` — label is
+///     applied as a separate check at query time.
+///   - has EXACT (not superset) removal semantics: `remove` deletes the
+///     precise `(prop_id, value, key)` triple. The SUPERSET behavior lives
+///     entirely in string-hash collisions and Bool/Int aliasing (identical
+///     to `SegmentPropertyIndexes`) — callers keep a residual Filter
+///     downstream regardless, so an index hit can over-select, never
+///     under-select.
+///
+/// Owned by `MemGraph` (not `NamedGraph`) — same lifetime and same
+/// single-writer, no-lock ownership as `nodes`/`node_order` (the shard
+/// thread exclusively owns `MemGraph`, so this index needs zero
+/// synchronization: no `RwLock`, no atomics).
+///
+/// Forward-compat note: any FUTURE property-mutation call site (e.g. a
+/// Cypher `REMOVE n.prop` clause, which does not exist yet) MUST route
+/// through `MemGraph::set_node_property`/`remove_node_property` rather than
+/// poking `MutableNode.properties` directly, or this index goes stale.
+#[derive(Debug, Default)]
+pub struct MutablePropertyIndex {
+    /// prop_id -> sorted numeric value -> node keys with that value.
+    /// `SmallVec<[NodeKey; 2]>` because point-lookup properties (ids) are
+    /// near-unique in practice; low-cardinality properties spill to heap
+    /// transparently — no correctness difference, just an allocation, same
+    /// as today's per-node `SmallVec<4>` properties.
+    numeric: FxHashMap<u16, BTreeMap<OrderedFloat<f64>, SmallVec<[NodeKey; 2]>>>,
+    /// prop_id -> xxh64(bytes) -> node keys (String/Bytes equality).
+    strings: FxHashMap<u16, FxHashMap<u64, SmallVec<[NodeKey; 2]>>>,
+}
+
+impl MutablePropertyIndex {
+    /// Insert `(prop_id, value) -> key` into the index.
+    pub fn insert(&mut self, pid: u16, value: &PropertyValue, key: NodeKey) {
+        match normalize_numeric(value) {
+            Some(v) => self
+                .numeric
+                .entry(pid)
+                .or_default()
+                .entry(OrderedFloat(v))
+                .or_default()
+                .push(key),
+            None => {
+                if let PropertyValue::String(s) | PropertyValue::Bytes(s) = value {
+                    self.strings
+                        .entry(pid)
+                        .or_default()
+                        .entry(xxhash_rust::xxh64::xxh64(s, 0))
+                        .or_default()
+                        .push(key);
+                }
+            }
+        }
+    }
+
+    /// Remove the exact `(prop_id, value, key)` triple from the index.
+    /// Cleans up now-empty buckets/prop entries so the index never leaks
+    /// stale, permanently-empty containers across a long server lifetime.
+    pub fn remove(&mut self, pid: u16, value: &PropertyValue, key: NodeKey) {
+        match normalize_numeric(value) {
+            Some(v) => {
+                if let Some(tree) = self.numeric.get_mut(&pid) {
+                    let ordered = OrderedFloat(v);
+                    let mut drop_value = false;
+                    if let Some(bucket) = tree.get_mut(&ordered) {
+                        bucket.retain(|k| *k != key);
+                        drop_value = bucket.is_empty();
+                    }
+                    if drop_value {
+                        tree.remove(&ordered);
+                    }
+                    if tree.is_empty() {
+                        self.numeric.remove(&pid);
+                    }
+                }
+            }
+            None => {
+                if let PropertyValue::String(s) | PropertyValue::Bytes(s) = value {
+                    if let Some(buckets) = self.strings.get_mut(&pid) {
+                        let hash = xxhash_rust::xxh64::xxh64(s, 0);
+                        let mut drop_hash = false;
+                        if let Some(bucket) = buckets.get_mut(&hash) {
+                            bucket.retain(|k| *k != key);
+                            drop_hash = bucket.is_empty();
+                        }
+                        if drop_hash {
+                            buckets.remove(&hash);
+                        }
+                        if buckets.is_empty() {
+                            self.strings.remove(&pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Index every entry in a node's property map (creation / undelete).
+    pub fn index_node(&mut self, key: NodeKey, props: &PropertyMap) {
+        for (pid, val) in props {
+            self.insert(*pid, val, key);
+        }
+    }
+
+    /// Unindex every entry in a node's property map (soft-delete /
+    /// replace-in-place overwrite). `freeze()` uses `clear()` instead — see
+    /// its doc comment.
+    pub fn unindex_node(&mut self, key: NodeKey, props: &PropertyMap) {
+        for (pid, val) in props {
+            self.remove(*pid, val, key);
+        }
+    }
+
+    /// Zero-alloc equality probe. Returns a borrowed slice (`&[]` when
+    /// absent) — no candidate materialization until the caller chooses to
+    /// (`.to_vec()`).
+    pub fn keys_eq(&self, pid: u16, value: &PropertyValue) -> &[NodeKey] {
+        match normalize_numeric(value) {
+            Some(v) => self
+                .numeric
+                .get(&pid)
+                .and_then(|tree| tree.get(&OrderedFloat(v)))
+                .map(SmallVec::as_slice)
+                .unwrap_or(&[]),
+            None => match value {
+                PropertyValue::String(s) | PropertyValue::Bytes(s) => self
+                    .strings
+                    .get(&pid)
+                    .and_then(|m| m.get(&xxhash_rust::xxh64::xxh64(s, 0)))
+                    .map(SmallVec::as_slice)
+                    .unwrap_or(&[]),
+                PropertyValue::Int(_) | PropertyValue::Float(_) | PropertyValue::Bool(_) => &[],
+            },
+        }
+    }
+
+    /// Range probe: `[min, max]` inclusive over the numeric B-tree for
+    /// `prop_id`. Allocates (BTree range union) — same cost class as
+    /// `PropertyIndex::range_query`; range queries are not the point-lookup
+    /// hot path this index primarily targets.
+    pub fn keys_range(&self, pid: u16, min: f64, max: f64) -> Vec<NodeKey> {
+        let Some(tree) = self.numeric.get(&pid) else {
+            return Vec::new();
+        };
+        let lo = OrderedFloat(min);
+        let hi = OrderedFloat(max);
+        tree.range(lo..=hi)
+            .flat_map(|(_, keys)| keys.iter().copied())
+            .collect()
+    }
+
+    /// Drop every indexed entry. `MemGraph::freeze()` drains ALL of
+    /// `self.nodes` unconditionally (dead or alive), so the entire index is
+    /// dead the instant freeze starts — `O(#buckets)`, not
+    /// `O(#nodes * #props)`.
+    pub fn clear(&mut self) {
+        self.numeric.clear();
+        self.strings.clear();
+    }
+
+    /// True when no property is indexed at all.
+    pub fn is_empty(&self) -> bool {
+        self.numeric.is_empty() && self.strings.is_empty()
+    }
+
+    /// Approximate resident bytes: feeds `MemGraph::resident_bytes()`'s
+    /// elastic-memory-budget accounting (same "monotonic signal, not exact
+    /// byte accounting" precedent as `PropertyIndex::resident_bytes`).
+    pub fn resident_bytes(&self) -> usize {
+        let numeric: usize = self
+            .numeric
+            .values()
+            .flat_map(|tree| tree.values())
+            .map(|bucket| {
+                std::mem::size_of::<OrderedFloat<f64>>()
+                    + bucket.len() * std::mem::size_of::<NodeKey>()
+            })
+            .sum();
+        let strings: usize = self
+            .strings
+            .values()
+            .flat_map(|inner| inner.values())
+            .map(|bucket| {
+                std::mem::size_of::<u64>() + bucket.len() * std::mem::size_of::<NodeKey>()
+            })
+            .sum();
+        numeric + strings
     }
 }
 
@@ -467,6 +700,7 @@ impl SegmentPropertyIndexes {
 mod tests {
     use super::*;
     use crate::graph::types::{EdgeMeta, NodeMeta};
+    use bytes::Bytes;
 
     // --- LabelIndex tests ---
 
@@ -703,6 +937,14 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(0));
         assert!(result.contains(1));
+
+        // lte(30) -> rows 0, 1, 2 (inclusive upper bound)
+        let result = idx.lte(30.0);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(2));
+
+        // lte below the minimum -> empty
+        assert!(idx.lte(9.0).is_empty());
     }
 
     #[test]
@@ -759,5 +1001,122 @@ mod tests {
         assert!(result.contains(0));
         assert!(result.contains(1));
         assert!(!result.contains(2));
+    }
+
+    // --- MutablePropertyIndex tests ---
+
+    fn make_keys(n: usize) -> Vec<NodeKey> {
+        use slotmap::SlotMap;
+        let mut sm: SlotMap<NodeKey, ()> = SlotMap::with_key();
+        (0..n).map(|_| sm.insert(())).collect()
+    }
+
+    #[test]
+    fn test_mutable_index_insert_eq_lookup() {
+        let keys = make_keys(3);
+        let mut idx = MutablePropertyIndex::default();
+        idx.insert(0, &PropertyValue::Int(1), keys[0]);
+        idx.insert(0, &PropertyValue::Int(2), keys[1]);
+        idx.insert(0, &PropertyValue::Int(3), keys[2]);
+
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(1)), &[keys[0]]);
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(2)), &[keys[1]]);
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(3)), &[keys[2]]);
+        assert!(idx.keys_eq(0, &PropertyValue::Int(4)).is_empty());
+    }
+
+    #[test]
+    fn test_mutable_index_string_property_eq() {
+        let keys = make_keys(2);
+        let mut idx = MutablePropertyIndex::default();
+        idx.insert(
+            1,
+            &PropertyValue::String(Bytes::from_static(b"alice")),
+            keys[0],
+        );
+        idx.insert(
+            1,
+            &PropertyValue::String(Bytes::from_static(b"bob")),
+            keys[1],
+        );
+
+        assert_eq!(
+            idx.keys_eq(1, &PropertyValue::String(Bytes::from_static(b"alice"))),
+            &[keys[0]]
+        );
+        assert_eq!(
+            idx.keys_eq(1, &PropertyValue::String(Bytes::from_static(b"bob"))),
+            &[keys[1]]
+        );
+        assert!(
+            idx.keys_eq(1, &PropertyValue::String(Bytes::from_static(b"carol")))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_mutable_index_update_moves_bucket() {
+        let keys = make_keys(1);
+        let k = keys[0];
+        let mut idx = MutablePropertyIndex::default();
+        idx.insert(0, &PropertyValue::Int(10), k);
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(10)), &[k]);
+
+        // Simulate an update: remove old value, insert new value.
+        idx.remove(0, &PropertyValue::Int(10), k);
+        idx.insert(0, &PropertyValue::Int(20), k);
+
+        assert!(idx.keys_eq(0, &PropertyValue::Int(10)).is_empty());
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(20)), &[k]);
+    }
+
+    #[test]
+    fn test_mutable_index_remove_is_exact() {
+        let keys = make_keys(1);
+        let k = keys[0];
+        let mut idx = MutablePropertyIndex::default();
+        idx.insert(0, &PropertyValue::Int(42), k);
+        idx.remove(0, &PropertyValue::Int(42), k);
+        assert!(idx.keys_eq(0, &PropertyValue::Int(42)).is_empty());
+        // Bucket cleanup: index should be fully empty, not just the value gone.
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_mutable_index_range_query() {
+        let keys = make_keys(5);
+        let mut idx = MutablePropertyIndex::default();
+        for (i, &k) in keys.iter().enumerate() {
+            idx.insert(0, &PropertyValue::Int((i as i64 + 1) * 10), k);
+        }
+        // Values: 10, 20, 30, 40, 50. Range [20, 40] -> keys[1..=3].
+        let mut result = idx.keys_range(0, 20.0, 40.0);
+        result.sort_by_key(|k| format!("{k:?}"));
+        let mut expected = vec![keys[1], keys[2], keys[3]];
+        expected.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_mutable_index_bool_int_aliasing_is_superset() {
+        let keys = make_keys(1);
+        let k = keys[0];
+        let mut idx = MutablePropertyIndex::default();
+        idx.insert(0, &PropertyValue::Bool(true), k);
+        // Bool(true) normalizes to 1.0, same bucket as Int(1) -- documented
+        // superset behavior (residual Filter downstream disambiguates).
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Int(1)), &[k]);
+        assert_eq!(idx.keys_eq(0, &PropertyValue::Bool(true)), &[k]);
+    }
+
+    #[test]
+    fn test_mutable_index_resident_bytes_grows_with_inserts() {
+        let keys = make_keys(10);
+        let mut idx = MutablePropertyIndex::default();
+        let before = idx.resident_bytes();
+        for (i, &k) in keys.iter().enumerate() {
+            idx.insert(0, &PropertyValue::Int(i as i64), k);
+        }
+        assert!(idx.resident_bytes() > before);
     }
 }

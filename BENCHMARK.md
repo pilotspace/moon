@@ -788,6 +788,91 @@ target). Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
 Moon insert **7.5× (x86) / 14.9× (ARM)** faster; RediSearch search ~16× higher QPS at higher recall (the
 SQ8/TQ-at-384d recall trade-off). Unchanged from §10.5 — no v3-1/v3-2 regression.
 
+(Note: the search-QPS deficit above predates the vector-search optimization branch (PR #214,
+insert 24–38×, matched-recall gap 16×→~1.3×) and the HQ-1 exact-rerank sidecar — see §10.7
+below for post-optimization numbers vs Qdrant.)
+
+### 10.7 2026-07-07 vs Qdrant (OrbStack Linux VM, Docker Qdrant, same box)
+
+50K × 384d clustered gaussian (unit-normalized), COSINE, KNN10, 500 queries with exact
+ground truth, redis-py / qdrant-client (REST), 8-thread QPS. Both engines at default HNSW
+params; recall@10 is matched (≥0.999 both) so QPS compares at equal quality. Branch
+`feat/graph-engine-wave2` HEAD.
+
+| metric | Moon | Qdrant | ratio |
+|--------|:----:|:------:|:-----:|
+| Ingest rate | **65,695 vec/s** (searchable immediately, brute tier) | 7,350 vec/s accepted / 6,399 vec/s to index-green | **8.9×** |
+| Time to HNSW-quality serving | 28.7 s (`FT.COMPACT`, incl. 6 s grace) | **7.8 s** (optimizer green) | 0.27× |
+| Search QPS (HNSW, 8 threads) | **3,092** | 1,223 | **2.53×** |
+| Search p50 / p99 | **2.60 / 4.39 ms** | 6.05 / 14.66 ms | 2.3× / 3.3× |
+| Recall@10 | 0.9992 | 0.9998 | parity |
+
+Moon wins ingest 8.9× and matched-recall search 2.5×; Qdrant reaches HNSW-tier serving
+faster after bulk load (Moon serves immediately from the brute tier during that window —
+recall 0.759 there, the documented TQ-at-384d quantized-brute trade-off; low brute QPS at
+50K is expected O(N) scan). Caveats: qdrant-client REST transport (gRPC would improve
+Qdrant's client-side latency somewhat); shared-host VM — ratios are the signal, absolutes
+are indicative.
+
+### 10.8 2026-07-07 vs Qdrant — GCE validation (dedicated instances, x86 + ARM)
+
+Same workload and harness as §10.7, re-run on dedicated GCE instances to validate the
+same-box VM ratios on real cloud hardware: **c3-standard-8** (Xeon Platinum 8481C, x86_64)
+and **t2a-standard-8** (Neoverse-N1, aarch64), us-central1-a. Fresh native build of branch
+HEAD `852d53a` on each instance; Docker Qdrant on the same box.
+
+| metric | x86 Moon | x86 Qdrant | ARM Moon | ARM Qdrant |
+|--------|:--------:|:----------:|:--------:|:----------:|
+| Ingest rate (vec/s) | **34,121** (searchable immediately) | 3,383 accepted / 3,167 to green | **26,034** (searchable immediately) | 2,383 accepted / 2,273 to green |
+| Time to HNSW-tier serving | 27.2 s | **15.8 s** | 47.6 s | **22.0 s** |
+| Search QPS (HNSW, 8 threads) | **2,097** | 613 | **1,422** | 531 |
+| Search p50 / p99 (ms) | **3.72 / 5.61** | 11.98 / 23.88 | **5.50 / 7.98** | 13.75 / 26.11 |
+| Recall@10 | 0.9992 | 1.0000 | 0.9992 | 0.9998 |
+
+Moon ingests **10.1× (x86) / 10.9× (ARM)** faster and serves matched-recall search
+**3.4× (x86) / 2.7× (ARM)** faster — confirming §10.7's VM reading (2.53×) on dedicated
+cloud hardware. Qdrant keeps its time-to-index-green edge after bulk load (Moon serves
+from the brute tier in that window). Recall is computed against exact ground truth
+(full-precision brute-force top-10 over all 50K vectors per query); both engines ≥0.999,
+within 0.0008 of each other, and Moon's 0.9992 reproduces bit-identically across all
+three environments (VM, GCE x86, GCE ARM).
+
+### 10.9 2026-07-08 time-to-index-green: parallel HNSW build + insert-path trigger — Moon now beats Qdrant (GCE, x86 + ARM)
+
+§10.8's one losing metric fixed (commit `061c73cb`, same instances/harness). Instrumentation
+showed 99.3% of FT.COMPACT wall was a single-threaded HNSW insert loop, compounded by a
+Linux affinity trap (threads spawned from core-pinned shard threads inherit the single-core
+mask — `available_parallelism()` returned 1, silently serializing the "parallel" path AND
+sizing the background-compactor pool to one worker) and by the auto-compact trigger living
+only on the search path (a pure bulk load never compacted until the first FT.COMPACT).
+Fixes: shared-graph concurrent HNSW builder (per-node locks + connectivity repair, builds
+≥10K vectors, ~88% scaling efficiency), affinity-independent `system_parallelism()` with
+explicit worker re-pinning, and an HSET-path compaction trigger (builds start + install
+during ingest).
+
+**Load → HNSW-tier serving** (50K × 384d bulk load, then immediate FT.COMPACT, no
+measurement traffic):
+
+| | x86 before | **x86 after** | x86 Qdrant | ARM before | **ARM after** | ARM Qdrant |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| load → green | ~22.7 s | **9.9 s** | 15.7 s | ~43.5 s | **9.5 s** | 22.2 s |
+
+Moon now reaches HNSW-tier serving **1.6× (x86) / 2.3× (ARM) faster than Qdrant** — every
+§10.8 metric is now a Moon win. Full-workload re-run on the same boxes:
+
+| metric | x86 Moon | x86 Qdrant | ARM Moon | ARM Qdrant |
+|--------|:--------:|:----------:|:--------:|:----------:|
+| Ingest rate (vec/s) | **19,792** | 3,408 accepted | **24,519** | 2,357 accepted |
+| Search QPS (HNSW, 8 threads) | **2,266** | 626 | **1,480** | 532 |
+| Search p50 / p99 (ms) | **3.55 / 4.04** | 11.64 / 24.12 | **5.37 / 6.20** | 13.64 / 26.74 |
+| Recall@10 | 0.9982 | 1.0000 | 0.9980 | 0.9998 |
+
+Honest trade-offs: (1) ingest rate drops vs §10.8 (34K→20K x86) because HNSW builds now
+run concurrently with ingest — the same trade Qdrant makes (its 3.4K/s accept rate IS its
+indexing); Moon still ingests 5.8–10.4× faster. (2) recall@10 dips 0.9992 → 0.998x —
+the index now serves from 3 segments instead of one (multi-segment beam truncation), a
+~0.001 recall cost for the 2.3–4.6× faster time-to-green; still within 0.002 of Qdrant.
+
 ---
 
 ## 11. Graph Engine
@@ -860,6 +945,131 @@ It still trails FalkorDB ~4× because FalkorDB has a **property index** on `id` 
 label scan** — a property index for inline-equality is a legitimate future optimization, explicitly out of
 v3-2 scope. Moon native builds 23–26× faster and native 1-hop edges out FalkorDB Cypher.
 Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
+
+### 11.6 2026-07-07 Graph wave-2 criterion microbenchmarks (OrbStack Linux VM, aarch64)
+
+Wave-2 engine (`feat/graph-engine-wave2`, PR #237): frozen-tier copy-up writes, IndexScan
+ranges, row-BFS multi-segment gate, write-side plan cache, Cypher aggregations,
+OPTIONAL MATCH/WITH. `-C target-cpu=native`, fat-LTO bench profile, criterion.
+VM cores are shared — treat absolutes as indicative, relatives as solid.
+
+| Benchmark | Median | Notes |
+|-----------|:------:|-------|
+| 1-hop neighbor, CSR (frozen) | **1.07 ns** | vs memgraph (mutable) 113.8 ns — frozen tier ~106× |
+| 2-hop BFS, CSR 1K / 10K | 1.01 / 1.10 µs | vs memgraph 3.47 / 3.64 µs (~3.3×) |
+| Edge insert (memgraph) | 206 ns | |
+| GRAPH.ADDNODE / ADDEDGE dispatch | 223 / 204 ns | ~4.5–4.9M ops/s per-shard ceiling |
+| GRAPH.NEIGHBORS dispatch | 429 ns | |
+| CSR freeze, 64K edges | 19.5 ms | per-dirty-graph cost of the checkpoint graph snapshot (P0 fix) |
+| Cosine similarity 384d / 768d | 31 / 57 ns SIMD | vs scalar 247 / 522 ns (~8–9×, NEON) |
+| Row-BFS frozen 1-segment, 10K depth-3 | **658 µs** | vs sequential memgraph BFS 9.44 ms (~14×) |
+| Row-BFS frozen 2-segment | 1.65 ms | W2-6 multi-segment gate ≈ 2.5× single-segment |
+| Reader BFS mixed-tier / frozen-2seg | 1.83 / 3.40 ms | |
+| `ParallelBfs` memgraph 10K depth-3 | 11.8 ms | **slower than sequential 9.44 ms — see note** |
+
+**`ParallelBfs` note:** the memgraph parallel path is a structural net loss and has **zero
+production callers** (the query path uses `BoundedBfs`; both share the row-BFS frozen fast
+path, which is where parallelism actually pays). Its neighbor collection stays sequential
+(`SegmentMergeReader` borrows `!Send` MemGraph), so it parallelizes only visited-set
+filtering while paying per-level neighbor-list clones, a full FxHashSet→DashSet visited
+rebuild, and raw `thread::scope` spawns per 128-node morsel (~76 spawns/level at a 9.7K
+frontier). Candidate cleanup: retire it or fold into `BoundedBfs`.
+
+### 11.7 2026-07-07 wave-2 vs FalkorDB (OrbStack Linux VM, Docker FalkorDB)
+
+`scripts/bench-graph-compare.sh --nodes 5000` (5K nodes, 3K edges), wave-2 engine.
+⚠ Sequential redis-cli harness (one process per command) — per-op cost is dominated by
+the ~1 ms redis-cli fork on BOTH sides, so this measures single-client latency deltas,
+not server throughput; the §11.5 8-thread persistent-connection GCloud run remains the
+throughput reference. Ratios:
+
+| Operation | Moon | FalkorDB | Ratio |
+|-----------|:----:|:--------:|:-----:|
+| Node insert | 880/s | 716/s | **1.2×** |
+| Edge insert | 996/s | 580/s | **1.7×** |
+| 1-hop query | 938/s | 684/s | **1.3×** |
+| 2-hop query | 1,000/s | 724/s | **1.3×** |
+| Cypher pattern match | 862/s | 757/s | **1.1×** |
+
+Moon leads every row in this harness — including Cypher, where §11.5 (pre-wave-2,
+concurrent harness) trailed ~4×. The two harnesses are not directly comparable
+(fork-bound single client compresses server-side deltas); a fresh 8-thread GCloud run
+is the right follow-up before claiming the Cypher gap is closed.
+
+### 11.7b 2026-07-07 Cypher-2× wave (P1 mutable property index, P2 result cache, P3 text predicates)
+
+Follow-up to §11.7/§11.8: profiling showed 82.5% of shard CPU in `index_scan_keys`'s
+mutable-tier linear scan. Three features landed (commits `8d5794b9`, `9b38f56c`+`1abc4998`,
+`9d634607`):
+
+- **P1 — mutable-tier property index**: point queries stop scanning every memgraph node.
+  Quiet-host measurement (OrbStack, 8-thread, 5K nodes): 25,506 → **29,014 qps**, p50
+  0.30 → **0.22 ms** (−27%), shard CPU −~70% (`index_scan_keys` GONE from perf profile;
+  top symbol drops to 3.9% kernel TCP). Same-box FalkorDB ratio 2.44× → **2.78×**.
+  The win scales with graph size: the bench scans only 5K nodes; at 1M the old path is
+  ~200× more per-query while the index probe stays O(1).
+- **P2 — Cypher result cache** (write-gen invalidated, pre-encoded RESP bytes, TinyLFU
+  doorkeeper): interleaved A/B vs P1-only (noisy shared host, alternating runs):
+  cache-hostile cycling **−2.4%** (was −21% before the doorkeeper — admission on second
+  sighting removed the serialize+insert+O(n)-evict miss cost), hot-key repeat **+1.9%**.
+  Real payoff is expensive reads (a 24 ms full-graph aggregation becomes a byte-copy),
+  not client-bound point queries.
+- **P3 — text predicates via FTS reuse**: `CONTAINS` / `STARTS WITH` / `ENDS WITH` (new
+  syntax) + `=~` now prune frozen segments through a `SegmentTextIndex` (presence
+  bitmap — deliberately NOT token-postings: `CONTAINS 'rust'` must match `"trusted"`,
+  so tokenized pruning would be unsound; residual Filter stays authoritative). BM25
+  scoring path implemented + tested, Cypher surface syntax deferred.
+
+### 11.8 2026-07-07 wave-2 vs FalkorDB — 8-thread GCloud harness: **Cypher gap CLOSED**
+
+Same harness as §11.5 (graph phase of `gce-4feature-bench.sh`: 5K nodes, 15K edges,
+redis-py, 8 threads, 6s per op class), wave-2 engine @ 1bbaec61, same-box FalkorDB
+(Docker). ⚠ Instance is **e2-standard-16** (2.2 GHz shared-core Xeon; c2d capacity
+exhausted in-zone), much weaker than §11.5's machines — cross-run absolutes are NOT
+comparable, but the same-box Moon:FalkorDB ratio is the valid metric.
+
+| metric | Moon (wave-2) | FalkorDB | ratio | §11.5 ratio (pre-wave-2) |
+|--------|:-------------:|:--------:|:-----:|:------------------------:|
+| cypher_1hop qps (p50) | 3,489 (1.77 ms) | 3,879 (2.02 ms) | **0.90×** | 0.25× |
+| cypher_2hop qps (p50) | **4,518** (0.89 ms) | 3,701 (2.11 ms) | **1.22×** | 0.26× |
+| build ops/s | **10,321** | 535 | **19×** | 26× |
+| cypher_match_rows | 5 | 5 | correct parity | 4 = 4 |
+| native_neighbors qps | 3,185 | — | — | — |
+
+The June deficit — FalkorDB's property index vs Moon's filtered label scan — is gone
+at this scale: Moon Cypher point queries improved ~3–4× relative to FalkorDB on the
+same box (wave-2 write-side plan cache + IndexScan + executor work). Moon now WINS
+2-hop at better p50 and ties 1-hop within 10% on the weakest instance class; on equal
+§11.5-class hardware the 1-hop tie likely flips too (**confirmed in §11.9** — dedicated
+cores flip 1-hop to a 2.3–2.7× Moon win). Caveat: Moon's p99 (18.9 ms 1-hop) trails
+FalkorDB's (3.1 ms) on this shared-core instance — §11.9 shows this was a shared-core
+artifact (dedicated-core p99 beats FalkorDB). Interesting inversion: Moon Cypher 1-hop (3,489 qps) now beats its own
+native GRAPH.NEIGHBORS (3,185 qps) under concurrency — the plan cache amortizes
+parsing to near-zero.
+
+### 11.9 2026-07-07 Cypher-2× wave vs FalkorDB — GCE dedicated-core validation (x86 + ARM)
+
+Supersedes §11.8's shared-core e2 caveat. Same 8-thread 1-hop Cypher point-query workload
+(5K nodes / 15K edges, seed(7), 20 s measure, redis-py persistent connections), run on
+dedicated GCE instances — **c3-standard-8** (Xeon Platinum 8481C) and **t2a-standard-8**
+(Neoverse-N1) — with Docker FalkorDB on the same box, 2 interleaved reps each. Fresh
+native build of branch HEAD `852d53a` (post P1 property index / P2 result cache / P3).
+
+| metric | x86 Moon | x86 FalkorDB | ratio | ARM Moon | ARM FalkorDB | ratio |
+|--------|:--------:|:------------:|:-----:|:--------:|:------------:|:-----:|
+| cypher_1hop qps (rep1 / rep2) | **11,641 / 11,620** | 4,988 / 4,955 | **2.34×** | **10,938 / 10,867** | 4,028 / 4,135 | **2.67×** |
+| p50 (ms) | **0.54** | 1.46 | 2.7× | **0.61** | 1.81 | 2.9× |
+| p90 (ms) | **1.36** | 2.30 | — | **1.33** | 2.83 | — |
+| p99 (ms) | **2.48** | 3.33 | — | **2.26** | 4.31 | — |
+
+Moon **wins 1-hop Cypher outright on both architectures** — 2.3–2.7× the QPS at ~2.7–2.9×
+better p50 — and rep-to-rep spread is <0.2% (dedicated cores). The §11.8 p99-tail concern
+(18.9 ms on the shared-core e2) is confirmed as a shared-core artifact: on dedicated cores
+Moon's p99 *beats* FalkorDB's on both arches. Ratios also validate the same-box VM readings
+(§11.7b 2.78×, final-HEAD 2.55×). FalkorDB build rate for context: 1,009 ops/s (x86) /
+605 ops/s (ARM) via batched UNWIND — Moon's build side used the sequential single-client
+native API in this harness, so build is not compared here (see §11.5 for the 23–26×
+concurrent-build comparison).
 
 ---
 

@@ -7,31 +7,30 @@
 //! property eval, GRAPH.NEIGHBORS existence, GRAPH.HYBRID) go through to see
 //! the whole graph.
 //!
-//! Tier invariant: a NodeKey lives in EXACTLY ONE tier, so lookups here need
-//! no dedup -- but this is actively ENFORCED, not automatic, across the two
-//! ways a mutable-tier `MemGraph` comes into being.
+//! Tier precedence: the MUTABLE tier is authoritative. Copy-up writes (W2-2)
+//! deliberately re-materialize a frozen key in the write buffer to mutate or
+//! tombstone it — such a shadow OVERRIDES the frozen row. Point lookups get
+//! this for free (mutable checked first); scans must skip segment rows whose
+//! key is resident in the mutable tier.
 //!
-//! In-process freeze (`NamedGraph::freeze_and_compact`) needs no extra work:
-//! `freeze()` drains keys out of the slotmap and thaws `write_buf` IN PLACE
-//! (same underlying slot maps), so slot reuse bumps the generation and a
-//! drained key can never reappear in the mutable tier; `compact_segments`
-//! swaps the segment list atomically, so within one loaded snapshot the
-//! segments are pairwise disjoint too.
-//!
+//! Fresh keys never alias frozen `external_id`s, but this is actively
+//! ENFORCED, not automatic, across the two ways a mutable-tier `MemGraph`
+//! comes into being. In-process freeze (`NamedGraph::freeze_and_compact`)
+//! needs no extra work: `freeze()` drains keys out of the slotmap and thaws
+//! `write_buf` IN PLACE (same underlying slot maps), so slot reuse bumps the
+//! generation and a drained key can never reappear in the mutable tier with
+//! a stale identity; `compact_segments` swaps the segment list atomically.
 //! Restart (`recover_graph_store` + WAL replay, `src/graph/recovery.rs` +
 //! `src/graph/replay.rs`) is different: a FRESH `MemGraph` has no history
 //! with the loaded CSR segments' generations, so its deterministic SlotMap
-//! allocation (index 0, generation 1 first) could otherwise numerically
-//! alias a persisted `external_id` -- silently shadowing a frozen node,
-//! since lookups here check the mutable tier first. The invariant is
-//! restored by two restart-only mechanisms: `recover_graph_store` seeds the
-//! post-recovery mutable tier via `MemGraph::with_id_offset` with a
-//! watermark one past the largest persisted `external_id` (so fresh keys
-//! can never collide), and `replay.rs`'s AddNode replay loop skips
-//! re-inserting any `node_id` already resident in a loaded segment (avoiding
-//! double enumeration when un-truncated WAL history replays a node that is
-//! already frozen). See `tests/graph_restart_id_aliasing.rs` for the
-//! regression coverage.
+//! allocation could otherwise numerically alias a persisted `external_id`.
+//! The invariant is restored on the recovery path: `recover_graph_store`
+//! restores the write buffer's id-allocation floors (manifest cursors plus
+//! every frozen `external_id`), WAL replay re-materializes nodes under their
+//! ORIGINAL logged ids (`add_node_with_id`, so client-cached handles survive
+//! a crash) and skips re-inserting any id already resident in a loaded
+//! segment. See `tests/graph_restart_id_aliasing.rs` and
+//! `tests/crash_recovery_graph_durability.rs` for the regression coverage.
 
 use std::sync::Arc;
 
@@ -57,9 +56,10 @@ impl<'a> MergedNodeView<'a> {
 
     /// Locate a frozen node: `(segment, CSR row)`. Mutable-tier nodes return
     /// `None` — callers that care about both tiers check `memgraph` first.
-    /// Newest segment wins on the (impossible-by-invariant) overlap.
+    /// Newest segment wins on overlap (a re-frozen copy-up shadow leaves a
+    /// stale row in an older segment); the list is ordered newest-first.
     pub fn segment_row(&self, key: NodeKey) -> Option<(&'a CsrStorage, u32)> {
-        for seg in self.segments.iter().rev() {
+        for seg in self.segments.iter() {
             if let Some(row) = seg.lookup_node(key) {
                 return Some((seg.as_ref(), row));
             }
@@ -170,6 +170,11 @@ impl<'a> MergedNodeView<'a> {
             }
             f(key);
         }
+        // Cross-segment dedup: a copy-up shadow that was later re-frozen
+        // leaves the SAME key in two segments (stale row in the old one).
+        // Property accessors resolve newest-segment-wins, so emitting the
+        // key once (whichever segment hits first) is sufficient.
+        let mut emitted = crate::graph::fasthash::FxHashSet::default();
         for seg in self.segments {
             let metas = seg.node_meta();
             match label {
@@ -184,7 +189,17 @@ impl<'a> MergedNodeView<'a> {
                         if !is_meta_visible(meta, snapshot_lsn, my_txn_id, committed, valid_at) {
                             continue;
                         }
-                        f(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+                        let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+                        // Copy-up shadow: the mutable tier overrides this row
+                        // (live shadow already emitted above; dead shadow =
+                        // tombstone).
+                        if self.memgraph.get_node(key).is_some() {
+                            continue;
+                        }
+                        if !emitted.insert(key) {
+                            continue;
+                        }
+                        f(key);
                     }
                 }
                 None => {
@@ -192,7 +207,14 @@ impl<'a> MergedNodeView<'a> {
                         if !is_meta_visible(meta, snapshot_lsn, my_txn_id, committed, valid_at) {
                             continue;
                         }
-                        f(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+                        let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+                        if self.memgraph.get_node(key).is_some() {
+                            continue;
+                        }
+                        if !emitted.insert(key) {
+                            continue;
+                        }
+                        f(key);
                     }
                 }
             }

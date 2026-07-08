@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
+### Added — parallel HNSW build + insert-path compaction trigger: time-to-index-green 11× (PR #237)
+
+- **`src/vector/hnsw/parallel_build.rs`** (new): concurrent HNSW
+  construction into one shared graph — per-node `parking_lot::Mutex`
+  adjacency (copy-under-lock, distance math unlocked; single lock held at a
+  time, deadlock-free by construction), entry point under a `RwLock`,
+  levels pre-generated from the same seeded LCG as the sequential builder,
+  sequential 1K warmup, then dynamic fan-out over an atomic cursor.
+  Finalize adds a connectivity repair pass (concurrent back-link pruning
+  orphaned ~0.2% of nodes = permanent recall loss; BFS + force-link makes
+  every node reachable, unit-asserted) and the exact same BFS-reorder →
+  `HnswGraph` path as the sequential builder — drop-in for search,
+  persistence, and GraphUnion merge. `compact()` routes builds ≥ 10K
+  vectors here; smaller segments keep the bitwise-deterministic
+  single-threaded builder. Measured (50K × 384d, 6-core Linux VM):
+  `FT.COMPACT` wall 30.2s → **2.71s**; a 24K segment build 14.1s →
+  **2.65s** (~88% scaling efficiency).
+- **Affinity-mask trap fixed (3 sites)**: shard threads are core-pinned and
+  every thread spawned from one inherits the SINGLE-core mask on Linux, so
+  `std::thread::available_parallelism()` returned 1 — the "parallel" build
+  ran at exactly sequential speed and the background-compactor pool sized
+  itself to one worker. New `shard::numa::system_parallelism()` (sysfs
+  online-CPU count, affinity-independent, cached) now sizes both; parallel
+  build workers and pool workers explicitly re-pin round-robin across the
+  machine (`pin_worker_to_core`), pool workers from the last core downward
+  so small builds stop time-slicing shard 0's core.
+- **`src/shard/spsc_handler.rs`**: HSET auto-index hook now calls
+  `try_compact()` after appending a vector — a pure bulk load (no
+  FT.SEARCH traffic) previously left everything in the brute-force mutable
+  tier until the autovacuum backstop's 30s tick, so the whole HNSW build
+  landed on the first explicit `FT.COMPACT`. Builds now start and install
+  DURING ingest (in-flight guard unchanged; respects
+  `FT.CONFIG AUTOCOMPACT OFF`). Red/green: new
+  `test_insert_path_triggers_background_compact_without_search`.
+- Net effect on the §10.8 losing metric (bulk load 50K × 384d → HNSW-tier
+  serving, VM): ~30s of post-ingest compaction becomes ~0 (already
+  compacted by measure time) — Moon's time-to-green now beats Qdrant's
+  optimizer on the same box (GCE re-validation pending). Multi-segment
+  recall@10 0.9986 vs 0.9992 single-segment (−0.0006, within the ≥0.99
+  gate); multi-shard verified (`--shards 4`: per-shard triggers, 9
+  segments, FT.COMPACT 1.57s).
+
 ### Docs — durability write-path benchmark results (PR #TBD)
 
 - `BENCHMARK.md` §7.3: new section recording the 2026-07-08 durability
@@ -505,7 +548,122 @@ path (below), or replay them on a pre-freeze build first and re-persist.
   HNSW bridge (heap-owned; mmap-backed sections count 0 per the
   `RawF16Store` precedent), keeping the elastic memory budget honest.
 
-### Changed — consolidated dependency bumps (PR #TBD)
+### Changed — graph engine wave 2: durability, Cypher coverage, hardening (PR #TBD)
+
+- **Durability (P0, found by GCP production-hardening soak):** graph data now
+  survives kill -9 under the DEFAULT disk-offload (WAL v3) configuration.
+  Two stacked pre-existing bugs erased graphs on crash: (A) v3 recovery
+  collected graph WAL commands into a throwaway replay engine — graph replay
+  was a complete no-op in v3 mode (a dedicated `replay_graph_wal_v3` boot
+  pass now applies them); (B) the checkpoint advanced the WAL replay floor
+  and recycled segments without ever snapshotting the graph store —
+  `save_graph_store` ran only on graceful shutdown and never persisted the
+  mutable tier (checkpoint finalize now freezes each graph's write buffer,
+  persists segments + a `snapshot_lsn` replay floor, and ABORTS the
+  checkpoint if the graph snapshot fails, keeping the old floor). The prior
+  crash suite ran exclusively with `--disk-offload disable`; new G4/G5
+  scenarios cover the default config with and without a checkpoint crossing.
+- **Durability:** stable external node/edge ids across WAL replay (handles
+  handed to clients before a crash resolve to the same rows after recovery);
+  Cypher `SET` property/label writes now emit WAL records
+  (`GRAPH.SETPROP`/`GRAPH.SETLABEL` — previously a documented durability gap:
+  SET mutations silently vanished on kill -9); new kill-9 crash-recovery
+  suite (`tests/crash_recovery_graph_durability.rs`: mutable tier, frozen
+  64K-edge tier rebuilt through replay-time freeze, double-crash idempotence).
+- **Cypher coverage:** aggregations `count`/`sum`/`avg`/`min`/`max`/`collect`
+  with implicit grouping, `DISTINCT`, and count-over-zero-rows semantics;
+  `OPTIONAL MATCH` null-pads unmatched expansions (previously compiled
+  silently to inner MATCH; unsupported shapes now reject loudly);
+  `WITH` rebinds the pipeline mid-query (aggregate + `WHERE`-as-HAVING,
+  `ORDER BY`/`SKIP`/`LIMIT` between WITH and RETURN; previously every clause
+  after WITH ran on an empty row stream). `WITH *` rejects loudly.
+- **Copy-up writes:** `SET`/`DELETE`/`MERGE` on frozen rows copy the row up
+  into the write buffer instead of silently missing the frozen tier.
+- **Query performance:** IndexScan range predicates (`WHERE n.p > x` prunes
+  via per-segment B-tree-ish numeric index, superset semantics + residual
+  filter); write-side plan cache (repeated write shapes skip parse+compile);
+  row-BFS fast path engages on multi-segment fully-frozen graphs (~4× vs
+  reader fallback, criterion-pinned); `Value::String` holds `Bytes` for a
+  zero-copy reply path; HYB-02/HYB-04 use the HNSW bridge with off-thread
+  bridge builds.
+- **Query performance — mutable-tier property index (task #31):** `MATCH
+  (a:N {id: X})` on the write buffer used to degrade to a full
+  `O(live_node_count)` linear scan even though `PhysicalOp::IndexScan` was
+  already the plan (profiling on the 5K-node/15K-edge Cypher point-query
+  bench put this scan at 82.5% of shard CPU — the mutable tier never
+  freezes below `edge_threshold`, default 64,000). A new incrementally
+  maintained `MutablePropertyIndex` (`src/graph/index.rs`, mirrors the
+  frozen tier's `SegmentPropertyIndexes` numeric-BTree/string-hash split,
+  keyed by `NodeKey`) turns the mutable-tail probe into an O(log N +
+  |result|) index seed; `index_scan_keys`'s residual label/MVCC/property
+  checks are unchanged (SUPERSET contract preserved, no planner changes).
+  `MemGraph::set_node_property`/`remove_node_property`/`undelete_node` are
+  now the single source of truth for node-property mutation, replacing 5
+  previously hand-rolled call sites (Cypher `SET`, MERGE ON CREATE/MATCH
+  SET, TXN.ABORT undo, WAL replay) that could silently let the index drift
+  from live state. Closes a TXN.ABORT `UndeleteNode` gap found during
+  design review: undoing a `DELETE` inside a transaction now re-indexes the
+  restored node instead of leaving it live but permanently unreachable by
+  index probes.
+- **Query performance — Cypher result cache (task #32):** read-only
+  `GRAPH.QUERY`/`GRAPH.RO_QUERY` now cache the fully-encoded RESP reply
+  bytes for repeated identical queries (same raw Cypher text + args),
+  keyed by `(query_hash, args_hash)` and served via the existing
+  `Frame::PreSerialized` passthrough — no new protocol variant needed, and
+  both RESP2 and RESP3 encodings are cached in separate slots so a
+  protocol-version switch is a clean miss rather than a stale re-encode.
+  Invalidation is a per-graph monotonic `write_gen: u64` bumped by
+  `NamedGraph::touch()` at every real mutation site (plain `GRAPH.ADDNODE`/
+  `GRAPH.ADDEDGE`, the Cypher write-plan mutation loop, `TS.*` temporal
+  invalidation, and TXN.ABORT rollback of graph undo-ops) — deliberately
+  NOT at `freeze_and_compact`, which reshapes storage without changing
+  query-visible content. The write_gen is captured before executing a
+  read and the encoded reply is only cached if it is still unchanged
+  after — a miss is always safe (SUPERSET semantics), so a benign race
+  just skips caching rather than serving stale data. Decayed queries and
+  errored/timed-out results are never cached. `ResultCache` is a bounded
+  per-graph LRU (256 entries / 4MiB default, `src/graph/cypher/
+  result_cache.rs`) whose resident bytes are folded into
+  `GraphStore::resident_bytes()`; dropping a graph (`GRAPH.DELETE`) drops
+  its cache with it. The cache is only consulted on the connection-local
+  dispatch path where the negotiated protocol version is reliably known
+  (`dispatch_graph_read`, threaded as `Option<u8>`); the cross-shard
+  `GraphCommand` hop and `graph_query_or_write`'s internal read-execute
+  calls pass `None` and bypass the cache entirely rather than risk an
+  unverified protocol version.
+- **Query performance — FTS reuse for Cypher text predicates (task #33):**
+  first-class `CONTAINS`/`STARTS WITH`/`ENDS WITH` Cypher operators (pure
+  syntax sugar over the existing `=~` byte-level checks — `src/graph/
+  cypher/lexer.rs`, `ast.rs`, `parser/expr.rs`, `executor/eval.rs`), plus a
+  new per-frozen-segment `SegmentTextIndex` (`src/graph/text_index.rs`,
+  lazy `OnceLock` + `resident_bytes` accounting, same pattern as
+  `SegmentPropertyIndexes`/`hnsw_bridge`) that accelerates `CONTAINS`/
+  `STARTS WITH`/`ENDS WITH`/`=~` conjuncts in `WHERE` (`planner.rs`'s new
+  `extract_text_conjuncts`, mirroring W2-3's `extract_range_conjuncts`).
+  Reuses `crate::text::posting::PostingStore`/`crate::text::bm25::
+  {FieldStats, bm25_score}`/`crate::text::term_dict::TermDictionary`
+  verbatim (already ID-space-agnostic, zero-fork). **Correctness note:**
+  the index prunes on PROPERTY PRESENCE only, not token identity — a
+  tokenized/stemmed/case-folded posting lookup cannot safely decide
+  substring/prefix/suffix containment (e.g. `CONTAINS 'rust'` must also
+  match `"trusted"`, which tokenizes to a different term entirely), so
+  `candidate_rows` returns every row whose target property is a
+  String/Bytes at all, and the existing residual `Filter` remains the sole
+  decider (SUPERSET contract, same as `prop_eq`/`prop_range`). The
+  MUTABLE tier gets no acceleration (falls back to an exact scan of the
+  write buffer, pre-approved scope decision — mirrors the pre-task-#31
+  numeric story); a `GraphUnion`-merged segment does not remap posting row
+  ids and simply rebuilds its text index lazily on first use post-merge.
+  `SegmentTextIndex::bm25_score_for` is a tested-but-unwired internal BM25
+  relevance-scoring hook (no Cypher `ORDER BY` grammar was specified for
+  it) — proves the `bm25_score` reuse end-to-end; surface syntax is a
+  documented follow-up.
+- **Operability:** traversal timeout is configurable — `--graph-timeout-ms`
+  server default plus per-query `GRAPH.QUERY ... TIMEOUT <ms>` (RedisGraph
+  parity, 0 = unlimited).
+- **Dead code:** cross-shard traverse scaffolding deleted (532 lines, no
+  sender existed); the single-shard-per-graph sharding model is now
+  documented in `src/graph/mod.rs`.
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →
   0.18.3 (semver-major; both compile and test green with no code changes —

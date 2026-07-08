@@ -1,12 +1,42 @@
-//! MemGraph -- mutable adjacency-list write buffer backed by SlotMap.
+//! MemGraph -- mutable adjacency-list write buffer with stable external ids.
 //!
 //! Absorbs graph writes at O(1) amortized cost per insert. Freezes into a
 //! `FrozenMemGraph` when the edge threshold is reached, enabling CSR conversion.
+//!
+//! Storage is `FxHashMap` keyed by monotonically allocated ids (in slotmap
+//! ffi encoding) rather than a `SlotMap`: WAL replay must re-materialize
+//! nodes/edges under the EXACT ids that were logged, and slot maps cannot
+//! insert at a chosen (index, generation) pair. Insertion order is kept in
+//! side vectors so iteration and freeze remain deterministic.
 
-use slotmap::{Key, SlotMap};
+use crate::graph::fasthash::FxHashMap;
+use crate::graph::index::MutablePropertyIndex;
 use smallvec::SmallVec;
 
-use crate::graph::types::{Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap};
+use crate::graph::types::{
+    Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap, PropertyValue,
+};
+
+/// First id handed out by a fresh MemGraph: index 1, version 1.
+///
+/// Ids live in slotmap's ffi encoding (`version << 32 | index`) so they
+/// round-trip through `KeyData::from_ffi`/`as_ffi` unchanged. slotmap 1.1
+/// forces the version odd on `from_ffi` (`(value >> 32) | 1`), so allocation
+/// stays in odd-version space; index 0 is skipped to avoid the encoding's
+/// degenerate all-zero key.
+const FIRST_ID: u64 = (1 << 32) | 1;
+
+/// Next id after `id` in odd-version ffi space. Rolls the 32-bit index over
+/// into `version + 2` (stays odd) before it can reach `u32::MAX` (slotmap's
+/// null-key index).
+#[inline]
+const fn next_id(id: u64) -> u64 {
+    if id as u32 >= u32::MAX - 1 {
+        ((id >> 32) + 2) << 32 | 1
+    } else {
+        id + 1
+    }
+}
 
 /// Errors returned by MemGraph operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,11 +56,22 @@ pub struct FrozenMemGraph {
     pub edges: Vec<(EdgeKey, MutableEdge)>,
 }
 
-/// Mutable graph segment backed by generational SlotMap indices.
+/// Mutable graph segment keyed by stable, monotonically allocated ids.
 #[derive(Debug)]
 pub struct MemGraph {
-    nodes: SlotMap<NodeKey, MutableNode>,
-    edges: SlotMap<EdgeKey, MutableEdge>,
+    nodes: FxHashMap<NodeKey, MutableNode>,
+    edges: FxHashMap<EdgeKey, MutableEdge>,
+    /// Insertion order of live-at-insert node keys (deterministic iteration
+    /// and freeze). May contain keys later removed from `nodes`.
+    node_order: Vec<NodeKey>,
+    /// Insertion order of edge keys (same contract as `node_order`).
+    edge_order: Vec<EdgeKey>,
+    /// Next node id to hand out (slotmap ffi encoding, odd version).
+    /// Monotonic across freeze/thaw — never reset, so post-freeze inserts can
+    /// never alias the external_ids of frozen CSR rows.
+    next_node_id: u64,
+    /// Next edge id to hand out (same encoding and monotonicity contract).
+    next_edge_id: u64,
     /// Adjacency (outgoing / incoming) for cross-tier "delta" edges whose
     /// endpoint was frozen into a CSR segment. A frozen endpoint has no
     /// `MutableNode` to carry inline adjacency, so its edge keys live here,
@@ -44,133 +85,46 @@ pub struct MemGraph {
     /// Edge count threshold that triggers freeze.
     edge_threshold: usize,
     frozen: bool,
-    /// Index-space watermark added to the raw SlotMap index of every
-    /// NodeKey this MemGraph hands out or accepts. See `with_id_offset` for
-    /// the full soundness argument. Zero (the default via `new`) makes the
-    /// translation the identity function -- the overwhelmingly common case
-    /// for graphs with no persisted (pre-restart) history.
-    id_offset: u32,
+    /// Incrementally-maintained property index over the mutable tier (Task
+    /// #31 — see `tmp/DESIGN-MUTABLE-PROP-INDEX.md`). Owned here (not on
+    /// `NamedGraph`) for the same single-writer, no-lock lifetime as
+    /// `nodes`/`node_order`. Maintained by `insert_node_at`, `remove_node`,
+    /// `set_node_property`, `remove_node_property`, `undelete_node`, and
+    /// wholesale-cleared at `freeze()`.
+    prop_index: MutablePropertyIndex,
 }
 
 impl MemGraph {
     /// Create an empty MemGraph with the given freeze threshold.
+    ///
+    /// Restart NodeKey-aliasing soundness (P0): node/edge ids are handed out
+    /// from explicit monotonic cursors (`next_node_id`/`next_edge_id`) that
+    /// recovery restores from the manifest AND floors past every frozen
+    /// `external_id` (`restore_id_cursors` + `ensure_node_id_floor`), while
+    /// WAL replay re-materializes nodes under their ORIGINAL logged ids
+    /// (`add_node_with_id`). A fresh post-restart insert therefore can never
+    /// mint a key that numerically aliases a persisted frozen row — the bug
+    /// the earlier SlotMap representation had (deterministic index counter
+    /// restarting at 0). See `tests/graph_restart_id_aliasing.rs`.
     pub fn new(edge_threshold: usize) -> Self {
-        Self::with_id_offset(edge_threshold, 0)
-    }
-
-    /// Create an empty MemGraph whose NodeKeys are all minted `id_offset`
-    /// above the raw SlotMap index.
-    ///
-    /// # Why this exists (soundness argument -- graph NodeKey aliasing, P0)
-    ///
-    /// `slotmap::SlotMap` key allocation is fully deterministic and a fresh
-    /// map's index counter always starts at 0
-    /// (`slotmap::basic::SlotMap::insert`, free_head/grow-path). After a
-    /// restart, WAL replay works against a fresh `MemGraph`
-    /// (`replay.rs::take_memgraph`), while CSR segments loaded from disk
-    /// carry `NodeMeta::external_id` values that are the raw
-    /// `slotmap::KeyData::as_ffi()` bits minted by the PRE-CRASH process's
-    /// SlotMap -- which also started at index 0. Without an offset, the
-    /// first node the fresh MemGraph mints gets `(idx=0, version=1)`,
-    /// bit-for-bit IDENTICAL to the pre-crash process's first-ever node key
-    /// if that node is still resident in a loaded CSR segment (the common
-    /// case whenever an AOF fold/WAL checkpoint truncates pre-freeze
-    /// history so replay only sees post-freeze commands). Every merged read
-    /// path (`MergedNodeView`) checks the mutable tier first, so the
-    /// aliasing new node would permanently and silently shadow the real
-    /// frozen node.
-    ///
-    /// ## Fix
-    ///
-    /// Shift the INDEX component (low 32 bits of `KeyData::as_ffi()`, see
-    /// `slotmap::KeyData::{as_ffi, from_ffi}` -- version occupies the high
-    /// 32 bits) of every key this MemGraph hands out by `id_offset`. The
-    /// caller (recovery.rs) chooses `id_offset` to be `> ` the largest index
-    /// component among ALL `external_id`s in the CSR segments it just
-    /// loaded for this graph:
-    /// - Outgoing (`add_node` return value, `iter_nodes` keys): raw SlotMap
-    ///   index + `id_offset` (see `to_public_key`).
-    /// - Incoming (any NodeKey parameter): raw index = public index -
-    ///   `id_offset`; underflow (public index < `id_offset`) means the key
-    ///   was never minted by THIS MemGraph -- it is a CSR-only (or foreign)
-    ///   key -- and is treated as "not resident", exactly the existing
-    ///   ghost / `NodeNotFound` semantics already used for non-resident
-    ///   endpoints (see `to_internal_key`).
-    ///
-    /// This costs two `u64` shifts per NodeKey touched (zero when
-    /// `id_offset == 0`) and precisely **zero** extra permanent memory:
-    /// the alternative of pre-consuming `id_offset` SlotMap slots via a
-    /// dummy-insert/remove cycle would permanently pin `id_offset`
-    /// live-or-vacant slot entries in the SlotMap's backing `Vec` (slotmap
-    /// never shrinks its storage) -- exactly the O(watermark) leak this
-    /// design avoids. It is also the only sound option: a dummy-cycle
-    /// approach only bumps a slot's *generation*, and persisted external_ids
-    /// may already carry an arbitrarily-bumped generation from pre-crash
-    /// slot churn, so a fixed number of dummy cycles cannot be proven to
-    /// out-run every possible persisted generation for a given index.
-    ///
-    /// ## Overflow
-    ///
-    /// If `idx + id_offset` would exceed `u32::MAX`, the public key
-    /// saturates at `u32::MAX` instead of wrapping (a wrapped index could
-    /// re-enter `[0, id_offset)` and alias a persisted `external_id` again).
-    /// This is an astronomical corner case (>4 billion prior nodes on one
-    /// graph) and degrades to "new inserts stop being independently
-    /// addressable" rather than corrupting existing data.
-    pub fn with_id_offset(edge_threshold: usize, id_offset: u32) -> Self {
         Self {
-            nodes: SlotMap::with_key(),
-            edges: SlotMap::with_key(),
+            nodes: FxHashMap::default(),
+            edges: FxHashMap::default(),
+            node_order: Vec::new(),
+            edge_order: Vec::new(),
+            next_node_id: FIRST_ID,
+            next_edge_id: FIRST_ID,
             ghost_out: std::collections::HashMap::new(),
             ghost_in: std::collections::HashMap::new(),
             live_node_count: 0,
             live_edge_count: 0,
             edge_threshold,
             frozen: false,
-            id_offset,
+            prop_index: MutablePropertyIndex::default(),
         }
     }
 
-    /// Translate a raw internal SlotMap `NodeKey` to the PUBLIC key handed
-    /// to callers (index + `id_offset`, version unchanged). Identity when
-    /// `id_offset == 0`. See `with_id_offset` for the soundness argument.
-    #[inline]
-    fn to_public_key(id_offset: u32, key: NodeKey) -> NodeKey {
-        if id_offset == 0 {
-            return key;
-        }
-        let ffi = key.data().as_ffi();
-        let idx = ffi as u32;
-        let version = ffi >> 32;
-        // Saturate rather than wrap: a wrapped index could re-enter
-        // [0, id_offset) and alias a persisted external_id again.
-        let public_idx = idx.saturating_add(id_offset);
-        NodeKey::from(slotmap::KeyData::from_ffi(
-            (version << 32) | u64::from(public_idx),
-        ))
-    }
-
-    /// Translate a PUBLIC `NodeKey` (offset applied) to the raw internal
-    /// SlotMap key used to index `self.nodes`. Returns `None` if the public
-    /// index is below `id_offset` -- such a key was never minted by this
-    /// MemGraph (it belongs to a CSR segment or a foreign graph) and must be
-    /// treated as non-resident, matching the existing ghost / NodeNotFound
-    /// semantics for non-resident endpoints. Identity when `id_offset == 0`.
-    #[inline]
-    fn to_internal_key(id_offset: u32, key: NodeKey) -> Option<NodeKey> {
-        if id_offset == 0 {
-            return Some(key);
-        }
-        let ffi = key.data().as_ffi();
-        let idx = ffi as u32;
-        let version = ffi >> 32;
-        let internal_idx = idx.checked_sub(id_offset)?;
-        Some(NodeKey::from(slotmap::KeyData::from_ffi(
-            (version << 32) | u64::from(internal_idx),
-        )))
-    }
-
-    /// Insert a new node. Returns the generational (public) key.
+    /// Insert a new node under a freshly allocated stable id.
     pub fn add_node(
         &mut self,
         labels: SmallVec<[u16; 4]>,
@@ -178,20 +132,119 @@ impl MemGraph {
         embedding: Option<Vec<f32>>,
         lsn: u64,
     ) -> NodeKey {
-        let key = self.nodes.insert(MutableNode {
+        let id = self.next_node_id;
+        self.next_node_id = next_id(id);
+        self.insert_node_at(
+            NodeKey::from(slotmap::KeyData::from_ffi(id)),
             labels,
-            outgoing: SmallVec::new(),
-            incoming: SmallVec::new(),
             properties,
             embedding,
-            created_lsn: lsn,
-            deleted_lsn: u64::MAX,
-            txn_id: 0,
-            valid_from: 0,
-            valid_to: i64::MAX,
-        });
-        self.live_node_count += 1;
-        Self::to_public_key(self.id_offset, key)
+            lsn,
+        )
+    }
+
+    /// Insert a new node under a CALLER-CHOSEN id (WAL replay: the id that
+    /// was logged at original execution). Bumps the allocation floor past
+    /// `node_id` so later `add_node` calls can never alias it. Replaces any
+    /// existing entry under the same id (replay is authoritative).
+    pub fn add_node_with_id(
+        &mut self,
+        node_id: u64,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+        lsn: u64,
+    ) -> NodeKey {
+        self.ensure_node_id_floor(node_id);
+        self.insert_node_at(
+            NodeKey::from(slotmap::KeyData::from_ffi(node_id)),
+            labels,
+            properties,
+            embedding,
+            lsn,
+        )
+    }
+
+    /// Raise the node-id allocation floor above `node_id` (no-op if already
+    /// above). Used when frozen CSR external_ids are re-seeded at recovery.
+    pub fn ensure_node_id_floor(&mut self, node_id: u64) {
+        if node_id >= self.next_node_id {
+            self.next_node_id = next_id(node_id);
+        }
+    }
+
+    /// Raise the edge-id allocation floor above `edge_id`.
+    pub fn ensure_edge_id_floor(&mut self, edge_id: u64) {
+        if edge_id >= self.next_edge_id {
+            self.next_edge_id = next_id(edge_id);
+        }
+    }
+
+    /// Current allocation cursors `(next_node_id, next_edge_id)` — persisted
+    /// in the graph manifest so a restart resumes allocation past every id
+    /// ever handed out (WAL-truncation-safe).
+    pub fn id_cursors(&self) -> (u64, u64) {
+        (self.next_node_id, self.next_edge_id)
+    }
+
+    /// Restore persisted allocation cursors. Values are `next_*` cursors
+    /// (NOT handed-out ids — see `ensure_*_id_floor` for those). Only ever
+    /// raises; `0` (pre-cursor manifest) is a no-op.
+    pub fn restore_id_cursors(&mut self, next_node_id: u64, next_edge_id: u64) {
+        if next_node_id > self.next_node_id {
+            self.next_node_id = next_node_id;
+        }
+        if next_edge_id > self.next_edge_id {
+            self.next_edge_id = next_edge_id;
+        }
+    }
+
+    fn insert_node_at(
+        &mut self,
+        key: NodeKey,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+        lsn: u64,
+    ) -> NodeKey {
+        // Index the NEW properties before the move below so a fresh insert
+        // never has a transient window with zero index presence.
+        self.prop_index.index_node(key, &properties);
+        let prev = self.nodes.insert(
+            key,
+            MutableNode {
+                labels,
+                outgoing: SmallVec::new(),
+                incoming: SmallVec::new(),
+                properties,
+                embedding,
+                created_lsn: lsn,
+                deleted_lsn: u64::MAX,
+                txn_id: 0,
+                valid_from: 0,
+                valid_to: i64::MAX,
+            },
+        );
+        match prev {
+            Some(old) => {
+                // Replaced-in-place (replay overwrite): order entry already
+                // present; only fix the live count if the old entry was dead.
+                if old.deleted_lsn != u64::MAX {
+                    self.live_node_count += 1;
+                }
+                // Undo the double-index from a replace: the OLD value's
+                // bucket entry must not dangle when the same id is
+                // replayed twice under different property values. Harmless
+                // no-op if `old` was already dead (its properties were
+                // already unindexed by `remove_node`'s soft-delete).
+                self.prop_index.unindex_node(key, &old.properties);
+            }
+            None => {
+                self.node_order.push(key);
+                self.live_node_count += 1;
+            }
+        }
+        key
     }
 
     /// Insert a new edge between `src` and `dst`. Validates both exist and are alive.
@@ -210,33 +263,21 @@ impl MemGraph {
         if src == dst {
             return Err(GraphError::SelfLoop);
         }
-        // Translate PUBLIC keys to raw internal SlotMap keys. Translation
-        // failure (offset underflow) means the key was never minted by this
-        // MemGraph -- treat exactly like "not resident" (`add_edge` does not
+        // Validate both nodes exist and are alive (`add_edge` does not
         // support cross-tier endpoints; use `add_edge_across_tiers`).
-        let Some(src_i) = Self::to_internal_key(self.id_offset, src) else {
-            return Err(GraphError::NodeNotFound);
-        };
-        let Some(dst_i) = Self::to_internal_key(self.id_offset, dst) else {
-            return Err(GraphError::NodeNotFound);
-        };
-        // Validate both nodes exist and are alive.
         let src_alive = self
             .nodes
-            .get(src_i)
+            .get(&src)
             .map_or(false, |n| n.deleted_lsn == u64::MAX);
         let dst_alive = self
             .nodes
-            .get(dst_i)
+            .get(&dst)
             .map_or(false, |n| n.deleted_lsn == u64::MAX);
         if !src_alive || !dst_alive {
             return Err(GraphError::NodeNotFound);
         }
 
-        let ek = self.edges.insert(MutableEdge {
-            // Stored as PUBLIC keys: `MutableEdge.src/dst` are the identity
-            // callers (freeze(), neighbors()) compare against, matching
-            // `add_node`'s return value and CSR `external_id`s.
+        let ek = self.insert_edge_fresh(MutableEdge {
             src,
             dst,
             edge_type,
@@ -254,14 +295,25 @@ impl MemGraph {
 
         // Push edge key into src.outgoing and dst.incoming.
         // Both are validated alive above, so get_mut is safe.
-        if let Some(src_node) = self.nodes.get_mut(src_i) {
+        if let Some(src_node) = self.nodes.get_mut(&src) {
             src_node.outgoing.push(ek);
         }
-        if let Some(dst_node) = self.nodes.get_mut(dst_i) {
+        if let Some(dst_node) = self.nodes.get_mut(&dst) {
             dst_node.incoming.push(ek);
         }
         self.live_edge_count += 1;
         Ok(ek)
+    }
+
+    /// Insert an edge under a freshly allocated stable id and record its
+    /// insertion order. Does NOT touch adjacency or live counts.
+    fn insert_edge_fresh(&mut self, edge: MutableEdge) -> EdgeKey {
+        let id = self.next_edge_id;
+        self.next_edge_id = next_id(id);
+        let ek = EdgeKey::from(slotmap::KeyData::from_ffi(id));
+        self.edges.insert(ek, edge);
+        self.edge_order.push(ek);
+        ek
     }
 
     /// Insert an edge whose endpoints may live in the frozen CSR tier
@@ -280,29 +332,55 @@ impl MemGraph {
         properties: Option<PropertyMap>,
         lsn: u64,
     ) -> Result<EdgeKey, GraphError> {
+        self.add_edge_across_tiers_at(None, src, dst, edge_type, weight, properties, lsn)
+    }
+
+    /// `add_edge_across_tiers` under a CALLER-CHOSEN edge id (WAL replay).
+    /// Bumps the edge-id allocation floor past `edge_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_edge_across_tiers_with_id(
+        &mut self,
+        edge_id: u64,
+        src: NodeKey,
+        dst: NodeKey,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+        lsn: u64,
+    ) -> Result<EdgeKey, GraphError> {
+        self.ensure_edge_id_floor(edge_id);
+        let ek = EdgeKey::from(slotmap::KeyData::from_ffi(edge_id));
+        self.add_edge_across_tiers_at(Some(ek), src, dst, edge_type, weight, properties, lsn)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_edge_across_tiers_at(
+        &mut self,
+        chosen: Option<EdgeKey>,
+        src: NodeKey,
+        dst: NodeKey,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+        lsn: u64,
+    ) -> Result<EdgeKey, GraphError> {
         if self.frozen {
             return Err(GraphError::AlreadyFrozen);
         }
         if src == dst {
             return Err(GraphError::SelfLoop);
         }
-        // Translate PUBLIC keys to internal SlotMap keys where possible.
-        // `None` (translation underflow, or a key genuinely absent from this
-        // MemGraph) means non-resident -- caller-verified via the CSR tier.
-        let src_i = Self::to_internal_key(self.id_offset, src);
-        let dst_i = Self::to_internal_key(self.id_offset, dst);
-        // Resident endpoints must be alive; non-resident are caller-verified.
-        for key_i in [src_i, dst_i].into_iter().flatten() {
-            if let Some(n) = self.nodes.get(key_i) {
+        // Resident endpoints must be alive; non-resident are caller-verified
+        // via the CSR tier (delta edge).
+        for key in [src, dst] {
+            if let Some(n) = self.nodes.get(&key) {
                 if n.deleted_lsn != u64::MAX {
                     return Err(GraphError::NodeNotFound);
                 }
             }
         }
 
-        let ek = self.edges.insert(MutableEdge {
-            // PUBLIC keys: ghost_out/ghost_in are keyed by public identity
-            // too (a non-resident endpoint has no internal key at all).
+        let edge = MutableEdge {
             src,
             dst,
             edge_type,
@@ -314,13 +392,33 @@ impl MemGraph {
             valid_from: 0,
             valid_to: i64::MAX,
             created_ms: crate::storage::entry::current_time_ms(),
-        });
+        };
+        let ek = match chosen {
+            Some(ek) => {
+                match self.edges.insert(ek, edge) {
+                    None => self.edge_order.push(ek),
+                    Some(old) => {
+                        // Replay overwrite of an identical logged edge id:
+                        // adjacency already points at `ek`; keep counts
+                        // consistent (the +1 below re-adds a live entry).
+                        if old.deleted_lsn == u64::MAX {
+                            self.live_edge_count = self.live_edge_count.saturating_sub(1);
+                        }
+                        // Skip the adjacency pushes — already linked.
+                        self.live_edge_count += 1;
+                        return Ok(ek);
+                    }
+                }
+                ek
+            }
+            None => self.insert_edge_fresh(edge),
+        };
 
-        match src_i.and_then(|k| self.nodes.get_mut(k)) {
+        match self.nodes.get_mut(&src) {
             Some(src_node) => src_node.outgoing.push(ek),
             None => self.ghost_out.entry(src).or_default().push(ek),
         }
-        match dst_i.and_then(|k| self.nodes.get_mut(k)) {
+        match self.nodes.get_mut(&dst) {
             Some(dst_node) => dst_node.incoming.push(ek),
             None => self.ghost_in.entry(dst).or_default().push(ek),
         }
@@ -330,10 +428,7 @@ impl MemGraph {
 
     /// Soft-delete a node and all its incident edges.
     pub fn remove_node(&mut self, key: NodeKey, lsn: u64) -> bool {
-        let Some(internal) = Self::to_internal_key(self.id_offset, key) else {
-            return false;
-        };
-        let Some(node) = self.nodes.get_mut(internal) else {
+        let Some(node) = self.nodes.get_mut(&key) else {
             return false;
         };
         if node.deleted_lsn != u64::MAX {
@@ -350,9 +445,16 @@ impl MemGraph {
             .copied()
             .collect();
 
+        // Soft-delete removes the node from live property-index candidacy.
+        // Disjoint-field borrow: `node` borrows `self.nodes` via `get_mut`,
+        // `self.prop_index` is a distinct field — legal without
+        // restructuring since both accesses go through explicit field
+        // projections, not an opaque `self.foo()` call.
+        self.prop_index.unindex_node(key, &node.properties);
+
         // Soft-delete all incident edges.
         for ek in edge_keys {
-            if let Some(edge) = self.edges.get_mut(ek) {
+            if let Some(edge) = self.edges.get_mut(&ek) {
                 if edge.deleted_lsn == u64::MAX {
                     edge.deleted_lsn = lsn;
                     self.live_edge_count = self.live_edge_count.saturating_sub(1);
@@ -364,7 +466,7 @@ impl MemGraph {
 
     /// Soft-delete a single edge.
     pub fn remove_edge(&mut self, key: EdgeKey, lsn: u64) -> bool {
-        let Some(edge) = self.edges.get_mut(key) else {
+        let Some(edge) = self.edges.get_mut(&key) else {
             return false;
         };
         if edge.deleted_lsn != u64::MAX {
@@ -386,24 +488,107 @@ impl MemGraph {
 
     /// O(1) node lookup by key.
     pub fn get_node(&self, key: NodeKey) -> Option<&MutableNode> {
-        let internal = Self::to_internal_key(self.id_offset, key)?;
-        self.nodes.get(internal)
+        self.nodes.get(&key)
     }
 
     /// O(1) mutable node lookup by key.
     pub fn get_node_mut(&mut self, key: NodeKey) -> Option<&mut MutableNode> {
-        let internal = Self::to_internal_key(self.id_offset, key)?;
-        self.nodes.get_mut(internal)
+        self.nodes.get_mut(&key)
     }
 
     /// O(1) edge lookup by key.
     pub fn get_edge(&self, key: EdgeKey) -> Option<&MutableEdge> {
-        self.edges.get(key)
+        self.edges.get(&key)
     }
 
     /// O(1) mutable edge lookup by key.
     pub fn get_edge_mut(&mut self, key: EdgeKey) -> Option<&mut MutableEdge> {
-        self.edges.get_mut(key)
+        self.edges.get_mut(&key)
+    }
+
+    /// Set (insert-or-overwrite) a node's property, keeping the mutable-tier
+    /// property index in sync. Returns the OLD value (`None` if the node was
+    /// missing OR the property was newly added — same "no prior value"
+    /// signal callers already treat identically for undo/WAL bookkeeping).
+    ///
+    /// Single source of truth for node-property mutation: every call site
+    /// that used to hand-roll a find-and-replace-or-push on
+    /// `MutableNode.properties` (SET clause, MERGE ON CREATE/MATCH SET,
+    /// TXN.ABORT undo, WAL replay) MUST route through this method instead,
+    /// or the property index silently goes stale.
+    pub fn set_node_property(
+        &mut self,
+        key: NodeKey,
+        pid: u16,
+        value: PropertyValue,
+    ) -> Option<PropertyValue> {
+        let node = self.nodes.get_mut(&key)?;
+        let old = node
+            .properties
+            .iter()
+            .find(|(k, _)| *k == pid)
+            .map(|(_, v)| v.clone());
+        match node.properties.iter_mut().find(|(k, _)| *k == pid) {
+            Some(entry) => entry.1 = value.clone(),
+            None => node.properties.push((pid, value.clone())),
+        }
+        if let Some(old_v) = &old {
+            self.prop_index.remove(pid, old_v, key);
+        }
+        self.prop_index.insert(pid, &value, key);
+        old
+    }
+
+    /// Remove a property entirely, keeping the mutable-tier index in sync.
+    /// Returns the removed value, if any (TXN.ABORT's "property did not
+    /// exist before SET" undo branch; also the future landing spot for a
+    /// Cypher `REMOVE n.prop` clause, which does not exist yet).
+    pub fn remove_node_property(&mut self, key: NodeKey, pid: u16) -> Option<PropertyValue> {
+        let node = self.nodes.get_mut(&key)?;
+        let removed = node
+            .properties
+            .iter()
+            .position(|(k, _)| *k == pid)
+            .map(|i| node.properties.remove(i).1);
+        if let Some(v) = &removed {
+            self.prop_index.remove(pid, v, key);
+        }
+        removed
+    }
+
+    /// Un-soft-delete a node previously removed at `delete_lsn` (TXN.ABORT's
+    /// `UndeleteNode` undo), re-indexing its CURRENT properties. Returns
+    /// `false` (no-op) unless the node is soft-deleted at EXACTLY
+    /// `delete_lsn` — idempotent re-entry guard, same contract the call site
+    /// enforced by hand before this method centralized it.
+    ///
+    /// This closes a gap a naive `deleted_lsn = u64::MAX` flip would leave:
+    /// `remove_node` unindexes on soft-delete, so undoing that delete
+    /// without re-indexing would leave the node live but permanently
+    /// invisible to `MATCH {prop: val}` index probes.
+    pub fn undelete_node(&mut self, key: NodeKey, delete_lsn: u64) -> bool {
+        let Some(node) = self.nodes.get_mut(&key) else {
+            return false;
+        };
+        if node.deleted_lsn != delete_lsn {
+            return false;
+        }
+        node.deleted_lsn = u64::MAX;
+        self.live_node_count += 1;
+        self.prop_index.index_node(key, &node.properties);
+        true
+    }
+
+    /// Zero-alloc equality probe into the mutable-tier property index. See
+    /// `MutablePropertyIndex::keys_eq`.
+    pub fn prop_index_keys_eq(&self, pid: u16, value: &PropertyValue) -> &[NodeKey] {
+        self.prop_index.keys_eq(pid, value)
+    }
+
+    /// Range probe into the mutable-tier property index (allocates). See
+    /// `MutablePropertyIndex::keys_range`.
+    pub fn prop_index_keys_range(&self, pid: u16, min: f64, max: f64) -> Vec<NodeKey> {
+        self.prop_index.keys_range(pid, min, max)
     }
 
     /// Returns neighbors of `node` visible at the given `lsn`, filtered by direction.
@@ -411,8 +596,7 @@ impl MemGraph {
     /// Yields `(EdgeKey, NodeKey)` pairs -- the edge and the neighbor node.
     /// No heap allocation: iterates over borrowed SmallVec adjacency lists.
     pub fn neighbors(&self, node: NodeKey, direction: Direction, lsn: u64) -> NeighborIter<'_> {
-        let internal = Self::to_internal_key(self.id_offset, node);
-        let Some(n) = internal.and_then(|k| self.nodes.get(k)) else {
+        let Some(n) = self.nodes.get(&node) else {
             // Non-resident (frozen) node: serve delta-edge adjacency from the
             // ghost maps so cross-tier edges are traversable from BOTH ends.
             let ghost_out = match direction {
@@ -455,19 +639,31 @@ impl MemGraph {
         }
     }
 
-    /// Iterate over all live (non-deleted) nodes. Yields `(NodeKey, &MutableNode)`
-    /// with PUBLIC keys (offset applied) -- matching `add_node`'s return value.
+    /// Iterate over all live (non-deleted) nodes in insertion order.
+    /// Yields `(NodeKey, &MutableNode)`.
     pub fn iter_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
-        let id_offset = self.id_offset;
-        self.nodes
+        self.node_order
             .iter()
+            .filter_map(move |k| self.nodes.get(k).map(|n| (*k, n)))
             .filter(|(_, n)| n.deleted_lsn == u64::MAX)
-            .map(move |(k, n)| (Self::to_public_key(id_offset, k), n))
     }
 
-    /// Iterate over all live (non-deleted) edges. Yields `(EdgeKey, &MutableEdge)`.
+    /// Iterate over all live (non-deleted) edges in insertion order.
+    /// Yields `(EdgeKey, &MutableEdge)`.
     pub fn iter_edges(&self) -> impl Iterator<Item = (EdgeKey, &MutableEdge)> {
-        self.edges.iter().filter(|(_, e)| e.deleted_lsn == u64::MAX)
+        self.edge_order
+            .iter()
+            .filter_map(move |k| self.edges.get(k).map(|e| (*k, e)))
+            .filter(|(_, e)| e.deleted_lsn == u64::MAX)
+    }
+
+    /// Iterate over all soft-deleted nodes in insertion order (copy-up
+    /// tombstone bookkeeping at freeze time).
+    pub fn iter_dead_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
+        self.node_order
+            .iter()
+            .filter_map(move |k| self.nodes.get(k).map(|n| (*k, n)))
+            .filter(|(_, n)| n.deleted_lsn != u64::MAX)
     }
 
     /// Number of live (non-deleted) nodes. O(1) via maintained counter.
@@ -498,10 +694,7 @@ impl MemGraph {
     /// were cascade-deleted at `lsn` by `remove_node`. Restores `deleted_lsn`
     /// to `u64::MAX` and increments `live_edge_count` for each restored edge.
     pub fn undelete_edges_at_lsn(&mut self, node: NodeKey, lsn: u64) {
-        let Some(internal) = Self::to_internal_key(self.id_offset, node) else {
-            return;
-        };
-        let Some(n) = self.nodes.get(internal) else {
+        let Some(n) = self.nodes.get(&node) else {
             return;
         };
         let edge_keys: SmallVec<[EdgeKey; 16]> = n
@@ -511,7 +704,7 @@ impl MemGraph {
             .copied()
             .collect();
         for ek in edge_keys {
-            if let Some(edge) = self.edges.get_mut(ek) {
+            if let Some(edge) = self.edges.get_mut(&ek) {
                 if edge.deleted_lsn == lsn {
                     edge.deleted_lsn = u64::MAX;
                     self.live_edge_count += 1;
@@ -520,12 +713,16 @@ impl MemGraph {
         }
     }
 
-    /// Resident bytes used by the in-memory adjacency lists (nodes + edges
-    /// slot maps). Approximation based on slot-map capacity and struct sizes.
+    /// Resident bytes used by the in-memory adjacency maps (nodes + edges).
+    /// Approximation based on map capacity and struct sizes.
     pub fn resident_bytes(&self) -> usize {
-        let node_bytes = self.nodes.capacity() * std::mem::size_of::<MutableNode>();
-        let edge_bytes = self.edges.capacity() * std::mem::size_of::<MutableEdge>();
-        node_bytes + edge_bytes
+        let node_bytes = self.nodes.capacity()
+            * (std::mem::size_of::<MutableNode>() + std::mem::size_of::<NodeKey>())
+            + self.node_order.capacity() * std::mem::size_of::<NodeKey>();
+        let edge_bytes = self.edges.capacity()
+            * (std::mem::size_of::<MutableEdge>() + std::mem::size_of::<EdgeKey>())
+            + self.edge_order.capacity() * std::mem::size_of::<EdgeKey>();
+        node_bytes + edge_bytes + self.prop_index.resident_bytes()
     }
 
     /// Whether the MemGraph should be frozen (threshold reached).
@@ -549,51 +746,57 @@ impl MemGraph {
         }
         self.frozen = true;
 
+        // The property index is derived entirely from `self.nodes`, which
+        // this function unconditionally drains in full below (dead or
+        // alive) — clear it up front rather than per-node: O(#buckets), not
+        // O(#nodes * #props), and correct because nothing reads the index
+        // between here and the drain completing (single-threaded, no
+        // background compaction thread for graphs).
+        self.prop_index.clear();
+
         // Partition edges BEFORE draining nodes (residency check needs the
-        // slot map): live + both endpoints resident → freeze into CSR;
+        // node map): live + both endpoints resident → freeze into CSR;
         // live + any frozen-elsewhere endpoint → retain as delta;
-        // dead → drop.
+        // dead → drop. Insertion order preserved via edge_order.
         let mut freeze_keys: Vec<EdgeKey> = Vec::new();
         let mut dead_keys: Vec<EdgeKey> = Vec::new();
-        let id_offset = self.id_offset;
-        // `e.src`/`e.dst` are PUBLIC keys; translate to internal before
-        // checking slot-map residency.
-        let is_resident = |nodes: &SlotMap<NodeKey, MutableNode>, key: NodeKey| {
-            Self::to_internal_key(id_offset, key).is_some_and(|k| nodes.contains_key(k))
-        };
-        for (ek, e) in self.edges.iter() {
+        for ek in &self.edge_order {
+            let Some(e) = self.edges.get(ek) else {
+                continue;
+            };
             if e.deleted_lsn != u64::MAX {
-                dead_keys.push(ek);
-            } else if is_resident(&self.nodes, e.src) && is_resident(&self.nodes, e.dst) {
-                freeze_keys.push(ek);
+                dead_keys.push(*ek);
+            } else if self.nodes.contains_key(&e.src) && self.nodes.contains_key(&e.dst) {
+                freeze_keys.push(*ek);
             }
         }
         for ek in dead_keys {
-            self.edges.remove(ek);
+            self.edges.remove(&ek);
         }
         let edges: Vec<(EdgeKey, MutableEdge)> = freeze_keys
             .into_iter()
-            .filter_map(|ek| self.edges.remove(ek).map(|e| (ek, e)))
+            .filter_map(|ek| self.edges.remove(&ek).map(|e| (ek, e)))
             .collect();
+        self.edge_order.retain(|ek| self.edges.contains_key(ek));
 
-        // `drain()` yields raw internal keys -- translate to PUBLIC before
-        // handing them to CSR conversion (they become `NodeMeta::external_id`
-        // and must match the identity every other reference to this node
-        // uses: node_map, ghost adjacency, edge endpoints).
-        let nodes: Vec<(NodeKey, MutableNode)> = self
-            .nodes
-            .drain()
-            .filter(|(_, n)| n.deleted_lsn == u64::MAX)
-            .map(|(k, n)| (Self::to_public_key(id_offset, k), n))
-            .collect();
+        let mut nodes: Vec<(NodeKey, MutableNode)> = Vec::with_capacity(self.nodes.len());
+        for nk in self.node_order.drain(..) {
+            if let Some(n) = self.nodes.remove(&nk) {
+                if n.deleted_lsn == u64::MAX {
+                    nodes.push((nk, n));
+                }
+            }
+        }
 
         // Rebuild ghost adjacency for the retained delta edges: with the
-        // node slot map drained, EVERY endpoint is now non-resident.
+        // node map drained, EVERY endpoint is now non-resident.
         self.ghost_out.clear();
         self.ghost_in.clear();
-        for (ek, e) in self.edges.iter() {
-            self.ghost_out.entry(e.src).or_default().push(ek);
-            self.ghost_in.entry(e.dst).or_default().push(ek);
+        for ek in &self.edge_order {
+            if let Some(e) = self.edges.get(ek) {
+                self.ghost_out.entry(e.src).or_default().push(*ek);
+                self.ghost_in.entry(e.dst).or_default().push(*ek);
+            }
         }
 
         Ok(FrozenMemGraph { nodes, edges })
@@ -601,12 +804,15 @@ impl MemGraph {
 
     /// Re-arm a drained MemGraph for writes after a successful freeze.
     ///
-    /// Keeps the SAME slot maps (drain bumps each vacated slot's generation,
-    /// so keys handed out after thaw can never collide with the external_ids
-    /// of frozen CSR rows). Replacing the MemGraph with a fresh one instead
-    /// would restart SlotMap allocation at the same (index, generation) pairs
-    /// and silently alias new nodes onto frozen rows.
+    /// The monotonic id counters are NOT reset, so keys handed out after
+    /// thaw can never collide with the external_ids of frozen CSR rows.
+    /// (Replacing the MemGraph with a fresh one instead would restart
+    /// allocation at FIRST_ID and silently alias new nodes onto frozen rows.)
     pub fn thaw(&mut self) {
+        debug_assert!(
+            self.prop_index.is_empty(),
+            "prop_index must be empty after freeze() drained all nodes"
+        );
         self.frozen = false;
         // Post-freeze contents: zero nodes, retained delta edges (all live —
         // freeze removed dead ones).
@@ -617,7 +823,7 @@ impl MemGraph {
 
 /// Zero-allocation neighbor iterator. Borrows from MemGraph's SmallVec adjacency lists.
 pub struct NeighborIter<'a> {
-    edges: &'a SlotMap<EdgeKey, MutableEdge>,
+    edges: &'a FxHashMap<EdgeKey, MutableEdge>,
     out_iter: core::slice::Iter<'a, EdgeKey>,
     in_iter: core::slice::Iter<'a, EdgeKey>,
     lsn: u64,
@@ -650,7 +856,7 @@ impl<'a> Iterator for NeighborIter<'a> {
         };
         loop {
             if let Some(&ek) = self.out_iter.next() {
-                if let Some(edge) = self.edges.get(ek) {
+                if let Some(edge) = self.edges.get(&ek) {
                     if is_visible(edge) {
                         return Some((ek, edge.dst));
                     }
@@ -658,7 +864,7 @@ impl<'a> Iterator for NeighborIter<'a> {
                 continue;
             }
             if let Some(&ek) = self.in_iter.next() {
-                if let Some(edge) = self.edges.get(ek) {
+                if let Some(edge) = self.edges.get(&ek) {
                     if is_visible(edge) {
                         return Some((ek, edge.src));
                     }
@@ -890,6 +1096,130 @@ mod tests {
         assert_eq!(
             g.add_edge(a, b, 1, 1.0, None, 3).unwrap_err(),
             GraphError::NodeNotFound
+        );
+    }
+
+    // --- MutablePropertyIndex maintenance-hook tests (Task #31) ---
+
+    use crate::graph::types::PropertyValue;
+
+    fn id_props(id: i64) -> PropertyMap {
+        smallvec![(0u16, PropertyValue::Int(id))]
+    }
+
+    #[test]
+    fn test_add_node_populates_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(42), None, 1);
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(42)), &[a]);
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(43)).is_empty());
+    }
+
+    #[test]
+    fn test_remove_node_clears_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(42), None, 1);
+        g.remove_node(a, 2);
+        assert!(
+            g.prop_index_keys_eq(0, &PropertyValue::Int(42)).is_empty(),
+            "soft-deleted node must not remain an index candidate"
+        );
+    }
+
+    #[test]
+    fn test_replay_overwrite_unindexes_old_properties() {
+        // Simulates WAL replay: the SAME node id is (re-)inserted twice
+        // under different property values. This is the leak edge case the
+        // `Some(old)` branch in `insert_node_at` exists to close.
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node_with_id((1u64 << 32) | 1, smallvec![0], id_props(1), None, 1);
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)), &[a]);
+
+        let a2 = g.add_node_with_id((1u64 << 32) | 1, smallvec![0], id_props(2), None, 2);
+        assert_eq!(a, a2, "same ffi id must re-materialize the same NodeKey");
+
+        assert!(
+            g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty(),
+            "old value's bucket must not dangle after a replay overwrite"
+        );
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(2)), &[a]);
+    }
+
+    #[test]
+    fn test_freeze_clears_prop_index() {
+        let mut g = MemGraph::new(1000);
+        g.add_node(smallvec![0], id_props(1), None, 1);
+        g.add_node(smallvec![0], id_props(2), None, 1);
+        g.freeze().expect("freeze ok");
+        assert!(g.prop_index.is_empty());
+        // thaw()'s debug_assert must not fire (stays empty post-thaw).
+        g.thaw();
+        assert!(g.prop_index.is_empty());
+    }
+
+    #[test]
+    fn test_set_node_property_moves_index_entry() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        let old = g.set_node_property(a, 0, PropertyValue::Int(2));
+        assert_eq!(old, Some(PropertyValue::Int(1)));
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(2)), &[a]);
+    }
+
+    #[test]
+    fn test_set_node_property_new_key_returns_none() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+        let old = g.set_node_property(a, 5, PropertyValue::Int(9));
+        assert_eq!(old, None);
+        assert_eq!(g.prop_index_keys_eq(5, &PropertyValue::Int(9)), &[a]);
+    }
+
+    #[test]
+    fn test_remove_node_property_clears_index_entry() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(7), None, 1);
+        let removed = g.remove_node_property(a, 0);
+        assert_eq!(removed, Some(PropertyValue::Int(7)));
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(7)).is_empty());
+        assert_eq!(g.get_node(a).expect("node").properties.len(), 0);
+    }
+
+    #[test]
+    fn test_undelete_node_reindexes_properties() {
+        // Targets the TXN.ABORT UndeleteNode gap (design doc risk #6): a
+        // naive `deleted_lsn = u64::MAX` flip without re-indexing would
+        // leave the node live but invisible to index probes forever.
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        g.remove_node(a, 5);
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+
+        assert!(g.undelete_node(a, 5));
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)), &[a]);
+        assert_eq!(g.get_node(a).expect("node").deleted_lsn, u64::MAX);
+    }
+
+    #[test]
+    fn test_undelete_node_wrong_lsn_is_noop() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        g.remove_node(a, 5);
+        assert!(!g.undelete_node(a, 99), "delete_lsn mismatch must no-op");
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+    }
+
+    #[test]
+    fn test_resident_bytes_includes_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let before = g.resident_bytes();
+        for i in 0..20 {
+            g.add_node(smallvec![0], id_props(i), None, 1);
+        }
+        assert!(
+            g.resident_bytes() > before,
+            "resident_bytes must grow as the prop_index accumulates entries"
         );
     }
 }

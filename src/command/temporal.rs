@@ -125,6 +125,13 @@ pub fn apply_invalidate(
         entity_id, is_node, wall_ms, wall_ms,
     );
     gs.wal_pending.push(payload);
+    // Task #32: TEMPORAL.INVALIDATE mutates valid_to on write_buf directly,
+    // changing what a subsequent read sees -- invalidate the graph's cached
+    // query results. Re-fetch rather than reuse `named_graph` above: the
+    // borrow was released at the `let Some(named_graph) = ...` match end.
+    if let Some(named_graph) = gs.get_graph_mut(graph_name) {
+        named_graph.touch();
+    }
     Ok(())
 }
 

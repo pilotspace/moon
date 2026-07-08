@@ -13,30 +13,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::graph::csr::{CsrError, CsrStorage};
 use crate::graph::manifest::GraphManifest;
-use crate::graph::memgraph::MemGraph;
 use crate::graph::segment::GraphSegmentList;
 use crate::graph::store::GraphStore;
-
-/// Compute the NodeKey index-space watermark for a set of loaded CSR
-/// segments: one past the largest SlotMap index component among all
-/// persisted `NodeMeta::external_id`s. Passed to `MemGraph::with_id_offset`
-/// so that replay (or any post-recovery write) can never mint a NodeKey
-/// that aliases a persisted external_id -- see `MemGraph::with_id_offset`
-/// for the full soundness argument. Zero (no offset) when there are no
-/// loaded segments -- there is nothing to alias against.
-fn node_id_watermark(segments: &[Arc<CsrStorage>]) -> u32 {
-    segments
-        .iter()
-        .flat_map(|seg| seg.node_meta().iter())
-        // KeyData::as_ffi() packs the SlotMap index in the low 32 bits
-        // (version occupies the high 32 bits) -- `as u32` truncation
-        // extracts exactly that index component.
-        .map(|meta| meta.external_id as u32)
-        .max()
-        .map_or(0, |max_idx| max_idx.saturating_add(1))
-}
 
 /// Result of graph recovery for a single shard.
 pub struct GraphRecoveryResult {
@@ -167,19 +149,24 @@ pub fn recover_graph_store(
             }
         }
 
-        // Inject loaded segments into the graph's segment holder, and
-        // fast-forward the mutable tier's key allocator (P0 fix: graph
-        // NodeKey aliasing across restart). At this point `graph.segments`
-        // still holds the pristine fresh MemGraph `create_graph` built via
-        // `GraphStore::load_metadata` -- nothing has written to it yet, so
-        // it is safe to replace outright rather than merge.
+        // Inject loaded segments into the graph's segment holder and restore
+        // the write buffer's id-allocation floors: the manifest cursors
+        // (authoritative when present; 0 in pre-cursor manifests) plus every
+        // frozen external_id (covers manifests written before cursors
+        // existed), so fresh post-recovery inserts can never alias a frozen
+        // row or a WAL-replayed id.
         if let Some(graph) = store.get_graph_mut(graph_name.as_bytes()) {
-            let watermark = node_id_watermark(&loaded_segments);
+            graph
+                .write_buf
+                .restore_id_cursors(manifest.next_node_id, manifest.next_edge_id);
+            for seg in &loaded_segments {
+                for nm in seg.node_meta() {
+                    graph.write_buf.ensure_node_id_floor(nm.external_id);
+                }
+            }
+            let current = graph.segments.load();
             graph.segments.swap(GraphSegmentList {
-                mutable: Some(Arc::new(MemGraph::with_id_offset(
-                    graph.edge_threshold,
-                    watermark,
-                ))),
+                mutable: current.mutable.clone(),
                 immutable: loaded_segments,
             });
         }
@@ -231,8 +218,15 @@ pub fn save_graph_store(
             }
         }
 
-        // Write manifest.
-        let manifest = GraphManifest::from_segments(&graph_name, &segments.immutable, &base_dir);
+        // Write manifest (including the write buffer's id-allocation
+        // cursors, so recovery resumes allocation past every id ever
+        // handed out even if the WAL was truncated).
+        let manifest = GraphManifest::from_segments(
+            &graph_name,
+            &segments.immutable,
+            &base_dir,
+            graph.write_buf.id_cursors(),
+        );
         let manifest_path = graph_data_dir.join("manifest.json");
         manifest.save(&manifest_path)?;
     }
@@ -245,10 +239,73 @@ pub fn shard_graph_dir(persistence_dir: &Path, shard_id: usize) -> PathBuf {
     persistence_dir.join(format!("shard_{shard_id}"))
 }
 
+/// Snapshot the graph store as part of a WAL v3 checkpoint (Bug B of the
+/// 2026-07 durability P0: the checkpoint advances the WAL replay floor and
+/// recycles segments, so every graph record it covers must be materialized
+/// on disk FIRST or a crash loses the graph permanently).
+///
+/// Freezes each graph's write buffer into an immutable CSR segment (the
+/// mutable tier is never serialized directly — freeze is the only path to
+/// disk), stamps `snapshot_lsn` (the WAL LSN this snapshot covers; recovery
+/// skips graph records at or below it), and persists segments + manifests +
+/// metadata.
+///
+/// Returns `true` when the checkpoint may proceed (snapshot persisted, or
+/// nothing to do). Returns `false` on save failure — the caller MUST abort
+/// the checkpoint finalize so the control file keeps the old replay floor
+/// and the WAL segments holding the graph records are not recycled.
+///
+/// Called on the shard thread between mutations (single-threaded event
+/// loop), so the snapshot is a consistent cut: every record `<= snapshot_lsn`
+/// is in the freeze, every later record is not.
+pub fn persist_graph_at_checkpoint(
+    store: &mut GraphStore,
+    persistence_dir: Option<&Path>,
+    shard_id: usize,
+    snapshot_lsn: u64,
+) -> bool {
+    if !store.is_dirty() || store.graph_count() == 0 {
+        return true;
+    }
+    // No persistence dir (e.g. --appendonly no): graph writes carry no
+    // durability contract; let the checkpoint proceed.
+    let Some(dir) = persistence_dir else {
+        return true;
+    };
+
+    // Freeze every write buffer so the on-disk segments cover the mutable
+    // tier. Graphs whose buffer is empty (or holds only cross-tier delta
+    // edges) skip the freeze — freeze_and_compact returns false without
+    // pushing an empty segment.
+    let names: Vec<Bytes> = store.list_graphs().into_iter().cloned().collect();
+    for name in &names {
+        let lsn = store.allocate_lsn();
+        if let Some(graph) = store.get_graph_mut(name) {
+            graph.freeze_and_compact(lsn);
+        }
+    }
+
+    store.set_snapshot_lsn(snapshot_lsn);
+    match save_graph_store(store, dir, shard_id) {
+        Ok(()) => {
+            store.clear_dirty();
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "Shard {shard_id}: checkpoint graph snapshot failed ({e}); \
+                 aborting checkpoint finalize to keep the WAL replay floor"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use slotmap::Key;
     use smallvec::smallvec;
     use tempfile::TempDir;
 
@@ -300,6 +357,84 @@ mod tests {
         assert_eq!(segs.immutable.len(), 1);
         assert_eq!(segs.immutable[0].node_count(), 3);
         assert_eq!(segs.immutable[0].edge_count(), 2);
+    }
+
+    /// P0-2 stable ids: recovery must restore the id-allocation cursors so
+    /// post-restart inserts can never alias frozen external_ids — via the
+    /// manifest cursors AND (for pre-cursor manifests) the frozen
+    /// external_ids themselves.
+    #[test]
+    fn test_recover_restores_id_allocation_floor() {
+        let dir = TempDir::new().expect("tmpdir");
+        let shard_id = 0;
+
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 64_000, 10)
+            .expect("ok");
+        let graph = store.get_graph_mut(b"g").expect("exists");
+
+        // Simulate a pre-crash session: nodes allocated from the write
+        // buffer, then frozen into a CSR segment.
+        let a = graph.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+        let b = graph.write_buf.add_node(smallvec![1], smallvec![], None, 1);
+        graph.write_buf.add_edge(a, b, 0, 1.0, None, 2).expect("ok");
+        let frozen = graph.write_buf.freeze().expect("ok");
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("ok");
+        graph.segments.add_immutable(csr);
+        graph.write_buf.thaw();
+        let saved_cursors = graph.write_buf.id_cursors();
+        let max_frozen_id = a.data().as_ffi().max(b.data().as_ffi());
+
+        save_graph_store(&store, dir.path(), shard_id).expect("save ok");
+
+        let mut result = recover_graph_store(dir.path(), shard_id)
+            .expect("io ok")
+            .expect("result exists");
+        let graph = result.store.get_graph_mut(b"g").expect("exists");
+
+        // Cursors restored to at least the saved values.
+        let (nn, ne) = graph.write_buf.id_cursors();
+        assert!(
+            nn >= saved_cursors.0,
+            "node cursor {nn} < saved {}",
+            saved_cursors.0
+        );
+        assert!(
+            ne >= saved_cursors.1,
+            "edge cursor {ne} < saved {}",
+            saved_cursors.1
+        );
+
+        // A fresh insert must not alias any frozen row.
+        let fresh = graph.write_buf.add_node(smallvec![9], smallvec![], None, 5);
+        assert!(
+            fresh.data().as_ffi() > max_frozen_id,
+            "fresh id {} aliases frozen tier (max frozen {})",
+            fresh.data().as_ffi(),
+            max_frozen_id
+        );
+
+        // Pre-cursor manifest fallback: zero cursors, floor comes from the
+        // frozen external_ids scan.
+        let manifest_path = dir
+            .path()
+            .join(format!("shard_{shard_id}/graph_g/manifest.json"));
+        let mut manifest = GraphManifest::load(&manifest_path).expect("load ok");
+        manifest.next_node_id = 0;
+        manifest.next_edge_id = 0;
+        manifest.save(&manifest_path).expect("save ok");
+
+        let mut result = recover_graph_store(dir.path(), shard_id)
+            .expect("io ok")
+            .expect("result exists");
+        let graph = result.store.get_graph_mut(b"g").expect("exists");
+        let fresh = graph.write_buf.add_node(smallvec![9], smallvec![], None, 5);
+        assert!(
+            fresh.data().as_ffi() > max_frozen_id,
+            "pre-cursor fallback: fresh id {} aliases frozen tier",
+            fresh.data().as_ffi()
+        );
     }
 
     #[test]

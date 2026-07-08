@@ -40,6 +40,14 @@ pub struct GraphManifest {
     pub segments: Vec<SegmentManifestEntry>,
     /// Unix timestamp (seconds) when this manifest was written.
     pub created_at: u64,
+    /// Node-id allocation cursor (`MemGraph::id_cursors`) at save time.
+    /// `0` (absent in pre-cursor manifests) means unknown — recovery then
+    /// derives the floor from frozen external_ids + WAL replay alone.
+    #[serde(default)]
+    pub next_node_id: u64,
+    /// Edge-id allocation cursor at save time (same contract).
+    #[serde(default)]
+    pub next_edge_id: u64,
 }
 
 impl GraphManifest {
@@ -47,7 +55,13 @@ impl GraphManifest {
     ///
     /// `base_dir` is the relative directory prefix for segment file paths
     /// (e.g. `"graph_social"`). Segment files are named `seg_{lsn}.csr`.
-    pub fn from_segments(graph_name: &str, segments: &[Arc<CsrStorage>], base_dir: &str) -> Self {
+    /// `id_cursors` is the write buffer's `(next_node_id, next_edge_id)`.
+    pub fn from_segments(
+        graph_name: &str,
+        segments: &[Arc<CsrStorage>],
+        base_dir: &str,
+        id_cursors: (u64, u64),
+    ) -> Self {
         let entries: Vec<SegmentManifestEntry> = segments
             .iter()
             .map(|seg| SegmentManifestEntry {
@@ -69,6 +83,8 @@ impl GraphManifest {
             graph_name: graph_name.to_owned(),
             segments: entries,
             created_at,
+            next_node_id: id_cursors.0,
+            next_edge_id: id_cursors.1,
         }
     }
 
@@ -130,6 +146,8 @@ mod tests {
                 },
             ],
             created_at: 1700000000,
+            next_node_id: (7 << 32) | 42,
+            next_edge_id: (3 << 32) | 9,
         };
 
         let path = dir.path().join("manifest.json");
@@ -152,9 +170,12 @@ mod tests {
         let csr = CsrSegment::from_frozen(frozen, 42).expect("ok");
 
         let segments: Vec<Arc<CsrStorage>> = vec![Arc::new(CsrStorage::from(csr))];
-        let manifest = GraphManifest::from_segments("test_graph", &segments, "graph_test");
+        let manifest =
+            GraphManifest::from_segments("test_graph", &segments, "graph_test", mg.id_cursors());
 
         assert_eq!(manifest.graph_name, "test_graph");
+        assert_eq!(manifest.next_node_id, mg.id_cursors().0);
+        assert_eq!(manifest.next_edge_id, mg.id_cursors().1);
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(manifest.segments[0].segment_id, 42);
         assert_eq!(manifest.segments[0].node_count, 2);
@@ -185,6 +206,8 @@ mod tests {
             graph_name: "empty".to_owned(),
             segments: vec![],
             created_at: 0,
+            next_node_id: 0,
+            next_edge_id: 0,
         };
         let path = dir.path().join("manifest.json");
         manifest.save(&path).expect("save ok");

@@ -866,6 +866,11 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
     }
 
+    // Graph traversal timeout default — set BEFORE shard threads spawn so every
+    // TraversalGuard::with_default_timeout observes it (per-query TIMEOUT overrides).
+    #[cfg(feature = "graph")]
+    moon::graph::traversal_guard::set_default_traversal_timeout_ms(config.graph_timeout_ms);
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
@@ -1412,6 +1417,14 @@ fn main() -> anyhow::Result<()> {
             dir_path,
             config.databases,
         );
+    }
+    // v3 disk-offload mode logs graph records to `shard-<N>/wal-v3/` instead
+    // of the legacy per-shard WAL file — replay them with their own pass
+    // (2026-07 graph durability P0, Bug A). Runs AFTER recover_graph_stores
+    // so the per-shard graph snapshot floor (snapshot_lsn) is loaded.
+    #[cfg(feature = "graph")]
+    if let Some(ref offload_base) = disk_offload_base {
+        moon::shard::shared_databases::replay_graph_wal_v3(&mut slice_inits, offload_base);
     }
 
     // Replay temporal WAL records (not gated on graph feature — temporal KV is core).

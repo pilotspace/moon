@@ -2,6 +2,178 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// W2-12: if `expr` is a top-level aggregate call, return
+/// `(lowercase name, input expr, distinct)`. `None` input = `count(*)` /
+/// bare `count()` (counts rows, not values). Aggregates nested inside a
+/// larger expression (`count(n) + 1`) are NOT recognized — the item then
+/// evaluates per-row like any scalar (pre-existing behavior), so keep
+/// aggregates at the top level of a RETURN item.
+fn aggregate_call(expr: &Expr) -> Option<(&'static str, Option<&Expr>, bool)> {
+    let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+    } = expr
+    else {
+        return None;
+    };
+    let canon: &'static str = match name.to_ascii_lowercase().as_str() {
+        "count" => "count",
+        "sum" => "sum",
+        "avg" => "avg",
+        "min" => "min",
+        "max" => "max",
+        "collect" => "collect",
+        _ => return None,
+    };
+    let input = args.first().filter(|a| !matches!(a, Expr::Star));
+    Some((canon, input, *distinct))
+}
+
+/// W2-12: aggregate projection with implicit grouping (openCypher): the
+/// non-aggregate RETURN items form the group key; each group emits one row.
+/// No group key + zero input rows still emits ONE row (`count` = 0, `sum` =
+/// 0, `collect` = [], others Null); a present group key over zero rows
+/// emits none. Null inputs are skipped by every aggregate except `count(*)`,
+/// which counts rows. Returns `None` when no item is an aggregate (caller
+/// takes the plain per-row projection path).
+fn try_project_aggregate(
+    items: &[ReturnItem],
+    row_count: usize,
+    mut eval_at: impl FnMut(&Expr, usize) -> Value,
+) -> Option<Vec<Vec<Value>>> {
+    let specs: Vec<Option<(&'static str, Option<&Expr>, bool)>> =
+        items.iter().map(|it| aggregate_call(&it.expr)).collect();
+    if specs.iter().all(Option::is_none) {
+        return None;
+    }
+    let has_group_key = specs.iter().any(Option::is_none);
+    let agg_count = specs.iter().filter(|s| s.is_some()).count();
+
+    // Group rows by the stringified key (same "simple approach" as
+    // dedup_rows), keeping first-seen order for deterministic output.
+    struct Group {
+        key_values: Vec<Value>,
+        inputs: Vec<Vec<Value>>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Group> = HashMap::new();
+
+    for ri in 0..row_count {
+        let mut key_values = Vec::new();
+        let mut key_str = String::new();
+        for (item, spec) in items.iter().zip(&specs) {
+            if spec.is_none() {
+                let v = eval_at(&item.expr, ri);
+                key_str.push_str(&value_to_string(&v));
+                key_str.push('\u{1f}');
+                key_values.push(v);
+            }
+        }
+        let group = groups.entry(key_str.clone()).or_insert_with(|| {
+            order.push(key_str);
+            Group {
+                key_values,
+                inputs: vec![Vec::new(); agg_count],
+            }
+        });
+        for (ai, spec) in specs.iter().flatten().enumerate() {
+            match spec.1 {
+                Some(input_expr) => {
+                    let v = eval_at(input_expr, ri);
+                    if !matches!(v, Value::Null) {
+                        group.inputs[ai].push(v);
+                    }
+                }
+                // count(*): every row counts.
+                None => group.inputs[ai].push(Value::Int(1)),
+            }
+        }
+    }
+
+    // Global aggregate over zero rows: one synthetic empty group.
+    if groups.is_empty() && !has_group_key {
+        let key = String::new();
+        order.push(key.clone());
+        groups.insert(
+            key,
+            Group {
+                key_values: Vec::new(),
+                inputs: vec![Vec::new(); agg_count],
+            },
+        );
+    }
+
+    let finalize = |name: &str, mut inputs: Vec<Value>, distinct: bool| -> Value {
+        if distinct {
+            let mut seen = std::collections::HashSet::new();
+            inputs.retain(|v| seen.insert(value_to_string(v)));
+        }
+        match name {
+            "count" => Value::Int(inputs.len() as i64),
+            "sum" => {
+                if inputs.iter().any(|v| matches!(v, Value::Float(_))) {
+                    Value::Float(inputs.iter().fold(0.0, |acc, v| match v {
+                        Value::Int(i) => acc + *i as f64,
+                        Value::Float(f) => acc + f,
+                        _ => acc,
+                    }))
+                } else {
+                    Value::Int(inputs.iter().fold(0i64, |acc, v| match v {
+                        Value::Int(i) => acc.saturating_add(*i),
+                        _ => acc,
+                    }))
+                }
+            }
+            "avg" => {
+                let numeric: Vec<f64> = inputs
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Int(i) => Some(*i as f64),
+                        Value::Float(f) => Some(*f),
+                        _ => None,
+                    })
+                    .collect();
+                if numeric.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Float(numeric.iter().sum::<f64>() / numeric.len() as f64)
+                }
+            }
+            "min" => inputs
+                .into_iter()
+                .min_by(compare_values)
+                .unwrap_or(Value::Null),
+            "max" => inputs
+                .into_iter()
+                .max_by(compare_values)
+                .unwrap_or(Value::Null),
+            "collect" => Value::List(inputs),
+            _ => Value::Null,
+        }
+    };
+
+    let mut out = Vec::with_capacity(order.len());
+    for key in &order {
+        let Some(group) = groups.remove(key) else {
+            continue;
+        };
+        let mut key_iter = group.key_values.into_iter();
+        let mut input_iter = group.inputs.into_iter();
+        let row: Vec<Value> = specs
+            .iter()
+            .map(|spec| match spec {
+                None => key_iter.next().unwrap_or(Value::Null),
+                Some((name, _, distinct)) => {
+                    finalize(name, input_iter.next().unwrap_or_default(), *distinct)
+                }
+            })
+            .collect();
+        out.push(row);
+    }
+    Some(out)
+}
+
 /// Resolve an `IndexScan` into the matching node keys across both tiers.
 ///
 /// Frozen tier: per segment, intersect the property-equality bitmaps
@@ -13,12 +185,34 @@ use super::*;
 /// `prop_eq` values are literals or parameters; if any resolves to a
 /// non-scalar the whole scan degrades to the plain merged label scan (the
 /// residual Filter downstream keeps results exact either way).
+///
+/// `prop_range` conjuncts (`n.p > $x` etc.) prune via the per-segment
+/// numeric B-trees. A conjunct whose threshold resolves non-numeric is
+/// dropped (can't prune the numeric space) — never narrowed: the pruned set
+/// stays a SUPERSET of the rows the residual Filter accepts, because the
+/// post-W2-3 comparison semantics make cross-type / missing-property
+/// comparisons evaluate to Null (dropped by WHERE), exactly the rows the
+/// numeric index excludes.
+///
+/// `text_pred` conjuncts (`n.p CONTAINS 'x'`, `STARTS WITH`, `ENDS WITH`,
+/// `=~`; P3 design part B) prune the FROZEN tier only, via
+/// `SegmentTextIndex::candidate_rows` — a PRESENCE-only superset (rows
+/// whose value at that property is a String/Bytes at all; see
+/// `text_index.rs` module docs for why token-level pruning is unsound for
+/// substring/prefix/suffix predicates). The MUTABLE tier has no text index
+/// (pre-approved scope decision): a text-only conjunct (no `prop_eq`/
+/// `prop_range` alongside it) falls back to an exact full scan of the
+/// mutable tail, seeded from `memgraph.iter_nodes()` — correct, just
+/// unaccelerated, matching the mutable tier's existing story for numeric
+/// properties before freeze.
 #[allow(clippy::too_many_arguments)]
 fn index_scan_keys(
     memgraph: &crate::graph::memgraph::MemGraph,
     csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     label: Option<&String>,
     prop_eq: &[(String, Expr)],
+    prop_range: &[(String, RangeCmp, Expr)],
+    text_pred: &[(String, BinaryOperator, Expr)],
     params: &HashMap<String, Value>,
     ctx: &ExecutionContext,
 ) -> Vec<NodeKey> {
@@ -59,10 +253,102 @@ fn index_scan_keys(
         }
     }
 
+    // Resolve each range conjunct to (prop_id, cmp, numeric threshold). A
+    // threshold that resolves non-numeric (e.g. a String parameter) cannot
+    // prune the numeric index — drop the conjunct (superset-safe); the
+    // residual Filter stays exact.
+    let mut ranges: Vec<(u16, RangeCmp, f64)> = Vec::with_capacity(prop_range.len());
+    for (name, cmp, expr) in prop_range {
+        let v = eval_expr(
+            expr,
+            &empty_row,
+            memgraph,
+            params,
+            csr_segs,
+            ctx.snapshot_lsn,
+            ctx.decay,
+        );
+        match v {
+            Value::Int(i) => ranges.push((label_to_id(name.as_bytes()), *cmp, i as f64)),
+            Value::Float(f) => ranges.push((label_to_id(name.as_bytes()), *cmp, f)),
+            _ => {}
+        }
+    }
+
+    // Resolve each text conjunct to a bare prop_id (deduplicated). No value
+    // is evaluated: `SegmentTextIndex::candidate_rows` prunes on PRESENCE
+    // alone (see its module docs) -- valid as a superset regardless of the
+    // pattern's content, so the pattern expression is never consulted here.
+    let mut text_prop_ids: Vec<u16> = Vec::with_capacity(text_pred.len());
+    for (name, _op, _expr) in text_pred {
+        let pid = label_to_id(name.as_bytes());
+        if !text_prop_ids.contains(&pid) {
+            text_prop_ids.push(pid);
+        }
+    }
+
+    // Nothing prunable (pure-range scan whose thresholds all resolved
+    // non-numeric, and no text conjunct either): full merged label scan,
+    // residual Filter stays exact.
+    if targets.is_empty() && ranges.is_empty() && text_prop_ids.is_empty() {
+        let mut keys = Vec::new();
+        view.for_each_visible_node(
+            label_id,
+            ctx.snapshot_lsn,
+            ctx.my_txn_id,
+            &committed,
+            ctx.valid_time_as_of,
+            |k| keys.push(k),
+        );
+        return keys;
+    }
+
     let mut keys = Vec::new();
 
-    // Mutable tail: inline superset-consistent property check.
-    for (key, node) in memgraph.iter_nodes() {
+    // Mutable tail: seed a small candidate set from the mutable-tier
+    // property index (Task #31) instead of scanning every live node, then
+    // apply the SAME superset-consistent label/visibility/property checks
+    // as before to that candidate set. SUPERSET contract preserved: the
+    // index only prunes candidates, never decides — these checks (and the
+    // planner's residual Filter downstream) stay authoritative.
+    //
+    // Seed from the first equality target when available (exact bucket,
+    // typically 0-1 entries for a unique id); otherwise from the full
+    // indexed value range of the first range conjunct (conservative — the
+    // `ranges_match` check below narrows it exactly). One of the two is
+    // always present here: `targets.is_empty() && ranges.is_empty()` was
+    // already handled by the early return above.
+    let candidates: Vec<NodeKey> = if let Some((pid, want)) = targets.first() {
+        memgraph.prop_index_keys_eq(*pid, want).to_vec()
+    } else if let Some((pid, cmp, threshold)) = ranges.first() {
+        // Boundary-INCLUSIVE on the threshold side regardless of Gt/Lt vs
+        // Gte/Lte — a superset seed; the exact `ranges_match` check below
+        // enforces strictness.
+        let (lo, hi) = match cmp {
+            RangeCmp::Gt | RangeCmp::Gte => (*threshold, f64::INFINITY),
+            RangeCmp::Lt | RangeCmp::Lte => (f64::NEG_INFINITY, *threshold),
+        };
+        memgraph.prop_index_keys_range(*pid, lo, hi)
+    } else if !text_prop_ids.is_empty() {
+        // Text-only conjunct(s): the mutable tier has no text index
+        // (pre-approved scope decision, see `text_index.rs` module docs) --
+        // fall back to a full label-scoped scan of the mutable tail. Still
+        // bounded by `edge_threshold` (freeze keeps the mutable tail
+        // small), and the generic label/visibility checks below plus the
+        // planner's residual Filter downstream stay authoritative, exactly
+        // like every other candidate source in this function.
+        memgraph.iter_nodes().map(|(key, _)| key).collect()
+    } else {
+        // Structurally unreachable (see above) — an empty candidate set is
+        // the safe degradation if this invariant is ever violated by a
+        // future refactor, never a panic on live traffic.
+        Vec::new()
+    };
+
+    for key in candidates {
+        let Some(node) = memgraph.get_node(key) else {
+            continue; // tombstone/race guard: index entry outlived the node
+        };
         if let Some(lid) = label_id {
             if !node.labels.contains(&lid) {
                 continue;
@@ -82,12 +368,31 @@ fn index_scan_keys(
                 .iter()
                 .any(|(id, have)| id == pid && prop_value_loose_eq(have, want))
         });
-        if all_match {
+        // Range check mirrors the index's numeric normalization (Int/Float/
+        // Bool as 0-1 in one f64 space) so both tiers prune identically.
+        let ranges_match = ranges.iter().all(|(pid, cmp, threshold)| {
+            node.properties.iter().any(|(id, have)| {
+                if id != pid {
+                    return false;
+                }
+                let num = match have {
+                    PropertyValue::Int(i) => *i as f64,
+                    PropertyValue::Float(f) => *f,
+                    PropertyValue::Bool(b) => f64::from(u8::from(*b)),
+                    _ => return false,
+                };
+                range_cmp_holds(num, *cmp, *threshold)
+            })
+        });
+        if all_match && ranges_match {
             keys.push(key);
         }
     }
 
-    // Frozen tier: bitmap intersection per segment.
+    // Frozen tier: bitmap intersection per segment. `emitted` dedups keys a
+    // re-frozen copy-up shadow left in multiple segments (stale-index hits
+    // are dropped by the planner's residual Filter downstream).
+    let mut emitted = crate::graph::fasthash::FxHashSet::default();
     for seg in csr_segs {
         let mut bm: Option<roaring::RoaringBitmap> = None;
         for (pid, pv) in &targets {
@@ -100,6 +405,42 @@ fn index_scan_keys(
                 bm = Some(acc);
                 break;
             }
+            bm = Some(acc);
+        }
+        for (pid, cmp, threshold) in &ranges {
+            if bm.as_ref().is_some_and(roaring::RoaringBitmap::is_empty) {
+                break;
+            }
+            let rows = match seg.property_index().numeric_index(*pid) {
+                Some(ix) => match cmp {
+                    RangeCmp::Gt => ix.gt(*threshold),
+                    RangeCmp::Gte => ix.gte(*threshold),
+                    RangeCmp::Lt => ix.lt(*threshold),
+                    RangeCmp::Lte => ix.lte(*threshold),
+                },
+                // No numeric value ever indexed under this prop in this
+                // segment -> no row here can pass the residual comparison.
+                None => roaring::RoaringBitmap::new(),
+            };
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
+            bm = Some(acc);
+        }
+        for pid in &text_prop_ids {
+            if bm.as_ref().is_some_and(roaring::RoaringBitmap::is_empty) {
+                break;
+            }
+            let rows = seg
+                .text_index()
+                .candidate_rows(*pid)
+                .cloned()
+                .unwrap_or_default();
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
             bm = Some(acc);
         }
         let Some(mut bm) = bm else { continue };
@@ -126,11 +467,31 @@ fn index_scan_keys(
             ) {
                 continue;
             }
-            keys.push(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+            let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+            // Copy-up shadow (W2-2): the mutable tier overrides this row —
+            // a live shadow was already scanned above (with its CURRENT
+            // property values); a dead shadow is a tombstone.
+            if memgraph.get_node(key).is_some() {
+                continue;
+            }
+            if !emitted.insert(key) {
+                continue;
+            }
+            keys.push(key);
         }
     }
 
     keys
+}
+
+/// Numeric range comparison for the mutable-tail index check.
+fn range_cmp_holds(value: f64, cmp: RangeCmp, threshold: f64) -> bool {
+    match cmp {
+        RangeCmp::Gt => value > threshold,
+        RangeCmp::Gte => value >= threshold,
+        RangeCmp::Lt => value < threshold,
+        RangeCmp::Lte => value <= threshold,
+    }
 }
 
 /// Superset-consistent equality between stored and queried property values,
@@ -256,9 +617,19 @@ pub fn execute_with_slots(
                 variable,
                 label,
                 prop_eq,
+                prop_range,
+                text_pred,
             } => {
-                let keys =
-                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let keys = index_scan_keys(
+                    memgraph,
+                    csr_segs,
+                    label.as_ref(),
+                    prop_eq,
+                    prop_range,
+                    text_pred,
+                    params,
+                    ctx,
+                );
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -278,6 +649,7 @@ pub fn execute_with_slots(
                 direction,
                 min_hops,
                 max_hops,
+                optional,
             } => {
                 let type_ids: Vec<u16> = edge_types
                     .iter()
@@ -315,8 +687,16 @@ pub fn execute_with_slots(
                 for row in &rows {
                     let src_key = match row.get(source) {
                         Some(Value::Node(k)) => *k,
-                        _ => continue,
+                        _ => {
+                            // W2-13: a Null/unbound source under OPTIONAL
+                            // MATCH survives null-padded instead of dropping.
+                            if *optional {
+                                push_null_padded(row, target, edge_variable, &mut new_rows);
+                            }
+                            continue;
+                        }
                     };
+                    let row_start = new_rows.len();
 
                     if *max_hops <= 1 {
                         // Single-hop expansion via SegmentMergeReader.
@@ -393,6 +773,12 @@ pub fn execute_with_slots(
                             }
                         }
                     }
+
+                    // W2-13: zero matches under OPTIONAL MATCH → the source
+                    // row survives with target/edge bound to Null.
+                    if *optional && new_rows.len() == row_start {
+                        push_null_padded(row, target, edge_variable, &mut new_rows);
+                    }
                 }
                 rows = new_rows;
             }
@@ -414,7 +800,11 @@ pub fn execute_with_slots(
                 });
             }
 
-            PhysicalOp::Project { items, distinct } => {
+            PhysicalOp::Project {
+                items,
+                distinct,
+                rebind,
+            } => {
                 columns = items
                     .iter()
                     .map(|item| {
@@ -426,40 +816,74 @@ pub fn execute_with_slots(
                     })
                     .collect();
 
-                let mut projected: Vec<Vec<Value>> = rows
-                    .iter()
-                    .map(|row| {
-                        items
-                            .iter()
-                            .map(|item| {
-                                if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.to_owned(), v.clone()))
-                                        .collect();
-                                    Value::Map(entries)
-                                } else {
-                                    eval_expr(
-                                        &item.expr,
-                                        row,
-                                        memgraph,
-                                        params,
-                                        csr_segs,
-                                        ctx.snapshot_lsn,
-                                        ctx.decay,
-                                    )
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
+                // W2-12: aggregate items (count/sum/avg/min/max/collect)
+                // switch the projection into grouped-aggregation mode.
+                let aggregated = try_project_aggregate(items, rows.len(), |e, ri| {
+                    eval_expr(
+                        e,
+                        &rows[ri],
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    )
+                });
+
+                let mut projected: Vec<Vec<Value>> = match aggregated {
+                    Some(agg_rows) => agg_rows,
+                    None => rows
+                        .iter()
+                        .map(|row| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    if matches!(item.expr, Expr::Star) {
+                                        let entries: Vec<(String, Value)> = row
+                                            .iter()
+                                            .map(|(k, v)| (k.to_owned(), v.clone()))
+                                            .collect();
+                                        Value::Map(entries)
+                                    } else {
+                                        eval_expr(
+                                            &item.expr,
+                                            row,
+                                            memgraph,
+                                            params,
+                                            csr_segs,
+                                            ctx.snapshot_lsn,
+                                            ctx.decay,
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                };
 
                 if *distinct {
                     dedup_rows(&mut projected);
                 }
 
-                projected_rows = Some(projected);
-                rows.clear();
+                if *rebind {
+                    // W2-13 WITH: re-seed the variable-binding row stream
+                    // with the projection outputs so later clauses (WHERE /
+                    // ORDER BY / MATCH / RETURN) keep executing. `columns`
+                    // stays set but the final RETURN overwrites it.
+                    let mut new_rows = Vec::with_capacity(projected.len());
+                    for vals in projected {
+                        let mut new_row = Row::seed(slot_table);
+                        for (name, val) in columns.iter().zip(vals) {
+                            new_row.insert(name, val);
+                        }
+                        new_rows.push(new_row);
+                    }
+                    rows = new_rows;
+                    projected_rows = None;
+                } else {
+                    projected_rows = Some(projected);
+                    rows.clear();
+                }
             }
 
             PhysicalOp::Sort { items } => {
@@ -798,9 +1222,19 @@ pub fn execute_profile(
                 variable,
                 label,
                 prop_eq,
+                prop_range,
+                text_pred,
             } => {
-                let keys =
-                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let keys = index_scan_keys(
+                    memgraph,
+                    csr_segs,
+                    label.as_ref(),
+                    prop_eq,
+                    prop_range,
+                    text_pred,
+                    params,
+                    ctx,
+                );
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -820,6 +1254,7 @@ pub fn execute_profile(
                 direction,
                 min_hops,
                 max_hops,
+                optional,
             } => {
                 let type_ids: Vec<u16> = edge_types
                     .iter()
@@ -857,8 +1292,15 @@ pub fn execute_profile(
                 for row in &rows {
                     let src_key = match row.get(source) {
                         Some(Value::Node(k)) => *k,
-                        _ => continue,
+                        _ => {
+                            // W2-13 OPTIONAL MATCH (parity with main executor).
+                            if *optional {
+                                push_null_padded(row, target, edge_variable, &mut new_rows);
+                            }
+                            continue;
+                        }
                     };
+                    let row_start = new_rows.len();
 
                     if *max_hops <= 1 {
                         reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
@@ -931,6 +1373,10 @@ pub fn execute_profile(
                             }
                         }
                     }
+
+                    if *optional && new_rows.len() == row_start {
+                        push_null_padded(row, target, edge_variable, &mut new_rows);
+                    }
                 }
                 rows = new_rows;
             }
@@ -952,7 +1398,11 @@ pub fn execute_profile(
                 });
             }
 
-            PhysicalOp::Project { items, distinct } => {
+            PhysicalOp::Project {
+                items,
+                distinct,
+                rebind,
+            } => {
                 columns = items
                     .iter()
                     .map(|item| {
@@ -964,40 +1414,71 @@ pub fn execute_profile(
                     })
                     .collect();
 
-                let mut projected: Vec<Vec<Value>> = rows
-                    .iter()
-                    .map(|row| {
-                        items
-                            .iter()
-                            .map(|item| {
-                                if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.to_owned(), v.clone()))
-                                        .collect();
-                                    Value::Map(entries)
-                                } else {
-                                    eval_expr(
-                                        &item.expr,
-                                        row,
-                                        memgraph,
-                                        params,
-                                        csr_segs,
-                                        ctx.snapshot_lsn,
-                                        ctx.decay,
-                                    )
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
+                // W2-12: aggregate items switch into grouped-aggregation
+                // mode (shared with the non-profile executor).
+                let aggregated = try_project_aggregate(items, rows.len(), |e, ri| {
+                    eval_expr(
+                        e,
+                        &rows[ri],
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    )
+                });
+
+                let mut projected: Vec<Vec<Value>> = match aggregated {
+                    Some(agg_rows) => agg_rows,
+                    None => rows
+                        .iter()
+                        .map(|row| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    if matches!(item.expr, Expr::Star) {
+                                        let entries: Vec<(String, Value)> = row
+                                            .iter()
+                                            .map(|(k, v)| (k.to_owned(), v.clone()))
+                                            .collect();
+                                        Value::Map(entries)
+                                    } else {
+                                        eval_expr(
+                                            &item.expr,
+                                            row,
+                                            memgraph,
+                                            params,
+                                            csr_segs,
+                                            ctx.snapshot_lsn,
+                                            ctx.decay,
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                };
 
                 if *distinct {
                     dedup_rows(&mut projected);
                 }
 
-                projected_rows = Some(projected);
-                rows.clear();
+                if *rebind {
+                    // W2-13 WITH rebind (parity with main executor).
+                    let mut new_rows = Vec::with_capacity(projected.len());
+                    for vals in projected {
+                        let mut new_row = Row::seed(&slot_table);
+                        for (name, val) in columns.iter().zip(vals) {
+                            new_row.insert(name, val);
+                        }
+                        new_rows.push(new_row);
+                    }
+                    rows = new_rows;
+                    projected_rows = None;
+                } else {
+                    projected_rows = Some(projected);
+                    rows.clear();
+                }
             }
 
             PhysicalOp::Sort { items } => {

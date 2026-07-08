@@ -183,6 +183,10 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     // Bump version AFTER successful node insert.
     store.bump_version();
+    // Task #32: invalidate this graph's cached query results (write_gen).
+    if let Some(graph) = store.get_graph_mut(graph_name) {
+        graph.touch();
+    }
     Frame::Integer(external_id as i64)
 }
 
@@ -352,6 +356,12 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             // Check if compaction threshold reached after edge insertion.
             // If so, freeze the mutable MemGraph and convert to an immutable
             // CSR segment. This is synchronous and fast (<5ms at 64K edges).
+            //
+            // Task #32: freeze_and_compact is a storage-tier reorg with
+            // identical logical content -- it must NOT bump write_gen (that
+            // would flush the result cache every edge_threshold edges for
+            // zero correctness benefit). touch() below covers only the edge
+            // insert itself.
             let needs_compact = store
                 .get_graph(graph_name)
                 .is_some_and(|g| g.should_compact());
@@ -364,6 +374,9 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
             // Bump version AFTER successful edge insert.
             store.bump_version();
+            if let Some(graph) = store.get_graph_mut(graph_name) {
+                graph.touch();
+            }
             Frame::Integer(external_id as i64)
         }
         Err(crate::graph::memgraph::GraphError::NodeNotFound) => Frame::Error(Bytes::from_static(

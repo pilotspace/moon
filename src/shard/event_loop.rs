@@ -1458,7 +1458,7 @@ impl super::Shard {
                             bgsave_checkpoint_requested = false;
                         }
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
-                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs) {
+                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs, &mut persistence_tick::graph_checkpoint_hook(persistence_dir.as_deref(), shard_id)) {
                             wal_bytes_since_checkpoint = 0;
                             last_checkpoint_completed_at = std::time::Instant::now();
                         }
@@ -1512,6 +1512,10 @@ impl super::Shard {
                             shard_id,
                             last_checkpoint_completed_at,
                             server_config.wal_max_checkpoint_lag_ms,
+                            &mut persistence_tick::graph_checkpoint_hook(
+                                persistence_dir.as_deref(),
+                                shard_id,
+                            ),
                         ) {
                             wal_bytes_since_checkpoint = 0;
                             last_checkpoint_completed_at = std::time::Instant::now();
@@ -1665,7 +1669,7 @@ impl super::Shard {
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
-                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs);
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs, &mut persistence_tick::graph_checkpoint_hook(persistence_dir.as_deref(), shard_id));
                     }
                     // Persist graph store to disk on shutdown.
                     #[cfg(feature = "graph")]
@@ -1820,6 +1824,10 @@ impl super::Shard {
                             shard_id,
                             server_config.manifest_tombstone_retain_epochs,
                             server_config.manifest_tombstone_retain_secs,
+                            &mut persistence_tick::graph_checkpoint_hook(
+                                persistence_dir.as_deref(),
+                                shard_id,
+                            ),
                         );
                     }
                     if let Some(ref mut wal) = wal_writer {
@@ -2083,6 +2091,10 @@ impl super::Shard {
                         ctrl_path,
                         server_config.manifest_tombstone_retain_epochs,
                         server_config.manifest_tombstone_retain_secs,
+                        &mut persistence_tick::graph_checkpoint_hook(
+                            persistence_dir.as_deref(),
+                            shard_id,
+                        ),
                     ) {
                         wal_bytes_since_checkpoint = 0;
                         last_checkpoint_completed_at = std::time::Instant::now();
@@ -2160,6 +2172,10 @@ impl super::Shard {
                             shard_id,
                             last_checkpoint_completed_at,
                             server_config.wal_max_checkpoint_lag_ms,
+                            &mut persistence_tick::graph_checkpoint_hook(
+                                persistence_dir.as_deref(),
+                                shard_id,
+                            ),
                         ) {
                             wal_bytes_since_checkpoint = 0;
                             last_checkpoint_completed_at = std::time::Instant::now();

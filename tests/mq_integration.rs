@@ -119,6 +119,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         autovacuum_interval_secs: 30,
         graph_merge_max_segments: 8,
         graph_dead_edge_trigger: 0.20,
+        graph_timeout_ms: 30_000,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,

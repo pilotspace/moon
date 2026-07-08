@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -166,7 +167,11 @@ impl CsrStorage {
         let hnsw = self
             .hnsw_bridge_if_built()
             .map_or(0, |b| b.resident_bytes());
-        core + props + indexes + hnsw
+        let text = self.text_index_if_built().map_or(
+            0,
+            crate::graph::text_index::SegmentTextIndex::resident_bytes,
+        );
+        core + props + indexes + hnsw + text
     }
 
     /// Borrow the property index ONLY if it has already been built (does
@@ -176,6 +181,16 @@ impl CsrStorage {
         match self {
             CsrStorage::Heap(s) => s.props_index.get(),
             CsrStorage::Mmap(s) => s.props_index.get(),
+        }
+    }
+
+    /// Borrow the text index ONLY if it has already been built (does not
+    /// trigger a build) — same `resident_bytes`-must-be-cheap rule as
+    /// `props_index_if_built`.
+    fn text_index_if_built(&self) -> Option<&crate::graph::text_index::SegmentTextIndex> {
+        match self {
+            CsrStorage::Heap(s) => s.text_index.get(),
+            CsrStorage::Mmap(s) => s.text_index.get(),
         }
     }
 
@@ -368,23 +383,64 @@ impl CsrStorage {
         }
     }
 
-    /// Get-or-build this segment's HNSW bridge over v5 node embeddings
-    /// (hybrid HnswPreFilter). Built at most once per segment, and only when
-    /// it holds >= `BRIDGE_MIN_VECTORS` usable embeddings — the negative
-    /// answer is cached too, so small segments pay the scan exactly once.
-    /// Same `OnceLock` interior-mutability pattern as `incoming_index`.
-    pub fn hnsw_bridge(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
-        let cell = match self {
-            CsrStorage::Heap(s) => &s.hnsw_bridge,
-            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+    /// Get-or-build this segment's lazy text index over CSR rows (P3 design
+    /// part B). Built once from node_meta + the v5 property blob; cached in
+    /// the segment's `OnceLock` (same interior-mutability pattern as
+    /// `property_index`/`incoming_index`).
+    pub fn text_index(&self) -> &crate::graph::text_index::SegmentTextIndex {
+        match self {
+            CsrStorage::Heap(s) => s.text_index.get_or_init(|| {
+                crate::graph::text_index::SegmentTextIndex::build(&s.node_meta, &s.node_props)
+            }),
+            CsrStorage::Mmap(s) => s.text_index.get_or_init(|| {
+                crate::graph::text_index::SegmentTextIndex::build(
+                    s.node_meta(),
+                    s.node_props_blob(),
+                )
+            }),
+        }
+    }
+
+    /// This segment's HNSW bridge over v5 node embeddings (hybrid
+    /// HnswPreFilter), if already built. The build itself runs on a
+    /// detached background thread (W2-5): the first caller kicks it off and
+    /// gets `None` — every caller already treats `None` as "score exactly",
+    /// so queries brute-force until the bridge installs instead of stalling
+    /// the shard event loop for the full HNSW construction. The negative
+    /// answer (too few embeddings) is cached the same way. Built at most
+    /// once per segment.
+    pub fn hnsw_bridge(self: &Arc<Self>) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let (cell, building) = match &**self {
+            CsrStorage::Heap(s) => (&s.hnsw_bridge, &s.hnsw_building),
+            CsrStorage::Mmap(s) => (&s.hnsw_bridge, &s.hnsw_building),
         };
-        cell.get_or_init(|| {
-            crate::graph::hnsw_bridge::GraphHnsw::build(
-                self,
-                crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
-            )
-        })
-        .as_ref()
+        if let Some(cached) = cell.get() {
+            return cached.as_ref();
+        }
+        if !building.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let seg = Arc::clone(self);
+            std::thread::spawn(move || {
+                // A panicking build must still converge the cell (to None),
+                // or the segment would re-arm `building` on no future call
+                // and answer exact-only forever without a cached decision.
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::graph::hnsw_bridge::GraphHnsw::build(
+                        &seg,
+                        crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::warn!("graph hnsw bridge build panicked; segment stays exact-scored");
+                    None
+                });
+                let cell = match &*seg {
+                    CsrStorage::Heap(s) => &s.hnsw_bridge,
+                    CsrStorage::Mmap(s) => &s.hnsw_bridge,
+                };
+                let _ = cell.set(built);
+            });
+        }
+        None
     }
 
     /// Test hook: build the bridge regardless of the production minimum, so
@@ -614,6 +670,65 @@ mod tests {
             "resident_bytes must grow again once the lazily-built GraphHnsw bridge \
              is materialized: after_props_index={after_props_index}, after_bridge={after_bridge}"
         );
+    }
+
+    /// A heap-backed segment with real per-node STRING properties, so
+    /// `text_index()` has something non-trivial to build (mirrors the
+    /// numeric-property fixture's rationale above -- an all-numeric fixture
+    /// would build an empty text index and mask a broken resident_bytes
+    /// count with a true-by-accident 0 -> 0 "no growth" result).
+    fn heap_segment_with_string_props(n: usize) -> CsrStorage {
+        let mut g = MemGraph::new(1_000_000);
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            let props = smallvec![(
+                0u16,
+                PropertyValue::String(bytes::Bytes::from(format!(
+                    "the quick brown fox jumps over lazy dog number {i}"
+                ))),
+            )];
+            keys.push(g.add_node(smallvec![0u16], props, None, 1));
+        }
+        for i in 0..n.saturating_sub(1) {
+            g.add_edge(keys[i], keys[i + 1], 1, 1.0, None, 2)
+                .expect("edge");
+        }
+        let frozen = g.freeze().expect("freeze");
+        let seg = CsrSegment::from_frozen(frozen, 10).expect("csr");
+        CsrStorage::Heap(seg)
+    }
+
+    /// P3 design part B, B1 test #3: `SegmentTextIndex` is absent until the
+    /// first `text_index()` call (mirrors `SegmentPropertyIndexes`'s lazy
+    /// build contract).
+    #[test]
+    fn test_text_index_lazy_build_on_first_use() {
+        let storage = heap_segment_with_string_props(8);
+        let baseline = storage.resident_bytes();
+        let idx = storage.text_index();
+        assert!(
+            !idx.is_empty(),
+            "fixture has a string property on every row"
+        );
+        let after = storage.resident_bytes();
+        assert!(
+            after > baseline,
+            "resident_bytes must grow once the lazily-built SegmentTextIndex is \
+             materialized: baseline={baseline}, after={after}"
+        );
+    }
+
+    /// P3 design part B, B1 test #8: `resident_bytes` must be visible to the
+    /// shard's elastic memory budget the same way `SegmentPropertyIndexes`
+    /// and `GraphHnsw` already are (the exact bug class `CsrStorage::
+    /// resident_bytes`'s doc comment records as previously fixed).
+    #[test]
+    fn test_text_index_resident_bytes_accounted() {
+        let storage = heap_segment_with_string_props(32);
+        let before = storage.resident_bytes();
+        let _ = storage.text_index();
+        let after = storage.resident_bytes();
+        assert!(after > before, "before={before} after={after}");
     }
 
     #[test]

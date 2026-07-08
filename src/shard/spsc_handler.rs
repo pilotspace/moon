@@ -202,10 +202,6 @@ pub(crate) fn drain_spsc_shared(
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "graph")]
-                        ShardMessage::GraphTraverse(_) => {
-                            execute_batch.push(msg);
-                        }
-                        #[cfg(feature = "graph")]
                         ShardMessage::GraphRollback(_) => {
                             execute_batch.push(msg);
                         }
@@ -2052,29 +2048,6 @@ pub(crate) fn handle_shard_message_shared(
                 bytes::Bytes::from_static(b"OK"),
             ));
         }
-        #[cfg(feature = "graph")]
-        ShardMessage::GraphTraverse(payload) => {
-            let crate::shard::dispatch::GraphTraversePayload {
-                graph_name,
-                node_ids,
-                remaining_hops: _,
-                edge_type_filter,
-                snapshot_lsn,
-                reply_tx,
-            } = *payload;
-            let response = {
-                crate::shard::slice::with_shard(|s| {
-                    crate::graph::cross_shard::handle_graph_traverse(
-                        &s.graph_store,
-                        &graph_name,
-                        &node_ids,
-                        edge_type_filter,
-                        snapshot_lsn,
-                    )
-                })
-            };
-            let _ = reply_tx.send(response);
-        }
         #[cfg(feature = "text-index")]
         ShardMessage::InvertedSearch(payload) => {
             // Phase 152 Plan 06 (B-02): remote shard executes a FieldFilter
@@ -2730,6 +2703,16 @@ fn auto_index_hset(
         // `mark_deleted_by_key_hash(key_hash, rollback_lsn)`.
         if any_vector_inserted {
             inserted.push((idx_name.clone(), key_hash));
+            // Insert-path compaction trigger: poll installs + dispatch a
+            // background build when the mutable segment crosses its compact
+            // threshold. Without this, a pure bulk load (no FT.SEARCH
+            // traffic) leaves everything in the brute-force mutable tier
+            // until the autovacuum backstop's 30s tick — the whole HNSW
+            // build then lands on the first explicit FT.COMPACT. Cheap when
+            // below threshold or a build is already in flight (two
+            // non-blocking polls + a length compare, same calls the
+            // FT.SEARCH path makes per query).
+            idx.try_compact();
         }
 
         // Metadata-only path: if no vector was inserted but key already exists

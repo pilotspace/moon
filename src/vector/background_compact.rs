@@ -104,6 +104,17 @@ impl BackgroundCompactor {
                 std::thread::Builder::new()
                     .name(format!("moon-vec-compact-{i}"))
                     .spawn(move || {
+                        // The pool is lazily created from a core-pinned shard
+                        // thread, so every worker inherits that shard's
+                        // SINGLE-core affinity mask on Linux — concurrent
+                        // small (sequential) builds then time-slice one core
+                        // (measured: 3 × 1K builds at ~1s each vs ~0.6s
+                        // alone). Spread workers round-robin from the LAST
+                        // core downward, away from shard 0. No-op on macOS.
+                        let cores = crate::shard::numa::system_parallelism();
+                        crate::shard::numa::pin_worker_to_core(
+                            cores.saturating_sub(1 + (i % cores)),
+                        );
                         while let Ok(job) = rx.recv() {
                             let result = match job.op {
                                 BuildOp::Compact {
@@ -233,9 +244,11 @@ fn default_worker_count() -> usize {
             return n.max(1);
         }
     }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // system_parallelism, NOT available_parallelism: this runs lazily on
+    // first submit — i.e. on a core-pinned shard thread, whose affinity
+    // mask makes available_parallelism() report 1 (the pool silently sized
+    // itself to a single worker on every pinned deployment).
+    let cores = crate::shard::numa::system_parallelism();
     (cores / 2).clamp(1, 8)
 }
 

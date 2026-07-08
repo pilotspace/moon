@@ -138,7 +138,14 @@ impl Shard {
         persistence_dir: &str,
         disk_offload_dir: Option<&std::path::Path>,
     ) -> usize {
-        // If disk-offload was enabled, use v3 recovery protocol
+        // If disk-offload was enabled, use v3 recovery protocol.
+        //
+        // The throwaway DispatchReplayEngine below intercepts graph commands
+        // into a collector that is dropped with it — INTENTIONAL: this pass
+        // recovers KV only. Graph records in the v3 WAL are applied by the
+        // dedicated `shared_databases::replay_graph_wal_v3` boot pass, which
+        // runs later against `ShardSliceInit::graph_store` with the graph
+        // snapshot floor (see main.rs; 2026-07 graph durability P0, Bug A).
         if let Some(offload_dir) = disk_offload_dir {
             let shard_dir = offload_dir.join(format!("shard-{}", self.id));
             if shard_dir.exists() {

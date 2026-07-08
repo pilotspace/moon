@@ -139,5 +139,119 @@ fn bench_parallel_vs_sequential_bfs(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(graph_traversal, bench_parallel_vs_sequential_bfs);
+// ---------------------------------------------------------------------------
+// Frozen-tier BFS benchmarks (W2-10)
+//
+// The CSR row-space fast path (`row_bfs`) only engages on a fully-frozen
+// graph — the mutable-only fixtures above never exercise it. These fixtures
+// freeze the SAME 10K/50 graph so the three production shapes are directly
+// comparable:
+//   frozen_single — one CSR segment: full row-BFS (parallel levels + Beamer)
+//   frozen_multi2 — the graph frozen twice (identical clone segments, the
+//                   W2-2 copy-up aftermath shape): W2-6 multi-segment row
+//                   path with worst-case key-level boundary sync (every node
+//                   resident in both segments)
+//   mixed_tier    — same segment + a non-empty mutable tail: the gate
+//                   declines and BFS falls back to the SegmentMergeReader
+//                   path (what row-BFS saves)
+// ---------------------------------------------------------------------------
+
+fn bench_frozen_tier_bfs(c: &mut Criterion) {
+    use moon::graph::csr::CsrSegment;
+    use slotmap::Key;
+
+    let mut group = c.benchmark_group("frozen_bfs");
+
+    const N: usize = 10_000;
+    const DEGREE: usize = 50;
+
+    // Freeze the standard fixture once → single segment.
+    let (mut g, nodes) = build_memgraph(N, DEGREE);
+    let seed = nodes[500];
+    let seg_old = Arc::new(CsrStorage::from(
+        CsrSegment::from_frozen(g.freeze().expect("freeze"), 3).expect("csr"),
+    ));
+
+    // Re-materialize every node at its ORIGINAL key and re-add the same LCG
+    // edges, then freeze again → an identical clone segment (the shape a
+    // W2-2 copy-up + re-freeze leaves behind). Every node is resident in
+    // BOTH segments — worst-case boundary sync for the multi-segment path.
+    g.thaw();
+    for &nk in &nodes {
+        g.add_node_with_id(nk.data().as_ffi(), smallvec![0], empty_props(), None, 4);
+    }
+    let mut rng_state: u32 = 42;
+    for i in 0..N {
+        for _ in 0..DEGREE {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let target = (rng_state as usize) % N;
+            if target == i {
+                continue;
+            }
+            let _ = g.add_edge(nodes[i], nodes[target], 1, 1.0, None, 5);
+        }
+    }
+    let seg_new = Arc::new(CsrStorage::from(
+        CsrSegment::from_frozen(g.freeze().expect("freeze"), 6).expect("csr"),
+    ));
+
+    let single: Vec<Arc<CsrStorage>> = vec![seg_old.clone()];
+    let multi: Vec<Arc<CsrStorage>> = vec![seg_new, seg_old.clone()];
+
+    // Mixed tier: one live node in the write buffer flips the gate off and
+    // forces the reader fallback over the same frozen data.
+    let mut tail = MemGraph::new(usize::MAX >> 1);
+    let _ = tail.add_node(smallvec![0], empty_props(), None, 7);
+
+    let run = |mg: Option<&MemGraph>, segs: &[Arc<CsrStorage>]| {
+        let reader = SegmentMergeReader::new(mg, segs, Direction::Outgoing, u64::MAX - 1, None);
+        BoundedBfs::new(3).execute(&reader, seed)
+    };
+
+    // Correctness: all three shapes must visit the same node set (the clone
+    // segment adds no new reachability).
+    {
+        let key_set = |r: &moon::graph::traversal::BfsResult| {
+            let mut v: Vec<u64> = r.visited.iter().map(|e| e.0.data().as_ffi()).collect();
+            v.sort_unstable();
+            v
+        };
+        let s = run(None, &single).expect("single ok");
+        let m = run(None, &multi).expect("multi ok");
+        let x = run(Some(&tail), &single).expect("mixed ok");
+        assert_eq!(key_set(&s), key_set(&m), "multi must match single");
+        assert_eq!(key_set(&s), key_set(&x), "reader fallback must match");
+        eprintln!(
+            "frozen BFS precheck: 10K nodes, degree 50, depth 3 -> {} nodes visited",
+            s.visited.len()
+        );
+    }
+
+    group.bench_function("row_bfs_frozen_single_10k_depth3", |b| {
+        b.iter(|| black_box(run(None, black_box(&single))))
+    });
+
+    group.bench_function("row_bfs_frozen_multi2_10k_depth3", |b| {
+        b.iter(|| black_box(run(None, black_box(&multi))))
+    });
+
+    group.bench_function("reader_bfs_mixed_tier_10k_depth3", |b| {
+        b.iter(|| black_box(run(Some(black_box(&tail)), black_box(&single))))
+    });
+
+    // Apples-to-apples W2-6 baseline: the reader path over the SAME two
+    // segments (multi2 doubles the edge probes vs `single`, so only this
+    // pairing isolates the multi-segment row path's win).
+    group.bench_function("reader_bfs_frozen_multi2_10k_depth3", |b| {
+        b.iter(|| black_box(run(Some(black_box(&tail)), black_box(&multi))))
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    graph_traversal,
+    bench_parallel_vs_sequential_bfs,
+    bench_frozen_tier_bfs
+);
 criterion_main!(graph_traversal);
