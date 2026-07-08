@@ -76,6 +76,10 @@ pub struct SegmentSearchJob {
     /// `Some` = ACORN-filtered traversal (allow-list). Post-filter oversampling
     /// mode ships `None` here; the caller applies the bitmap to the results.
     pub filter: Option<Arc<RoaringBitmap>>,
+    /// Per-index recall/QPS knobs (FT.CONFIG RERANK_MULT / EXACT_BEAM) —
+    /// threaded so pooled == serial identity holds. Immutable segments only;
+    /// warm segments carry no f16 sidecar and ignore it.
+    pub tuning: crate::vector::types::SearchTuning,
     pub reply: flume::Sender<SmallVec<[SearchResult; 32]>>,
 }
 
@@ -163,10 +167,17 @@ fn run_job(job: &SegmentSearchJob, scratch: &mut SearchScratch) -> SmallVec<[Sea
     let filter = job.filter.as_deref();
     match &job.segment {
         GraphSegmentRef::Immutable(seg) => match filter {
-            Some(bm) => {
-                seg.search_filtered(&job.query, job.fetch_k, job.ef_search, scratch, Some(bm))
+            Some(bm) => seg.search_filtered_with_tuning(
+                &job.query,
+                job.fetch_k,
+                job.ef_search,
+                scratch,
+                Some(bm),
+                job.tuning,
+            ),
+            None => {
+                seg.search_with_tuning(&job.query, job.fetch_k, job.ef_search, scratch, job.tuning)
             }
-            None => seg.search(&job.query, job.fetch_k, job.ef_search, scratch),
         },
         GraphSegmentRef::Warm(seg) => match filter {
             Some(bm) => {
@@ -290,6 +301,7 @@ mod tests {
             scratch: SearchScratch::new(0, padded_dimension(dim)),
             key_hash_to_key: idx.key_hash_to_key.clone(),
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         }
     }
 
@@ -374,6 +386,7 @@ mod tests {
                             scratch: SearchScratch::new(0, padded_dimension(dim)),
                             key_hash_to_key: key_map.clone(),
                             ef_defaulted: false,
+                            tuning: crate::vector::types::SearchTuning::default(),
                         };
                         let results = futures::executor::block_on(
                             SegmentHolder::search_mvcc_yielding_with_pool(

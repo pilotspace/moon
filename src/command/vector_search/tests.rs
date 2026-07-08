@@ -1527,6 +1527,127 @@ fn test_ft_config_ef_runtime_set_get() {
 }
 
 #[test]
+fn test_ft_config_rerank_mult_set_get() {
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+
+    // Default is 4 (the HQ-1 baseline oversample).
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"RERANK_MULT")];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"4"),
+        other => panic!("expected BulkString 4, got {other:?}"),
+    }
+
+    // SET a deeper oversample; the query path reads meta.rerank_mult live.
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"RERANK_MULT"),
+        bulk(b"16"),
+    ];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
+    assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
+    #[allow(clippy::unwrap_used)] // index just created above
+    let idx = store.get_index_mut(b"myidx").unwrap();
+    assert_eq!(idx.meta.rerank_mult, 16);
+
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"RERANK_MULT")];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"16"),
+        other => panic!("expected BulkString 16, got {other:?}"),
+    }
+
+    // Out-of-range and non-numeric values are rejected.
+    for bad in [&b"0"[..], b"65", b"abc"] {
+        let set_args = vec![
+            bulk(b"SET"),
+            bulk(b"myidx"),
+            bulk(b"RERANK_MULT"),
+            bulk(bad),
+        ];
+        let result = ft_config(
+            &mut store,
+            &mut crate::text::store::TextStore::new(),
+            &set_args,
+        );
+        assert!(matches!(result, Frame::Error(_)), "{bad:?} -> {result:?}");
+    }
+}
+
+#[test]
+fn test_ft_config_exact_beam_on_off() {
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+
+    // Default is OFF.
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"EXACT_BEAM")];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"OFF"),
+        other => panic!("expected BulkString OFF, got {other:?}"),
+    }
+
+    for (val, expect) in [
+        (&b"ON"[..], true),
+        (b"OFF", false),
+        (b"1", true),
+        (b"0", false),
+        (b"true", true),
+        (b"false", false),
+    ] {
+        let set_args = vec![bulk(b"SET"), bulk(b"myidx"), bulk(b"EXACT_BEAM"), bulk(val)];
+        let result = ft_config(
+            &mut store,
+            &mut crate::text::store::TextStore::new(),
+            &set_args,
+        );
+        assert!(
+            matches!(result, Frame::SimpleString(_)),
+            "{val:?} -> {result:?}"
+        );
+        #[allow(clippy::unwrap_used)] // index exists
+        let idx = store.get_index_mut(b"myidx").unwrap();
+        assert_eq!(idx.meta.exact_beam, expect, "value {val:?}");
+    }
+
+    // Invalid values are rejected.
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"EXACT_BEAM"),
+        bulk(b"maybe"),
+    ];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
+    assert!(matches!(result, Frame::Error(_)), "{result:?}");
+}
+
+#[test]
 fn test_ft_config_autocompact_on_off() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();

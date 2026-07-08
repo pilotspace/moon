@@ -58,6 +58,8 @@ fn make_meta(name: &str, quant: QuantizationConfig, metric: DistanceMetric) -> I
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     }
 }
 
@@ -446,4 +448,225 @@ fn tombstoned_candidates_do_not_eat_rerank_budget() {
     let expect: Vec<usize> = order[30..35].to_vec();
     let got: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
     assert_eq!(got, expect, "live top-k mismatch after tombstone filtering");
+}
+
+// ── 9. FT.CONFIG knobs: RERANK_MULT deepens the oversample ───────────────────
+
+/// Search one compacted segment with explicit tuning knobs.
+fn segment_search_tuned(
+    store: &mut VectorStore,
+    name: &str,
+    q: &[f32],
+    k: usize,
+    ef: usize,
+    tuning: moon::vector::types::SearchTuning,
+) -> Vec<SearchResult> {
+    let idx = store.get_index_mut(name.as_bytes()).expect("index");
+    let snap = idx.segments.load();
+    let seg = &snap.immutable[0];
+    let mut scratch = moon::vector::hnsw::search::SearchScratch::new(
+        seg.total_count(),
+        padded_dimension(DIM as u32),
+    );
+    seg.search_with_tuning(q, k, ef, &mut scratch, tuning)
+        .into_iter()
+        .collect()
+}
+
+fn recall_at_k(results: &[SearchResult], truth_ids: &std::collections::HashSet<u32>) -> usize {
+    results
+        .iter()
+        .filter(|r| truth_ids.contains(&r.id.0))
+        .count()
+}
+
+fn true_top_k(q: &[f32], vecs: &[Vec<f32>], k: usize) -> std::collections::HashSet<u32> {
+    let mut truth: Vec<(f32, u32)> = vecs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (l2_sq(q, v), i as u32))
+        .collect();
+    truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    truth[..k].iter().map(|(_, i)| *i).collect()
+}
+
+#[test]
+fn rerank_mult_deeper_oversample_never_hurts_recall() {
+    use moon::vector::types::SearchTuning;
+    // TQ4's coarse codes misrank enough beam candidates that the exact
+    // rerank's oversample depth matters: with mult=1 only the top k ADC
+    // candidates are re-scored (true neighbors ranked k..4k by ADC are
+    // lost); deeper mult recovers them from the same beam.
+    let (mut store, vecs) = build_compacted(
+        "xr_mult",
+        QuantizationConfig::TurboQuant4,
+        DistanceMetric::L2,
+        400,
+        0x4EED5,
+    );
+    let mut rng = Rng::new(0x517E);
+    let k = 10;
+    let (mut hits_m1, mut hits_m4, mut hits_m16, mut total) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..20 {
+        let q = rng.vec(DIM);
+        let truth_ids = true_top_k(&q, &vecs, k);
+        for (mult, hits) in [
+            (1u32, &mut hits_m1),
+            (4u32, &mut hits_m4),
+            (16u32, &mut hits_m16),
+        ] {
+            let tuning = SearchTuning {
+                rerank_mult: mult,
+                exact_beam: false,
+            };
+            let results = segment_search_tuned(&mut store, "xr_mult", &q, k, 128, tuning);
+            *hits += recall_at_k(&results, &truth_ids);
+        }
+        total += k;
+    }
+    // Monotone: deeper oversample can only help (same beam, more re-scored).
+    assert!(
+        hits_m4 >= hits_m1,
+        "mult=4 recall {hits_m4}/{total} < mult=1 recall {hits_m1}/{total}"
+    );
+    assert!(
+        hits_m16 >= hits_m4,
+        "mult=16 recall {hits_m16}/{total} < mult=4 recall {hits_m4}/{total}"
+    );
+    // And the knob must actually bite on this seeded workload: shallow
+    // mult=1 measurably trails the mult=16 deep rerank.
+    assert!(
+        hits_m16 > hits_m1,
+        "mult=16 ({hits_m16}/{total}) did not improve over mult=1 \
+         ({hits_m1}/{total}) — RERANK_MULT knob is not reaching rerank_exact"
+    );
+}
+
+// ── 10. FT.CONFIG knobs: EXACT_BEAM navigates with true f16 distances ────────
+
+#[test]
+fn exact_beam_recall_at_least_matches_adc_beam() {
+    use moon::vector::types::SearchTuning;
+    // A deliberately narrow beam (ef just above k) makes beam-candidate
+    // SELECTION the recall bottleneck: TQ4's quantized ADC steers the beam
+    // into wrong graph regions that no post-hoc rerank can repair. The
+    // exact f16 beam navigates with true distances — recall becomes
+    // graph-limited. Widely varying norms (0.5..40) are TQ4+L2's weak spot:
+    // the norm-corrected sphere estimator is unbiased but noisy there.
+    distance::init();
+    let mut store = VectorStore::new();
+    store
+        .create_index(make_meta(
+            "xr_beam",
+            QuantizationConfig::TurboQuant4,
+            DistanceMetric::L2,
+        ))
+        .expect("create_index");
+    let mut vrng = Rng::new(0xBEA31);
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(400);
+    for i in 0..400usize {
+        let mut v = vrng.vec(DIM);
+        let scale = 0.5 + 39.5 * (vrng.next_f32() * 0.5 + 0.5);
+        for x in v.iter_mut() {
+            *x *= scale;
+        }
+        let key = Bytes::from(format!("doc:{i}"));
+        let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
+        store
+            .insert_vector(b"xr_beam", &v, key_hash, key)
+            .expect("insert");
+        vecs.push(v);
+    }
+    store.force_compact_index(b"xr_beam").expect("compact");
+    assert_eq!(store.immutable_segment_count(b"xr_beam"), Some(1));
+    let mut rng = Rng::new(0x90D0);
+    let k = 10;
+    let ef = 16;
+    let (mut hits_adc, mut hits_exact, mut total) = (0usize, 0usize, 0usize);
+    for _ in 0..20 {
+        let q = rng.vec(DIM);
+        let truth_ids = true_top_k(&q, &vecs, k);
+        let adc = segment_search_tuned(&mut store, "xr_beam", &q, k, ef, SearchTuning::default());
+        let exact = segment_search_tuned(
+            &mut store,
+            "xr_beam",
+            &q,
+            k,
+            ef,
+            SearchTuning {
+                rerank_mult: 4,
+                exact_beam: true,
+            },
+        );
+        hits_adc += recall_at_k(&adc, &truth_ids);
+        hits_exact += recall_at_k(&exact, &truth_ids);
+        total += k;
+
+        // EXACT_BEAM distances are true metric values (f16 tolerance) —
+        // the beam scored them exactly, no rerank pass needed.
+        for r in &exact {
+            let truth = l2_sq(&q, &vecs[r.id.0 as usize]);
+            let rel = (r.distance - truth).abs() / truth.max(1e-6);
+            assert!(
+                rel < 1.5e-3,
+                "EXACT_BEAM id={} returned={} exact={truth} rel={rel} — beam \
+                 returned a quantized estimate",
+                r.id.0,
+                r.distance
+            );
+        }
+    }
+    assert!(
+        hits_exact >= hits_adc,
+        "exact beam recall {hits_exact}/{total} < ADC beam recall {hits_adc}/{total}"
+    );
+    // The knob must bite: at ef=16 the TQ4 ADC beam measurably trails.
+    assert!(
+        hits_exact > hits_adc,
+        "exact beam ({hits_exact}/{total}) did not improve over the ADC beam \
+         ({hits_adc}/{total}) — EXACT_BEAM is not reaching the distance closures"
+    );
+}
+
+#[test]
+fn exact_beam_without_sidecar_falls_back_to_adc() {
+    use moon::vector::persistence::segment_io::{read_immutable_segment, write_immutable_segment};
+    use moon::vector::types::SearchTuning;
+
+    let (mut store, _vecs) = build_compacted(
+        "xr_bleg",
+        QuantizationConfig::Sq8,
+        DistanceMetric::L2,
+        32,
+        0x1B3A,
+    );
+    let dir = std::env::temp_dir().join(format!("moon-xr-bleg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let idx = store.get_index_mut(b"xr_bleg").expect("index");
+        let snap = idx.segments.load();
+        write_immutable_segment(&dir, 5, &snap.immutable[0], &idx.collection).expect("write");
+    }
+    let _ = std::fs::remove_file(dir.join("segment-5").join("raw_f16.bin"));
+
+    let (seg, _meta) = read_immutable_segment(&dir, 5).expect("read legacy segment");
+    let mut scratch = moon::vector::hnsw::search::SearchScratch::new(seg.total_count(), 64);
+    let mut rng = Rng::new(0xFA11);
+    let q = rng.vec(DIM);
+    let results = seg.search_with_tuning(
+        &q,
+        5,
+        64,
+        &mut scratch,
+        SearchTuning {
+            rerank_mult: 4,
+            exact_beam: true,
+        },
+    );
+    assert!(
+        !results.is_empty(),
+        "EXACT_BEAM on a sidecar-less segment must silently fall back to ADC"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

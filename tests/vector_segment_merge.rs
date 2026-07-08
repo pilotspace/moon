@@ -80,6 +80,8 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     }
 }
 
@@ -104,6 +106,8 @@ fn make_meta_sq8(name: &str, dim: u32) -> IndexMeta {
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     }
 }
 

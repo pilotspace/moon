@@ -48,6 +48,8 @@ mod qw7 {
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 

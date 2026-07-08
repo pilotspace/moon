@@ -39,7 +39,7 @@
 //!   [compaction_weight: f32 LE]   ← NEW in v3
 //! ```
 //!
-//! ## Format v4 (current — WS5a db-scoped indexes)
+//! ## Format v4 (WS5a db-scoped indexes)
 //!
 //! Extends v3 with a single `db_index: u8` byte appended after
 //! `compaction_weight`, tagging which logical db (`SELECT 0..databases-1`)
@@ -53,6 +53,17 @@
 //! Per index:
 //!   ... (same as v3 fields) ...
 //!   [db_index: u8]   ← NEW in v4
+//! ```
+//!
+//! ## Format v5 (current — search-tuning knobs)
+//!
+//! Extends v4 with the FT.CONFIG search-tuning knobs appended after
+//! `db_index`. v1-v4 sidecars are read with the defaults (mult 4, beam off).
+//!
+//! ```text
+//! Per index:
+//!   ... (same as v4 fields) ...
+//!   [rerank_mult: u32 LE] [exact_beam: u8] [reserved: 3B]   ← NEW in v5
 //! ```
 
 use std::io::{self, Read, Write};
@@ -69,6 +80,9 @@ const VERSION_V1: u8 = 1;
 const VERSION_V2: u8 = 2;
 const VERSION_V3: u8 = 3;
 const VERSION_V4: u8 = 4;
+/// v5 appends per-index search-tuning knobs (rerank_mult u32 LE,
+/// exact_beam u8, 3 reserved bytes) after the v4 db_index byte.
+const VERSION_V5: u8 = 5;
 
 /// Default compaction weight used when reading v1/v2 sidecars without a stored weight.
 const DEFAULT_WEIGHT_ON_LOAD: f32 = 1.0;
@@ -100,10 +114,10 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// from `vector_fields[0]` for backward compatibility), then appends the full
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
-    // Wrap with default weight=1.0 and delegate to the current (v4) serializer.
+    // Wrap with default weight=1.0 and delegate to the current (v5) serializer.
     let pairs: Vec<(&IndexMeta, f32)> =
         metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
-    serialize_index_metas_v4(&pairs)
+    serialize_index_metas_v5(&pairs)
 }
 
 /// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using v3 format (W3-deep).
@@ -116,14 +130,23 @@ fn serialize_index_metas_v3(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V3)
 }
 
-/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
-/// current v4 format (WS5a): v3 plus a trailing `db_index: u8` per index.
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the v4
+/// format (WS5a): v3 plus a trailing `db_index: u8` per index. Kept for
+/// v4-migration test coverage; production writers use
+/// [`serialize_index_metas_v5`] (via [`serialize_index_metas`]).
 pub fn serialize_index_metas_v4(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V4)
 }
 
-/// Shared v3/v4 serializer — `version` selects whether the trailing
-/// `db_index` byte (v4) is written.
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
+/// current v5 format: v4 plus the per-index search-tuning knobs
+/// (`rerank_mult` u32 LE, `exact_beam` u8, 3 reserved bytes).
+pub fn serialize_index_metas_v5(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
+    serialize_index_metas_versioned(pairs, VERSION_V5)
+}
+
+/// Shared v3/v4/v5 serializer — `version` selects which trailing extensions
+/// (`db_index` byte at v4, search-tuning knobs at v5) are written.
 fn serialize_index_metas_versioned(pairs: &[(&IndexMeta, f32)], version: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
@@ -154,6 +177,13 @@ fn serialize_index_metas_versioned(pairs: &[(&IndexMeta, f32)], version: u8) -> 
         // v4 extension: db_index (1 byte)
         if version >= VERSION_V4 {
             buf.push(m.db_index);
+        }
+
+        // v5 extension: search-tuning knobs
+        if version >= VERSION_V5 {
+            buf.extend_from_slice(&m.rerank_mult.to_le_bytes());
+            buf.push(m.exact_beam as u8);
+            buf.extend_from_slice(&[0u8; 3]); // reserved
         }
     }
 
@@ -205,11 +235,7 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let version = data[4];
-    if version != VERSION_V1
-        && version != VERSION_V2
-        && version != VERSION_V3
-        && version != VERSION_V4
-    {
+    if !(VERSION_V1..=VERSION_V5).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported version {version}"),
@@ -286,6 +312,20 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             DEFAULT_DB_INDEX_ON_LOAD
         };
 
+        // v5: read search-tuning knobs; older versions default (mult 4,
+        // beam off). Out-of-range persisted mult (corrupt/hand-edited
+        // sidecar) clamps back to the default rather than importing a
+        // pathological knob.
+        let (rerank_mult, exact_beam) = if version >= VERSION_V5 {
+            let mult = read_u32(data, &mut cursor)?;
+            let beam = read_u8(data, &mut cursor)? != 0;
+            cursor += 3; // reserved
+            let mult = if (1..=64).contains(&mult) { mult } else { 4 };
+            (mult, beam)
+        } else {
+            (4, false)
+        };
+
         let meta = IndexMeta {
             name: meta_base.0,
             dimension,
@@ -304,6 +344,8 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
             db_index,
+            rerank_mult,
+            exact_beam,
         };
         results.push((meta, compaction_weight));
     }
@@ -543,6 +585,8 @@ mod tests {
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 
@@ -595,17 +639,58 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    /// WS5a (db-scoped indexes): v4 sidecar round-trips `db_index`.
+    /// WS5a (db-scoped indexes): the sidecar round-trips `db_index` — via
+    /// the current (v5) writer AND via an explicit v4 sidecar (migration).
     #[test]
     fn test_roundtrip_v4_db_index() {
         let m1 = make_meta_for_db("idx1", 128, "doc:", "vec", 0);
         let m2 = make_meta_for_db("idx2", 128, "doc:", "vec", 7);
         let data = serialize_index_metas(&[&m1, &m2]);
-        // v4 is the current on-disk version.
-        assert_eq!(data[4], VERSION_V4);
+        // v5 is the current on-disk version.
+        assert_eq!(data[4], VERSION_V5);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result[0].db_index, 0);
         assert_eq!(result[1].db_index, 7);
+
+        // Explicit v4 data (written before the search-tuning knobs) still
+        // carries db_index and loads knob defaults.
+        let v4_data = serialize_index_metas_v4(&[(&m1, 1.0), (&m2, 1.0)]);
+        assert_eq!(v4_data[4], VERSION_V4);
+        let result = deserialize_index_metas(&v4_data).unwrap();
+        assert_eq!(result[1].db_index, 7);
+        assert_eq!(result[1].rerank_mult, 4);
+        assert!(!result[1].exact_beam);
+    }
+
+    /// v5: search-tuning knobs round-trip; corrupt out-of-range mult clamps.
+    #[test]
+    fn test_v5_roundtrip_search_tuning_knobs() {
+        let mut meta = make_meta("idx_v5", 128, "doc:", "vec");
+        meta.rerank_mult = 16;
+        meta.exact_beam = true;
+        let data = serialize_index_metas(&[&meta]);
+        assert_eq!(data[4], VERSION_V5);
+        let result = deserialize_index_metas(&data).unwrap();
+        assert_eq!(result[0].rerank_mult, 16);
+        assert!(result[0].exact_beam);
+
+        // The v5 knob block is the last 8 bytes of the buffer:
+        // [rerank_mult: u32 LE][exact_beam: u8][reserved: 3B].
+        let mut data = serialize_index_metas(&[&meta]);
+        let n = data.len();
+        data[n - 8..n - 4].copy_from_slice(&999u32.to_le_bytes());
+        let result = deserialize_index_metas(&data).unwrap();
+        assert_eq!(result[0].rerank_mult, 4, "out-of-range mult must clamp");
+    }
+
+    /// Pre-v5 sidecars carry no knob block — defaults apply.
+    #[test]
+    fn test_v1_reads_default_search_tuning_knobs() {
+        let meta = make_meta("idx_v1", 128, "doc:", "vec");
+        let data = serialize_index_metas_v1(&[&meta]);
+        let result = deserialize_index_metas(&data).unwrap();
+        assert_eq!(result[0].rerank_mult, 4);
+        assert!(!result[0].exact_beam);
     }
 
     /// WS5a: a v3 sidecar (written before db_index existed) loads every
@@ -671,8 +756,8 @@ mod tests {
     fn test_serialize_deserialize_v2_single_field() {
         let meta = make_meta("idx", 128, "doc:", "vec");
         let data = serialize_index_metas(&[&meta]);
-        // Now writes v4 (serialize_index_metas delegates to v4 -- WS5a db_index)
-        assert_eq!(data[4], VERSION_V4);
+        // Now writes v5 (serialize_index_metas delegates to v5 -- tuning knobs)
+        assert_eq!(data[4], VERSION_V5);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector_fields.len(), 1);

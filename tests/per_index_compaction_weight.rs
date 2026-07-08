@@ -262,6 +262,8 @@ fn test_ft_config_weight_roundtrip() {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     };
     store.create_index(meta).unwrap();
 
@@ -340,6 +342,8 @@ fn test_compaction_weight_persists_across_reload() {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     };
     store.create_index(meta.clone()).unwrap();
 
@@ -393,6 +397,8 @@ fn test_vacuum_vector_weight_sets_and_reads() {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     };
     store.create_index(meta).unwrap();
 

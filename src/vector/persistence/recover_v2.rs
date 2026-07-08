@@ -598,6 +598,8 @@ mod tests {
             merge_mode: crate::vector::store::MergeMode::default(),
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 

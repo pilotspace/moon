@@ -46,6 +46,9 @@ pub struct MvccContext<'a> {
     /// user `EF_RUNTIME`) — saturation-certified segments may then run at
     /// their min-ef estimate. Always false when the user pinned ef.
     pub ef_defaulted: bool,
+    /// Per-index recall/QPS knobs (FT.CONFIG RERANK_MULT / EXACT_BEAM),
+    /// copied from `IndexMeta` at search entry.
+    pub tuning: crate::vector::types::SearchTuning,
 }
 
 /// Snapshot of all segments at a point in time.
@@ -211,6 +214,9 @@ pub struct SearchSnapshot {
     /// user `EF_RUNTIME`) — saturation-certified segments may then run at
     /// their min-ef estimate.
     pub ef_defaulted: bool,
+    /// Per-index recall/QPS knobs (FT.CONFIG RERANK_MULT / EXACT_BEAM),
+    /// copied from `IndexMeta` at capture.
+    pub tuning: crate::vector::types::SearchTuning,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -591,9 +597,16 @@ impl SegmentHolder {
         for imm in &snapshot.immutable {
             let ef_i = seg_ef(imm.suggested_ef());
             if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered(query_f32, k, ef_i, _scratch, filter_bitmap));
+                all.extend(imm.search_filtered_with_tuning(
+                    query_f32,
+                    k,
+                    ef_i,
+                    _scratch,
+                    filter_bitmap,
+                    mvcc.tuning,
+                ));
             } else {
-                all.extend(imm.search(query_f32, k, ef_i, _scratch));
+                all.extend(imm.search_with_tuning(query_f32, k, ef_i, _scratch, mvcc.tuning));
             }
         }
 
@@ -750,6 +763,7 @@ impl SegmentHolder {
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
+        let tuning = snap.tuning;
 
         // Prepare TurboQuant_prod query state for mutable search (same as sync).
         let collection = segments.mutable.collection();
@@ -796,20 +810,28 @@ impl SegmentHolder {
                     fetch_k,
                     ef_search: ef_seg,
                     filter: filter_arc.clone(),
+                    tuning,
                     reply: tx.clone(),
                 };
                 if pool.submit(job) {
                     pending_replies += 1;
                 } else if graph_filter.is_some() {
-                    all.extend(seg.search_filtered(
+                    all.extend(seg.search_filtered_with_tuning(
                         query_f32,
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
                         graph_filter,
+                        tuning,
                     ));
                 } else {
-                    let results = seg.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
+                    let results = seg.search_with_tuning(
+                        query_f32,
+                        fetch_k,
+                        ef_seg,
+                        &mut snap.scratch,
+                        tuning,
+                    );
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -828,6 +850,7 @@ impl SegmentHolder {
                     fetch_k,
                     ef_search: graph_ef,
                     filter: filter_arc.clone(),
+                    tuning,
                     reply: tx.clone(),
                 };
                 if pool.submit(job) {
@@ -934,15 +957,22 @@ impl SegmentHolder {
             for imm in &segments.immutable {
                 let ef_seg = seg_ef(imm.suggested_ef());
                 if graph_filter.is_some() {
-                    all.extend(imm.search_filtered(
+                    all.extend(imm.search_filtered_with_tuning(
                         query_f32,
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
                         graph_filter,
+                        tuning,
                     ));
                 } else {
-                    let results = imm.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
+                    let results = imm.search_with_tuning(
+                        query_f32,
+                        fetch_k,
+                        ef_seg,
+                        &mut snap.scratch,
+                        tuning,
+                    );
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -1242,6 +1272,7 @@ mod tests {
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         };
         let mvcc = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1276,6 +1307,7 @@ mod tests {
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
         assert_eq!(results.len(), 1);
@@ -1333,6 +1365,7 @@ mod tests {
             dirty_set: std::slice::from_ref(&dirty_entry),
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1372,6 +1405,7 @@ mod tests {
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         };
         let r1 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty);
 
@@ -1383,6 +1417,7 @@ mod tests {
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
         };
         let r2 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty2);
 

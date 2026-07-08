@@ -27,6 +27,7 @@ use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_pro
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
+use crate::vector::types::SearchTuning;
 use crate::vector::types::VectorId;
 
 /// Microseconds since UNIX epoch, read from the shard's thread-local cached
@@ -450,18 +451,25 @@ impl ImmutableSegment {
     /// Candidates still carry per-segment internal ids (pre
     /// `remap_to_global_ids`); `graph.to_bfs` maps them into the sidecar.
     ///
-    /// Cost control: only the top `4·k` ADC-ranked candidates are re-scored
-    /// (candidates arrive nearest-first from the beam). The true top-k landing
-    /// outside a 4× ADC oversample is rare; re-scoring the full ef-wide beam
-    /// costs ~ef·dim f16 decodes per segment for negligible recall beyond that.
-    fn rerank_exact(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32], k: usize) {
+    /// Cost control: only the top `mult·k` ADC-ranked candidates are re-scored
+    /// (candidates arrive nearest-first from the beam; `mult` defaults to 4,
+    /// runtime-tunable via FT.CONFIG RERANK_MULT). The true top-k landing
+    /// outside a 4× ADC oversample is rare; deeper oversampling recovers the
+    /// tail at ~mult·k·dim f16 decodes per segment.
+    fn rerank_exact(
+        &self,
+        candidates: &mut SmallVec<[SearchResult; 32]>,
+        query: &[f32],
+        k: usize,
+        mult: u32,
+    ) {
         let Some(raw) = self.raw_f16() else {
             return;
         };
         if candidates.is_empty() {
             return;
         }
-        let rerank_n = (4 * k.max(1)).min(candidates.len());
+        let rerank_n = ((mult.max(1) as usize) * k.max(1)).min(candidates.len());
         let dim = self.collection_meta.dimension as usize;
         let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
 
@@ -567,16 +575,52 @@ impl ImmutableSegment {
         ef_search: usize,
         scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
+        self.search_with_tuning(query, k, ef_search, scratch, SearchTuning::default())
+    }
+
+    /// [`Self::search`] with explicit recall/QPS knobs (FT.CONFIG
+    /// RERANK_MULT / EXACT_BEAM). The knob-free wrapper uses the defaults.
+    pub fn search_with_tuning(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        tuning: SearchTuning,
+    ) -> SmallVec<[SearchResult; 32]> {
         // WS3 idle-unload: record this search so the HOT->WARM idle-eligibility
         // check has an accurate recency signal (see `idle_secs`).
         self.touch_last_access();
+        // EXACT_BEAM: navigate the graph with true f16 distances from the
+        // exact sidecar — the beam's candidate SELECTION becomes exact, so
+        // recall is graph-limited rather than quantization-limited. Requires
+        // the sidecar; segments without one keep the quantized ADC beam.
+        let exact_f16 = if tuning.exact_beam {
+            self.raw_f16()
+        } else {
+            None
+        };
         // Use sub-centroid signs during beam (32-level LUT) when available.
         // This eliminates the separate rerank pass — beam itself is high-accuracy.
         // Note: passing ef_search for both k and ef_search is intentional.
         // HNSW returns up to `ef_search` candidates (no early truncation to k).
         // This preserves candidates for cross-segment merging in the caller,
         // which does the final top-k selection after merging all segments.
-        let mut candidates = if !self.sub_centroid_signs.is_empty() {
+        let mut candidates = if exact_f16.is_some() {
+            hnsw_search_filtered(
+                &self.graph,
+                self.vectors_tq.as_slice(),
+                query,
+                &self.collection_meta,
+                ef_search,
+                ef_search,
+                scratch,
+                None,
+                &self.sub_centroid_signs,
+                self.sub_sign_bytes_per_vec,
+                exact_f16,
+            )
+        } else if !self.sub_centroid_signs.is_empty() {
             hnsw_search_subcent(
                 &self.graph,
                 self.vectors_tq.as_slice(),
@@ -606,19 +650,22 @@ impl ImmutableSegment {
             cands
         };
         // Filter deleted entries first so tombstones neither consume the
-        // exact-rerank 4·k budget nor leave stale ADC scores mixed into the
+        // exact-rerank mult·k budget nor leave stale ADC scores mixed into the
         // post-rerank ordering.
         candidates.retain(|c| {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
-        // HQ-1: exact rerank of the top 4·k live beam candidates from the f16
-        // sidecar — replaces quantized estimates with true metric distances
-        // before top-k truncation. No-op without a sidecar. Runs for SQ8
-        // too: an A/B (20k×384d, 1seg+5seg) measured skipping it costs
-        // R@10 −0.010 clustered / −0.017 gaussian-5seg — real recall, and
-        // the SIMD sidecar kernels make the pass ~3% of a query.
-        self.rerank_exact(&mut candidates, query, k);
+        // HQ-1: exact rerank of the top mult·k live beam candidates from the
+        // f16 sidecar — replaces quantized estimates with true metric
+        // distances before top-k truncation. No-op without a sidecar. Runs
+        // for SQ8 too: an A/B (20k×384d, 1seg+5seg) measured skipping it
+        // costs R@10 −0.010 clustered / −0.017 gaussian-5seg — real recall,
+        // and the SIMD sidecar kernels make the pass ~3% of a query.
+        // Skipped under EXACT_BEAM: the beam already produced true distances.
+        if exact_f16.is_none() {
+            self.rerank_exact(&mut candidates, query, k, tuning.rerank_mult);
+        }
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -633,8 +680,34 @@ impl ImmutableSegment {
         scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
-        // WS3 idle-unload: see comment in `search()` above.
+        self.search_filtered_with_tuning(
+            query,
+            k,
+            ef_search,
+            scratch,
+            allow_bitmap,
+            SearchTuning::default(),
+        )
+    }
+
+    /// [`Self::search_filtered`] with explicit recall/QPS knobs.
+    pub fn search_filtered_with_tuning(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        allow_bitmap: Option<&RoaringBitmap>,
+        tuning: SearchTuning,
+    ) -> SmallVec<[SearchResult; 32]> {
+        // WS3 idle-unload: see comment in `search_with_tuning()` above.
         self.touch_last_access();
+        // EXACT_BEAM (see `search_with_tuning`): exact f16 beam navigation.
+        let exact_f16 = if tuning.exact_beam {
+            self.raw_f16()
+        } else {
+            None
+        };
         // Note: passing ef_search for both k and ef_search is intentional
         // (see comment in search() method above).
         let mut candidates = hnsw_search_filtered(
@@ -648,12 +721,13 @@ impl ImmutableSegment {
             allow_bitmap,
             &self.sub_centroid_signs,
             self.sub_sign_bytes_per_vec,
+            exact_f16,
         );
 
         // When sub-centroid signs are used in beam, no rerank needed.
         // Only rerank if beam used standard 16-level scoring (and no exact
         // sidecar — rerank_exact below supersedes the estimator).
-        if self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
+        if exact_f16.is_none() && self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
             self.rerank_with_prod(&mut candidates, query);
         }
         // Filter deleted entries first (see comment in search()).
@@ -662,8 +736,11 @@ impl ImmutableSegment {
             self.is_live_bfs(bfs)
         });
         // HQ-1: exact rerank of the live beam from the f16 sidecar (see the
-        // recall A/B note in `search`).
-        self.rerank_exact(&mut candidates, query, k);
+        // recall A/B note in `search`). Skipped under EXACT_BEAM — the beam
+        // already produced true distances.
+        if exact_f16.is_none() {
+            self.rerank_exact(&mut candidates, query, k, tuning.rerank_mult);
+        }
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates

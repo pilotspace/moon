@@ -51,6 +51,13 @@ FT.CREATE <index_name> ON HASH PREFIX <count> <prefix>...
 | `QUANTIZATION` | TQ4 (COSINE/IP), SQ8 (L2) | TQ1-TQ4, SQ8 | Compression level. TQ4 = 4-bit (best compression, strongest on unit-sphere metrics; L2 uses a norm-corrected estimator), SQ8 = 8-bit (higher recall, all metrics — the default for L2) |
 | `BUILD_MODE` | LIGHT | LIGHT, EXACT | HNSW build quality vs resource trade-off (see below) |
 
+Two more per-index recall knobs are runtime-only (set via `FT.CONFIG`, persisted, applied on the next search):
+
+| FT.CONFIG parameter | Default | Range | Description |
+|---------------------|---------|-------|-------------|
+| `RERANK_MULT` | 4 | 1-64 | Exact-rerank depth: re-score the top `mult×k` beam candidates with true f16 distances before truncation. Deeper recovers neighbors the quantized ranking dropped, at ~`mult·k·dim` f16 decodes per segment |
+| `EXACT_BEAM` | OFF | ON/OFF | Navigate the HNSW beam with exact f16 distances instead of quantized estimates — recall becomes graph-limited (~1.0 at high ef). QPS cost grows with dimension; segments without an exact-rerank sidecar keep the quantized beam |
+
 ### BUILD_MODE: Light vs Exact
 
 | Aspect | LIGHT (default) | EXACT |

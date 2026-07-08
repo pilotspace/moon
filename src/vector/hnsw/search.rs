@@ -224,6 +224,7 @@ pub fn hnsw_search(
         None,
         &[],
         0,
+        None,
     )
 }
 
@@ -253,6 +254,7 @@ pub fn hnsw_search_subcent(
         None,
         sub_centroid_signs,
         sub_sign_bytes_per_vec,
+        None,
     )
 }
 
@@ -274,6 +276,7 @@ pub fn hnsw_search_filtered(
     allow_bitmap: Option<&RoaringBitmap>,
     sub_centroid_signs: &[u8],
     sub_sign_bpv: usize,
+    exact_f16: Option<&[u16]>,
 ) -> SmallVec<[SearchResult; 32]> {
     let num_nodes = graph.num_nodes();
     if num_nodes == 0 {
@@ -380,6 +383,49 @@ pub fn hnsw_search_filtered(
             sphere_sum * (norm * norm)
         }
     };
+    // EXACT_BEAM: when `exact_f16` is Some, both distance closures below score
+    // candidates with TRUE f16 distances from the exact-rerank sidecar instead
+    // of quantized ADC — beam candidate SELECTION becomes exact, so recall is
+    // graph-limited rather than quantization-limited. Same distance
+    // conventions as `ImmutableSegment::rerank_exact` (true squared L2 for
+    // L2; `2 − 2·⟨q̂,x̂⟩` for the unit-sphere metrics), so cross-segment merge
+    // ordering stays consistent. Out-of-range sidecar reads (never expected —
+    // the sidecar is BFS-complete) fall through to the quantized path.
+    let exact_kernels = distance::table();
+    let mut exact_q_unit: SmallVec<[f32; 512]> = SmallVec::new();
+    if exact_f16.is_some() && collection.metric != DistanceMetric::L2 {
+        exact_q_unit = SmallVec::from_slice(query);
+        let n: f32 = exact_q_unit.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            let inv = 1.0 / n;
+            for v in exact_q_unit.iter_mut() {
+                *v *= inv;
+            }
+        }
+    }
+    let exact_metric_is_l2 = collection.metric == DistanceMetric::L2;
+    let exact_q: &[f32] = if exact_metric_is_l2 {
+        query
+    } else {
+        &exact_q_unit
+    };
+    let exact_dist = move |vec_f16: &[u16]| -> f32 {
+        if exact_metric_is_l2 {
+            (exact_kernels.f16_l2)(exact_q, vec_f16)
+        } else {
+            let (dot, xsq) = (exact_kernels.f16_dot_normsq)(exact_q, vec_f16);
+            if xsq > 0.0 {
+                // f16 rounding can push cos slightly outside [-1, 1]; clamp
+                // so distances stay in the metric's [0, 4] range.
+                let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
+                2.0 - 2.0 * cos
+            } else {
+                // Zero vector: normalized form undefined — neutral distance.
+                2.0
+            }
+        }
+    };
+
     // SQ8 has no shared codebook; use a zero placeholder so codebook_16() never
     // logs a spurious "empty codebook" error (the SQ8 closures ignore the LUT).
     let zero_codebook = [0.0f32; 16];
@@ -467,6 +513,13 @@ pub fn hnsw_search_filtered(
     // Hot path: processes `code_len` bytes (nibble-packed TQ codes) with LUT lookups.
     // For 384d: code_len ≈ 192, 384 nibble lookups per candidate, called ~500 times per query.
     let dist_bfs = |bfs_pos: u32| -> f32 {
+        // EXACT_BEAM override: true f16 distance from the sidecar.
+        if let Some(raw) = exact_f16 {
+            let start = bfs_pos as usize * dim;
+            if let Some(vec_f16) = raw.get(start..start + dim) {
+                return exact_dist(vec_f16);
+            }
+        }
         let offset = bfs_pos as usize * bytes_per_code;
         if is_sq8 {
             // SQ8: decode (min, scale) from the slot trailer, SIMD-dispatched
@@ -626,6 +679,17 @@ pub fn hnsw_search_filtered(
 
     // LUT-based budgeted distance with early termination.
     let dist_bfs_budgeted = |bfs_pos: u32, budget: f32| -> f32 {
+        // EXACT_BEAM override: the exact distance is cheap enough relative to
+        // its accuracy win that the ADC early-exit budget is not needed —
+        // compute the true distance and let the caller's domination check
+        // (`d >= worst_dist`) discard it.
+        if let Some(raw) = exact_f16 {
+            let start = bfs_pos as usize * dim;
+            if let Some(vec_f16) = raw.get(start..start + dim) {
+                let _ = budget;
+                return exact_dist(vec_f16);
+            }
+        }
         let offset = bfs_pos as usize * bytes_per_code;
         if is_sq8 {
             // SQ8 ADC is cheap and exact; ignore the budget early-exit.
@@ -1604,6 +1668,7 @@ mod tests {
             None,
             &[],
             0,
+            None,
         );
 
         assert_eq!(unfiltered.len(), filtered.len());
@@ -1642,6 +1707,7 @@ mod tests {
             Some(&bitmap),
             &[],
             0,
+            None,
         );
         for r in &results {
             assert!(

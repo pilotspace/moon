@@ -348,6 +348,10 @@ pub fn ft_recommend(
         dirty_set: &[],
         dimension: dim as u32,
         ef_defaulted: false,
+        tuning: crate::vector::types::SearchTuning {
+            rerank_mult: idx.meta.rerank_mult,
+            exact_beam: idx.meta.exact_beam,
+        },
     };
 
     // Dispatch to correct field segments
