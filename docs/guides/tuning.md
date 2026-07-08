@@ -137,3 +137,40 @@ single-purpose benchmark rigs.
   embeddings; **TQ4** shines at 768-d and above. Validate recall with real embeddings,
   not random vectors.
 - Details: [Vector search guide](../vector-search-guide.md).
+
+## Vector bulk load and compaction
+
+Newly-inserted vectors are **searchable immediately** against the brute-force mutable
+tier — exact results, but an O(N) scan per query. The HNSW graph that makes search
+O(log N) is built by *compaction*, and Moon now builds it **concurrently with ingest**
+across cores, so a bulk load reaches HNSW-tier serving shortly after the last insert
+rather than on a later `FT.COMPACT`. On an 8-vCPU dedicated GCE instance, 50K × 384-d
+vectors reach HNSW-quality serving in ≈ 9–10 s end to end.
+
+You usually don't need to touch anything — the defaults do the right thing. Reach for a
+knob only in these cases:
+
+- **`COMPACT_THRESHOLD`** (per index, at `FT.CREATE`) sets when a mutable segment freezes
+  into an immutable HNSW segment. It's the main time-to-serve vs recall lever:
+  - *Streaming / continuous ingest* — leave it at the default. Segments compact in the
+    background as thresholds are crossed; queries stay fast throughout.
+  - *One-shot bulk load where recall matters most* — set it **at or above your dataset
+    size** and call `FT.COMPACT` once at the end. You get a single optimal segment (best
+    recall, no multi-segment beam split) at the cost of a later first-fast-query.
+  - Lower thresholds build more, smaller segments sooner (faster time-to-serve, ~0.001
+    lower recall@10 from multi-segment search); higher thresholds do the opposite.
+- **`MOON_VEC_COMPACT_WORKERS`** (env) sizes the background compaction thread pool.
+  Default is half the machine's cores, clamped to `[1, 8]`. Raise it on write-heavy
+  fleets that compact many indexes or shards at once; set `1` for strict shard-thread
+  isolation on latency-critical nodes. Segments of ~10K+ vectors additionally build with
+  a multi-core parallel HNSW builder; smaller segments use the single-threaded builder.
+  Both are automatic and correct on core-pinned deployments — no tuning required.
+- **Trade-off to expect:** overlapping the HNSW build with ingest shares cores, so peak
+  *ingest* throughput drops while a build runs, and multi-segment serving costs about
+  0.001 recall@10 versus a single fully-compacted segment. That buys a dramatically
+  faster time-to-first-fast-query. If you care about raw ingest rate and will query
+  later, prefer the high-`COMPACT_THRESHOLD` + single final `FT.COMPACT` recipe above.
+- **Multi-shard:** each shard compacts its own segments independently and the trigger
+  fires per shard, so bulk loads parallelize across shards automatically. Co-locate
+  related vectors with hash tags only if you also do multi-key KV ops on them; vector
+  search itself scatter-gathers across shards regardless.

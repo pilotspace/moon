@@ -6,7 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
+### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
+
+- `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents
+  immediate-search-then-background-HNSW-build behavior, the `COMPACT_THRESHOLD`
+  time-to-serve vs recall lever, the `MOON_VEC_COMPACT_WORKERS` pool knob, the
+  ~10K-vector parallel-build threshold, per-shard bulk-load parallelism, and the
+  ingest-rate/recall trade-offs. Operator guidance for the parallel-build +
+  insert-path-compaction work shipped in #237.
+- Removes a stray `<<<<<<< HEAD` conflict marker accidentally left in the
+  `[Unreleased]` heading by #237's squash merge.
+
 ### Added — parallel HNSW build + insert-path compaction trigger: time-to-index-green 11× (PR #237)
 
 - **`src/vector/hnsw/parallel_build.rs`** (new): concurrent HNSW
