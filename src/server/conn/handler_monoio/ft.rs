@@ -325,15 +325,40 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+            // SET must broadcast: each shard holds its own index partition, and a
+            // local-only write would leave 7/8 shards on the old value (the tokio
+            // sharded handler already broadcasts FT.CONFIG via its catch-all).
+            // GET stays local — post-broadcast, every shard agrees. The
+            // connection's SELECTed db rides the broadcast (WS5a db scoping).
             let db_index = conn.selected_db as u8;
-            let response = crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::ft_config(
-                    &mut s.vector_store,
-                    &mut s.text_store,
-                    cmd_args,
+            let is_set = cmd_args
+                .first()
+                .and_then(|f| match f {
+                    crate::protocol::Frame::BulkString(b) => Some(b.as_ref()),
+                    _ => None,
+                })
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"SET"));
+            let response = if is_set {
+                crate::shard::coordinator::broadcast_vector_command(
+                    std::sync::Arc::new(frame.clone()),
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    &ctx.shard_databases,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
                     db_index,
                 )
-            });
+                .await
+            } else {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_config(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                        db_index,
+                    )
+                })
+            };
             responses.push(response);
             return true;
         }

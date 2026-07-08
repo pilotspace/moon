@@ -165,6 +165,29 @@ fn ft_config_set(
         }
         idx.merge_recall_tolerance = parsed;
         Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else if param.eq_ignore_ascii_case(b"EF_RUNTIME") {
+        // Runtime-tunable search beam width, same range as FT.CREATE's
+        // EF_RUNTIME (10-4096). 0 restores the auto heuristic (max(k*20, 200)
+        // with dimension boost). Query path reads meta.hnsw_ef_runtime per
+        // search, so the change applies to the next FT.SEARCH immediately.
+        let parsed: u32 = match std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(v) if v == 0 || (10..=4096).contains(&v) => v,
+            Some(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR EF_RUNTIME must be 10-4096 (or 0 for auto)",
+                ));
+            }
+            None => {
+                return Frame::Error(Bytes::from_static(b"ERR invalid EF_RUNTIME value"));
+            }
+        };
+        idx.meta.hnsw_ef_runtime = parsed;
+        // Persist so the value survives a server restart.
+        store.save_index_meta_sidecar();
+        Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }
@@ -210,6 +233,11 @@ fn ft_config_get(
         let mut buf = String::with_capacity(8);
         use std::fmt::Write as _;
         let _ = write!(buf, "{}", idx.merge_recall_tolerance);
+        Frame::BulkString(Bytes::from(buf))
+    } else if param.eq_ignore_ascii_case(b"EF_RUNTIME") {
+        let mut buf = String::with_capacity(8);
+        use std::fmt::Write as _;
+        let _ = write!(buf, "{}", idx.meta.hnsw_ef_runtime);
         Frame::BulkString(Bytes::from(buf))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
