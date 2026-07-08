@@ -94,6 +94,20 @@ At pipeline=64, Moon delivers **1.71x the throughput of Redis while using 23x le
 !!! note
     Moon's per-shard WAL avoids the global serialization point that Redis's single AOF file introduces. The advantage grows with pipeline depth because per-shard WAL scales linearly with shards.
 
+### Max-durability (`appendfsync always`) and `everysec` write path
+
+A 2026-07 write-path campaign (GCE c3-standard-8, Redis 7.0.15, `--shards 2`, 3 alternated reps) closed Moon's remaining AOF-on deficits:
+
+| Policy / workload | Before | After | vs Redis |
+|:---|---:|---:|:---:|
+| `always` SET p16 | 5.7K (0.12x) | **40.1K** | **0.91x** |
+| `always` SET p1 | ~3.2K | 3.1K | parity (fsync-device-bound) |
+| `everysec` SET p16 | 605K | **789K** | **1.32x** |
+| `everysec` SET p1 | 117K (0.80x) | **135K** | **0.99x parity** |
+| Pub/sub fan-out delivery | 438 msg/s (drops) | **5.09M msg/s** | **1.04x, 0 drops** |
+
+The wins come from per-batch group commit (one fsync per pipeline batch, not per command), a single coalesced `write_all` per batch, a park-free AOF-writer poll that removes a ~150K/sec futex-wake storm on the shard thread under `everysec`, and coalesced pub/sub delivery writes. Durability is unchanged (`always` = RPO 0, `everysec` = RPO ≤ 1s), verified by the SIGKILL crash-recovery matrix. Full detail: `BENCHMARK.md` §7.3.
+
 ## Latency
 
 | Metric | Redis | Moon | Improvement |
