@@ -382,10 +382,11 @@ single-purpose benchmark rigs.
   final compaction; explicit `FT.COMPACT` on a small mutable segment is a no-op below
   the threshold.
 - Match quantization to dimension **and metric**: **SQ8** (or full-precision HNSW) for
-  ≤ 384-d embeddings; **TQ4** shines at 768-d and above **but only on unit-sphere
-  metrics (COSINE / IP)** — on unnormalized L2 data (e.g. gist-960) TQ4's norm-scaled
-  distance estimator collapses (recall < 0.01 measured); use SQ8 for raw-L2 workloads.
-  Validate recall with real embeddings, not random vectors.
+  ≤ 384-d embeddings; **TQ4** shines at 768-d and above and is strongest on the
+  unit-sphere metrics (COSINE / IP). TQ on raw L2 uses a norm-corrected distance
+  estimator (an earlier norm-scaled ranking collapsed on unnormalized data, which is
+  why L2 indexes default to SQ8); SQ8 remains the recommended choice for raw-L2
+  workloads. Validate recall with real embeddings, not random vectors.
 - **Query cost scales with segment count**: each FT.SEARCH runs the full ef beam on
   *every* graph segment on *every* shard (cost ≈ shards × segments × ef). An index
   that accumulated 50+ segments during a bulk load answers the same query 4–5× slower

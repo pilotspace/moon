@@ -48,7 +48,7 @@ FT.CREATE <index_name> ON HASH PREFIX <count> <prefix>...
 | `EF_CONSTRUCTION` | 200 | 10-4096 | HNSW build effort. Higher = better graph quality, slower compaction |
 | `EF_RUNTIME` | auto | 10-4096 | Search beam width. 0/omit = auto: max(k×15, 200). Higher = better recall, lower QPS. Tunable at runtime: `FT.CONFIG SET <idx> EF_RUNTIME <n>` (0 = restore auto) — applies to the next search, no rebuild |
 | `COMPACT_THRESHOLD` | 1000 | 100-100000 | Min vectors before auto-compaction. Higher = fewer larger HNSW graphs |
-| `QUANTIZATION` | TQ4 | TQ1-TQ4, SQ8 | Compression level. TQ4 = 4-bit (best compression, **unit-sphere metrics COSINE/IP only** — collapses on unnormalized L2), SQ8 = 8-bit (higher recall, all metrics) |
+| `QUANTIZATION` | TQ4 (COSINE/IP), SQ8 (L2) | TQ1-TQ4, SQ8 | Compression level. TQ4 = 4-bit (best compression, strongest on unit-sphere metrics; L2 uses a norm-corrected estimator), SQ8 = 8-bit (higher recall, all metrics — the default for L2) |
 | `BUILD_MODE` | LIGHT | LIGHT, EXACT | HNSW build quality vs resource trade-off (see below) |
 
 ### BUILD_MODE: Light vs Exact

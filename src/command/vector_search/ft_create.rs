@@ -747,9 +747,9 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
             quantization = QuantizationConfig::Sq8;
         } else if quantization != QuantizationConfig::Sq8 {
             tracing::warn!(
-                "FT.CREATE: TQ quantization with DISTANCE_METRIC L2 — TQ's \
-                 norm-scaled estimator degrades badly on unnormalized vectors; \
-                 use SQ8 unless the data is unit-normalized"
+                "FT.CREATE: TQ quantization with DISTANCE_METRIC L2 uses the \
+                 norm-corrected ADC estimator; SQ8 generally gives higher \
+                 recall for raw-L2 workloads"
             );
         }
     }
