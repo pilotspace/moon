@@ -601,6 +601,138 @@ fn multishard_ft_list_scoped_per_db() {
 }
 
 // ---------------------------------------------------------------------------
+// (g) Write-path db-isolation — auto-index / auto-delete hooks (round 4).
+// ---------------------------------------------------------------------------
+//
+// Round 3 closed the READ-path leak (a foreign db's FT.SEARCH/scatter could
+// see another db's index). A follow-up adversarial review found the
+// auto-index/auto-unindex WRITE-path hooks (`auto_index_hset`,
+// `auto_delete_vectors` in `src/shard/spsc_handler.rs`) were never
+// db-scoped despite the round-2 CHANGELOG claiming they were: a HSET/DEL
+// issued from ANY db, matching an index's PREFIX by pure string match, fed
+// or tombstoned that index regardless of which db actually owns it. This is
+// a DATA-INTEGRITY bug (corrupts/erases another db's documents), worse than
+// the read-path visibility leak, and triggers at `--shards 1` — no
+// multi-shard fan-out needed.
+
+/// Extract `num_docs` from a bulk `FT.INFO` reply (`redis::Value::Array`
+/// flat key/value pairs, matching the raw shape asserted against elsewhere
+/// in this crate, e.g. `tests/per_index_compaction_weight.rs`).
+fn ft_info_num_docs(conn: &mut Connection, idx: &str) -> i64 {
+    let info: redis::Value = redis::cmd("FT.INFO").arg(idx).query(conn).unwrap();
+    let redis::Value::Array(items) = info else {
+        panic!("FT.INFO must return an array, got {info:?}");
+    };
+    for pair in items.windows(2) {
+        if let redis::Value::BulkString(k) = &pair[0] {
+            if k == b"num_docs" {
+                return match &pair[1] {
+                    redis::Value::Int(n) => *n,
+                    other => panic!("num_docs must be an integer, got {other:?}"),
+                };
+            }
+        }
+    }
+    panic!("FT.INFO reply had no top-level num_docs field: {items:?}");
+}
+
+/// (g1) HSET auto-index cross-db leak: `FT.CREATE idx ON HASH PREFIX 1 doc:`
+/// in db 0, then `HSET doc:x ...` from db 5 (same prefix, foreign db). Round
+/// 4's fix (`auto_index_hset` -> `find_matching_index_names_for_db`) must
+/// make db 5's HSET invisible to db 0's index: db 0's `num_docs` must not
+/// grow, and db 0's own FT.SEARCH must not return `doc:x`.
+#[test]
+fn write_path_auto_index_does_not_leak_across_db() {
+    let Some(m) = spawn_moon(1, "wp-autoindex") else {
+        return;
+    };
+    let mut c0 = m.conn(0);
+    let mut c5 = m.conn(5);
+
+    assert_eq!(ft_create(&mut c0, "wp_idx", "doc:").unwrap(), "OK");
+    let before = ft_info_num_docs(&mut c0, "wp_idx");
+    assert_eq!(before, 0, "freshly created index must start with 0 docs");
+
+    // Foreign-db HSET with a key matching db 0's index PREFIX.
+    hset_vec(&mut c5, "doc:x", [1.0, 0.0, 0.0, 0.0]).unwrap();
+
+    let after = ft_info_num_docs(&mut c0, "wp_idx");
+    assert_eq!(
+        after, before,
+        "db 0's wp_idx num_docs must NOT change when db 5 HSETs a \
+         prefix-matching key — this is adversarial review round-4 finding \
+         (auto_index_hset unscoped by db_index)"
+    );
+
+    let r0 = ft_search_count(&mut c0, "wp_idx", [1.0, 0.0, 0.0, 0.0]);
+    assert!(
+        matches!(r0, redis::Value::Nil)
+            || matches!(&r0, redis::Value::Array(items) if matches!(items.first(), Some(redis::Value::Int(0)))),
+        "db 0's wp_idx must NOT return doc:x (written from db 5), got {r0:?}"
+    );
+}
+
+/// (g2) DEL/auto-delete cross-db leak: `HSET doc:y ...` in db 0 (indexed by
+/// db 0's own index), then `DEL doc:y` issued from db 5 (same key, foreign
+/// db — a purely coincidental key collision across independent keyspaces,
+/// which Redis dbs are supposed to be). Round 4's fix
+/// (`auto_delete_vectors` -> `mark_deleted_for_key_for_db`) must make db 5's
+/// DEL a no-op against db 0's index: `doc:y` must remain searchable from
+/// db 0 afterward.
+#[test]
+fn write_path_auto_delete_does_not_leak_across_db() {
+    let Some(m) = spawn_moon(1, "wp-autodelete") else {
+        return;
+    };
+    let mut c0 = m.conn(0);
+    let mut c5 = m.conn(5);
+
+    assert_eq!(ft_create(&mut c0, "wp_del_idx", "doc:").unwrap(), "OK");
+    hset_vec(&mut c0, "doc:y", [1.0, 0.0, 0.0, 0.0]).unwrap();
+
+    let before = ft_info_num_docs(&mut c0, "wp_del_idx");
+    assert_eq!(before, 1, "db 0's own HSET must be indexed");
+
+    // Foreign-db DEL of the SAME key name (independent keyspace: db 5 never
+    // wrote `doc:y`, so this DEL only matters as a probe against db 0's
+    // index-owning auto-delete hook).
+    let deleted: i64 = redis::cmd("DEL").arg("doc:y").query(&mut c5).unwrap();
+    assert_eq!(
+        deleted, 0,
+        "db 5 never had doc:y in its own keyspace — DEL must report 0 removed"
+    );
+
+    // NOTE: `FT.INFO num_docs` is NOT the right signal for a deletion probe
+    // — it's `mutable_segment.len()`, an append-only counter that a
+    // tombstone never decrements (only compaction physically removes dead
+    // entries). It stays at `before` in BOTH the leaking and the fixed case,
+    // so it can't distinguish them. `FT.SEARCH` is the authoritative signal:
+    // a tombstoned entry is excluded from results immediately, scoped or
+    // not.
+
+    // NOTE: `ft_search_count`'s helper name is misleading here — a foreign-db
+    // tombstone doesn't error the search, it just empties the result set. So
+    // the real check is total-matched > 0 (real hits), NOT merely "not Nil"
+    // (an empty-but-OK `[0]` array also satisfies "not Nil" and would have
+    // silently passed this test against the unfixed code).
+    let r0 = ft_search_count(&mut c0, "wp_del_idx", [1.0, 0.0, 0.0, 0.0]);
+    match &r0 {
+        redis::Value::Array(items) => {
+            assert!(
+                matches!(items.first(), Some(redis::Value::Int(n)) if *n > 0),
+                "doc:y must remain searchable (real hits) from db 0 after db \
+                 5's same-name DEL — this is adversarial review round-4 \
+                 finding (auto_delete_vectors unscoped by db_index), got {r0:?}"
+            );
+        }
+        other => panic!(
+            "doc:y must remain searchable from db 0 after db 5's same-name \
+             DEL, got {other:?}"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (e) Legacy sidecar loads to db 0 — already covered by unit tests.
 // ---------------------------------------------------------------------------
 //
