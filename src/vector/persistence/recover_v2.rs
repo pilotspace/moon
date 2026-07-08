@@ -174,14 +174,23 @@ impl RecoveryState {
     /// Text-only matches are unaffected either way — `auto_index_hset`
     /// always re-derives text/TAG/NUMERIC from `args[1..]`, and stripping
     /// only ever removes a vector field's (name, value) pair.
+    /// WS5a round 4 (adversarial review, CRITICAL): `db_index` scopes
+    /// `find_matching_index_names_for_db` and the `auto_index_hset_public`
+    /// delegate below. Without it, a restart's dedup rescan would silently
+    /// RE-INTRODUCE the exact cross-db auto-index leak fixed on the live
+    /// write path (`auto_index_hset` in `src/shard/spsc_handler.rs`) on
+    /// every reboot — `event_loop.rs` already collects matching keys
+    /// per-db (`for db_idx in 0..db_count`) before calling this, so the
+    /// caller has always had the right value; it just wasn't threaded in.
     pub fn reconcile_key(
         &mut self,
         vector_store: &mut VectorStore,
         text_store: &mut TextStore,
         key: &[u8],
         args: &[Frame],
+        db_index: u8,
     ) {
-        let matching_vector = vector_store.find_matching_index_names(key);
+        let matching_vector = vector_store.find_matching_index_names_for_db(key, db_index);
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
 
         let mut any_recovered_checked = false;
@@ -241,6 +250,7 @@ impl RecoveryState {
                 text_store,
                 key,
                 &stripped,
+                db_index,
             );
             debug_assert!(
                 inserted.is_empty(),
@@ -257,6 +267,7 @@ impl RecoveryState {
                 text_store,
                 key,
                 args,
+                db_index,
             );
             for idx_name in &matching_vector {
                 if self.recovered_names.contains(idx_name) {
@@ -690,6 +701,7 @@ mod tests {
                 &mut TextStore::new(),
                 key.as_bytes(),
                 &args,
+                0,
             );
         }
 
@@ -761,7 +773,7 @@ mod tests {
                 Frame::BulkString(blob),
             ];
             let mut text_store = TextStore::new();
-            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args);
+            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args, 0);
         }
 
         // The load-bearing assertion: every key must have taken the
@@ -805,6 +817,7 @@ mod tests {
             &mut text_store,
             &new_key,
             &args,
+            0,
         );
         let new_global_id = *fresh
             .get_index(b"idx")
@@ -871,6 +884,7 @@ mod tests {
                 &mut TextStore::new(),
                 key.as_bytes(),
                 &args,
+                0,
             );
         }
         {
@@ -935,14 +949,14 @@ mod tests {
                 Frame::BulkString(Bytes::from_static(b"vec")),
                 Frame::BulkString(blob),
             ];
-            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args);
+            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args, 0);
         }
         let phantom_args = vec![
             Frame::BulkString(Bytes::from(phantom_key.clone())),
             Frame::BulkString(Bytes::from_static(b"vec")),
             Frame::BulkString(phantom_blob.clone()),
         ];
-        state.reconcile_key(&mut fresh, &mut text_store, &phantom_key, &phantom_args);
+        state.reconcile_key(&mut fresh, &mut text_store, &phantom_key, &phantom_args, 0);
 
         let counters = *state.counters.get(&Bytes::from_static(b"idx")).unwrap();
         assert_eq!(
@@ -1046,6 +1060,7 @@ mod tests {
                 &mut TextStore::new(),
                 key.as_bytes(),
                 &args,
+                0,
             );
         }
         {
@@ -1089,7 +1104,7 @@ mod tests {
                 Frame::BulkString(blob),
             ];
             let mut text_store = TextStore::new();
-            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args);
+            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args, 0);
         }
         state.finish(&mut fresh, tmp.path());
 

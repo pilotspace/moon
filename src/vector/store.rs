@@ -3059,6 +3059,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &v1),
+            0,
         );
         {
             let idx = store.get_index(b"idx").unwrap();
@@ -3082,6 +3083,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &v2),
+            0,
         );
         {
             let idx = store.get_index(b"idx").unwrap();
@@ -3131,6 +3133,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &[1.0, 2.0, 3.0, 4.0]),
+            0,
         );
 
         store.get_index_mut(b"idx").unwrap().force_compact();

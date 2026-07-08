@@ -853,6 +853,7 @@ mod tests {
                 &mut text_store,
                 b"doc:1",
                 &args,
+                0,
             );
 
             // Verify TEXT indexing fired despite no vector index matches

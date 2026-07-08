@@ -1463,6 +1463,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     &mut s.text_store,
                                     key.as_ref(),
                                     cmd_args,
+                                    sel_db as u8,
                                 )
                             } else {
                                 smallvec::SmallVec::new()
@@ -1482,6 +1483,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_delete_vectors(
                                 &mut s.vector_store,
                                 cmd_args,
+                                sel_db as u8,
                             );
                         }
 
@@ -1490,6 +1492,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_hdel_vectors(
                                 &mut s.vector_store,
                                 cmd_args,
+                                sel_db as u8,
                             );
                         }
 

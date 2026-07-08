@@ -1010,6 +1010,7 @@ impl super::Shard {
                                     &mut s.text_store,
                                     key,
                                     args,
+                                    db_idx as u8,
                                 );
                                 reindexed += 1;
                             }

@@ -1569,9 +1569,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // with_shard closure (multi-resource arm) to avoid re-entrant RefCell borrow.
                                     let inserted = crate::shard::slice::with_shard(|s| {
                                         if active_txn_id != 0 {
-                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id)
+                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id, conn.selected_db as u8)
                                         } else {
-                                            crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args)
+                                            crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args, conn.selected_db as u8)
                                         }
                                     });
                                     // Push one VectorIntent per (index_name, key_hash) so
@@ -1592,7 +1592,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::shard::slice::with_shard(|s| {
                                     for arg in cmd_args.iter() {
                                         if let Some(key) = extract_bytes(arg) {
-                                            s.vector_store.mark_deleted_for_key(key.as_ref());
+                                            s.vector_store.mark_deleted_for_key_for_db(
+                                                key.as_ref(),
+                                                conn.selected_db as u8,
+                                            );
                                         }
                                     }
                                 });
@@ -1607,6 +1610,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     crate::shard::spsc_handler::auto_hdel_vectors(
                                         &mut s.vector_store,
                                         cmd_args,
+                                        conn.selected_db as u8,
                                     );
                                 });
                             }

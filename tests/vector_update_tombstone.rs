@@ -50,7 +50,7 @@ fn ft_create_args(name: &str, dim: u32) -> Vec<Frame> {
 
 fn hset(vs: &mut VectorStore, ts: &mut TextStore, key: &[u8], vec: &[f32]) {
     let args = vec![bulk(key), bulk(b"vec"), f32_blob(vec)];
-    auto_index_hset_public(vs, ts, key, &args);
+    auto_index_hset_public(vs, ts, key, &args, 0);
 }
 
 /// KNN k=10 search; returns the total-result count (first array element).

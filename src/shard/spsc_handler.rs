@@ -735,6 +735,7 @@ pub(crate) fn handle_shard_message_shared(
                                         key_bytes,
                                         args,
                                         0,
+                                        db_idx as u8,
                                     );
                                 }
                             }
@@ -761,7 +762,8 @@ pub(crate) fn handle_shard_message_shared(
                     crate::shard::slice::with_shard(|s| {
                         for arg in args.iter() {
                             if let crate::protocol::Frame::BulkString(key_bytes) = arg {
-                                s.vector_store.mark_deleted_for_key(key_bytes.as_ref());
+                                s.vector_store
+                                    .mark_deleted_for_key_for_db(key_bytes.as_ref(), db_idx as u8);
                             }
                         }
                     });
@@ -1108,6 +1110,7 @@ pub(crate) fn handle_shard_message_shared(
                                 key_bytes,
                                 args,
                                 0,
+                                db_idx as u8,
                             );
                         }
                     }
@@ -1117,14 +1120,14 @@ pub(crate) fn handle_shard_message_shared(
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     {
-                        auto_delete_vectors(&mut s.vector_store, args);
+                        auto_delete_vectors(&mut s.vector_store, args, db_idx as u8);
                     }
 
                     // R4: HDEL of an indexed vector field tombstones the vector.
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && cmd.eq_ignore_ascii_case(b"HDEL")
                     {
-                        auto_hdel_vectors(&mut s.vector_store, args);
+                        auto_hdel_vectors(&mut s.vector_store, args, db_idx as u8);
                     }
 
                     // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
@@ -1707,6 +1710,7 @@ pub(crate) fn handle_shard_message_shared(
                                 key_bytes,
                                 args,
                                 0,
+                                db_idx as u8,
                             );
                         }
                     }
@@ -1716,14 +1720,14 @@ pub(crate) fn handle_shard_message_shared(
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     {
-                        auto_delete_vectors(&mut s.vector_store, args);
+                        auto_delete_vectors(&mut s.vector_store, args, db_idx as u8);
                     }
 
                     // R4: HDEL of an indexed vector field tombstones the vector.
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && cmd.eq_ignore_ascii_case(b"HDEL")
                     {
-                        auto_hdel_vectors(&mut s.vector_store, args);
+                        auto_hdel_vectors(&mut s.vector_store, args, db_idx as u8);
                     }
 
                     // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
@@ -2680,8 +2684,9 @@ pub fn auto_index_hset_public(
     text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
+    db_index: u8,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
-    auto_index_hset(vector_store, text_store, key, args, 0)
+    auto_index_hset(vector_store, text_store, key, args, 0, db_index)
 }
 
 /// Tombstone auto-indexed vectors for every key argument of a successful
@@ -2689,10 +2694,19 @@ pub fn auto_index_hset_public(
 /// `auto_index_hset*` on HSET must run this on DEL/UNLINK, or deleted keys
 /// keep matching FT.SEARCH forever (resurrection + live-set recall collapse;
 /// found by the Bundle-5 soak diagnostic at shards=1).
-pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protocol::Frame]) {
+///
+/// WS5a round 4 (adversarial review): db-scoped via `mark_deleted_for_key_for_db`
+/// — a DEL issued in db N must only tombstone indexes owned by db N, or a
+/// foreign db's documents get silently unindexed (data-integrity leak, worse
+/// than the read-path leak fixed in round 3).
+pub fn auto_delete_vectors(
+    vector_store: &mut VectorStore,
+    args: &[crate::protocol::Frame],
+    db_index: u8,
+) {
     for arg in args {
         if let Some(key) = crate::server::connection::extract_bytes(arg) {
-            vector_store.mark_deleted_for_key(key.as_ref());
+            vector_store.mark_deleted_for_key_for_db(key.as_ref(), db_index);
         }
     }
 }
@@ -2708,12 +2722,11 @@ pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protoc
 /// contents survive. FLUSHALL (`is_flushdb = false`) still clears every
 /// db's contents, matching Redis semantics for a whole-keyspace flush.
 ///
-/// NOTE: this only fixes the CONTENTS side of FLUSHDB scoping. The
-/// auto-index HSET hook that FEEDS these indexes is not yet db-scoped (see
-/// `find_matching_index_names` call sites and the WS5a gap report in
-/// `.planning/v0.6.0-release/WS5A-NOTES.md`), so a HSET issued in another db
-/// can still repopulate an index immediately after a scoped FLUSHDB. Full
-/// closure requires migrating the auto-index hook too.
+/// NOTE: the auto-index HSET hook that FEEDS these indexes is now ALSO
+/// db-scoped (WS5a round 4, adversarial review) via `auto_index_hset`'s
+/// `find_matching_index_names_for_db` — a HSET issued in another db can no
+/// longer repopulate an index after a scoped FLUSHDB. Previously this
+/// function's own doc comment tracked this as an open gap; it is closed.
 pub fn auto_flush_indexes(
     vector_store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
@@ -2741,14 +2754,22 @@ pub fn auto_flush_indexes(
 /// tombstones the WHOLE document when any of its vector fields is removed
 /// (a later HSET re-indexes the remainder), and TEXT/TAG/NUMERIC field
 /// removal is not yet re-indexed.
-pub fn auto_hdel_vectors(vector_store: &mut VectorStore, args: &[crate::protocol::Frame]) {
+///
+/// WS5a round 4 (adversarial review, bonus fix — same bug class as
+/// `auto_delete_vectors`): db-scoped via `find_matching_index_names_for_db`
+/// so an HDEL issued in db N cannot tombstone a foreign db's vector field.
+pub fn auto_hdel_vectors(
+    vector_store: &mut VectorStore,
+    args: &[crate::protocol::Frame],
+    db_index: u8,
+) {
     let Some(key) = args
         .first()
         .and_then(crate::server::connection::extract_bytes)
     else {
         return;
     };
-    let matching = vector_store.find_matching_index_names(key.as_ref());
+    let matching = vector_store.find_matching_index_names_for_db(key.as_ref(), db_index);
     for idx_name in matching {
         let Some(idx) = vector_store.get_index(&idx_name) else {
             continue;
@@ -2779,20 +2800,30 @@ pub fn auto_index_hset_public_txn(
     key: &[u8],
     args: &[crate::protocol::Frame],
     txn_id: u64,
+    db_index: u8,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
-    auto_index_hset(vector_store, text_store, key, args, txn_id)
+    auto_index_hset(vector_store, text_store, key, args, txn_id, db_index)
 }
 
+/// WS5a round 4 (adversarial review, CRITICAL): `db_index` scopes both the
+/// vector and text `find_matching_index_names` lookups below via their
+/// `_for_db` variants — an HSET issued in db N must only auto-index into
+/// indexes owned by db N. Previously unscoped: any db's HSET could feed an
+/// index created in ANY other db whose PREFIX happened to match the key,
+/// silently cross-contaminating index contents (worse than the read-path
+/// leak fixed in round 3, since it corrupts data rather than just exposing
+/// it). Triggers at `--shards 1` (no multi-shard fan-out required).
 fn auto_index_hset(
     vector_store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
     txn_id: u64,
+    db_index: u8,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
     let mut inserted: smallvec::SmallVec<[(bytes::Bytes, u64); 4]> = smallvec::SmallVec::new();
-    let matching_names = vector_store.find_matching_index_names(key);
-    let text_matching = text_store.find_matching_index_names(key);
+    let matching_names = vector_store.find_matching_index_names_for_db(key, db_index);
+    let text_matching = text_store.find_matching_index_names_for_db(key, db_index);
     if matching_names.is_empty() && text_matching.is_empty() {
         return inserted;
     }

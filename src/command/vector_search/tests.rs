@@ -1581,7 +1581,13 @@ fn test_insert_path_triggers_background_compact_without_search() {
             .flat_map(|d| ((i as f32) * 0.37 + d as f32).to_le_bytes())
             .collect();
         let hset_args = vec![bulk(key.as_bytes()), bulk(b"vec"), bulk(&vec_bytes)];
-        crate::shard::spsc_handler::auto_index_hset_public(store, text, key.as_bytes(), &hset_args);
+        crate::shard::spsc_handler::auto_index_hset_public(
+            store,
+            text,
+            key.as_bytes(),
+            &hset_args,
+            0,
+        );
     };
 
     // Pure bulk load: ONLY the HSET auto-index hook runs. No FT.SEARCH, no

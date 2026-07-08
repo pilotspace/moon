@@ -1242,10 +1242,12 @@ pub async fn handle_connection(
                                                             // TXN support; return value discarded.
                                                             let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut *ts_guard, key_bytes, a,
+                                                                conn.selected_db as u8,
                                                             );
                                                         } else {
                                                             let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut fallback_ts, key_bytes, a,
+                                                                conn.selected_db as u8,
                                                             );
                                                         }
                                                     }
@@ -1259,6 +1261,7 @@ pub async fn handle_connection(
                                                     crate::shard::spsc_handler::auto_delete_vectors(
                                                         &mut vs.lock(),
                                                         a,
+                                                        conn.selected_db as u8,
                                                     );
                                                 } else if c.eq_ignore_ascii_case(b"HDEL")
                                                     && i < txn_results.len()
@@ -1268,6 +1271,7 @@ pub async fn handle_connection(
                                                     crate::shard::spsc_handler::auto_hdel_vectors(
                                                         &mut vs.lock(),
                                                         a,
+                                                        conn.selected_db as u8,
                                                     );
                                                 } else if (c.eq_ignore_ascii_case(b"FLUSHDB")
                                                     || c.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -2402,10 +2406,10 @@ pub async fn handle_connection(
                                             if let Some(ref ts) = text_store {
                                                 let mut ts_guard = ts.lock();
                                                 // Plan 166-01: discard return (no TXN here).
-                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args);
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args, conn.selected_db as u8);
                                             } else {
                                                 let mut fallback_ts = crate::text::store::TextStore::new();
-                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args, conn.selected_db as u8);
                                             }
                                         }
                                     }
@@ -2421,6 +2425,7 @@ pub async fn handle_connection(
                                         crate::shard::spsc_handler::auto_delete_vectors(
                                             &mut vs.lock(),
                                             d_args,
+                                            conn.selected_db as u8,
                                         );
                                     }
                                 }
@@ -2433,6 +2438,7 @@ pub async fn handle_connection(
                                         crate::shard::spsc_handler::auto_hdel_vectors(
                                             &mut vs.lock(),
                                             d_args,
+                                            conn.selected_db as u8,
                                         );
                                     }
                                 }
