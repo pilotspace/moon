@@ -1006,7 +1006,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx,
                 &mut responses,
                 &mut exec_publishes,
-            ) {
+            )
+            .await
+            {
                 // C2: PUBLISH queued inside MULTI fans out only now — after the
                 // transaction body has been applied — and its placeholder in the
                 // EXEC reply array is patched with the real receiver count.

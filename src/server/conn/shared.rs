@@ -194,8 +194,14 @@ pub(crate) fn execute_transaction(
 
 /// Execute a queued transaction on the local shard (sharded path).
 ///
-/// Transactions in the shared-nothing architecture are restricted to local-shard
-/// keys only. Cross-shard transactions require distributed coordination (future work).
+/// The caller must ensure every key in `command_queue` is owned by THIS shard
+/// (see `analyze_txn_locality`) — the body runs on the local slice with no
+/// per-key routing.
+///
+/// Returns the result Frame (an array of per-command responses) **and** the
+/// serialized AOF bytes for each successful write, in order. The caller MUST
+/// append those entries to the shard's AOF (previously this path did no
+/// persistence, so MULTI/EXEC writes were silently lost on restart).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
     _shard_id: usize,
@@ -203,10 +209,11 @@ pub(crate) fn execute_transaction_sharded(
     selected_db: usize,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
-) -> Frame {
+) -> (Frame, Vec<Bytes>) {
     let db_count = shard_databases.db_count();
 
     let mut results = Vec::with_capacity(command_queue.len());
+    let mut aof_entries: Vec<Bytes> = Vec::new();
     let mut selected = selected_db;
 
     for cmd_frame in command_queue {
@@ -228,6 +235,19 @@ pub(crate) fn execute_transaction_sharded(
             continue;
         }
 
+        // Serialize write commands for AOF *before* dispatch (matches the
+        // single-shard `execute_transaction` path). Without this the sharded
+        // MULTI/EXEC path logged nothing, so every transactional write was
+        // silently lost on restart. Fully-qualified paths because `metadata`
+        // is only `use`d under runtime-tokio but this fn compiles under both.
+        let aof_bytes = if crate::command::metadata::is_write(cmd) {
+            let mut buf = bytes::BytesMut::new();
+            crate::protocol::serialize::serialize(cmd_frame, &mut buf);
+            Some(buf.freeze())
+        } else {
+            None
+        };
+
         let result = crate::shard::slice::with_shard_db(selected, |db| {
             db.refresh_now_from_cache(cached_clock);
             dispatch(db, cmd, cmd_args, &mut selected, db_count)
@@ -236,6 +256,14 @@ pub(crate) fn execute_transaction_sharded(
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
         };
+
+        // Only log the write if it actually succeeded (parity with the
+        // single-shard path — an errored write must not reach the AOF).
+        if let Some(bytes) = aof_bytes {
+            if !matches!(&response, Frame::Error(_)) {
+                aof_entries.push(bytes);
+            }
+        }
 
         // Auto-index: if HSET succeeded, check for vector index match
         if cmd.eq_ignore_ascii_case(b"HSET") && !matches!(response, Frame::Error(_)) {
@@ -284,7 +312,50 @@ pub(crate) fn execute_transaction_sharded(
         results.push(response);
     }
 
-    Frame::Array(results.into())
+    (Frame::Array(results.into()), aof_entries)
+}
+
+/// Persist the AOF entries of a just-executed sharded MULTI/EXEC body.
+///
+/// Mirrors the normal write path's group-commit: each entry is enqueued
+/// fire-and-forget on the owning shard's writer (`send_append_group`), and a
+/// single `fsync_barrier` is issued at the end under `appendfsync=always`
+/// (`send_append_group` returns `Ok(true)` when a barrier is owed). All keys in
+/// the body are owned by `ctx.shard_id` (Phase A rejects foreign-owned bodies),
+/// so that is the correct AOF target.
+///
+/// Returns `Err(())` if any append or the barrier fails — the caller surfaces
+/// `AOF_FSYNC_ERR` instead of acking a durability it can't guarantee. A no-op
+/// (returns `Ok`) when AOF is disabled (`aof_pool` is `None`) or the body wrote
+/// nothing.
+pub(crate) async fn persist_txn_aof(
+    ctx: &crate::server::conn::core::ConnectionContext,
+    aof_entries: Vec<Bytes>,
+) -> Result<(), ()> {
+    if aof_entries.is_empty() {
+        return Ok(());
+    }
+    let Some(ref pool) = ctx.aof_pool else {
+        return Ok(());
+    };
+    let mut barrier_pending = false;
+    for bytes in aof_entries {
+        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            &ctx.repl_state,
+            ctx.shard_id,
+            bytes.len(),
+        );
+        match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
+            Ok(true) => barrier_pending = true,
+            Ok(false) => {}
+            Err(_) => return Err(()),
+        }
+    }
+    // appendfsync=always: one barrier confirms the whole body is on disk.
+    if barrier_pending && pool.fsync_barrier(ctx.shard_id).await.is_err() {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Shared PUBLISH-inside-MULTI intercept for both transaction executors (C2).

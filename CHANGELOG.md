@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — sharded MULTI/EXEC writes are now persisted (were lost on restart) (PR #TBD)
+
+- **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:
+  `execute_transaction_sharded` — the MULTI/EXEC executor used by the monoio
+  handler at **every** shard count (including `--shards 1`) and by the tokio
+  sharded handler at `--shards ≥ 2` — appended **nothing** to the AOF. Every
+  transactional write was silently lost on restart under `appendonly=yes`, while
+  an identical write issued outside MULTI survived. The executor now returns the
+  serialized AOF bytes for each successful write (mirroring the single-shard
+  tokio `execute_transaction`), and a shared `persist_txn_aof` helper appends
+  them to the owning shard's writer via the normal group-commit path, issuing one
+  `fsync_barrier` under `appendfsync=always` before EXEC is acked. On a barrier
+  failure EXEC returns `AOF_FSYNC_ERR` and suppresses any queued PUBLISH fan-out,
+  rather than acking a durability it can't guarantee. `try_handle_multi_exec` is
+  now `async` in both sharded handlers. Red/green:
+  `tests/sharded_multi_exec_durability.rs` pins *EXEC-committed write survives
+  kill-9 + restart, exactly like a non-MULTI write* (fails on the pre-fix path:
+  the txn key returns nil after restart while the plain control key survives).
+
 ### Security — sharded MULTI/EXEC no longer silently misplaces cross-shard writes (Phase A, PR #TBD)
 
 - **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:

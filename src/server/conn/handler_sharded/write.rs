@@ -513,7 +513,11 @@ pub(super) async fn try_handle_mq_command(
 }
 
 /// Handle MULTI/EXEC/DISCARD commands. Returns `true` if consumed.
-pub(super) fn try_handle_multi_exec(
+///
+/// `async` because EXEC now persists the transaction body to the shard AOF via
+/// the same group-commit path as normal writes (previously this path logged
+/// nothing, so every transactional write was lost on restart).
+pub(super) async fn try_handle_multi_exec(
     cmd: &[u8],
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
@@ -570,7 +574,7 @@ pub(super) fn try_handle_multi_exec(
                     _ => {}
                 }
             }
-            let result = execute_transaction_sharded(
+            let (result, aof_entries) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
                 &conn.command_queue,
@@ -578,6 +582,27 @@ pub(super) fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // DURABILITY: append every successful write in the body to THIS
+            // shard's AOF via the same group-commit path as normal writes, then
+            // issue ONE fsync barrier under appendfsync=always before acking.
+            // All keys are local here (Phase A rejected foreign-owned bodies),
+            // so ctx.shard_id is the correct AOF target. On barrier failure we
+            // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
+            // with the normal write path.
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries)
+                .await
+                .is_err()
+            {
+                conn.command_queue.clear();
+                // Durability could not be guaranteed: report the error and
+                // suppress any queued PUBLISH fan-out — the client sees EXEC
+                // fail, so it must not observe the txn's pub/sub side effects.
+                exec_publishes.clear();
+                responses.push(Frame::Error(Bytes::from_static(
+                    crate::persistence::aof::AOF_FSYNC_ERR,
+                )));
+                return true;
+            }
             // CLIENT TRACKING: invalidate keys written inside the txn, same as
             // the normal write path (EXEC previously bypassed this). Self-gated
             // on tracking_active(); must run before command_queue is cleared.
