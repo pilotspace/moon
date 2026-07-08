@@ -4,6 +4,7 @@ Concrete, step-by-step incident response procedures for operating Moon.
 
 | Runbook | When to reach for it |
 |---|---|
+| [upgrade-to-v0.6.0.md](upgrade-to-v0.6.0.md) | Upgrading from v0.5.x — truthful memory accounting, default engine offload, WS DROP leak sweep |
 | [shard-count-change.md](shard-count-change.md) | Startup refusal: `ERR shard count changed (manifest=N, config=M)` |
 | [corrupted-aof-recovery.md](corrupted-aof-recovery.md) | AOF corruption — partial replay and recovery fallback |
 | [disk-full-during-wal-rotation.md](disk-full-during-wal-rotation.md) | Persistence hits ENOSPC mid-rotation |

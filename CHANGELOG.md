@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-08
+
+**Release highlights** (full detail in the sections below; "PR #TBD" entries
+below all shipped together in this release's PR):
+
+- **Multi-db isolation is now a first-class, enforced boundary**: FT.*/graph/
+  full-text indexes are scoped to the db that created them (`SELECT 1`'s
+  indexes are invisible to db 0, verified across shards, restarts, and the
+  recovery path); per-db memory quotas (`--db-maxmemory <db>:<bytes>`,
+  `CONFIG SET db-maxmemory`) enforce noeviction/evicting policies per db slot
+  with Redis-style deny-OOM semantics (shrink commands always pass, so a
+  tenant can never wedge itself); named workspaces harden the prefix layer.
+- **Memory accounting is now truthful under container growth**: HSET/LPUSH/
+  SADD/ZADD growth into existing keys is charged to `used_memory` in O(1)
+  (previously invisible to `--maxmemory` — an unbounded single-key hash could
+  never trigger eviction).
+- **Engines offload when idle**: vector segments demote HOT→WARM (mmap)→COLD
+  (unloaded stub, reload-on-search) on configurable idle/age thresholds
+  (`--engine-offload-idle-secs`, `--segment-warm-after`), with DEL/HDEL
+  tombstone correctness across all tiers — measured −26% process RSS on a
+  40K×768d corpus with search results identical after reload.
+- **Single-node tuning preset**: `--profile standalone` fills in the measured
+  best flags for a shard-1 deployment (the p=1 busy-poll configuration that
+  beats Redis on both GCE arches).
+- **Command parity widened**: SORT_RO / BITFIELD_RO / GEORADIUS_RO /
+  GEORADIUSBYMEMBER_RO plus subcommand gaps; the compat matrix is regenerated.
+  PFDEBUG/PFSELFTEST/FAILOVER/MODULE/SENTINEL are documented non-goals.
+
+> **Operator callout — historical `WS DROP` key leak.** Before this release,
+> `WS DROP`'s cleanup sweep was hardcoded to logical db 0: any workspace whose
+> connection ever `SELECT`ed a non-zero db before writing leaked those keys
+> permanently on drop. v0.6.0 fixes the sweep (all dbs on the owning shard),
+> but keys leaked by PAST drops are still resident. To detect/clean on an
+> upgraded instance: `SELECT <n>` each non-zero db and `SCAN 0 MATCH <ws-uuid>:*`
+> for workspace prefixes that no longer appear in `WS LIST`, then `DEL` the
+> matches (or `FLUSHDB` if the db held nothing else).
+
 ### Fixed — WS3 COLD/WARM tier adversarial-review fixes (round 2 follow-up, PR #TBD)
 
 An adversarial review of the round-2 COLD tier (below) found one CRITICAL

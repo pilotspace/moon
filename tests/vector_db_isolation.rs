@@ -41,11 +41,15 @@ fn free_port() -> u16 {
 
 fn release_binary() -> std::path::PathBuf {
     // MOON_BIN pin wins (VM-local / worktree-local target dirs); fall back
-    // to target/release/moon under this crate's manifest dir.
+    // to CARGO_BIN_EXE_moon — the binary cargo itself built for this test
+    // run, guaranteed to exist and to match the code under test. Never fall
+    // back to a bare target/release/moon: that path silently skipped all
+    // tests ("9 passed in 0.00s") when the binary was missing, and ran a
+    // stale binary when it wasn't (see CLAUDE.md's stale-checkout trap).
     if let Ok(p) = std::env::var("MOON_BIN") {
         return std::path::PathBuf::from(p);
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
 struct Moon {
@@ -100,13 +104,11 @@ fn wait_ready(port: u16) -> bool {
 /// not just a config knob).
 fn spawn_moon(shards: usize, tag: &str) -> Option<Moon> {
     let bin = release_binary();
-    if !bin.exists() {
-        eprintln!(
-            "skipping: {} not built. Run `cargo build --release` first.",
-            bin.display()
-        );
-        return None;
-    }
+    assert!(
+        bin.exists(),
+        "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
+        bin.display()
+    );
     let port = free_port();
     let tmp_dir = std::env::temp_dir().join(format!("moon-db-isolation-{tag}-{port}"));
     let _ = std::fs::create_dir_all(&tmp_dir);
@@ -329,10 +331,11 @@ fn ft_create_same_name_different_db_errors() {
 #[test]
 fn restart_round_trip_preserves_db_binding() {
     let bin = release_binary();
-    if !bin.exists() {
-        eprintln!("skipping: {} not built.", bin.display());
-        return;
-    }
+    assert!(
+        bin.exists(),
+        "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
+        bin.display()
+    );
     let port = free_port();
     let tmp_dir = std::env::temp_dir().join(format!("moon-db-isolation-restart-{port}"));
     let _ = std::fs::create_dir_all(&tmp_dir);

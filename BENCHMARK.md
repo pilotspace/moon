@@ -1,5 +1,10 @@
 # moon Benchmark Report
 
+**Release marker:** the numbers below are the benchmark record backing **v0.6.0**
+(README headline claims: peak GET/SET §2, p=1 busy-poll win §2.10, durability
+write-path §7.3, multi-shard convoy fix §6.6, vector time-to-green vs Qdrant §10.9,
+graph vs FalkorDB §11, engine-offload RSS reduction in `docs/guides/tuning.md`).
+
 **Last Updated:** 2026-07-08 (**new §7.3: durability write-path campaign (PRs #238–#242)** — closes the AOF-on deficits vs Redis. `appendfsync always` P16 SET 0.12×→**0.91×** (per-command fsync → per-batch group commit + one coalesced write), `everysec` P1 SET 0.80×→**0.99× parity** (park-free writer poll kills a 150k/run futex-wake storm on the shard thread), `everysec` P16 SET **1.32× WIN**, and pub/sub fan-out delivery 438 msg/s (near-total drops) → **5.09M msg/s, zero drops, ~1.04× Redis**. All GCE c3-standard-8, Redis 7.0.15, 3 alternated reps, provenance-probed. Prior 2026-07-04 §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **§6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
