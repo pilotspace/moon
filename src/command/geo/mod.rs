@@ -415,4 +415,155 @@ mod tests {
         );
         assert_eq!(result, Frame::Integer(1));
     }
+
+    fn setup_sicily(db: &mut Database) {
+        geoadd(
+            db,
+            &[
+                bs(b"mygeo"),
+                bs(b"13.361389"),
+                bs(b"38.115556"),
+                bs(b"Palermo"),
+                bs(b"15.087269"),
+                bs(b"37.502669"),
+                bs(b"Catania"),
+                bs(b"2.349014"),
+                bs(b"48.864716"),
+                bs(b"Paris"),
+            ],
+        );
+    }
+
+    // --- GEORADIUS_RO tests ---
+
+    #[test]
+    fn test_georadius_ro_matches_georadius() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let args = [
+            bs(b"mygeo"),
+            bs(b"15"),
+            bs(b"37"),
+            bs(b"200"),
+            bs(b"km"),
+            bs(b"ASC"),
+        ];
+        let expected = georadius(&mut db, &args);
+        let got = georadius_ro(&mut db, &args);
+        assert_eq!(got, expected);
+        match got {
+            Frame::Array(ref arr) => assert_eq!(arr.len(), 2),
+            _ => panic!("expected array, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn test_georadius_ro_rejects_store() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let result = georadius_ro(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert!(matches!(result, Frame::Error(_)));
+        assert!(!db.exists(b"dest"));
+    }
+
+    #[test]
+    fn test_georadius_ro_readonly_matches_mutable_track() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let args = [
+            bs(b"mygeo"),
+            bs(b"15"),
+            bs(b"37"),
+            bs(b"200"),
+            bs(b"km"),
+            bs(b"ASC"),
+        ];
+        let expected = georadius_ro(&mut db, &args);
+        let got = georadius_ro_readonly(&db, &args, 0);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_georadius_ro_readonly_rejects_storedist() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let result = georadius_ro_readonly(
+            &db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STOREDIST"),
+                bs(b"dest"),
+            ],
+            0,
+        );
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- GEORADIUSBYMEMBER_RO tests ---
+
+    #[test]
+    fn test_georadiusbymember_ro_matches_georadiusbymember() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let args = [
+            bs(b"mygeo"),
+            bs(b"Palermo"),
+            bs(b"200"),
+            bs(b"km"),
+            bs(b"ASC"),
+        ];
+        let expected = georadiusbymember(&mut db, &args);
+        let got = georadiusbymember_ro(&mut db, &args);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_georadiusbymember_ro_rejects_store() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let result = georadiusbymember_ro(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"Palermo"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert!(matches!(result, Frame::Error(_)));
+        assert!(!db.exists(b"dest"));
+    }
+
+    #[test]
+    fn test_georadiusbymember_ro_readonly_matches_mutable_track() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let args = [
+            bs(b"mygeo"),
+            bs(b"Palermo"),
+            bs(b"200"),
+            bs(b"km"),
+            bs(b"ASC"),
+        ];
+        let expected = georadiusbymember_ro(&mut db, &args);
+        let got = georadiusbymember_ro_readonly(&db, &args, 0);
+        assert_eq!(got, expected);
+    }
 }

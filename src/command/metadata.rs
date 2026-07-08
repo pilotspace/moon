@@ -305,6 +305,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "DUMP" => CommandMeta { name: "DUMP", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "RESTORE" => CommandMeta { name: "RESTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "SORT" => CommandMeta { name: "SORT", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "SORT_RO" => CommandMeta { name: "SORT_RO", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "COPY" => CommandMeta { name: "COPY", arity: -3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
     "TOUCH" => CommandMeta { name: "TOUCH", arity: -2, flags: RF, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
     "EXPIREAT" => CommandMeta { name: "EXPIREAT", arity: 3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
@@ -318,6 +319,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "BITCOUNT" => CommandMeta { name: "BITCOUNT", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITOP" => CommandMeta { name: "BITOP", arity: -4, flags: W, first_key: 2, last_key: -1, step: 1, acl_categories: STR },
     "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "BITFIELD_RO" => CommandMeta { name: "BITFIELD_RO", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITPOS" => CommandMeta { name: "BITPOS", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "LCS" => CommandMeta { name: "LCS", arity: -3, flags: R, first_key: 1, last_key: 2, step: 1, acl_categories: STR },
     "XSETID" => CommandMeta { name: "XSETID", arity: -3, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
@@ -335,7 +337,9 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "GEOSEARCH" => CommandMeta { name: "GEOSEARCH", arity: -7, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "GEOSEARCHSTORE" => CommandMeta { name: "GEOSEARCHSTORE", arity: -8, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
     "GEORADIUS" => CommandMeta { name: "GEORADIUS", arity: -6, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEORADIUS_RO" => CommandMeta { name: "GEORADIUS_RO", arity: -6, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "GEORADIUSBYMEMBER" => CommandMeta { name: "GEORADIUSBYMEMBER", arity: -5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEORADIUSBYMEMBER_RO" => CommandMeta { name: "GEORADIUSBYMEMBER_RO", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
 
     // ---- Connection / server commands ----
     "PING" => CommandMeta { name: "PING", arity: -1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: CON },
@@ -976,6 +980,10 @@ mod tests {
             b"SMEMBERS",
             b"SISMEMBER",
             b"ZRANGEBYSCORE",
+            b"BITFIELD_RO",
+            b"SORT_RO",
+            b"GEORADIUS_RO",
+            b"GEORADIUSBYMEMBER_RO",
         ];
         for cmd in writes {
             assert!(
