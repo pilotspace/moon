@@ -200,6 +200,9 @@ pub async fn run_embedded(
     // whole-instance cap (per-shard budget = maxmemory / num_shards).
     runtime_config_shared.write().num_shards = num_shards;
     crate::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    // Publish the per-db quota "any set?" atomic (WS5b) — see main.rs's
+    // identical call for the standalone binary entry point.
+    crate::storage::db_quota::publish_db_maxmemory_any_set(&runtime_config_shared.read());
     let server_config_shared: Arc<ServerConfig> = Arc::new(config.clone());
 
     // Per-shard pubsub + remote-subscriber registries.

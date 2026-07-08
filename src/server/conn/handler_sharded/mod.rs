@@ -1427,6 +1427,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     drop(rt);
                                     return Err(oom_frame);
                                 }
+                                // WS5b: per-db quota, additive and finer-grained
+                                // than the whole-instance maxmemory gate above.
+                                // Zero-cost when unconfigured for this db.
+                                // `_for_command` exempts SELECT/SWAPDB (this
+                                // chokepoint runs on `metadata::is_write`-flagged
+                                // commands, which includes SELECT despite it not
+                                // writing to the current db — see
+                                // `db_quota::command_exempt_from_db_quota`).
+                                if let Err(oom_frame) =
+                                    crate::storage::db_quota::check_db_maxmemory_for_command(
+                                        db,
+                                        conn.selected_db,
+                                        &rt,
+                                        cmd,
+                                    )
+                                {
+                                    drop(rt);
+                                    return Err(oom_frame);
+                                }
                                 drop(rt);
 
                                 // KV undo-log capture for active cross-store transactions.

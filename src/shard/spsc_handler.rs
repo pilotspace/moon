@@ -58,7 +58,7 @@ pub(super) fn spsc_eviction_gate(
 ) -> Result<(), crate::protocol::Frame> {
     let rt = runtime_config.read();
     let budget = shard_databases.elastic_budget(shard_id);
-    if let Some(sender) = spill_sender {
+    let global_result = if let Some(sender) = spill_sender {
         let mut fid = spill_file_id.get();
         let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
         let res =

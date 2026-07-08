@@ -917,6 +917,11 @@ fn main() -> anyhow::Result<()> {
     // any server launched with --maxmemory (until the first CONFIG SET).
     moon::storage::eviction::publish_maxmemory(runtime_config_shared.read().maxmemory as u64);
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    // Publish the per-db quota "any set?" atomic (WS5b). Same fail-open
+    // rationale as the maxmemory publishes above: a missed publish at
+    // startup silently bypasses the inline write path's db-quota pre-gate
+    // for any server launched with --db-maxmemory.
+    moon::storage::db_quota::publish_db_maxmemory_any_set(&runtime_config_shared.read());
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 

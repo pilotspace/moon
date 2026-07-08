@@ -81,10 +81,11 @@ fn run_write_eviction_gate(
     ctx: &super::core::ConnectionContext,
     db: &mut crate::storage::db::Database,
     sel_db: usize,
+    cmd: &[u8],
 ) -> Result<(), Frame> {
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
-    if let Some(ref sender) = ctx.spill_sender {
+    let global_result = if let Some(ref sender) = ctx.spill_sender {
         let mut fid = ctx.spill_file_id.get();
         let dir = ctx
             .disk_offload_dir
@@ -96,7 +97,14 @@ fn run_write_eviction_gate(
         res
     } else {
         try_evict_if_needed_budget(db, &rt, budget)
-    }
+    };
+    global_result?;
+    // WS5b: per-db quota, additive and finer-grained than the whole-instance
+    // maxmemory gate above. Zero-cost when unconfigured for this db.
+    // `_for_command` exempts SELECT/SWAPDB — see `db_quota::command_exempt_from_db_quota`
+    // (this chokepoint runs on `metadata::is_write`-flagged commands, which
+    // includes SELECT despite it not writing to the current db).
+    crate::storage::db_quota::check_db_maxmemory_for_command(db, sel_db, &rt, cmd)
 }
 
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
@@ -1377,7 +1385,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         let db = &mut s.databases[sel_db];
 
                         if batch_eviction_active {
-                            run_write_eviction_gate(ctx, db, sel_db)?;
+                            run_write_eviction_gate(ctx, db, sel_db, cmd)?;
                         }
 
                         // KV undo-log capture (MUST precede dispatch)

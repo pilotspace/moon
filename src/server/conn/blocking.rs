@@ -1392,6 +1392,24 @@ pub(crate) fn try_inline_dispatch(
                 return 1;
             }
         }
+        // WS5b: per-db quota, additive and finer-grained than the
+        // whole-instance maxmemory gate above. Lock-free pre-gate mirrors
+        // `inline_write_can_skip_eviction` above: the overwhelmingly common
+        // case (no `--db-maxmemory` configured anywhere) costs one Relaxed
+        // atomic load, no `RuntimeConfig` lock.
+        if crate::storage::db_quota::db_maxmemory_any_set() {
+            let rt = runtime_config.read();
+            let quota_err = crate::shard::slice::with_shard_db(selected_db, |db| {
+                crate::storage::db_quota::check_db_maxmemory(db, selected_db, &rt).err()
+            });
+            drop(rt);
+            if let Some(crate::protocol::Frame::Error(msg)) = quota_err {
+                write_buf.extend_from_slice(b"-");
+                write_buf.extend_from_slice(&msg);
+                write_buf.extend_from_slice(b"\r\n");
+                return 1;
+            }
+        }
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);

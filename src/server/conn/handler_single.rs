@@ -918,15 +918,23 @@ pub async fn handle_connection(
                                 guard.refresh_now();
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
+                                    #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
+                                    let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     if is_write {
                                         let rt = runtime_config.read();
                                         if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                             responses[resp_idx] = oom_frame;
                                             continue;
                                         }
+                                        // WS5b: per-db quota, additive to the
+                                        // whole-instance gate above. `_for_command`
+                                        // exempts SELECT/SWAPDB — see
+                                        // `db_quota::command_exempt_from_db_quota`.
+                                        if let Err(oom_frame) = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, conn.selected_db, &rt, d_cmd) {
+                                            responses[resp_idx] = oom_frame;
+                                            continue;
+                                        }
                                     }
-                                    #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
-                                    let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     let dispatch_start = std::time::Instant::now();
                                     let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
@@ -2053,14 +2061,21 @@ pub async fn handle_connection(
                                     guard.refresh_now();
                                 }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
+                                #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
+                                let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
                                 let rt = runtime_config.read();
                                 if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                     responses[resp_idx] = oom_frame;
                                     continue;
                                 }
+                                // WS5b: per-db quota, additive to the whole-instance
+                                // gate above. `_for_command` exempts SELECT/SWAPDB so
+                                // a quota'd db doesn't trap the connection.
+                                if let Err(oom_frame) = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, current_db, &rt, d_cmd) {
+                                    responses[resp_idx] = oom_frame;
+                                    continue;
+                                }
                                 drop(rt);
-                                #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
-                                let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
 
                                 // FT.* vector commands: dispatch to VectorStore directly
                                 if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {

@@ -183,6 +183,25 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub maxmemory_samples: usize,
 
+    /// Per-logical-db memory quota (repeatable): `--db-maxmemory <db>:<bytes>`.
+    ///
+    /// Independent of and additive to `--maxmemory` (the whole-instance cap):
+    /// a db-scoped quota bounds ONE `SELECT`-able db slot, while `--maxmemory`
+    /// still bounds the whole instance. Enforced with the SAME eviction
+    /// policy as `--maxmemory-policy` (mirrors global maxmemory behavior —
+    /// `noeviction` rejects the write with a `MOONERR db maxmemory exceeded`
+    /// error, an evicting policy sheds this db's own keys first). Malformed
+    /// entries (bad format, non-numeric db/bytes) or an out-of-range db index
+    /// (`>= --databases`) are logged as a startup warning and ignored — a
+    /// typo in this flag must never refuse to start the server.
+    /// Zero-cost when omitted: the fast path is a single empty-`Vec` check.
+    #[arg(
+        long = "db-maxmemory",
+        value_parser = clap::value_parser!(String),
+        action = clap::ArgAction::Append,
+    )]
+    pub db_maxmemory: Vec<String>,
+
     /// Number of shards (0 = auto-detect from CPU count).
     ///
     /// Defaults to 1: single-shard gives the best per-op latency for
@@ -1058,6 +1077,7 @@ impl ServerConfig {
             maxmemory: self.maxmemory.unwrap_or(0),
             maxmemory_policy: self.maxmemory_policy.clone(),
             maxmemory_samples: self.maxmemory_samples,
+            db_maxmemory: parse_db_maxmemory_entries(&self.db_maxmemory, self.databases),
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: self.save.clone(),
@@ -1081,6 +1101,57 @@ impl ServerConfig {
             num_shards: 1,
         }
     }
+}
+
+/// Parse `--db-maxmemory <db>:<bytes>` entries into a dense `Vec<u64>` of
+/// length `num_databases` (index = db number, `0` = unlimited).
+///
+/// Malformed entries (no `:`, non-numeric halves) or an out-of-range db
+/// index (`>= num_databases`) are logged via `tracing::warn!` and skipped —
+/// a typo in this repeatable flag must never refuse to start the server
+/// (same fail-open philosophy as the parser-defensiveness rule for wire
+/// protocol input). Later entries for the same db index win (clap
+/// `ArgAction::Append` preserves argv order), matching `CONFIG SET`'s
+/// last-wins semantics for the same key.
+pub fn parse_db_maxmemory_entries(raw: &[String], num_databases: usize) -> Vec<u64> {
+    let mut out = vec![0u64; num_databases];
+    for entry in raw {
+        match parse_one_db_maxmemory_entry(entry) {
+            Ok((idx, bytes)) if idx < num_databases => out[idx] = bytes,
+            Ok((idx, _)) => tracing::warn!(
+                entry = %entry,
+                idx,
+                num_databases,
+                "--db-maxmemory: db index out of range (>= --databases); ignoring entry"
+            ),
+            Err(reason) => tracing::warn!(
+                entry = %entry,
+                reason,
+                "--db-maxmemory: ignoring malformed entry"
+            ),
+        }
+    }
+    out
+}
+
+/// Parse a single `<db>:<bytes>` token, shared by [`parse_db_maxmemory_entries`]
+/// (batch, startup CLI) and `CONFIG SET db-maxmemory <db>:<bytes>` (single,
+/// runtime). Returns `Err(reason)` — never panics — on malformed input; the
+/// db-index range check (`>= --databases`) is the caller's responsibility
+/// since only the caller knows `num_databases`.
+pub fn parse_one_db_maxmemory_entry(entry: &str) -> Result<(usize, u64), &'static str> {
+    let Some((idx_str, bytes_str)) = entry.split_once(':') else {
+        return Err("expected '<db>:<bytes>' format");
+    };
+    let idx = idx_str
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "non-numeric db index")?;
+    let bytes = bytes_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "non-numeric byte count")?;
+    Ok((idx, bytes))
 }
 
 /// Fraction (percent) of the detected memory limit used as the G1 auto
@@ -1306,6 +1377,13 @@ pub struct RuntimeConfig {
     pub maxmemory_policy: String,
     /// Number of random keys to sample for eviction.
     pub maxmemory_samples: usize,
+    /// Per-logical-db memory quota in bytes, indexed by db number
+    /// (`db_maxmemory[i]`, `0` = unlimited for db `i`). Dense: length equals
+    /// `--databases` so `CONFIG SET db-maxmemory <db> <bytes>` can index
+    /// directly with a bounds check instead of resizing at runtime. Empty
+    /// (or all-zero) is the common case and costs a single slice-index
+    /// check on the write path — see [`crate::storage::db_quota`].
+    pub db_maxmemory: Vec<u64>,
     /// LFU logarithmic factor for probabilistic counter increment.
     pub lfu_log_factor: u8,
     /// LFU decay time in minutes.
@@ -1371,6 +1449,23 @@ impl RuntimeConfig {
         }
         self.maxmemory.div_ceil(self.num_shards.max(1))
     }
+
+    /// Per-shard quota for logical db `db_index`, mirroring
+    /// [`Self::maxmemory_per_shard`] exactly but keyed by db instead of the
+    /// whole instance. Returns `0` (unlimited) when no quota is configured
+    /// for this db, or `db_index` is out of range — the fast, allocation-free
+    /// path taken on every write when `--db-maxmemory` was never set.
+    #[inline]
+    #[must_use]
+    pub fn db_maxmemory_per_shard(&self, db_index: usize) -> u64 {
+        let Some(&limit) = self.db_maxmemory.get(db_index) else {
+            return 0;
+        };
+        if limit == 0 {
+            return 0;
+        }
+        limit.div_ceil(self.num_shards.max(1) as u64)
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -1379,6 +1474,7 @@ impl Default for RuntimeConfig {
             maxmemory: 0,
             maxmemory_policy: "noeviction".to_string(),
             maxmemory_samples: 5,
+            db_maxmemory: Vec::new(),
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: None,
@@ -2141,5 +2237,93 @@ mod tests {
             config.per_shard_aof_active(2),
             "must remain active with disk_offload=disable"
         );
+    }
+
+    // --- db-maxmemory (WS5b) ---
+
+    #[test]
+    fn parse_db_maxmemory_entries_basic() {
+        let raw = vec!["0:1024".to_string(), "3:2048".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(out.len(), 16);
+        assert_eq!(out[0], 1024);
+        assert_eq!(out[3], 2048);
+        assert_eq!(out[1], 0, "unmentioned dbs stay unlimited");
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_empty_is_all_zero() {
+        let out = parse_db_maxmemory_entries(&[], 16);
+        assert_eq!(out, vec![0u64; 16]);
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_malformed_is_ignored_not_fatal() {
+        let raw = vec![
+            "not-a-pair".to_string(),
+            "abc:1024".to_string(),
+            "1:not-bytes".to_string(),
+            "2:4096".to_string(), // the one well-formed entry
+        ];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(out[2], 4096, "the well-formed entry must still apply");
+        assert_eq!(
+            out[1], 0,
+            "malformed entries must not panic or partially apply"
+        );
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_out_of_range_index_is_ignored() {
+        let raw = vec!["99:1024".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(
+            out,
+            vec![0u64; 16],
+            "out-of-range db index must not resize or panic"
+        );
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_later_entry_wins_for_same_db() {
+        let raw = vec!["0:1024".to_string(), "0:9999".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 4);
+        assert_eq!(out[0], 9999, "last entry for the same db index must win");
+    }
+
+    #[test]
+    fn parse_one_db_maxmemory_entry_roundtrip() {
+        assert_eq!(parse_one_db_maxmemory_entry("7:123456"), Ok((7, 123456)));
+        assert!(parse_one_db_maxmemory_entry("no-colon").is_err());
+        assert!(parse_one_db_maxmemory_entry("x:123").is_err());
+        assert!(parse_one_db_maxmemory_entry("1:notbytes").is_err());
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_unconfigured_is_zero() {
+        let rt = RuntimeConfig::default();
+        assert_eq!(rt.db_maxmemory_per_shard(0), 0);
+        assert_eq!(
+            rt.db_maxmemory_per_shard(999),
+            0,
+            "out-of-range db must not panic"
+        );
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_divides_like_global_maxmemory() {
+        let mut rt = RuntimeConfig::default();
+        rt.db_maxmemory = vec![1000];
+        rt.num_shards = 4;
+        assert_eq!(rt.db_maxmemory_per_shard(0), 250);
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_zero_entry_is_unlimited() {
+        let mut rt = RuntimeConfig::default();
+        rt.db_maxmemory = vec![0, 500];
+        rt.num_shards = 1;
+        assert_eq!(rt.db_maxmemory_per_shard(0), 0);
+        assert_eq!(rt.db_maxmemory_per_shard(1), 500);
     }
 }

@@ -36,7 +36,7 @@ pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id:
     }
 }
 
-/// Run background eviction if maxmemory is configured.
+/// Run background eviction if maxmemory (or a per-db quota) is configured.
 pub(crate) fn run_eviction(
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
@@ -50,6 +50,22 @@ pub(crate) fn run_eviction(
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 let _ = crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget);
+            });
+        }
+    }
+    // WS5b: proactive per-db quota sweep. This is what catches a quota'd db
+    // that grew over budget WITHOUT a write to that db triggering the
+    // on-write gate — e.g. `SWAPDB` moving an unbounded db's data into a
+    // quota'd slot, or `MOVE` inserting into a quota'd target db (both
+    // documented in docs/guides/isolation.md as lazily, not synchronously,
+    // enforced). Runs even when `--maxmemory` is unset, gated by the
+    // lock-free "any db quota configured?" atomic so an unconfigured
+    // instance pays only one atomic load per tick, not a `Vec` scan.
+    if crate::storage::db_quota::db_maxmemory_any_set() {
+        let db_count = shard_databases.db_count();
+        for i in 0..db_count {
+            crate::shard::slice::with_shard_db(i, |db| {
+                let _ = crate::storage::db_quota::check_db_maxmemory(db, i, &rt);
             });
         }
     }
