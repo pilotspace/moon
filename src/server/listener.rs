@@ -181,7 +181,7 @@ pub async fn run_with_shutdown(
     let runtime_config = Arc::new(parking_lot::RwLock::new(config.to_runtime_config()));
 
     // Create shared tracking table for client-side caching invalidation
-    let tracking_table = Arc::new(Mutex::new(TrackingTable::new()));
+    let tracking_table = crate::tracking::global_table();
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =

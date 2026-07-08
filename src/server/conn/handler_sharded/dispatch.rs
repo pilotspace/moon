@@ -74,7 +74,7 @@ pub(super) fn try_handle_client_command(
                                 let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
                                 conn.tracking_state.invalidation_tx = Some(tx.clone());
                                 conn.tracking_rx = Some(rx);
-                                let mut table = ctx.tracking_table.borrow_mut();
+                                let mut table = ctx.tracking_table.lock();
                                 table.register_client(client_id, tx);
                                 if let Some(target) = config_parsed.redirect {
                                     table.set_redirect(client_id, target);
@@ -90,7 +90,7 @@ pub(super) fn try_handle_client_command(
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         } else {
                             conn.tracking_state = TrackingState::default();
-                            ctx.tracking_table.borrow_mut().untrack_all(client_id);
+                            ctx.tracking_table.lock().untrack_all(client_id);
                             conn.tracking_rx = None;
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         }

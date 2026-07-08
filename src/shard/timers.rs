@@ -119,18 +119,17 @@ pub(crate) fn fire_pending_mq_triggers(
     });
     let _ = shard_databases; // shared handle no longer needed on this path
 
-    // Publish each trigger notification via pub/sub (outside with_shard — no re-entry).
-    if !notifications.is_empty() {
-        let mut pubsub = pubsub_registry.write();
-        for (channel, message) in &notifications {
-            let _subscriber_count = pubsub.publish(channel, message);
-            tracing::debug!(
-                "Shard {}: MQ trigger fired on channel {:?} -> {} subscriber(s)",
-                shard_id,
-                String::from_utf8_lossy(channel),
-                _subscriber_count,
-            );
-        }
+    // Publish each trigger notification via pub/sub (outside with_shard — no
+    // re-entry). publish_shared fans out without holding the registry lock
+    // across the loop (P1).
+    for (channel, message) in &notifications {
+        let _subscriber_count = crate::pubsub::publish_shared(pubsub_registry, channel, message);
+        tracing::debug!(
+            "Shard {}: MQ trigger fired on channel {:?} -> {} subscriber(s)",
+            shard_id,
+            String::from_utf8_lossy(channel),
+            _subscriber_count,
+        );
     }
 }
 

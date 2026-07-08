@@ -1,3 +1,27 @@
+//! Pub/Sub: per-shard channel/pattern registries with cross-shard fan-out.
+//!
+//! # Ordering and consistency guarantees (C1, 2026-07 pub/sub review)
+//!
+//! **Same-connection write→publish ordering IS guaranteed.** A connection's
+//! commands are processed strictly in order by its handler: a `PUBLISH` is not
+//! dispatched until every preceding command on that connection (including
+//! cross-shard writes, which the handler awaits) has completed. Therefore a
+//! subscriber that receives a message may immediately read any key the
+//! publisher wrote *before* the `PUBLISH` on the same connection and observe
+//! the new value — the classic cache-invalidation pattern
+//! (`SET k v; PUBLISH ch k`) is safe. This matches Redis semantics and is
+//! locked in by the `pubsub_kv_ordering` integration test.
+//!
+//! **Cross-connection / cross-channel ordering is NOT guaranteed.** Publishes
+//! from different connections may be delivered in any relative order (each
+//! shard fans out independently), and delivery is at-most-once: a slow
+//! subscriber whose buffer is full is dropped, and a subscriber that
+//! (un)subscribes concurrently with an in-flight publish may miss or still
+//! receive that one message. Redis makes the same trades.
+//!
+//! Delivery within one (publisher connection → subscriber connection) pair is
+//! FIFO: messages traverse a single bounded mpsc per subscriber.
+
 pub mod subscriber;
 
 use std::collections::HashMap;
@@ -195,6 +219,30 @@ impl PubSubRegistry {
         count
     }
 
+    /// Remove specific (channel, subscriber-id) pairs — the slow-subscriber
+    /// reconciliation pass for [`publish_shared`]. Also prunes emptied
+    /// channel/pattern entries.
+    fn remove_slow(&mut self, channel: &Bytes, slow_exact: &[u64], slow_patterns: &[(Bytes, u64)]) {
+        if !slow_exact.is_empty() {
+            if let Some(subs) = self.channels.get_mut(channel) {
+                subs.retain(|s| !slow_exact.contains(&s.id));
+                if subs.is_empty() {
+                    self.channels.remove(channel);
+                }
+            }
+        }
+        if !slow_patterns.is_empty() {
+            self.patterns.retain_mut(|(p, subs)| {
+                subs.retain(|s| {
+                    !slow_patterns
+                        .iter()
+                        .any(|(sp, sid)| *sid == s.id && sp.as_ref() == p.as_ref())
+                });
+                !subs.is_empty()
+            });
+        }
+    }
+
     /// List active channels, optionally filtered by glob pattern.
     pub fn active_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
         self.channels
@@ -247,6 +295,115 @@ impl PubSubRegistry {
     pub fn total_subscription_count(&self, sub_id: u64) -> usize {
         self.channel_subscription_count(sub_id) + self.pattern_subscription_count(sub_id)
     }
+}
+
+/// Publish with the fan-out OUTSIDE the registry lock (P1, 2026-07 pub/sub
+/// review): `PubSubRegistry::publish` under a `write()` guard holds the
+/// per-shard registry lock for the whole O(N) subscriber loop — at high
+/// fan-out (10K cache clients on one invalidation channel) that stalls every
+/// concurrent SUBSCRIBE/UNSUBSCRIBE and, on the SPSC path, the whole drain.
+///
+/// Three phases:
+/// 1. snapshot matching subscribers under a brief READ lock (Subscriber is
+///    a cheap clone: mpsc sender + id + flag),
+/// 2. serialize + `try_send` completely lock-free,
+/// 3. only if a slow subscriber was hit, take the WRITE lock briefly to
+///    remove exactly those (channel, id) pairs.
+///
+/// Semantics vs the locked path (documented trade): a subscriber that
+/// unsubscribes concurrently with a publish may still receive that one
+/// in-flight message, and a subscriber added mid-fan-out may miss it —
+/// both allowed by Redis's at-most-once, no-ordering-across-connections
+/// pub/sub contract.
+pub fn publish_shared(
+    lock: &parking_lot::RwLock<PubSubRegistry>,
+    channel: &Bytes,
+    message: &Bytes,
+) -> i64 {
+    use smallvec::SmallVec;
+
+    // Phase 1: snapshot under read lock.
+    let (exact, pattern_matches): (
+        SmallVec<[Subscriber; 8]>,
+        SmallVec<[(Bytes, SmallVec<[Subscriber; 8]>); 2]>,
+    ) = {
+        let reg = lock.read();
+        let exact = reg
+            .channels
+            .get(channel)
+            .map(|subs| subs.iter().cloned().collect())
+            .unwrap_or_default();
+        let pats = reg
+            .patterns
+            .iter()
+            .filter(|(p, _)| glob_match(p, channel))
+            .map(|(p, subs)| (p.clone(), subs.iter().cloned().collect()))
+            .collect();
+        (exact, pats)
+    };
+    if exact.is_empty() && pattern_matches.is_empty() {
+        return 0;
+    }
+
+    // Phase 2: serialize once per RESP variant, fan out lock-free.
+    let mut count: i64 = 0;
+    let mut slow_exact: SmallVec<[u64; 4]> = SmallVec::new();
+    let mut slow_patterns: SmallVec<[(Bytes, u64); 4]> = SmallVec::new();
+    {
+        let mut resp2: Option<Bytes> = None;
+        let mut resp3: Option<Bytes> = None;
+        for sub in &exact {
+            let data = if sub.is_resp3 {
+                resp3
+                    .get_or_insert_with(|| serialize_message_bytes_push(channel, message))
+                    .clone()
+            } else {
+                resp2
+                    .get_or_insert_with(|| serialize_message_bytes(channel, message))
+                    .clone()
+            };
+            if sub.try_send(data) {
+                count += 1;
+            } else {
+                slow_exact.push(sub.id);
+            }
+        }
+    }
+    for (pattern, subs) in &pattern_matches {
+        let mut resp2: Option<Bytes> = None;
+        let mut resp3: Option<Bytes> = None;
+        for sub in subs {
+            let data = if sub.is_resp3 {
+                resp3
+                    .get_or_insert_with(|| serialize_pmessage_bytes_push(pattern, channel, message))
+                    .clone()
+            } else {
+                resp2
+                    .get_or_insert_with(|| serialize_pmessage_bytes(pattern, channel, message))
+                    .clone()
+            };
+            if sub.try_send(data) {
+                count += 1;
+            } else {
+                slow_patterns.push((pattern.clone(), sub.id));
+            }
+        }
+    }
+
+    // Phase 3: reconcile slow-subscriber removals under a brief write lock.
+    let slow_total = (slow_exact.len() + slow_patterns.len()) as i64;
+    if slow_total > 0 {
+        lock.write()
+            .remove_slow(channel, &slow_exact, &slow_patterns);
+    }
+
+    if count > 0 {
+        crate::admin::metrics_setup::record_pubsub_published();
+    }
+    for _ in 0..slow_total {
+        crate::admin::metrics_setup::record_pubsub_slow_drop();
+    }
+    count
 }
 
 // -- Pre-serialization helpers for zero-copy fan-out --
@@ -582,5 +739,112 @@ mod tests {
         let removed = registry.punsubscribe_all(1);
         assert_eq!(removed.len(), 2);
         assert_eq!(registry.pattern_subscription_count(1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_publish_shared_delivers_and_counts() {
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx1, rx1) = channel::mpsc_bounded::<Bytes>(16);
+        let (tx2, _rx2) = channel::mpsc_bounded::<Bytes>(16);
+        let channel = Bytes::from_static(b"news");
+        {
+            let mut reg = lock.write();
+            reg.subscribe(channel.clone(), Subscriber::new(tx1, 1));
+            reg.subscribe(channel.clone(), Subscriber::new(tx2, 2));
+        }
+
+        let count = publish_shared(&lock, &channel, &Bytes::from_static(b"hello"));
+        assert_eq!(count, 2);
+
+        let msg = rx1.recv_async().await.unwrap();
+        let parsed = parse_resp(&msg);
+        assert_eq!(
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"hello")),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_shared_pattern_delivery() {
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
+        lock.write()
+            .psubscribe(Bytes::from_static(b"news.*"), Subscriber::new(tx, 1));
+
+        let channel = Bytes::from_static(b"news.sports");
+        let count = publish_shared(&lock, &channel, &Bytes::from_static(b"goal!"));
+        assert_eq!(count, 1);
+
+        let msg = rx.recv_async().await.unwrap();
+        let parsed = parse_resp(&msg);
+        assert_eq!(
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"pmessage")),
+                Frame::BulkString(Bytes::from_static(b"news.*")),
+                Frame::BulkString(Bytes::from_static(b"news.sports")),
+                Frame::BulkString(Bytes::from_static(b"goal!")),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_shared_removes_slow_subscriber() {
+        // Parity with test_slow_subscriber_disconnected on the locked path.
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
+        let channel = Bytes::from_static(b"news");
+        lock.write()
+            .subscribe(channel.clone(), Subscriber::new(tx, 1));
+
+        // First publish fills the capacity-1 buffer.
+        assert_eq!(
+            publish_shared(&lock, &channel, &Bytes::from_static(b"msg1")),
+            1
+        );
+        // Second publish: buffer full -> phase-3 reconciliation removes the subscriber.
+        assert_eq!(
+            publish_shared(&lock, &channel, &Bytes::from_static(b"msg2")),
+            0
+        );
+        assert_eq!(lock.read().channel_subscription_count(1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_publish_shared_removes_slow_pattern_subscriber() {
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
+        lock.write()
+            .psubscribe(Bytes::from_static(b"news.*"), Subscriber::new(tx, 1));
+
+        let channel = Bytes::from_static(b"news.a");
+        assert_eq!(
+            publish_shared(&lock, &channel, &Bytes::from_static(b"m1")),
+            1
+        );
+        assert_eq!(
+            publish_shared(&lock, &channel, &Bytes::from_static(b"m2")),
+            0
+        );
+        let reg = lock.read();
+        assert_eq!(reg.pattern_subscription_count(1), 0);
+        assert_eq!(reg.numpat(), 0);
+    }
+
+    #[test]
+    fn test_publish_shared_no_subscribers_fast_path() {
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        assert_eq!(
+            publish_shared(
+                &lock,
+                &Bytes::from_static(b"empty"),
+                &Bytes::from_static(b"x")
+            ),
+            0
+        );
     }
 }

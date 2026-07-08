@@ -3,8 +3,41 @@ pub mod invalidation;
 use crate::runtime::channel;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::protocol::Frame;
+
+/// Number of clients with a registered invalidation channel, process-wide.
+///
+/// This is the write-path gate: every successful write checks
+/// [`tracking_active`] (one relaxed load) before touching the shared
+/// [`TrackingTable`] lock. With no tracking clients the KV hot path pays
+/// a single atomic load and nothing else.
+static ACTIVE_TRACKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// True when at least one connection has CLIENT TRACKING enabled.
+#[inline]
+pub fn tracking_active() -> bool {
+    ACTIVE_TRACKERS.load(Ordering::Relaxed) > 0
+}
+
+/// The process-wide tracking table.
+///
+/// CLIENT TRACKING must be GLOBAL, not per-shard: a tracked read registers on
+/// the reader connection's shard thread while the invalidating write can
+/// execute on any other shard (or arrive over the SPSC mesh). Per-shard
+/// tables silently dropped every cross-shard invalidation — the table is one
+/// shared instance guarded by a mutex, gated off the hot path by
+/// [`tracking_active`]. Invalidation senders are cross-thread-safe (flume),
+/// so a write on shard A pushes directly into a connection's channel on
+/// shard B; the connection's own event loop writes it to the socket.
+pub fn global_table() -> std::sync::Arc<parking_lot::Mutex<TrackingTable>> {
+    static GLOBAL: std::sync::OnceLock<std::sync::Arc<parking_lot::Mutex<TrackingTable>>> =
+        std::sync::OnceLock::new();
+    GLOBAL
+        .get_or_init(|| std::sync::Arc::new(parking_lot::Mutex::new(TrackingTable::new())))
+        .clone()
+}
 
 /// Per-client tracking configuration.
 #[derive(Debug, Clone)]
@@ -71,7 +104,9 @@ impl TrackingTable {
 
     /// Register a client's invalidation channel.
     pub fn register_client(&mut self, client_id: u64, tx: channel::MpscSender<Frame>) {
-        self.client_channels.insert(client_id, tx);
+        if self.client_channels.insert(client_id, tx).is_none() {
+            ACTIVE_TRACKERS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Register a redirect: invalidations for source go to target.
@@ -150,8 +185,19 @@ impl TrackingTable {
         // Remove from bcast_clients
         self.bcast_clients.retain(|(id, _, _)| *id != client_id);
         // Remove channel and redirect
-        self.client_channels.remove(&client_id);
+        if self.client_channels.remove(&client_id).is_some() {
+            ACTIVE_TRACKERS.fetch_sub(1, Ordering::Relaxed);
+        }
         self.redirects.remove(&client_id);
+    }
+
+    /// Cache-flush invalidation (FLUSHALL/FLUSHDB): every registered client
+    /// must drop its whole local cache. Clears the per-key table and returns
+    /// every client channel so the caller can push the RESP3 flush
+    /// invalidation (`invalidate` + Null payload, the Redis convention).
+    pub fn invalidate_all(&mut self) -> Vec<channel::MpscSender<Frame>> {
+        self.key_clients.clear();
+        self.client_channels.values().cloned().collect()
     }
 }
 

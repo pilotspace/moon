@@ -197,12 +197,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    type RemoteMeta = (
+        usize,
+        Option<Bytes>,
+        Bytes,
+        Option<crate::tracking::invalidation::TrackedWriteKeys>,
+    );
     let mut remote_groups: HashMap<
         usize,
-        Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>,
+        Vec<(
+            usize,
+            std::sync::Arc<Frame>,
+            Option<Bytes>,
+            Bytes,
+            Option<crate::tracking::invalidation::TrackedWriteKeys>,
+        )>,
     > = HashMap::with_capacity(ctx.num_shards);
-    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> =
-        Vec::with_capacity(ctx.num_shards);
+    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(ctx.num_shards);
     // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
     // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
     // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
@@ -533,6 +544,42 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
             }
+        } else if conn.tracking_rx.is_some() {
+            // CLIENT TRACKING: deliver invalidation Push frames while parked
+            // in read(). Only tracking connections take this select — the
+            // hot path below is untouched for everyone else. Losing-future
+            // buffer semantics mirror the idle-timeout arm above.
+            let track_buf = std::mem::take(&mut tmp_buf);
+            let mut push_frame: Option<Frame> = None;
+            monoio::select! {
+                read_result = stream.read(track_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                push = async {
+                    match conn.tracking_rx {
+                        Some(ref rx) => rx.recv_async().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    push_frame = push;
+                }
+            }
+            if let Some(frame) = push_frame {
+                let mut push_buf = BytesMut::new();
+                crate::protocol::serialize_resp3(&frame, &mut push_buf);
+                let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
+                    stream.write_all(push_buf.freeze()).await;
+                if wr.is_err() {
+                    break;
+                }
+                continue;
+            }
         } else {
             let (result, returned_buf) = stream.read(tmp_buf).await;
             tmp_buf = returned_buf;
@@ -558,9 +605,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 .is_replica_mirror
                 .as_ref()
                 .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
+            // `!tracking_active()`: inline writes bypass the dispatch-path
+            // CLIENT TRACKING invalidation hook, so ANY tracking client in
+            // the process (not just this conn) forces writes through the
+            // normal path. One relaxed atomic load; free when tracking is off.
             let can_inline_writes = conn.acl_skip_allowed()
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
+                && !crate::tracking::tracking_active()
                 && !is_replica
                 && ctx.spill_sender.is_none();
             let inlined = try_inline_dispatch_loop(
@@ -845,14 +897,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             // --- Pub/sub commands ---
-            if pubsub::try_handle_publish(
-                cmd,
-                cmd_args,
-                &conn,
-                ctx,
-                &mut responses,
-                &mut publish_batches,
-            ) {
+            // C2 fix: inside MULTI, PUBLISH must fall through to the queue
+            // (it used to execute immediately, fanning out before the
+            // transaction's writes were applied).
+            if !conn.in_multi
+                && pubsub::try_handle_publish(
+                    cmd,
+                    cmd_args,
+                    &conn,
+                    ctx,
+                    &mut responses,
+                    &mut publish_batches,
+                )
+            {
                 continue;
             }
             match pubsub::try_handle_subscribe_entry(
@@ -942,7 +999,39 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- MULTI / EXEC / DISCARD ---
-            if write::try_handle_multi_exec(cmd, &mut conn, ctx, &mut responses) {
+            let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+            if write::try_handle_multi_exec(
+                cmd,
+                &mut conn,
+                ctx,
+                &mut responses,
+                &mut exec_publishes,
+            ) {
+                // C2: PUBLISH queued inside MULTI fans out only now — after the
+                // transaction body has been applied — and its placeholder in the
+                // EXEC reply array is patched with the real receiver count.
+                if !exec_publishes.is_empty() {
+                    let exec_idx = responses.len() - 1;
+                    for (inner, ch, msg) in exec_publishes.drain(..) {
+                        // Channel ACL gates the txn PUBLISH path (C2 security):
+                        // a denied channel is patched with NOPERM, never sent.
+                        let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                            &ch,
+                        ) {
+                            Some(err) => err,
+                            None => Frame::Integer(
+                                crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                            ),
+                        };
+                        if let Frame::Array(items) = &mut responses[exec_idx] {
+                            if inner < items.len() {
+                                items[inner] = patched;
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1473,21 +1562,29 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // with_shard closure: this awaits). Any failed leg turns the
                     // reply into an explicit partial-flush error, never silent +OK.
                     if !matches!(response, Frame::Error(_))
-                        && ctx.num_shards > 1
                         && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                             || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                     {
-                        if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
-                            &frame,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            conn.selected_db,
-                            &ctx.dispatch_tx,
-                            &ctx.spsc_notifiers,
-                        )
-                        .await
-                        {
-                            response = e;
+                        if ctx.num_shards > 1 {
+                            if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
+                                &frame,
+                                ctx.shard_id,
+                                ctx.num_shards,
+                                conn.selected_db,
+                                &ctx.dispatch_tx,
+                                &ctx.spsc_notifiers,
+                            )
+                            .await
+                            {
+                                response = e;
+                            }
+                        }
+                        // CLIENT TRACKING: a flush drops every cached key —
+                        // push the RESP3 flush invalidation (invalidate + Null)
+                        // to all tracking clients. Process-global table: one
+                        // hook at the originating connection covers all shards.
+                        if !matches!(response, Frame::Error(_)) {
+                            crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
                         }
                     }
 
@@ -1542,20 +1639,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
-                    // Track key on write / invalidate tracked keys
-                    if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
-                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let senders = ctx
-                                .tracking_table
-                                .borrow_mut()
-                                .invalidate_key(&key, client_id);
-                            if !senders.is_empty() {
-                                let push = crate::tracking::invalidation::invalidation_push(&[key]);
-                                for tx in senders {
-                                    let _ = tx.try_send(push.clone());
-                                }
-                            }
-                        }
+                    // CLIENT TRACKING: any successful write (from ANY client,
+                    // tracking or not) invalidates trackers of every written
+                    // key — gated off the hot path by tracking_active().
+                    if !matches!(response, Frame::Error(_)) {
+                        crate::tracking::invalidation::invalidate_after_write(
+                            &ctx.tracking_table,
+                            cmd,
+                            cmd_args,
+                            client_id,
+                        );
                     }
                     let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
@@ -1643,15 +1736,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     };
 
-                    // Track key on local read
-                    if conn.tracking_state.enabled && !conn.tracking_state.bcast {
-                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            ctx.tracking_table.borrow_mut().track_key(
-                                client_id,
-                                &key,
-                                conn.tracking_state.noloop,
-                            );
-                        }
+                    // Track every key of a successful local read (MGET a b
+                    // must track both, not just the first).
+                    if conn.tracking_state.enabled
+                        && !conn.tracking_state.bcast
+                        && !matches!(response, Frame::Error(_))
+                    {
+                        crate::tracking::invalidation::track_read_keys(
+                            &ctx.tracking_table,
+                            cmd,
+                            cmd_args,
+                            client_id,
+                            conn.tracking_state.noloop,
+                        );
                     }
                     let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
@@ -1705,11 +1802,31 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 } else {
                     Bytes::new()
                 };
+                // CLIENT TRACKING: capture the write's key set at enqueue time
+                // (gated); invalidation fires when the remote reply confirms.
+                let track_keys = if crate::tracking::tracking_active() && metadata::is_write(cmd) {
+                    Some(crate::tracking::invalidation::command_keys(cmd, cmd_args))
+                } else {
+                    None
+                };
+                // Remote READ by a tracking client: register the keys now
+                // (Redis tracks reads even for missing keys, so registering
+                // before the reply is faithful).
+                if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                    crate::tracking::invalidation::track_read_keys(
+                        &ctx.tracking_table,
+                        cmd,
+                        cmd_args,
+                        client_id,
+                        conn.tracking_state.noloop,
+                    );
+                }
                 remote_groups.entry(target).or_default().push((
                     resp_idx,
                     std::sync::Arc::new(dispatch_frame),
                     aof_bytes,
                     cmd_bytes,
+                    track_keys,
                 ));
                 crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
@@ -1770,12 +1887,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // shard's pool (not ctx.shard_id — mirrors handler_sharded).
             for (target, entries) in remote_groups.drain() {
                 let slot_arc = response_pool.slot_arc(target);
-                let (meta, commands): (
-                    Vec<(usize, Option<Bytes>, Bytes)>,
-                    Vec<std::sync::Arc<Frame>>,
-                ) = entries
+                let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) = entries
                     .into_iter()
-                    .map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame))
+                    .map(|(idx, arc_frame, aof, cmd, tk)| ((idx, aof, cmd, tk), arc_frame))
                     .unzip();
 
                 let msg = ShardMessage::PipelineBatchSlotted {
@@ -1832,7 +1946,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             target,
                             outcome
                         );
-                        for (resp_idx, _, _) in &meta {
+                        for (resp_idx, _, _, _) in &meta {
                             responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                 b"ERR cross-shard dispatch backpressure",
                             ));
@@ -1892,7 +2006,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
                 let mut write_resp_idxs: Vec<usize> = Vec::new();
-                for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
+                for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in
+                    meta.into_iter().zip(shard_responses)
                 {
                     // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                     // inside the SPSC arm (PipelineBatchSlotted), BEFORE the response
@@ -1904,6 +2019,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let resp = apply_resp3_conversion(&cmd_name, resp, conn.protocol_version);
                     if aof_bytes.is_some() && !matches!(resp, Frame::Error(_)) {
                         write_resp_idxs.push(resp_idx);
+                    }
+                    // CLIENT TRACKING: remote write confirmed — invalidate the
+                    // keys captured at enqueue time.
+                    if let Some(keys) = track_keys {
+                        if !matches!(resp, Frame::Error(_)) {
+                            crate::tracking::invalidation::invalidate_keys(
+                                &ctx.tracking_table,
+                                &keys,
+                                client_id,
+                            );
+                        }
                     }
                     responses[resp_idx] = resp;
                 }
@@ -2085,6 +2211,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             ctx.pubsub_affinity.write().remove_pubsub(&addr.ip());
         }
+    }
+
+    // --- Disconnect cleanup: release CLIENT TRACKING registration ---
+    // A client that disconnects without `CLIENT TRACKING OFF` would otherwise
+    // leave `ACTIVE_TRACKERS` nonzero and keep `tracking_active()` hot for the
+    // rest of the process (single/sharded handlers already do this on close).
+    // `untrack_all` only decrements when the client was actually tracked, so
+    // gating on `tracking_active()` keeps the common no-tracking close lock-free.
+    if crate::tracking::tracking_active() {
+        ctx.tracking_table.lock().untrack_all(client_id);
     }
 
     // NOTE: connection close is recorded by the caller (conn_accept.rs) to

@@ -255,6 +255,91 @@ path (below), or replay them on a pre-freeze build first and re-persist.
   replay_temporal_wal` scans `shard-N/` directly for `*.wal` files instead of
   `shard-N/wal-v3/` like its siblings — looks like a pre-existing directory
   mismatch, left as-is pending its own investigation.
+### Fixed — CLIENT TRACKING invalidation actually works on sharded servers (PR #TBD)
+
+- **`src/tracking/`, all three handler stacks**: RESP3 client-side-caching
+  invalidation was non-functional outside the single-shard handler via five
+  stacked defects: (1) sharded handlers registered the per-connection
+  invalidation channel but never drained it — pushes went into a channel
+  nobody read; (2) invalidation was gated on the WRITER's own tracking state
+  (backwards — a non-tracking writer never invalidated anyone); (3) only the
+  first key of a multi-key write was invalidated (`DEL k1 k2` left `k2`
+  stale); (4) the tracking table was per-shard, so a reader and writer
+  accepted on different shards never saw each other; (5) FLUSHALL/FLUSHDB
+  never invalidated. The table is now process-global (`OnceLock`, gated by a
+  relaxed `ACTIVE_TRACKERS` atomic so the hot path pays one load when
+  tracking is unused), keys are extracted via the command-metadata key
+  specs, and all write paths (local, cross-shard remote leg, multi-key
+  coordinator, monoio inline fast-path via a tracking-aware gate, FLUSH) hook
+  invalidation. Red/green: `tests/client_tracking_invalidation.rs` (4 tests,
+  raw RESP3 client) fails 0/4 on the previous binary.
+
+### Changed — pub/sub publish fan-out moved outside the registry lock (P1, PR #TBD)
+
+- **`src/pubsub/mod.rs`** (`publish_shared`): PUBLISH previously held the
+  per-shard registry **write** lock for the whole O(N) subscriber fan-out —
+  and the SPSC drain held it across the entire drain cycle. High fan-out
+  (10K cache clients on one invalidation channel) stalled every concurrent
+  (UN)SUBSCRIBE and the shard's cross-shard message drain. The new 3-phase
+  path snapshots matching subscribers under a brief read lock, serializes +
+  `try_send`s lock-free, and takes the write lock only to remove slow
+  subscribers actually hit. Handler PUBLISH sites (both runtimes), the SPSC
+  `PubSubPublish`/`PubSubPublishBatch` arms, and the MQ trigger-notification
+  loop all switched. Documented at-most-once trade (matches Redis).
+
+### Fixed — PUBLISH inside MULTI executed immediately instead of queueing (C2, PR #TBD)
+
+- **All three handler stacks**: the PUBLISH arm ran before the `in_multi`
+  queue check, so `MULTI; SET k v; PUBLISH ch m; EXEC` fanned the message out
+  at queue time — subscribers received it before the transaction's writes
+  applied (even on DISCARD). PUBLISH now queues like any other command; both
+  transaction executors intercept it and the handler fans it out after the
+  transaction body, patching the reply placeholder with the real receiver
+  count (remote shards awaited via targeted `PubSubPublish`). Discovered but
+  NOT fixed (pre-existing, tracked as follow-up): sharded MULTI/EXEC executes
+  the queued body on the connection's local shard regardless of key
+  ownership — at shards=4 most txn-written keys are silently invisible to
+  other connections; the new test documents this and runs on `--shards 1`.
+
+### Added — pub/sub ↔ KV ordering guarantee documented + locked in (C1/C2, PR #TBD)
+
+- **`src/pubsub/mod.rs`** module docs now state the contract: same-connection
+  write→publish ordering IS guaranteed (a received message implies every
+  preceding write on the publisher's connection is visible), cross-connection
+  ordering is NOT, delivery is at-most-once. `tests/pubsub_kv_ordering.rs`
+  pins both the pipelined `SET;PUBLISH` case and `MULTI{SET,PUBLISH}EXEC`
+  across a 4-shard server. (P2 of the review — event-loop/scheduler coupling
+  benchmark — deferred to a Linux box; macOS numbers are not decision-grade.)
+
+### Security — channel ACL enforced on the transactional PUBLISH path (C2 follow-up, PR #TBD)
+
+- **`src/server/conn/{shared,handler_single,handler_sharded/mod,handler_monoio/mod}.rs`**:
+  the C2 ordering fix queues `PUBLISH` inside `MULTI` and fans it out after the
+  transaction body, but the fan-out skipped the per-channel ACL check that the
+  immediate path enforces — so a client denied a channel could wrap `PUBLISH`
+  in `MULTI/EXEC` to reach it. A shared `publish_channel_acl_deny` helper now
+  gates every fan-out site (all three handlers); a denied channel is patched
+  into the EXEC reply slot as `NOPERM` and never delivered. The check runs at
+  fan-out time because Moon has no queue-time EXECABORT machinery. Also closes a
+  pre-existing gap where the single-handler *immediate* PUBLISH never checked
+  channel ACLs at all (the sharded/monoio immediate paths already did).
+  Red/green: `tests/pubsub_multi_channel_acl.rs` (2 tests, 1- and 4-shard) —
+  a restricted user's `MULTI; PUBLISH denied m; EXEC` returned `:0` on the old
+  binary, `NOPERM` on the fixed one.
+
+### Fixed — CLIENT TRACKING invalidation + cleanup edge cases (review follow-up, PR #TBD)
+
+- **EXEC now invalidates tracked keys**: `SET`/`DEL`/`MSET` applied inside
+  `MULTI/EXEC` bypassed the post-write invalidation hook, leaving RESP3
+  client-side caches stale until the next non-txn write. All three handlers now
+  run `invalidate_after_write` for each successful queued write (self-gated on
+  `tracking_active()`, so no cost when tracking is unused).
+- **monoio disconnect releases tracking registration**: a client that
+  disconnected without `CLIENT TRACKING OFF` left `ACTIVE_TRACKERS` nonzero and
+  kept `tracking_active()` hot for the rest of the process (the single/sharded
+  handlers already cleaned up on close). The monoio disconnect path now calls
+  `untrack_all`, gated on `tracking_active()` to keep the common no-tracking
+  close lock-free.
 
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 

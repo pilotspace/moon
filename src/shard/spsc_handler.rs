@@ -84,7 +84,7 @@ pub(super) fn spsc_eviction_gate(
 pub(crate) fn drain_spsc_shared(
     shard_databases: &Arc<ShardDatabases>,
     consumers: &mut [HeapCons<ShardMessage>],
-    pubsub_registry: &mut PubSubRegistry,
+    pubsub_registry: &parking_lot::RwLock<PubSubRegistry>,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
     pending_snapshot: &mut Option<(
         u64,
@@ -315,7 +315,7 @@ pub(crate) fn drain_spsc_shared(
 /// and appends write commands to the per-shard WAL writer.
 pub(crate) fn handle_shard_message_shared(
     shard_databases: &Arc<ShardDatabases>,
-    pubsub_registry: &mut PubSubRegistry,
+    pubsub_registry: &parking_lot::RwLock<PubSubRegistry>,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
     msg: ShardMessage,
     pending_snapshot: &mut Option<(
@@ -1756,13 +1756,14 @@ pub(crate) fn handle_shard_message_shared(
             slot.fill(results);
         }
         ShardMessage::PubSubPublish(payload) => {
-            let count = pubsub_registry.publish(&payload.channel, &payload.message);
+            let count =
+                crate::pubsub::publish_shared(pubsub_registry, &payload.channel, &payload.message);
             payload.slot.add(count);
         }
         ShardMessage::PubSubPublishBatch { pairs, slot } => {
             let mut batch_total: i64 = 0;
             for (i, (channel, message)) in pairs.iter().enumerate() {
-                let count = pubsub_registry.publish(channel, message);
+                let count = crate::pubsub::publish_shared(pubsub_registry, channel, message);
                 if i < slot.counts.len() {
                     slot.counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -3487,7 +3488,7 @@ mod drain_cap_tests {
         }
         let mut consumers = vec![cons];
 
-        let mut pubsub = PubSubRegistry::new();
+        let pubsub = parking_lot::RwLock::new(PubSubRegistry::new());
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let mut pending_snapshot = None;
         let mut snapshot_state: Option<SnapshotState> = None;
@@ -3512,7 +3513,7 @@ mod drain_cap_tests {
         let hit_cap = drain_spsc_shared(
             &shard_databases,
             &mut consumers,
-            &mut pubsub,
+            &pubsub,
             &blocking,
             &mut pending_snapshot,
             &mut snapshot_state,
@@ -3546,7 +3547,7 @@ mod drain_cap_tests {
         let hit_cap2 = drain_spsc_shared(
             &shard_databases,
             &mut consumers,
-            &mut pubsub,
+            &pubsub,
             &blocking,
             &mut pending_snapshot,
             &mut snapshot_state,
