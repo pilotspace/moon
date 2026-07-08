@@ -1406,6 +1406,71 @@ fn test_parse_ft_search_args_without_limit() {
 // -- FT.CONFIG tests --
 
 #[test]
+fn test_ft_config_ef_runtime_set_get() {
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+
+    // SET a pinned beam width; the query path reads meta.hnsw_ef_runtime live.
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"EF_RUNTIME"),
+        bulk(b"64"),
+    ];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
+    assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
+    #[allow(clippy::unwrap_used)] // index just created above
+    let idx = store.get_index_mut(b"myidx").unwrap();
+    assert_eq!(idx.meta.hnsw_ef_runtime, 64);
+
+    // GET reflects the new value.
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"EF_RUNTIME")];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"64"),
+        other => panic!("expected BulkString 64, got {other:?}"),
+    }
+
+    // 0 restores the auto heuristic.
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"EF_RUNTIME"),
+        bulk(b"0"),
+    ];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
+    assert!(matches!(result, Frame::SimpleString(_)));
+    #[allow(clippy::unwrap_used)] // index exists
+    let idx = store.get_index_mut(b"myidx").unwrap();
+    assert_eq!(idx.meta.hnsw_ef_runtime, 0);
+
+    // Out-of-range and non-numeric values are rejected.
+    for bad in [&b"5"[..], b"5000", b"abc"] {
+        let set_args = vec![bulk(b"SET"), bulk(b"myidx"), bulk(b"EF_RUNTIME"), bulk(bad)];
+        let result = ft_config(
+            &mut store,
+            &mut crate::text::store::TextStore::new(),
+            &set_args,
+        );
+        assert!(matches!(result, Frame::Error(_)), "{bad:?} -> {result:?}");
+    }
+}
+
+#[test]
 fn test_ft_config_autocompact_on_off() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
