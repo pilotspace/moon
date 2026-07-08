@@ -378,7 +378,8 @@ async fn flushall_clears_vector_index_contents() {
 }
 
 // ---------------------------------------------------------------------------
-// R3: FLUSHDB behaves identically (Moon FT indexes are keyspace-global).
+// R3: FLUSHDB on db 0 (where "fidx" lives -- FT.CREATE still always tags
+// db 0, see WS5A-NOTES.md) still clears index contents same as before.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flushdb_clears_vector_index_contents() {
@@ -454,5 +455,65 @@ async fn hdel_vector_field_tombstones_vector() {
         knn_count(&mut conn, "fidx").await,
         1,
         "HDEL of a non-vector field must not tombstone the vector"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WS5a (db-scoped indexes): FLUSHDB issued against a DIFFERENT db than the
+// one an index's contents live in must NOT clear that index.
+//
+// Today FT.CREATE still always tags an index db 0 (see
+// `.planning/v0.6.0-release/WS5A-NOTES.md` -- the FT.CREATE db_index wiring
+// is open follow-up work), so this test exercises exactly the case that
+// wiring will complete: with the index's contents effectively "owned" by
+// db 0 (the only db_index FT.CREATE can produce today), a FLUSHDB run from
+// db 1 must leave them untouched -- this is the direct fix for the
+// documented pre-WS5a bug ("FLUSHDB of any db clears ALL index contents").
+// A FLUSHDB from db 0 (the matching owner) still clears them, proving the
+// scoping is real and not just "FLUSHDB now does nothing".
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flushdb_from_different_db_does_not_clear_vector_index_contents() {
+    let (port, _shutdown) = start_moon_sharded(1).await;
+    let mut conn = connect(port).await;
+
+    ft_create(&mut conn, "fidx").await;
+    hset_doc(&mut conn, "doc:1", [1.0, 0.0, 0.0, 0.0]).await;
+    hset_doc(&mut conn, "doc:2", [0.0, 1.0, 0.0, 0.0]).await;
+    assert_eq!(knn_count(&mut conn, "fidx").await, 2, "pre-flush sanity");
+
+    // FLUSHDB from db 1 must NOT touch db 0's index contents.
+    let _: String = redis::cmd("SELECT")
+        .arg(1)
+        .query_async(&mut conn)
+        .await
+        .expect("SELECT 1 should succeed");
+    let _: String = redis::cmd("FLUSHDB")
+        .query_async(&mut conn)
+        .await
+        .expect("FLUSHDB (db 1) should succeed");
+
+    let _: String = redis::cmd("SELECT")
+        .arg(0)
+        .query_async(&mut conn)
+        .await
+        .expect("SELECT 0 should succeed");
+    assert_eq!(
+        knn_count(&mut conn, "fidx").await,
+        2,
+        "FLUSHDB from db 1 must not clear an index whose contents belong to db 0 \
+         (this is the direct WS5a fix for the pre-v0.6.0 global-FLUSHDB bug)"
+    );
+
+    // Sanity: FLUSHDB from the OWNING db (0) still clears it -- proves this
+    // isn't just "FLUSHDB is a no-op now".
+    let _: String = redis::cmd("FLUSHDB")
+        .query_async(&mut conn)
+        .await
+        .expect("FLUSHDB (db 0) should succeed");
+    assert_eq!(
+        knn_count(&mut conn, "fidx").await,
+        0,
+        "FLUSHDB from the owning db (0) must still clear index contents"
     );
 }
