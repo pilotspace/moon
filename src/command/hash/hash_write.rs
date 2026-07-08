@@ -3,7 +3,10 @@ use smallvec::SmallVec;
 
 use crate::protocol::{Frame, FrameVec};
 use crate::storage::Database;
-use crate::storage::db::{HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
+use crate::storage::db::{
+    HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, hash_field_cost,
+    hash_field_cost_len,
+};
 
 use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
 
@@ -36,6 +39,9 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
                 let mut count = 0i64;
+                // Listpack `estimate_memory()` is O(1) (capacity-based), so a
+                // before/after snapshot is cheap — no per-element formula needed.
+                let before = lp.estimate_memory();
                 let mut i = 1;
                 while i < args.len() {
                     let field = match extract_bytes(&args[i]) {
@@ -65,9 +71,25 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                     }
                     i += 2;
                 }
+                let after = lp.estimate_memory();
                 // Check threshold: lp.len()/2 fields > LISTPACK_MAX_ENTRIES
-                if lp.len() / 2 > LISTPACK_MAX_ENTRIES {
-                    db.upgrade_hash_listpack_to_hash(key);
+                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here (last use above) — safe to
+                // call back into `db` for accounting from this point on.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
+                if should_upgrade {
+                    // One-time listpack -> Hash upgrade: the cost MODEL changes
+                    // (capacity-based -> per-field sum), so the swing is charged
+                    // via a single O(n) recompute. This fires once per key at
+                    // the 128-entry boundary, not per mutation.
+                    let map = db.upgrade_hash_listpack_to_hash(key);
+                    let new_cost: usize = map.iter().map(|(k, v)| hash_field_cost(k, v)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
                 }
                 return Frame::Integer(count);
             }
@@ -95,6 +117,9 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let mut new_count: i64 = 0;
+    // Net signed byte delta across all fields in this call — O(1) per field
+    // (no full-map rescan); applied to `used_memory` once `map`'s borrow ends.
+    let mut mem_delta: i64 = 0;
     let mut i = 1;
     while i < args.len() {
         let field = match extract_bytes(&args[i]) {
@@ -105,10 +130,27 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
             Some(v) => v.clone(),
             None => return err_wrong_args("HSET"),
         };
-        if map.insert(field, value).is_none() {
-            new_count += 1;
+        let field_len = field.len();
+        let value_len = value.len();
+        match map.insert(field, value) {
+            Some(old_value) => {
+                let old_cost = hash_field_cost_len(field_len, old_value.len()) as i64;
+                let new_cost = hash_field_cost_len(field_len, value_len) as i64;
+                mem_delta += new_cost - old_cost;
+            }
+            None => {
+                new_count += 1;
+                mem_delta += hash_field_cost_len(field_len, value_len) as i64;
+            }
         }
         i += 2;
+    }
+    // `map`'s borrow of `db` ends above (last use in the loop) — safe to
+    // call back into `db` for accounting and the TTL-sidecar clear below.
+    if mem_delta >= 0 {
+        db.charge_memory(mem_delta as usize);
+    } else {
+        db.credit_memory((-mem_delta) as usize);
     }
     // Clear TTL sidecar entries for all touched fields (Valkey: HSET unconditionally
     // persists the field).  No-op for plain Hash; cheap enum-match on HashWithTtl.
@@ -173,6 +215,8 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         // HashWithTtl returns Ok(None), falling through — same as HSET.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
+                // Listpack `estimate_memory()` is O(1) (capacity-based).
+                let before = lp.estimate_memory();
                 let mut i = 1;
                 while i < args.len() {
                     let field = match extract_bytes(&args[i]) {
@@ -199,8 +243,20 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                     }
                     i += 2;
                 }
-                if lp.len() / 2 > LISTPACK_MAX_ENTRIES {
-                    db.upgrade_hash_listpack_to_hash(key);
+                let after = lp.estimate_memory();
+                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
+                if should_upgrade {
+                    // One-time cost-model swing — see the matching comment in `hset`.
+                    let map = db.upgrade_hash_listpack_to_hash(key);
+                    let new_cost: usize = map.iter().map(|(k, v)| hash_field_cost(k, v)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
                 }
                 return ok();
             }
@@ -223,6 +279,7 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(m) => m,
         Err(e) => return e,
     };
+    let mut mem_delta: i64 = 0;
     let mut i = 1;
     while i < args.len() {
         let field = match extract_bytes(&args[i]) {
@@ -233,8 +290,25 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
             Some(v) => v.clone(),
             None => return err_wrong_args("HMSET"),
         };
-        map.insert(field, value);
+        let field_len = field.len();
+        let value_len = value.len();
+        match map.insert(field, value) {
+            Some(old_value) => {
+                let old_cost = hash_field_cost_len(field_len, old_value.len()) as i64;
+                let new_cost = hash_field_cost_len(field_len, value_len) as i64;
+                mem_delta += new_cost - old_cost;
+            }
+            None => {
+                mem_delta += hash_field_cost_len(field_len, value_len) as i64;
+            }
+        }
         i += 2;
+    }
+    // `map`'s borrow of `db` ends above.
+    if mem_delta >= 0 {
+        db.charge_memory(mem_delta as usize);
+    } else {
+        db.credit_memory((-mem_delta) as usize);
     }
     // Valkey: HMSET clears TTL for every overwritten field.
     db.hash_clear_field_ttls(key, &touched);
@@ -286,10 +360,19 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let new_value = current + increment;
     let mut ibuf = itoa::Buffer::new();
-    map.insert(
-        field,
-        Bytes::copy_from_slice(ibuf.format(new_value).as_bytes()),
-    );
+    let field_len = field.len();
+    let new_bytes = Bytes::copy_from_slice(ibuf.format(new_value).as_bytes());
+    let new_value_len = new_bytes.len();
+    let old_value_len = map.insert(field, new_bytes).map(|v| v.len());
+    // `map`'s borrow of `db` ends above.
+    let new_cost = hash_field_cost_len(field_len, new_value_len) as i64;
+    let old_cost = old_value_len.map_or(0, |l| hash_field_cost_len(field_len, l) as i64);
+    let mem_delta = new_cost - old_cost;
+    if mem_delta >= 0 {
+        db.charge_memory(mem_delta as usize);
+    } else {
+        db.credit_memory((-mem_delta) as usize);
+    }
     Frame::Integer(new_value)
 }
 
@@ -333,7 +416,20 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     let new_value = current + increment;
     // Format like Redis: integer-like floats get no decimal, otherwise trim trailing zeros
     let formatted = format_float(new_value);
-    map.insert(field, Bytes::from(formatted.clone()));
+    let field_len = field.len();
+    let new_value_len = formatted.len();
+    let old_value_len = map
+        .insert(field, Bytes::from(formatted.clone()))
+        .map(|v| v.len());
+    // `map`'s borrow of `db` ends above.
+    let new_cost = hash_field_cost_len(field_len, new_value_len) as i64;
+    let old_cost = old_value_len.map_or(0, |l| hash_field_cost_len(field_len, l) as i64);
+    let mem_delta = new_cost - old_cost;
+    if mem_delta >= 0 {
+        db.charge_memory(mem_delta as usize);
+    } else {
+        db.credit_memory((-mem_delta) as usize);
+    }
     Frame::BulkString(Bytes::from(formatted))
 }
 
@@ -383,7 +479,11 @@ pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
     if map.contains_key(&field) {
         Frame::Integer(0)
     } else {
+        let cost = hash_field_cost(&field, &value);
         map.insert(field, value);
+        // `map`'s borrow of `db` ends above — field was absent, so this is a
+        // pure charge (no prior cost to net out).
+        db.charge_memory(cost);
         Frame::Integer(1)
     }
 }

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
+use crate::storage::db::set_member_cost;
 use crate::storage::entry::Entry;
 
 use super::{collect_sets, parse_int};
@@ -49,6 +50,8 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
     if all_integers && member_count <= INTSET_MAX_ENTRIES {
         match db.get_or_create_intset(key) {
             Ok(Some(intset)) => {
+                // `Intset::estimate_memory()` is O(1) (capacity-based).
+                let before = intset.estimate_memory();
                 let mut added = 0i64;
                 let mut needs_upgrade = false;
                 for arg in &args[1..] {
@@ -65,8 +68,16 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                         }
                     }
                 }
+                let after = intset.estimate_memory();
+                // `intset`'s borrow of `db` ends here.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
                 if needs_upgrade {
-                    // Upgrade intset to HashSet and continue adding remaining members
+                    // One-time cost-model swing (intset -> HashSet) — see the
+                    // matching comment in hash_write.rs's hset.
                     let set = db.upgrade_intset_to_set(key);
                     // Re-add remaining members (some may already be in the set from intset)
                     for arg in &args[1..] {
@@ -74,6 +85,9 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             set.insert(member.clone());
                         }
                     }
+                    let new_cost: usize = set.iter().map(|m| set_member_cost(m)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
                     // Recount: we need accurate count of new members
                     // Since we already inserted into intset and then upgraded,
                     // just count total unique members vs original
@@ -95,13 +109,17 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let mut added = 0i64;
+    let mut mem_delta: usize = 0;
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
             if set.insert(member.clone()) {
                 added += 1;
+                mem_delta += set_member_cost(member);
             }
         }
     }
+    // `set`'s borrow of `db` ends above.
+    db.charge_memory(mem_delta);
     Frame::Integer(added)
 }
 
@@ -124,13 +142,17 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let mut removed = 0i64;
+    let mut credit: usize = 0;
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
             if set.remove(member) {
                 removed += 1;
+                credit += set_member_cost(member);
             }
         }
     }
+    // `set`'s borrow of `db` ends above.
+    db.credit_memory(credit);
     // Clean up empty set
     let key_clone = key.clone();
     if let Ok(Some(s)) = db.get_set(&key_clone) {
@@ -190,8 +212,13 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
             return Frame::Null;
         };
         set.remove(&chosen);
-        if set.is_empty() {
+        let empty = set.is_empty();
+        // `set`'s borrow of `db` ends above.
+        if empty {
+            // Whole-key removal recomputes the (now-empty) entry cost.
             db.remove(&key);
+        } else {
+            db.credit_memory(set_member_cost(&chosen));
         }
         return Frame::BulkString(chosen);
     }
@@ -225,8 +252,13 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     for m in &chosen {
         set.remove(m);
     }
-    if set.is_empty() {
+    let empty = set.is_empty();
+    // `set`'s borrow of `db` ends above.
+    if empty {
         db.remove(&key);
+    } else {
+        let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
+        db.credit_memory(credit);
     }
 
     let result: Vec<Frame> = chosen.into_iter().map(Frame::BulkString).collect();
@@ -464,15 +496,23 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Integer(0);
     }
     let src_empty = src_set.is_empty();
+    // `src_set`'s borrow of `db` ends above.
+    if src_empty {
+        // Whole-key removal recomputes the (now-empty) entry cost -- covers
+        // the removed member too, so skip the standalone credit below.
+        db.remove(&source);
+    } else {
+        db.credit_memory(set_member_cost(&member));
+    }
 
     let dst_set = match db.get_or_create_set(&destination) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    dst_set.insert(member);
-
-    if src_empty {
-        db.remove(&source);
+    let inserted = dst_set.insert(member.clone());
+    // `dst_set`'s borrow of `db` ends above.
+    if inserted {
+        db.charge_memory(set_member_cost(&member));
     }
 
     Frame::Integer(1)

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+use crate::storage::db::zset_member_cost;
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
@@ -80,6 +81,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut added = 0i64;
     let mut changed = 0i64;
+    // Net O(1) byte charge across all members in this call — see the WS6
+    // accounting note above `entry_overhead` in storage/db.rs. A brand-new
+    // member costs `zset_member_cost` (one BPTree node + one `members` map
+    // entry); an existing member's score-only update costs nothing (the
+    // `SortedSetBPTree` estimator doesn't factor in score values).
+    let mut mem_charge: usize = 0;
 
     let mut j = 0;
     while j < remaining.len() {
@@ -124,10 +131,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         };
 
         if should_update {
+            let member_cost = zset_member_cost(&member);
             let is_new = zadd_member(members, scores, member, score);
             if is_new {
                 added += 1;
                 changed += 1;
+                mem_charge += member_cost;
             } else if existing_score.is_some_and(|es| (es - score).abs() > f64::EPSILON) {
                 changed += 1;
             }
@@ -135,6 +144,9 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
 
         j += 2;
     }
+
+    // `members`/`scores`' borrow of `db` ends above.
+    db.charge_memory(mem_charge);
 
     if ch {
         Frame::Integer(changed)
@@ -159,6 +171,7 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let mut removed = 0i64;
+    let mut credit: usize = 0;
     for arg in &args[1..] {
         let member = match extract_bytes(arg) {
             Some(b) => b,
@@ -166,11 +179,15 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
         };
         if zrem_member(members, scores, member) {
             removed += 1;
+            credit += zset_member_cost(member);
         }
     }
+    let is_empty = members.is_empty();
+    // `members`/`scores`' borrow of `db` ends above.
+    db.credit_memory(credit);
 
     // Remove key if empty
-    if members.is_empty() {
+    if is_empty {
         db.remove(&key);
     }
 
@@ -215,7 +232,12 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     let current = members.get(&member).copied().unwrap_or(0.0);
     let new_score = current + increment;
 
-    zadd_member(members, scores, member, new_score);
+    let member_cost = zset_member_cost(&member);
+    let is_new = zadd_member(members, scores, member, new_score);
+    // `members`/`scores`' borrow of `db` ends above.
+    if is_new {
+        db.charge_memory(member_cost);
+    }
 
     Frame::BulkString(Bytes::from(format_score(new_score)))
 }
@@ -252,21 +274,26 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let mut result = Vec::new();
+    let mut credit: usize = 0;
     for _ in 0..count {
         let first = scores.iter().next().map(|(s, m)| (s, m.clone()));
         match first {
             Some((score, member)) => {
                 scores.remove(score, &member);
                 members.remove(&member);
+                credit += zset_member_cost(&member);
                 result.push(Frame::BulkString(member));
                 result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
             }
             None => break,
         }
     }
+    let is_empty = members.is_empty();
+    // `members`/`scores`' borrow of `db` ends above.
+    db.credit_memory(credit);
 
     // Remove key if empty
-    if members.is_empty() {
+    if is_empty {
         db.remove(&key);
     }
 
@@ -305,21 +332,26 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let mut result = Vec::new();
+    let mut credit: usize = 0;
     for _ in 0..count {
         let last = scores.iter_rev().next().map(|(s, m)| (s, m.clone()));
         match last {
             Some((score, member)) => {
                 scores.remove(score, &member);
                 members.remove(&member);
+                credit += zset_member_cost(&member);
                 result.push(Frame::BulkString(member));
                 result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
             }
             None => break,
         }
     }
+    let is_empty = members.is_empty();
+    // `members`/`scores`' borrow of `db` ends above.
+    db.credit_memory(credit);
 
     // Remove key if empty
-    if members.is_empty() {
+    if is_empty {
         db.remove(&key);
     }
 
@@ -503,9 +535,16 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
             Err(e) => return e,
         };
 
+        // `dest` was just removed/recreated above, so every member here is
+        // new -- charge each unconditionally (O(1) per member, no full
+        // recompute of the destination sorted set).
+        let mut mem_charge: usize = 0;
         for (member, score) in result_map {
+            mem_charge += zset_member_cost(&member);
             zadd_member(members, scores, member, score);
         }
+        // `members`/`scores`' borrow of `db` ends above.
+        db.charge_memory(mem_charge);
     }
 
     Frame::Integer(result_size)
@@ -661,9 +700,14 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(pair) => pair,
             Err(e) => return e,
         };
+        // `dst` was just removed/recreated above, so every entry is new.
+        let mut mem_charge: usize = 0;
         for (member, score) in entries {
+            mem_charge += zset_member_cost(&member);
             zadd_member(dst_members, dst_scores, member, score);
         }
+        // `dst_members`/`dst_scores`' borrow of `db` ends above.
+        db.charge_memory(mem_charge);
     }
 
     Frame::Integer(count)
@@ -764,6 +808,7 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         };
 
         let mut popped = Vec::with_capacity(pop_count);
+        let mut credit: usize = 0;
         for _ in 0..pop_count {
             let entry = if is_min {
                 scores.iter().next().map(|(s, m)| (s, m.clone()))
@@ -774,6 +819,7 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
                 Some((score, member)) => {
                     scores.remove(score, &member);
                     members.remove(&member);
+                    credit += zset_member_cost(&member);
                     popped.push(Frame::Array(framevec![
                         Frame::BulkString(member),
                         Frame::BulkString(format_score_bytes(score.0)),
@@ -782,8 +828,11 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
                 None => break,
             }
         }
+        let is_empty = members.is_empty();
+        // `members`/`scores`' borrow of `db` ends above.
+        db.credit_memory(credit);
 
-        if members.is_empty() {
+        if is_empty {
             db.remove(key);
         }
 

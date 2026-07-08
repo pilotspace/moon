@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, list_elem_cost};
 
 use super::{parse_i64, resolve_index};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
@@ -32,6 +32,8 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
     if !has_large_element {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
+                // Listpack `estimate_memory()` is O(1) (capacity-based).
+                let before = lp.estimate_memory();
                 for arg in &args[1..] {
                     let val = match extract_bytes(arg) {
                         Some(v) => v,
@@ -40,8 +42,21 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
                     lp.push_front(val);
                 }
                 let len = lp.len();
-                if len > LISTPACK_MAX_ENTRIES {
-                    db.upgrade_list_listpack_to_list(key);
+                let after = lp.estimate_memory();
+                let should_upgrade = len > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
+                if should_upgrade {
+                    // One-time cost-model swing (listpack -> List) — see the
+                    // matching comment in hash_write.rs's hset.
+                    let list = db.upgrade_list_listpack_to_list(key);
+                    let new_cost: usize = list.iter().map(|e| list_elem_cost(e)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
                 }
                 return Frame::Integer(len as i64);
             }
@@ -54,14 +69,19 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(l) => l,
         Err(e) => return e,
     };
+    let mut mem_delta: usize = 0;
     for arg in &args[1..] {
         let val = match extract_bytes(arg) {
             Some(v) => v.clone(),
             None => return err_wrong_args("LPUSH"),
         };
+        mem_delta += list_elem_cost(&val);
         list.push_front(val);
     }
-    Frame::Integer(list.len() as i64)
+    let len = list.len() as i64;
+    // `list`'s borrow of `db` ends above.
+    db.charge_memory(mem_delta);
+    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +107,7 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
     if !has_large_element {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
+                let before = lp.estimate_memory();
                 for arg in &args[1..] {
                     let val = match extract_bytes(arg) {
                         Some(v) => v,
@@ -95,8 +116,19 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
                     lp.push_back(val);
                 }
                 let len = lp.len();
-                if len > LISTPACK_MAX_ENTRIES {
-                    db.upgrade_list_listpack_to_list(key);
+                let after = lp.estimate_memory();
+                let should_upgrade = len > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
+                if should_upgrade {
+                    let list = db.upgrade_list_listpack_to_list(key);
+                    let new_cost: usize = list.iter().map(|e| list_elem_cost(e)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
                 }
                 return Frame::Integer(len as i64);
             }
@@ -109,14 +141,19 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(l) => l,
         Err(e) => return e,
     };
+    let mut mem_delta: usize = 0;
     for arg in &args[1..] {
         let val = match extract_bytes(arg) {
             Some(v) => v.clone(),
             None => return err_wrong_args("RPUSH"),
         };
+        mem_delta += list_elem_cost(&val);
         list.push_back(val);
     }
-    Frame::Integer(list.len() as i64)
+    let len = list.len() as i64;
+    // `list`'s borrow of `db` ends above.
+    db.charge_memory(mem_delta);
+    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -169,11 +206,15 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
+    let mut credit: usize = 0;
     let result = match count {
         None => {
             // Single pop
             match list.pop_front() {
-                Some(v) => Frame::BulkString(v),
+                Some(v) => {
+                    credit = list_elem_cost(&v);
+                    Frame::BulkString(v)
+                }
                 None => Frame::Null,
             }
         }
@@ -182,14 +223,19 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
             let mut items = Vec::with_capacity(actual);
             for _ in 0..actual {
                 if let Some(v) = list.pop_front() {
+                    credit += list_elem_cost(&v);
                     items.push(Frame::BulkString(v));
                 }
             }
             Frame::Array(items.into())
         }
     };
+    // `list`'s borrow of `db` ends above.
+    db.credit_memory(credit);
 
-    // If list is now empty, remove the key
+    // If list is now empty, remove the key (this credits the container's
+    // fixed key/struct overhead — the popped elements were already credited
+    // above, so there is no double count).
     if db
         .get_list(&key)
         .ok()
@@ -251,9 +297,13 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
+    let mut credit: usize = 0;
     let result = match count {
         None => match list.pop_back() {
-            Some(v) => Frame::BulkString(v),
+            Some(v) => {
+                credit = list_elem_cost(&v);
+                Frame::BulkString(v)
+            }
             None => Frame::Null,
         },
         Some(c) => {
@@ -261,12 +311,15 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
             let mut items = Vec::with_capacity(actual);
             for _ in 0..actual {
                 if let Some(v) = list.pop_back() {
+                    credit += list_elem_cost(&v);
                     items.push(Frame::BulkString(v));
                 }
             }
             Frame::Array(items.into())
         }
     };
+    // `list`'s borrow of `db` ends above.
+    db.credit_memory(credit);
 
     if db
         .get_list(&key)
@@ -317,7 +370,16 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
 
     match resolve_index(index, list.len()) {
         Some(i) => {
+            let old_cost = list_elem_cost(&list[i]) as i64;
+            let new_cost = list_elem_cost(&element) as i64;
             list[i] = element;
+            // `list`'s borrow of `db` ends above.
+            let delta = new_cost - old_cost;
+            if delta >= 0 {
+                db.charge_memory(delta as usize);
+            } else {
+                db.credit_memory((-delta) as usize);
+            }
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
         None => Frame::Error(Bytes::from_static(b"ERR index out of range")),
@@ -376,8 +438,12 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         None => Frame::Integer(-1),
         Some(idx) => {
             let insert_at = if before { idx } else { idx + 1 };
+            let cost = list_elem_cost(&element);
             list.insert(insert_at, element);
-            Frame::Integer(list.len() as i64)
+            let len = list.len() as i64;
+            // `list`'s borrow of `db` ends above.
+            db.charge_memory(cost);
+            Frame::Integer(len)
         }
     }
 }
@@ -449,8 +515,16 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
 
+    let is_empty = list.is_empty();
+    // `list`'s borrow of `db` ends above. Every removed element compared equal
+    // to `element` (LREM semantics), so a single per-element cost applies to
+    // all of them — O(1), no need to track each removed value individually.
+    if removed > 0 {
+        db.credit_memory(removed as usize * list_elem_cost(&element));
+    }
+
     // If list is now empty, remove the key
-    if list.is_empty() {
+    if is_empty {
         db.remove(&key);
     }
 
@@ -509,8 +583,11 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         e = len - 1;
     }
 
+    let mut credit: usize = 0;
     if s > e || s >= len {
-        // Empty range -- clear the list
+        // Empty range -- clear the list. Credit every dropped element's cost
+        // (proportional to what's removed, same as the drain paths below).
+        credit = list.iter().map(|v| list_elem_cost(v)).sum();
         list.clear();
     } else {
         // Keep only [s..=e]
@@ -518,14 +595,20 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         let e = e as usize;
         // Drain from the back first, then from the front
         if e + 1 < list.len() {
-            list.drain(e + 1..);
+            credit += list
+                .drain(e + 1..)
+                .map(|v| list_elem_cost(&v))
+                .sum::<usize>();
         }
         if s > 0 {
-            list.drain(..s);
+            credit += list.drain(..s).map(|v| list_elem_cost(&v)).sum::<usize>();
         }
     }
+    let is_empty = list.is_empty();
+    // `list`'s borrow of `db` ends above.
+    db.credit_memory(credit);
 
-    if list.is_empty() {
+    if is_empty {
         db.remove(&key);
     }
 
@@ -633,14 +716,19 @@ pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(l) => l,
         Err(e) => return e,
     };
+    let mut mem_delta: usize = 0;
     for arg in &args[1..] {
         let val = match extract_bytes(arg) {
             Some(v) => v.clone(),
             None => return err_wrong_args("LPUSHX"),
         };
+        mem_delta += list_elem_cost(&val);
         list.push_front(val);
     }
-    Frame::Integer(list.len() as i64)
+    let len = list.len() as i64;
+    // `list`'s borrow of `db` ends above.
+    db.charge_memory(mem_delta);
+    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -668,14 +756,19 @@ pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(l) => l,
         Err(e) => return e,
     };
+    let mut mem_delta: usize = 0;
     for arg in &args[1..] {
         let val = match extract_bytes(arg) {
             Some(v) => v.clone(),
             None => return err_wrong_args("RPUSHX"),
         };
+        mem_delta += list_elem_cost(&val);
         list.push_back(val);
     }
-    Frame::Integer(list.len() as i64)
+    let len = list.len() as i64;
+    // `list`'s borrow of `db` ends above.
+    db.charge_memory(mem_delta);
+    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +847,7 @@ pub fn lmpop(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
         let mut elems = Vec::with_capacity(n);
+        let mut credit: usize = 0;
         for _ in 0..n {
             let val = if left {
                 list.pop_front()
@@ -761,12 +855,18 @@ pub fn lmpop(db: &mut Database, args: &[Frame]) -> Frame {
                 list.pop_back()
             };
             match val {
-                Some(v) => elems.push(Frame::BulkString(v)),
+                Some(v) => {
+                    credit += list_elem_cost(&v);
+                    elems.push(Frame::BulkString(v));
+                }
                 None => break,
             }
         }
+        let is_empty = list.is_empty();
+        // `list`'s borrow of `db` ends above.
+        db.credit_memory(credit);
 
-        if list.is_empty() {
+        if is_empty {
             db.remove(&key);
         }
 
