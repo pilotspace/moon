@@ -162,28 +162,47 @@ if a guarantee isn't listed here, don't assume it holds.
   bridge's gate, which already had this term). Covered by
   `test_quota_rejects_non_inline_writes_without_spill_sender` in
   `tests/db_maxmemory_quota.rs`.
-- **Pre-existing, independent, systemic gap: container-type memory
-  accounting doesn't track growth after key creation.** `used_memory` is
-  charged once, at key-creation time, for an empty container's fixed
-  overhead (`entry_overhead()` in `src/storage/db.rs`, called immediately
-  after `Entry::new_hash()`/equivalent, before any fields/elements are
-  inserted). Every subsequent mutation of that SAME key — `HSET`'s
-  `map.insert(field, value)`, and the equivalent direct-collection-mutation
-  pattern in List/Set/ZSet write commands — never updates `used_memory`
-  again. Growing one hash key's fields therefore never grows its accounted
-  memory, no matter how large the values are. **This defeats the global
-  `--maxmemory` gate identically** (verified empirically: repeated HSETs
-  into one key never tripped a small `--maxmemory` cap) — it is NOT a
-  db-quota-specific bug, predates this feature, and is orthogonal to it.
-  Fixing it properly means auditing and patching every container-type
-  mutation site for delta-tracking (a much larger body of work than
-  per-db quotas), so it is documented here rather than fixed. Operators
-  relying on `--maxmemory` or `--db-maxmemory` to bound memory should be
-  aware that **workloads dominated by growing existing Hash/List/Set/ZSet
-  keys are effectively invisible to both eviction gates** — only new-key
-  creation and plain string SET/APPEND are accurately accounted today. The
-  `db-quota` regression test above works around this by using a fresh
-  key per HSET rather than growing one shared key's fields.
+- **Container-growth memory accounting gap (WS6, fixed)**: `used_memory`
+  used to be charged once, at key-creation time, for an empty container's
+  fixed overhead (`entry_overhead()` in `src/storage/db.rs`, called
+  immediately after `Entry::new_hash()`/equivalent, before any
+  fields/elements were inserted). Every subsequent mutation of that SAME
+  key — `HSET`'s `map.insert(field, value)`, and the equivalent
+  direct-collection-mutation pattern in List/Set/ZSet write commands —
+  never updated `used_memory` again, so growing one hash key's fields
+  never grew its accounted memory, defeating both the global
+  `--maxmemory` gate and the per-db quota above identically. Fixed via
+  O(1) per-mutation delta accounting (`Database::charge_memory` /
+  `credit_memory`, plus per-container byte-cost helpers
+  `hash_field_cost`/`list_elem_cost`/`set_member_cost`/`zset_member_cost`
+  next to `entry_overhead` in `src/storage/db.rs`) rather than a full
+  recompute per command — recomputing `RedisValue::estimate_memory()` on
+  every mutation would turn an O(1) HSET into O(n) on a large hash. The
+  listpack/intset compact encodings use before/after `estimate_memory()`
+  snapshots instead (already O(1) there — capacity-based). Covered by
+  `tests/container_growth_memory_accounting.rs` (HSET/LPUSH growth trips
+  `--maxmemory`; HDEL correctly credits deleted fields back) plus unit
+  tests in each container command family's `mod.rs`. The eviction loop's
+  before/after `estimated_memory()` delta arithmetic needed no changes —
+  it was already reading the (now-correct) live accumulator.
+  - **Known follow-up, NOT fixed here**: `run_write_eviction_gate`
+    (`src/server/conn/handler_monoio/mod.rs`) applies the same
+    over-budget pre-check to every write command uniformly, including
+    pure-shrink ones (`HDEL`/`SREM`/`LREM`/`ZREM`/...). Unlike Redis's
+    `CMD_DENYOOM` classification — which explicitly exempts
+    memory-freeing commands so an operator can recover from an OOM state
+    without `FLUSHALL`/restart — moon has no such classification today.
+    Once a key's growth (now correctly visible) trips `noeviction`
+    `--maxmemory`, an `HDEL` on that SAME key is *also* rejected, even
+    though it would only shrink it. This was unreachable before WS6 (the
+    accounting bug meant growth-triggered OOM on a single key essentially
+    never happened), so the container-growth fix makes this pre-existing
+    gate-classification gap newly observable. Reproduced manually
+    (grow a hash to the `noeviction` boundary, then `HDEL` a field on it —
+    also rejected) and worked around in the credit-on-delete test by
+    staying under budget throughout rather than draining from an
+    already-OOM'd key. Recommend a `CommandFlags::DENYOOM`-equivalent
+    (or an explicit allow-list) as separate follow-up work.
 
 ## FT.* / vector indexes and workspaces (handoff note — WS5a scope)
 

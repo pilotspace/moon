@@ -356,6 +356,67 @@ reduction. Round 2 fixes the actual memory problem:
   `src/vector/persistence/warm_search.rs` unit tests cover the sidecar
   round-trip and the corrected MVCC entry parsing.
 
+### Fixed — WS6: container-growth memory accounting gap (HSET/LPUSH/SADD/ZADD... growth was invisible to `--maxmemory`)
+
+- **Critical**: `used_memory` was charged once at key-creation time for an
+  EMPTY Hash/List/Set/ZSet container (`entry_overhead()` in
+  `src/storage/db.rs`, called from `get_or_create_hash`/`_list`/`_set`/
+  `_sorted_set`), then a raw `&mut` reference into the map/deque/set/tree
+  was handed to the command layer. Every subsequent mutation through that
+  reference — `HSET` adding fields, `LPUSH` growing the deque, `SADD`/
+  `ZADD` growing the set/sorted-set, and their listpack/intset compact-
+  encoding equivalents — never updated `used_memory` again, so growing a
+  SINGLE key's contents was invisible to both the global `--maxmemory`
+  gate and the per-db quotas (WS5b). Confirmed by adversarial review
+  2026-07-08 (flagged as a known limitation in `docs/guides/isolation.md`
+  at the time).
+- Fixed via O(1) per-mutation delta accounting rather than a full
+  recompute: `RedisValue::estimate_memory()` sums over every element for
+  the expanded Hash/List/Set/SortedSetBPTree encodings, so recomputing it
+  on every single-field HSET on a large hash would turn an O(1) command
+  into O(n). New `Database::charge_memory`/`credit_memory`/`adjust_memory`
+  (O(1), saturating) plus per-container byte-cost helpers next to
+  `entry_overhead` (`hash_field_cost`, `list_elem_cost`, `set_member_cost`,
+  `zset_member_cost`) that mirror `RedisValue::estimate_memory`'s
+  per-variant formulas exactly. The listpack/intset COMPACT encodings are
+  the exception — their `estimate_memory()` is already O(1)
+  (capacity-based), so those call sites snapshot before/after instead.
+- Every hash/list/set/zset mutation site instrumented: `HSET`/`HMSET`/
+  `HINCRBY`/`HINCRBYFLOAT`/`HSETNX`/`HDEL`/`HGETDEL`/`HEXPIRE`-family
+  past-expiry delete (`src/command/hash/hash_write.rs`,
+  `src/storage/db.rs`); `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LSET`/`LINSERT`/
+  `LREM`/`LTRIM`/`LMOVE`/`LPUSHX`/`RPUSHX`/`LMPOP`
+  (`src/command/list/list_write.rs`, `src/storage/db.rs`'s
+  `list_push_front`/`_back`/`list_pop_front`/`_back`); `SADD` (intset +
+  HashSet paths)/`SREM`/`SPOP`/`SMOVE` (`*STORE` variants were already
+  correct — they replace the whole entry via `Database::set`, which
+  already accounted correctly); `ZADD`/`ZREM`/`ZINCRBY`/`ZPOPMIN`/
+  `ZPOPMAX`/`ZMPOP`/`ZUNIONSTORE`/`ZINTERSTORE`/`ZRANGESTORE`
+  (`src/command/sorted_set/sorted_set_write.rs`). Whole-key removal paths
+  (`Database::remove`/`Database::set`) needed no changes — they already
+  recompute `entry_overhead` on the final (already-mutated) entry, an O(n)
+  cost paid once per key lifetime, not per mutation, so they correctly
+  credit a grown container's true size when it's fully removed or
+  replaced.
+- The eviction loop's before/after `estimated_memory()` delta arithmetic
+  (`src/storage/eviction.rs`) required no code changes — it already reads
+  the (now-correct) live `used_memory` accumulator.
+- RED/GREEN: `tests/container_growth_memory_accounting.rs` (growing one
+  HSET/LPUSH key past `--maxmemory` under `noeviction` now rejects further
+  writes; draining a grown hash via `HDEL` correctly credits the freed
+  bytes back). Unit tests per container family (hash/list/set/zset
+  `mod.rs`) assert `estimated_memory()` rises/falls with insert/remove/
+  overwrite, including a same-length overwrite netting a zero delta.
+- **Known follow-up, NOT fixed here**: `run_write_eviction_gate`
+  (`src/server/conn/handler_monoio/mod.rs`) gates every write command
+  uniformly, including pure-shrink ones (`HDEL`/`SREM`/`LREM`/`ZREM`/...).
+  Moon has no Redis-`CMD_DENYOOM`-equivalent classification exempting
+  memory-freeing commands, so once a key's (now correctly visible) growth
+  trips `noeviction` `--maxmemory`, an `HDEL` on that SAME key is also
+  rejected — unreachable before this fix (growth-triggered single-key OOM
+  essentially never happened), now newly observable. See
+  `docs/guides/isolation.md` for detail; recommend a dedicated follow-up.
+
 ### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
 
 - **`src/shard/{dispatch,spsc_handler,coordinator}.rs`,
@@ -497,11 +558,10 @@ reduction. Round 2 fixes the actual memory problem:
   `used_memory`. This defeats the *global* `--maxmemory` gate identically
   (verified: growing one hash key's fields never trips a small
   `--maxmemory` cap regardless of value size), so it predates and is
-  independent of db-quota. Out of scope to fix here (touches every
-  container-type mutation site, a much larger body of work); documented as
-  a known limitation. The new regression test works around it by using a
-  fresh key per HSET (each key's flat creation overhead is tracked
-  correctly) rather than growing one shared key's fields.
+  independent of db-quota. At the time this was out of scope to fix here
+  (touches every container-type mutation site, a much larger body of work)
+  and was documented as a known limitation; **now fixed** — see "WS6:
+  container-growth memory accounting gap" above.
 - `--db-maxmemory` CLI parsing now fails fast at startup (`REFUSING TO
   START:` + nonzero exit, matching this file's existing trusted-config
   validation convention) instead of silently warning and dropping a
