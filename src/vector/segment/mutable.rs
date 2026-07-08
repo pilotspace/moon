@@ -12,7 +12,9 @@ use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use crate::vector::distance;
+use crate::vector::distance::fastscan;
 use crate::vector::mvcc::visibility::is_visible;
+use crate::vector::segment::ivf::BLOCK_SIZE as FASTSCAN_BLOCK;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::{
     encode_tq_mse_a2, encode_tq_mse_scaled, encode_tq_mse_scaled_with_signs, padded_dimension,
@@ -90,6 +92,19 @@ pub struct BruteForceQuery {
     sq8_qi8: Vec<i8>,
     sq8_q_scale: f32,
     sq8_sum_qi8: i32,
+    /// FastScan pre-filter (TQ-ADC path only): quantized u8 LUT built once at
+    /// prepare (`padded_dim * 16` entries). Empty when the segment is too
+    /// small or the path doesn't apply — the chunk scan then runs the plain
+    /// per-candidate loop.
+    fs_lut: Vec<u8>,
+    /// 1/scale from `build_quantized_lut` (f32 distance reconstruction).
+    fs_inv_scale: f32,
+    /// Bias from `build_quantized_lut` (sum of per-coordinate minima).
+    fs_bias: f32,
+    /// Sound quantization error bound (`padded_dim / scale`, pre-norm²):
+    /// `|reconstructed - exact| <= fs_eps`, so `reconstructed - fs_eps` is a
+    /// true lower bound and the filter can never drop a real top-k candidate.
+    fs_eps: f32,
     /// Shared top-k accumulator across all chunks.
     heap: BinaryHeap<DistF32>,
 }
@@ -149,6 +164,12 @@ pub struct FrozenSegment {
 struct MutableSegmentInner {
     /// TQ-encoded codes for HNSW TQ-ADC traversal.
     tq_codes: Vec<u8>,
+    /// FastScan shadow of the nibble-packed TQ codes in FAISS-interleaved
+    /// 32-vector blocks (`block[d * 32 + lane]`, zero-padded lanes). Written
+    /// at append time for scalar-codebook TQ4 collections (empty for SQ8/A2);
+    /// lets the MVCC brute-force scan batch 32 candidates per SIMD LUT pass.
+    /// Costs padded_dim/2 bytes per vector on top of `tq_codes`.
+    fs_blocks: Vec<u8>,
     /// QJL sign bits per vector — for TurboQuant_prod unbiased IP scoring.
     /// Zero-filled at insert time; recomputed from raw_f32 during freeze().
     qjl_signs: Vec<u8>,
@@ -230,6 +251,53 @@ fn encode_sq8_slot(vector_f32: &[f32], metric: DistanceMetric, dim: usize) -> (V
     (codes, raw_norm)
 }
 
+/// Minimum entry count before the FastScan pre-filter engages. Below this,
+/// the ~2-8µs per-query LUT build costs more than the plain scan saves.
+const FASTSCAN_MIN_ENTRIES: usize = 64;
+
+/// Mirror one vector's nibble-packed TQ code into the FastScan shadow blocks.
+///
+/// `internal_id` must be the next sequential id (append-only invariant): a new
+/// zero-filled block is grown whenever a block boundary is crossed, so lanes
+/// past the current count stay zero (FastScan scans full blocks; out-of-range
+/// lanes are skipped by position, never by content).
+fn push_fastscan_shadow(fs_blocks: &mut Vec<u8>, internal_id: usize, code: &[u8]) {
+    let dim_half = code.len();
+    let block_bytes = dim_half * FASTSCAN_BLOCK;
+    if internal_id % FASTSCAN_BLOCK == 0 {
+        fs_blocks.resize(fs_blocks.len() + block_bytes, 0);
+    }
+    let block_base = (internal_id / FASTSCAN_BLOCK) * block_bytes;
+    let lane = internal_id % FASTSCAN_BLOCK;
+    for (d, &b) in code.iter().enumerate() {
+        fs_blocks[block_base + d * FASTSCAN_BLOCK + lane] = b;
+    }
+}
+
+impl MutableSegmentInner {
+    /// Single shadow-maintenance gate shared by every TQ-code writer
+    /// (`append` + `append_transactional`): mirrors the nibble code into
+    /// `fs_blocks` for scalar-codebook TQ4 and accounts the extra bytes.
+    /// Keeping this in ONE place is what guarantees `fs_blocks` can never
+    /// desync from `tq_codes` when a new insertion path is added.
+    fn maintain_fastscan_shadow(&mut self, internal_id: u32, code: &[u8], is_a2: bool) {
+        if !is_a2 && code.len() * 2 == self.padded_dimension as usize {
+            push_fastscan_shadow(&mut self.fs_blocks, internal_id as usize, code);
+            self.byte_size += code.len();
+        }
+    }
+
+    /// O(1) structural check that the shadow covers exactly the blocks needed
+    /// for `entries.len()` vectors. Used as the FastScan gate: a mismatch
+    /// (e.g. a future writer that misses the shadow) falls back to the plain
+    /// scan instead of scanning stale/garbage lanes.
+    #[inline]
+    fn fastscan_shadow_consistent(&self, code_len: usize) -> bool {
+        let expected = self.entries.len().div_ceil(FASTSCAN_BLOCK) * code_len * FASTSCAN_BLOCK;
+        !self.fs_blocks.is_empty() && self.fs_blocks.len() == expected
+    }
+}
+
 /// Append-only flat buffer with TQ-ADC brute-force search.
 pub struct MutableSegment {
     inner: RwLock<MutableSegmentInner>,
@@ -254,6 +322,7 @@ impl MutableSegment {
         Self {
             inner: RwLock::new(MutableSegmentInner {
                 tq_codes: Vec::new(),
+                fs_blocks: Vec::new(),
                 qjl_signs: Vec::new(),
                 residual_norms: Vec::new(),
                 raw_f32: Vec::new(),
@@ -363,6 +432,10 @@ impl MutableSegment {
         // Append packed code + norm to TQ buffer
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
+
+        // FastScan shadow: scalar-codebook TQ4 only (A2 never scans via ADC).
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        inner.maintain_fastscan_shadow(internal_id, &code.codes, is_a2);
 
         // Append sub-centroid signs (Light mode TQ4 only)
         if let Some(signs) = sub_signs {
@@ -741,6 +814,26 @@ impl MutableSegment {
             } else {
                 (Vec::new(), 0.0, 0)
             };
+        // FastScan pre-filter LUT (TQ-ADC path only): one per-query build,
+        // gated on segment size so tiny segments skip the fixed LUT cost.
+        // `use_tq_adc` already excludes SQ8 and A2 (the paths without a
+        // scalar 16-centroid codebook / interleaved shadow).
+        let (fs_lut, fs_inv_scale, fs_bias, fs_eps) =
+            if use_tq_adc && self.inner.read().entries.len() >= FASTSCAN_MIN_ENTRIES {
+                let centroids = self.collection.codebook_16();
+                let mut lut = vec![0u8; prepared.len() * 16];
+                let params = fastscan::build_quantized_lut(&prepared, centroids, &mut lut);
+                // Round-to-nearest quantization: each of the padded_dim LUT entries
+                // carries at most 0.5 quanta of error, so 0.5·padded_dim/scale is a
+                // sound accumulated bound (kernel saturation only *under*-estimates,
+                // which routes the candidate to the exact rescore anyway). The 1e-3
+                // headroom covers f32 accumulation order differences.
+                let eps = 0.5 * prepared.len() as f32 / params.scale * 1.001;
+                (lut, 1.0 / params.scale, params.bias, eps)
+            } else {
+                (Vec::new(), 0.0, 0.0, 0.0)
+            };
+
         BruteForceQuery {
             prepared,
             use_tq_adc,
@@ -749,6 +842,10 @@ impl MutableSegment {
             sq8_qi8,
             sq8_q_scale,
             sq8_sum_qi8,
+            fs_lut,
+            fs_inv_scale,
+            fs_bias,
+            fs_eps,
             heap: BinaryHeap::with_capacity(k + 1),
         }
     }
@@ -849,6 +946,94 @@ impl MutableSegment {
 
         let use_tq_adc = q.use_tq_adc;
         let q_rotated = q.prepared.as_slice();
+
+        // FastScan-filtered scan: batch 32 candidates per SIMD LUT pass, then
+        // exact-rescore only candidates whose sound lower bound
+        // `(approx - eps) * norm²` beats the current heap worst. Every pushed
+        // distance is still the exact `tq_l2_adc_scaled` value, so results are
+        // identical to the plain loop below — the filter only skips candidates
+        // that provably cannot enter the top-k.
+        // The shadow-consistency gate is the safety net: if a future writer
+        // ever misses `maintain_fastscan_shadow`, the O(1) length check fails
+        // and the scan falls back to the plain loop instead of reading
+        // stale/garbage lanes. Note: a `[lo,hi)` chunk that splits a 32-block
+        // re-scans that block's SIMD pass on the next chunk (out-of-range
+        // lanes are skipped by position) — the default yield chunking is
+        // 32-aligned, so this costs at most one duplicate block per
+        // operator-tuned unaligned boundary.
+        let use_fastscan = use_tq_adc
+            && !q.fs_lut.is_empty()
+            && code_len * 2 == q.prepared.len()
+            && inner.fastscan_shadow_consistent(code_len);
+        if use_fastscan {
+            let scan = fastscan::fastscan_dispatch().scan_block;
+            let fs_lut = q.fs_lut.as_slice();
+            let (inv_scale, bias, eps) = (q.fs_inv_scale, q.fs_bias, q.fs_eps);
+            let heap = &mut q.heap;
+            let block_bytes = code_len * FASTSCAN_BLOCK;
+            let mut block_dists = [0u16; 32];
+
+            let mut block = lo / FASTSCAN_BLOCK;
+            while block * FASTSCAN_BLOCK < hi {
+                let vec_start = block * FASTSCAN_BLOCK;
+                let base = block * block_bytes;
+                scan(
+                    &inner.fs_blocks[base..base + block_bytes],
+                    fs_lut,
+                    code_len,
+                    &mut block_dists,
+                );
+
+                let lane_lo = lo.saturating_sub(vec_start);
+                let lane_hi = (hi - vec_start).min(FASTSCAN_BLOCK);
+                for lane in lane_lo..lane_hi {
+                    let entry = &inner.entries[vec_start + lane];
+                    if !is_visible(
+                        entry.insert_lsn,
+                        entry.delete_lsn,
+                        entry.txn_id,
+                        snapshot_lsn,
+                        my_txn_id,
+                        committed,
+                    ) {
+                        continue;
+                    }
+                    if let Some(bm) = allow_bitmap {
+                        let gid = inner.global_id_base + entry.internal_id;
+                        if !bm.contains(gid) {
+                            continue;
+                        }
+                    }
+                    let norm_sq = entry.norm * entry.norm;
+                    if heap.len() >= k {
+                        let lower = (block_dists[lane] as f32 * inv_scale + bias - eps) * norm_sq;
+                        if let Some(&DistF32(worst, _, _)) = heap.peek() {
+                            if lower >= worst {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let id = entry.internal_id as usize;
+                    let tq_offset = id * bytes_per_code;
+                    let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
+                    let dist = tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids);
+
+                    let global_id = inner.global_id_base + entry.internal_id;
+                    if heap.len() < k {
+                        heap.push(DistF32(dist, global_id, entry.key_hash));
+                    } else if let Some(&DistF32(worst, _, _)) = heap.peek() {
+                        if dist < worst {
+                            heap.pop();
+                            heap.push(DistF32(dist, global_id, entry.key_hash));
+                        }
+                    }
+                }
+                block += 1;
+            }
+            return;
+        }
+
         let heap = &mut q.heap;
 
         for entry in &inner.entries[lo..hi] {
@@ -976,6 +1161,10 @@ impl MutableSegment {
 
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
+
+        // FastScan shadow: scalar-codebook TQ4 only (shared gate with append()).
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        inner.maintain_fastscan_shadow(internal_id, &code.codes, is_a2);
 
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
@@ -1325,7 +1514,20 @@ impl MutableSegment {
             })
             .collect();
 
+        // ── FastScan shadow: rebuild (lanes rebase along with internal ids) ──
+        let fs_blocks = if inner.fs_blocks.is_empty() {
+            Vec::new()
+        } else {
+            let code_len = bpc - 4;
+            let mut fs = Vec::new();
+            for i in 0..count {
+                push_fastscan_shadow(&mut fs, i, &tq_codes[i * bpc..i * bpc + code_len]);
+            }
+            fs
+        };
+
         let byte_size = count * (bpc + std::mem::size_of::<MutableEntry>())
+            + fs_blocks.len()
             + count * sub_bpv
             + (if !qjl_signs.is_empty() {
                 count * qjl_bpv
@@ -1350,6 +1552,7 @@ impl MutableSegment {
 
         let new_inner = MutableSegmentInner {
             tq_codes,
+            fs_blocks,
             qjl_signs,
             residual_norms,
             raw_f32,
@@ -1582,6 +1785,154 @@ mod tests {
         }
         fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
         q_rot
+    }
+
+    #[test]
+    fn test_fastscan_shadow_matches_vector_major_codes() {
+        distance::init();
+        let dim = 32u32;
+        let col = make_collection(dim);
+        let seg = MutableSegment::new(dim, col);
+
+        // 70 vectors: 2 full blocks + 1 partial (6 lanes).
+        for i in 0..70u32 {
+            let v = make_f32_vector(dim as usize, 1000 + i);
+            seg.append(i as u64, &v, i as u64 + 1);
+        }
+
+        let inner = seg.inner.read();
+        let code_len = inner.bytes_per_code - 4;
+        assert_eq!(code_len * 2, inner.padded_dimension as usize);
+        let block_bytes = code_len * FASTSCAN_BLOCK;
+        assert_eq!(
+            inner.fs_blocks.len(),
+            3 * block_bytes,
+            "3 blocks for 70 entries"
+        );
+
+        for v in 0..70usize {
+            let code =
+                &inner.tq_codes[v * inner.bytes_per_code..v * inner.bytes_per_code + code_len];
+            let block_base = (v / FASTSCAN_BLOCK) * block_bytes;
+            let lane = v % FASTSCAN_BLOCK;
+            for (d, &byte) in code.iter().enumerate() {
+                assert_eq!(
+                    inner.fs_blocks[block_base + d * FASTSCAN_BLOCK + lane],
+                    byte,
+                    "shadow mismatch at vector {v}, sub-dim {d}"
+                );
+            }
+        }
+        // Padding lanes of the partial block must be zero.
+        let last_base = 2 * block_bytes;
+        for d in 0..code_len {
+            for lane in 6..FASTSCAN_BLOCK {
+                assert_eq!(
+                    inner.fs_blocks[last_base + d * FASTSCAN_BLOCK + lane],
+                    0,
+                    "padding lane {lane} must stay zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fastscan_filtered_scan_identical_to_plain_scan() {
+        distance::init();
+        let dim = 32u32;
+        let col = make_collection(dim);
+        let seg = MutableSegment::new(dim, col);
+
+        let n = 500u32;
+        for i in 0..n {
+            let v = make_f32_vector(dim as usize, 7000 + i);
+            seg.append(i as u64, &v, i as u64 + 1);
+        }
+
+        let committed = roaring::RoaringTreemap::new();
+        let query = make_f32_vector(dim as usize, 42);
+        let k = 10;
+        // Snapshot excludes the last 100 entries (insert_lsn > 400) and a
+        // bitmap filter drops every third id — exercises both skip paths
+        // inside the FastScan block loop.
+        let snapshot_lsn = 400u64;
+        let mut bitmap = RoaringBitmap::new();
+        for i in 0..n {
+            if i % 3 != 0 {
+                bitmap.insert(i);
+            }
+        }
+
+        // FastScan-filtered path (default: LUT built at prepare).
+        let mut q_fs = seg.prepare_brute_force_query(&query, false, k);
+        assert!(
+            !q_fs.fs_lut.is_empty(),
+            "FastScan LUT must engage above FASTSCAN_MIN_ENTRIES"
+        );
+        seg.brute_force_scan_mvcc_chunk(
+            &mut q_fs,
+            None,
+            k,
+            Some(&bitmap),
+            snapshot_lsn,
+            0,
+            &committed,
+            0,
+            n as usize,
+        );
+        let fs_results = q_fs.into_results();
+
+        // Plain path: identical query with the LUT cleared.
+        let mut q_plain = seg.prepare_brute_force_query(&query, false, k);
+        q_plain.fs_lut.clear();
+        seg.brute_force_scan_mvcc_chunk(
+            &mut q_plain,
+            None,
+            k,
+            Some(&bitmap),
+            snapshot_lsn,
+            0,
+            &committed,
+            0,
+            n as usize,
+        );
+        let plain_results = q_plain.into_results();
+
+        assert_eq!(fs_results.len(), plain_results.len());
+        assert_eq!(
+            fs_results.len(),
+            k,
+            "enough visible entries for a full top-k"
+        );
+        for (a, b) in fs_results.iter().zip(plain_results.iter()) {
+            assert_eq!(a.id, b.id, "FastScan filter changed the result set");
+            assert_eq!(a.distance, b.distance, "distances must be bit-identical");
+        }
+
+        // Chunked scan (yield-path shape) must also match: same query fed in
+        // 64-entry chunks.
+        let mut q_chunked = seg.prepare_brute_force_query(&query, false, k);
+        let mut start = 0usize;
+        while start < n as usize {
+            let end = (start + 64).min(n as usize);
+            seg.brute_force_scan_mvcc_chunk(
+                &mut q_chunked,
+                None,
+                k,
+                Some(&bitmap),
+                snapshot_lsn,
+                0,
+                &committed,
+                start,
+                end,
+            );
+            start = end;
+        }
+        let chunked_results = q_chunked.into_results();
+        for (a, b) in chunked_results.iter().zip(plain_results.iter()) {
+            assert_eq!(a.id, b.id, "chunked FastScan diverged");
+            assert_eq!(a.distance, b.distance);
+        }
     }
 
     #[test]

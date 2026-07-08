@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance::fastscan;
-use crate::vector::turbo_quant::codebook::CENTROIDS;
+use crate::vector::turbo_quant::codebook::scaled_centroids;
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::SearchResult;
 
@@ -140,51 +140,6 @@ pub fn interleave_posting_list(
     }
 }
 
-/// Maximum possible single-coordinate squared distance for LUT quantization.
-///
-/// Conservative bound: the largest FWHT coordinate for a unit vector is bounded,
-/// and the largest centroid is CENTROIDS[15]. We use a generous bound.
-const MAX_SINGLE_COORD_DIST_SQ: f32 = 0.03;
-
-/// Scale factor for quantizing float distances to u8.
-const LUT_SCALE: f32 = 240.0 / MAX_SINGLE_COORD_DIST_SQ;
-
-/// Quantize a single float squared distance to u8 [0, 255].
-#[inline]
-fn quantize_dist_to_u8(dist_sq: f32) -> u8 {
-    let scaled = dist_sq * LUT_SCALE;
-    if scaled >= 255.0 {
-        255
-    } else if scaled <= 0.0 {
-        0
-    } else {
-        scaled as u8
-    }
-}
-
-/// Precompute u8 distance LUT from a rotated query vector.
-///
-/// For each coordinate `coord` in `0..padded_dim`, produces 16 entries:
-/// `lut_out[coord * 16 + k] = quantize_dist_to_u8((q_rotated[coord] - CENTROIDS[k])^2)`
-///
-/// `lut_out` must have length >= `padded_dim * 16`.
-///
-/// No allocations. Caller provides output buffer.
-#[inline]
-pub fn precompute_lut(q_rotated: &[f32], lut_out: &mut [u8]) {
-    let padded_dim = q_rotated.len();
-    debug_assert!(lut_out.len() >= padded_dim * 16);
-
-    for coord in 0..padded_dim {
-        let q_val = q_rotated[coord];
-        let base = coord * 16;
-        for k in 0..16 {
-            let diff = q_val - CENTROIDS[k];
-            lut_out[base + k] = quantize_dist_to_u8(diff * diff);
-        }
-    }
-}
-
 /// An IVF segment: cluster centroids + posting lists of quantized vectors.
 pub struct IvfSegment {
     /// Flat array of cluster centroids: n_clusters * dimension floats.
@@ -201,6 +156,10 @@ pub struct IvfSegment {
     padded_dim: u32,
     /// FWHT sign flips used to rotate queries before LUT precomputation.
     sign_flips: AlignedBuffer<f32>,
+    /// Dimension-scaled 16-centroid codebook for LUT construction.
+    /// MUST match the codebook used to encode the stored TQ codes
+    /// (`scaled_centroids(padded_dim)`, codebook v2).
+    lut_centroids: [f32; 16],
 }
 
 impl IvfSegment {
@@ -213,14 +172,16 @@ impl IvfSegment {
         dimension: u32,
         sign_flips: AlignedBuffer<f32>,
     ) -> Self {
+        let padded_dim = padded_dimension(dimension);
         Self {
             centroids,
             posting_lists,
             n_clusters,
             quantization,
             dimension,
-            padded_dim: padded_dimension(dimension),
+            padded_dim,
             sign_flips,
+            lut_centroids: scaled_centroids(padded_dim),
         }
     }
 
@@ -288,8 +249,9 @@ impl IvfSegment {
         nprobe: usize,
         lut_buf: &mut [u8],
     ) -> SmallVec<[SearchResult; 32]> {
-        // Precompute u8 distance LUT from rotated query.
-        precompute_lut(q_rotated, lut_buf);
+        // Build the quantized u8 distance LUT from the rotated query using the
+        // same dimension-scaled codebook the stored codes were encoded with.
+        let lut_params = fastscan::build_quantized_lut(q_rotated, &self.lut_centroids, lut_buf);
 
         let dim = self.dimension as usize;
         let pdim = self.padded_dim as usize;
@@ -314,6 +276,7 @@ impl IvfSegment {
             fastscan::scan_posting_list(
                 pl.codes.as_slice(),
                 lut_buf,
+                lut_params,
                 dim_half,
                 &pl.ids,
                 &pl.norms,
@@ -726,42 +689,45 @@ mod tests {
     }
 
     #[test]
-    fn test_precompute_lut_known_query() {
-        // Query: all zeros -> distance to each centroid k = CENTROIDS[k]^2
-        let padded_dim = 4;
-        let q = vec![0.0f32; padded_dim];
-        let mut lut = vec![0u8; padded_dim * 16];
-        precompute_lut(&q, &mut lut);
+    fn test_build_quantized_lut_known_query() {
+        // Query: all zeros -> distance to each centroid k = centroids[k]^2.
+        // The per-coordinate minimum (centroids 7/8, nearest to zero) must map
+        // to LUT entry 0; farther centroids must be monotonically larger.
+        let padded_dim = 4u32;
+        let centroids = scaled_centroids(padded_dim);
+        let q = vec![0.0f32; padded_dim as usize];
+        let mut lut = vec![0u8; padded_dim as usize * 16];
+        let params = fastscan::build_quantized_lut(&q, &centroids, &mut lut);
 
-        // For each coord (all zero), LUT entry k = quantize(CENTROIDS[k]^2)
-        for coord in 0..padded_dim {
-            for k in 0..16 {
-                let expected_dist = CENTROIDS[k] * CENTROIDS[k];
-                let expected_u8 = quantize_dist_to_u8(expected_dist);
-                assert_eq!(
-                    lut[coord * 16 + k],
-                    expected_u8,
-                    "LUT mismatch at coord={coord}, k={k}: dist={expected_dist}"
-                );
+        assert!(params.scale > 0.0);
+        // bias = sum of per-coord minima = padded_dim * centroids[8]^2 (nearest).
+        let expected_bias = padded_dim as f32 * centroids[8] * centroids[8];
+        assert!((params.bias - expected_bias).abs() < 1e-6);
+
+        for coord in 0..padded_dim as usize {
+            // Nearest centroids (7/8) -> residual 0.
+            assert_eq!(lut[coord * 16 + 7], lut[coord * 16 + 8]);
+            assert_eq!(lut[coord * 16 + 8], 0, "nearest centroid must map to 0");
+            // Monotonically increasing away from center.
+            for k in 8..15 {
+                assert!(lut[coord * 16 + k] <= lut[coord * 16 + k + 1]);
             }
-            // Centroid 7 and 8 are near zero, should have smallest distances
-            #[allow(clippy::identity_op)]
-            {
-                assert!(lut[coord * 16 + 7] <= lut[coord * 16 + 0]);
-            }
-            assert!(lut[coord * 16 + 8] <= lut[coord * 16 + 15]);
+            // Farthest centroid must hit the top of the u8 range (scale is
+            // chosen as 255/max_range here since padded_dim is tiny).
+            assert_eq!(lut[coord * 16 + 15], 255);
         }
     }
 
     #[test]
-    fn test_precompute_lut_symmetry() {
-        // Query at zero: CENTROIDS are symmetric, so LUT[k] == LUT[15-k]
-        let padded_dim = 2;
-        let q = vec![0.0f32; padded_dim];
-        let mut lut = vec![0u8; padded_dim * 16];
-        precompute_lut(&q, &mut lut);
+    fn test_build_quantized_lut_symmetry() {
+        // Query at zero: centroids are symmetric, so LUT[k] == LUT[15-k].
+        let padded_dim = 2u32;
+        let centroids = scaled_centroids(padded_dim);
+        let q = vec![0.0f32; padded_dim as usize];
+        let mut lut = vec![0u8; padded_dim as usize * 16];
+        fastscan::build_quantized_lut(&q, &centroids, &mut lut);
 
-        for coord in 0..padded_dim {
+        for coord in 0..padded_dim as usize {
             for k in 0..16 {
                 assert_eq!(
                     lut[coord * 16 + k],
@@ -825,18 +791,6 @@ mod tests {
         );
 
         assert_eq!(seg.total_vectors(), 30);
-    }
-
-    #[test]
-    fn test_quantize_dist_to_u8_range() {
-        // Zero distance -> 0
-        assert_eq!(quantize_dist_to_u8(0.0), 0);
-        // Max distance -> 240
-        assert_eq!(quantize_dist_to_u8(MAX_SINGLE_COORD_DIST_SQ), 240);
-        // Over max -> clamped to 255
-        assert_eq!(quantize_dist_to_u8(1.0), 255);
-        // Negative -> 0
-        assert_eq!(quantize_dist_to_u8(-0.1), 0);
     }
 
     // -----------------------------------------------------------------------
