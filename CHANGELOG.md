@@ -93,6 +93,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed.
 - Tests: profile expansion, explicit-flag-wins precedence, no-profile no-op,
   and unknown-profile error (`src/config.rs` `tests::test_profile_*`).
+### Added — WS1 command parity: `*_RO` variants + ACL LOG/CLIENT LIST/OBJECT HELP audit (PR #TBD)
+
+- **`BITFIELD_RO`, `SORT_RO`, `GEORADIUS_RO`, `GEORADIUSBYMEMBER_RO`**: new
+  read-only twins registered in the `phf` command registry with all three
+  dispatch paths wired (mutable `dispatch()`, immutable `dispatch_read()`,
+  and the `is_dispatch_read_supported()` fast-reject bucket list — a command
+  missing that last one is unreachable over the wire despite compiling and
+  passing unit tests). Each rejects its write-capable subcommand/option
+  (`SET`/`INCRBY`/`OVERFLOW` for BITFIELD_RO; `STORE` for SORT_RO;
+  `STORE`/`STOREDIST` for the GEORADIUS twins) via positional parsing (not a
+  blind token scan, so a `GET`/`BY` pattern value that happens to read
+  "STORE" is never misclassified).
+- **CLIENT LIST/INFO**: added the missing Redis fields (`laddr`, `multi-mem`,
+  `tot-net-in`/`tot-net-out`, `rbs`/`rbp`/`obl`/`oll`/`omem`, `events`,
+  `cmd`, `redir`, `resp`, `lib-name`, `lib-ver`) so key=value parsers no
+  longer choke on absent keys; `redir` and the tracking flag stay at their
+  "off" defaults; wiring them to the CLIENT TRACKING state shipped in PR #234
+  is a known follow-up.
+- **Audit findings**: `ACL LOG` (real entries + RESET) and `OBJECT HELP`
+  were already fully implemented — added regression tests to lock in that
+  coverage rather than re-implementing.
+- `docs/redis-compat.md` regenerated against `src/command/metadata.rs`
+  (258 commands): fixed stale claims that `WAIT` and `FUNCTION *` are
+  unimplemented (both are live), documented the four new `_RO` commands,
+  and added an explicit non-goals section for `PFDEBUG`, `PFSELFTEST`,
+  `FAILOVER`, `MODULE *`, `SENTINEL *` with one-line rationale each.
+- `scripts/test-consistency.sh` (+section 9b) and `scripts/test-commands.sh`
+  (key-commands category) gained coverage for all four new commands.
 
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
