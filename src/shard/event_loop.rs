@@ -911,12 +911,16 @@ impl super::Shard {
                         text_metas.len()
                     );
                     for meta in text_metas {
-                        let text_index = crate::text::store::TextIndex::new(
+                        let mut text_index = crate::text::store::TextIndex::new(
                             meta.name.clone(),
                             meta.key_prefixes.clone(),
                             meta.text_fields.clone(),
                             meta.bm25_config,
                         );
+                        // WS5a: carry the persisted db_index forward so a
+                        // restart doesn't silently re-home a restored text
+                        // index to db 0.
+                        text_index.db_index = meta.db_index;
                         if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
                             tracing::warn!(
                                 "Shard {}: failed to restore text index '{}': {}",

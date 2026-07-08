@@ -18,6 +18,20 @@
 //!     [weight: f64]
 //!     [flags: u8] — bit 0 = nostem, bit 1 = sortable, bit 2 = noindex
 //! ```
+//!
+//! ## Format v2 (current — WS5a db-scoped indexes)
+//!
+//! Extends v1 with a single `db_index: u8` byte appended after the v1
+//! per-index fields, mirroring `src/vector/index_persist.rs` format v4.
+//! v1 sidecars (written before db scoping existed) are read with
+//! `db_index = 0`.
+//!
+//! ```text
+//! [magic: 4B "TMIX"] [version: 2] [count: u16] [reserved: 1B]
+//! Per index:
+//!   ... (same as v1 fields) ...
+//!   [db_index: u8]   ← NEW in v2
+//! ```
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -27,7 +41,10 @@ use bytes::Bytes;
 use crate::text::types::{BM25Config, TextFieldDef};
 
 const MAGIC: &[u8; 4] = b"TMIX";
-const VERSION: u8 = 1;
+const VERSION_V1: u8 = 1;
+const VERSION_V2: u8 = 2;
+/// Default db_index used when reading v1 sidecars written before WS5a.
+const DEFAULT_DB_INDEX_ON_LOAD: u8 = 0;
 
 const FST_MAGIC: &[u8; 4] = b"TFST";
 const FST_VERSION: u8 = 1;
@@ -42,14 +59,17 @@ pub struct TextIndexMeta {
     pub bm25_config: BM25Config,
     pub key_prefixes: Vec<Bytes>,
     pub text_fields: Vec<TextFieldDef>,
+    /// Logical db this index belongs to (WS5a). Defaults to `0` for v1
+    /// sidecars and for callers not yet threading a real db_index.
+    pub db_index: u8,
 }
 
-/// Serialize text index metadata to bytes.
+/// Serialize text index metadata to bytes (current v2 format — WS5a db_index).
 pub fn serialize_text_index_metas(indexes: &[TextIndexMeta]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
     buf.extend_from_slice(MAGIC);
-    buf.push(VERSION);
+    buf.push(VERSION_V2);
     buf.extend_from_slice(&(indexes.len() as u16).to_le_bytes());
     buf.push(0); // reserved
 
@@ -78,12 +98,15 @@ pub fn serialize_text_index_metas(indexes: &[TextIndexMeta]) -> Vec<u8> {
             let flags: u8 = (f.nostem as u8) | ((f.sortable as u8) << 1) | ((f.noindex as u8) << 2);
             buf.push(flags);
         }
+
+        // v2 extension: db_index (1 byte)
+        buf.push(idx.db_index);
     }
 
     buf
 }
 
-/// Deserialize text index metadata from bytes.
+/// Deserialize text index metadata from bytes. Handles v1 and v2 formats.
 pub fn deserialize_text_index_metas(data: &[u8]) -> io::Result<Vec<TextIndexMeta>> {
     if data.len() < 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "too short"));
@@ -92,7 +115,7 @@ pub fn deserialize_text_index_metas(data: &[u8]) -> io::Result<Vec<TextIndexMeta
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let version = data[4];
-    if version != VERSION {
+    if version != VERSION_V1 && version != VERSION_V2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported text index version {version}"),
@@ -138,11 +161,19 @@ pub fn deserialize_text_index_metas(data: &[u8]) -> io::Result<Vec<TextIndexMeta
             });
         }
 
+        // v2 (WS5a): read db_index; v1 sidecars predate db scoping.
+        let db_index = if version >= VERSION_V2 {
+            read_u8(data, &mut cursor)?
+        } else {
+            DEFAULT_DB_INDEX_ON_LOAD
+        };
+
         metas.push(TextIndexMeta {
             name,
             bm25_config,
             key_prefixes,
             text_fields,
+            db_index,
         });
     }
 
@@ -375,6 +406,7 @@ mod tests {
                     noindex: flags & 0x04 != 0,
                 })
                 .collect(),
+            db_index: 0,
         }
     }
 
@@ -410,6 +442,35 @@ mod tests {
         assert_eq!(result[0].name, "article_idx");
         assert_eq!(result[1].name, "blog_idx");
         assert_eq!(result[1].text_fields.len(), 2);
+    }
+
+    /// WS5a (db-scoped indexes): v2 sidecar round-trips `db_index`.
+    #[test]
+    fn test_roundtrip_v2_db_index() {
+        let mut m1 = make_meta("idx1", "doc:", &[("body", 1.0, 0)]);
+        m1.db_index = 0;
+        let mut m2 = make_meta("idx2", "doc:", &[("body", 1.0, 0)]);
+        m2.db_index = 7;
+        let data = serialize_text_index_metas(&[m1, m2]);
+        assert_eq!(data[4], VERSION_V2);
+        let result = deserialize_text_index_metas(&data).expect("deserialize");
+        assert_eq!(result[0].db_index, 0);
+        assert_eq!(result[1].db_index, 7);
+    }
+
+    /// WS5a: a v1 sidecar (written before db_index existed) loads every
+    /// index as db 0.
+    #[test]
+    fn test_v1_sidecar_defaults_to_db_zero() {
+        let meta = make_meta("legacyidx", "doc:", &[("body", 1.0, 0)]);
+        // Hand-roll a v1 payload: same as v2 serializer output minus the
+        // trailing db_index byte.
+        let v2_data = serialize_text_index_metas(std::slice::from_ref(&meta));
+        let mut v1_data = v2_data[..v2_data.len() - 1].to_vec();
+        v1_data[4] = VERSION_V1;
+        let result = deserialize_text_index_metas(&v1_data).expect("deserialize v1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].db_index, 0);
     }
 
     #[test]
@@ -470,6 +531,7 @@ mod tests {
                     noindex: true,
                 },
             ],
+            db_index: 0,
         };
 
         let data = serialize_text_index_metas(&[meta]);
@@ -506,7 +568,7 @@ mod tests {
     fn test_magic_bytes() {
         let data = serialize_text_index_metas(&[]);
         assert_eq!(&data[0..4], b"TMIX");
-        assert_eq!(data[4], 1); // version
+        assert_eq!(data[4], VERSION_V2); // version (WS5a: now v2)
     }
 
     #[test]
@@ -533,6 +595,7 @@ mod tests {
                 Bytes::from_static(b"c:"),
             ],
             text_fields: vec![TextFieldDef::new(Bytes::from_static(b"content"))],
+            db_index: 0,
         };
 
         let data = serialize_text_index_metas(&[meta]);

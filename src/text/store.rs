@@ -141,6 +141,14 @@ pub struct TextIndex {
     #[cfg(feature = "text-index")]
     pub doc_numeric_entries:
         HashMap<u32, smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>>,
+
+    /// Logical database this index was created in (WS5a db-scoped indexes —
+    /// mirrors `IndexMeta::db_index` in `src/vector/store.rs`). Defaults to
+    /// `0`: `TextStore::create_index` does not yet receive the connection's
+    /// selected db (see `.planning/v0.6.0-release/WS5A-NOTES.md` gap
+    /// report), so every text index is currently tagged db 0 —
+    /// behavior-preserving with pre-WS5a global semantics.
+    pub db_index: u8,
 }
 
 impl TextIndex {
@@ -201,6 +209,7 @@ impl TextIndex {
             numeric_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
             doc_numeric_entries: HashMap::new(),
+            db_index: 0,
         }
     }
 
@@ -1485,6 +1494,7 @@ impl TextStore {
                 bm25_config: idx.bm25_config,
                 key_prefixes: idx.key_prefixes.clone(),
                 text_fields: idx.text_fields.clone(),
+                db_index: idx.db_index,
             })
             .collect()
     }
@@ -1502,6 +1512,8 @@ impl TextStore {
     }
 
     /// Drop a text index by name. Returns true if it existed.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::drop_index_for_db`].
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
         let removed = self.indexes.remove(name).is_some();
         if removed {
@@ -1512,16 +1524,49 @@ impl TextStore {
         removed
     }
 
+    /// Db-scoped variant of [`Self::drop_index`] (WS5a): refuses to drop an
+    /// index owned by a different db.
+    pub fn drop_index_for_db(&mut self, name: &[u8], db_index: u8) -> bool {
+        match self.indexes.get(name) {
+            Some(idx) if idx.db_index == db_index => self.drop_index(name),
+            _ => false,
+        }
+    }
+
     /// FLUSHALL/FLUSHDB parity (persistence-review R3): reset every text
     /// index to an empty state (postings, term dicts, doc maps, TAG/NUMERIC
     /// indexes) while KEEPING the FT.CREATE schema — mirroring restart
     /// semantics. Without this, flushed hashes stayed matchable as ghost
     /// documents until the next restart.
+    ///
+    /// Clears indexes in EVERY logical db — the correct primitive for
+    /// FLUSHALL. FLUSHDB must use [`Self::clear_all_contents_for_db`]
+    /// instead (WS5a) — the two commands are not yet differentiated at the
+    /// call sites, see the WS5a gap report.
     pub fn clear_all_contents(&mut self) {
+        self.clear_contents_matching(|_| true);
+    }
+
+    /// Db-scoped variant of [`Self::clear_all_contents`] for FLUSHDB
+    /// (WS5a): only resets indexes owned by `db_index`.
+    pub fn clear_all_contents_for_db(&mut self, db_index: u8) {
+        self.clear_contents_matching(|idx| idx.db_index == db_index);
+    }
+
+    #[cfg_attr(not(feature = "text-index"), allow(unused_variables))]
+    fn clear_contents_matching(&mut self, predicate: impl Fn(&TextIndex) -> bool) {
         #[cfg(feature = "text-index")]
         {
             let mut any = false;
             for idx in self.indexes.values_mut() {
+                if !predicate(idx) {
+                    continue;
+                }
+                // Preserve db_index across the schema-only recreate -- a
+                // fresh TextIndex::new_with_schema() defaults to db 0, which
+                // would otherwise silently re-home the index to db 0 on
+                // every FLUSH.
+                let db_index = idx.db_index;
                 *idx = TextIndex::new_with_schema(
                     idx.name.clone(),
                     idx.key_prefixes.clone(),
@@ -1530,6 +1575,7 @@ impl TextStore {
                     idx.numeric_fields.clone(),
                     idx.bm25_config,
                 );
+                idx.db_index = db_index;
                 any = true;
             }
             if any {
@@ -1541,16 +1587,39 @@ impl TextStore {
     }
 
     /// Get a read-only reference to a text index.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::get_index_for_db`] and the
+    /// WS5a gap report for the call-site migration.
     pub fn get_index(&self, name: &[u8]) -> Option<&TextIndex> {
         self.indexes.get(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index`] (WS5a).
+    pub fn get_index_for_db(&self, name: &[u8], db_index: u8) -> Option<&TextIndex> {
+        self.indexes
+            .get(name)
+            .filter(|idx| idx.db_index == db_index)
+    }
+
     /// Get a mutable reference to a text index.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::get_index_mut_for_db`].
     pub fn get_index_mut(&mut self, name: &[u8]) -> Option<&mut TextIndex> {
         self.indexes.get_mut(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index_mut`] (WS5a).
+    pub fn get_index_mut_for_db(&mut self, name: &[u8], db_index: u8) -> Option<&mut TextIndex> {
+        self.indexes
+            .get_mut(name)
+            .filter(|idx| idx.db_index == db_index)
+    }
+
     /// Find all index names whose key_prefixes match the given key.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — the HSET auto-index hook still calls
+    /// this unscoped variant (see [`Self::find_matching_index_names_for_db`]
+    /// and the WS5a gap report).
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
         let mut matches = Vec::new();
         for (name, index) in &self.indexes {
@@ -1569,9 +1638,41 @@ impl TextStore {
         matches
     }
 
+    /// Db-scoped variant of [`Self::find_matching_index_names`] (WS5a).
+    pub fn find_matching_index_names_for_db(&self, key: &[u8], db_index: u8) -> Vec<Bytes> {
+        let mut matches = Vec::new();
+        for (name, index) in &self.indexes {
+            if index.db_index != db_index {
+                continue;
+            }
+            if index.key_prefixes.is_empty() {
+                matches.push(name.clone());
+                continue;
+            }
+            for prefix in &index.key_prefixes {
+                if key.starts_with(prefix.as_ref()) {
+                    matches.push(name.clone());
+                    break;
+                }
+            }
+        }
+        matches
+    }
+
     /// List all index names (for FT._LIST).
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::index_names_for_db`].
     pub fn index_names(&self) -> Vec<Bytes> {
         self.indexes.keys().cloned().collect()
+    }
+
+    /// Db-scoped variant of [`Self::index_names`] (WS5a).
+    pub fn index_names_for_db(&self, db_index: u8) -> Vec<Bytes> {
+        self.indexes
+            .iter()
+            .filter(|(_, idx)| idx.db_index == db_index)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Number of text indexes.
@@ -1672,6 +1773,123 @@ mod tests {
             idx.index_document(key_hash, key.as_bytes(), &args);
         }
         idx
+    }
+
+    /// WS5a (db-scoped indexes): TextStore db-tagged variants mirror the
+    /// VectorStore ones (`src/vector/store.rs` `mod ws5a_db_scoping`).
+    mod ws5a_db_scoping {
+        use super::*;
+
+        fn make_text_index(name: &str, prefix: &str, db_index: u8) -> TextIndex {
+            let field = TextFieldDef::new(Bytes::from_static(b"body"));
+            let mut idx = TextIndex::new(
+                Bytes::from(name.to_owned()),
+                vec![Bytes::from(prefix.to_owned())],
+                vec![field],
+                crate::text::types::BM25Config::default(),
+            );
+            idx.db_index = db_index;
+            idx
+        }
+
+        #[test]
+        fn get_index_for_db_is_invisible_cross_db() {
+            let mut store = TextStore::new();
+            store
+                .create_index(
+                    Bytes::from_static(b"idx"),
+                    make_text_index("idx", "doc:", 3),
+                )
+                .unwrap();
+
+            assert!(store.get_index_for_db(b"idx", 3).is_some());
+            assert!(store.get_index_for_db(b"idx", 0).is_none());
+            // Legacy unscoped accessor keeps its historical (global) behavior.
+            assert!(store.get_index(b"idx").is_some());
+        }
+
+        #[test]
+        fn index_names_for_db_filters_by_owner() {
+            let mut store = TextStore::new();
+            store
+                .create_index(Bytes::from_static(b"a"), make_text_index("a", "doc:", 0))
+                .unwrap();
+            store
+                .create_index(Bytes::from_static(b"b"), make_text_index("b", "doc:", 1))
+                .unwrap();
+
+            assert_eq!(store.index_names_for_db(0), vec![Bytes::from_static(b"a")]);
+            assert_eq!(store.index_names_for_db(1), vec![Bytes::from_static(b"b")]);
+            assert_eq!(store.index_names().len(), 2);
+        }
+
+        #[test]
+        fn find_matching_index_names_for_db_scopes_auto_index() {
+            let mut store = TextStore::new();
+            store
+                .create_index(
+                    Bytes::from_static(b"db0idx"),
+                    make_text_index("db0idx", "doc:", 0),
+                )
+                .unwrap();
+            store
+                .create_index(
+                    Bytes::from_static(b"db1idx"),
+                    make_text_index("db1idx", "doc:", 1),
+                )
+                .unwrap();
+
+            assert_eq!(
+                store.find_matching_index_names_for_db(b"doc:1", 0),
+                vec![Bytes::from_static(b"db0idx")]
+            );
+            assert_eq!(
+                store.find_matching_index_names_for_db(b"doc:1", 1),
+                vec![Bytes::from_static(b"db1idx")]
+            );
+            assert_eq!(store.find_matching_index_names(b"doc:1").len(), 2);
+        }
+
+        #[test]
+        fn clear_all_contents_for_db_leaves_other_dbs_untouched_and_preserves_db_index() {
+            let mut store = TextStore::new();
+            store
+                .create_index(
+                    Bytes::from_static(b"db0idx"),
+                    make_text_index("db0idx", "doc:", 0),
+                )
+                .unwrap();
+            store
+                .create_index(
+                    Bytes::from_static(b"db1idx"),
+                    make_text_index("db1idx", "doc:", 1),
+                )
+                .unwrap();
+
+            store.clear_all_contents_for_db(0);
+
+            // Definitions survive in both dbs, and db_index is preserved
+            // across the schema-only recreate (not silently reset to 0).
+            assert_eq!(store.index_count(), 2);
+            assert_eq!(store.get_index(b"db0idx").unwrap().db_index, 0);
+            assert_eq!(store.get_index(b"db1idx").unwrap().db_index, 1);
+        }
+
+        #[test]
+        fn drop_index_for_db_refuses_cross_db_drop() {
+            let mut store = TextStore::new();
+            store
+                .create_index(
+                    Bytes::from_static(b"idx"),
+                    make_text_index("idx", "doc:", 3),
+                )
+                .unwrap();
+
+            assert!(!store.drop_index_for_db(b"idx", 0));
+            assert_eq!(store.index_count(), 1);
+            assert!(store.drop_index_for_db(b"idx", 3));
+            assert_eq!(store.index_count(), 0);
+        }
     }
 
     #[test]
