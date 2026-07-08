@@ -44,6 +44,8 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         tcp_backlog: 1024,
         databases: 16,
         requirepass: None,
+        db_maxmemory: Vec::new(),
+        profile: None,
         appendonly: "no".to_string(),
         unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),

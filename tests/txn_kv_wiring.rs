@@ -49,6 +49,8 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         tcp_backlog: 1024,
         databases: 16,
         requirepass: None,
+        db_maxmemory: Vec::new(),
+        profile: None,
         appendonly,
         unsafe_multishard_aof: false,
         experimental_per_shard_rewrite: false,
