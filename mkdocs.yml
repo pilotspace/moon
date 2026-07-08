@@ -141,6 +141,7 @@ nav:
       - Vector search: vector-search-guide.md
       - Transactions: guides/transactions.md
       - Workspaces: guides/workspaces.md
+      - Isolation semantics: guides/isolation.md
       - Message queues: guides/message-queues.md
       - Temporal queries: guides/temporal.md
       - Persistence: guides/persistence.md

@@ -122,6 +122,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/test-consistency.sh` (+section 9b) and `scripts/test-commands.sh`
   (key-commands category) gained coverage for all four new commands.
 
+### Added — per-db resource quotas + workspace hardening sweep (WS5b, PR #TBD)
+
+- New per-db memory quota: `--db-maxmemory <db>:<bytes>` (repeatable CLI
+  flag) and `CONFIG SET/GET db-maxmemory <db> <bytes>` (0 = unlimited,
+  default). Enforcement mirrors global `--maxmemory`: `noeviction`
+  rejects writes at quota with a `MOONERR db maxmemory exceeded` error;
+  eviction policies shed keys from the offending db only. Zero-cost
+  when unconfigured via a single relaxed-atomic pre-gate
+  (`DB_MAXMEMORY_ANY_SET`), same pattern as the existing global-maxmemory
+  gate. New `src/storage/db_quota.rs`.
+- Fixed a real bug found via this work: `SELECT`/`SWAPDB` are flagged
+  `is_write` in moon's command-metadata table (for unrelated ACL/dispatch
+  reasons), which meant a connection that filled a `noeviction`-quota'd db
+  could not even `SELECT` away from it afterward — the eviction/quota gate
+  ran against the pre-switch db index before `SELECT` updated connection
+  state. Fixed for the new db-quota gate via
+  `check_db_maxmemory_for_command()` (SELECT/SWAPDB exempt); the
+  pre-existing identical quirk in the global `--maxmemory` gate is
+  documented but deliberately left unfixed (out of scope — shared,
+  widely-used eviction code).
+- Fixed a real, pre-existing bug: `WS DROP`'s best-effort key cleanup
+  only swept logical db 0 (hardcoded), silently leaking a workspace's
+  keys forever if its connection ever `SELECT`ed to a non-zero db before
+  writing (`WS AUTH` and `SELECT` are orthogonal connection state). Now
+  sweeps every db on the owning shard. Proven via RED/GREEN TDD
+  (`test_workspace_drop_cleans_keys_across_all_dbs`).
+- New `docs/guides/isolation.md` — honest "isolation semantics" reference
+  covering logical dbs, workspaces, and per-db quotas: what each
+  guarantees, and every discovered limit (FLUSHDB is whole-db not
+  workspace-scoped; MOVE/SWAPDB reconciled lazily by a background sweep,
+  not synchronously; no disk-offload spill integration for db-quota
+  eviction; FT.* indexes remain keyspace-global, not workspace-scoped —
+  handoff note for the concurrent WS5a db-scoped-FT-index work).
+- New tests: 9 unit tests in `src/config.rs` (CLI/CONFIG parsing), 7 in
+  `src/storage/db_quota.rs` (accounting + enforcement), 6 in
+  `src/command/config.rs` (CONFIG GET/SET), 3 new workspace hardening
+  tests in `tests/workspace_integration.rs` (WS DROP all-dbs regression,
+  cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
+  `tests/db_maxmemory_quota.rs` real-server integration test.
+
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
 - `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents

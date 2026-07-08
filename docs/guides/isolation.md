@@ -1,0 +1,176 @@
+---
+title: "Isolation semantics"
+description: "What Moon's multi-tenancy mechanisms guarantee, and what they don't."
+---
+
+# Isolation semantics
+
+Moon has three overlapping mechanisms that look like "isolation" from a
+distance but each guarantee something narrower than the word implies:
+**logical databases** (`SELECT 0..N`), **workspaces** (`WS AUTH`), and
+**per-db resource quotas** (`db-maxmemory`). This page states plainly what
+each one promises, what it does not, and every limit found during the
+WS5b hardening sweep (2026-07). None of these are marketing claims —
+if a guarantee isn't listed here, don't assume it holds.
+
+## Logical databases (`SELECT`)
+
+- **Guarantee**: keys in db N are never visible to a client selected into
+  db M ≠ N via normal KV commands (GET/SET/KEYS/SCAN/etc.).
+- **Not a security boundary**: any authenticated connection can `SELECT`
+  to any db (0..`--databases`). There is no ACL concept of "this user may
+  only touch db 3." Use workspaces (below) or ACL key patterns for real
+  tenant separation.
+- **`FLUSHDB` is whole-db, not workspace-scoped** (see Workspaces below) —
+  it clears every key in the selected db, including keys belonging to
+  every workspace that happens to be co-resident in that db. This is
+  pinned by `test_workspace_flushdb_is_whole_db_not_workspace_scoped` in
+  `tests/workspace_integration.rs` as intentional, current behavior, not
+  a bug — workspaces layer a key-prefix on top of a shared db, they do
+  not carve out a separate db per workspace.
+- **`FLUSHALL`/`FLUSHDB` and `FT.*` indexes**: index *contents* are
+  cleared keyspace-globally (every index, every db) on FLUSHALL/FLUSHDB,
+  while the index *definition* (`FT.CREATE`) survives — this matches
+  moon's restart-reload semantics. See "FT.* / vector indexes" below.
+
+## Workspaces (`WS AUTH`)
+
+- **Guarantee**: once a connection runs `WS AUTH <id>`, every key argument
+  it sends is transparently rewritten with a `{ws_hex}:` hash-tag prefix
+  before dispatch, and stripped back off in KEYS/SCAN/RANDOMKEY/FT.SEARCH
+  responses. Two workspaces with colliding logical key names
+  (`user:1` in workspace A and workspace B) do not collide in storage or
+  in KEYS output — verified by
+  `test_workspace_keys_no_cross_workspace_leakage`.
+- **Composes orthogonally with `SELECT`**: `WS AUTH` and `SELECT` are
+  independent connection-state. A workspace-bound connection can still
+  `SELECT` to any db; its keys land in whichever db was selected at
+  write time, still under its `{ws_hex}:` prefix. This is intentional —
+  workspaces are a keyspace partition, not a db partition — but it means
+  **`WS DROP`'s cleanup must sweep every db, not just db 0**, which was a
+  real bug (see below).
+- **`WS DROP` cascade-delete gap (fixed in this branch)**: `WS DROP`'s
+  best-effort key cleanup (`handler_monoio/write.rs`,
+  `handler_sharded/write.rs`, `spsc_handler.rs`'s `WsDropCleanup`) only
+  swept db 0 via a hardcoded `with_shard_db(0, ...)` call. A workspace
+  connection that ever `SELECT`ed to a non-zero db before writing would
+  leak its keys **forever** after `WS DROP` — they were orphaned, prefixed
+  with a workspace id nothing could ever `WS AUTH` into again (workspace
+  ids aren't reusable). Found via `git apply -R` RED/GREEN TDD with
+  `test_workspace_drop_cleans_keys_across_all_dbs`; fixed by sweeping
+  `s.databases.iter_mut()` at all three call sites. **This affects every
+  moon release before this fix** — operators running workspaces with
+  connections that `SELECT` non-zero dbs should treat prior `WS DROP`
+  calls as having potentially leaked keys, recoverable only via manual
+  `SCAN` for the `{ws_hex}:*` prefix pattern.
+- **`FLUSHDB` does not respect workspace boundaries** — see above.
+- **Not a security boundary on its own**: `WS AUTH` requires knowing the
+  workspace's UUID v7. There is no password/ACL gate on `WS AUTH` itself
+  in this release — anyone who can open a connection and knows (or
+  guesses) a workspace id can bind to it. Pair with ACL `requirepass` /
+  TLS client-cert auth for real tenant boundaries; workspaces solve
+  **keyspace collision**, not **authentication**.
+
+## Per-db resource quotas (`db-maxmemory`, new in this branch)
+
+- **Config surface**: `--db-maxmemory <db>:<bytes>` (repeatable CLI flag)
+  and `CONFIG SET db-maxmemory <db> <bytes>` (0 = unlimited, the
+  default for every db). `CONFIG GET db-maxmemory` lists only the
+  nonzero entries.
+- **Guarantee**: when db N's estimated memory is at or above its quota
+  and the effective eviction policy is `noeviction`, writes that would
+  grow db N's memory are rejected with a `MOONERR db maxmemory exceeded`
+  error, without touching any other db's memory or quota. Sibling dbs
+  are unaffected — `neighbor_db_is_unaffected_by_sibling_quota` covers
+  this. Under an eviction policy (`allkeys-lru`, etc.) db N sheds its
+  own keys to get back under quota instead of rejecting.
+- **Zero cost when unset**: the enforcement path is gated by a single
+  process-wide `AtomicBool` (`DB_MAXMEMORY_ANY_SET`) published whenever
+  `--db-maxmemory`/`CONFIG SET db-maxmemory` change the config; if no db
+  quota is ever configured, every hot-path check is a single relaxed
+  atomic load, mirroring the existing global-`maxmemory` pre-gate
+  pattern in `src/storage/eviction.rs`.
+- **`SELECT`/`SWAPDB` are exempted from the on-write quota check.**
+  Moon's command-metadata table flags `SELECT` and `SWAPDB` as
+  "write-fast" (`WF`) for ACL/dispatch-classification reasons unrelated
+  to memory growth, which means they flow through the *same*
+  write-path eviction gate as a real `SET`. Without an exemption, a
+  connection that fills a `noeviction` db to its quota could not even
+  `SELECT` away from that db on the same connection afterward — the
+  gate ran using the pre-switch db index before the SELECT itself
+  updated connection state, so a full db effectively **trapped the
+  connection**. This was caught by a real-server repro (raw socket
+  script driving `SELECT 1` → writes to exhaustion → `SELECT 0` →
+  observed the db-1 quota error instead of `+OK`) and fixed via
+  `db_quota::command_exempt_from_db_quota()` +
+  `check_db_maxmemory_for_command()`. A fresh connection starting at
+  db 0 was never affected — this was a same-connection state artifact,
+  not a global lock.
+  - **Known, deliberately unfixed twin**: the pre-existing *global*
+    `--maxmemory` gate has the identical quirk (SELECT is also
+    `is_write`-flagged there) and was NOT touched by this branch — fixing
+    it would mean changing widely-used, shared eviction-gate code well
+    beyond per-db quotas' scope. Filed as a follow-up, not fixed here.
+- **`MOVE` is not covered by the immediate on-write quota check** — a
+  `MOVE` into a quota'd db does not re-check that db's quota synchronously
+  (the write-path gate only covers the *originating* db of the command
+  being dispatched). The periodic background sweep in
+  `src/shard/timers.rs::run_eviction()` (runs every eviction tick,
+  gated by the same zero-cost atomic) catches this lazily — a db that
+  drifts over quota via `MOVE`/`SWAPDB` gets reconciled on the next
+  tick, not instantaneously.
+- **No disk-offload spill integration**: db-quota eviction always
+  deletes the victim key outright (mirrors
+  `eviction::evict_one_with_spill` called with `None` for the spill
+  sender). Global `--maxmemory` eviction can spill to disk-offload
+  storage when configured; per-db quota eviction cannot. A db under
+  quota pressure with `allkeys-lru` will lose data it could otherwise
+  have kept cold-tiered under the global gate. Document this before
+  recommending db-quotas as a substitute for disk offload.
+- **Eviction candidate sampling is a pre-existing, unrelated
+  limitation**: `eviction::sample_random_keys`/`find_victim_random` uses
+  a fixed 1-sample/8-attempt retry budget regardless of the configured
+  `maxmemory-samples`. At very low live-key counts under `allkeys-random`
+  this can return an OOM error even though technically-evictable keys
+  remain, because the bounded retry gives up first. Not introduced or
+  fixed by db-quota work; noted here because it is easy to mistake for a
+  db-quota bug when writing tests against a small dataset.
+
+## FT.* / vector indexes and workspaces (handoff note — WS5a scope)
+
+**This branch (WS5b) does not modify `src/vector/`,
+`src/command/vector_search/`, or any FTS code** — that surface is owned
+by the concurrent WS5a workstream (db-scoped FT indexes). What follows
+is an observational finding for WS5a to fold in, not a WS5b fix:
+
+- As of this writing, `FT.*` indexes are **keyspace-global**, not
+  workspace-scoped or (pre-WS5a) db-scoped: `FLUSHALL`/`FLUSHDB` clear
+  every index's contents regardless of which db or workspace triggered
+  the flush (see the `Vector Search` section of the project root
+  `CLAUDE.md`, "FLUSHALL/FLUSHDB/HDEL keyspace parity"). A workspace's
+  `WS AUTH`-injected key prefix does reach `FT.SEARCH`/auto-indexing (the
+  prefix is applied before dispatch like any other command), so two
+  workspaces indexing hashes under logically-identical field names do
+  get distinct, non-colliding *entries* keyed by their distinct prefixed
+  keys — but they share the *same index definition and segment set*.
+  There is currently no notion of "workspace A's FT index" vs
+  "workspace B's FT index" as separate objects; a workspace-scoped
+  `FT.DROPINDEX` or `FT.SEARCH` cannot avoid touching sibling workspaces'
+  documents in the same index, and `FT.INFO num_docs` reports the
+  combined total across all workspaces.
+- Recommendation for WS5a: if db-scoped FT indexes land, the natural
+  follow-up is workspace-scoped indexes gated the same way per-db quotas
+  are — an explicit index-creation-time association plus a cheap
+  zero-cost-when-unused check, not a blanket prefix-filter over search
+  results (which would break HNSW/TQ recall accounting per
+  `CLAUDE.md`'s vector search notes on segment-level `num_docs`).
+- No code changes were made on the WS5b side to accommodate or preempt
+  this; it is purely an observation for the other workstream.
+
+## Summary table
+
+| Mechanism | Guarantees | Does NOT guarantee |
+|---|---|---|
+| `SELECT` (logical db) | Keys in db N invisible to db M via normal KV ops | Auth/ACL boundary; `FLUSHDB` still whole-db |
+| Workspaces (`WS AUTH`) | No keyspace collision between workspaces, even same db | Auth boundary (no password on `WS AUTH`); not `FLUSHDB`-safe; `FT.*` indexes not workspace-scoped |
+| `db-maxmemory` quota | Per-db memory ceiling, independent of sibling dbs, zero-cost when unset | Not spill-integrated; `MOVE`/`SWAPDB` reconciled lazily not synchronously; shares the SELECT-exemption quirk with global maxmemory (both now fixed for db-quota, global left as-is) |
