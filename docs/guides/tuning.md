@@ -16,7 +16,7 @@ recommendation here is backed by measurements on dedicated-vCPU GCE instances
 | Workload | Recipe |
 |---|---|
 | Pure cache (no durability) | `--appendonly no --maxmemory <bytes> --maxmemory-policy allkeys-lru` |
-| Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores |
+| Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores, or `--profile standalone` (see [Profiles](#profiles) — **pinned cores only**) |
 | High-concurrency API backend (8+ conns) | `--shards 4` (+ busy-poll on dedicated cores) |
 | Pipelined / batch ingest | `--shards 4` or more; pipeline depth ≥ 16 |
 | Durable primary store | defaults (`--appendonly yes --appendfsync everysec`, ~1.32× Redis at depth); `always` for RPO 0 — disk-fsync-bound, pipelines fine |
@@ -67,6 +67,60 @@ The trade-offs are explicit:
   instances). On shared/oversubscribed hosts (laptops, burstable VMs, busy Kubernetes
   nodes) it *regresses* performance — the spin fights neighbors for the core.
 - Values 20–100 µs behave similarly; 40 is a good default. `0` (default) disables it.
+
+## Profiles
+
+`--profile <name>` bundles a set of proven flags for a given deployment shape into one
+switch, instead of you having to remember and re-type the individual recipe every time.
+
+**Precedence rule:** a profile only fills flags you left at their default. Any flag you
+pass explicitly — on the CLI or in `moon.conf` — always wins over the profile's value.
+Startup logs exactly which flags the profile set, so `--profile` is never a silent
+behavior change:
+
+```text
+INFO --profile standalone: set --shards=1, --io-busy-poll-us=40, --io-driver=epoll
+     (implied by io-busy-poll-us) (unset flags only; pass a flag explicitly on the
+     CLI to override the preset)
+```
+
+### `standalone`
+
+For a single dedicated Moon instance answering low-pipeline request/response traffic —
+the "beat Redis at p=1" shape from the [Busy-polling](#busy-polling-single-op-latency-on-dedicated-cores)
+and [shard count](#shard-count-the-most-important-knob) sections above, as one flag:
+
+```
+moon --profile standalone
+```
+
+Expands to (only for flags left unset):
+
+| Flag | Value | Why |
+|---|---|---|
+| `--shards` | `1` | best per-op latency for low-concurrency, non-pipelined traffic |
+| `--io-busy-poll-us` | `40` | deletes scheduler sleep/wake latency from the request path |
+| `--io-driver` | `epoll` | implied by busy-poll (legacy driver only; io_uring CQEs aren't observable this way) |
+
+> **⚠ Pinned/dedicated cores required.** `--io-busy-poll-us` busy-loops the shard thread
+> for up to the budget before parking. On a host with genuinely idle, pinned cores this
+> deletes wakeup latency and is the single biggest lever behind Moon's p=1 win over Redis
+> (measured 1.19–1.21× ARM, 1.65–1.66× x86 on GCE, 2026-07). On **shared or oversubscribed
+> cores** — OrbStack's default VM, laptops, burstable/noisy-neighbor cloud instances,
+> busy Kubernetes nodes — the same spin **regresses** throughput: it fights every other
+> tenant for the core instead of yielding it. **Do not** reach for `--profile standalone`
+> on such hosts; run without it (or with `--io-busy-poll-us 0`, the plain default) and
+> rely on shard count alone.
+>
+> There is currently no automatic pinned-core detection — this is an operator judgment
+> call, not something Moon can safely default on for you.
+
+An unrecognized profile name is a startup error (exit code 2), not a silent no-op:
+
+```
+$ moon --profile bogus
+moon: unknown --profile 'bogus' (supported: standalone)
+```
 
 ## Persistence: what durability costs
 
