@@ -636,7 +636,7 @@ fn test_ft_create_merge_mode_none_roundtrip() {
         bulk(b"NONE"),
     ];
 
-    let result = ft_create(&mut store, &mut text_store, &args);
+    let result = ft_create(&mut store, &mut text_store, &args, 0);
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE must succeed: {:?}",
@@ -687,7 +687,7 @@ fn test_ft_create_merge_mode_graph_union_roundtrip() {
         bulk(b"GRAPH_UNION"),
     ];
 
-    let result = ft_create(&mut store, &mut text_store, &args);
+    let result = ft_create(&mut store, &mut text_store, &args, 0);
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE must succeed: {:?}",
@@ -740,7 +740,7 @@ fn test_ft_create_keep_raw_on_roundtrip() {
         bulk(b"ON"),
     ];
 
-    let result = ft_create(&mut store, &mut text_store, &args);
+    let result = ft_create(&mut store, &mut text_store, &args, 0);
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE must succeed: {:?}",
@@ -789,7 +789,7 @@ fn test_ft_create_keep_raw_default_is_false() {
         bulk(b"L2"),
     ];
 
-    let result = ft_create(&mut store, &mut text_store, &args);
+    let result = ft_create(&mut store, &mut text_store, &args, 0);
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE must succeed: {:?}",
@@ -841,7 +841,7 @@ fn test_ft_create_merge_mode_keep_raw_rejected() {
         bulk(b"KEEP_RAW"),
     ];
 
-    let result = ft_create(&mut store, &mut text_store, &args);
+    let result = ft_create(&mut store, &mut text_store, &args, 0);
     assert!(
         matches!(result, Frame::Error(_)),
         "MERGE_MODE KEEP_RAW must be rejected until implemented: {result:?}"

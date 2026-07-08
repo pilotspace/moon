@@ -67,7 +67,7 @@ fn search_total(vs: &mut VectorStore, index: &str, query: &[f32]) -> i64 {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(qb)),
     ];
-    match ft_search(vs, &args, None, None, 0) {
+    match ft_search(vs, &args, None, None, 0, 0) {
         Frame::Array(items) => match items.first() {
             Some(Frame::Integer(n)) => *n,
             other => panic!("expected Integer total, got {other:?}"),
@@ -83,7 +83,7 @@ fn hset_update_in_mutable_segment_does_not_duplicate() {
     distance::init();
     let mut vs = VectorStore::new();
     let mut ts = TextStore::new();
-    let out = ft_create(&mut vs, &mut ts, &ft_create_args("upd_mut", DIM as u32));
+    let out = ft_create(&mut vs, &mut ts, &ft_create_args("upd_mut", DIM as u32), 0);
     assert!(!matches!(out, Frame::Error(_)), "ft_create failed: {out:?}");
 
     let v1: Vec<f32> = (0..DIM).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
@@ -104,7 +104,7 @@ fn hset_update_after_compaction_tombstones_immutable_copy() {
     distance::init();
     let mut vs = VectorStore::new();
     let mut ts = TextStore::new();
-    let out = ft_create(&mut vs, &mut ts, &ft_create_args("upd_imm", DIM as u32));
+    let out = ft_create(&mut vs, &mut ts, &ft_create_args("upd_imm", DIM as u32), 0);
     assert!(!matches!(out, Frame::Error(_)), "ft_create failed: {out:?}");
 
     let v1: Vec<f32> = (0..DIM).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
