@@ -229,12 +229,9 @@ pub fn fastscan_block_neon(codes: &[u8], lut: &[u8], dim_half: usize, results: &
     assert!(codes.len() >= dim_half * BLOCK_SIZE);
     assert!(lut.len() >= dim_half * 32);
 
-    // SAFETY: NEON is mandatory baseline on aarch64 (guaranteed by the
-    // target_arch cfg above). All pointer arithmetic stays within the
-    // caller-provided slices: per iteration we read 16 bytes at
-    // codes[d*32 + half*16], bounded by the `codes.len() >= dim_half*32`
-    // assert above, and 16 bytes at lut[(2d)*16] / lut[(2d+1)*16], bounded by
-    // the `lut.len() >= dim_half*32` assert above (= padded_dim*16).
+    // SAFETY: NEON is mandatory baseline on aarch64 (target_arch cfg above).
+    // Per iteration we read 16 bytes at codes[d*32 + half*16] and at
+    // lut[(2d)*16] / lut[(2d+1)*16], all bounded by the two asserts above.
     unsafe {
         let nibble_mask = vdupq_n_u8(0x0F);
         // Four u16x8 accumulators in linear vector order: v0..7, v8..15, v16..23, v24..31.
