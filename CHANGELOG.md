@@ -210,6 +210,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
   `tests/db_maxmemory_quota.rs` real-server integration test.
 
+### Fixed — WS5a: FLUSHDB no longer clears vector/text index contents across dbs (foundation)
+
+- **`IndexMeta`/`TextIndex`** gain a `db_index: u8` tag (vector sidecar
+  format bumped to v4, text sidecar to v2; legacy sidecars default to db 0,
+  fully backward compatible).
+- **FLUSHDB now scopes** to the connection's selected db —
+  `VectorStore::clear_all_contents_for_db` /
+  `TextStore::clear_all_contents_for_db`, wired through all 3 dispatch
+  paths (`handler_single`, `handler_sharded`, `handler_monoio`) plus the
+  cross-shard MULTI/EXEC replay path. FLUSHALL is unchanged (still clears
+  every db). Previously FLUSHDB in ANY db cleared ALL index contents
+  keyspace-wide — direct fix, covered by a new integration test
+  (`tests/vector_flush_hdel_tombstone.rs`).
+- Db-scoped lookup/listing/delete primitives (`get_index_for_db`,
+  `index_names_for_db`, `find_matching_index_names_for_db`,
+  `mark_deleted_for_key_for_db`, `drop_index_for_db`) added alongside the
+  existing unscoped methods on both `VectorStore` and `TextStore`, unit
+  tested.
+- **Not yet complete**: FT.CREATE still tags every index db 0 (the
+  connection's selected db isn't threaded to it yet), and FT.SEARCH /
+  FT.INFO / FT._LIST / auto-index-on-HSET / auto-unindex-on-DEL remain
+  unscoped. Full call-site punch list in
+  `.planning/v0.6.0-release/WS5A-NOTES.md`. Graph engine not attempted.
+
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
 - `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents
