@@ -1154,6 +1154,52 @@ pub fn parse_one_db_maxmemory_entry(entry: &str) -> Result<(usize, u64), &'stati
     Ok((idx, bytes))
 }
 
+/// Validate `--db-maxmemory` entries strictly, for startup fail-fast.
+///
+/// `parse_db_maxmemory_entries` (used by [`ServerConfig::to_runtime_config`])
+/// is deliberately fail-OPEN: a malformed entry there is logged and skipped
+/// so a stray typo can never crash a server that's already running (mirrors
+/// the wire-protocol parser-defensiveness rule). But `--db-maxmemory` itself
+/// is trusted OPERATOR config supplied at process launch, not untrusted wire
+/// input — silently ignoring a typo there means the operator believes a
+/// quota is protecting a db when it is not, which is a worse failure mode
+/// than refusing to start. `CONFIG SET db-maxmemory` already fails loud
+/// (returns `Frame::Error`) for the identical malformed/out-of-range cases;
+/// this closes the same gap for the CLI form. Call this BEFORE
+/// `to_runtime_config()` at both startup entry points (`main.rs`,
+/// `server/embedded.rs`) and exit non-zero on `Err` — matches this file's
+/// existing "REFUSING TO START: ..." + `std::process::exit(2)` convention
+/// for other trusted-config validation failures (see e.g. the AOF manifest
+/// / shard-count guards in `main.rs`).
+///
+/// Returns `Err(message)` describing every invalid entry found (not just the
+/// first) so an operator with several typos in one invocation sees all of
+/// them in a single failed start, not one-at-a-time.
+pub fn validate_db_maxmemory_cli(raw: &[String], num_databases: usize) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    for entry in raw {
+        match parse_one_db_maxmemory_entry(entry) {
+            Ok((idx, _)) if idx >= num_databases => {
+                problems.push(format!(
+                    "'{entry}': db index {idx} is out of range (--databases is {num_databases})"
+                ));
+            }
+            Ok(_) => {}
+            Err(reason) => problems.push(format!("'{entry}': {reason}")),
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid --db-maxmemory entr{plural}: {joined} \
+             (expected '<db>:<bytes>' with db < --databases)",
+            plural = if problems.len() == 1 { "y" } else { "ies" },
+            joined = problems.join("; "),
+        ))
+    }
+}
+
 /// Fraction (percent) of the detected memory limit used as the G1 auto
 /// guardrail cap when `--maxmemory` is omitted. 80% leaves headroom for
 /// allocator fragmentation, page cache, and non-keyspace overhead.
@@ -2297,6 +2343,49 @@ mod tests {
         assert!(parse_one_db_maxmemory_entry("no-colon").is_err());
         assert!(parse_one_db_maxmemory_entry("x:123").is_err());
         assert!(parse_one_db_maxmemory_entry("1:notbytes").is_err());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_accepts_well_formed_in_range_entries() {
+        let raw = vec!["0:1024".to_string(), "15:2048".to_string()];
+        assert!(validate_db_maxmemory_cli(&raw, 16).is_ok());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_empty_is_ok() {
+        assert!(validate_db_maxmemory_cli(&[], 16).is_ok());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_rejects_malformed_entry() {
+        let raw = vec!["not-a-pair".to_string()];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(
+            err.contains("not-a-pair"),
+            "error must name the offending entry: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_rejects_out_of_range_index() {
+        let raw = vec!["99:1024".to_string()];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(
+            err.contains("99") && err.contains("out of range"),
+            "error must name the bad index and explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_reports_every_bad_entry_not_just_first() {
+        let raw = vec![
+            "not-a-pair".to_string(),
+            "99:1024".to_string(),
+            "0:512".to_string(), // valid — must not appear as a problem
+        ];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(err.contains("not-a-pair"), "missing first bad entry: {err}");
+        assert!(err.contains("99"), "missing second bad entry: {err}");
     }
 
     #[test]

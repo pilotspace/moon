@@ -701,8 +701,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Safety: `maxmemory` changes via `CONFIG SET maxmemory N` are picked
         // up on the NEXT batch. A batch spans sub-millisecond; operators do
         // not observe this granularity.
-        let batch_eviction_active =
-            ctx.spill_sender.is_some() || ctx.runtime_config.read().maxmemory != 0;
+        //
+        // WS5b fix-first review: this condition MUST also consult the per-db
+        // quota atomic. `run_write_eviction_gate` (below) is the only caller
+        // of `check_db_maxmemory_for_command` in this file, and it is gated
+        // entirely behind `batch_eviction_active` — without this term, a
+        // server started with `--maxmemory 0` and no disk-offload spill
+        // sender (e.g. `--disk-offload disable`) never runs the db-quota
+        // check for any non-inline write (HSET/LPUSH/SADD/ZADD/INCR/APPEND/
+        // MSET/SET-with-options/RESTORE/...), even with `--db-maxmemory`
+        // configured. Reproduced empirically: 60x1KB HSET into a 4KB-quota'd
+        // db all succeeded while plain SET was correctly rejected (SET takes
+        // the separate, correctly-gated inline fast path in blocking.rs).
+        // Mirrors the Lua bridge's early-exit gate in scripting/bridge.rs,
+        // which already included this term.
+        let batch_eviction_active = ctx.spill_sender.is_some()
+            || ctx.runtime_config.read().maxmemory != 0
+            || crate::storage::db_quota::db_maxmemory_any_set();
 
         let mut auth_delay_ms: u64 = 0;
 

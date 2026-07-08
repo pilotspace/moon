@@ -98,6 +98,54 @@ fn spawn_moon_db_quota(port: u16, dir: &std::path::Path, db_entries: &[&str]) ->
     ServerGuard(child)
 }
 
+/// Same as `spawn_moon_db_quota` but additionally passes `--disk-offload
+/// disable` — the exact combination (`--maxmemory 0` + no disk-offload spill
+/// sender + `--db-maxmemory` configured) that the fix-first adversarial
+/// review found bypassed the db-quota gate entirely for every non-inline
+/// write command (HSET/LPUSH/SADD/ZADD/INCR/APPEND/MSET/SET-with-options/
+/// RESTORE/...). `handler_monoio::batch_eviction_active` (and the
+/// cross-shard-leg twin `spsc_handler::evict_active`) previously only
+/// consulted `spill_sender.is_some() || maxmemory != 0`, so with both false
+/// the entire non-inline write-eviction-gate call was skipped — including
+/// the db-quota check nested inside it. Plain `SET` was unaffected because
+/// it takes the separate, always-correctly-gated inline fast path in
+/// `blocking.rs`, which is exactly why the original quota test above (which
+/// only ever issues `SET`) did not catch this.
+fn spawn_moon_db_quota_no_spill(
+    port: u16,
+    dir: &std::path::Path,
+    db_entries: &[&str],
+) -> ServerGuard {
+    let mut cmd = Command::new(find_moon_binary());
+    cmd.args([
+        "--port",
+        &port.to_string(),
+        "--dir",
+        &dir.to_string_lossy(),
+        "--shards",
+        "1",
+        "--appendonly",
+        "no",
+        "--maxmemory",
+        "0",
+        "--maxmemory-policy",
+        "noeviction",
+        "--databases",
+        "16",
+        "--disk-offload",
+        "disable",
+    ]);
+    for entry in db_entries {
+        cmd.args(["--db-maxmemory", entry]);
+    }
+    let child = cmd
+        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .spawn()
+        .expect("spawn moon");
+    ServerGuard(child)
+}
+
 // ---------------------------------------------------------------------------
 // Minimal RESP client (binary-safe args, full-frame parser) — same shape as
 // tests/mem_watchdog.rs's Client, duplicated rather than shared: integration
@@ -336,5 +384,179 @@ fn test_config_set_get_db_maxmemory_live() {
     assert!(
         matches!(ping_ok, Ok(true)),
         "server must survive malformed CONFIG SET db-maxmemory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case C (fix-first adversarial review regression test): with `--maxmemory 0`
+// and `--disk-offload disable` (no spill sender), non-inline write commands
+// (HSET here, plus one SET-with-EX to confirm the option-bearing SET variant
+// also rides the fixed gate) must STILL be rejected once db 1 is over its
+// quota. Before the fix, `batch_eviction_active`
+// (`src/server/conn/handler_monoio/mod.rs`) and its cross-shard-leg twin
+// `evict_active` (`src/shard/spsc_handler.rs`) only checked
+// `spill_sender.is_some() || maxmemory != 0`, silently skipping the entire
+// eviction-gate call — including the nested db-quota check — for exactly
+// this configuration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quota_rejects_non_inline_writes_without_spill_sender() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    // db 1 gets a tiny 4 KB quota; no disk-offload spill sender exists at all.
+    let _guard = spawn_moon_db_quota_no_spill(port, dir.path(), &["1:4096"]);
+    let mut c = wait_ready(port);
+
+    let sel = c.cmd(&[b"SELECT", b"1"]);
+    assert_eq!(sel, V::Simple("OK".to_string()));
+
+    let big_value = vec![b'x'; 1024];
+
+    // HSET: a non-inline write command. Must eventually hit the db-1 quota.
+    //
+    // Deliberately uses a DISTINCT key per iteration (`h{i}`), not repeated
+    // field-growth on one shared hash key. Investigation during this fix
+    // found a second, pre-existing, independent bug: `used_memory` is only
+    // charged once, at hash-key CREATION time, for the empty hash's fixed
+    // overhead (`entry_overhead` in `src/storage/db.rs`, called right after
+    // `Entry::new_hash()` before any fields are inserted) — subsequent
+    // `map.insert(field, value)` calls in `hash_write::hset` (and the
+    // equivalent List/Set/ZSet mutation sites) never update `used_memory`.
+    // Growing ONE hash key's fields therefore never grows its accounted
+    // memory at all, regardless of value size — verified this defeats even
+    // the pre-existing GLOBAL `--maxmemory` gate identically (not something
+    // introduced by db-quota). That systemic accounting gap is out of scope
+    // for this fix (affects every container type, requires auditing every
+    // mutation site) and is documented as a follow-up in
+    // docs/guides/isolation.md rather than fixed here. Using a fresh key per
+    // HSET charges each key's flat ~(key.len() + 128)-byte creation overhead
+    // (verified empirically: ~130 bytes/key trips a 4 KB quota at ~32 keys),
+    // which is enough to exercise the gate fix under test without depending
+    // on the separate, unfixed accounting gap.
+    let mut saw_quota_error = false;
+    for i in 0..80 {
+        let key = format!("h{i}");
+        let r = c.cmd(&[b"HSET", key.as_bytes(), b"f0", &big_value]);
+        if r.is_db_quota_error() {
+            saw_quota_error = true;
+            break;
+        }
+        // HSET's successful reply is an integer (":1" for a new field), not
+        // "+OK" — accept any non-error reply as "still under quota".
+        assert!(
+            !matches!(r, V::Err(_)),
+            "unexpected error before quota should have bitten: {r:?}"
+        );
+    }
+    assert!(
+        saw_quota_error,
+        "expected a MOONERR db maxmemory exceeded reply within 80 HSETs \
+         (distinct keys) to db 1 (4 KB quota, no disk-offload spill sender) \
+         — the non-inline write path's db-quota gate is bypassed"
+    );
+
+    // SET with an option (EX) also takes the non-inline dispatch path (only
+    // bare SET/GET use the byte-level inline fast path in blocking.rs) — it
+    // must be rejected too, on the same already-exhausted db 1 quota.
+    let r = c.cmd(&[b"SET", b"k-with-ex", &big_value, b"EX", b"100"]);
+    assert!(
+        r.is_db_quota_error(),
+        "SET with EX option must ride the non-inline gate and be rejected \
+         once db 1 is over quota, got {r:?}"
+    );
+
+    // db 0 remains fully unaffected.
+    let sel0 = c.cmd(&[b"SELECT", b"0"]);
+    assert_eq!(sel0, V::Simple("OK".to_string()));
+    let r0 = c.cmd(&[b"HSET", b"h0", b"f0", &big_value]);
+    assert!(
+        !r0.is_db_quota_error(),
+        "db 0 has no quota configured; HSET must succeed, got {r0:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case D (fix-first adversarial review item 3): a malformed or out-of-range
+// `--db-maxmemory` CLI entry is trusted operator config, not wire input —
+// the server must refuse to start (nonzero exit, clear stderr message)
+// rather than silently warn-and-drop the entry and start anyway (which
+// `CONFIG SET db-maxmemory` already correctly refuses to do for the same
+// bad input).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_malformed_db_maxmemory_cli_refuses_to_start() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    let mut cmd = Command::new(find_moon_binary());
+    cmd.args([
+        "--port",
+        &port.to_string(),
+        "--dir",
+        &dir.path().to_string_lossy(),
+        "--shards",
+        "1",
+        "--appendonly",
+        "no",
+        "--databases",
+        "16",
+        "--db-maxmemory",
+        "not-a-pair", // malformed: no ':' separator
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let output = cmd
+        .output()
+        .expect("spawn moon with malformed --db-maxmemory");
+    assert!(
+        !output.status.success(),
+        "server must exit nonzero on malformed --db-maxmemory, got status {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_uppercase().contains("REFUSING TO START"),
+        "expected a clear REFUSING TO START message on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("not-a-pair"),
+        "error message must name the offending entry, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_out_of_range_db_maxmemory_cli_refuses_to_start() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    let mut cmd = Command::new(find_moon_binary());
+    cmd.args([
+        "--port",
+        &port.to_string(),
+        "--dir",
+        &dir.path().to_string_lossy(),
+        "--shards",
+        "1",
+        "--appendonly",
+        "no",
+        "--databases",
+        "16",
+        "--db-maxmemory",
+        "99:1024", // out of range: >= --databases (16)
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let output = cmd
+        .output()
+        .expect("spawn moon with out-of-range --db-maxmemory");
+    assert!(
+        !output.status.success(),
+        "server must exit nonzero on out-of-range --db-maxmemory, got status {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_uppercase().contains("REFUSING TO START"),
+        "expected a clear REFUSING TO START message on stderr, got: {stderr}"
     );
 }

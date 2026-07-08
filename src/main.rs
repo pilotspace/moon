@@ -901,6 +901,18 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "graph")]
     moon::graph::traversal_guard::set_default_traversal_timeout_ms(config.graph_timeout_ms);
 
+    // WS5b fix-first review (item 3): `--db-maxmemory` is trusted operator
+    // config, not wire input — fail fast on a malformed/out-of-range entry
+    // instead of silently dropping it (which would leave the operator
+    // believing a quota is enforced when it is not). Matches this file's
+    // existing "REFUSING TO START" + exit(2) convention.
+    if let Err(msg) =
+        moon::config::validate_db_maxmemory_cli(&config.db_maxmemory, config.databases)
+    {
+        eprintln!("REFUSING TO START: {msg}");
+        std::process::exit(2);
+    }
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };

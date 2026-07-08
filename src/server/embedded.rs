@@ -193,6 +193,14 @@ pub async fn run_embedded(
         crate::acl::AclTable::load_or_default(&config),
     ));
 
+    // WS5b fix-first review (item 3): `--db-maxmemory` is trusted operator
+    // config, not wire input — fail fast on a malformed/out-of-range entry
+    // rather than silently dropping it. `run_embedded` returns
+    // `anyhow::Result`, so (unlike main.rs's process::exit) this propagates
+    // as a normal error to the embedder instead of killing the process.
+    crate::config::validate_db_maxmemory_cli(&config.db_maxmemory, config.databases)
+        .map_err(|msg| anyhow::anyhow!("invalid --db-maxmemory config: {msg}"))?;
+
     // Shared runtime + server configs.
     let runtime_config_shared: Arc<RwLock<crate::config::RuntimeConfig>> =
         Arc::new(RwLock::new(config.to_runtime_config()));

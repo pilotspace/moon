@@ -145,7 +145,16 @@ pub(crate) fn drain_spsc_shared(
     // write arm below skips the eviction call (and any lock acquire)
     // entirely. `runtime_config` is still threaded through for the actual
     // eviction pass (`spsc_eviction_gate`) when this is true.
-    let evict_active = spill_sender.is_some() || crate::storage::eviction::maxmemory_is_set();
+    //
+    // WS5b fix-first review: MUST also consult the per-db quota atomic —
+    // this gate skips the call to `spsc_eviction_gate` entirely (which is
+    // where the db-quota check for cross-shard write legs lives), so without
+    // this term a server with `--maxmemory 0` and no spill sender never
+    // enforces `--db-maxmemory` on any remote-shard write leg either. Same
+    // bug class as the `batch_eviction_active` fix in handler_monoio/mod.rs.
+    let evict_active = spill_sender.is_some()
+        || crate::storage::eviction::maxmemory_is_set()
+        || crate::storage::db_quota::db_maxmemory_any_set();
 
     // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
     //
