@@ -118,15 +118,29 @@ pub(super) async fn try_handle_ws_command(
                             crate::shard::dispatch::key_to_shard(prefix.as_bytes(), ctx.num_shards);
                         // Unconditional slice path: ShardSlice is always initialized.
                         if cleanup_owner == ctx.shard_id {
-                            // Owner is this shard — operate directly on the slice.
-                            crate::shard::slice::with_shard_db(0, |db| {
-                                let keys_to_delete: Vec<Vec<u8>> = db
-                                    .keys()
-                                    .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
-                                    .map(|k| k.as_bytes().to_vec())
-                                    .collect();
-                                for key in &keys_to_delete {
-                                    db.remove(key);
+                            // Owner is this shard — operate directly on the
+                            // slice. Sweep EVERY logical db on this shard, not
+                            // just db 0 — a workspace-bound connection can
+                            // SELECT to any db before writing (WS AUTH and
+                            // SELECT are orthogonal), so workspace keys can
+                            // legitimately live outside db 0. A db-0-only
+                            // sweep leaked those keys forever after WS DROP
+                            // (found during the WS5b hardening sweep; see
+                            // docs/guides/isolation.md). Cost note:
+                            // synchronous O(keys × --databases) full scan on
+                            // this shard's event-loop thread — see the fuller
+                            // comment on the `WsDropCleanup` handler in
+                            // src/shard/spsc_handler.rs.
+                            crate::shard::slice::with_shard(|s| {
+                                for db in s.databases.iter_mut() {
+                                    let keys_to_delete: Vec<Vec<u8>> = db
+                                        .keys()
+                                        .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
+                                        .map(|k| k.as_bytes().to_vec())
+                                        .collect();
+                                    for key in &keys_to_delete {
+                                        db.remove(key);
+                                    }
                                 }
                             });
                         } else {

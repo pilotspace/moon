@@ -690,12 +690,15 @@ fn dispatch_inner(
             }
         }
         (7, b's') => {
-            // SLOWLOG
+            // SLOWLOG SORT_RO
             if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
                 return resp(crate::admin::slowlog::handle_slowlog(
                     crate::admin::metrics_setup::global_slowlog(),
                     args,
                 ));
+            }
+            if cmd.eq_ignore_ascii_case(b"SORT_RO") {
+                return resp(key_extra::sort_ro(db, args));
             }
         }
         (7, b'z') => {
@@ -882,6 +885,12 @@ fn dispatch_inner(
                 return resp(key::pexpiretime(db, args));
             }
         }
+        (11, b'b') => {
+            // BITFIELD_RO
+            if cmd.eq_ignore_ascii_case(b"BITFIELD_RO") {
+                return resp(string::bitfield_ro(db, args));
+            }
+        }
         (11, b'i') => {
             // INCRBYFLOAT
             if cmd.eq_ignore_ascii_case(b"INCRBYFLOAT") {
@@ -932,6 +941,12 @@ fn dispatch_inner(
                 return resp(hash::hpexpiretime(db, args));
             }
         }
+        (12, b'g') => {
+            // GEORADIUS_RO
+            if cmd.eq_ignore_ascii_case(b"GEORADIUS_RO") {
+                return resp(geo::georadius_ro(db, args));
+            }
+        }
         // 13-letter commands
         (13, b'z') => {
             // ZRANGEBYSCORE
@@ -958,6 +973,13 @@ fn dispatch_inner(
             // GEORADIUSBYMEMBER
             if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER") {
                 return resp(geo::georadiusbymember(db, args));
+            }
+        }
+        // 20-letter commands
+        (20, b'g') => {
+            // GEORADIUSBYMEMBER_RO
+            if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER_RO") {
+                return resp(geo::georadiusbymember_ro(db, args));
             }
         }
         _ => {}
@@ -1052,9 +1074,12 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (11, b'p') // PEXPIRETIME
         | (11, b'z') // ZRANDMEMBER
         | (11, b's') // SRANDMEMBER
+        | (11, b'b') // BITFIELD_RO
         | (12, b'h') // HPEXPIRETIME
+        | (12, b'g') // GEORADIUS_RO
         | (13, b'z') // ZRANGEBYSCORE
         | (16, b'z') // ZREVRANGEBYSCORE
+        | (20, b'g') // GEORADIUSBYMEMBER_RO
     )
 }
 
@@ -1473,11 +1498,15 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
         }
         (7, b's') => {
             // SLOWLOG — named exception: RESET mutates the global ring (own sync, not Database)
+            // SORT_RO
             if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
                 return resp(crate::admin::slowlog::handle_slowlog(
                     crate::admin::metrics_setup::global_slowlog(),
                     args,
                 ));
+            }
+            if cmd.eq_ignore_ascii_case(b"SORT_RO") {
+                return resp(key_extra::sort_ro_readonly(db, args, now_ms));
             }
         }
         (7, b'z') => {
@@ -1532,6 +1561,24 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // ZRANDMEMBER (11 bytes)
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember_readonly(db, args, now_ms));
+            }
+        }
+        (11, b'b') => {
+            // BITFIELD_RO (11 bytes)
+            if cmd.eq_ignore_ascii_case(b"BITFIELD_RO") {
+                return resp(string::bitfield_ro_readonly(db, args, now_ms));
+            }
+        }
+        (12, b'g') => {
+            // GEORADIUS_RO (12 bytes)
+            if cmd.eq_ignore_ascii_case(b"GEORADIUS_RO") {
+                return resp(geo::georadius_ro_readonly(db, args, now_ms));
+            }
+        }
+        (20, b'g') => {
+            // GEORADIUSBYMEMBER_RO (20 bytes)
+            if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER_RO") {
+                return resp(geo::georadiusbymember_ro_readonly(db, args, now_ms));
             }
         }
         _ => {}

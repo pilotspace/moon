@@ -403,6 +403,232 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// Detect whether SORT args request STORE, using the same token-position
+/// walk as `sort()`'s parser (so a `BY`/`GET` pattern value that happens to
+/// read "STORE" is never mistaken for the keyword).
+fn sort_args_request_store(args: &[Frame]) -> bool {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = match extract_key(&args[i]) {
+            Some(a) => a,
+            None => return false, // sort()/sort_ro_readonly surfaces the syntax error
+        };
+        if arg.eq_ignore_ascii_case(b"STORE") {
+            return true;
+        } else if arg.eq_ignore_ascii_case(b"BY") || arg.eq_ignore_ascii_case(b"GET") {
+            i += 1; // skip the pattern value
+        } else if arg.eq_ignore_ascii_case(b"LIMIT") {
+            i += 2; // skip offset + count
+        }
+        // ASC/DESC/ALPHA consume no extra args
+        i += 1;
+    }
+    false
+}
+
+const SORT_RO_STORE_ERR: &[u8] =
+    b"ERR SORT_RO is read-only and does not accept the STORE parameter";
+
+/// SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA]
+///
+/// Read-only twin of SORT — same option grammar minus STORE (a write
+/// side-effect has no place in a replica-routable read command). Used on the
+/// mutable dispatch track; delegates to `sort()` once STORE is ruled out.
+pub fn sort_ro(db: &mut Database, args: &[Frame]) -> Frame {
+    if sort_args_request_store(args) {
+        return Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR));
+    }
+    sort(db, args)
+}
+
+/// Read-only twin of `sort_ro` for the `dispatch_read` fast path: uses
+/// `get_if_alive` throughout (key + BY/GET pattern lookups) so it never
+/// takes the lazy-expiry write path.
+pub fn sort_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SORT_RO");
+    }
+    if sort_args_request_store(args) {
+        return Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR));
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SORT_RO"),
+    };
+
+    let mut by_pattern: Option<&[u8]> = None;
+    let mut get_patterns: Vec<&[u8]> = Vec::new();
+    let mut limit_offset: usize = 0;
+    let mut limit_count: Option<usize> = None;
+    let mut descending = false;
+    let mut alpha = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let arg = match extract_key(&args[i]) {
+            Some(a) => a,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if arg.eq_ignore_ascii_case(b"BY") {
+            i += 1;
+            by_pattern = Some(match extract_key(args.get(i).unwrap_or(&Frame::Null)) {
+                Some(p) => p,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            });
+        } else if arg.eq_ignore_ascii_case(b"GET") {
+            i += 1;
+            let pat = match extract_key(args.get(i).unwrap_or(&Frame::Null)) {
+                Some(p) => p,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            get_patterns.push(pat);
+        } else if arg.eq_ignore_ascii_case(b"LIMIT") {
+            let off = match args.get(i + 1).and_then(|f| parse_int(f)) {
+                Some(v) if v >= 0 => v as usize,
+                _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            let cnt = match args.get(i + 2).and_then(|f| parse_int(f)) {
+                Some(v) if v >= 0 => v as usize,
+                _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            limit_offset = off;
+            limit_count = Some(cnt);
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"ASC") {
+            descending = false;
+        } else if arg.eq_ignore_ascii_case(b"DESC") {
+            descending = true;
+        } else if arg.eq_ignore_ascii_case(b"ALPHA") {
+            alpha = true;
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+        i += 1;
+    }
+
+    use crate::storage::compact_value::RedisValueRef;
+    let elements: Vec<Bytes> = match db.get_if_alive(key, now_ms) {
+        None => return Frame::Array(framevec![]),
+        Some(entry) => match entry.value.as_redis_value() {
+            RedisValueRef::List(l) => l.iter().cloned().collect(),
+            RedisValueRef::ListListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::Set(s) => s.iter().cloned().collect(),
+            RedisValueRef::SetListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::SetIntset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
+            RedisValueRef::SortedSet { members, .. } => members.keys().cloned().collect(),
+            RedisValueRef::SortedSetBPTree { members, .. } => members.keys().cloned().collect(),
+            RedisValueRef::SortedSetListpack(lp) => {
+                let entries: Vec<_> = lp.iter().collect();
+                entries
+                    .chunks(2)
+                    .filter_map(|c| c.first().map(|e| e.to_bytes()))
+                    .collect()
+            }
+            _ => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        },
+    };
+
+    let sort_keys: Vec<Option<Bytes>> = if let Some(pattern) = by_pattern {
+        if pattern == b"nosort" {
+            elements.iter().map(|_| None).collect()
+        } else {
+            elements
+                .iter()
+                .map(|elem| {
+                    let lookup_key = apply_pattern(pattern, elem);
+                    db.get_if_alive(&lookup_key, now_ms)
+                        .and_then(|e| e.value.as_bytes().map(|b| Bytes::copy_from_slice(b)))
+                })
+                .collect()
+        }
+    } else {
+        elements.iter().map(|e| Some(e.clone())).collect()
+    };
+
+    let no_sort = by_pattern.is_some_and(|p| p == b"nosort");
+    if !alpha && !no_sort {
+        for sk in &sort_keys {
+            if let Some(v) = sk {
+                if std::str::from_utf8(v)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .is_none()
+                {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR One or more scores can't be converted into double",
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut indices: Vec<usize> = (0..elements.len()).collect();
+    if !no_sort {
+        indices.sort_by(|&a, &b| {
+            let ka = sort_keys[a].as_ref();
+            let kb = sort_keys[b].as_ref();
+            let cmp = match (ka, kb) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(va), Some(vb)) => {
+                    if alpha {
+                        va.cmp(vb)
+                    } else {
+                        let fa = std::str::from_utf8(va)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let fb = std::str::from_utf8(vb)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                }
+            };
+            if descending { cmp.reverse() } else { cmp }
+        });
+    }
+
+    let start = limit_offset.min(indices.len());
+    let count = limit_count.unwrap_or(indices.len());
+    let end = (start + count).min(indices.len());
+    let selected = &indices[start..end];
+
+    let results: Vec<Frame> = if get_patterns.is_empty() {
+        selected
+            .iter()
+            .map(|&idx| Frame::BulkString(elements[idx].clone()))
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(selected.len() * get_patterns.len());
+        for &idx in selected {
+            for pat in &get_patterns {
+                if *pat == b"#" {
+                    out.push(Frame::BulkString(elements[idx].clone()));
+                } else {
+                    let lookup_key = apply_pattern(pat, &elements[idx]);
+                    match db.get_if_alive(&lookup_key, now_ms) {
+                        Some(e) => match e.value.as_bytes() {
+                            Some(v) => out.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+                            None => out.push(Frame::Null),
+                        },
+                        None => out.push(Frame::Null),
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    Frame::Array(results.into())
+}
+
 /// Apply a SORT pattern by replacing the first `*` with the element value.
 fn apply_pattern(pattern: &[u8], element: &[u8]) -> Bytes {
     if let Some(pos) = pattern.iter().position(|&b| b == b'*') {
@@ -618,5 +844,100 @@ mod tests {
                 Frame::BulkString(Bytes::from_static(b"3")),
             ])
         );
+    }
+
+    // --- SORT_RO tests ---
+
+    #[test]
+    fn test_sort_ro_matches_sort() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
+        let result = sort_ro(&mut db, &[bs(b"mylist")]);
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"1")),
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_ro_rejects_store() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
+        let result = sort_ro(&mut db, &[bs(b"mylist"), bs(b"STORE"), bs(b"dest")]);
+        assert_eq!(result, Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR)));
+        // Confirms read-only: STORE never ran.
+        assert!(!db.exists(b"dest"));
+    }
+
+    #[test]
+    fn test_sort_ro_limit_and_alpha() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"banana", b"apple", b"cherry"]);
+        let result = sort_ro(
+            &mut db,
+            &[
+                bs(b"mylist"),
+                bs(b"ALPHA"),
+                bs(b"LIMIT"),
+                bs(b"0"),
+                bs(b"2"),
+            ],
+        );
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"apple")),
+                Frame::BulkString(Bytes::from_static(b"banana")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_ro_readonly_matches_mutable_track() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
+        let result = sort_ro_readonly(&db, &[bs(b"mylist")], 0);
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"1")),
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_ro_readonly_rejects_store() {
+        let db = Database::new();
+        let result = sort_ro_readonly(&db, &[bs(b"mylist"), bs(b"STORE"), bs(b"dest")], 0);
+        assert_eq!(result, Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR)));
+    }
+
+    #[test]
+    fn test_sort_ro_readonly_missing_key() {
+        let db = Database::new();
+        let result = sort_ro_readonly(&db, &[bs(b"nokey")], 0);
+        assert_eq!(result, Frame::Array(framevec![]));
+    }
+
+    #[test]
+    fn test_sort_ro_readonly_get_pattern_value_named_store_is_not_rejected() {
+        // Regression guard for the positional STORE detector: a GET pattern
+        // whose literal value is "STORE" must not be mistaken for the STORE
+        // keyword (it occupies a value slot, not a keyword slot) — it must
+        // be treated as an ordinary (non-wildcard) GET lookup key, not
+        // rejected with the SORT_RO STORE error.
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"1"]);
+        let result = sort_ro_readonly(&db, &[bs(b"mylist"), bs(b"GET"), bs(b"STORE")], 0);
+        // No key literally named "STORE" exists, so the external lookup
+        // misses (Null) — the important assertion is that this is NOT the
+        // SORT_RO STORE-rejection error.
+        assert_eq!(result, Frame::Array(framevec![Frame::Null]));
     }
 }

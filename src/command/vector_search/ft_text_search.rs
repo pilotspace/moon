@@ -1429,7 +1429,7 @@ fn strip_surrounding_parens(s: &[u8]) -> &[u8] {
 /// 6. Sorts descending by score, applies LIMIT, returns RESP array
 ///
 /// Response format: `[total, key1, ["__bm25_score", "N.NNNNNN"], key2, [...], ...]`
-pub fn ft_text_search(text_store: &TextStore, args: &[Frame]) -> Frame {
+pub fn ft_text_search(text_store: &TextStore, args: &[Frame], db_index: u8) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.SEARCH' command",
@@ -1472,11 +1472,12 @@ pub fn ft_text_search(text_store: &TextStore, args: &[Frame]) -> Frame {
             top_k,
             limit_offset,
             limit_count,
+            db_index,
         )
     }
     #[cfg(not(feature = "text-index"))]
     {
-        let _ = (text_store, index_name, query_bytes, top_k);
+        let _ = (text_store, index_name, query_bytes, top_k, db_index);
         Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
     }
 }
@@ -1599,8 +1600,10 @@ pub fn run_text_query(
     top_k: usize,
     offset: usize,
     count: usize,
+    db_index: u8,
 ) -> Frame {
-    match text_store.get_index(index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible.
+    match text_store.get_index_for_db(index_name, db_index) {
         Some(text_index) => {
             run_text_query_on_index(text_index, query, None, None, top_k, offset, count)
         }

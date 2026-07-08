@@ -44,12 +44,14 @@ pub(super) fn search_local_raw(
     filter: Option<&FilterExpr>,
     field_name: Option<&Bytes>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> SearchRawResult {
     // Clone committed treemap BEFORE get_index_mut to satisfy the borrow checker.
     // Non-TXN readers need this to see entries whose owning txn has committed
     // (entries tagged with txn_id by auto_index_hset_public_txn; ACID-09 fix).
     let committed = store.txn_manager().committed_snapshot();
-    let idx = match store.get_index_mut(index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible (NOTFOUND).
+    let idx = match store.get_index_mut_for_db(index_name, db_index) {
         Some(i) => i,
         None => {
             return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name")));
@@ -187,6 +189,7 @@ pub fn search_local(
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
+    db_index: u8,
 ) -> Frame {
     search_local_filtered(
         store,
@@ -198,6 +201,7 @@ pub fn search_local(
         usize::MAX,
         None,
         0,
+        db_index,
     )
 }
 
@@ -221,11 +225,13 @@ pub fn search_local_filtered(
     count: usize,
     field_name: Option<&Bytes>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> Frame {
     // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering).
     // Ensures non-TXN readers see entries whose owning txn has committed.
     let committed = store.txn_manager().committed_snapshot();
-    let idx = match store.get_index_mut(index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible (NOTFOUND).
+    let idx = match store.get_index_mut_for_db(index_name, db_index) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };

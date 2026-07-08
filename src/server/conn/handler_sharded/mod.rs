@@ -1103,6 +1103,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         crate::command::server_admin::vacuum_vector(
                                             &mut s.vector_store,
                                             &cmd_args[1..],
+                                            conn.selected_db as u8,
                                         )
                                     });
                                     responses.push(response);
@@ -1423,9 +1424,41 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 } else {
                                     try_evict_if_needed_budget(db, &rt, budget)
                                 };
-                                if let Err(oom_frame) = evict_result {
-                                    drop(rt);
-                                    return Err(oom_frame);
+                                // WS6 fix (HIGH, adversarial review 2026-07-08): a
+                                // command that can only shrink memory (HDEL, SREM,
+                                // LPOP, ...) must never be REJECTED by either gate
+                                // below, or a key/db that crosses its noeviction
+                                // boundary has no self-recovery path. Eviction is
+                                // still attempted above; only the reject is
+                                // bypassed. See `db_quota::is_shrink_only_command`.
+                                let shrink_only =
+                                    crate::storage::db_quota::is_shrink_only_command(cmd);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = evict_result {
+                                        drop(rt);
+                                        return Err(oom_frame);
+                                    }
+                                }
+                                // WS5b: per-db quota, additive and finer-grained
+                                // than the whole-instance maxmemory gate above.
+                                // Zero-cost when unconfigured for this db.
+                                // `_for_command` exempts SELECT/SWAPDB (this
+                                // chokepoint runs on `metadata::is_write`-flagged
+                                // commands, which includes SELECT despite it not
+                                // writing to the current db — see
+                                // `db_quota::command_exempt_from_db_quota`).
+                                let db_quota_result =
+                                    crate::storage::db_quota::check_db_maxmemory_for_command(
+                                        db,
+                                        conn.selected_db,
+                                        &rt,
+                                        cmd,
+                                    );
+                                if !shrink_only {
+                                    if let Err(oom_frame) = db_quota_result {
+                                        drop(rt);
+                                        return Err(oom_frame);
+                                    }
                                 }
                                 drop(rt);
 
@@ -1549,9 +1582,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // with_shard closure (multi-resource arm) to avoid re-entrant RefCell borrow.
                                     let inserted = crate::shard::slice::with_shard(|s| {
                                         if active_txn_id != 0 {
-                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id)
+                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id, conn.selected_db as u8)
                                         } else {
-                                            crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args)
+                                            crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args, conn.selected_db as u8)
                                         }
                                     });
                                     // Push one VectorIntent per (index_name, key_hash) so
@@ -1572,7 +1605,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::shard::slice::with_shard(|s| {
                                     for arg in cmd_args.iter() {
                                         if let Some(key) = extract_bytes(arg) {
-                                            s.vector_store.mark_deleted_for_key(key.as_ref());
+                                            s.vector_store.mark_deleted_for_key_for_db(
+                                                key.as_ref(),
+                                                conn.selected_db as u8,
+                                            );
                                         }
                                     }
                                 });
@@ -1587,11 +1623,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     crate::shard::spsc_handler::auto_hdel_vectors(
                                         &mut s.vector_store,
                                         cmd_args,
+                                        conn.selected_db as u8,
                                     );
                                 });
                             }
                             // R3: FLUSHALL/FLUSHDB clears vector + text index contents
                             // (FT.CREATE definitions survive, matching restart semantics).
+                            // WS5a: FLUSHDB scopes to `conn.selected_db`; FLUSHALL clears
+                            // every db.
                             if !matches!(response, Frame::Error(_))
                                 && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                     || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -1600,6 +1639,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     crate::shard::spsc_handler::auto_flush_indexes(
                                         &mut s.vector_store,
                                         &mut s.text_store,
+                                        cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                                        conn.selected_db as u8,
                                     );
                                 });
                                 // D-2: keyless flush routed local-only cleared just this

@@ -94,13 +94,16 @@ impl LuaEvictionCtx {
             return Ok(());
         };
         // Lock-free fast path: a script issuing thousands of writes checks
-        // the process-global atomic (Gap C), not the RuntimeConfig lock.
-        if inner.spill_sender.is_none() && !crate::storage::eviction::maxmemory_is_set() {
+        // process-global atomics (Gap C + WS5b), not the RuntimeConfig lock.
+        if inner.spill_sender.is_none()
+            && !crate::storage::eviction::maxmemory_is_set()
+            && !crate::storage::db_quota::db_maxmemory_any_set()
+        {
             return Ok(());
         }
         let rt = inner.runtime_config.read();
         let budget = inner.shard_databases.elastic_budget(inner.shard_id);
-        if let Some(sender) = &inner.spill_sender {
+        let global_result = if let Some(sender) = &inner.spill_sender {
             let mut fid = inner.spill_file_id.get();
             let dir = inner
                 .disk_offload_dir
@@ -113,7 +116,11 @@ impl LuaEvictionCtx {
             res
         } else {
             try_evict_if_needed_budget(db, &rt, budget)
-        }
+        };
+        global_result?;
+        // WS5b: per-db quota, additive and finer-grained than the
+        // whole-instance maxmemory gate above. Zero-cost when unconfigured.
+        crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt)
     }
 }
 

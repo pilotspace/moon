@@ -16,7 +16,7 @@ recommendation here is backed by measurements on dedicated-vCPU GCE instances
 | Workload | Recipe |
 |---|---|
 | Pure cache (no durability) | `--appendonly no --maxmemory <bytes> --maxmemory-policy allkeys-lru` |
-| Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores |
+| Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores, or `--profile standalone` (see [Profiles](#profiles) — **pinned cores only**) |
 | High-concurrency API backend (8+ conns) | `--shards 4` (+ busy-poll on dedicated cores) |
 | Pipelined / batch ingest | `--shards 4` or more; pipeline depth ≥ 16 |
 | Durable primary store | defaults (`--appendonly yes --appendfsync everysec`, ~1.32× Redis at depth); `always` for RPO 0 — disk-fsync-bound, pipelines fine |
@@ -67,6 +67,60 @@ The trade-offs are explicit:
   instances). On shared/oversubscribed hosts (laptops, burstable VMs, busy Kubernetes
   nodes) it *regresses* performance — the spin fights neighbors for the core.
 - Values 20–100 µs behave similarly; 40 is a good default. `0` (default) disables it.
+
+## Profiles
+
+`--profile <name>` bundles a set of proven flags for a given deployment shape into one
+switch, instead of you having to remember and re-type the individual recipe every time.
+
+**Precedence rule:** a profile only fills flags you left at their default. Any flag you
+pass explicitly — on the CLI or in `moon.conf` — always wins over the profile's value.
+Startup logs exactly which flags the profile set, so `--profile` is never a silent
+behavior change:
+
+```text
+INFO --profile standalone: set --shards=1, --io-busy-poll-us=40, --io-driver=epoll
+     (implied by io-busy-poll-us) (unset flags only; pass a flag explicitly on the
+     CLI to override the preset)
+```
+
+### `standalone`
+
+For a single dedicated Moon instance answering low-pipeline request/response traffic —
+the "beat Redis at p=1" shape from the [Busy-polling](#busy-polling-single-op-latency-on-dedicated-cores)
+and [shard count](#shard-count-the-most-important-knob) sections above, as one flag:
+
+```
+moon --profile standalone
+```
+
+Expands to (only for flags left unset):
+
+| Flag | Value | Why |
+|---|---|---|
+| `--shards` | `1` | best per-op latency for low-concurrency, non-pipelined traffic |
+| `--io-busy-poll-us` | `40` | deletes scheduler sleep/wake latency from the request path |
+| `--io-driver` | `epoll` | implied by busy-poll (legacy driver only; io_uring CQEs aren't observable this way) |
+
+> **⚠ Pinned/dedicated cores required.** `--io-busy-poll-us` busy-loops the shard thread
+> for up to the budget before parking. On a host with genuinely idle, pinned cores this
+> deletes wakeup latency and is the single biggest lever behind Moon's p=1 win over Redis
+> (measured 1.19–1.21× ARM, 1.65–1.66× x86 on GCE, 2026-07). On **shared or oversubscribed
+> cores** — OrbStack's default VM, laptops, burstable/noisy-neighbor cloud instances,
+> busy Kubernetes nodes — the same spin **regresses** throughput: it fights every other
+> tenant for the core instead of yielding it. **Do not** reach for `--profile standalone`
+> on such hosts; run without it (or with `--io-busy-poll-us 0`, the plain default) and
+> rely on shard count alone.
+>
+> There is currently no automatic pinned-core detection — this is an operator judgment
+> call, not something Moon can safely default on for you.
+
+An unrecognized profile name is a startup error (exit code 2), not a silent no-op:
+
+```
+$ moon --profile bogus
+moon: unknown --profile 'bogus' (supported: standalone)
+```
 
 ## Persistence: what durability costs
 
@@ -130,6 +184,161 @@ are fire-and-forget and never persisted, regardless of `--appendonly`.
   Also size `--vec-warm-mmap-budget` down if you use vector search under a cgroup limit.
 - Comparing per-key memory against Redis? Use `--shards 1` and a fresh server; RSS is a
   high-water mark, so measure by loading a known keyspace, not by deltas.
+
+## Tiered memory offload (KV + vector, `--disk-offload`)
+
+`--disk-offload` (default `enable`) lets cold data leave RAM instead of staying
+resident forever:
+
+- **KV**: cold values spill to `KvLeafPage` DataFiles under `--disk-offload-dir`
+  (default: same as `--dir`). `--disk-offload-threshold` (default `0.85`) is
+  the RAM-pressure trigger — once a shard's published KV memory crosses
+  `threshold × per-shard budget`, the eviction tick runs an ordered cascade
+  *before* falling back to plain LRU/LFU eviction: PageCache clock-sweep
+  eviction → force-demote the oldest HOT vector segments to WARM → proactive
+  spill via the background `SpillThread` → a `noeviction` warning if none of
+  that relieved pressure. This makes offload proactive instead of edge-
+  triggered — you don't have to hit `maxmemory` exactly to start shedding.
+- **Cold reads** (`GET` on a spilled key) go through `PageCache` when a page
+  is already cached (repeated cold reads that land on the same 4KB
+  `KvLeafPage` — several keys packed into one page, or a key churned
+  cold→hot→cold — are served without a second `pread`). A promoted key is
+  moved back into the hot DashTable on its first cold hit, same as before.
+- **Vector segments**: immutable (HOT) HNSW+TurboQuant segments transition to
+  a mmap-backed WARM tier — see the next section.
+- `--pagecache-size` (default: 25% of `--maxmemory`) sizes the buffer pool
+  backing both the KV cold-read cache and vector/graph page I/O; it starts
+  empty and grows lazily, so setting it high does not pre-commit RAM.
+
+## Vector/FTS/graph idle-unload
+
+Immutable vector segments (`ImmutableSegment`: full in-memory HNSW graph +
+TurboQuant codes + f16 exact-rerank sidecar) don't have to stay resident
+forever once a workload goes cold. Two independent, differently-behaved
+tiers can receive a HOT segment — **COLD wins if both would fire at once**:
+
+- `--engine-offload-idle-secs <secs>` (default `3600`, `0` disables this
+  criterion) — seconds since the segment last served a search. Idle segments
+  go straight to a **COLD** stub: the HNSW graph, TQ/SQ8 codes, and f16
+  sidecar are dropped from memory entirely, keeping only the segment
+  directory path, doc count, and enough metadata to reload. This is the one
+  to lower if you want genuinely cold segments to actually free RAM.
+- `--segment-warm-after <secs>` (default `3600`) — age since the segment was
+  compacted, regardless of query traffic. Segments that age out *without*
+  also being idle go to the **WARM** tier (`WarmSearchSegment`) instead —
+  see the caveat below.
+
+Set `--engine-offload-idle-secs` below `--segment-warm-after` if you want
+idleness to be the effective, memory-freeing trigger for most segments (the
+common case); a segment that's old-but-still-busy will hit `--segment-
+warm-after` first and land on WARM, which does not free memory (below).
+
+**COLD tier (idle-triggered) — real memory savings.** On the next query that
+touches a COLD segment, it is synchronously reloaded via the same on-disk
+`.mpf`-file path used at server boot (`WarmSearchSegment::from_files`), so
+recall is exactly preserved — the exact-rerank sidecar is never silently
+dropped, only paged back in. The reload is single-flight per segment (a
+`parking_lot::Mutex` guards the promote-and-reload sequence), so concurrent
+queries hitting the same COLD segment block behind one reload rather than
+each re-reading the segment from disk.
+Measured on a real server (40,000 × 768-dim vectors, SQ8, single shard):
+
+| Phase | RSS |
+|---|---|
+| Before unload (HOT) | 400,544 KB |
+| After unload (COLD) | 295,760 KB (**−26.2%**) |
+| After reload (touched, back to WARM) | 395,376 KB |
+
+> **⚠ First-touch reload latency is a SHARD-WIDE stall, not just a
+> per-query one.** All three call sites that reload a COLD segment
+> (`SegmentHolder::search_filtered`, `SegmentHolder::search_mvcc`, and the
+> FT.SEARCH yielding/worker-pool path's snapshot capture in
+> `command/vector_search/ft_search/dispatch.rs`) run their promote-and-reload
+> step INSIDE `crate::shard::slice::with_shard(...)`, i.e. on the shard's own
+> single OS thread, before any `.await` boundary — confirmed by tracing every
+> call site, not assumed. Under monoio's thread-per-core model this means
+> the reload blocks every connection sharing that shard, not only the one
+> that triggered it, for the reload's duration (`--shards 1` makes this
+> "every connection on the server"). PR #179's off-loop worker pool
+> (`crate::vector::search_pool`) only carries the actual HNSW beam search off
+> the event loop after capture — the capture phase, including a COLD reload,
+> is deliberately synchronous by design (`SearchSnapshot` capture must run
+> under one `&mut VectorIndex` borrow). Moving the reload itself off-thread
+> would require `SegmentHolder` to be reachable from the async continuation
+> without holding open a `VectorIndex` borrow (e.g. wrapping it in an `Arc`,
+> a ~100-call-site change) — out of scope for this pass; tracked as a
+> follow-up. In practice this only matters the FIRST query after a segment
+> goes idle: measured on the 40K×768d fixture above (same-instance
+> measurement, `--shards 1`), the first-touch `FT.SEARCH` round-trip that
+> triggered the reload took **79.59 ms**, during which a concurrent `PING`
+> hammering a second connection to the same shard peaked at **76.70 ms**
+> (vs a sub-millisecond baseline) — confirming the stall is real, shard-wide,
+> and essentially the full duration of the reload itself, but bounded to a
+> single segment-reload's worth of wall time, once per idle segment touched.
+
+**WARM tier (pure-age-triggered) — does not reduce RSS by itself.**
+`WarmSearchSegment::from_files` opens each `.mpf` file's mmap only for the
+duration of loading and immediately copies every payload into owned
+`Vec<u8>` / a parsed `HnswGraph` of essentially the same size as the HOT
+segment it replaces — the two structures that dominate memory at scale (TQ
+codes + the HNSW graph) are fully duplicated in heap memory, not lazily
+paged in from disk. The idle/age *triggers* are both correctly wired
+(`FT.INFO` counters, recall, and `num_docs` are verified correct across
+both transitions), and the **subsequent** `--vec-warm-mmap-budget` LRU
+eviction *does* free real memory (it drops the `Arc` outright, same as COLD
+— but without a promote-on-touch reload path, see the known bug below). But
+"demote to WARM" alone is not a memory-saving operation — it exists so an
+old-but-still-queried segment doesn't pay the COLD reload latency on every
+touch. A true zero-copy WARM tier (HNSW traversal + TQ-ADC distance kernels
+operating directly on borrowed mmap'd bytes instead of owned buffers) is an
+open, larger follow-up; until then, prefer tuning
+`--engine-offload-idle-secs` (COLD) over `--segment-warm-after` (WARM) when
+the goal is lower RSS.
+
+> **⚠ Known pre-existing bug, not introduced by the COLD tier:**
+> `MmapBudget::enforce_budget`'s WARM-tier LRU eviction drops the `Arc<WarmSearchSegment>`
+> outright with no reload-on-touch mechanism, despite its own doc comment
+> claiming one exists — once a WARM segment is evicted by the mmap budget it
+> stops being searched until restart. This is a correctness gap in the
+> pre-existing WARM path, not the new COLD path (COLD always reloads on
+> touch). Tracked for a follow-up fix.
+
+`FT.INFO <index>` reports tier residency (summed across shards):
+
+- `graph_segments` / `segments_with_exact_rerank` — HOT segments, and how
+  many still carry the sidecar (should equal `graph_segments`; less means
+  something dropped a sidecar somewhere upstream — see the vector search
+  guide's HQ-1 notes).
+- `warm_segments` / `warm_segments_with_exact_rerank` — same pair for the
+  WARM tier. A gap here after a fresh idle-unload is a regression: file an
+  issue, it means the exact-rerank sidecar failed to transfer.
+- `unloaded_segments` / `unloaded_segments_with_exact_rerank` — same pair
+  for the COLD tier. `unloaded_segments_with_exact_rerank` reflects whether
+  the *stub* remembers it had a sidecar before unload (used to detect drift
+  after reload), not whether the sidecar is currently resident (it isn't —
+  that's the point of COLD).
+
+Both tiers correctly participate in `FLUSHALL`/`FLUSHDB`/`FT.DROPINDEX`
+(their on-disk directories are tombstoned/removed like any other segment),
+survive server restart cleanly (COLD/WARM segments are just on-disk data —
+they're rediscovered fresh as HOT by the existing boot-recovery scan, no
+special-cased restoration needed), and are skipped by GraphUnion background
+merge scheduling (`needs_merge`/`begin_background_merge` only ever consider
+`immutable`, never `warm`/`unloaded`, so a COLD segment can't be corrupted
+by a concurrent merge attempt).
+
+**Known limitation shared by both tiers (pre-existing, not introduced by
+this work):** per-key tombstoning (`DEL`/`HDEL` on an indexed vector field)
+does not currently walk WARM or COLD segments — a delete against a key that
+lives only in a WARM/COLD segment does not take effect until that segment
+is later merged or dropped. This is an existing gap in the tombstone path,
+not something the COLD tier introduces or worsens.
+
+FTS (`TextStore`) and the graph engine do not yet have an equivalent
+idle-unload path — FTS has no aggregate memory-accounting API yet, and while
+the graph engine's on-disk segment (`MmapCsrSegment`) is already mmap-backed,
+it has no idle/LRU-eviction-driven unload comparable to vector's
+`MmapBudget`. Both are natural follow-ups but need their own design pass.
 
 ## Platform notes
 

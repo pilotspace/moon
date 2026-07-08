@@ -32,6 +32,7 @@ pub fn config_get(
             b"maxmemory-samples",
             runtime_config.maxmemory_samples.to_string(),
         ),
+        (b"db-maxmemory", format_db_maxmemory(runtime_config)),
         (b"lfu-log-factor", runtime_config.lfu_log_factor.to_string()),
         (b"lfu-decay-time", runtime_config.lfu_decay_time.to_string()),
         (
@@ -69,6 +70,20 @@ pub fn config_get(
     }
 
     Frame::Array(result.into())
+}
+
+/// Format `db-maxmemory` for CONFIG GET as a comma-joined `<db>:<bytes>` list
+/// of only the dbs with a nonzero quota (an all-zero/empty Vec formats as
+/// the empty string, matching the "feature unconfigured" fast path).
+fn format_db_maxmemory(runtime_config: &RuntimeConfig) -> String {
+    runtime_config
+        .db_maxmemory
+        .iter()
+        .enumerate()
+        .filter(|&(_, &limit)| limit > 0)
+        .map(|(idx, &limit)| format!("{idx}:{limit}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Handle CONFIG SET for runtime-mutable parameters.
@@ -140,6 +155,27 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 _ => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'maxmemory-samples'",
+                        value_str
+                    )));
+                }
+            },
+            "db-maxmemory" => match crate::config::parse_one_db_maxmemory_entry(&value_str) {
+                Ok((idx, bytes)) if idx < runtime_config.db_maxmemory.len() => {
+                    runtime_config.db_maxmemory[idx] = bytes;
+                    crate::storage::db_quota::publish_db_maxmemory_any_set(&*runtime_config);
+                }
+                Ok((idx, _)) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR CONFIG SET 'db-maxmemory': db index {} is out of range \
+                         (0..{}, see --databases)",
+                        idx,
+                        runtime_config.db_maxmemory.len()
+                    )));
+                }
+                Err(reason) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'db-maxmemory' ({reason}, \
+                         expected '<db>:<bytes>')",
                         value_str
                     )));
                 }
@@ -265,6 +301,11 @@ pub fn config_rewrite(runtime_config: &RuntimeConfig, server_config: &ServerConf
         "maxmemory-samples {}",
         runtime_config.maxmemory_samples
     ));
+    for (idx, &limit) in runtime_config.db_maxmemory.iter().enumerate() {
+        if limit > 0 {
+            lines.push(format!("db-maxmemory {idx}:{limit}"));
+        }
+    }
     lines.push(format!("lfu-log-factor {}", runtime_config.lfu_log_factor));
     lines.push(format!("lfu-decay-time {}", runtime_config.lfu_decay_time));
     lines.push(String::new());
@@ -458,5 +499,104 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    // --- db-maxmemory CONFIG SET/GET (WS5b) ---
+
+    fn rt_with_dbs(n: usize) -> RuntimeConfig {
+        RuntimeConfig {
+            db_maxmemory: vec![0u64; n],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_config_set_db_maxmemory() {
+        let mut rt = rt_with_dbs(16);
+        let args = make_args(&[b"db-maxmemory", b"3:1048576"]);
+        let result = config_set(&mut rt, &args);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(rt.db_maxmemory[3], 1048576);
+        // Sibling dbs untouched.
+        assert_eq!(rt.db_maxmemory[0], 0);
+        assert_eq!(rt.db_maxmemory[2], 0);
+    }
+
+    #[test]
+    fn test_config_set_db_maxmemory_zero_clears_quota() {
+        let mut rt = rt_with_dbs(4);
+        rt.db_maxmemory[1] = 500;
+        let args = make_args(&[b"db-maxmemory", b"1:0"]);
+        let result = config_set(&mut rt, &args);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(rt.db_maxmemory[1], 0);
+    }
+
+    #[test]
+    fn test_config_set_db_maxmemory_out_of_range_errors() {
+        let mut rt = rt_with_dbs(4);
+        let args = make_args(&[b"db-maxmemory", b"99:1024"]);
+        let result = config_set(&mut rt, &args);
+        match result {
+            Frame::Error(msg) => {
+                assert!(String::from_utf8_lossy(&msg).contains("out of range"));
+            }
+            other => panic!("expected Frame::Error, got {other:?}"),
+        }
+        // Must not have mutated the Vec (no resize, no partial write).
+        assert_eq!(rt.db_maxmemory, vec![0u64; 4]);
+    }
+
+    #[test]
+    fn test_config_set_db_maxmemory_malformed_errors() {
+        let mut rt = rt_with_dbs(4);
+        for bad in [b"garbage" as &[u8], b"1", b"a:1024", b"1:notbytes"] {
+            let args = make_args(&[b"db-maxmemory", bad]);
+            let result = config_set(&mut rt, &args);
+            assert!(
+                matches!(result, Frame::Error(_)),
+                "expected error for malformed entry {:?}",
+                std::str::from_utf8(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_get_db_maxmemory_lists_only_nonzero() {
+        let mut rt = rt_with_dbs(4);
+        rt.db_maxmemory[0] = 1024;
+        rt.db_maxmemory[2] = 2048;
+        let sc = default_server_config();
+        let args = make_args(&[b"db-maxmemory"]);
+        let result = config_get(&rt, &sc, &args);
+        if let Frame::Array(arr) = result {
+            assert_eq!(arr.len(), 2, "name + value pair");
+            assert_eq!(
+                arr[0],
+                Frame::BulkString(Bytes::from_static(b"db-maxmemory"))
+            );
+            let value = match &arr[1] {
+                Frame::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+                other => panic!("expected BulkString, got {other:?}"),
+            };
+            assert!(value.contains("0:1024"));
+            assert!(value.contains("2:2048"));
+            assert!(!value.contains("1:"), "db 1 has no quota, must not appear");
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn test_config_get_db_maxmemory_empty_when_unconfigured() {
+        let rt = rt_with_dbs(16);
+        let sc = default_server_config();
+        let args = make_args(&[b"db-maxmemory"]);
+        let result = config_get(&rt, &sc, &args);
+        if let Frame::Array(arr) = result {
+            assert_eq!(arr[1], Frame::BulkString(Bytes::from_static(b"")));
+        } else {
+            panic!("expected Array");
+        }
     }
 }

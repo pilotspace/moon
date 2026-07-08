@@ -50,7 +50,6 @@ pub static malloc_conf: MallocConfPtr = MallocConfPtr(
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use moon::config::ServerConfig;
 use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
@@ -127,14 +126,45 @@ fn main() -> anyhow::Result<()> {
     // argv — it will NOT see a `memory-arenas-cap` value that comes from the
     // conf file.  That setting must be given on the CLI if the jemalloc
     // respawn is needed.  This is documented behaviour.
-    let mut config = match merge_conf_argv(std::env::args_os()) {
-        Ok(Some(merged)) => ServerConfig::parse_from(merged),
-        Ok(None) => ServerConfig::parse(),
+    let (mut config, arg_matches) = match merge_conf_argv(std::env::args_os()) {
+        Ok(Some(merged)) => ServerConfig::parse_from_with_matches(merged),
+        Ok(None) => ServerConfig::parse_from_with_matches(std::env::args_os()),
         Err(e) => {
             eprintln!("moon: conf file error: {e}");
             std::process::exit(1);
         }
     };
+
+    // ── --profile tuning presets (WS4, v0.6.0) ──────────────────────────────
+    // Fill-only: a preset only sets flags the operator left at their default
+    // (see `ServerConfig::apply_profile`); anything explicitly passed on the
+    // CLI/moon.conf always wins. Must run before RuntimeConfig construction
+    // and shard spawn so `shards` / `io_busy_poll_us` / `io_driver` are
+    // resolved for every downstream reader.
+    match config.apply_profile(&arg_matches) {
+        Ok(moon::config::ProfileOutcome::Applied { profile, fields }) => {
+            info!(
+                "--profile {profile}: set {} (unset flags only; pass a flag \
+                 explicitly on the CLI to override the preset)",
+                fields.join(", ")
+            );
+            if profile == "standalone" {
+                tracing::warn!(
+                    "--profile standalone enables busy-poll parking \
+                     (--io-busy-poll-us 40), which REGRESSES throughput on \
+                     shared/unpinned cores (OrbStack default, laptops, \
+                     noisy-neighbor cloud VMs). Only use this profile on a \
+                     host with dedicated/pinned CPU cores for the moon \
+                     process. See docs/guides/tuning.md#profiles."
+                );
+            }
+        }
+        Ok(moon::config::ProfileOutcome::None) => {}
+        Err(e) => {
+            eprintln!("moon: {e}");
+            std::process::exit(2);
+        }
+    }
 
     // Resolve the persistence directory before anything reads config.dir
     // (check-config validation, persistence init, WAL). Empty --dir
@@ -184,6 +214,14 @@ fn main() -> anyhow::Result<()> {
             result.commands_skipped
         );
         return Ok(());
+    }
+
+    // WS5a round-2 fix (adversarial review finding 2): reject an unbounded
+    // `--databases` before shard/index init — see
+    // `ServerConfig::validate_databases_bound` for the aliasing risk this
+    // closes. Runs unconditionally (both normal boot and `--check-config`).
+    if let Err(msg) = config.validate_databases_bound() {
+        return Err(anyhow::anyhow!(msg));
     }
 
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
@@ -871,6 +909,18 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "graph")]
     moon::graph::traversal_guard::set_default_traversal_timeout_ms(config.graph_timeout_ms);
 
+    // WS5b fix-first review (item 3): `--db-maxmemory` is trusted operator
+    // config, not wire input — fail fast on a malformed/out-of-range entry
+    // instead of silently dropping it (which would leave the operator
+    // believing a quota is enforced when it is not). Matches this file's
+    // existing "REFUSING TO START" + exit(2) convention.
+    if let Err(msg) =
+        moon::config::validate_db_maxmemory_cli(&config.db_maxmemory, config.databases)
+    {
+        eprintln!("REFUSING TO START: {msg}");
+        std::process::exit(2);
+    }
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
@@ -887,6 +937,11 @@ fn main() -> anyhow::Result<()> {
     // any server launched with --maxmemory (until the first CONFIG SET).
     moon::storage::eviction::publish_maxmemory(runtime_config_shared.read().maxmemory as u64);
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    // Publish the per-db quota "any set?" atomic (WS5b). Same fail-open
+    // rationale as the maxmemory publishes above: a missed publish at
+    // startup silently bypasses the inline write path's db-quota pre-gate
+    // for any server launched with --db-maxmemory.
+    moon::storage::db_quota::publish_db_maxmemory_any_set(&runtime_config_shared.read());
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 

@@ -193,6 +193,14 @@ pub async fn run_embedded(
         crate::acl::AclTable::load_or_default(&config),
     ));
 
+    // WS5b fix-first review (item 3): `--db-maxmemory` is trusted operator
+    // config, not wire input — fail fast on a malformed/out-of-range entry
+    // rather than silently dropping it. `run_embedded` returns
+    // `anyhow::Result`, so (unlike main.rs's process::exit) this propagates
+    // as a normal error to the embedder instead of killing the process.
+    crate::config::validate_db_maxmemory_cli(&config.db_maxmemory, config.databases)
+        .map_err(|msg| anyhow::anyhow!("invalid --db-maxmemory config: {msg}"))?;
+
     // Shared runtime + server configs.
     let runtime_config_shared: Arc<RwLock<crate::config::RuntimeConfig>> =
         Arc::new(RwLock::new(config.to_runtime_config()));
@@ -200,6 +208,9 @@ pub async fn run_embedded(
     // whole-instance cap (per-shard budget = maxmemory / num_shards).
     runtime_config_shared.write().num_shards = num_shards;
     crate::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    // Publish the per-db quota "any set?" atomic (WS5b) — see main.rs's
+    // identical call for the standalone binary entry point.
+    crate::storage::db_quota::publish_db_maxmemory_any_set(&runtime_config_shared.read());
     let server_config_shared: Arc<ServerConfig> = Arc::new(config.clone());
 
     // Per-shard pubsub + remote-subscriber registries.

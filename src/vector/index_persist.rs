@@ -25,7 +25,7 @@
 //!     [dimension: u32] [metric: u8] [quantization: u8] [build_mode: u8] [reserved: 1B]
 //! ```
 //!
-//! ## Format v3 (current — W3-deep)
+//! ## Format v3 (W3-deep)
 //!
 //! Extends v2 with a per-index `compaction_weight` (f32 LE) appended after the
 //! v2 vector_fields block. v1/v2 files are read with `compaction_weight = 1.0`.
@@ -37,6 +37,22 @@
 //!   [field_count: u16]
 //!   Per field: ... (same as v2) ...
 //!   [compaction_weight: f32 LE]   ← NEW in v3
+//! ```
+//!
+//! ## Format v4 (current — WS5a db-scoped indexes)
+//!
+//! Extends v3 with a single `db_index: u8` byte appended after
+//! `compaction_weight`, tagging which logical db (`SELECT 0..databases-1`)
+//! the index belongs to. v1/v2/v3 sidecars (written before this field
+//! existed) are read with `db_index = 0` — pre-v0.6.0 indexes become
+//! db-0-owned, matching their previous global (all-db-visible-from-db-0)
+//! behavior for the common case where db 0 is what was used.
+//!
+//! ```text
+//! [magic: 4B "VMIX"] [version: 4] [count: u16] [reserved: 1B]
+//! Per index:
+//!   ... (same as v3 fields) ...
+//!   [db_index: u8]   ← NEW in v4
 //! ```
 
 use std::io::{self, Read, Write};
@@ -52,9 +68,14 @@ const MAGIC: &[u8; 4] = b"VMIX";
 const VERSION_V1: u8 = 1;
 const VERSION_V2: u8 = 2;
 const VERSION_V3: u8 = 3;
+const VERSION_V4: u8 = 4;
 
 /// Default compaction weight used when reading v1/v2 sidecars without a stored weight.
 const DEFAULT_WEIGHT_ON_LOAD: f32 = 1.0;
+
+/// Default db_index used when reading v1/v2/v3 sidecars written before
+/// WS5a db-scoped indexes existed.
+const DEFAULT_DB_INDEX_ON_LOAD: u8 = 0;
 
 /// Serialize a list of IndexMeta to bytes using v1 format (for testing v1 migration).
 #[cfg(test)]
@@ -79,20 +100,35 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// from `vector_fields[0]` for backward compatibility), then appends the full
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
-    // Wrap with default weight=1.0 and delegate to v3 serializer.
+    // Wrap with default weight=1.0 and delegate to the current (v4) serializer.
     let pairs: Vec<(&IndexMeta, f32)> =
         metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
-    serialize_index_metas_v3(&pairs)
+    serialize_index_metas_v4(&pairs)
 }
 
 /// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using v3 format (W3-deep).
 ///
-/// v3 extends v2 with a 4-byte LE f32 `compaction_weight` per index.
-pub fn serialize_index_metas_v3(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
+/// v3 extends v2 with a 4-byte LE f32 `compaction_weight` per index. Kept
+/// for `#[cfg(test)]` v3-migration coverage; production writers use
+/// [`serialize_index_metas_v4`] (via [`serialize_index_metas`]).
+#[cfg(test)]
+fn serialize_index_metas_v3(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
+    serialize_index_metas_versioned(pairs, VERSION_V3)
+}
+
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
+/// current v4 format (WS5a): v3 plus a trailing `db_index: u8` per index.
+pub fn serialize_index_metas_v4(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
+    serialize_index_metas_versioned(pairs, VERSION_V4)
+}
+
+/// Shared v3/v4 serializer — `version` selects whether the trailing
+/// `db_index` byte (v4) is written.
+fn serialize_index_metas_versioned(pairs: &[(&IndexMeta, f32)], version: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
     buf.extend_from_slice(MAGIC);
-    buf.push(VERSION_V3);
+    buf.push(version);
     buf.extend_from_slice(&(pairs.len() as u16).to_le_bytes());
     buf.push(0); // reserved
 
@@ -114,6 +150,11 @@ pub fn serialize_index_metas_v3(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
 
         // v3 extension: compaction_weight (4 bytes LE f32)
         buf.extend_from_slice(&weight.to_le_bytes());
+
+        // v4 extension: db_index (1 byte)
+        if version >= VERSION_V4 {
+            buf.push(m.db_index);
+        }
     }
 
     buf
@@ -164,7 +205,11 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let version = data[4];
-    if version != VERSION_V1 && version != VERSION_V2 && version != VERSION_V3 {
+    if version != VERSION_V1
+        && version != VERSION_V2
+        && version != VERSION_V3
+        && version != VERSION_V4
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported version {version}"),
@@ -233,6 +278,14 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             DEFAULT_WEIGHT_ON_LOAD
         };
 
+        // v4 (WS5a): read db_index; v1/v2/v3 sidecars predate db scoping and
+        // default to db 0 (see module docs).
+        let db_index = if version >= VERSION_V4 {
+            read_u8(data, &mut cursor)?
+        } else {
+            DEFAULT_DB_INDEX_ON_LOAD
+        };
+
         let meta = IndexMeta {
             name: meta_base.0,
             dimension,
@@ -250,6 +303,7 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             schema_fields: Vec::new(),
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
+            db_index,
         };
         results.push((meta, compaction_weight));
     }
@@ -364,7 +418,9 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
     save_index_metadata_v3(shard_dir, &pairs)
 }
 
-/// Write all active index metadata **with compaction weights** to the sidecar file (v3).
+/// Write all active index metadata **with compaction weights** to the sidecar file
+/// (current on-disk format: v4, WS5a db_index; name kept as `_v3` for API stability
+/// across the many existing call sites — see module docs for the v4 wire format).
 ///
 /// Called after FT.CREATE / FT.DROPINDEX / FT.CONFIG SET COMPACTION_WEIGHT.
 /// Atomically replaces the file via write-to-temp + rename.
@@ -372,7 +428,7 @@ pub fn save_index_metadata_v3(shard_dir: &Path, pairs: &[(&IndexMeta, f32)]) -> 
     let path = shard_dir.join("vector-indexes.meta");
     let tmp_path = shard_dir.join(".vector-indexes.meta.tmp");
 
-    let data = serialize_index_metas_v3(pairs);
+    let data = serialize_index_metas_v4(pairs);
 
     let mut f = std::fs::File::create(&tmp_path)?;
     f.write_all(&data)?;
@@ -486,7 +542,20 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
+    }
+
+    fn make_meta_for_db(
+        name: &str,
+        dim: u32,
+        prefix: &str,
+        field: &str,
+        db_index: u8,
+    ) -> IndexMeta {
+        let mut meta = make_meta(name, dim, prefix, field);
+        meta.db_index = db_index;
+        meta
     }
 
     #[test]
@@ -524,6 +593,32 @@ mod tests {
         let data = serialize_index_metas(&[]);
         let result = deserialize_index_metas(&data).unwrap();
         assert!(result.is_empty());
+    }
+
+    /// WS5a (db-scoped indexes): v4 sidecar round-trips `db_index`.
+    #[test]
+    fn test_roundtrip_v4_db_index() {
+        let m1 = make_meta_for_db("idx1", 128, "doc:", "vec", 0);
+        let m2 = make_meta_for_db("idx2", 128, "doc:", "vec", 7);
+        let data = serialize_index_metas(&[&m1, &m2]);
+        // v4 is the current on-disk version.
+        assert_eq!(data[4], VERSION_V4);
+        let result = deserialize_index_metas(&data).unwrap();
+        assert_eq!(result[0].db_index, 0);
+        assert_eq!(result[1].db_index, 7);
+    }
+
+    /// WS5a: a v3 sidecar (written before db_index existed) loads every
+    /// index as db 0 — pre-v0.6.0 sidecars migrate forward without operator
+    /// action, matching their previous global (db-0-equivalent) visibility.
+    #[test]
+    fn test_v3_sidecar_defaults_to_db_zero() {
+        let meta = make_meta("legacyidx", 128, "doc:", "vec");
+        let v3_data = serialize_index_metas_v3(&[(&meta, 1.0)]);
+        assert_eq!(v3_data[4], VERSION_V3);
+        let result = deserialize_index_metas(&v3_data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].db_index, 0);
     }
 
     #[test]
@@ -576,8 +671,8 @@ mod tests {
     fn test_serialize_deserialize_v2_single_field() {
         let meta = make_meta("idx", 128, "doc:", "vec");
         let data = serialize_index_metas(&[&meta]);
-        // Now writes v3 (serialize_index_metas delegates to v3)
-        assert_eq!(data[4], VERSION_V3);
+        // Now writes v4 (serialize_index_metas delegates to v4 -- WS5a db_index)
+        assert_eq!(data[4], VERSION_V4);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector_fields.len(), 1);

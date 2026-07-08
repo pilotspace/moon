@@ -11,6 +11,7 @@ use super::cold_index::{ColdIndex, ColdLocation};
 use super::kv_serde;
 use crate::persistence::kv_page::{ValueType, entry_flags, read_overflow_chain};
 use crate::persistence::page::PAGE_4K;
+use crate::persistence::page_cache::PageCache;
 use crate::storage::entry::RedisValue;
 
 /// Outcome of a cold read, distinguishing EXPIRED from plain miss so the
@@ -52,10 +53,26 @@ pub fn cold_read_through_outcome(
     key: &[u8],
     now_ms: u64,
 ) -> ColdReadOutcome {
+    cold_read_through_outcome_cached(cold_index, shard_dir, key, now_ms, None)
+}
+
+/// Same as [`cold_read_through_outcome`], but reads the 4KB leaf page through
+/// `page_cache` when given (WS3 KV polish: repeated cold reads that land on
+/// the same on-disk page -- e.g. distinct keys packed into one `KvLeafPage`,
+/// or the same key re-evicted after promotion -- hit the PageCache instead of
+/// re-issuing a `pread` every time). `None` preserves the exact pre-WS3
+/// behavior (always pread).
+pub fn cold_read_through_outcome_cached(
+    cold_index: &ColdIndex,
+    shard_dir: &Path,
+    key: &[u8],
+    now_ms: u64,
+    page_cache: Option<&PageCache>,
+) -> ColdReadOutcome {
     let Some(location) = cold_index.lookup(key) else {
         return ColdReadOutcome::Miss;
     };
-    read_cold_entry(shard_dir, location, now_ms)
+    read_cold_entry(shard_dir, location, now_ms, page_cache)
 }
 
 /// Read a cold entry from disk given its location.
@@ -67,27 +84,74 @@ pub fn read_cold_entry_at(
     location: ColdLocation,
     now_ms: u64,
 ) -> Option<(RedisValue, Option<u64>)> {
-    match read_cold_entry(shard_dir, location, now_ms) {
+    match read_cold_entry(shard_dir, location, now_ms, None) {
         ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
         ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
     }
 }
 
-fn read_cold_entry(shard_dir: &Path, location: ColdLocation, now_ms: u64) -> ColdReadOutcome {
+/// Cached variant of [`read_cold_entry_at`] (see
+/// [`cold_read_through_outcome_cached`]).
+pub fn read_cold_entry_at_cached(
+    shard_dir: &Path,
+    location: ColdLocation,
+    now_ms: u64,
+    page_cache: Option<&PageCache>,
+) -> Option<(RedisValue, Option<u64>)> {
+    match read_cold_entry(shard_dir, location, now_ms, page_cache) {
+        ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+    }
+}
+
+fn read_cold_entry(
+    shard_dir: &Path,
+    location: ColdLocation,
+    now_ms: u64,
+    page_cache: Option<&PageCache>,
+) -> ColdReadOutcome {
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
 
-    let Ok(file) = std::fs::File::open(&file_path) else {
-        return ColdReadOutcome::Miss;
-    };
-
-    // Read only the specific 4KB page identified by page_idx (pread, no whole-file read).
     let page_offset = (location.page_idx as u64) * (PAGE_4K as u64);
-    let mut leaf_buf = [0u8; PAGE_4K];
-    if crate::util::file_ext::read_exact_at(&file, &mut leaf_buf, page_offset).is_err() {
-        return ColdReadOutcome::Miss;
-    }
+
+    let leaf_buf: [u8; PAGE_4K] = match page_cache {
+        Some(pc) => {
+            // file_id namespaces the PageCache key by the on-disk DataFile's
+            // own id (unique per shard, per `ColdLocation::file_id`) -- no
+            // collision risk with other files sharing this PageCache pool.
+            let Ok(handle) = pc.fetch_page(location.file_id, page_offset, false, |buf| {
+                let Ok(file) = std::fs::File::open(&file_path) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "cold data file missing",
+                    ));
+                };
+                crate::util::file_ext::read_exact_at(&file, buf, page_offset)
+            }) else {
+                return ColdReadOutcome::Miss;
+            };
+            let data = pc.page_data(&handle);
+            let mut buf = [0u8; PAGE_4K];
+            buf.copy_from_slice(&data);
+            drop(data);
+            pc.unpin_page(handle);
+            buf
+        }
+        None => {
+            let Ok(file) = std::fs::File::open(&file_path) else {
+                return ColdReadOutcome::Miss;
+            };
+            // Read only the specific 4KB page identified by page_idx (pread,
+            // no whole-file read).
+            let mut buf = [0u8; PAGE_4K];
+            if crate::util::file_ext::read_exact_at(&file, &mut buf, page_offset).is_err() {
+                return ColdReadOutcome::Miss;
+            }
+            buf
+        }
+    };
 
     let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf) else {
         return ColdReadOutcome::Miss;
@@ -194,6 +258,88 @@ mod tests {
             }
             _ => panic!("expected Hash, got {:?}", value.type_name()),
         }
+    }
+
+    /// WS3: a `PageCache`-backed read must serve a second lookup against the
+    /// same on-disk page from the cache instead of re-opening the file --
+    /// proven by renaming the underlying data file away between the two
+    /// reads. The plain (uncached) path would fail on the second read (file
+    /// gone); the cached path must still succeed (page pinned in RAM from the
+    /// first read).
+    #[test]
+    fn test_cold_read_through_page_cache_serves_second_read_without_disk() {
+        use crate::persistence::page_cache::PageCache;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        let entry = Entry::new_string(Bytes::from_static(b"cached-value"));
+        spill_to_datafile(
+            shard_dir,
+            21,
+            b"cachekey",
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let page_cache = PageCache::new(8, 0);
+
+        // First read: real cache miss, must pread from disk and populate the
+        // cache.
+        let r1 = cold_read_through_outcome_cached(
+            &cold_index,
+            shard_dir,
+            b"cachekey",
+            0,
+            Some(&page_cache),
+        );
+        assert!(
+            matches!(r1, ColdReadOutcome::Hit(..)),
+            "first read should hit"
+        );
+
+        // Sabotage the on-disk file: if the second read falls through to a
+        // real pread, it MUST miss.
+        let location = cold_index.lookup(b"cachekey").expect("indexed");
+        let file_path = shard_dir
+            .join("data")
+            .join(format!("heap-{:06}.mpf", location.file_id));
+        std::fs::rename(&file_path, shard_dir.join("heap-moved-away.mpf")).unwrap();
+
+        // Second read: must be served entirely from the PageCache -- the
+        // page is still pinned-and-touched from the first fetch, so
+        // `fetch_page` takes the cache-hit path and never calls `read_fn`
+        // (which is the only place that would touch the now-missing file).
+        let r2 = cold_read_through_outcome_cached(
+            &cold_index,
+            shard_dir,
+            b"cachekey",
+            0,
+            Some(&page_cache),
+        );
+        assert!(
+            matches!(r2, ColdReadOutcome::Hit(..)),
+            "second read must be served from PageCache even though the file was moved away, got {:?}",
+            match r2 {
+                ColdReadOutcome::Hit(..) => "Hit",
+                ColdReadOutcome::Expired => "Expired",
+                ColdReadOutcome::Miss => "Miss",
+            }
+        );
+
+        // Sanity: the uncached path against the same (now-missing) file
+        // really does miss -- proves the test's premise (a real second pread
+        // would fail) rather than the file having survived by luck.
+        let r3 = cold_read_through_outcome(&cold_index, shard_dir, b"cachekey", 0);
+        assert!(
+            matches!(r3, ColdReadOutcome::Miss),
+            "uncached read against the moved-away file must miss (test premise check)"
+        );
     }
 
     /// Build a Database with an active cold tier holding one spilled key.

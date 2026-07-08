@@ -110,6 +110,13 @@ pub struct IndexMeta {
     /// lossless re-quantization during merge. Default: false.
     /// Set via FT.CREATE … KEEP_RAW ON.
     pub keep_raw: bool,
+    /// Logical database (SELECT/`--databases`) this index was created in
+    /// (WS5a db-scoped indexes). The index's definition AND contents belong
+    /// exclusively to this db: FT.SEARCH/FT.INFO/FT._LIST/auto-indexing from
+    /// any other db must not see it. Persisted sidecars written before this
+    /// field existed (v1-v3) default to `0` on load (legacy indexes become
+    /// db-0-owned, matching pre-v0.6.0 global behavior for db 0 callers).
+    pub db_index: u8,
 }
 
 impl IndexMeta {
@@ -448,6 +455,7 @@ impl VectorIndex {
                 let padded = self.collection.padded_dimension;
                 self.scratch = SearchScratch::new(num_nodes, padded);
                 let mut imm_list = snap.immutable.clone();
+                immutable.mark_installed();
                 imm_list.push(Arc::new(immutable));
                 let new_list = SegmentList {
                     mutable: tail_mutable,
@@ -455,6 +463,7 @@ impl VectorIndex {
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
                     cold: snap.cold.clone(),
+                    unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
                 self.segments.swap(new_list);
@@ -563,6 +572,7 @@ impl VectorIndex {
                     let old = segments.load();
                     let tail_mutable = old.mutable.clone_suffix(frozen_len);
                     let mut imm_list = old.immutable.clone();
+                    immutable.mark_installed();
                     imm_list.push(Arc::new(immutable));
                     let new_list = SegmentList {
                         mutable: tail_mutable,
@@ -570,6 +580,7 @@ impl VectorIndex {
                         ivf: old.ivf.clone(),
                         warm: old.warm.clone(),
                         cold: old.cold.clone(),
+                        unloaded: old.unloaded.clone(),
                     };
                     segments.swap(new_list);
                     if frozen_len == mutable_len {
@@ -896,6 +907,7 @@ impl VectorIndex {
 
         // ── Atomic swap ───────────────────────────────────────────────────────
         let mut imm_list = snap.immutable.clone();
+        immutable.mark_installed();
         imm_list.push(Arc::new(immutable));
         let new_list = SegmentList {
             mutable: tail_mutable,
@@ -903,6 +915,7 @@ impl VectorIndex {
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
             cold: snap.cold.clone(),
+            unloaded: snap.unloaded.clone(),
         };
         drop(snap);
         self.segments.swap(new_list);
@@ -1125,6 +1138,7 @@ impl VectorIndex {
                 })
                 .cloned()
                 .collect();
+        merged_arc.mark_installed();
         new_immutable.push(merged_arc.clone());
 
         // Rebuild scratch for the merged segment's graph size.
@@ -1140,6 +1154,7 @@ impl VectorIndex {
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
             cold: snap.cold.clone(),
+            unloaded: snap.unloaded.clone(),
         };
         drop(snap);
         self.segments.swap(new_list);
@@ -1158,11 +1173,14 @@ impl VectorIndex {
     }
 
     /// Check each immutable segment's age. If older than `warm_after_secs`,
-    /// transition it to warm tier (mmap-backed on disk).
+    /// transition it to warm tier (mmap-backed on disk). Age-only; idleness
+    /// is not considered (see [`Self::try_warm_transitions_idle`]).
     ///
     /// After transition, the segment is replaced by a WarmSearchSegment that
     /// reads TQ codes and HNSW graph from mmap'd .mpf files. The segment
-    /// remains searchable -- no data loss from the user's perspective.
+    /// remains searchable -- no data loss from the user's perspective. The
+    /// exact-rerank f16 sidecar (if the HOT segment had one) is carried over
+    /// too, so recall is unaffected by the transition.
     ///
     /// Returns the number of segments transitioned.
     pub fn try_warm_transitions(
@@ -1173,23 +1191,105 @@ impl VectorIndex {
         next_file_id: &mut u64,
         wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
+        self.try_warm_transitions_idle(shard_dir, manifest, warm_after_secs, 0, next_file_id, wal)
+    }
+
+    /// Same as [`Self::try_warm_transitions`] but also accepts an idle-time
+    /// threshold (WS3, `--engine-offload-idle-secs`). `idle_after_secs == 0`
+    /// disables the idle criterion, matching the pre-WS3 age-only behavior
+    /// exactly.
+    ///
+    /// **Two independent tiers, two different destinations (WS3 round 2):**
+    /// - `age_eligible` (pure age, `--segment-warm-after`) -> WARM tier
+    ///   (`WarmSearchSegment`, mmap-backed on disk but fully materialized
+    ///   into owned buffers in memory -- searchable with zero reload cost,
+    ///   but does NOT reduce RSS; measured flat-to-+1.1% in practice, see
+    ///   CHANGELOG). This is unchanged pre-WS3 behavior: an old-but-still-hot
+    ///   segment structurally simplifies to disk-file-backed storage without
+    ///   promising a memory win.
+    /// - `idle_eligible` (`--engine-offload-idle-secs`, genuinely cold) ->
+    ///   COLD tier directly (`UnloadedSegment` stub -- everything in-memory
+    ///   dropped, only a handful of scalars + a `SegmentHandle` resident).
+    ///   This is the tier that actually frees memory. Reload is synchronous
+    ///   and transparent on the next search that touches the index (see
+    ///   `SegmentHolder::promote_unloaded`).
+    ///
+    /// If a segment satisfies both criteria simultaneously, COLD wins (it is
+    /// strictly more beneficial memory-wise and the segment is, by
+    /// definition, not being queried).
+    ///
+    /// Both destinations write the exact same on-disk `.mpf` files via
+    /// [`crate::storage::tiered::warm_tier::transition_to_warm`] (including
+    /// the f16 exact-rerank sidecar) -- COLD additionally drops the
+    /// in-memory `WarmSearchSegment` immediately after capturing its stub
+    /// metadata, instead of keeping it resident.
+    pub fn try_warm_transitions_idle(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        idle_after_secs: u64,
+        next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    ) -> usize {
         let snapshot = self.segments.load();
-        let mut to_warm: Vec<usize> = Vec::new();
+        // (segment index, route straight to COLD instead of WARM)
+        let mut to_transition: Vec<(usize, bool)> = Vec::new();
         for (i, imm) in snapshot.immutable.iter().enumerate() {
-            if imm.age_secs() >= warm_after_secs {
-                to_warm.push(i);
+            let age_eligible = imm.age_secs() >= warm_after_secs;
+            let idle_eligible = idle_after_secs > 0 && imm.idle_secs() >= idle_after_secs;
+            if idle_eligible {
+                to_transition.push((i, true)); // -> COLD
+            } else if age_eligible {
+                to_transition.push((i, false)); // -> WARM
             }
         }
-        if to_warm.is_empty() {
+
+        // WS3 round-2 fix (adversarial review #3): a WARM segment can go
+        // idle too, and previously had no path to COLD -- it just sat in
+        // `warm` (fully materialized, no RSS win) forever. This is
+        // mechanical: `UnloadedSegment::from_warm` already builds a stub
+        // from any `&WarmSearchSegment`, on-disk files already exist (WARM
+        // segments are mmap-backed), no new transition protocol needed.
+        let mut warm_to_cold: Vec<usize> = Vec::new();
+        if idle_after_secs > 0 {
+            for (i, w) in snapshot.warm.iter().enumerate() {
+                if w.idle_secs() >= idle_after_secs {
+                    warm_to_cold.push(i);
+                }
+            }
+        }
+
+        if to_transition.is_empty() && warm_to_cold.is_empty() {
             return 0;
         }
 
         let mut new_immutable = snapshot.immutable.clone();
         let mut new_warm = snapshot.warm.clone();
+        let mut new_unloaded = snapshot.unloaded.clone();
         let mut transitioned = 0usize;
 
+        // Process the WARM -> COLD sweep first (index-stable: independent of
+        // the immutable removal loop below, which mutates `new_immutable`,
+        // not `new_warm`/`new_unloaded` directly until it pushes).
+        for &idx in warm_to_cold.iter().rev() {
+            let warm_seg = &snapshot.warm[idx];
+            let stub = crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(
+                warm_seg, false,
+            );
+            tracing::info!(
+                "WARM -> COLD idle transition: segment {} ({} vectors, idle {}s)",
+                warm_seg.segment_id(),
+                warm_seg.total_count(),
+                warm_seg.idle_secs(),
+            );
+            new_warm.remove(idx);
+            new_unloaded.push(Arc::new(stub));
+            transitioned += 1;
+        }
+
         // Process in reverse order to maintain valid indices during removal.
-        for &idx in to_warm.iter().rev() {
+        for &(idx, to_cold) in to_transition.iter().rev() {
             let imm = &snapshot.immutable[idx];
             let file_id = *next_file_id;
             *next_file_id += 1;
@@ -1197,6 +1297,15 @@ impl VectorIndex {
             let graph_bytes = imm.graph().to_bytes_compressed();
             let codes_data = imm.vectors_tq().as_slice();
             let mvcc_data = imm.mvcc_raw_bytes();
+            // WS3 / HQ-1 parity: carry the exact-rerank f16 sidecar over to
+            // the warm tier so recall does not silently degrade on
+            // HOT->WARM transition (`WarmSearchSegment` now knows how to
+            // rerank from it — see `warm_search.rs`). `None` when the
+            // segment never had one (pre-sidecar build) or has zero halves.
+            let raw_f16_bytes: Option<Vec<u8>> = imm
+                .raw_f16()
+                .filter(|halves| !halves.is_empty())
+                .map(crate::vector::segment::raw_f16_store::RawF16Store::le_bytes);
 
             match crate::storage::tiered::warm_tier::transition_to_warm(
                 shard_dir,
@@ -1204,7 +1313,7 @@ impl VectorIndex {
                 file_id,
                 codes_data,
                 &graph_bytes,
-                None, // vectors_data (f16 reranking -- not used yet)
+                raw_f16_bytes.as_deref(),
                 &mvcc_data,
                 manifest,
                 wal.as_mut(),
@@ -1214,15 +1323,20 @@ impl VectorIndex {
                     // The ImmutableSegment is purely in-memory (no on-disk files),
                     // so it needs no SegmentHandle tombstoning -- it's simply dropped.
                     //
-                    // Tombstone lifecycle for the NEW warm segment:
+                    // Tombstone lifecycle for the NEW warm/cold segment:
                     //   1. `handle` (SegmentHandle) is passed to WarmSearchSegment below
-                    //   2. WarmSearchSegment stores it as `_handle` (Arc refcount)
-                    //   3. When later transitioned to cold: mark_tombstoned() is called
-                    //   4. On index drop: mark_tombstoned() is called
+                    //   2. WarmSearchSegment stores it as `_handle` (Arc refcount);
+                    //      for a COLD destination, `UnloadedSegment::from_warm`
+                    //      captures a clone of the same handle before the
+                    //      WarmSearchSegment is dropped.
+                    //   3. When later transitioned to cold (WARM->COLD/DiskAnn):
+                    //      mark_tombstoned() is called
+                    //   4. On index drop / FLUSH: mark_tombstoned() is called
                     //   5. Directory is deleted only when last Arc ref drops AND tombstoned
                     new_immutable.remove(idx);
 
-                    // Open mmap-backed warm search segment to keep data searchable.
+                    // Open mmap-backed warm search segment to keep data searchable
+                    // (or, for a COLD destination, to capture its stub metadata).
                     // transition_to_warm places files at shard_dir/vectors/segment-{id}/
                     let seg_dir = shard_dir.join("vectors").join(format!("segment-{file_id}"));
                     match crate::vector::persistence::warm_search::WarmSearchSegment::from_files(
@@ -1233,13 +1347,41 @@ impl VectorIndex {
                         false, // mlock_codes: off by default for warm tier
                     ) {
                         Ok(warm_seg) => {
-                            new_warm.push(Arc::new(warm_seg));
-                            tracing::info!(
-                                "Warm transition: segment {} ({} vectors, age {}s) -> searchable warm",
-                                file_id,
-                                imm.total_count(),
-                                imm.age_secs()
-                            );
+                            // WS3 round-2 resurrection fix: `mvcc_raw_bytes()`
+                            // only serializes INSTALL-time deletes
+                            // (`mvcc[i].delete_lsn`) -- a steady-state HDEL
+                            // that landed against this already-Arc'd
+                            // immutable segment (interior `tombstoned_keys`,
+                            // never written back into `mvcc[]`) would
+                            // otherwise be silently dropped by this
+                            // transition and the doc would resurface once
+                            // this WARM/COLD segment is searched. Carry it
+                            // over explicitly.
+                            let src_tombs = imm.tombstoned_key_hashes();
+                            if !src_tombs.is_empty() {
+                                warm_seg.seed_tombstones(&src_tombs);
+                            }
+                            if to_cold {
+                                // COLD (WS3 round 2): capture the stub, then let
+                                // `warm_seg` drop at end of scope -- this is what
+                                // actually frees the codes/graph/sidecar buffers.
+                                let stub = crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(&warm_seg, false);
+                                tracing::info!(
+                                    "Cold (unload) transition: segment {} ({} vectors, idle {}s) -> stub only, reload on next search",
+                                    file_id,
+                                    imm.total_count(),
+                                    imm.idle_secs(),
+                                );
+                                new_unloaded.push(Arc::new(stub));
+                            } else {
+                                tracing::info!(
+                                    "Warm transition: segment {} ({} vectors, age {}s) -> searchable warm",
+                                    file_id,
+                                    imm.total_count(),
+                                    imm.age_secs()
+                                );
+                                new_warm.push(Arc::new(warm_seg));
+                            }
                         }
                         Err(e) => {
                             // Transition wrote files but failed to open for search.
@@ -1261,12 +1403,15 @@ impl VectorIndex {
         }
 
         if transitioned > 0 {
+            // Functional-update clone-and-patch (item 6, adversarial review):
+            // only the 3 fields this function actually touches are named;
+            // `mutable`/`ivf`/`cold` come along via `..(**snapshot).clone()`
+            // without being enumerated here.
             let new_list = SegmentList {
-                mutable: Arc::clone(&snapshot.mutable),
                 immutable: new_immutable,
-                ivf: snapshot.ivf.clone(),
                 warm: new_warm,
-                cold: snapshot.cold.clone(),
+                unloaded: new_unloaded,
+                ..(**snapshot).clone()
             };
             self.segments.swap(new_list);
         }
@@ -1351,6 +1496,7 @@ impl VectorIndex {
                 ivf: snapshot.ivf.clone(),
                 warm: new_warm,
                 cold: new_cold,
+                unloaded: snapshot.unloaded.clone(),
             };
             self.segments.swap(new_list);
         }
@@ -1760,16 +1906,35 @@ impl VectorStore {
         }
     }
 
+    /// Db-scoped variant of [`Self::drop_index`] (WS5a): refuses to drop an
+    /// index owned by a different db (returns `false`, matching the
+    /// "unknown index" outcome a same-db caller would see as `NOTFOUND`).
+    pub fn drop_index_for_db(&mut self, name: &[u8], db_index: u8) -> bool {
+        match self.indexes.get(name) {
+            Some(idx) if idx.meta.db_index == db_index => self.drop_index(name),
+            _ => false,
+        }
+    }
+
     /// Drop an index by name. Returns true if it existed.
     ///
     /// Tombstones any warm segments so their on-disk directories are cleaned up
     /// once all in-flight search references (Arc snapshots) are dropped.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::drop_index_for_db`].
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
         if let Some(index) = self.indexes.remove(name) {
             // Tombstone warm segments: mark for deletion on last Arc drop.
             let snapshot = index.segments.load();
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
+            }
+            // WS3 round 2: COLD (unloaded) stubs also hold a `SegmentHandle`
+            // over an on-disk directory -- tombstone them too, or the
+            // directory would leak (nothing else ever tombstones it, since
+            // the stub itself is being dropped right here).
+            for stub in &snapshot.unloaded {
+                stub.mark_tombstoned();
             }
             drop(snapshot);
             self.spawn_delete_index_persist_dir(&index.meta.name);
@@ -1789,9 +1954,34 @@ impl VectorStore {
     /// definitions come from the sidecar and contents are re-derived from
     /// the (now empty) keyspace. Without this, flushed hashes stayed
     /// searchable as ghost vectors until the next restart.
+    ///
+    /// Clears indexes in EVERY logical db — this is the correct primitive
+    /// for FLUSHALL. FLUSHDB must use [`Self::clear_all_contents_for_db`]
+    /// instead (WS5a): the two commands are not yet differentiated at the
+    /// call sites — see the WS5a gap report.
     pub fn clear_all_contents(&mut self) {
-        // FLUSH discards everything.
-        let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
+        self.clear_contents_matching(|_| true);
+    }
+
+    /// Db-scoped variant of [`Self::clear_all_contents`] for FLUSHDB
+    /// (WS5a): only clears contents of indexes owned by `db_index`, leaving
+    /// every other db's index contents untouched.
+    pub fn clear_all_contents_for_db(&mut self, db_index: u8) {
+        self.clear_contents_matching(|meta| meta.db_index == db_index);
+    }
+
+    /// Shared implementation for [`Self::clear_all_contents`] /
+    /// [`Self::clear_all_contents_for_db`]: recreate every index whose
+    /// `IndexMeta` satisfies `predicate` from its own definition, discarding
+    /// contents but keeping the FT.CREATE definition (see
+    /// `clear_all_contents` doc for the rationale).
+    fn clear_contents_matching(&mut self, predicate: impl Fn(&IndexMeta) -> bool) {
+        let names: Vec<Bytes> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| predicate(&idx.meta))
+            .map(|(name, _)| name.clone())
+            .collect();
         for name in names {
             let Some(index) = self.indexes.remove(&name) else {
                 continue;
@@ -1801,6 +1991,13 @@ impl VectorStore {
             let snapshot = index.segments.load();
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
+            }
+            // WS3 round 2: COLD (unloaded) stubs also hold a `SegmentHandle`
+            // over an on-disk directory -- tombstone them too, or the
+            // directory would leak (nothing else ever tombstones it, since
+            // the stub itself is being dropped right here).
+            for stub in &snapshot.unloaded {
+                stub.mark_tombstoned();
             }
             drop(snapshot);
             let meta = index.meta.clone();
@@ -1820,22 +2017,62 @@ impl VectorStore {
     }
 
     /// Get index reference by name.
+    ///
+    /// NOTE (WS5a): this is the pre-existing, NOT db-scoped lookup — it
+    /// ignores `IndexMeta::db_index` entirely and will return an index
+    /// created in ANY logical db. Command handlers that need db isolation
+    /// MUST migrate to [`Self::get_index_for_db`] (see
+    /// `.planning/v0.6.0-release/WS5A-NOTES.md` for the call-site punch
+    /// list — this migration is NOT yet complete).
     pub fn get_index(&self, name: &[u8]) -> Option<&VectorIndex> {
         self.indexes.get(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index`]: returns `None` if the index
+    /// exists but was created in a different logical db (WS5a isolation —
+    /// makes an index invisible outside its owning db, matching Redis-style
+    /// NOTFOUND semantics for a name that "doesn't exist" from this db's
+    /// point of view).
+    pub fn get_index_for_db(&self, name: &[u8], db_index: u8) -> Option<&VectorIndex> {
+        self.indexes
+            .get(name)
+            .filter(|idx| idx.meta.db_index == db_index)
+    }
+
     /// Get mutable index reference by name.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::get_index`].
     pub fn get_index_mut(&mut self, name: &[u8]) -> Option<&mut VectorIndex> {
         self.indexes.get_mut(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index_mut`].
+    pub fn get_index_mut_for_db(&mut self, name: &[u8], db_index: u8) -> Option<&mut VectorIndex> {
+        self.indexes
+            .get_mut(name)
+            .filter(|idx| idx.meta.db_index == db_index)
+    }
+
     /// List all index names.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — returns names across every logical db.
     pub fn index_names(&self) -> Vec<&Bytes> {
         self.indexes.keys().collect()
     }
 
+    /// Db-scoped variant of [`Self::index_names`] (for FT._LIST).
+    pub fn index_names_for_db(&self, db_index: u8) -> Vec<&Bytes> {
+        self.indexes
+            .iter()
+            .filter(|(_, idx)| idx.meta.db_index == db_index)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Find indexes whose key_prefixes match the given key.
     /// Returns refs to matching VectorIndex entries.
+    ///
+    /// NOTE (WS5a): NOT db-scoped.
     pub fn find_matching_indexes(&self, key: &[u8]) -> Vec<&VectorIndex> {
         self.indexes
             .values()
@@ -1845,11 +2082,34 @@ impl VectorStore {
 
     /// Find matching index names for auto-indexing.
     /// Caller must collect names first to avoid borrow issues.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — the HSET auto-index hook
+    /// (`auto_index_hset` in `src/shard/spsc_handler.rs`) still calls this
+    /// unscoped variant, so a HSET issued in db 3 can still feed an index
+    /// created in db 0 if the key matches its PREFIX. Migrating the caller
+    /// to [`Self::find_matching_index_names_for_db`] is open follow-up work.
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
         self.indexes
             .iter()
             .filter_map(|(name, idx)| {
                 if idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Db-scoped variant of [`Self::find_matching_index_names`]: only
+    /// considers indexes owned by `db_index`.
+    pub fn find_matching_index_names_for_db(&self, key: &[u8], db_index: u8) -> Vec<Bytes> {
+        self.indexes
+            .iter()
+            .filter_map(|(name, idx)| {
+                if idx.meta.db_index == db_index
+                    && idx.meta.key_prefixes.iter().any(|p| key.starts_with(p))
+                {
                     Some(name.clone())
                 } else {
                     None
@@ -1866,6 +2126,8 @@ impl VectorStore {
     ///
     /// NOTE: Vec allocation for matching_names is acceptable -- this only fires
     /// when a deleted key matches an index prefix (rare per-operation).
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::find_matching_index_names`].
     pub fn mark_deleted_for_key(&mut self, key: &[u8]) {
         let matching_names = self.find_matching_index_names(key);
         if matching_names.is_empty() {
@@ -1877,6 +2139,22 @@ impl VectorStore {
             any_deleted |= self.tombstone_key_in_index(&idx_name, key_hash);
         }
         // Bump version AFTER any successful deletion mark.
+        if any_deleted {
+            self.bump_version();
+        }
+    }
+
+    /// Db-scoped variant of [`Self::mark_deleted_for_key`].
+    pub fn mark_deleted_for_key_for_db(&mut self, key: &[u8], db_index: u8) {
+        let matching_names = self.find_matching_index_names_for_db(key, db_index);
+        if matching_names.is_empty() {
+            return;
+        }
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        let mut any_deleted = false;
+        for idx_name in matching_names {
+            any_deleted |= self.tombstone_key_in_index(&idx_name, key_hash);
+        }
         if any_deleted {
             self.bump_version();
         }
@@ -1908,6 +2186,17 @@ impl VectorStore {
         // may still contain the key (steady-state interior tombstone).
         for imm in snap.immutable.iter() {
             imm.mark_deleted_by_key_hash(key_hash);
+        }
+        // WS3 round-2 resurrection fix (adversarial review #1): WARM and
+        // COLD (unloaded) segments must also be tombstoned, or a HDEL'd doc
+        // resurfaces the next time that segment is searched (WARM: takes
+        // effect immediately, no reload) or reloaded (COLD: the stub queues
+        // the tombstone and replays it in `UnloadedSegment::reload`).
+        for warm in snap.warm.iter() {
+            warm.mark_deleted_by_key_hash(key_hash);
+        }
+        for stub in snap.unloaded.iter() {
+            stub.mark_deleted_by_key_hash(key_hash);
         }
         drop(snap);
         // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
@@ -2027,8 +2316,22 @@ impl VectorStore {
     }
 
     /// Collect references to all active IndexMeta for persistence.
+    ///
+    /// Deliberately NOT db-scoped: the sidecar (`vector-indexes.meta`) must
+    /// persist every logical db's index definitions so a restart restores
+    /// all of them (see `save_index_meta_sidecar`).
     pub fn collect_index_metas(&self) -> Vec<&IndexMeta> {
         self.indexes.values().map(|idx| &idx.meta).collect()
+    }
+
+    /// Db-scoped variant of [`Self::collect_index_metas`] (for FT._LIST /
+    /// scatter_ft_info at the command layer — WS5a).
+    pub fn collect_index_metas_for_db(&self, db_index: u8) -> Vec<&IndexMeta> {
+        self.indexes
+            .values()
+            .map(|idx| &idx.meta)
+            .filter(|meta| meta.db_index == db_index)
+            .collect()
     }
 
     /// Collect `(meta, compaction_weight)` pairs for v3 sidecar persistence (W3-deep).
@@ -2050,14 +2353,36 @@ impl VectorStore {
         next_file_id: &mut u64,
         wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
+        self.try_warm_transitions_all_idle(
+            shard_dir,
+            manifest,
+            warm_after_secs,
+            0,
+            next_file_id,
+            wal,
+        )
+    }
+
+    /// Same as [`Self::try_warm_transitions_all`] but also applies the WS3
+    /// idle-time criterion (see [`VectorIndex::try_warm_transitions_idle`]).
+    pub fn try_warm_transitions_all_idle(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        idle_after_secs: u64,
+        next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    ) -> usize {
         let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
         let mut total = 0;
         for name in names {
             if let Some(idx) = self.indexes.get(&name) {
-                total += idx.try_warm_transitions(
+                total += idx.try_warm_transitions_idle(
                     shard_dir,
                     manifest,
                     warm_after_secs,
+                    idle_after_secs,
                     next_file_id,
                     wal,
                 );
@@ -2119,6 +2444,7 @@ impl VectorStore {
                             ivf: old.ivf.clone(),
                             warm: new_warm,
                             cold: old.cold.clone(),
+                            unloaded: old.unloaded.clone(),
                         };
                         idx.segments.swap(new_list);
                         loaded += 1;
@@ -2361,6 +2687,7 @@ impl VectorStore {
                     })
                     .cloned()
                     .collect();
+                merged_arc.mark_installed();
                 new_immutable.push(merged_arc.clone());
                 idx.scratch = crate::vector::hnsw::search::SearchScratch::new(
                     merged_arc.graph().num_nodes(),
@@ -2372,6 +2699,7 @@ impl VectorStore {
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
                     cold: snap.cold.clone(),
+                    unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
                 idx.segments.swap(new_list);
@@ -2435,6 +2763,7 @@ impl VectorStore {
             Ok(merged) => {
                 let live = merged.live_count() as usize;
                 // Atomically swap: replace all immutable segments with the single merged one.
+                merged.mark_installed();
                 let old = idx.segments.load();
                 let new_list = SegmentList {
                     mutable: Arc::clone(&old.mutable),
@@ -2442,6 +2771,7 @@ impl VectorStore {
                     ivf: old.ivf.clone(),
                     warm: old.warm.clone(),
                     cold: old.cold.clone(),
+                    unloaded: old.unloaded.clone(),
                 };
                 idx.segments.swap(new_list);
                 idx.persist_hook_after_install();
@@ -2577,6 +2907,7 @@ fn enforce_segment_holder_budget(
         ivf: snapshot.ivf.clone(),
         warm: snapshot.warm.clone(),
         cold: snapshot.cold.clone(),
+        unloaded: snapshot.unloaded.clone(),
     };
 
     let stats = budget.enforce_budget(&mut list);
@@ -2620,6 +2951,7 @@ pub(crate) fn test_index_meta(dim: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 
@@ -2648,6 +2980,7 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 
@@ -2669,6 +3002,7 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 
@@ -2705,6 +3039,174 @@ mod tests {
         // Drop non-existent
         assert!(!store.drop_index(b"idx"));
         assert!(!store.drop_index(b"nonexistent"));
+    }
+
+    /// WS5a (db-scoped indexes): db-tagged variants of the lookup/listing/
+    /// deletion primitives must be invisible/inert across logical dbs, while
+    /// the pre-existing unscoped methods keep their historical (global)
+    /// behavior for callers not yet migrated.
+    mod ws5a_db_scoping {
+        use super::*;
+
+        fn make_meta_for_db(name: &str, db_index: u8) -> IndexMeta {
+            let mut meta = make_meta(name, 32, &["doc:"]);
+            meta.db_index = db_index;
+            meta
+        }
+
+        #[test]
+        fn get_index_for_db_is_invisible_cross_db() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("idx", 3)).unwrap();
+
+            // Owning db sees it.
+            assert!(store.get_index_for_db(b"idx", 3).is_some());
+            assert!(store.get_index_mut_for_db(b"idx", 3).is_some());
+            // Every other db does not -- this is the core WS5a guarantee.
+            assert!(store.get_index_for_db(b"idx", 0).is_none());
+            assert!(store.get_index_mut_for_db(b"idx", 0).is_none());
+            // The legacy unscoped accessor is intentionally untouched
+            // (documents the current, NOT-yet-migrated global behavior).
+            assert!(store.get_index(b"idx").is_some());
+        }
+
+        #[test]
+        fn index_names_for_db_filters_by_owner() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("a", 0)).unwrap();
+            store.create_index(make_meta_for_db("b", 1)).unwrap();
+            store.create_index(make_meta_for_db("c", 1)).unwrap();
+
+            let db0: Vec<&[u8]> = store
+                .index_names_for_db(0)
+                .into_iter()
+                .map(|b| b.as_ref())
+                .collect();
+            assert_eq!(db0, vec![b"a".as_ref()]);
+
+            let mut db1: Vec<&[u8]> = store
+                .index_names_for_db(1)
+                .into_iter()
+                .map(|b| b.as_ref())
+                .collect();
+            db1.sort();
+            assert_eq!(db1, vec![b"b".as_ref(), b"c".as_ref()]);
+
+            // Unscoped listing still returns all three (documents current
+            // FT._LIST behavior pending call-site migration).
+            assert_eq!(store.index_names().len(), 3);
+        }
+
+        #[test]
+        fn find_matching_index_names_for_db_scopes_auto_index() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let db0_matches = store.find_matching_index_names_for_db(b"doc:1", 0);
+            assert_eq!(db0_matches, vec![Bytes::from_static(b"db0idx")]);
+
+            let db1_matches = store.find_matching_index_names_for_db(b"doc:1", 1);
+            assert_eq!(db1_matches, vec![Bytes::from_static(b"db1idx")]);
+
+            // Unscoped variant still matches both (documents the HSET
+            // auto-index hook's current global behavior pending migration).
+            assert_eq!(store.find_matching_index_names(b"doc:1").len(), 2);
+        }
+
+        #[test]
+        fn mark_deleted_for_key_for_db_only_tombstones_owning_db() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let key = b"doc:1";
+            let vec = vec![0.1f32; 32];
+            let hash = xxhash_rust::xxh64::xxh64(key, 0);
+            store
+                .insert_vector(b"db0idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+            store
+                .insert_vector(b"db1idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+
+            // Deleting the key from db 0 must not affect db 1's copy.
+            store.mark_deleted_for_key_for_db(key, 0);
+
+            let db0_alive = store
+                .get_index(b"db0idx")
+                .unwrap()
+                .key_hash_to_key
+                .contains_key(&hash);
+            let db1_alive = store
+                .get_index(b"db1idx")
+                .unwrap()
+                .key_hash_to_key
+                .contains_key(&hash);
+            assert!(!db0_alive, "db0's entry must be tombstoned");
+            assert!(db1_alive, "db1's entry must survive a db0-scoped delete");
+        }
+
+        #[test]
+        fn clear_all_contents_for_db_leaves_other_dbs_untouched() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let key = b"doc:1";
+            let vec = vec![0.1f32; 32];
+            let hash = xxhash_rust::xxh64::xxh64(key, 0);
+            store
+                .insert_vector(b"db0idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+            store
+                .insert_vector(b"db1idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+
+            // FLUSHDB on db 0 only.
+            store.clear_all_contents_for_db(0);
+
+            // Definitions survive in both dbs (FLUSH keeps FT.CREATE defs).
+            assert_eq!(store.len(), 2);
+            // db0's content is gone; db1's is untouched.
+            assert!(
+                !store
+                    .get_index(b"db0idx")
+                    .unwrap()
+                    .key_hash_to_key
+                    .contains_key(&hash)
+            );
+            assert!(
+                store
+                    .get_index(b"db1idx")
+                    .unwrap()
+                    .key_hash_to_key
+                    .contains_key(&hash)
+            );
+        }
+
+        #[test]
+        fn drop_index_for_db_refuses_cross_db_drop() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("idx", 3)).unwrap();
+
+            // Wrong db: refused, index survives.
+            assert!(!store.drop_index_for_db(b"idx", 0));
+            assert_eq!(store.len(), 1);
+
+            // Owning db: succeeds.
+            assert!(store.drop_index_for_db(b"idx", 3));
+            assert_eq!(store.len(), 0);
+        }
+
+        #[test]
+        fn legacy_persisted_index_defaults_to_db_zero() {
+            // v1-v3 sidecar formats have no db_index byte; the field defaults
+            // to 0 via `IndexMeta { db_index: 0, .. }` in the deserializer,
+            // matching pre-v0.6.0 global (db-0-visible) behavior.
+            let meta = make_meta("legacyidx", 64, &["doc:"]);
+            assert_eq!(meta.db_index, 0);
+        }
     }
 
     /// Builds HSET-style args `[key, field, vector_bytes]` for
@@ -2749,6 +3251,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &v1),
+            0,
         );
         {
             let idx = store.get_index(b"idx").unwrap();
@@ -2772,6 +3275,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &v2),
+            0,
         );
         {
             let idx = store.get_index(b"idx").unwrap();
@@ -2821,6 +3325,7 @@ mod tests {
             &mut text_store,
             b"doc:1",
             &hset_vector_args(b"doc:1", b"vec", &[1.0, 2.0, 3.0, 4.0]),
+            0,
         );
 
         store.get_index_mut(b"idx").unwrap().force_compact();
@@ -2974,6 +3479,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         };
         idx.segments.swap(new_list);
         drop(old_snap);
@@ -3059,6 +3565,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         });
         drop(old_snap);
 
@@ -3190,6 +3697,7 @@ mod bg_compact_tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 

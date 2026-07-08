@@ -34,19 +34,39 @@ Moon implements a large subset of the Redis command surface with wire-level comp
 
 ## Known Incompatibilities
 
+The command registry (`src/command/metadata.rs`) is the source of truth: 258
+commands as of this writing, each with an arity, read/write flag, and ACL
+category, checked by `cargo test command::metadata::tests`. The table below
+is regenerated against that registry — previous editions of this doc
+incorrectly listed `WAIT` and `FUNCTION *` as unimplemented; both are live.
+
 ### Commands
 
 | Command | Status | Detail |
 |---|---|---|
 | `DEBUG DIGEST` | Not implemented | Use DBSIZE for parity checks |
-| `DEBUG OBJECT` | Not implemented | |
-| `ACL LOG` | Partial | Missing some subcommands |
-| `CLIENT LIST` | Partial | Limited fields |
-| `WAIT` | Not implemented | Single-node focus |
-| `OBJECT HELP` | Not implemented | |
-| `MODULE *` | Not implemented | Moon builds features natively |
-| `SENTINEL *` | Not implemented | Cluster mode covers HA |
-| `FUNCTION *` | Not implemented | Deferred to v0.2+ |
+| `DEBUG OBJECT` | Implemented | Redis-compatible one-line summary (encoding/refcount/serializedlength) |
+| `ACL LOG` | Implemented | Real entries pushed from every command-dispatch path (single/sharded/monoio handlers) on auth/perm failures; `ACL LOG RESET` clears the ring |
+| `CLIENT LIST` / `CLIENT INFO` | Implemented, some fields are placeholders | Full Redis field set is present (`id`, `addr`, `laddr`, `fd`, `name`, `age`, `idle`, `flags`, `db`, `sub`, `psub`, `ssub`, `multi`, `watch`, `qbuf*`, `argv-mem`, `multi-mem`, `tot-net-in/out`, `rbs`, `rbp`, `obl`, `oll`, `omem`, `tot-mem`, `events`, `cmd`, `user`, `redir`, `resp`, `lib-name`, `lib-ver`) so key=value parsers never choke on a missing key, but `laddr`, `tot-net-in/out`, `rbs`/`rbp`/`obl`/`oll`/`omem`, `cmd`, and `events` are not yet wired to live per-connection data (honest placeholder values, not real telemetry). `redir` and the tracking flag char track `CLIENT TRACKING` state landing separately. |
+| `WAIT` | Implemented | Single-node: returns immediately (no replicas to wait for) |
+| `OBJECT HELP` | Implemented | |
+| `BITFIELD_RO` | Implemented | GET-only; rejects SET/INCRBY/OVERFLOW |
+| `SORT_RO` | Implemented | Rejects STORE |
+| `GEORADIUS_RO` | Implemented | Rejects STORE/STOREDIST (the base `GEORADIUS` doesn't implement STORE either — translates to GEOSEARCH internally) |
+| `GEORADIUSBYMEMBER_RO` | Implemented | Rejects STORE/STOREDIST (same STORE caveat as `GEORADIUS_RO`) |
+| `FUNCTION *` | Implemented | FCALL/FUNCTION LOAD/DELETE/LIST/DUMP/FLUSH/STATS via the Lua sandbox |
+
+### Explicit Non-Goals
+
+These commands are deliberately not implemented — not oversights:
+
+| Command | Rationale |
+|---|---|
+| `PFDEBUG` | HyperLogLog internals-inspection command; no debugging surface to expose (Moon's HLL implementation isn't the dense/sparse Redis encoding this command introspects) |
+| `PFSELFTEST` | Internal Redis HLL self-test with no external behavioral contract; nothing for a compatible server to reproduce |
+| `FAILOVER` | Requires a primary/replica replication topology Moon doesn't have (single-node + cluster-mode sharding, no leader-initiated failover handshake) |
+| `MODULE *` | Moon ships equivalent functionality (vector search, graph, JSON-like structures) as native compiled features rather than a dynamically loaded C module ABI |
+| `SENTINEL *` | Moon's HA story is cluster mode + external orchestration (k8s/systemd), not Sentinel's gossip-based failover protocol |
 
 ### Behavior Differences
 
@@ -74,4 +94,4 @@ Moon implements a large subset of the Redis command surface with wire-level comp
 
 ---
 
-*Last updated: 2026-04-09 — Phase 96 of v0.1.3 Production Readiness*
+*Last updated: 2026-07-08 — v0.6.0 WS1 command-parity audit (regenerated against `src/command/metadata.rs`; fixed stale WAIT/FUNCTION/ACL LOG/CLIENT LIST/OBJECT HELP claims, added BITFIELD_RO/SORT_RO/GEORADIUS_RO/GEORADIUSBYMEMBER_RO, documented explicit non-goals)*

@@ -50,7 +50,7 @@ OK
    - Strips the prefix from response values (KEYS, SCAN, etc.)
    - Skips non-key commands (WS, TXN, TEMPORAL, MQ, etc.)
 
-4. **WS DROP** deletes the workspace registry entry. Keys remain until they expire or are explicitly cleaned.
+4. **WS DROP** deletes the workspace registry entry and best-effort cascade-deletes every KV key carrying that workspace's `{ws_hex}:` prefix, across all logical databases on the owning shard (fixed in v0.6.0 — it was previously scoped to db 0 only, see [Isolation semantics](isolation.md)).
 
 ## Use cases
 
@@ -63,4 +63,7 @@ OK
 - A connection can only be bound to one workspace (no re-binding).
 - Workspace names are limited to 64 bytes.
 - Cross-workspace operations are not supported — each connection sees only its workspace's data.
-- `WS DROP` removes the registry entry but does not currently cascade-delete all prefixed keys.
+
+See [Isolation semantics](isolation.md) for the full, honest breakdown of what
+workspaces and per-db quotas guarantee (and don't) — including `FLUSHDB`,
+`FT.*` index scoping, and per-db resource quotas.

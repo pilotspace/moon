@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 // NOTE: `src/config.rs` (this file) co-exists with `src/config/conf_file.rs`
 // using the Rust "file + directory-sibling" layout.  We add `conf_file` as a
@@ -183,6 +183,25 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub maxmemory_samples: usize,
 
+    /// Per-logical-db memory quota (repeatable): `--db-maxmemory <db>:<bytes>`.
+    ///
+    /// Independent of and additive to `--maxmemory` (the whole-instance cap):
+    /// a db-scoped quota bounds ONE `SELECT`-able db slot, while `--maxmemory`
+    /// still bounds the whole instance. Enforced with the SAME eviction
+    /// policy as `--maxmemory-policy` (mirrors global maxmemory behavior —
+    /// `noeviction` rejects the write with a `MOONERR db maxmemory exceeded`
+    /// error, an evicting policy sheds this db's own keys first). Malformed
+    /// entries (bad format, non-numeric db/bytes) or an out-of-range db index
+    /// (`>= --databases`) are logged as a startup warning and ignored — a
+    /// typo in this flag must never refuse to start the server.
+    /// Zero-cost when omitted: the fast path is a single empty-`Vec` check.
+    #[arg(
+        long = "db-maxmemory",
+        value_parser = clap::value_parser!(String),
+        action = clap::ArgAction::Append,
+    )]
+    pub db_maxmemory: Vec<String>,
+
     /// Number of shards (0 = auto-detect from CPU count).
     ///
     /// Defaults to 1: single-shard gives the best per-op latency for
@@ -287,6 +306,20 @@ pub struct ServerConfig {
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
 
+    /// Apply a named tuning preset. A profile only fills flags the operator
+    /// left at their default — any flag passed explicitly on the CLI (or via
+    /// `moon.conf`) always wins over the preset's value.
+    ///
+    /// Currently supported: `standalone` — single dedicated instance, tuned
+    /// for the "beat Redis at p=1" latency path (`--shards 1`,
+    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). REQUIRES
+    /// pinned/dedicated CPU cores: the busy-poll park REGRESSES throughput on
+    /// shared or unpinned cores (OrbStack default, laptops, noisy-neighbor
+    /// cloud VMs) — see docs/guides/tuning.md#profiles. Unknown profile names
+    /// are a startup error.
+    #[arg(long)]
+    pub profile: Option<String>,
+
     /// FT.SEARCH intra-query worker threads: per-segment HNSW searches of one
     /// KNN query fan out across this pool, cutting single-query latency on
     /// multi-segment indexes (the pool also serves concurrent queries).
@@ -310,14 +343,34 @@ pub struct ServerConfig {
     pub disk_offload_dir: Option<PathBuf>,
 
     /// RAM pressure threshold to trigger disk offload (0.0-1.0).
-    /// NOTE: Consumed by the memory pressure cascade (deferred to a future phase).
-    /// Currently parsed and stored but not acted upon at runtime.
+    /// Acted upon every 100ms eviction tick (`persistence_tick::run_eviction_tick`):
+    /// once a shard's published KV memory crosses `threshold * per-shard-budget`,
+    /// `handle_memory_pressure` runs the ordered cascade (PageCache clock-sweep
+    /// eviction -> force HOT->WARM segment demotion -> proactive KV spill via the
+    /// background `SpillThread` -> NoEviction warning) instead of waiting for the
+    /// plain LRU/LFU eviction edge.
     #[arg(long = "disk-offload-threshold", default_value_t = 0.85)]
     pub disk_offload_threshold: f64,
 
-    /// Seconds before sealed segments transition to warm tier
+    /// Seconds before sealed segments transition to warm tier (age-based).
+    /// A segment also qualifies once it hits `--engine-offload-idle-secs` of
+    /// no search traffic, whichever threshold is reached first — see that
+    /// flag's doc comment.
     #[arg(long = "segment-warm-after", default_value_t = 3600)]
     pub segment_warm_after: u64,
+
+    /// Seconds of no FT.SEARCH traffic before an immutable (HOT) vector
+    /// segment becomes eligible for HOT->WARM demotion, regardless of its
+    /// age. `0` disables this idle criterion — only `--segment-warm-after`
+    /// (age since compaction) then applies, matching pre-existing behavior.
+    /// Complements `--segment-warm-after`: a segment demotes as soon as
+    /// EITHER threshold is met, so a segment that is old but still being
+    /// queried heavily is not unloaded just because `--segment-warm-after`
+    /// disagrees with treating hot data as cold — set this lower than
+    /// `--segment-warm-after` to make idleness the effective trigger.
+    /// Default 3600s (1 hour) is conservative; `0` = disabled.
+    #[arg(long = "engine-offload-idle-secs", default_value_t = 3600)]
+    pub engine_offload_idle_secs: u64,
 
     // ── MoonStore v2: PageCache ─────────────────────────────────────
     /// PageCache memory budget (e.g., "256mb", "1gb"). Default: 25% of maxmemory.
@@ -767,7 +820,33 @@ fn decide_dir(
     }
 }
 
+/// Maximum allowed `--databases` count (WS5a round 2, adversarial review
+/// finding 2). Vector/text index `db_index` tagging downcasts the
+/// connection's SELECTed db to `u8` at ~20 call sites
+/// (`conn.selected_db as u8`); `--databases 300` + `SELECT 256` would pass
+/// SELECT's `index < db_count` range check, then silently wrap
+/// `256 as u8 == 0`, aliasing db 256's indexes onto db 0's. `u8::MAX + 1`
+/// keeps the full 0..=255 range addressable without widening `db_index` to
+/// `u16` across every `IndexMeta`/`TextIndex`/SPSC payload site.
+pub const MAX_DATABASES: usize = 256;
+
 impl ServerConfig {
+    /// Validate `--databases` fits the `u8` db_index tag used by vector/text
+    /// index scoping (WS5a round 2). Returns an error message (not a
+    /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot
+    /// path and unit tests can format/assert on it directly) when the
+    /// configured count exceeds `MAX_DATABASES`.
+    pub fn validate_databases_bound(&self) -> Result<(), String> {
+        if self.databases > MAX_DATABASES {
+            return Err(format!(
+                "--databases {} exceeds the maximum of {MAX_DATABASES} (vector/text index db \
+                 scoping uses a u8 tag; higher values alias distinct dbs onto the same index)",
+                self.databases
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the persistence directory when `--dir` was not given.
     ///
     /// Must run once at startup (after conf-file merge, before any
@@ -949,6 +1028,91 @@ impl ServerConfig {
         outcome
     }
 
+    /// Parse argv into a `ServerConfig`, also returning the `clap::ArgMatches`
+    /// used to produce it.
+    ///
+    /// Callers need the `ArgMatches` alongside the parsed struct so
+    /// [`Self::apply_profile`] can tell explicitly-passed flags apart from
+    /// ones that only hold their `default_value`/`default_value_t` — a plain
+    /// `ServerConfig::parse_from` throws that provenance away. Exits the
+    /// process on parse error (or `--help`/`--version`), matching
+    /// `clap::Parser::parse_from`'s behavior exactly.
+    ///
+    /// Uses [`FromArgMatches::from_arg_matches`] (the non-consuming variant,
+    /// which clones internally) rather than `from_arg_matches_mut`: the
+    /// `_mut` builder removes consumed entries from `ArgMatches` as it goes
+    /// (an optimization to avoid extra clones), which would silently erase
+    /// `value_source` provenance for every field before `apply_profile` ever
+    /// gets to inspect it.
+    pub fn parse_from_with_matches<I, T>(args: I) -> (Self, clap::ArgMatches)
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = match Self::command().try_get_matches_from(args) {
+            Ok(m) => m,
+            Err(e) => e.exit(),
+        };
+        let config = match Self::from_arg_matches(&matches) {
+            Ok(c) => c,
+            Err(e) => e.exit(),
+        };
+        (config, matches)
+    }
+
+    /// Apply a named `--profile` tuning preset, mutating `self` in place.
+    ///
+    /// Fill-only semantics: a preset field is written ONLY when the
+    /// corresponding flag's [`clap::ValueSource`] is not `CommandLine` (i.e.
+    /// the operator did not pass it explicitly — on the real CLI or via the
+    /// `moon.conf`-merged argv, both of which land in the same `ArgMatches`
+    /// fed to clap). An explicitly-passed flag always wins over the profile.
+    ///
+    /// `matches` MUST be the `ArgMatches` produced by parsing the SAME argv
+    /// that produced `self` (see [`Self::parse_from_with_matches`]).
+    ///
+    /// MUST be called once at startup, after parsing and before any code
+    /// reads `shards` / `io_busy_poll_us` / `io_driver` (shard spawn,
+    /// `to_runtime_config`, etc.).
+    pub fn apply_profile(
+        &mut self,
+        matches: &clap::ArgMatches,
+    ) -> Result<ProfileOutcome, ProfileError> {
+        let Some(name) = self.profile.clone() else {
+            return Ok(ProfileOutcome::None);
+        };
+        if name != "standalone" {
+            return Err(ProfileError::Unknown(name));
+        }
+
+        let mut fields: Vec<&'static str> = Vec::new();
+        if !Self::flag_was_explicit(matches, "shards") {
+            self.shards = 1;
+            fields.push("--shards=1");
+        }
+        if !Self::flag_was_explicit(matches, "io_busy_poll_us") {
+            self.io_busy_poll_us = 40;
+            fields.push("--io-busy-poll-us=40");
+        }
+        if !Self::flag_was_explicit(matches, "io_driver") {
+            self.io_driver = "epoll".to_string();
+            fields.push("--io-driver=epoll (implied by io-busy-poll-us)");
+        }
+        Ok(ProfileOutcome::Applied {
+            profile: name,
+            fields,
+        })
+    }
+
+    /// True when `id`'s value came from the parsed argv rather than a
+    /// `default_value`/`default_value_t`/env fallback.
+    fn flag_was_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
+        matches!(
+            matches.value_source(id),
+            Some(clap::parser::ValueSource::CommandLine)
+        )
+    }
+
     /// Create a RuntimeConfig from this server config, copying mutable parameters.
     ///
     /// `maxmemory` resolves `None`/`Some(0)` → `0` (the downstream "unlimited"
@@ -959,6 +1123,7 @@ impl ServerConfig {
             maxmemory: self.maxmemory.unwrap_or(0),
             maxmemory_policy: self.maxmemory_policy.clone(),
             maxmemory_samples: self.maxmemory_samples,
+            db_maxmemory: parse_db_maxmemory_entries(&self.db_maxmemory, self.databases),
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: self.save.clone(),
@@ -981,6 +1146,103 @@ impl ServerConfig {
             // bounds aggregate RSS. Tests that call this directly run 1 shard.
             num_shards: 1,
         }
+    }
+}
+
+/// Parse `--db-maxmemory <db>:<bytes>` entries into a dense `Vec<u64>` of
+/// length `num_databases` (index = db number, `0` = unlimited).
+///
+/// Malformed entries (no `:`, non-numeric halves) or an out-of-range db
+/// index (`>= num_databases`) are logged via `tracing::warn!` and skipped —
+/// a typo in this repeatable flag must never refuse to start the server
+/// (same fail-open philosophy as the parser-defensiveness rule for wire
+/// protocol input). Later entries for the same db index win (clap
+/// `ArgAction::Append` preserves argv order), matching `CONFIG SET`'s
+/// last-wins semantics for the same key.
+pub fn parse_db_maxmemory_entries(raw: &[String], num_databases: usize) -> Vec<u64> {
+    let mut out = vec![0u64; num_databases];
+    for entry in raw {
+        match parse_one_db_maxmemory_entry(entry) {
+            Ok((idx, bytes)) if idx < num_databases => out[idx] = bytes,
+            Ok((idx, _)) => tracing::warn!(
+                entry = %entry,
+                idx,
+                num_databases,
+                "--db-maxmemory: db index out of range (>= --databases); ignoring entry"
+            ),
+            Err(reason) => tracing::warn!(
+                entry = %entry,
+                reason,
+                "--db-maxmemory: ignoring malformed entry"
+            ),
+        }
+    }
+    out
+}
+
+/// Parse a single `<db>:<bytes>` token, shared by [`parse_db_maxmemory_entries`]
+/// (batch, startup CLI) and `CONFIG SET db-maxmemory <db>:<bytes>` (single,
+/// runtime). Returns `Err(reason)` — never panics — on malformed input; the
+/// db-index range check (`>= --databases`) is the caller's responsibility
+/// since only the caller knows `num_databases`.
+pub fn parse_one_db_maxmemory_entry(entry: &str) -> Result<(usize, u64), &'static str> {
+    let Some((idx_str, bytes_str)) = entry.split_once(':') else {
+        return Err("expected '<db>:<bytes>' format");
+    };
+    let idx = idx_str
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "non-numeric db index")?;
+    let bytes = bytes_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "non-numeric byte count")?;
+    Ok((idx, bytes))
+}
+
+/// Validate `--db-maxmemory` entries strictly, for startup fail-fast.
+///
+/// `parse_db_maxmemory_entries` (used by [`ServerConfig::to_runtime_config`])
+/// is deliberately fail-OPEN: a malformed entry there is logged and skipped
+/// so a stray typo can never crash a server that's already running (mirrors
+/// the wire-protocol parser-defensiveness rule). But `--db-maxmemory` itself
+/// is trusted OPERATOR config supplied at process launch, not untrusted wire
+/// input — silently ignoring a typo there means the operator believes a
+/// quota is protecting a db when it is not, which is a worse failure mode
+/// than refusing to start. `CONFIG SET db-maxmemory` already fails loud
+/// (returns `Frame::Error`) for the identical malformed/out-of-range cases;
+/// this closes the same gap for the CLI form. Call this BEFORE
+/// `to_runtime_config()` at both startup entry points (`main.rs`,
+/// `server/embedded.rs`) and exit non-zero on `Err` — matches this file's
+/// existing "REFUSING TO START: ..." + `std::process::exit(2)` convention
+/// for other trusted-config validation failures (see e.g. the AOF manifest
+/// / shard-count guards in `main.rs`).
+///
+/// Returns `Err(message)` describing every invalid entry found (not just the
+/// first) so an operator with several typos in one invocation sees all of
+/// them in a single failed start, not one-at-a-time.
+pub fn validate_db_maxmemory_cli(raw: &[String], num_databases: usize) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    for entry in raw {
+        match parse_one_db_maxmemory_entry(entry) {
+            Ok((idx, _)) if idx >= num_databases => {
+                problems.push(format!(
+                    "'{entry}': db index {idx} is out of range (--databases is {num_databases})"
+                ));
+            }
+            Ok(_) => {}
+            Err(reason) => problems.push(format!("'{entry}': {reason}")),
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid --db-maxmemory entr{plural}: {joined} \
+             (expected '<db>:<bytes>' with db < --databases)",
+            plural = if problems.len() == 1 { "y" } else { "ies" },
+            joined = problems.join("; "),
+        ))
     }
 }
 
@@ -1008,6 +1270,27 @@ pub enum GuardrailOutcome {
     /// non-Linux dev host, or `/proc`/`/sys` unreadable). Left UNLIMITED — the
     /// caller warns the operator to set `--maxmemory` explicitly.
     Skipped,
+}
+
+/// Result of resolving `--profile` — drives the startup transparency log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOutcome {
+    /// No `--profile` flag was given; nothing to do.
+    None,
+    /// `profile` was applied; `fields` lists exactly what it set (only
+    /// fields the operator left unset — see [`ServerConfig::apply_profile`]).
+    Applied {
+        profile: String,
+        fields: Vec<&'static str>,
+    },
+}
+
+/// `--profile` resolution failure: an unrecognised profile name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProfileError {
+    /// `name` does not match any known preset.
+    #[error("unknown --profile '{0}' (supported: standalone)")]
+    Unknown(String),
 }
 
 /// Parse the `MemTotal:` line of `/proc/meminfo` contents into bytes.
@@ -1186,6 +1469,13 @@ pub struct RuntimeConfig {
     pub maxmemory_policy: String,
     /// Number of random keys to sample for eviction.
     pub maxmemory_samples: usize,
+    /// Per-logical-db memory quota in bytes, indexed by db number
+    /// (`db_maxmemory[i]`, `0` = unlimited for db `i`). Dense: length equals
+    /// `--databases` so `CONFIG SET db-maxmemory <db> <bytes>` can index
+    /// directly with a bounds check instead of resizing at runtime. Empty
+    /// (or all-zero) is the common case and costs a single slice-index
+    /// check on the write path — see [`crate::storage::db_quota`].
+    pub db_maxmemory: Vec<u64>,
     /// LFU logarithmic factor for probabilistic counter increment.
     pub lfu_log_factor: u8,
     /// LFU decay time in minutes.
@@ -1251,6 +1541,23 @@ impl RuntimeConfig {
         }
         self.maxmemory.div_ceil(self.num_shards.max(1))
     }
+
+    /// Per-shard quota for logical db `db_index`, mirroring
+    /// [`Self::maxmemory_per_shard`] exactly but keyed by db instead of the
+    /// whole instance. Returns `0` (unlimited) when no quota is configured
+    /// for this db, or `db_index` is out of range — the fast, allocation-free
+    /// path taken on every write when `--db-maxmemory` was never set.
+    #[inline]
+    #[must_use]
+    pub fn db_maxmemory_per_shard(&self, db_index: usize) -> u64 {
+        let Some(&limit) = self.db_maxmemory.get(db_index) else {
+            return 0;
+        };
+        if limit == 0 {
+            return 0;
+        }
+        limit.div_ceil(self.num_shards.max(1) as u64)
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -1259,6 +1566,7 @@ impl Default for RuntimeConfig {
             maxmemory: 0,
             maxmemory_policy: "noeviction".to_string(),
             maxmemory_samples: 5,
+            db_maxmemory: Vec::new(),
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: None,
@@ -1300,6 +1608,45 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    // ── WS5a round 2 (adversarial review finding 2): --databases bound ────
+
+    #[test]
+    fn test_validate_databases_bound_default_ok() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert!(config.validate_databases_bound().is_ok());
+    }
+
+    #[test]
+    fn test_validate_databases_bound_at_max_ok() {
+        let config = ServerConfig::parse_from(["moon", "--databases", "256"]);
+        assert!(
+            config.validate_databases_bound().is_ok(),
+            "256 databases (u8::MAX + 1) must be the accepted ceiling"
+        );
+    }
+
+    #[test]
+    fn test_validate_databases_bound_over_max_rejected() {
+        let config = ServerConfig::parse_from(["moon", "--databases", "257"]);
+        let err = config
+            .validate_databases_bound()
+            .expect_err("257 databases must be rejected");
+        assert!(
+            err.contains("257") && err.contains("256"),
+            "error must name both the offending value and the ceiling: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_databases_bound_way_over_max_rejected() {
+        // The exact scenario from the review: --databases 300 + SELECT 256
+        // would silently wrap `256 as u8 == 0`, aliasing db 256's vector/text
+        // indexes onto db 0's. Must be rejected at config-validation time,
+        // not discovered later as a cross-db data leak.
+        let config = ServerConfig::parse_from(["moon", "--databases", "300"]);
+        assert!(config.validate_databases_bound().is_err());
     }
 
     /// `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`.
@@ -1366,6 +1713,74 @@ mod tests {
         let config = ServerConfig::parse_from(["moon", "--io-busy-poll-us", "40"]);
         assert_eq!(config.io_busy_poll_us, 40);
         assert!(ServerConfig::try_parse_from(["moon", "--io-busy-poll-us", "x"]).is_err());
+    }
+
+    /// `--profile standalone` with no other flags fills the single-instance
+    /// preset (shards=1, io-busy-poll-us=40, io-driver=epoll) and reports
+    /// exactly what it set.
+    #[test]
+    fn test_profile_standalone_fills_unset_fields() {
+        let (mut config, matches) =
+            ServerConfig::parse_from_with_matches(["moon", "--profile", "standalone"]);
+        let outcome = config.apply_profile(&matches).expect("known profile");
+        assert_eq!(config.shards, 1);
+        assert_eq!(config.io_busy_poll_us, 40);
+        assert_eq!(config.io_driver, "epoll");
+        match outcome {
+            ProfileOutcome::Applied { profile, fields } => {
+                assert_eq!(profile, "standalone");
+                assert!(!fields.is_empty(), "must report what it set");
+            }
+            ProfileOutcome::None => panic!("expected Applied outcome"),
+        }
+    }
+
+    /// An explicitly-passed flag ALWAYS overrides the profile's value — the
+    /// profile only fills fields left at their default.
+    #[test]
+    fn test_profile_standalone_explicit_flag_wins() {
+        let (mut config, matches) = ServerConfig::parse_from_with_matches([
+            "moon",
+            "--profile",
+            "standalone",
+            "--shards",
+            "4",
+            "--io-busy-poll-us",
+            "0",
+        ]);
+        config.apply_profile(&matches).expect("known profile");
+        assert_eq!(config.shards, 4, "explicit --shards must beat the profile");
+        assert_eq!(
+            config.io_busy_poll_us, 0,
+            "explicit --io-busy-poll-us must beat the profile"
+        );
+        // io_driver was NOT passed explicitly, so the profile still fills it.
+        assert_eq!(config.io_driver, "epoll");
+    }
+
+    /// No `--profile` flag → no-op, `ProfileOutcome::None`.
+    #[test]
+    fn test_profile_absent_is_noop() {
+        let (mut config, matches) = ServerConfig::parse_from_with_matches::<[&str; 0], &str>([]);
+        let outcome = config.apply_profile(&matches).expect("no profile is Ok");
+        assert_eq!(outcome, ProfileOutcome::None);
+        assert_eq!(config.shards, 1, "unmodified default");
+        assert_eq!(config.io_busy_poll_us, 0, "unmodified default");
+    }
+
+    /// Unknown profile name is a clear startup error, not a silent no-op.
+    #[test]
+    fn test_profile_unknown_name_errors() {
+        let (mut config, matches) =
+            ServerConfig::parse_from_with_matches(["moon", "--profile", "bogus"]);
+        let err = config
+            .apply_profile(&matches)
+            .expect_err("unknown profile must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "error must name the offending profile: {msg}"
+        );
     }
 
     #[test]
@@ -1953,5 +2368,136 @@ mod tests {
             config.per_shard_aof_active(2),
             "must remain active with disk_offload=disable"
         );
+    }
+
+    // --- db-maxmemory (WS5b) ---
+
+    #[test]
+    fn parse_db_maxmemory_entries_basic() {
+        let raw = vec!["0:1024".to_string(), "3:2048".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(out.len(), 16);
+        assert_eq!(out[0], 1024);
+        assert_eq!(out[3], 2048);
+        assert_eq!(out[1], 0, "unmentioned dbs stay unlimited");
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_empty_is_all_zero() {
+        let out = parse_db_maxmemory_entries(&[], 16);
+        assert_eq!(out, vec![0u64; 16]);
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_malformed_is_ignored_not_fatal() {
+        let raw = vec![
+            "not-a-pair".to_string(),
+            "abc:1024".to_string(),
+            "1:not-bytes".to_string(),
+            "2:4096".to_string(), // the one well-formed entry
+        ];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(out[2], 4096, "the well-formed entry must still apply");
+        assert_eq!(
+            out[1], 0,
+            "malformed entries must not panic or partially apply"
+        );
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_out_of_range_index_is_ignored() {
+        let raw = vec!["99:1024".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 16);
+        assert_eq!(
+            out,
+            vec![0u64; 16],
+            "out-of-range db index must not resize or panic"
+        );
+    }
+
+    #[test]
+    fn parse_db_maxmemory_entries_later_entry_wins_for_same_db() {
+        let raw = vec!["0:1024".to_string(), "0:9999".to_string()];
+        let out = parse_db_maxmemory_entries(&raw, 4);
+        assert_eq!(out[0], 9999, "last entry for the same db index must win");
+    }
+
+    #[test]
+    fn parse_one_db_maxmemory_entry_roundtrip() {
+        assert_eq!(parse_one_db_maxmemory_entry("7:123456"), Ok((7, 123456)));
+        assert!(parse_one_db_maxmemory_entry("no-colon").is_err());
+        assert!(parse_one_db_maxmemory_entry("x:123").is_err());
+        assert!(parse_one_db_maxmemory_entry("1:notbytes").is_err());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_accepts_well_formed_in_range_entries() {
+        let raw = vec!["0:1024".to_string(), "15:2048".to_string()];
+        assert!(validate_db_maxmemory_cli(&raw, 16).is_ok());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_empty_is_ok() {
+        assert!(validate_db_maxmemory_cli(&[], 16).is_ok());
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_rejects_malformed_entry() {
+        let raw = vec!["not-a-pair".to_string()];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(
+            err.contains("not-a-pair"),
+            "error must name the offending entry: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_rejects_out_of_range_index() {
+        let raw = vec!["99:1024".to_string()];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(
+            err.contains("99") && err.contains("out of range"),
+            "error must name the bad index and explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_db_maxmemory_cli_reports_every_bad_entry_not_just_first() {
+        let raw = vec![
+            "not-a-pair".to_string(),
+            "99:1024".to_string(),
+            "0:512".to_string(), // valid — must not appear as a problem
+        ];
+        let err = validate_db_maxmemory_cli(&raw, 16).unwrap_err();
+        assert!(err.contains("not-a-pair"), "missing first bad entry: {err}");
+        assert!(err.contains("99"), "missing second bad entry: {err}");
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_unconfigured_is_zero() {
+        let rt = RuntimeConfig::default();
+        assert_eq!(rt.db_maxmemory_per_shard(0), 0);
+        assert_eq!(
+            rt.db_maxmemory_per_shard(999),
+            0,
+            "out-of-range db must not panic"
+        );
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_divides_like_global_maxmemory() {
+        let mut rt = RuntimeConfig::default();
+        rt.db_maxmemory = vec![1000];
+        rt.num_shards = 4;
+        assert_eq!(rt.db_maxmemory_per_shard(0), 250);
+    }
+
+    #[test]
+    fn db_maxmemory_per_shard_zero_entry_is_unlimited() {
+        let mut rt = RuntimeConfig::default();
+        rt.db_maxmemory = vec![0, 500];
+        rt.num_shards = 1;
+        assert_eq!(rt.db_maxmemory_per_shard(0), 0);
+        assert_eq!(rt.db_maxmemory_per_shard(1), 500);
     }
 }

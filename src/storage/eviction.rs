@@ -708,7 +708,11 @@ fn evict_one_async_spill(
 }
 
 /// Evict a single key, optionally spilling to disk before removal.
-fn evict_one_with_spill(
+///
+/// `pub(crate)` so [`crate::storage::db_quota`] can reuse the exact same
+/// victim-selection + spill logic for per-db quota enforcement, keeping a
+/// single policy implementation for both the whole-instance and per-db gates.
+pub(crate) fn evict_one_with_spill(
     db: &mut Database,
     config: &RuntimeConfig,
     policy: &EvictionPolicy,
@@ -1050,6 +1054,7 @@ mod tests {
             maxmemory,
             maxmemory_policy: policy.to_string(),
             maxmemory_samples: 5,
+            db_maxmemory: Vec::new(),
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: None,

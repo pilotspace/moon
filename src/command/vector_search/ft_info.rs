@@ -16,6 +16,7 @@ pub fn ft_info(
     store: &VectorStore,
     text_store: &crate::text::store::TextStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
@@ -26,22 +27,35 @@ pub fn ft_info(
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
-    let idx = match store.get_index(&name) {
+    let idx = match store.get_index_for_db(&name, db_index) {
         Some(i) => i,
         None => {
-            // Check TextStore for TEXT-only indexes
-            if let Some(text_idx) = text_store.get_index(&name) {
+            // Check TextStore for TEXT-only indexes (db-scoped: WS5a)
+            if let Some(text_idx) = text_store.get_index_for_db(&name, db_index) {
                 return ft_info_text_only(text_idx, text_store);
             }
             return Frame::Error(Bytes::from_static(b"Unknown Index name"));
         }
     };
 
-    // Count default field docs across mutable + immutable segments.
+    // Count default field docs across mutable + immutable + WARM segments.
+    // WARM (WS3 idle-unload / age-based) segments must contribute too --
+    // otherwise num_docs silently drops to 0 for an index whose only
+    // segment demoted to the mmap-backed tier, even though it is still
+    // fully searchable (see FT.INFO doc comment above re: summing across
+    // segments).
     let snap = idx.segments.load();
     let mut num_docs = snap.mutable.len();
     for imm in snap.immutable.iter() {
         num_docs += imm.live_count() as usize;
+    }
+    for warm in snap.warm.iter() {
+        num_docs += warm.live_count() as usize;
+    }
+    // WS3 round 2: COLD (unloaded) segments carry their doc count in the
+    // stub itself (captured at unload time), so this needs no reload.
+    for stub in snap.unloaded.iter() {
+        num_docs += stub.live_count() as usize;
     }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
@@ -52,6 +66,21 @@ pub fn ft_info(
         .immutable
         .iter()
         .filter(|imm| imm.raw_f16().is_some())
+        .count();
+    // WS3 idle-unload observability: HOT (graph_segments, above) vs WARM
+    // (mmap-backed, fully materialized in memory once aged past
+    // `--segment-warm-after`) vs COLD/unloaded (WS3 round 2: everything
+    // in-memory dropped once idle past `--engine-offload-idle-secs`, only a
+    // stub resident). `*_with_exact_rerank` mirrors `segments_with_exact_rerank`'s
+    // "coverage < total ⇒ some segments answer ADC-only" signal for each tier.
+    let warm_segments = snap.warm.len();
+    let warm_segments_with_exact_rerank =
+        snap.warm.iter().filter(|w| w.raw_f16().is_some()).count();
+    let unloaded_segments = snap.unloaded.len();
+    let unloaded_segments_with_exact_rerank = snap
+        .unloaded
+        .iter()
+        .filter(|s| s.had_exact_rerank())
         .count();
 
     // Use itoa for numeric formatting -- no format!() on hot path.
@@ -101,6 +130,14 @@ pub fn ft_info(
         Frame::Integer(graph_segments as i64),
         Frame::BulkString(Bytes::from_static(b"segments_with_exact_rerank")),
         Frame::Integer(segments_with_exact_rerank as i64),
+        Frame::BulkString(Bytes::from_static(b"warm_segments")),
+        Frame::Integer(warm_segments as i64),
+        Frame::BulkString(Bytes::from_static(b"warm_segments_with_exact_rerank")),
+        Frame::Integer(warm_segments_with_exact_rerank as i64),
+        Frame::BulkString(Bytes::from_static(b"unloaded_segments")),
+        Frame::Integer(unloaded_segments as i64),
+        Frame::BulkString(Bytes::from_static(b"unloaded_segments_with_exact_rerank")),
+        Frame::Integer(unloaded_segments_with_exact_rerank as i64),
     ];
 
     // Per-field stats: vector_fields array
@@ -114,6 +151,12 @@ pub fn ft_info(
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
             }
+            for warm in s.warm.iter() {
+                docs += warm.live_count() as usize;
+            }
+            for stub in s.unloaded.iter() {
+                docs += stub.live_count() as usize;
+            }
             (docs, s.mutable.len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
             let s = fs.segments.load();
@@ -121,6 +164,12 @@ pub fn ft_info(
             let imm_count = s.immutable.len();
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
+            }
+            for warm in s.warm.iter() {
+                docs += warm.live_count() as usize;
+            }
+            for stub in s.unloaded.iter() {
+                docs += stub.live_count() as usize;
             }
             (docs, s.mutable.len(), imm_count)
         } else {
@@ -161,7 +210,8 @@ pub fn ft_info(
     items.push(Frame::Integer(store.version_token() as i64));
 
     // Hybrid index: append text field stats if this index also has a TextIndex
-    if let Some(text_idx) = text_store.get_index(&name) {
+    // (db-scoped: WS5a — same name in a different db must not leak in here).
+    if let Some(text_idx) = text_store.get_index_for_db(&name, db_index) {
         let mut text_field_entries: Vec<Frame> = Vec::with_capacity(text_idx.text_fields.len());
         for (i, field_def) in text_idx.text_fields.iter().enumerate() {
             let stats = &text_idx.field_stats[i];
@@ -230,6 +280,10 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         b"text_version_token",
         b"graph_segments",
         b"segments_with_exact_rerank",
+        b"warm_segments",
+        b"warm_segments_with_exact_rerank",
+        b"unloaded_segments",
+        b"unloaded_segments_with_exact_rerank",
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 

@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
@@ -28,6 +28,21 @@ use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
 use crate::vector::types::VectorId;
+
+/// Microseconds since UNIX epoch, read from the shard's thread-local cached
+/// clock (`crate::storage::entry::current_time_ms`, one `clock_gettime` per
+/// shard tick, ~1ms) instead of a raw per-call `SystemTime::now()` syscall
+/// (CLAUDE.md performance invariant: never call the real clock per-op on a
+/// path that can run once per query per segment). `current_time_ms` falls
+/// back to a real syscall automatically on a thread whose shard clock was
+/// never ticked (tests, or an off-loop FT.SEARCH worker thread) — see its
+/// own doc comment. Millisecond resolution (upscaled ×1000 for unit parity
+/// with the microsecond field below) is sufficient: every caller here only
+/// ever compares `age_secs`/`idle_secs` at second granularity.
+#[inline]
+fn now_micros() -> u64 {
+    crate::storage::entry::current_time_ms() * 1000
+}
 
 /// MVCC header for immutable segment entries.
 #[repr(C)]
@@ -112,6 +127,16 @@ pub struct ImmutableSegment {
     /// Disk segment id this segment was persisted under (B2, durability write
     /// path). See [`Self::disk_segment_id`].
     disk_segment_id: Option<u64>,
+
+    /// Microseconds since UNIX epoch of the last search that touched this
+    /// segment (WS3 idle-unload). Updated on every `search`/`search_filtered`
+    /// call via `touch_last_access`. Mirrors
+    /// `WarmSearchSegment::last_access_micros` so the HOT->WARM transition can
+    /// use the same idle-recency signal the WARM->mmap-budget LRU already
+    /// does. Relaxed ordering: approximate recency is sufficient for a
+    /// tick-cadence eligibility check, never read on another segment's hot
+    /// path.
+    last_access_micros: AtomicU64,
 }
 
 impl ImmutableSegment {
@@ -147,6 +172,7 @@ impl ImmutableSegment {
             raw_f16: None,
             suggested_ef: None,
             disk_segment_id: None,
+            last_access_micros: AtomicU64::new(now_micros()),
         }
     }
 
@@ -541,6 +567,9 @@ impl ImmutableSegment {
         ef_search: usize,
         scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
+        // WS3 idle-unload: record this search so the HOT->WARM idle-eligibility
+        // check has an accurate recency signal (see `idle_secs`).
+        self.touch_last_access();
         // Use sub-centroid signs during beam (32-level LUT) when available.
         // This eliminates the separate rerank pass — beam itself is high-accuracy.
         // Note: passing ef_search for both k and ef_search is intentional.
@@ -604,6 +633,8 @@ impl ImmutableSegment {
         scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
+        // WS3 idle-unload: see comment in `search()` above.
+        self.touch_last_access();
         // Note: passing ef_search for both k and ef_search is intentional
         // (see comment in search() method above).
         let mut candidates = hnsw_search_filtered(
@@ -915,6 +946,46 @@ impl ImmutableSegment {
         self.created_at.elapsed().as_secs()
     }
 
+    /// Seconds since this segment last served a search (WS3 idle-unload).
+    /// `0` if it has never been searched more than a second ago (or is
+    /// brand new — `last_access_micros` is seeded at construction time).
+    pub fn idle_secs(&self) -> u64 {
+        let now = now_micros();
+        let last = self.last_access_micros.load(Ordering::Relaxed);
+        now.saturating_sub(last) / 1_000_000
+    }
+
+    /// Bump the last-access timestamp. Called on every search
+    /// (`search`/`search_filtered`) — mirrors
+    /// `WarmSearchSegment::touch_last_access`.
+    #[inline]
+    fn touch_last_access(&self) {
+        self.last_access_micros
+            .store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// Reset the idle clock at install time (when the segment is swapped
+    /// into the live `SegmentList`). `last_access_micros` is seeded at
+    /// *construction*, but a multi-second background HNSW build can consume
+    /// the whole idle-unload budget before the segment is even searchable —
+    /// a freshly published segment would then be unloaded to COLD in the
+    /// very next sweep tick. Idle time must be measured from visibility,
+    /// not from the start of the build.
+    ///
+    /// Deliberately bypasses the shard's cached clock (`now_micros`): the
+    /// inline FT.COMPACT path builds ON the shard thread, so the event loop
+    /// hasn't ticked (and the cache hasn't advanced) for the entire build —
+    /// stamping the cached value here would be build-duration stale, which
+    /// is the exact bug this method exists to fix. Install is a cold path;
+    /// one real syscall is fine.
+    pub fn mark_installed(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        self.last_access_micros.store(now, Ordering::Relaxed);
+    }
+
     /// Serialize MVCC headers to raw bytes for warm tier .mpf writing.
     ///
     /// Each entry: internal_id(u32 LE) + global_id(u32 LE) + key_hash(u64 LE) +
@@ -1197,6 +1268,65 @@ mod tests {
         assert!(seg.age_secs() < 2);
         // created_at() should be accessible
         let _t = seg.created_at();
+    }
+
+    /// WS3 idle-unload: a freshly constructed segment is not yet idle, and a
+    /// search touches the last-access timestamp so `idle_secs()` resets to
+    /// (near) zero. This is the signal `VectorIndex::try_warm_transitions_idle`
+    /// relies on to distinguish a busy segment from a cold one.
+    #[test]
+    fn test_immutable_segment_idle_secs_tracks_search_touch() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            8,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+
+        let seg = ImmutableSegment::new(
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            Vec::new(),
+            collection,
+            0,
+            0,
+        );
+
+        // Freshly constructed: idle_secs seeded at construction time, so it
+        // reads ~0, not garbage / a huge sentinel.
+        assert!(seg.idle_secs() < 2);
+
+        // An empty segment's search() short-circuits before touching the
+        // graph (total_count 0), but `touch_last_access` runs unconditionally
+        // at the top of both search entry points -- call it directly here to
+        // pin that contract without needing a populated HNSW graph.
+        seg.touch_last_access();
+        assert!(
+            seg.idle_secs() < 2,
+            "idle_secs must reset to ~0 immediately after a touch"
+        );
     }
 
     #[test]

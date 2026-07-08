@@ -53,6 +53,7 @@ pub fn ft_search(
     mut db: Option<&mut crate::storage::db::Database>,
     text_store: Option<&TextStore>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> Frame {
     // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
     if args.len() < 2 {
@@ -106,7 +107,7 @@ pub fn ft_search(
             // TextIndex::is_doc_visible_at. Text-index MVCC upsert-chain remains a
             // Phase 178 (MVCC-01) follow-up.
             return crate::command::vector_search::hybrid::execute_hybrid_search_local(
-                store, ts, &hq, as_of_lsn,
+                store, ts, &hq, as_of_lsn, db_index,
             );
         }
         Ok(None) => { /* fall through to existing path */ }
@@ -146,7 +147,7 @@ pub fn ft_search(
     // Look up metric for range filtering (cheap immutable borrow before search paths)
     let range_metric = if range_threshold.is_some() {
         store
-            .get_index(index_name.as_ref())
+            .get_index_for_db(index_name.as_ref(), db_index)
             .map(|idx| idx.meta.default_field().metric)
     } else {
         None
@@ -207,6 +208,7 @@ pub fn ft_search(
             filter_expr.as_ref(),
             field_name.as_ref(),
             as_of_lsn,
+            db_index,
         );
         let (dense_results, key_hash_to_key) = match dense_raw {
             SearchRawResult::Ok {
@@ -216,8 +218,8 @@ pub fn ft_search(
             SearchRawResult::Error(frame) => return frame,
         };
 
-        // Sparse search
-        let idx = match store.get_index_mut(index_name.as_ref()) {
+        // Sparse search (db-scoped: WS5a)
+        let idx = match store.get_index_mut_for_db(index_name.as_ref(), db_index) {
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
@@ -282,9 +284,9 @@ pub fn ft_search(
         );
     }
 
-    // --- Sparse-only path ---
+    // --- Sparse-only path (db-scoped: WS5a) ---
     if let Some((sparse_field, sparse_pairs)) = sparse_query {
-        let idx = match store.get_index_mut(index_name.as_ref()) {
+        let idx = match store.get_index_mut_for_db(index_name.as_ref(), db_index) {
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
@@ -364,6 +366,7 @@ pub fn ft_search(
             filter_expr.as_ref(),
             field_name.as_ref(),
             as_of_lsn,
+            db_index,
         );
         crate::vector::metrics::increment_search();
         return match result {
@@ -426,6 +429,7 @@ pub fn ft_search(
             filter_expr.as_ref(),
             field_name.as_ref(),
             as_of_lsn,
+            db_index,
         );
         crate::vector::metrics::increment_search();
         match raw {
@@ -449,6 +453,7 @@ pub fn ft_search(
             limit_count,
             field_name.as_ref(),
             as_of_lsn,
+            db_index,
         );
         crate::vector::metrics::increment_search();
         result
@@ -495,6 +500,7 @@ pub fn ft_search_capture(
     db: Option<&mut crate::storage::db::Database>,
     text_store: Option<&TextStore>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> FtSearchPlan {
     // Store-free gate: only the plain dense-KNN path is yieldable.
     let hybrid = matches!(
@@ -514,7 +520,7 @@ pub fn ft_search_capture(
         || parse_range_clause(args).is_some()
         || !has_knn;
     if not_plain {
-        return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn));
+        return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
     }
 
     // Plain dense-KNN. Parse the inputs (store-free), then capture the snapshot.
@@ -523,20 +529,28 @@ pub fn ft_search_capture(
         .and_then(crate::command::vector_search::extract_bulk)
     {
         Some(b) => b,
-        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+        None => {
+            return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
+        }
     };
     // query_str is Some here (has_knn implies it parsed).
     let query_str = match query_str {
         Some(q) => q,
-        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+        None => {
+            return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
+        }
     };
     let (k, field_name, dense_param) = match parse_knn_query(&query_str) {
         Some(t) => t,
-        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+        None => {
+            return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
+        }
     };
     let blob = match extract_param_blob(args, &dense_param) {
         Some(b) => b,
-        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+        None => {
+            return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
+        }
     };
     let filter_expr = parse_filter_clause(args).or_else(|| parse_inline_filter(&query_str));
     let (offset, count) = parse_limit_clause(args);
@@ -550,6 +564,7 @@ pub fn ft_search_capture(
         field_name.as_ref(),
         filter_expr.as_ref(),
         as_of_lsn,
+        db_index,
     ) {
         Some(snapshot) => {
             crate::vector::metrics::increment_search();
@@ -559,7 +574,7 @@ pub fn ft_search_capture(
                 count,
             }
         }
-        None => FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+        None => FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index)),
     }
 }
 
@@ -576,6 +591,7 @@ fn capture_dense_knn_snapshot(
     field_name: Option<&Bytes>,
     filter: Option<&crate::vector::filter::FilterExpr>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> Option<crate::vector::segment::holder::SearchSnapshot> {
     use crate::vector::segment::holder::SearchSnapshot;
     use crate::vector::turbo_quant::encoder::padded_dimension;
@@ -583,7 +599,9 @@ fn capture_dense_knn_snapshot(
     // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering),
     // matching search_local_raw / search_local_filtered.
     let committed = store.txn_manager().committed_snapshot();
-    let idx = store.get_index_mut(index_name)?;
+    // WS5a: db-scoped — falls back to the sync path's NOTFOUND for a
+    // cross-db name collision, same as every other lookup in this module.
+    let idx = store.get_index_mut_for_db(index_name, db_index)?;
 
     // Default field only — non-default field stays on the sync path.
     let dim = match field_name {
@@ -649,6 +667,11 @@ fn capture_dense_knn_snapshot(
     let filter_strategy =
         crate::vector::filter::selectivity::select_strategy(filter_bitmap.as_ref(), total_vectors);
 
+    // WS3 round 2: the yielding (worker-pool) search path captures its
+    // segment snapshot here, separately from `SegmentHolder::search_filtered`'s
+    // own promote-before-search call -- must reload any COLD segments before
+    // this capture too, or a query on this path would silently skip them.
+    idx.segments.promote_unloaded();
     let segments = idx.segments.load_full();
     let mutable_len = segments.mutable.len();
 
@@ -689,12 +712,13 @@ pub fn ft_search_with_graph(
     db: Option<&mut crate::storage::db::Database>,
     text_store: Option<&TextStore>,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> Frame {
     let expand_depth = super::parse::parse_expand_clause(args);
 
     // No expansion requested or no graph store — fall back to standard search.
     if expand_depth.is_none() || graph_store.is_none() {
-        return ft_search(store, args, db, text_store, as_of_lsn);
+        return ft_search(store, args, db, text_store, as_of_lsn, db_index);
     }
 
     let depth = expand_depth.unwrap_or(1);
@@ -702,7 +726,7 @@ pub fn ft_search_with_graph(
     let gs = graph_store.unwrap();
 
     // Run the standard KNN search first (session filtering happens inside ft_search).
-    let knn_result = ft_search(store, args, db, text_store, as_of_lsn);
+    let knn_result = ft_search(store, args, db, text_store, as_of_lsn, db_index);
 
     // Extract (key, score) pairs from the KNN response for seeding graph expansion.
     let seed_keys = super::response::extract_seeds_from_response(&knn_result);

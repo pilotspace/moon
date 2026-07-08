@@ -198,8 +198,10 @@ fn cache_probe(
     cache_prefix: &[u8],
     query_blob: &[u8],
     threshold: f32,
+    db_index: u8,
 ) -> Option<CacheHit> {
-    let idx = store.get_index(index_name)?;
+    // WS5a: db-scoped.
+    let idx = store.get_index_for_db(index_name, db_index)?;
     let metric = idx.meta.metric;
     let key_hash_to_key = &idx.key_hash_to_key;
 
@@ -231,6 +233,7 @@ fn cache_probe(
         usize::MAX,
         None,
         0,
+        db_index,
     );
 
     // Parse the response to find the best cache hit.
@@ -318,7 +321,7 @@ fn extract_score_from_fields(fields_frame: &Frame) -> f32 {
 /// 2. On cache HIT: returns the cached entry with `cache_hit: "true"` metadata.
 /// 3. On cache MISS: falls back to full KNN search with `fallback_k` and returns
 ///    results with `cache_hit: "false"` metadata.
-pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame]) -> Frame {
+pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame], db_index: u8) -> Frame {
     let parsed = match parse_cachesearch_args(args) {
         Ok(p) => p,
         Err(e) => return e,
@@ -331,6 +334,7 @@ pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame]) -> Frame {
         &parsed.cache_prefix,
         &parsed.query_blob,
         parsed.threshold,
+        db_index,
     );
 
     if let Some(cache_hit) = hit {
@@ -367,6 +371,7 @@ pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame]) -> Frame {
         parsed.count,
         None, // cache search always uses default field
         0,    // non-temporal
+        db_index,
     );
 
     // Augment each result with cache_hit: "false" metadata.

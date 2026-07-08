@@ -687,10 +687,19 @@ impl super::Shard {
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
         #[cfg(feature = "runtime-tokio")]
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
-        // Warm check interval adapts to segment_warm_after for fast testing:
-        // default 10s, but if warm_after < 10s, poll at warm_after frequency.
-        let warm_poll_ms =
-            (server_config.segment_warm_after * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
+        // Warm check interval adapts to segment_warm_after / engine_offload_idle_secs
+        // for fast testing: default 10s, but if either threshold is < 10s (WS3: an
+        // operator or test wants near-immediate idle-unload), poll at that
+        // frequency instead. `0` (idle criterion disabled) does not shrink the
+        // interval.
+        let warm_trigger_secs = if server_config.engine_offload_idle_secs > 0 {
+            server_config
+                .segment_warm_after
+                .min(server_config.engine_offload_idle_secs)
+        } else {
+            server_config.segment_warm_after
+        };
+        let warm_poll_ms = (warm_trigger_secs * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
         #[cfg(feature = "runtime-tokio")]
         let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
         // Cold tier transition check: poll at min(60s, segment_cold_after) so the
@@ -911,12 +920,16 @@ impl super::Shard {
                         text_metas.len()
                     );
                     for meta in text_metas {
-                        let text_index = crate::text::store::TextIndex::new(
+                        let mut text_index = crate::text::store::TextIndex::new(
                             meta.name.clone(),
                             meta.key_prefixes.clone(),
                             meta.text_fields.clone(),
                             meta.bm25_config,
                         );
+                        // WS5a: carry the persisted db_index forward so a
+                        // restart doesn't silently re-home a restored text
+                        // index to db 0.
+                        text_index.db_index = meta.db_index;
                         if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
                             tracing::warn!(
                                 "Shard {}: failed to restore text index '{}': {}",
@@ -1006,6 +1019,7 @@ impl super::Shard {
                                     &mut s.text_store,
                                     key,
                                     args,
+                                    db_idx as u8,
                                 );
                                 reindexed += 1;
                             }
@@ -1533,6 +1547,7 @@ impl super::Shard {
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
+                                    server_config.engine_offload_idle_secs,
                                     &mut next_file_id,
                                     shard_id,
                                     &mut wal_writer,
@@ -2194,6 +2209,7 @@ impl super::Shard {
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
+                                    server_config.engine_offload_idle_secs,
                                     &mut next_file_id,
                                     shard_id,
                                     &mut wal_writer,

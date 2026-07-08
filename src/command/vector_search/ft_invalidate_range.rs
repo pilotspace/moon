@@ -53,7 +53,7 @@ use crate::text::store::TextStore;
 ///
 /// See module-level documentation for the Lunaris integration contract.
 #[cfg(feature = "text-index")]
-pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame {
+pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame], db_index: u8) -> Frame {
     // ── Argument parsing ──────────────────────────────────────────────────────
     // Expected: <index> <node_id_field> <node_id_value> <hlc_wall_field> <hlc_wall_lo> <hlc_wall_hi>
     if args.len() != 6 {
@@ -115,9 +115,12 @@ pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame 
         ));
     }
 
-    // ── Index lookup ──────────────────────────────────────────────────────────
+    // ── Index lookup (db-scoped: WS5a) ────────────────────────────────────────
     // Verify the index exists before attempting any mutation.
-    if text_store.get_index(index_name.as_ref()).is_none() {
+    if text_store
+        .get_index_for_db(index_name.as_ref(), db_index)
+        .is_none()
+    {
         return Frame::Error(Bytes::from_static(
             b"WRONGTYPE no such index; FT.INVALIDATE_RANGE requires an existing text index",
         ));
@@ -135,7 +138,7 @@ pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame 
         // because the borrow is held synchronously on a single shard thread.
         #[allow(clippy::expect_used)]
         let idx = text_store
-            .get_index(index_name.as_ref())
+            .get_index_for_db(index_name.as_ref(), db_index)
             .expect("existence checked above");
 
         // TAG filter: all doc_ids where node_id_field == node_id_value.
@@ -178,7 +181,7 @@ pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame 
 
     // ── Hard-delete matching documents ────────────────────────────────────────
     let count = matching_doc_ids.len() as i64;
-    if let Some(idx) = text_store.get_index_mut(index_name.as_ref()) {
+    if let Some(idx) = text_store.get_index_mut_for_db(index_name.as_ref(), db_index) {
         for doc_id in matching_doc_ids {
             idx.remove_doc_by_doc_id(doc_id);
         }
@@ -248,7 +251,7 @@ mod tests {
             bulk(b"content"),
             bulk(b"TEXT"),
         ];
-        ft_create(&mut vs, &mut ts, &create_args);
+        ft_create(&mut vs, &mut ts, &create_args, 0);
 
         // Insert docs
         for i in 0..n {
@@ -296,7 +299,7 @@ mod tests {
             bulk(b"2"),
             bulk(b"4"),
         ];
-        let result = ft_invalidate_range(&mut ts, &args);
+        let result = ft_invalidate_range(&mut ts, &args, 0);
         assert_eq!(
             result,
             Frame::Integer(2),
@@ -331,7 +334,7 @@ mod tests {
             bulk(b"100"),
             bulk(b"200"),
         ];
-        let result = ft_invalidate_range(&mut ts, &args);
+        let result = ft_invalidate_range(&mut ts, &args, 0);
         assert_eq!(result, Frame::Integer(0), "no docs in range → returns 0");
     }
 
@@ -354,7 +357,7 @@ mod tests {
             bulk(b"999"),
             bulk(b"1000"),
         ];
-        ft_invalidate_range(&mut ts, &args_zero);
+        ft_invalidate_range(&mut ts, &args_zero, 0);
         let after_zero = ts.version_token();
         assert_eq!(
             after_zero,
@@ -371,7 +374,7 @@ mod tests {
             bulk(b"0"),
             bulk(b"2"),
         ];
-        ft_invalidate_range(&mut ts, &args_match);
+        ft_invalidate_range(&mut ts, &args_match, 0);
         let after_match = ts.version_token();
         assert_eq!(
             after_match,
@@ -389,7 +392,7 @@ mod tests {
 
         // Too few args (only 3 instead of 6)
         let args = vec![bulk(b"idx"), bulk(b"node_id"), bulk(b"node:1")];
-        let result = ft_invalidate_range(&mut ts, &args);
+        let result = ft_invalidate_range(&mut ts, &args, 0);
         match result {
             Frame::Error(e) => {
                 let s = std::str::from_utf8(&e).unwrap_or("");
@@ -417,7 +420,7 @@ mod tests {
             bulk(b"10"), // lo
             bulk(b"5"),  // hi < lo
         ];
-        let result = ft_invalidate_range(&mut ts, &args);
+        let result = ft_invalidate_range(&mut ts, &args, 0);
         match result {
             Frame::Error(e) => {
                 let s = std::str::from_utf8(&e).unwrap_or("");
@@ -445,7 +448,7 @@ mod tests {
             bulk(b"0"),
             bulk(b"100"),
         ];
-        let result = ft_invalidate_range(&mut ts, &args);
+        let result = ft_invalidate_range(&mut ts, &args, 0);
         match result {
             Frame::Error(e) => {
                 let s = std::str::from_utf8(&e).unwrap_or("");

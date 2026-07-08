@@ -914,6 +914,111 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Array(results.into())
 }
 
+const BITFIELD_RO_ERR: &[u8] = b"ERR BITFIELD_RO only supports the GET subcommand";
+
+/// Reject BITFIELD_RO args containing SET/INCRBY/OVERFLOW. Safe as a blind
+/// token scan: a GET op's own arguments (encoding `iN`/`uN`, offset numeric
+/// or `#N`) can never lexically collide with these keywords.
+fn bitfield_ro_rejects(args: &[Frame]) -> Option<Frame> {
+    for a in args.iter().skip(1) {
+        if let Some(tok) = extract_bytes(a) {
+            if tok.eq_ignore_ascii_case(b"SET")
+                || tok.eq_ignore_ascii_case(b"INCRBY")
+                || tok.eq_ignore_ascii_case(b"OVERFLOW")
+            {
+                return Some(Frame::Error(Bytes::from_static(BITFIELD_RO_ERR)));
+            }
+        }
+    }
+    None
+}
+
+/// BITFIELD_RO key GET encoding offset [GET encoding offset ...]
+///
+/// Read-only twin of BITFIELD — only GET is permitted (no SET/INCRBY/
+/// OVERFLOW). Used on the mutable dispatch track; delegates to `bitfield()`
+/// once every op is confirmed to be GET.
+pub fn bitfield_ro(db: &mut Database, args: &[Frame]) -> Frame {
+    if let Some(e) = bitfield_ro_rejects(args) {
+        return e;
+    }
+    bitfield(db, args)
+}
+
+/// Read-only twin of `bitfield_ro` for the `dispatch_read` fast path: reads
+/// via `get_if_alive` and never calls `db.set()`.
+pub fn bitfield_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("BITFIELD_RO");
+    }
+    if let Some(e) = bitfield_ro_rejects(args) {
+        return e;
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("BITFIELD_RO"),
+    };
+
+    let empty: &[u8] = &[];
+    let data: &[u8] = match db.get_if_alive(key, now_ms) {
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        },
+        None => empty,
+    };
+
+    let mut results = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let subcmd = match extract_bytes(&args[i]) {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if !subcmd.eq_ignore_ascii_case(b"GET") {
+            // bitfield_ro_rejects already screened SET/INCRBY/OVERFLOW; any
+            // other token here is a genuine syntax error.
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+        let enc = match args.get(i + 1).and_then(|f| extract_bytes(f)) {
+            Some(e) => e,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        let offset_arg = match args.get(i + 2).and_then(|f| extract_bytes(f)) {
+            Some(o) => o,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        let (signed, bits) = match parse_encoding(enc) {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Invalid bitfield type. Use something like i8 u8 i16 u16 ...",
+                ));
+            }
+        };
+        let bit_offset = match parse_bit_offset(offset_arg, bits) {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR bit offset is not an integer or out of range",
+                ));
+            }
+        };
+        let val = bf_get(data, bit_offset, bits, signed);
+        results.push(Frame::Integer(val));
+        i += 3;
+    }
+
+    Frame::Array(results.into())
+}
+
 #[derive(Clone, Copy)]
 enum Overflow {
     Wrap,
@@ -1242,5 +1347,97 @@ mod tests {
         let mut db = make_db();
         let result = bitpos(&mut db, &[bs(b"key"), bs(b"1")]);
         assert_eq!(result, Frame::Integer(-1));
+    }
+
+    // --- BITFIELD_RO tests ---
+
+    #[test]
+    fn test_bitfield_ro_get_matches_bitfield() {
+        let mut db = make_db();
+        bitfield(
+            &mut db,
+            &[bs(b"key"), bs(b"SET"), bs(b"u8"), bs(b"0"), bs(b"255")],
+        );
+        let result = bitfield_ro(&mut db, &[bs(b"key"), bs(b"GET"), bs(b"u8"), bs(b"0")]);
+        assert_eq!(result, Frame::Array(vec![Frame::Integer(255)].into()));
+    }
+
+    #[test]
+    fn test_bitfield_ro_rejects_set() {
+        let mut db = make_db();
+        let result = bitfield_ro(
+            &mut db,
+            &[bs(b"key"), bs(b"SET"), bs(b"u8"), bs(b"0"), bs(b"1")],
+        );
+        assert_eq!(result, Frame::Error(Bytes::from_static(BITFIELD_RO_ERR)));
+        // Confirms read-only: nothing was written.
+        assert!(db.get(b"key").is_none());
+    }
+
+    #[test]
+    fn test_bitfield_ro_rejects_incrby() {
+        let mut db = make_db();
+        let result = bitfield_ro(
+            &mut db,
+            &[bs(b"key"), bs(b"INCRBY"), bs(b"u8"), bs(b"0"), bs(b"1")],
+        );
+        assert_eq!(result, Frame::Error(Bytes::from_static(BITFIELD_RO_ERR)));
+    }
+
+    #[test]
+    fn test_bitfield_ro_rejects_overflow() {
+        let mut db = make_db();
+        let result = bitfield_ro(
+            &mut db,
+            &[
+                bs(b"key"),
+                bs(b"OVERFLOW"),
+                bs(b"SAT"),
+                bs(b"GET"),
+                bs(b"u8"),
+                bs(b"0"),
+            ],
+        );
+        assert_eq!(result, Frame::Error(Bytes::from_static(BITFIELD_RO_ERR)));
+    }
+
+    #[test]
+    fn test_bitfield_ro_missing_key_returns_zero() {
+        let mut db = make_db();
+        let result = bitfield_ro(&mut db, &[bs(b"nope"), bs(b"GET"), bs(b"u8"), bs(b"0")]);
+        assert_eq!(result, Frame::Array(vec![Frame::Integer(0)].into()));
+    }
+
+    #[test]
+    fn test_bitfield_ro_readonly_matches_mutable_track() {
+        let mut db = make_db();
+        bitfield(
+            &mut db,
+            &[bs(b"key"), bs(b"SET"), bs(b"u8"), bs(b"0"), bs(b"42")],
+        );
+        let result = bitfield_ro_readonly(&db, &[bs(b"key"), bs(b"GET"), bs(b"u8"), bs(b"0")], 0);
+        assert_eq!(result, Frame::Array(vec![Frame::Integer(42)].into()));
+    }
+
+    #[test]
+    fn test_bitfield_ro_readonly_rejects_set() {
+        let db = make_db();
+        let result = bitfield_ro_readonly(
+            &db,
+            &[bs(b"key"), bs(b"SET"), bs(b"u8"), bs(b"0"), bs(b"1")],
+            0,
+        );
+        assert_eq!(result, Frame::Error(Bytes::from_static(BITFIELD_RO_ERR)));
+    }
+
+    #[test]
+    fn test_bitfield_ro_readonly_wrong_type() {
+        let mut db = make_db();
+        db.set(
+            Bytes::from_static(b"key"),
+            crate::storage::entry::Entry::new_list(),
+        );
+        let result = bitfield_ro_readonly(&db, &[bs(b"key"), bs(b"GET"), bs(b"u8"), bs(b"0")], 0);
+        assert!(matches!(result, Frame::Error(_)));
     }
 }

@@ -1828,4 +1828,116 @@ mod tests {
         // pairs must live long enough for the hexpire_args references above
         drop(pairs);
     }
+
+    // -----------------------------------------------------------------
+    // WS6 — container-growth memory accounting (src/storage/db.rs).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_estimated_memory_rises_with_hset_growth() {
+        let mut db = Database::new();
+        let value = vec![b'v'; 200];
+        hset(&mut db, &make_args(&[b"h", b"f0", &value]));
+        let after_one = db.estimated_memory();
+
+        // Force the full-HashMap path (large elements skip the listpack
+        // fast path) so this exercises the per-field `hash_field_cost`
+        // delta tracking in `hash_write.rs::hset`, not the listpack
+        // before/after snapshot.
+        for i in 1..50 {
+            let field = format!("f{i}");
+            hset(&mut db, &make_args(&[b"h", field.as_bytes(), &value]));
+        }
+        let after_fifty = db.estimated_memory();
+        assert!(
+            after_fifty > after_one,
+            "estimated_memory must rise as fields are added: after_one={after_one} \
+             after_fifty={after_fifty}"
+        );
+        // Roughly 49 more fields at ~(field_len + 200 + 64) bytes each.
+        assert!(
+            after_fifty - after_one > 49 * 200,
+            "growth must be at least proportional to the added field payload"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_falls_with_hdel() {
+        let mut db = Database::new();
+        let value = vec![b'v'; 200];
+        for i in 0..50 {
+            let field = format!("f{i}");
+            hset(&mut db, &make_args(&[b"h", field.as_bytes(), &value]));
+        }
+        let grown = db.estimated_memory();
+
+        for i in 0..49 {
+            let field = format!("f{i}");
+            hdel(&mut db, &make_args(&[b"h", field.as_bytes()]));
+        }
+        let drained = db.estimated_memory();
+        assert!(
+            drained < grown,
+            "estimated_memory must fall as fields are deleted: grown={grown} drained={drained}"
+        );
+
+        // Delete the last field too -- the key is removed entirely, and its
+        // full entry cost (recomputed via `entry_overhead` in `db.remove`)
+        // must be credited back down to (near-)zero.
+        hdel(&mut db, &make_args(&[b"h", b"f49"]));
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "estimated_memory must return to zero once the hash is fully drained \
+             and the key removed"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_overwrite_nets_correct_delta() {
+        let mut db = Database::new();
+        let small = vec![b'a'; 10];
+        let big = vec![b'b'; 5_000];
+        hset(&mut db, &make_args(&[b"h", b"f0", &small]));
+        let small_mem = db.estimated_memory();
+
+        // Overwriting the SAME field with a much bigger value must charge
+        // the net delta, not silently ignore the growth (the original bug:
+        // only the empty-container creation was ever charged).
+        hset(&mut db, &make_args(&[b"h", b"f0", &big]));
+        let big_mem = db.estimated_memory();
+        assert!(
+            big_mem > small_mem + 4_000,
+            "overwriting a field with a much larger value must grow \
+             estimated_memory proportionally: small={small_mem} big={big_mem}"
+        );
+
+        // Overwriting back down to a small value must credit the shrink.
+        hset(&mut db, &make_args(&[b"h", b"f0", &small]));
+        let shrunk_mem = db.estimated_memory();
+        assert!(
+            shrunk_mem < big_mem,
+            "overwriting a field with a smaller value must shrink \
+             estimated_memory: big={big_mem} shrunk={shrunk_mem}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_listpack_growth_and_upgrade() {
+        let mut db = Database::new();
+        // Small values stay on the listpack fast path (< LISTPACK_MAX_ELEMENT_SIZE).
+        let value = vec![b'v'; 8];
+        hset(&mut db, &make_args(&[b"h", b"f0", &value]));
+        let one = db.estimated_memory();
+        for i in 1..40 {
+            let field = format!("f{i}");
+            hset(&mut db, &make_args(&[b"h", field.as_bytes(), &value]));
+        }
+        let many = db.estimated_memory();
+        assert!(
+            many > one,
+            "listpack-encoded hash growth must still be visible in \
+             estimated_memory: one={one} many={many}"
+        );
+    }
 }

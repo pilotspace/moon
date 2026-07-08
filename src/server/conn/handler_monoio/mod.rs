@@ -81,10 +81,11 @@ fn run_write_eviction_gate(
     ctx: &super::core::ConnectionContext,
     db: &mut crate::storage::db::Database,
     sel_db: usize,
+    cmd: &[u8],
 ) -> Result<(), Frame> {
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
-    if let Some(ref sender) = ctx.spill_sender {
+    let global_result = if let Some(ref sender) = ctx.spill_sender {
         let mut fid = ctx.spill_file_id.get();
         let dir = ctx
             .disk_offload_dir
@@ -96,7 +97,25 @@ fn run_write_eviction_gate(
         res
     } else {
         try_evict_if_needed_budget(db, &rt, budget)
+    };
+    // WS6 fix (HIGH, adversarial review 2026-07-08): a command that can only
+    // shrink memory (HDEL, SREM, LPOP, ...) must never be REJECTED by either
+    // gate below, or a key/db that crosses its noeviction boundary has no
+    // self-recovery path. Eviction is still attempted above — an evicting
+    // policy may as well reclaim while the write lock is already held; only
+    // the reject is bypassed. See `db_quota::is_shrink_only_command`.
+    let shrink_only = crate::storage::db_quota::is_shrink_only_command(cmd);
+    if !shrink_only {
+        global_result?;
     }
+    // WS5b: per-db quota, additive and finer-grained than the whole-instance
+    // maxmemory gate above. Zero-cost when unconfigured for this db.
+    // `_for_command` exempts SELECT/SWAPDB — see `db_quota::command_exempt_from_db_quota`
+    // (this chokepoint runs on `metadata::is_write`-flagged commands, which
+    // includes SELECT despite it not writing to the current db).
+    let db_quota_result =
+        crate::storage::db_quota::check_db_maxmemory_for_command(db, sel_db, &rt, cmd);
+    if shrink_only { Ok(()) } else { db_quota_result }
 }
 
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
@@ -693,8 +712,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Safety: `maxmemory` changes via `CONFIG SET maxmemory N` are picked
         // up on the NEXT batch. A batch spans sub-millisecond; operators do
         // not observe this granularity.
-        let batch_eviction_active =
-            ctx.spill_sender.is_some() || ctx.runtime_config.read().maxmemory != 0;
+        //
+        // WS5b fix-first review: this condition MUST also consult the per-db
+        // quota atomic. `run_write_eviction_gate` (below) is the only caller
+        // of `check_db_maxmemory_for_command` in this file, and it is gated
+        // entirely behind `batch_eviction_active` — without this term, a
+        // server started with `--maxmemory 0` and no disk-offload spill
+        // sender (e.g. `--disk-offload disable`) never runs the db-quota
+        // check for any non-inline write (HSET/LPUSH/SADD/ZADD/INCR/APPEND/
+        // MSET/SET-with-options/RESTORE/...), even with `--db-maxmemory`
+        // configured. Reproduced empirically: 60x1KB HSET into a 4KB-quota'd
+        // db all succeeded while plain SET was correctly rejected (SET takes
+        // the separate, correctly-gated inline fast path in blocking.rs).
+        // Mirrors the Lua bridge's early-exit gate in scripting/bridge.rs,
+        // which already included this term.
+        let batch_eviction_active = ctx.spill_sender.is_some()
+            || ctx.runtime_config.read().maxmemory != 0
+            || crate::storage::db_quota::db_maxmemory_any_set();
 
         let mut auth_delay_ms: u64 = 0;
 
@@ -1133,6 +1167,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 crate::command::server_admin::vacuum_vector(
                                     &mut s.vector_store,
                                     &cmd_args[1..],
+                                    conn.selected_db as u8,
                                 )
                             });
                             responses.push(response);
@@ -1377,7 +1412,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         let db = &mut s.databases[sel_db];
 
                         if batch_eviction_active {
-                            run_write_eviction_gate(ctx, db, sel_db)?;
+                            run_write_eviction_gate(ctx, db, sel_db, cmd)?;
                         }
 
                         // KV undo-log capture (MUST precede dispatch)
@@ -1439,6 +1474,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     &mut s.text_store,
                                     key.as_ref(),
                                     cmd_args,
+                                    sel_db as u8,
                                 )
                             } else {
                                 smallvec::SmallVec::new()
@@ -1458,6 +1494,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_delete_vectors(
                                 &mut s.vector_store,
                                 cmd_args,
+                                sel_db as u8,
                             );
                         }
 
@@ -1466,11 +1503,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_hdel_vectors(
                                 &mut s.vector_store,
                                 cmd_args,
+                                sel_db as u8,
                             );
                         }
 
                         // R3: FLUSHALL/FLUSHDB clears index contents
-                        // (FT.CREATE definitions survive).
+                        // (FT.CREATE definitions survive). WS5a: FLUSHDB
+                        // scopes to `sel_db`; FLUSHALL clears every db.
                         if !is_error
                             && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                 || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -1478,6 +1517,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_flush_indexes(
                                 &mut s.vector_store,
                                 &mut s.text_store,
+                                cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                                sel_db as u8,
                             );
                         }
 

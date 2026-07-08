@@ -87,9 +87,10 @@ pub fn execute_hybrid_search_local_raw_streams(
     global_n: u32,
     as_of_lsn: u64,
     filter: Option<&crate::command::vector_search::hybrid::HybridFilter>,
+    db_index: u8,
 ) -> Frame {
     // ── Stream 1: BM25 with injected global IDF ──────────────────────────────
-    let text_index = match text_store.get_index(index_name.as_ref()) {
+    let text_index = match text_store.get_index_for_db(index_name.as_ref(), db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -119,7 +120,7 @@ pub fn execute_hybrid_search_local_raw_streams(
     // `as_of_lsn == 0` → no temporal filtering (treemap still snapshotted for
     // ACID-09 committed-entry visibility parity with search_local_raw).
     let committed = vector_store.txn_manager().committed_snapshot();
-    let idx = match vector_store.get_index_mut(index_name.as_ref()) {
+    let idx = match vector_store.get_index_mut_for_db(index_name.as_ref(), db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -420,6 +421,7 @@ mod tests {
             0,
             0,
             None,
+            0,
         );
         match result {
             Frame::Error(msg) => {

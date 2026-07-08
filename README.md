@@ -67,7 +67,8 @@ and how they compose.
 - **Thread-per-core, zero shared state.** Each shard owns its event loop, DashTable, WAL writer, and Pub/Sub registry. No global locks; cross-shard dispatch is a lock-free SPSC channel.
 - **Dual runtime.** Monoio (`io_uring` on Linux, `kqueue` on macOS) for peak throughput; Tokio for portability and CI. Same binary, feature-gated.
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no `fork()`, no COW memory spike. AOF is a per-shard WAL v3 with batched fsync; the advantage over Redis grows with pipeline depth.
-- **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
+- **Tiered disk offload — for data AND engines.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through; idle vector-index segments demote HOT→WARM (mmap)→COLD (unloaded stub, reload-on-search) and give the memory back — measured **−26% process RSS** on a 40K×768d corpus with identical search results after reload. 100% crash recovery across all tiers.
+- **Multi-tenant isolation that's actually enforced.** Logical dbs get their own `FT.*`/graph/full-text indexes (db 1's indexes are invisible to db 0 — across shards, restarts, and recovery), per-db memory quotas (`--db-maxmemory`) with Redis-style deny-OOM semantics (shrink commands always pass — a tenant can never wedge itself), and workspace key-prefix namespaces on top.
 - **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
 - **AI-native, in-core.** Vector search (HNSW + TurboQuant), BM25 full-text with three-way RRF hybrid fusion, a Cypher property-graph engine, cross-store ACID, workspaces, durable queues, and bi-temporal MVCC — one binary, no module loader.
 
@@ -83,7 +84,7 @@ Moon ships signed, checksummed packages for Linux, macOS, and Windows. All artif
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pilotspace/moon/main/install.sh | sh
-# pin: VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin sh install.sh
+# pin: VERSION=v0.6.0 INSTALL_DIR=/usr/local/bin sh install.sh
 ```
 
 **Windows — PowerShell** (installs `moon.exe` and adds it to PATH; not yet Authenticode-signed, so SmartScreen may prompt "Run anyway"):
@@ -216,9 +217,25 @@ are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.mdx](docs/benchmarks.
 | Crash recovery (SIGKILL, 5K keys)   | 100%   | 100% (parity) |
 
 On **ARM64** (Neoverse-N1) Moon runs ~2.1–2.2× Redis on the same harness.
+
+Deep pipelines were always Moon's home turf; v0.5–v0.6 closed the two
+classic gaps too:
+
+- **Unpipelined (p=1) single-connection** — historically Redis's best case —
+  now a Moon **win on both GCE architectures** with the shipped
+  `--io-busy-poll-us 40` poll-mode park (`--profile standalone` sets it for
+  you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86 (c3),
+  same-instance A/Bs, n=3.
+- **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
+  **0.91× Redis** via per-batch group commit + coalesced writes, while
+  `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.
+- **Vector time-to-index-green** (bulk load → searchable at target recall)
+  beats Qdrant **1.6–2.3×** on GCE with the parallel HNSW build.
+
 For **vector** (12.7K search QPS @ 384d), **graph** (23× FalkorDB bulk
-insert, 2.4× Cypher QPS), and **hash-field TTL** (Valkey-parity)
-benchmarks, see [BENCHMARK.md](BENCHMARK.md).
+insert, 2.4× Cypher QPS; 2.78× on point-filter after the mutable property
+index), and **hash-field TTL** (Valkey-parity) benchmarks, see
+[BENCHMARK.md](BENCHMARK.md).
 
 > Valkey is not yet head-to-head benched on this harness; its vendor-published
 > 2.1M RPS (9 I/O threads, p=10) is quoted for context in the comparison below.
@@ -232,7 +249,7 @@ every major cloud, drop-in compatibility. Redis OSS is the upstream
 reference but ships under SSPL since 2024. Full traced review:
 [`docs/comparison-valkey.md`](docs/comparison-valkey.md).
 
-| Dimension                  | **Moon v0.2.0**                  | **Valkey 9.1.0**            | **Redis 8.6.1 (OSS)**     |
+| Dimension                  | **Moon v0.6.0**                  | **Valkey 9.1.0**            | **Redis 8.6.1 (OSS)**     |
 |----------------------------|----------------------------------|-----------------------------|----------------------------|
 | Language / license         | Rust 2024 / Apache-2.0           | C99 / BSD-3 (LF TSC)        | C99 / **SSPL** since 2024 |
 | Threading                  | Thread-per-core, shared-nothing  | Main thread + ≤9 I/O threads | Single-threaded core      |
@@ -241,7 +258,8 @@ reference but ships under SSPL since 2024. Full traced review:
 | Vector / BM25 / graph      | **In-core** (HNSW+TQ, BM25, Cypher) | `valkey-search` module   | RediSearch module / none  |
 | Cross-store ACID           | `TXN.BEGIN/COMMIT/ABORT`         | None                        | None                      |
 | Hash-field TTL             | **Yes** (Valkey-parity)          | **Yes** (9.0+)              | No                        |
-| Tiered NVMe offload        | **Yes** (under `maxmemory`)      | No (OSS)                    | No (OSS)                  |
+| Tiered NVMe offload        | **Yes** (KV under `maxmemory` + idle engine segments) | No (OSS)   | No (OSS)                  |
+| Multi-tenant isolation     | **Per-db quotas + db-scoped indexes + workspaces** | ACL only  | ACL only                  |
 | Multi-node cluster (GA)    | **Alpha** (single-node GA today) | **Production**              | **Production**            |
 | Peak single-server GET     | **5.11M/s** (c3-8 x86_64)        | 2.1M RPS (vendor, p=10)     | 2.98M/s (same harness)    |
 
@@ -262,7 +280,9 @@ reference but ships under SSPL since 2024. Full traced review:
 | **Full-text search** | BM25 inverted index, typo tolerance (Levenshtein-automata), TAG/NUMERIC fields, HIGHLIGHT/SUMMARIZE, three-way RRF fusion |
 | **Graph engine** | 14 `GRAPH.*` commands, Cypher subset (MATCH/WHERE/RETURN/CREATE/DELETE/SET/MERGE), hybrid graph+vector, CSR segments, SIMD cosine, temporal-decay traversal |
 | **Transactions** | `MULTI`/`EXEC` (Redis compat) + `TXN.BEGIN`/`COMMIT`/`ABORT` (cross-store ACID with undo-log rollback) |
+| **Isolation & quotas** | Db-scoped `FT.*`/graph/full-text indexes, per-db memory quotas (`--db-maxmemory`, `CONFIG SET db-maxmemory`) with deny-OOM shrink exemptions, truthful container-growth accounting |
 | **Workspaces** | `WS CREATE`/`AUTH`/`LIST` — multi-tenant namespace isolation with transparent key prefixing |
+| **Memory offload** | Idle vector segments HOT→WARM (mmap)→COLD (`--engine-offload-idle-secs`, `--segment-warm-after`); DEL/HDEL-correct across all tiers |
 | **Message queues** | `MQ CREATE`/`PUSH`/`POP`/`ACK` — durable queues with dead-letter, triggers, WAL recovery |
 | **Temporal / CDC** | Bi-temporal MVCC (`TEMPORAL.SNAPSHOT_AT`), PITR (`--recovery-target-lsn`), `CDC.READ` change stream |
 | **Web console** | 7-view React app embedded in the binary, served at `/ui/` |
@@ -328,8 +348,9 @@ Full list in [CLAUDE.md](CLAUDE.md) "Gotchas".
 
 | Milestone | Focus | Status |
 |---|---|---|
-| **v0.2.0** (shipped) | Hash-field TTL, PITR, `CDC.READ`, signed multi-platform packaging | **GA** |
-| **v0.2.x** | Multi-node cluster soak (PSYNC2 + atomic slot migration), CDC push, GPU vectors, SLO lock-in | planned |
+| **v0.5.x** (shipped) | KV p=1 win (busy-poll park), durability write-path 2× campaign, WAL v3-only, sharded MULTI/EXEC hardening | **GA** |
+| **v0.6.0** (this release) | Multi-db isolation (db-scoped indexes + per-db quotas + workspace hardening), tiered engine offload (WARM/COLD), truthful container-growth accounting, `--profile standalone`, command-parity audit | **GA** |
+| **v0.6.x** | Multi-node cluster soak (PSYNC2 + atomic slot migration), CDC push, GPU vectors, SLO lock-in | planned |
 | **v1.0** | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA box ticked | gate |
 
 Full release history: [CHANGELOG.md](CHANGELOG.md).

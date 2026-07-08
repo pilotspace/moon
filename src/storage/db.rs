@@ -26,6 +26,80 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// O(1) container-growth memory accounting (WS6).
+//
+// `get_or_create_hash`/`_list`/`_set`/`_sorted_set` charge `entry_overhead`
+// ONCE, at creation of the (empty) container, then hand out a raw `&mut`
+// reference into the map/deque/set/tree. Every subsequent mutation through
+// that reference (HSET adding fields, LPUSH growing the deque, ...) was
+// invisible to `used_memory` — a real memory-safety hole against both the
+// global `--maxmemory` gate and per-db quotas (adversarial review, 2026-07-08).
+//
+// The fix is per-mutation delta accounting rather than a full recompute:
+// `RedisValue::estimate_memory()` is O(n) for the expanded encodings (plain
+// `Hash`/`List`/`Set`/`SortedSetBPTree` all sum over every element), so
+// recomputing it after every single-field HSET on a million-field hash would
+// turn an O(1) command into O(n) — exactly the "periodic rescan on the hot
+// path" this design avoids. Instead, call sites that mutate a container
+// in-place compute the exact per-element byte delta using the same
+// constants baked into `RedisValue::estimate_memory`'s per-variant arms
+// (kept below so they can't silently drift out of sync with that function)
+// and apply it via `Database::charge_memory` / `credit_memory` — O(1), no
+// allocation, no rescan.
+//
+// The listpack/intset COMPACT encodings are the exception: their
+// `estimate_memory()` is already O(1) (`size_of::<Self>() + data.capacity()`,
+// a byte-buffer capacity read), so those call sites snapshot
+// `lp.estimate_memory()` before/after the mutation instead of tracking a
+// per-element formula — simpler and just as cheap.
+// ---------------------------------------------------------------------------
+
+/// Per-field byte cost for a `RedisValue::Hash` / `HashWithTtl.fields` entry.
+/// MUST mirror the `Hash` arm of `RedisValue::estimate_memory` exactly.
+#[inline]
+pub fn hash_field_cost(field: &[u8], value: &[u8]) -> usize {
+    hash_field_cost_len(field.len(), value.len())
+}
+
+/// Length-only variant of [`hash_field_cost`] for call sites where the field
+/// and/or value `Bytes` have already been moved (e.g. into `map.insert`) —
+/// `Bytes::len()` is captured beforehand since it doesn't consume the value.
+#[inline]
+pub fn hash_field_cost_len(field_len: usize, value_len: usize) -> usize {
+    field_len + value_len + 64
+}
+
+/// Per-field TTL sidecar byte cost (`HashWithTtl.ttls`). MUST mirror the
+/// `HashWithTtl` arm's `ttls` term in `RedisValue::estimate_memory`.
+#[inline]
+pub fn hash_ttl_field_cost(field: &[u8]) -> usize {
+    field.len() + 8 + 32
+}
+
+/// Per-element byte cost for `RedisValue::List`. MUST mirror the `List` arm
+/// of `RedisValue::estimate_memory`.
+#[inline]
+pub fn list_elem_cost(elem: &[u8]) -> usize {
+    elem.len() + 24
+}
+
+/// Per-member byte cost for `RedisValue::Set`. MUST mirror the `Set` arm of
+/// `RedisValue::estimate_memory`.
+#[inline]
+pub fn set_member_cost(member: &[u8]) -> usize {
+    member.len() + 24
+}
+
+/// Per-member byte cost for `RedisValue::SortedSetBPTree`: one fixed-size
+/// tree node (80B, `tree.len() * 80` in the estimator) plus one
+/// `members: HashMap<Bytes, f64>` entry (`member.len() + 40`). MUST mirror
+/// the `SortedSetBPTree` arm of `RedisValue::estimate_memory`.
+#[inline]
+pub fn zset_member_cost(member: &[u8]) -> usize {
+    member.len() + 40 + 80
+}
+
+// ---------------------------------------------------------------------------
 // HEXPIRE family — public type surface (phase 195 / issue #106).
 // ---------------------------------------------------------------------------
 
@@ -297,15 +371,25 @@ impl Database {
 
         // 3. Past-expiry short-circuit: delete the field, return code 2.
         if ts_ms <= self.cached_now_ms {
+            // O(1) credit for the field removed below (see the WS6 accounting
+            // note above `entry_overhead`); the `HashListpack` branch instead
+            // diffs `estimate_memory()` before/after since it also changes
+            // encoding (listpack -> Hash), an O(n) transform it already pays.
+            let mut credit: usize = 0;
             match rv {
                 RedisValue::Hash(map) => {
-                    map.remove(field);
+                    if let Some(v) = map.remove(field) {
+                        credit = hash_field_cost(field, &v);
+                    }
                 }
                 RedisValue::HashListpack(lp) => {
+                    let before = lp.estimate_memory();
                     // Promote to Hash to delete (listpack delete-by-key is awkward).
                     let mut map = lp.to_hash_map();
                     map.remove(field);
                     *rv = RedisValue::Hash(map);
+                    let after = rv.estimate_memory();
+                    credit = before.saturating_sub(after);
                 }
                 RedisValue::HashWithTtl {
                     fields,
@@ -313,7 +397,9 @@ impl Database {
                     min_expiry_ms,
                 } => {
                     let old_ttl = ttls.remove(field);
-                    fields.remove(field);
+                    if let Some(v) = fields.remove(field) {
+                        credit = hash_field_cost(field, &v);
+                    }
                     if ttls.is_empty() {
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
@@ -323,6 +409,9 @@ impl Database {
                     }
                 }
                 _ => unreachable!(),
+            }
+            if credit > 0 {
+                self.credit_memory(credit);
             }
             return Ok(2);
         }
@@ -501,13 +590,24 @@ impl Database {
         let Some(rv) = entry.value.as_redis_value_mut() else {
             return Err(Self::wrongtype_error());
         };
-        match rv {
+        // Accumulated O(1) credit for this call; applied to `used_memory`
+        // once at the end (single field mutated per call, so this is exactly
+        // the byte delta — see the WS6 accounting note above `entry_overhead`).
+        let mut credit: usize = 0;
+        let result = match rv {
             RedisValue::Hash(map) => {
-                let removed = map.remove(field).is_some();
-                let empty = map.is_empty();
-                Ok((removed, empty))
+                if let Some(v) = map.remove(field) {
+                    credit = hash_field_cost(field, &v);
+                    let empty = map.is_empty();
+                    Ok((true, empty))
+                } else {
+                    Ok((false, false))
+                }
             }
             RedisValue::HashListpack(lp) => {
+                // Listpack cost is O(1) (capacity-based) — snapshot before/after
+                // instead of tracking a per-element formula.
+                let before = lp.estimate_memory();
                 // Locate field among pairs, remove both field + value entries.
                 let mut found_idx: Option<usize> = None;
                 for (i, (f, _)) in lp.iter_pairs().enumerate() {
@@ -521,6 +621,8 @@ impl Database {
                     // Remove value first (higher index) then field to keep indices stable.
                     lp.remove_at(i * 2 + 1);
                     lp.remove_at(i * 2);
+                    let after = lp.estimate_memory();
+                    credit = before.saturating_sub(after);
                     let empty = lp.is_empty();
                     Ok((true, empty))
                 } else {
@@ -532,34 +634,39 @@ impl Database {
                 ttls,
                 min_expiry_ms,
             } => {
-                let removed = fields.remove(field).is_some();
-                if removed {
+                if let Some(v) = fields.remove(field) {
+                    credit = hash_field_cost(field, &v);
                     let old_ttl = ttls.remove(field);
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone but fields remain — downgrade to plain Hash.
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
-                        return Ok((true, false));
+                        Ok((true, false))
                     } else if ttls.is_empty() && fields.is_empty() {
                         // Both maps empty — signal caller to delete the key.
                         // We leave the (now-empty) HashWithTtl in place; the
                         // caller will call db.remove() to drop the key.
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
-                        return Ok((true, true));
+                        Ok((true, true))
+                    } else {
+                        // TTLs remain; recompute min if the removed field held it.
+                        if old_ttl == Some(*min_expiry_ms) {
+                            *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                        }
+                        let empty = fields.is_empty();
+                        Ok((true, empty))
                     }
-                    // TTLs remain; recompute min if the removed field held it.
-                    if old_ttl == Some(*min_expiry_ms) {
-                        *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
-                    }
-                    let empty = fields.is_empty();
-                    Ok((true, empty))
                 } else {
                     Ok((false, false))
                 }
             }
             _ => Err(Self::wrongtype_error()),
+        };
+        if credit > 0 {
+            self.credit_memory(credit);
         }
+        result
     }
 
     // -- HGETDEL / HGETEX family (phase 199 / issue #110) ----------------------
@@ -592,9 +699,20 @@ impl Database {
         let Some(rv) = entry.value.as_redis_value_mut() else {
             return Err(WrongType);
         };
-        match rv {
-            RedisValue::Hash(map) => Ok(map.remove(field)),
+        // O(1) credit accumulator — one field removed per call (see the WS6
+        // accounting note above `entry_overhead`).
+        let mut credit: usize = 0;
+        let result = match rv {
+            RedisValue::Hash(map) => {
+                let v = map.remove(field);
+                if let Some(ref val) = v {
+                    credit = hash_field_cost(field, val);
+                }
+                Ok(v)
+            }
             RedisValue::HashListpack(lp) => {
+                // Listpack cost is O(1) (capacity-based) — snapshot before/after.
+                let before = lp.estimate_memory();
                 // Locate the field-value pair by linear scan then remove both
                 // listpack slots (value first so the field index stays valid).
                 let mut found: Option<(usize, Bytes)> = None;
@@ -607,6 +725,8 @@ impl Database {
                 if let Some((i, v)) = found {
                     lp.remove_at(i * 2 + 1); // value first (higher index)
                     lp.remove_at(i * 2); // then field
+                    let after = lp.estimate_memory();
+                    credit = before.saturating_sub(after);
                     Ok(Some(v))
                 } else {
                     Ok(None)
@@ -618,7 +738,8 @@ impl Database {
                 min_expiry_ms,
             } => {
                 let v = fields.remove(field);
-                if v.is_some() {
+                if let Some(ref val) = v {
+                    credit = hash_field_cost(field, val);
                     let old_ttl = ttls.remove(field);
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone, live fields remain — downgrade to Hash.
@@ -636,7 +757,11 @@ impl Database {
                 Ok(v)
             }
             _ => Err(WrongType),
+        };
+        if credit > 0 {
+            self.credit_memory(credit);
         }
+        result
     }
 
     /// Remove the key when its hash value has become empty.
@@ -672,6 +797,39 @@ impl Database {
     #[inline]
     pub fn resident_bytes(&self) -> usize {
         self.used_memory
+    }
+
+    /// Charge `delta` bytes of container growth to this database's memory
+    /// accounting. O(1), saturating, no allocation.
+    ///
+    /// Used by command-layer call sites that hold a `&mut` reference into a
+    /// container obtained via `get_or_create_hash`/`_list`/`_set`/`_sorted_set`
+    /// (so they cannot route the mutation back through `Database::set`) —
+    /// see the WS6 container-growth accounting note above `entry_overhead`.
+    #[inline]
+    pub fn charge_memory(&mut self, delta: usize) {
+        self.used_memory = self.used_memory.saturating_add(delta);
+    }
+
+    /// Credit back `delta` bytes previously charged via [`Self::charge_memory`]
+    /// (e.g. a field/element removed, or an overwrite that shrank a value).
+    /// O(1), saturating, no allocation.
+    #[inline]
+    pub fn credit_memory(&mut self, delta: usize) {
+        self.used_memory = self.used_memory.saturating_sub(delta);
+    }
+
+    /// Apply a signed byte delta in one call — convenience wrapper around
+    /// [`Self::charge_memory`] / [`Self::credit_memory`] for call sites that
+    /// compute a net `old_cost` vs `new_cost` difference (e.g. HINCRBY
+    /// overwriting a field with a same-or-different-length value).
+    #[inline]
+    pub fn adjust_memory(&mut self, old_cost: usize, new_cost: usize) {
+        if new_cost >= old_cost {
+            self.charge_memory(new_cost - old_cost);
+        } else {
+            self.credit_memory(old_cost - new_cost);
+        }
     }
 
     /// Get an entry by key, performing lazy expiration.
@@ -1830,8 +1988,15 @@ impl Database {
     pub fn list_pop_front(&mut self, key: &[u8]) -> Option<Bytes> {
         let list = self.get_or_create_list(key).ok()?;
         let val = list.pop_front()?;
-        if list.is_empty() {
+        let empty = list.is_empty();
+        // `list`'s borrow of `self` ends above.
+        if empty {
+            // Whole-key removal recomputes the (now-empty) entry cost via
+            // `entry_overhead` -- no separate credit needed for the popped
+            // element itself.
             self.remove(key);
+        } else {
+            self.credit_memory(list_elem_cost(&val));
         }
         Some(val)
     }
@@ -1841,8 +2006,11 @@ impl Database {
     pub fn list_pop_back(&mut self, key: &[u8]) -> Option<Bytes> {
         let list = self.get_or_create_list(key).ok()?;
         let val = list.pop_back()?;
-        if list.is_empty() {
+        let empty = list.is_empty();
+        if empty {
             self.remove(key);
+        } else {
+            self.credit_memory(list_elem_cost(&val));
         }
         Some(val)
     }
@@ -1850,15 +2018,19 @@ impl Database {
     /// Push an element to the front of a list. Creates the list if it does not exist.
     pub fn list_push_front(&mut self, key: &[u8], value: Bytes) {
         // get_or_create_list creates the key if missing
+        let cost = list_elem_cost(&value);
         if let Ok(list) = self.get_or_create_list(key) {
             list.push_front(value);
+            self.charge_memory(cost);
         }
     }
 
     /// Push an element to the back of a list. Creates the list if it does not exist.
     pub fn list_push_back(&mut self, key: &[u8], value: Bytes) {
+        let cost = list_elem_cost(&value);
         if let Ok(list) = self.get_or_create_list(key) {
             list.push_back(value);
+            self.charge_memory(cost);
         }
     }
 

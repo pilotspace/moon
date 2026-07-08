@@ -918,15 +918,45 @@ pub async fn handle_connection(
                                 guard.refresh_now();
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
-                                    if is_write {
-                                        let rt = runtime_config.read();
-                                        if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                            responses[resp_idx] = oom_frame;
-                                            continue;
-                                        }
-                                    }
                                     #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
+                                    if is_write {
+                                        let rt = runtime_config.read();
+                                        // WS6 fix (HIGH, adversarial review
+                                        // 2026-07-08): a command that can only
+                                        // shrink memory (HDEL, SREM, LPOP, ...)
+                                        // must never be REJECTED by either gate
+                                        // below, or a key/db that crosses its
+                                        // noeviction boundary has no
+                                        // self-recovery path. Eviction is still
+                                        // attempted; only the reject is
+                                        // bypassed. See
+                                        // `db_quota::is_shrink_only_command`.
+                                        let shrink_only =
+                                            crate::storage::db_quota::is_shrink_only_command(
+                                                d_cmd,
+                                            );
+                                        let evict_result =
+                                            try_evict_if_needed(&mut *guard, &rt);
+                                        if !shrink_only {
+                                            if let Err(oom_frame) = evict_result {
+                                                responses[resp_idx] = oom_frame;
+                                                continue;
+                                            }
+                                        }
+                                        // WS5b: per-db quota, additive to the
+                                        // whole-instance gate above. `_for_command`
+                                        // exempts SELECT/SWAPDB — see
+                                        // `db_quota::command_exempt_from_db_quota`.
+                                        let db_quota_result =
+                                            crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, conn.selected_db, &rt, d_cmd);
+                                        if !shrink_only {
+                                            if let Err(oom_frame) = db_quota_result {
+                                                responses[resp_idx] = oom_frame;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     let dispatch_start = std::time::Instant::now();
                                     let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
@@ -1234,10 +1264,12 @@ pub async fn handle_connection(
                                                             // TXN support; return value discarded.
                                                             let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut *ts_guard, key_bytes, a,
+                                                                conn.selected_db as u8,
                                                             );
                                                         } else {
                                                             let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut fallback_ts, key_bytes, a,
+                                                                conn.selected_db as u8,
                                                             );
                                                         }
                                                     }
@@ -1251,6 +1283,7 @@ pub async fn handle_connection(
                                                     crate::shard::spsc_handler::auto_delete_vectors(
                                                         &mut vs.lock(),
                                                         a,
+                                                        conn.selected_db as u8,
                                                     );
                                                 } else if c.eq_ignore_ascii_case(b"HDEL")
                                                     && i < txn_results.len()
@@ -1260,6 +1293,7 @@ pub async fn handle_connection(
                                                     crate::shard::spsc_handler::auto_hdel_vectors(
                                                         &mut vs.lock(),
                                                         a,
+                                                        conn.selected_db as u8,
                                                     );
                                                 } else if (c.eq_ignore_ascii_case(b"FLUSHDB")
                                                     || c.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -1269,9 +1303,23 @@ pub async fn handle_connection(
                                                     // R3 parity inside MULTI/EXEC (text
                                                     // store cleared via its own guard or
                                                     // the throwaway fallback store).
-                                                    vs.lock().clear_all_contents();
-                                                    if let Some(ref ts) = text_store {
-                                                        ts.lock().clear_all_contents();
+                                                    // WS5a: FLUSHDB scopes to
+                                                    // `conn.selected_db`; FLUSHALL clears
+                                                    // every db.
+                                                    if c.eq_ignore_ascii_case(b"FLUSHDB") {
+                                                        vs.lock().clear_all_contents_for_db(
+                                                            conn.selected_db as u8,
+                                                        );
+                                                        if let Some(ref ts) = text_store {
+                                                            ts.lock().clear_all_contents_for_db(
+                                                                conn.selected_db as u8,
+                                                            );
+                                                        }
+                                                    } else {
+                                                        vs.lock().clear_all_contents();
+                                                        if let Some(ref ts) = text_store {
+                                                            ts.lock().clear_all_contents();
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1503,6 +1551,7 @@ pub async fn handle_connection(
                                                             crate::command::vector_search::parse_summarize_clause(cmd_args);
                                                         #[cfg(feature = "text-index")]
                                                         {
+                                                            let db_index = conn.selected_db as u8;
                                                             let mut response = crate::command::vector_search::run_text_query(
                                                                 &*ts_mut,
                                                                 &index_name,
@@ -1510,9 +1559,10 @@ pub async fn handle_connection(
                                                                 top_k,
                                                                 offset,
                                                                 count,
+                                                                db_index,
                                                             );
                                                             if highlight_opts.is_some() || summarize_opts.is_some() {
-                                                                if let Some(text_index) = ts_mut.get_index(&index_name) {
+                                                                if let Some(text_index) = ts_mut.get_index_for_db(&index_name, db_index) {
                                                                     if let Ok(node) = crate::text::query::parse_query(
                                                                         query_bytes.as_ref(),
                                                                         &crate::text::query::QuerySchema::from_index(text_index),
@@ -1546,7 +1596,7 @@ pub async fn handle_connection(
                                         }
                                     }
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                        crate::command::vector_search::ft_create(&mut *store, ts_mut, cmd_args)
+                                        crate::command::vector_search::ft_create(&mut *store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                         // TEMP-04: single-shard handler has no TemporalRegistry and no cross-store TXN.
                                         // Unified helper with shard_databases=None returns ERR on AS_OF (correct per
@@ -1559,34 +1609,34 @@ pub async fn handle_connection(
                                                 });
                                                 if has_session {
                                                     let mut db_guard = db[conn.selected_db].write();
-                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, Some(&mut *db_guard), Some(&*ts_mut), as_of_lsn)
+                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, Some(&mut *db_guard), Some(&*ts_mut), as_of_lsn, conn.selected_db as u8)
                                                 } else {
-                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, None, Some(&*ts_mut), as_of_lsn)
+                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, None, Some(&*ts_mut), as_of_lsn, conn.selected_db as u8)
                                                 }
                                             }
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                         let mut db_guard = db[conn.selected_db].write();
-                                        crate::command::vector_search::ft_dropindex(&mut *store, ts_mut, Some(&mut *db_guard), cmd_args)
+                                        crate::command::vector_search::ft_dropindex(&mut *store, ts_mut, Some(&mut *db_guard), cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                        crate::command::vector_search::ft_info(&*store, ts_mut, cmd_args)
+                                        crate::command::vector_search::ft_info(&*store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                        crate::command::vector_search::ft_list(&*store)
+                                        crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                                        crate::command::vector_search::ft_compact(&mut *store, ts_mut, cmd_args)
+                                        crate::command::vector_search::ft_compact(&mut *store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                                        crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, cmd_args)
+                                        crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                        crate::command::vector_search::ft_config(&mut *store, ts_mut, cmd_args)
+                                        crate::command::vector_search::ft_config(&mut *store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                         let mut db_guard = db[conn.selected_db].write();
-                                        crate::command::vector_search::recommend::ft_recommend(&mut *store, cmd_args, Some(&mut *db_guard))
+                                        crate::command::vector_search::recommend::ft_recommend(&mut *store, cmd_args, Some(&mut *db_guard), conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                                         #[cfg(feature = "graph")]
                                         {
                                             let gs_frame = if let Some(ref gs) = graph_store {
                                                 let graph_guard = gs.lock();
-                                                crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), cmd_args, None)
+                                                crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), cmd_args, None, conn.selected_db as u8)
                                             } else {
                                                 Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
                                             };
@@ -1630,6 +1680,7 @@ pub async fn handle_connection(
                                                         &parsed.query,
                                                         &parsed.pipeline,
                                                         &*db_guard,
+                                                        conn.selected_db as u8,
                                                     )
                                                 }
                                                 Err(err_frame) => err_frame,
@@ -1792,29 +1843,29 @@ pub async fn handle_connection(
                                                     if has_session {
                                                         drop(guard);
                                                         let mut db_guard = db[conn.selected_db].write();
-                                                        let r = crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *db_guard), Some(&*ts_m2), as_of_lsn);
+                                                        let r = crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *db_guard), Some(&*ts_m2), as_of_lsn, conn.selected_db as u8);
                                                         drop(db_guard);
                                                         guard = db[conn.selected_db].read();
                                                         r
                                                     } else {
-                                                        crate::command::vector_search::ft_search(&mut *store, d_args, None, Some(&*ts_m2), as_of_lsn)
+                                                        crate::command::vector_search::ft_search(&mut *store, d_args, None, Some(&*ts_m2), as_of_lsn, conn.selected_db as u8)
                                                     }
                                                 }
                                             }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            crate::command::vector_search::ft_info(&*store, ts_m2, d_args)
+                                            crate::command::vector_search::ft_info(&*store, ts_m2, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                            crate::command::vector_search::ft_list(&*store)
+                                            crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                                            crate::command::vector_search::ft_compact(&mut *store, ts_m2, d_args)
+                                            crate::command::vector_search::ft_compact(&mut *store, ts_m2, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                                            crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
+                                            crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            crate::command::vector_search::ft_config(&mut *store, ts_m2, d_args)
+                                            crate::command::vector_search::ft_config(&mut *store, ts_m2, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                             drop(guard);
                                             let mut db_guard = db[conn.selected_db].write();
-                                            let r = crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *db_guard));
+                                            let r = crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *db_guard), conn.selected_db as u8);
                                             drop(db_guard);
                                             guard = db[conn.selected_db].read();
                                             r
@@ -1823,7 +1874,7 @@ pub async fn handle_connection(
                                             {
                                                 if let Some(ref gs) = graph_store {
                                                     let graph_guard = gs.lock();
-                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None)
+                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None, conn.selected_db as u8)
                                                 } else {
                                                     Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
                                                 }
@@ -1862,6 +1913,7 @@ pub async fn handle_connection(
                                                         &parsed.query,
                                                         &parsed.pipeline,
                                                         &*guard,
+                                                        conn.selected_db as u8,
                                                     ),
                                                     Err(err_frame) => err_frame,
                                                 }
@@ -1916,7 +1968,8 @@ pub async fn handle_connection(
                                                         crate::command::server_admin::vacuum_vector(
                                                             &mut vs_guard,
                                                             &d_args[1..],
-                                                        );
+                                                        conn.selected_db as u8,
+                                        );
                                                     drop(vs_guard);
                                                     responses[resp_idx] = response;
                                                 } else {
@@ -2053,14 +2106,36 @@ pub async fn handle_connection(
                                     guard.refresh_now();
                                 }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
-                                let rt = runtime_config.read();
-                                if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                    responses[resp_idx] = oom_frame;
-                                    continue;
-                                }
-                                drop(rt);
                                 #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
+                                let rt = runtime_config.read();
+                                // WS6 fix (HIGH, adversarial review 2026-07-08): a
+                                // command that can only shrink memory (HDEL, SREM,
+                                // LPOP, ...) must never be REJECTED by either gate
+                                // below, or a key/db that crosses its noeviction
+                                // boundary has no self-recovery path. Eviction is
+                                // still attempted; only the reject is bypassed.
+                                // See `db_quota::is_shrink_only_command`.
+                                let shrink_only =
+                                    crate::storage::db_quota::is_shrink_only_command(d_cmd);
+                                let evict_result = try_evict_if_needed(&mut *guard, &rt);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = evict_result {
+                                        responses[resp_idx] = oom_frame;
+                                        continue;
+                                    }
+                                }
+                                // WS5b: per-db quota, additive to the whole-instance
+                                // gate above. `_for_command` exempts SELECT/SWAPDB so
+                                // a quota'd db doesn't trap the connection.
+                                let db_quota_result = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, current_db, &rt, d_cmd);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = db_quota_result {
+                                        responses[resp_idx] = oom_frame;
+                                        continue;
+                                    }
+                                }
+                                drop(rt);
 
                                 // FT.* vector commands: dispatch to VectorStore directly
                                 if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
@@ -2070,35 +2145,35 @@ pub async fn handle_connection(
                                         let mut ts_g3 = text_store.as_ref().map(|ts| ts.lock());
                                         let ts_m3 = match ts_g3 { Some(ref mut g) => &mut **g, None => &mut fb_ts3 };
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                            crate::command::vector_search::ft_create(&mut *store, ts_m3, d_args)
+                                            crate::command::vector_search::ft_create(&mut *store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                             // Write run: guard is already write-locked.
                                             // TEMP-04: single-shard handler has no registry and no TXN; helper returns
                                             // ERR on AS_OF and Ok(0) otherwise (Plan 165-01 contract).
                                             match resolve_ft_search_as_of_lsn(d_args, None, None) {
                                                 Err(err_frame) => err_frame,
-                                                Ok(as_of_lsn) => crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3), as_of_lsn),
+                                                Ok(as_of_lsn) => crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3), as_of_lsn, conn.selected_db as u8),
                                             }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                            crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, Some(&mut *guard), d_args)
+                                            crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, Some(&mut *guard), d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            crate::command::vector_search::ft_info(&*store, ts_m3, d_args)
+                                            crate::command::vector_search::ft_info(&*store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                            crate::command::vector_search::ft_list(&*store)
+                                            crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                                            crate::command::vector_search::ft_compact(&mut *store, ts_m3, d_args)
+                                            crate::command::vector_search::ft_compact(&mut *store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                                            crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
+                                            crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            crate::command::vector_search::ft_config(&mut *store, ts_m3, d_args)
+                                            crate::command::vector_search::ft_config(&mut *store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
-                                            crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *guard))
+                                            crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *guard), conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                                             #[cfg(feature = "graph")]
                                             {
                                                 if let Some(ref gs) = graph_store {
                                                     let graph_guard = gs.lock();
-                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None)
+                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None, conn.selected_db as u8)
                                                 } else {
                                                     Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
                                                 }
@@ -2137,6 +2212,7 @@ pub async fn handle_connection(
                                                         &parsed.query,
                                                         &parsed.pipeline,
                                                         &*guard,
+                                                        conn.selected_db as u8,
                                                     ),
                                                     Err(err_frame) => err_frame,
                                                 }
@@ -2194,7 +2270,8 @@ pub async fn handle_connection(
                                                         crate::command::server_admin::vacuum_vector(
                                                             &mut vs_guard,
                                                             &d_args[1..],
-                                                        );
+                                                        conn.selected_db as u8,
+                                        );
                                                     drop(vs_guard);
                                                     responses[resp_idx] = response;
                                                 } else {
@@ -2366,10 +2443,10 @@ pub async fn handle_connection(
                                             if let Some(ref ts) = text_store {
                                                 let mut ts_guard = ts.lock();
                                                 // Plan 166-01: discard return (no TXN here).
-                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args);
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args, conn.selected_db as u8);
                                             } else {
                                                 let mut fallback_ts = crate::text::store::TextStore::new();
-                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args, conn.selected_db as u8);
                                             }
                                         }
                                     }
@@ -2385,6 +2462,7 @@ pub async fn handle_connection(
                                         crate::shard::spsc_handler::auto_delete_vectors(
                                             &mut vs.lock(),
                                             d_args,
+                                            conn.selected_db as u8,
                                         );
                                     }
                                 }
@@ -2397,21 +2475,35 @@ pub async fn handle_connection(
                                         crate::shard::spsc_handler::auto_hdel_vectors(
                                             &mut vs.lock(),
                                             d_args,
+                                            conn.selected_db as u8,
                                         );
                                     }
                                 }
 
                                 // R3: FLUSHALL/FLUSHDB clears vector + text index
                                 // contents (FT.CREATE definitions survive).
+                                // WS5a: FLUSHDB scopes to `conn.selected_db`;
+                                // FLUSHALL clears every db.
                                 if !matches!(&response, Frame::Error(_))
                                     && (d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                         || d_cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                                 {
-                                    if let Some(ref vs) = vector_store {
-                                        vs.lock().clear_all_contents();
-                                    }
-                                    if let Some(ref ts) = text_store {
-                                        ts.lock().clear_all_contents();
+                                    if d_cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                                        if let Some(ref vs) = vector_store {
+                                            vs.lock()
+                                                .clear_all_contents_for_db(conn.selected_db as u8);
+                                        }
+                                        if let Some(ref ts) = text_store {
+                                            ts.lock()
+                                                .clear_all_contents_for_db(conn.selected_db as u8);
+                                        }
+                                    } else {
+                                        if let Some(ref vs) = vector_store {
+                                            vs.lock().clear_all_contents();
+                                        }
+                                        if let Some(ref ts) = text_store {
+                                            ts.lock().clear_all_contents();
+                                        }
                                     }
                                 }
 

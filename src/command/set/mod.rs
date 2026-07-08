@@ -529,4 +529,71 @@ mod tests {
             _ => panic!("expected error"),
         }
     }
+
+    // -----------------------------------------------------------------
+    // WS6 — container-growth memory accounting (src/storage/db.rs).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_estimated_memory_rises_with_sadd_growth() {
+        let mut db = Database::new();
+        // Non-integer members force the standard HashSet path (not intset).
+        sadd(&mut db, &[bs(b"s"), bs(b"member-000")]);
+        let one = db.estimated_memory();
+        for i in 1..50 {
+            let m = format!("member-{i:03}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        let many = db.estimated_memory();
+        assert!(
+            many > one,
+            "estimated_memory must rise as members are added: one={one} many={many}"
+        );
+        assert!(
+            many - one > 49 * 10,
+            "growth must be at least proportional to the added member payload"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_falls_with_srem() {
+        let mut db = Database::new();
+        for i in 0..50 {
+            let m = format!("member-{i:03}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        let grown = db.estimated_memory();
+        for i in 0..49 {
+            let m = format!("member-{i:03}");
+            srem(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        let drained = db.estimated_memory();
+        assert!(
+            drained < grown,
+            "estimated_memory must fall as members are removed: grown={grown} drained={drained}"
+        );
+
+        srem(&mut db, &[bs(b"s"), bs(b"member-049")]);
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "estimated_memory must return to zero once the set is fully drained"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_spop_credits_removed_member() {
+        let mut db = Database::new();
+        for i in 0..10 {
+            let m = format!("member-{i:03}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        let grown = db.estimated_memory();
+        spop(&mut db, &[bs(b"s")]);
+        let after = db.estimated_memory();
+        assert!(
+            after < grown,
+            "SPOP must credit the removed member: grown={grown} after={after}"
+        );
+    }
 }

@@ -2,7 +2,7 @@
   "project": "moon",
   "stage": "production",
   "active_task": null,
-  "active_milestone": "v3-5-write-path-durability",
+  "active_milestone": "v0-6-0-release",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -251,10 +251,18 @@
       "status": "active",
       "created": "2026-07-04T10:10:03+00:00",
       "updated": "2026-07-04T10:10:03+00:00"
+    },
+    "v0-6-0-release": {
+      "title": "v0.6.0 Release: parity, isolation, tiered offload, marketing",
+      "goal": "Ship v0.6.0: pragmatic Redis command parity, db-scoped index isolation + per-db quotas + hardened workspaces, full tiered memory offload across KV/vector/graph/FTS engines, shard-1 tuning preset, and marketing-grade docs/benchmarks",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-07-08T03:13:56+00:00",
+      "updated": "2026-07-08T03:13:56+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-07-04T10:10:03+00:00",
+  "updated": "2026-07-08T03:13:56+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

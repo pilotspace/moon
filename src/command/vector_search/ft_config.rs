@@ -16,6 +16,7 @@ pub fn ft_config(
     store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
@@ -43,9 +44,16 @@ pub fn ft_config(
             Some(b) => b,
             None => return Frame::Error(Bytes::from_static(b"ERR invalid value")),
         };
-        ft_config_set(store, text_store, &index_name, &param_name, &value)
+        ft_config_set(
+            store,
+            text_store,
+            &index_name,
+            &param_name,
+            &value,
+            db_index,
+        )
     } else if subcommand.eq_ignore_ascii_case(b"GET") {
-        ft_config_get(store, text_store, &index_name, &param_name)
+        ft_config_get(store, text_store, &index_name, &param_name, db_index)
     } else {
         Frame::Error(Bytes::from_static(
             b"ERR FT.CONFIG subcommand must be SET or GET",
@@ -59,10 +67,11 @@ fn ft_config_set(
     index_name: &[u8],
     param: &[u8],
     value: &[u8],
+    db_index: u8,
 ) -> Frame {
-    // BM25 parameters route to TextStore
+    // BM25 parameters route to TextStore (db-scoped: WS5a)
     if param.eq_ignore_ascii_case(b"BM25_K1") || param.eq_ignore_ascii_case(b"BM25_B") {
-        let text_idx = match text_store.get_index_mut(index_name) {
+        let text_idx = match text_store.get_index_mut_for_db(index_name, db_index) {
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
@@ -85,7 +94,7 @@ fn ft_config_set(
         }
         return Frame::SimpleString(Bytes::from_static(b"OK"));
     }
-    let idx = match store.get_index_mut(index_name) {
+    let idx = match store.get_index_mut_for_db(index_name, db_index) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
@@ -166,10 +175,11 @@ fn ft_config_get(
     text_store: &mut crate::text::store::TextStore,
     index_name: &[u8],
     param: &[u8],
+    db_index: u8,
 ) -> Frame {
-    // BM25 parameters route to TextStore
+    // BM25 parameters route to TextStore (db-scoped: WS5a)
     if param.eq_ignore_ascii_case(b"BM25_K1") || param.eq_ignore_ascii_case(b"BM25_B") {
-        let text_idx = match text_store.get_index(index_name) {
+        let text_idx = match text_store.get_index_for_db(index_name, db_index) {
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
@@ -183,7 +193,7 @@ fn ft_config_get(
         let _ = write!(buf, "{val}");
         return Frame::BulkString(Bytes::from(buf));
     }
-    let idx = match store.get_index_mut(index_name) {
+    let idx = match store.get_index_mut_for_db(index_name, db_index) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };

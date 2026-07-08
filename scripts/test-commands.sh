@@ -588,20 +588,32 @@ if should_run "key"; then
     assert_match "BITPOS 1"            BITPOS k:bits 1
     assert_match "BITPOS 0"            BITPOS k:bits 0
 
-    # SORT
+    # BITFIELD / BITFIELD_RO (WS1 command parity)
+    rcli BITFIELD k:bf SET u8 0 255 >/dev/null 2>&1; mcli BITFIELD k:bf SET u8 0 255 >/dev/null 2>&1
+    assert_match "BITFIELD GET"         BITFIELD k:bf GET u8 0
+    assert_match "BITFIELD_RO GET"      BITFIELD_RO k:bf GET u8 0
+    assert_moon_contains "BITFIELD_RO rejects SET" "GET subcommand" BITFIELD_RO k:bf SET u8 0 1
+
+    # SORT / SORT_RO
     rcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1; mcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1
     assert_match "SORT numeric"        SORT k:sortl
     assert_match "SORT DESC"           SORT k:sortl DESC
     assert_match "SORT ALPHA"          SORT k:sortl ALPHA
     assert_match "SORT LIMIT"          SORT k:sortl LIMIT 0 2
+    assert_match "SORT_RO numeric"     SORT_RO k:sortl
+    assert_moon_contains "SORT_RO rejects STORE" "SORT_RO" SORT_RO k:sortl STORE k:sortdst
 
-    # GEO commands
+    # GEO commands (incl. GEORADIUS/GEORADIUSBYMEMBER + _RO twins, WS1 parity)
     rcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
     mcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
     assert_match "GEOPOS"              GEOPOS k:geo Palermo
     assert_match "GEODIST km"          GEODIST k:geo Palermo Catania km
     assert_match "GEOHASH"             GEOHASH k:geo Palermo
     assert_match "GEOSEARCH"           GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC
+    assert_match "GEORADIUS"                GEORADIUS k:geo 15 37 200 km ASC
+    assert_match "GEORADIUS_RO"             GEORADIUS_RO k:geo 15 37 200 km ASC
+    assert_match "GEORADIUSBYMEMBER"        GEORADIUSBYMEMBER k:geo Palermo 200 km ASC
+    assert_match "GEORADIUSBYMEMBER_RO"     GEORADIUSBYMEMBER_RO k:geo Palermo 200 km ASC
     # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
     rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
     assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999

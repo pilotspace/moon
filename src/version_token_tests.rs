@@ -95,6 +95,7 @@ mod tests {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &args,
+            0,
         );
         assert!(
             matches!(result, Frame::SimpleString(_)),
@@ -143,6 +144,7 @@ mod tests {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &create_args,
+            0,
         );
 
         let before = store.version_token();
@@ -189,6 +191,7 @@ mod tests {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &create_args,
+            0,
         );
         let after_first = store.version_token();
 
@@ -197,6 +200,7 @@ mod tests {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &create_args,
+            0,
         );
         assert!(
             matches!(result, Frame::Error(_)),
@@ -591,14 +595,14 @@ mod tests {
         .map(|s| bulk(s))
         .collect();
 
-        let r = ft_create(&mut vs, &mut ts, &create_args);
+        let r = ft_create(&mut vs, &mut ts, &create_args, 0);
         assert!(
             matches!(r, Frame::SimpleString(_)),
             "ft_create must return OK"
         );
 
         let info_args: Vec<Frame> = vec![bulk(b"vidx")];
-        let resp = ft_info(&vs, &ts, &info_args);
+        let resp = ft_info(&vs, &ts, &info_args, 0);
 
         let Frame::Array(items) = resp else {
             panic!("FT.INFO must return Frame::Array, got {resp:?}");
@@ -668,14 +672,14 @@ mod tests {
         .map(|s| bulk(s))
         .collect();
 
-        let r = ft_create(&mut vs, &mut ts, &create_args);
+        let r = ft_create(&mut vs, &mut ts, &create_args, 0);
         assert!(
             matches!(r, Frame::SimpleString(_)),
             "TEXT-only ft_create must return OK, got {r:?}"
         );
 
         let info_args: Vec<Frame> = vec![bulk(b"tidx")];
-        let resp = ft_info(&vs, &ts, &info_args);
+        let resp = ft_info(&vs, &ts, &info_args, 0);
 
         let Frame::Array(items) = resp else {
             panic!("FT.INFO (text-only) must return Frame::Array, got {resp:?}");

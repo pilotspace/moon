@@ -221,7 +221,12 @@ fn key_hash(key: &[u8]) -> u64 {
 /// 4. Normalize if cosine metric
 /// 5. Run KNN search with centroid
 /// 6. Filter out example keys from results
-pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Database>) -> Frame {
+pub fn ft_recommend(
+    store: &mut VectorStore,
+    args: &[Frame],
+    db: Option<&mut Database>,
+    db_index: u8,
+) -> Frame {
     let db = match db {
         Some(d) => d,
         None => {
@@ -236,9 +241,10 @@ pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Dat
         Err(e) => return e,
     };
 
-    // Look up the index to get metadata (dimension, metric, field name)
+    // Look up the index to get metadata (dimension, metric, field name).
+    // WS5a: db-scoped.
     let (dim, metric, source_field) = {
-        let idx = match store.get_index(parsed.index_name.as_ref()) {
+        let idx = match store.get_index_for_db(parsed.index_name.as_ref(), db_index) {
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
@@ -311,7 +317,7 @@ pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Dat
     // Request extra results to compensate for filtered-out example keys.
     let search_k = parsed.k + exclude.len();
 
-    let idx = match store.get_index_mut(parsed.index_name.as_ref()) {
+    let idx = match store.get_index_mut_for_db(parsed.index_name.as_ref(), db_index) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };

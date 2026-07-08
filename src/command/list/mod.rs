@@ -527,4 +527,96 @@ mod tests {
         let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"UP"), bs(b"LEFT")]);
         assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"ERR syntax")));
     }
+
+    // -----------------------------------------------------------------
+    // WS6 — container-growth memory accounting (src/storage/db.rs).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_estimated_memory_rises_with_rpush_growth() {
+        let mut db = Database::new();
+        let big = vec![b'v'; 200]; // forces the full-VecDeque path
+        rpush(&mut db, &[bs(b"l"), bs(&big)]);
+        let one = db.estimated_memory();
+        for _ in 1..50 {
+            rpush(&mut db, &[bs(b"l"), bs(&big)]);
+        }
+        let many = db.estimated_memory();
+        assert!(
+            many > one + 49 * 200,
+            "estimated_memory must rise proportionally with RPUSH growth: \
+             one={one} many={many}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_falls_with_lpop() {
+        let mut db = Database::new();
+        let big = vec![b'v'; 200];
+        for _ in 0..50 {
+            rpush(&mut db, &[bs(b"l"), bs(&big)]);
+        }
+        let grown = db.estimated_memory();
+        for _ in 0..49 {
+            lpop(&mut db, &[bs(b"l")]);
+        }
+        let drained = db.estimated_memory();
+        assert!(
+            drained < grown,
+            "estimated_memory must fall as elements are popped: grown={grown} drained={drained}"
+        );
+        // Pop the last element -- key removed entirely, cost returns to zero.
+        lpop(&mut db, &[bs(b"l")]);
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "estimated_memory must return to zero once the list is fully drained"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_lset_overwrite_nets_correct_delta() {
+        let mut db = Database::new();
+        let small = vec![b'a'; 10];
+        let big = vec![b'b'; 5_000];
+        rpush(&mut db, &[bs(b"l"), bs(&small)]);
+        let small_mem = db.estimated_memory();
+
+        lset(&mut db, &[bs(b"l"), bs(b"0"), bs(&big)]);
+        let big_mem = db.estimated_memory();
+        assert!(
+            big_mem > small_mem + 4_000,
+            "LSET growing an element must charge the net delta: \
+             small={small_mem} big={big_mem}"
+        );
+
+        lset(&mut db, &[bs(b"l"), bs(b"0"), bs(&small)]);
+        let shrunk_mem = db.estimated_memory();
+        assert!(
+            shrunk_mem < big_mem,
+            "LSET shrinking an element must credit the net delta: \
+             big={big_mem} shrunk={shrunk_mem}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_memory_ltrim_credits_dropped_elements() {
+        let mut db = Database::new();
+        let big = vec![b'v'; 200];
+        for _ in 0..50 {
+            rpush(&mut db, &[bs(b"l"), bs(&big)]);
+        }
+        let grown = db.estimated_memory();
+        // Keep only the first 5 elements -- 45 must be credited back.
+        ltrim(&mut db, &[bs(b"l"), bs(b"0"), bs(b"4")]);
+        let trimmed = db.estimated_memory();
+        assert!(
+            trimmed < grown,
+            "LTRIM must credit dropped elements: grown={grown} trimmed={trimmed}"
+        );
+        assert!(
+            grown - trimmed > 40 * 200,
+            "LTRIM's credit must be proportional to the ~45 dropped elements"
+        );
+    }
 }

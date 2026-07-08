@@ -53,6 +53,12 @@ use crate::vector::types::SearchResult;
 /// For `num_shards > 1`, the three-phase scatter runs DFS → raw-streams
 /// fan-out → coordinator RRF merge. All guards are dropped before any
 /// `.await` point (RESEARCH Pitfall 2).
+/// `db_index` (WS5a): the connection's currently-SELECTed logical db. Fully
+/// honored on both the `num_shards == 1` fast path AND the `num_shards > 1`
+/// multi-shard DFS scatter branch — threaded through the DocFreq pre-pass
+/// (local + remote), the local raw-streams executor, and `FtHybridPayload`
+/// to remote shards (adversarial-review round-2 fix; previously the remote
+/// leg was a documented gap).
 #[allow(clippy::too_many_arguments)]
 pub async fn scatter_hybrid_search(
     query: HybridQuery,
@@ -62,6 +68,7 @@ pub async fn scatter_hybrid_search(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     let top_k = query.top_k;
@@ -73,13 +80,14 @@ pub async fn scatter_hybrid_search(
         // the fused local path (identical to the non-HYBRID-routing code).
         // Phase 171 HYB-02 / SCAT-02: thread coordinator-resolved AS_OF LSN
         // through the single-shard fast path so callers routed here still
-        // honor temporal snapshots.
+        // honor temporal snapshots. WS5a: db_index fully honored here.
         return crate::shard::slice::with_shard(|s| {
             crate::command::vector_search::hybrid::execute_hybrid_search_local(
                 &mut s.vector_store,
                 &s.text_store,
                 &query,
                 as_of_lsn,
+                db_index,
             )
         });
     }
@@ -97,7 +105,10 @@ pub async fn scatter_hybrid_search(
     // Both branches return a fully-owned ParseOutcome so
     // no borrows of the shard slice escape.
     let parse_outcome: ParseOutcome = crate::shard::slice::with_shard(|s| {
-        match s.text_store.get_index(query.index_name.as_ref()) {
+        match s
+            .text_store
+            .get_index_for_db(query.index_name.as_ref(), db_index)
+        {
             None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
             Some(text_index) => match text_index.field_analyzers.first() {
                 None => Err(Frame::Error(Bytes::from_static(
@@ -137,7 +148,10 @@ pub async fn scatter_hybrid_search(
             //
             // Local DFS via slice — text_store accessed exclusively in the closure.
             let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index(query.index_name.as_ref()) {
+                match s
+                    .text_store
+                    .get_index_for_db(query.index_name.as_ref(), db_index)
+                {
                     Some(text_index) => {
                         let mut items: Vec<Frame> = Vec::new();
                         for (field_idx_opt, terms) in &field_queries {
@@ -158,11 +172,12 @@ pub async fn scatter_hybrid_search(
             local_dfs = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq {
+            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
                 index_name: query.index_name.clone(),
                 field_queries: field_queries.clone(),
                 reply_tx,
-            };
+                db_index,
+            }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             dfs_receivers.push(reply_rx);
         }
@@ -219,6 +234,7 @@ pub async fn scatter_hybrid_search(
                     global_n,
                     as_of_lsn,
                     filter_clone.as_ref(),
+                    db_index,
                 )
             });
             local_hyb = Some(response);
@@ -240,6 +256,7 @@ pub async fn scatter_hybrid_search(
                 // CHANGE F: forward filter to remote shard payload.
                 filter: query.filter.clone(),
                 reply_tx,
+                db_index,
             };
             let msg = ShardMessage::FtHybrid(Box::new(payload));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;

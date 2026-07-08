@@ -276,6 +276,7 @@ pub(crate) fn execute_transaction_sharded(
                         &mut s.text_store,
                         key_bytes,
                         cmd_args,
+                        selected as u8,
                     );
                 });
             }
@@ -286,18 +287,27 @@ pub(crate) fn execute_transaction_sharded(
             && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
         {
             crate::shard::slice::with_shard(|s| {
-                crate::shard::spsc_handler::auto_delete_vectors(&mut s.vector_store, cmd_args);
+                crate::shard::spsc_handler::auto_delete_vectors(
+                    &mut s.vector_store,
+                    cmd_args,
+                    selected as u8,
+                );
             });
         }
 
         // R4: HDEL of an indexed vector field tombstones it.
         if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HDEL") {
             crate::shard::slice::with_shard(|s| {
-                crate::shard::spsc_handler::auto_hdel_vectors(&mut s.vector_store, cmd_args);
+                crate::shard::spsc_handler::auto_hdel_vectors(
+                    &mut s.vector_store,
+                    cmd_args,
+                    selected as u8,
+                );
             });
         }
 
         // R3: FLUSHALL/FLUSHDB clears index contents (definitions survive).
+        // WS5a: FLUSHDB scopes to `selected`; FLUSHALL clears every db.
         if !matches!(response, Frame::Error(_))
             && (cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
         {
@@ -305,6 +315,8 @@ pub(crate) fn execute_transaction_sharded(
                 crate::shard::spsc_handler::auto_flush_indexes(
                     &mut s.vector_store,
                     &mut s.text_store,
+                    cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                    selected as u8,
                 );
             });
         }

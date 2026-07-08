@@ -311,6 +311,90 @@ pub fn georadiusbymember(db: &mut Database, args: &[Frame]) -> Frame {
     geosearch(db, &new_args)
 }
 
+/// Reject GEORADIUS_RO/GEORADIUSBYMEMBER_RO args containing STORE/STOREDIST.
+/// Neither base command implements STORE today (no STORE handling in
+/// `geosearch_core`), so this is a defensive, explicit rejection rather than
+/// a functional behavior change — it turns a generic "ERR syntax error" into
+/// a message that names the actual constraint.
+fn geo_ro_rejects(cmd_name: &str, args: &[Frame]) -> Option<Frame> {
+    for a in args.iter().skip(1) {
+        if let Some(tok) = extract_bytes(a) {
+            if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
+                return Some(Frame::Error(Bytes::from(format!(
+                    "ERR {cmd_name} does not support STORE/STOREDIST"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+/// GEORADIUS_RO key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]
+///
+/// Read-only twin of GEORADIUS — rejects STORE/STOREDIST so it stays safely
+/// routable to replicas. Used on the mutable dispatch track; delegates to
+/// `georadius()` (itself a GEOSEARCH translation) once STORE is ruled out.
+pub fn georadius_ro(db: &mut Database, args: &[Frame]) -> Frame {
+    if let Some(e) = geo_ro_rejects("GEORADIUS_RO", args) {
+        return e;
+    }
+    georadius(db, args)
+}
+
+/// Read-only twin of `georadius_ro` for the `dispatch_read` fast path:
+/// translates to GEOSEARCH args and calls `geosearch_readonly` (immutable
+/// member-map access throughout).
+pub fn georadius_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 5 {
+        return err_wrong_args("GEORADIUS_RO");
+    }
+    if let Some(e) = geo_ro_rejects("GEORADIUS_RO", args) {
+        return e;
+    }
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push(args[0].clone()); // key
+    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMLONLAT")));
+    new_args.push(args[1].clone()); // lon
+    new_args.push(args[2].clone()); // lat
+    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
+    new_args.push(args[3].clone()); // radius
+    new_args.push(args[4].clone()); // unit
+    new_args.extend_from_slice(&args[5..]); // remaining options
+    geosearch_readonly(db, &new_args, now_ms)
+}
+
+/// GEORADIUSBYMEMBER_RO key member radius M|KM|FT|MI [opts...]
+///
+/// Read-only twin of GEORADIUSBYMEMBER — rejects STORE/STOREDIST so it stays
+/// safely routable to replicas. Used on the mutable dispatch track;
+/// delegates to `georadiusbymember()` once STORE is ruled out.
+pub fn georadiusbymember_ro(db: &mut Database, args: &[Frame]) -> Frame {
+    if let Some(e) = geo_ro_rejects("GEORADIUSBYMEMBER_RO", args) {
+        return e;
+    }
+    georadiusbymember(db, args)
+}
+
+/// Read-only twin of `georadiusbymember_ro` for the `dispatch_read` fast
+/// path: translates to GEOSEARCH args and calls `geosearch_readonly`.
+pub fn georadiusbymember_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 4 {
+        return err_wrong_args("GEORADIUSBYMEMBER_RO");
+    }
+    if let Some(e) = geo_ro_rejects("GEORADIUSBYMEMBER_RO", args) {
+        return e;
+    }
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push(args[0].clone()); // key
+    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMMEMBER")));
+    new_args.push(args[1].clone()); // member
+    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
+    new_args.push(args[2].clone()); // radius
+    new_args.push(args[3].clone()); // unit
+    new_args.extend_from_slice(&args[4..]); // remaining options
+    geosearch_readonly(db, &new_args, now_ms)
+}
+
 /// GEOSEARCHSTORE destination source ...
 pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {

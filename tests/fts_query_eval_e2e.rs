@@ -145,7 +145,7 @@ fn set_of(keys: &[&str]) -> BTreeSet<Vec<u8>> {
 
 /// Run a full FT.SEARCH text query through the centralized dispatch wrapper, all results.
 fn search(ts: &TextStore, q: &str) -> Frame {
-    run_text_query(ts, b"idx", q.as_bytes(), 1000, 0, usize::MAX)
+    run_text_query(ts, b"idx", q.as_bytes(), 1000, 0, usize::MAX, 0)
 }
 
 // ─────────────────────────── E1 — OR is a union ────────────────────────────
@@ -555,7 +555,7 @@ fn test_eval_query_counted_total_is_pre_truncation() {
 fn test_run_text_query_limit_reports_true_total() {
     // C3: LIMIT 0 5 over a 12-match corpus → reply[0]==12, exactly 5 docs returned.
     let ts = alpha_corpus(12);
-    let r = run_text_query(&ts, b"idx", b"alpha", 5, 0, 5);
+    let r = run_text_query(&ts, b"idx", b"alpha", 5, 0, 5, 0);
     assert_eq!(total(&r), 12, "reply[0] = true matched, not the page size");
     assert_eq!(keys_ordered(&r).len(), 5, "page = LIMIT count");
 }
@@ -564,7 +564,7 @@ fn test_run_text_query_limit_reports_true_total() {
 fn test_run_text_query_no_limit_total_unchanged() {
     // C5: no LIMIT (unbounded top_k) → reply[0]==12==returned count (strict no-regression).
     let ts = alpha_corpus(12);
-    let r = run_text_query(&ts, b"idx", b"alpha", usize::MAX / 2, 0, usize::MAX);
+    let r = run_text_query(&ts, b"idx", b"alpha", usize::MAX / 2, 0, usize::MAX, 0);
     assert_eq!(total(&r), 12);
     assert_eq!(
         keys_ordered(&r).len(),

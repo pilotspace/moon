@@ -6,6 +6,493 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-08
+
+**Release highlights** (full detail in the sections below; "PR #TBD" entries
+below all shipped together in this release's PR):
+
+- **Multi-db isolation is now a first-class, enforced boundary**: FT.*/graph/
+  full-text indexes are scoped to the db that created them (`SELECT 1`'s
+  indexes are invisible to db 0, verified across shards, restarts, and the
+  recovery path); per-db memory quotas (`--db-maxmemory <db>:<bytes>`,
+  `CONFIG SET db-maxmemory`) enforce noeviction/evicting policies per db slot
+  with Redis-style deny-OOM semantics (shrink commands always pass, so a
+  tenant can never wedge itself); named workspaces harden the prefix layer.
+- **Memory accounting is now truthful under container growth**: HSET/LPUSH/
+  SADD/ZADD growth into existing keys is charged to `used_memory` in O(1)
+  (previously invisible to `--maxmemory` — an unbounded single-key hash could
+  never trigger eviction).
+- **Engines offload when idle**: vector segments demote HOT→WARM (mmap)→COLD
+  (unloaded stub, reload-on-search) on configurable idle/age thresholds
+  (`--engine-offload-idle-secs`, `--segment-warm-after`), with DEL/HDEL
+  tombstone correctness across all tiers — measured −26% process RSS on a
+  40K×768d corpus with search results identical after reload.
+- **Single-node tuning preset**: `--profile standalone` fills in the measured
+  best flags for a shard-1 deployment (the p=1 busy-poll configuration that
+  beats Redis on both GCE arches).
+- **Command parity widened**: SORT_RO / BITFIELD_RO / GEORADIUS_RO /
+  GEORADIUSBYMEMBER_RO plus subcommand gaps; the compat matrix is regenerated.
+  PFDEBUG/PFSELFTEST/FAILOVER/MODULE/SENTINEL are documented non-goals.
+
+> **Operator callout — historical `WS DROP` key leak.** Before this release,
+> `WS DROP`'s cleanup sweep was hardcoded to logical db 0: any workspace whose
+> connection ever `SELECT`ed a non-zero db before writing leaked those keys
+> permanently on drop. v0.6.0 fixes the sweep (all dbs on the owning shard),
+> but keys leaked by PAST drops are still resident. To detect/clean on an
+> upgraded instance: `SELECT <n>` each non-zero db and `SCAN 0 MATCH <ws-uuid>:*`
+> for workspace prefixes that no longer appear in `WS LIST`, then `DEL` the
+> matches (or `FLUSHDB` if the db held nothing else).
+
+### Fixed — WS3 COLD/WARM tier adversarial-review fixes (round 2 follow-up, PR #TBD)
+
+An adversarial review of the round-2 COLD tier (below) found one CRITICAL
+correctness bug and several hardening gaps. All fixed on the same branch:
+
+1. **CRITICAL: DEL/HDEL resurrection through WARM/COLD.**
+   `tombstone_key_in_index` (`src/vector/store.rs`) only ever walked
+   `mutable` + `immutable` — a HDEL against a key living in a WARM or COLD
+   (unloaded) segment was silently dropped. Sequence: index idles overnight
+   -> HDEL an old doc -> next-day query resurrects it as a phantom hit, and
+   `num_docs` over-counts. Fixed by giving both tiers a live tombstone set:
+   - `WarmSearchSegment` gained the same interior-mutable
+     `tombstoned_keys`/`has_tombstones` pattern `ImmutableSegment` already
+     has (`mark_deleted_by_key_hash`, `seed_tombstones`,
+     `tombstoned_key_hashes`, `live_count`) — `search_filtered` now filters
+     tombstoned entries out before rerank/truncate, same ordering as the HOT
+     path. Takes effect immediately, no reload required.
+   - `UnloadedSegment` gained a `pending_tombstones` set — a HDEL against a
+     COLD key is queued in the stub (no reload forced just to record a
+     delete) and replayed onto the freshly-reloaded `WarmSearchSegment` in
+     `reload()` via `seed_tombstones`.
+   - `tombstone_key_in_index` now also calls `mark_deleted_by_key_hash` on
+     every `warm` and `unloaded` entry.
+   - Bonus fix found while wiring this up: `mvcc_raw_bytes()` (the HOT->WARM
+     transition's serialization of MVCC headers) only captures INSTALL-time
+     deletes (`mvcc[i].delete_lsn`), never the STEADY-STATE
+     `tombstoned_keys` interior set — so a HDEL landing shortly before a
+     transition was ALSO silently lost, independent of the round-2 COLD
+     work (this bug predates it, in the pre-existing age-based WARM path).
+     `try_warm_transitions_idle` now seeds the new `WarmSearchSegment` with
+     `imm.tombstoned_key_hashes()` right after opening it, closing this gap
+     for both WARM and COLD destinations for free.
+   - `FT.INFO`'s `num_docs` now sums `warm.live_count()` /
+     `stub.live_count()` (total minus live tombstones) instead of the raw
+     `total_count()`, at all 4 call sites (top-level + per-field, default +
+     non-default field).
+   - New tests: `tests/vector_idle_unload.rs`'s
+     `hdel_during_cold_does_not_resurrect` and
+     `hdel_during_warm_does_not_resurrect` — HDEL a doc, wait for the
+     COLD/WARM transition (or vice versa), assert `num_docs` drops
+     immediately and the doc never resurfaces in a post-transition
+     `FT.SEARCH`, in both tier orderings.
+2. **Reload thread placement — verified empirically, documented honestly.**
+   Traced all 3 `promote_unloaded` call sites
+   (`SegmentHolder::search_filtered`, `SegmentHolder::search_mvcc`, and the
+   FT.SEARCH yielding-path snapshot capture in
+   `command/vector_search/ft_search/dispatch.rs`): all three run inside
+   `crate::shard::slice::with_shard(...)`, i.e. on the shard's own OS
+   thread, before any `.await` boundary — PR #179's off-loop worker pool
+   only carries the HNSW beam search itself off-loop, not the capture phase
+   a COLD reload runs in. This means a first-touch reload is a SHARD-WIDE
+   stall (every connection sharing that shard, not just the querying one),
+   for the reload's duration. A real off-loop fix needs `SegmentHolder`
+   reachable from the async continuation without an open `VectorIndex`
+   borrow (e.g. `Arc`-wrapping it, a ~100-call-site change) — judged
+   out-of-scope / too risky for this pass and tracked as a follow-up rather
+   than attempted half-finished. `docs/guides/tuning.md` now documents this
+   precisely instead of the earlier (incorrect) "one-query latency hit"
+   framing, plus a same-instance measurement of the stall's actual duration:
+   the first-touch `FT.SEARCH` reload took 79.59 ms round-trip, during which
+   a concurrent `PING` on a second connection to the same shard peaked at
+   76.70 ms (vs sub-millisecond baseline) — confirming the block is
+   shard-wide and roughly the full reload duration, not a per-connection cost.
+3. **WARM segments could never reach COLD.** `try_warm_transitions_idle`
+   only ever scanned `snapshot.immutable` for idle/age eligibility — a
+   segment that had already demoted to WARM (age-based) had no further path
+   to COLD even if it then went idle, defeating the whole point of the COLD
+   tier for that segment permanently. Fixed: the same function now also
+   scans `snapshot.warm` (`WarmSearchSegment::idle_secs`, a new method
+   mirroring `ImmutableSegment::idle_secs`) and demotes idle WARM segments
+   straight to COLD stubs via the same `UnloadedSegment::from_warm` used for
+   the immutable path — mechanical, since a WARM segment's `.mpf` files
+   already exist on disk.
+4. **Repo-rule compliance: no per-query `SystemTime::now()` syscalls.**
+   `WarmSearchSegment::touch_last_access`/`from_files` and
+   `ImmutableSegment`'s module-level `now_micros()` called
+   `SystemTime::now()` directly on a path that runs once per query per
+   segment. Both now read `crate::storage::entry::current_time_ms()` — the
+   existing shard-tick-populated thread-local cached clock (`TL_NOW_MS`,
+   updated once per ~1ms shard tick) that already backs the KV hot path,
+   with its documented automatic syscall fallback on threads that never
+   ticked a shard clock (tests, or an off-loop FT.SEARCH worker thread).
+   Millisecond resolution (×1000 for unit parity) is sufficient since every
+   caller only compares `age_secs`/`idle_secs` at second granularity.
+5. **Tightened the RSS regression test.** `cold_unload_reduces_process_rss`
+   asserted a plain `rss_after < rss_before`, which would still pass for a
+   regression that only frees (say) the HNSW graph while leaving TQ codes +
+   sidecar resident. Now asserts `rss_after < rss_before * 0.85` (a 15%
+   floor — the real 40K×768d measurement showed −26.2%, so this has margin
+   for the smaller CI-scale fixture and jemalloc arena noise without being
+   toothless).
+6. **`SegmentList::with_unloaded` / `with_warm_and_unloaded` clone-and-patch
+   helpers.** `SegmentList` now derives `Clone` (all fields are
+   `Arc`/`Vec<Arc<_>>` — refcount bumps, never a data copy) so reconstruction
+   sites can use Rust's functional-update syntax
+   (`SegmentList { changed_field, ..old.clone() }`) instead of enumerating
+   all 6 fields by hand. Applied at `try_warm_transitions_idle`'s final
+   `swap` (the site touched by this review's item 3 fix). This does NOT
+   convert all ~17 `SegmentList { ... }` construction sites in the codebase
+   — only the ones this pass's changes already touch, verified to compile.
+   The remaining sites are left as full literals rather than converted
+   speculatively without individual verification; they will fail to compile
+   the moment a new field (e.g. WS5a's `db_index`) is added, which is itself
+   the forcing function that gets them individually attended to. The
+   pattern (derive Clone + functional update, plus the two named helpers)
+   is now established for that future pass to reuse.
+7. **Freshly compacted segments were unloaded to COLD before they were ever
+   searchable.** Two stacked bugs, found via `cold_unload_reduces_process_rss`
+   timing out 600s waiting for `graph_segments >= 1`:
+   - `ImmutableSegment` seeds `last_access_micros` at *construction* (build
+     start), but a multi-second HNSW build consumes the whole
+     `--engine-offload-idle-secs` budget before the segment is published —
+     the idle sweep then unloaded the brand-new segment in its very next
+     tick (server log: "Cold (unload) transition: segment 1 (15000 vectors,
+     idle 3s)" 4.4s after server start). Fixed with
+     `ImmutableSegment::mark_installed()`, called at every point a built
+     segment is swapped into the live `SegmentList` (inline + background
+     compaction installs, both merge installs): idle time is now measured
+     from *visibility*, not from the start of the build.
+   - `mark_installed` deliberately bypasses the cached clock (item 4 above)
+     with a real `SystemTime::now()` syscall: the inline FT.COMPACT path
+     builds ON the shard thread, so `TL_NOW_MS` hasn't advanced for the
+     entire build and stamping the cached value would be build-duration
+     stale — the first iteration of this fix did exactly that and still
+     produced "idle 9s" on a just-installed segment. Install is a cold path;
+     one syscall is fine (does not violate the per-query no-syscall rule).
+### Added — true COLD tier: idle segments now actually free memory (WS3 round 2, PR #TBD)
+
+Round 1 (below) shipped an idle *trigger* but routed it into the pre-existing
+WARM tier, which copies `.mpf` payloads into owned buffers of the same size
+as the HOT segment it replaces -- measured flat-to-+1.1% RSS, not a
+reduction. Round 2 fixes the actual memory problem:
+
+- **New tier, `SegmentList.unloaded: Vec<Arc<UnloadedSegment>>`**
+  (`src/vector/persistence/unloaded_segment.rs`, new file): a COLD segment
+  stub holding only a handful of scalars (segment id, doc count, whether it
+  had an exact-rerank sidecar, an `mlock_codes` flag) plus a cloned
+  `SegmentHandle` keeping the on-disk directory alive. Nothing else --
+  no TQ/SQ8 codes, no HNSW graph, no f16 sidecar buffer.
+- **Idle now routes straight to COLD, not WARM**
+  (`VectorIndex::try_warm_transitions_idle`, `src/vector/store.rs`): the two
+  triggers now have different destinations. `age_eligible`
+  (`--segment-warm-after`) still demotes to WARM exactly as before (an
+  old-but-still-hot segment structurally simplifies to disk-backed storage,
+  no memory-reduction promise). `idle_eligible`
+  (`--engine-offload-idle-secs`, genuinely cold) now demotes straight to
+  COLD -- this is the one that actually frees memory. If a segment
+  satisfies both simultaneously, COLD wins. Both destinations write the
+  identical `.mpf` files via the existing `warm_tier::transition_to_warm`
+  (sidecar included); COLD additionally drops the materialized
+  `WarmSearchSegment` immediately after capturing the stub, instead of
+  keeping it resident.
+- **Transparent, synchronous, single-flight reload on touch**
+  (`SegmentHolder::promote_unloaded`, `src/vector/segment/holder/promote.rs`
+  -- split out as a child module to keep `holder.rs` under the 1500-line
+  cap): every search path (`search_filtered`, `search_mvcc`, and the
+  yielding worker-pool capture in
+  `command/vector_search/ft_search/dispatch.rs`) calls this before scanning
+  -- a KNN query must consider every segment for correctness, so a COLD
+  segment cannot stay unloaded and still participate. Fast path (nothing
+  unloaded) is a single `is_empty()` check, no lock, no allocation. When
+  there IS something to reload, a blocking (never `try_lock`, never held
+  across `.await`) `reload_lock` mutex makes it single-flight: N concurrent
+  callers touching the same COLD segment all wait for the one reload
+  (double-checked re-load after acquiring the lock) rather than racing
+  ahead with a stale, missing-segment snapshot. Reload reuses
+  `WarmSearchSegment::from_files` -- the same function the WARM tier and
+  server-boot recovery already use -- so recall/exactness (sidecar
+  included) is unaffected; a segment that fails to reload (corrupt/missing
+  files) stays in `unloaded` and is retried on the next touch without
+  poisoning the rest of the batch.
+- **`FT.INFO`**: new additive counters `unloaded_segments` /
+  `unloaded_segments_with_exact_rerank` (the latter answered from the stub,
+  no reload needed), and `num_docs` (both top-level and per-field) now also
+  sums `unloaded.iter().map(UnloadedSegment::total_count)` -- the same
+  regression class fixed for WARM in round 1, this time for COLD.
+- **Lifecycle**: `VectorStore::drop_index` / `clear_all_contents` (FLUSHALL/
+  FLUSHDB) now also tombstone every `unloaded` stub's `SegmentHandle`, or
+  its on-disk directory would leak once the stub itself is dropped (WARM
+  segments already got this treatment; COLD needed the same). GraphUnion
+  merge scheduling (`VectorIndex::needs_merge` / `begin_background_merge`)
+  only ever reads/filters `snapshot.immutable` (HOT segments) -- it never
+  touches `warm`, `cold` (DiskAnn), or `unloaded`, so COLD segments are
+  skipped by construction, not by added special-casing. Server restart:
+  COLD segments have no restart-time restoration path, same as WARM already
+  didn't -- the segment directories they point at are simply reloaded as
+  fresh HOT/immutable segments by the existing boot-recovery scan
+  (`persistence/recover_v2.rs`); "should be free" per the original ask.
+- **RSS re-measurement** (same methodology as round 1: real server,
+  `--shards 1`, 40,000 x 768-dim vectors, SQ8, `ps -o rss=`) -- this time a
+  real drop, not the round-1 flat-to-increase result:
+
+  | Phase | RSS (KB) | Delta |
+  |---|---|---|
+  | Before unload (HOT) | 400,544 | -- |
+  | After unload (COLD) | 295,760 | -104,784 KB (-26.2%) |
+  | After reload (touched, back to WARM) | 395,376 | +99,616 KB vs COLD |
+
+  The reload number lands just under the original HOT figure because the
+  segment reloads into the WARM (owned-buffer) representation, which is
+  itself ~1.3% smaller than the original HOT `ImmutableSegment` layout in
+  this run -- consistent with round 1's WARM-vs-HOT measurement, not a new
+  effect.
+- Red/green: `tests/vector_idle_unload.rs`'s
+  `hot_segment_idle_unloads_to_cold_and_preserves_recall` (supersedes round
+  1's `hot_segment_idle_unloads_and_preserves_recall`, which polled
+  `warm_segments` -- now stays 0 for a purely-idle transition) walks HOT ->
+  COLD -> reload -> WARM, asserting `FT.INFO` counters at every stage
+  (`graph_segments`, `warm_segments`, `unloaded_segments`,
+  `*_with_exact_rerank`, `num_docs`) plus recall/exactness before and after.
+  `cold_unload_reduces_process_rss` is the process-level RSS proxy (40,000 →
+  scaled down to a CI-reasonable 3,000 × 256-dim fixture -- see the full
+  40K×768d numbers below for the production-scale claim) asserting a real
+  `ps` RSS drop, not just a counter flip. `unloaded_segment.rs`'s own unit
+  tests cover stub-capture + reload round-trip and tombstone-triggers-
+  directory-removal.
+- **Correctness edges considered and their disposition**: concurrent search
+  during unload -- covered by single-flight `reload_lock` above; writes/
+  tombstones arriving for a COLD segment's key -- `WarmSearchSegment` (and
+  therefore also the COLD stub, which reloads into one) has **no per-key
+  tombstone mechanism at all**, a pre-existing gap discovered during this
+  work (`tombstone_key_in_index` only ever touches `mutable` and
+  `immutable`) -- COLD inherits exactly the same behavior as WARM already
+  had, so this is a documented pre-existing limitation, not a regression;
+  see "Known limitation" below. FLUSHALL/FLUSHDB/DROPINDEX -- handled (see
+  Lifecycle above). GraphUnion merge -- skipped by construction (see
+  Lifecycle above). Single-flight reload -- handled (see above).
+
+- **⚠ Known limitation (pre-existing, not introduced by WS3): no per-key
+  tombstoning for WARM or COLD segments.** `tombstone_key_in_index`
+  (`src/vector/store.rs`) only marks deletions in the `mutable` and
+  `immutable` (HOT) segments; `WarmSearchSegment` has no delete-bitmap or
+  MVCC-visibility mechanism of its own. A key deleted (DEL/HDEL/UNLINK)
+  after its vector's HOT segment has demoted to WARM or COLD stays
+  returned by that segment's own local search until the segment is later
+  merged away or the whole index is dropped/flushed. This predates WS3
+  (round 1's WARM tier already had it) and reloading a COLD stub does not
+  make it worse or better -- it inherits WARM's exact behavior. Flagged
+  here because implementing the new COLD tier required reading this code
+  path closely enough to notice it; fixing it is out of scope for this
+  workstream (adding per-segment tombstone tracking to `WarmSearchSegment`
+  is its own, separately-scoped change) and is recorded as a follow-up.
+
+### Added — vector idle-unload with sidecar-preserving WARM transition (WS3, PR #TBD)
+
+- **`src/vector/segment/immutable.rs`**: `ImmutableSegment` gains a
+  `last_access_micros` atomic (mirrors `WarmSearchSegment`'s existing field),
+  touched on every `search`/`search_filtered`, exposed via `idle_secs()`.
+- **`src/config.rs`**: new `--engine-offload-idle-secs <secs>` (default
+  `3600`, `0` disables). A HOT segment now demotes to the mmap-backed WARM
+  tier when EITHER `--segment-warm-after` (age) OR
+  `--engine-offload-idle-secs` (idleness since last search) is reached —
+  whichever fires first — so a segment that is old but still busy stays HOT
+  instead of unloading mid-traffic. `src/vector/store.rs` adds
+  `try_warm_transitions_idle` / `try_warm_transitions_all_idle` (the
+  pre-existing age-only methods now delegate to these with idle disabled, so
+  every existing caller is unaffected). `src/shard/{persistence_tick,
+  event_loop}.rs` thread the new threshold through; the warm-check poll
+  interval also adapts to the lower of the two thresholds for fast local
+  testing.
+- **Recall fix (was silently dropped, not new WS3 behavior)**:
+  `VectorIndex::try_warm_transitions` always passed `None` for the HOT
+  segment's f16 exact-rerank sidecar when writing `vectors.mpf`, and
+  `WarmSearchSegment` had no sidecar field or rerank logic at all — every
+  HOT->WARM transition silently downgraded to quantized ADC-only distances,
+  contradicting the sidecar's whole purpose (HQ-1, PR #232). Fixed:
+  `src/vector/persistence/warm_search.rs`'s `WarmSearchSegment` now loads
+  `vectors.mpf` (when present) into a `RawF16Store`, exposes `raw_f16()`, and
+  runs the same `rerank_exact` HQ-1 logic `ImmutableSegment` does before
+  truncating to `k`. `VectorIndex::try_warm_transitions` now passes
+  `imm.raw_f16()`'s bytes through instead of `None`.
+- **Correctness fix (also pre-existing, caught by the new integration
+  test)**: `warm_search.rs`'s `parse_global_ids` assumed a 24-byte MVCC entry
+  with no `key_hash` field; the actual writer
+  (`ImmutableSegment::mvcc_raw_bytes`) emits 32-byte entries
+  (`internal_id + global_id + key_hash + insert_lsn + delete_lsn`). Every
+  entry past the first was misaligned, and `key_hash` was dropped entirely —
+  every WARM-tier FT.SEARCH hit resolved to a synthetic `vec:<id>` key
+  instead of the real Redis key. Renamed to `parse_mvcc_ids`, fixed to the
+  correct 32-byte stride, and `key_hash` now propagates onto
+  `SearchResult.key_hash` via `remap_to_global_ids`.
+- **`FT.INFO`**: new additive (scatter-gathered across shards) counters
+  `warm_segments` / `warm_segments_with_exact_rerank`, mirroring the existing
+  `graph_segments` / `segments_with_exact_rerank` for the HOT tier.
+- **Correctness fix (regression this WS3 work would otherwise have shipped,
+  caught by RSS verification below)**: `command/vector_search/ft_info.rs`'s
+  `num_docs` computation (both the top-level and per-`vector_fields` entry)
+  only summed `mutable.len()` + `imm.live_count()` over HOT segments — it
+  never counted WARM segments. Before WS3 this was latent (age-based
+  HOT->WARM demotion existed but nothing exercised it in a live num_docs
+  check); with idle-unload now demoting segments routinely, a fully-idle
+  single-segment index would report `num_docs 0` even though every document
+  was still present and searchable. Fixed by adding
+  `warm.iter().map(WarmSearchSegment::total_count)` to both sums.
+- **⚠ Known limitation — RSS does NOT drop after HOT->WARM idle-unload.**
+  Verified with a real server (`--shards 1`, SQ8, 40,000 × 768-dim vectors,
+  `ps -o rss=` sampled every 2s for 16s after the transition): RSS went from
+  395,168 KB to a flat 399,504–399,520 KB post-unload — a **1.1% increase**,
+  not a decrease, with zero decay over the observation window. Root cause is
+  pre-existing (predates this WS3 change, confirmed by the standing doc
+  comment on `WarmSearchSegment::from_files` in
+  `src/vector/persistence/warm_search.rs`): the "mmap-backed" WARM tier opens
+  each `.mpf` file's mmap only for the duration of `from_files()` and
+  immediately copies every payload out into owned `Vec<u8>` /
+  parsed-`HnswGraph` buffers of essentially the same size as the HOT
+  segment's — the mmap is then dropped. So the two structures that dominate
+  memory at scale (TQ codes + HNSW graph) are fully duplicated in heap memory
+  on the WARM side, not lazily paged in from disk. The idle-based *trigger*
+  added by this change is correct and verified end-to-end (`FT.INFO` counters
+  flip, recall/exactness preserved, `num_docs` now stays correct — see
+  `tests/vector_idle_unload.rs`), but it does not, by itself, achieve the
+  memory-reduction goal this workstream set out to prove. A genuine RSS win
+  requires reworking `WarmSearchSegment` to search directly over borrowed
+  mmap'd bytes (HNSW traversal + TQ-ADC distance kernels operating on
+  `&[u8]` instead of owned `Vec`), which is a substantially larger, higher-risk
+  change (touches SIMD distance kernels, needs careful lifetime/alignment
+  handling, and was explicitly out of scope for this pass per the "no new
+  `unsafe` without approval" constraint). Tracked as an open follow-up; see
+  `docs/guides/tuning.md`.
+- **`src/config.rs`**: corrected the `--disk-offload-threshold` doc comment,
+  which claimed "parsed but not acted upon" — the memory-pressure cascade
+  (`persistence_tick::{should_run_pressure_cascade,handle_memory_pressure}`)
+  has actually acted on it since an earlier phase; the comment was stale.
+- **`src/storage/tiered/cold_read.rs`**: new `_cached` variants
+  (`cold_read_through_outcome_cached`, `read_cold_entry_at_cached`) read the
+  cold KV leaf page through `PageCache` when given one, instead of always
+  `pread`ing — the existing (uncached) functions are now thin wrappers
+  calling these with `page_cache: None`, so their behavior and every existing
+  call site are unchanged. **Not yet wired into `Database::get()`'s live
+  cold-read path** — that needs a `PageCache` handle threaded from the
+  per-shard event loop into `Database`, a broader plumbing change deferred as
+  a follow-up; the cache-capable read path itself is implemented and tested.
+- Docs: `docs/guides/tuning.md` gains "Tiered memory offload" and
+  "Vector/FTS/graph idle-unload" sections documenting the new flags,
+  `FT.INFO` counters, and the FTS/graph limitation (no equivalent idle-unload
+  yet — FTS has no aggregate memory-accounting API, and the graph engine's
+  mmap'd `MmapCsrSegment` has no LRU-eviction-driven unload comparable to
+  vector's `MmapBudget`).
+- Red/green: `tests/vector_idle_unload.rs` (real server process, `MOON_BIN` /
+  `CARGO_BIN_EXE_moon`) — idle-out a HOT segment with `--segment-warm-after`
+  set far above the test's timeout so only `--engine-offload-idle-secs` can
+  trigger the transition; asserts `FT.INFO` counters flip HOT->WARM and a
+  post-transition `FT.SEARCH` returns the same key with the same near-zero
+  exact-rerank distance (this is what caught both fixes above — it failed on
+  the pre-fix code, first on distance, then on key identity).
+  `src/storage/tiered/cold_read.rs` unit test proves a second cold read is
+  served from `PageCache` even after the backing file is renamed away.
+  `src/vector/persistence/warm_search.rs` unit tests cover the sidecar
+  round-trip and the corrected MVCC entry parsing.
+
+### Fixed — WS6: self-inflicted write lockout on an over-quota key (HIGH, adversarial review 2026-07-08)
+
+- **HIGH, release-blocking**: making container growth visible to
+  `used_memory` (see the accounting-gap fix below) made a second,
+  previously-unreachable bug reachable: `run_write_eviction_gate`
+  (`src/server/conn/handler_monoio/mod.rs`) and
+  `check_db_maxmemory_for_command` (`src/storage/db_quota.rs`) applied
+  the `noeviction` reject to **every** write command uniformly — so once
+  a key's growth tripped the global `--maxmemory` gate or a db's
+  `--db-maxmemory` quota, a pure-shrink command on that SAME key —
+  `HDEL`, `SREM`, `LPOP`, `ZREM`, ... — was *also* rejected. A tenant
+  that grew a key past the boundary had **no self-recovery path** short
+  of `FLUSHALL`/restart, undermining the WS5b per-db-quota guarantee
+  this same release ships.
+- Fixed with a static, provably shrink-only command classification,
+  `db_quota::is_shrink_only_command` (`src/storage/db_quota.rs`),
+  mirroring Redis's `CMD_DENYOOM` semantics: `DEL`/`UNLINK`,
+  `HDEL`/`HGETDEL`, `SREM`/`SPOP`, `LPOP`/`RPOP`/`LREM`/`LTRIM`/`LMPOP`/
+  `BLMPOP`, `ZREM`/`ZPOPMIN`/`ZPOPMAX`/`ZMPOP`/`BZPOPMIN`/`BZPOPMAX`/
+  `BZMPOP`/`ZREMRANGEBYSCORE`/`ZREMRANGEBYRANK`/`ZREMRANGEBYLEX`,
+  `GETDEL`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`PERSIST`,
+  `FLUSHDB`/`FLUSHALL` now bypass the *reject* from both the global
+  maxmemory gate and the per-db quota gate — eviction is still attempted
+  first (an evicting policy may as well reclaim while the write lock is
+  already held); only the reject is skipped. Deliberately conservative
+  — commands that can grow a destination key (`LMOVE`/`SMOVE`/`COPY`/
+  `RESTORE`/any `*STORE` variant) or aren't statically classifiable
+  (`SET`, even with a shorter value) are excluded ("when in doubt,
+  exclude").
+- Applied at all three connection-handler write-path chokepoints:
+  `handler_monoio::run_write_eviction_gate`, the inline eviction block in
+  `handler_sharded`'s sharded write path, and both inline blocks in
+  `handler_single` (the pipelined-dispatch loop and the single-command
+  write path).
+- RED/GREEN: `test_hdel_self_recovery_past_maxmemory_boundary` and
+  `test_hdel_self_recovery_past_db_maxmemory_boundary`
+  (`tests/container_growth_memory_accounting.rs`) — confirmed RED against
+  the pre-fix handler/db_quota code (`git stash`): both failed with the
+  exact OOM-on-HDEL symptom described above. Each test now: grows a hash
+  past its cap (asserting the growing HSET IS rejected with the correct
+  OOM flavor), asserts `HDEL` on that same over-cap key succeeds, drains
+  the rest, then asserts a follow-up `HSET` succeeds once back under
+  budget.
+
+### Fixed — WS6: container-growth memory accounting gap (HSET/LPUSH/SADD/ZADD... growth was invisible to `--maxmemory`)
+
+- **Critical**: `used_memory` was charged once at key-creation time for an
+  EMPTY Hash/List/Set/ZSet container (`entry_overhead()` in
+  `src/storage/db.rs`, called from `get_or_create_hash`/`_list`/`_set`/
+  `_sorted_set`), then a raw `&mut` reference into the map/deque/set/tree
+  was handed to the command layer. Every subsequent mutation through that
+  reference — `HSET` adding fields, `LPUSH` growing the deque, `SADD`/
+  `ZADD` growing the set/sorted-set, and their listpack/intset compact-
+  encoding equivalents — never updated `used_memory` again, so growing a
+  SINGLE key's contents was invisible to both the global `--maxmemory`
+  gate and the per-db quotas (WS5b). Confirmed by adversarial review
+  2026-07-08 (flagged as a known limitation in `docs/guides/isolation.md`
+  at the time).
+- Fixed via O(1) per-mutation delta accounting rather than a full
+  recompute: `RedisValue::estimate_memory()` sums over every element for
+  the expanded Hash/List/Set/SortedSetBPTree encodings, so recomputing it
+  on every single-field HSET on a large hash would turn an O(1) command
+  into O(n). New `Database::charge_memory`/`credit_memory`/`adjust_memory`
+  (O(1), saturating) plus per-container byte-cost helpers next to
+  `entry_overhead` (`hash_field_cost`, `list_elem_cost`, `set_member_cost`,
+  `zset_member_cost`) that mirror `RedisValue::estimate_memory`'s
+  per-variant formulas exactly. The listpack/intset COMPACT encodings are
+  the exception — their `estimate_memory()` is already O(1)
+  (capacity-based), so those call sites snapshot before/after instead.
+- Every hash/list/set/zset mutation site instrumented: `HSET`/`HMSET`/
+  `HINCRBY`/`HINCRBYFLOAT`/`HSETNX`/`HDEL`/`HGETDEL`/`HEXPIRE`-family
+  past-expiry delete (`src/command/hash/hash_write.rs`,
+  `src/storage/db.rs`); `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LSET`/`LINSERT`/
+  `LREM`/`LTRIM`/`LMOVE`/`LPUSHX`/`RPUSHX`/`LMPOP`
+  (`src/command/list/list_write.rs`, `src/storage/db.rs`'s
+  `list_push_front`/`_back`/`list_pop_front`/`_back`); `SADD` (intset +
+  HashSet paths)/`SREM`/`SPOP`/`SMOVE` (`*STORE` variants were already
+  correct — they replace the whole entry via `Database::set`, which
+  already accounted correctly); `ZADD`/`ZREM`/`ZINCRBY`/`ZPOPMIN`/
+  `ZPOPMAX`/`ZMPOP`/`ZUNIONSTORE`/`ZINTERSTORE`/`ZRANGESTORE`
+  (`src/command/sorted_set/sorted_set_write.rs`). Whole-key removal paths
+  (`Database::remove`/`Database::set`) needed no changes — they already
+  recompute `entry_overhead` on the final (already-mutated) entry, an O(n)
+  cost paid once per key lifetime, not per mutation, so they correctly
+  credit a grown container's true size when it's fully removed or
+  replaced.
+- The eviction loop's before/after `estimated_memory()` delta arithmetic
+  (`src/storage/eviction.rs`) required no code changes — it already reads
+  the (now-correct) live `used_memory` accumulator.
+- RED/GREEN: `tests/container_growth_memory_accounting.rs` (growing one
+  HSET/LPUSH key past `--maxmemory` under `noeviction` now rejects further
+  writes; draining a grown hash via `HDEL` correctly credits the freed
+  bytes back). Unit tests per container family (hash/list/set/zset
+  `mod.rs`) assert `estimated_memory()` rises/falls with insert/remove/
+  overwrite, including a same-length overwrite netting a zero delta.
+- Making this growth visible surfaced a second, previously-unreachable
+  bug — a self-inflicted write lockout where even shrink commands like
+  `HDEL` were rejected on an over-quota key. Now fixed; see the dedicated
+  entry above.
+
 ### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
 
 - **`src/shard/{dispatch,spsc_handler,coordinator}.rs`,
@@ -71,6 +558,359 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CROSSSLOT. Note found in passing (unrelated, out of scope): a *solo* GET sent
   mid-MULTI on the monoio single-shard handler executes immediately instead of
   queueing.
+
+### Added — `--profile standalone` tuning preset (v0.6.0 WS4)
+
+- New `--profile <name>` flag (`src/config.rs`). `standalone` fills the proven
+  single-instance p=1 recipe — `--shards 1`, `--io-busy-poll-us 40` (implying
+  `--io-driver epoll`) — for any of those flags the operator left unset.
+  Fill-only precedence: an explicitly-passed flag (CLI or `moon.conf`) always
+  wins over the preset. Startup logs exactly which flags the profile set;
+  an unknown profile name is a startup error (exit 2), never a silent no-op.
+- `ServerConfig::parse_from_with_matches` + `ServerConfig::apply_profile` use
+  `clap::ArgMatches::value_source` to distinguish explicit flags from
+  defaults; `FromArgMatches::from_arg_matches` (non-consuming, clones
+  internally) is used instead of `from_arg_matches_mut`, which removes
+  consumed entries from `ArgMatches` and would erase this provenance.
+- **Safety:** `--io-busy-poll-us` busy-polls the shard thread and REGRESSES
+  throughput on shared/unpinned cores (OrbStack default, laptops,
+  noisy-neighbor cloud VMs) — `standalone` prints a prominent startup warning
+  requiring pinned/dedicated cores, and `docs/guides/tuning.md#profiles` +
+  `docs/configuration.md` document the same caveat. No raw flag default
+  changed.
+- Tests: profile expansion, explicit-flag-wins precedence, no-profile no-op,
+  and unknown-profile error (`src/config.rs` `tests::test_profile_*`).
+### Added — WS1 command parity: `*_RO` variants + ACL LOG/CLIENT LIST/OBJECT HELP audit (PR #TBD)
+
+- **`BITFIELD_RO`, `SORT_RO`, `GEORADIUS_RO`, `GEORADIUSBYMEMBER_RO`**: new
+  read-only twins registered in the `phf` command registry with all three
+  dispatch paths wired (mutable `dispatch()`, immutable `dispatch_read()`,
+  and the `is_dispatch_read_supported()` fast-reject bucket list — a command
+  missing that last one is unreachable over the wire despite compiling and
+  passing unit tests). Each rejects its write-capable subcommand/option
+  (`SET`/`INCRBY`/`OVERFLOW` for BITFIELD_RO; `STORE` for SORT_RO;
+  `STORE`/`STOREDIST` for the GEORADIUS twins) via positional parsing (not a
+  blind token scan, so a `GET`/`BY` pattern value that happens to read
+  "STORE" is never misclassified).
+- **CLIENT LIST/INFO**: added the missing Redis fields (`laddr`, `multi-mem`,
+  `tot-net-in`/`tot-net-out`, `rbs`/`rbp`/`obl`/`oll`/`omem`, `events`,
+  `cmd`, `redir`, `resp`, `lib-name`, `lib-ver`) so key=value parsers no
+  longer choke on absent keys; `redir` and the tracking flag stay at their
+  "off" defaults; wiring them to the CLIENT TRACKING state shipped in PR #234
+  is a known follow-up.
+- **Audit findings**: `ACL LOG` (real entries + RESET) and `OBJECT HELP`
+  were already fully implemented — added regression tests to lock in that
+  coverage rather than re-implementing.
+- `docs/redis-compat.md` regenerated against `src/command/metadata.rs`
+  (258 commands): fixed stale claims that `WAIT` and `FUNCTION *` are
+  unimplemented (both are live), documented the four new `_RO` commands,
+  and added an explicit non-goals section for `PFDEBUG`, `PFSELFTEST`,
+  `FAILOVER`, `MODULE *`, `SENTINEL *` with one-line rationale each.
+- `scripts/test-consistency.sh` (+section 9b) and `scripts/test-commands.sh`
+  (key-commands category) gained coverage for all four new commands.
+
+### Fixed — WS5b fix-first adversarial review: db-quota bypass on non-inline writes
+
+- **Critical**: `--maxmemory 0` combined with `--disk-offload disable` (no
+  disk-offload spill sender) silently bypassed the per-db quota gate for
+  every non-inline write command (HSET/LPUSH/SADD/ZADD/INCR/APPEND/MSET/
+  SET-with-options/RESTORE/...) — plain `SET`/`GET` were unaffected because
+  they take a separate, always-correctly-gated inline fast path. Root cause:
+  `handler_monoio`'s `batch_eviction_active` and its cross-shard-leg twin
+  `spsc_handler`'s `evict_active` only checked
+  `spill_sender.is_some() || maxmemory != 0`, entirely skipping the
+  write-eviction-gate call (and the db-quota check nested inside it) when
+  neither was true. Fixed by adding `db_quota::db_maxmemory_any_set()` to
+  both conditions, mirroring the Lua bridge's gate (which already had this
+  term). RED/GREEN TDD via `git apply -R`; new integration test
+  `test_quota_rejects_non_inline_writes_without_spill_sender` in
+  `tests/db_maxmemory_quota.rs` (HSET + SET-with-EX). Manually re-verified
+  `RESTORE` also rides the fixed gate (rejected before payload
+  deserialization).
+- Along the way, found a second, independent, pre-existing bug: `used_memory`
+  accounting for Hash (and, by the same code pattern, List/Set/ZSet) is only
+  charged once at key-creation time for the empty container's overhead —
+  subsequent field/element inserts into an EXISTING key never update
+  `used_memory`. This defeats the *global* `--maxmemory` gate identically
+  (verified: growing one hash key's fields never trips a small
+  `--maxmemory` cap regardless of value size), so it predates and is
+  independent of db-quota. At the time this was out of scope to fix here
+  (touches every container-type mutation site, a much larger body of work)
+  and was documented as a known limitation; **now fixed** — see "WS6:
+  container-growth memory accounting gap" above.
+- `--db-maxmemory` CLI parsing now fails fast at startup (`REFUSING TO
+  START:` + nonzero exit, matching this file's existing trusted-config
+  validation convention) instead of silently warning and dropping a
+  malformed/out-of-range entry — this is trusted operator config supplied
+  at launch, not untrusted wire input, so a typo should refuse to start
+  rather than silently leave a db unprotected. `CONFIG SET db-maxmemory`
+  was already this strict; the CLI form now matches. New
+  `config::validate_db_maxmemory_cli()`; new tests
+  `test_malformed_db_maxmemory_cli_refuses_to_start` /
+  `test_out_of_range_db_maxmemory_cli_refuses_to_start`.
+- Documented (not changed): `WS DROP`'s all-dbs cascade-delete sweep is a
+  synchronous, in-place O(total keys × `--databases`) scan on the owning
+  shard's event-loop thread — it blocks every other connection pinned to
+  that shard for the duration. Accepted trade-off for an admin-rare
+  operation at the default `--databases 16`; flagged in
+  `docs/guides/isolation.md` and inline code comments for large-keyspace,
+  large-`--databases` deployments.
+
+### Added — per-db resource quotas + workspace hardening sweep (WS5b, PR #TBD)
+
+- New per-db memory quota: `--db-maxmemory <db>:<bytes>` (repeatable CLI
+  flag) and `CONFIG SET/GET db-maxmemory <db> <bytes>` (0 = unlimited,
+  default). Enforcement mirrors global `--maxmemory`: `noeviction`
+  rejects writes at quota with a `MOONERR db maxmemory exceeded` error;
+  eviction policies shed keys from the offending db only. Zero-cost
+  when unconfigured via a single relaxed-atomic pre-gate
+  (`DB_MAXMEMORY_ANY_SET`), same pattern as the existing global-maxmemory
+  gate. New `src/storage/db_quota.rs`.
+- Fixed a real bug found via this work: `SELECT`/`SWAPDB` are flagged
+  `is_write` in moon's command-metadata table (for unrelated ACL/dispatch
+  reasons), which meant a connection that filled a `noeviction`-quota'd db
+  could not even `SELECT` away from it afterward — the eviction/quota gate
+  ran against the pre-switch db index before `SELECT` updated connection
+  state. Fixed for the new db-quota gate via
+  `check_db_maxmemory_for_command()` (SELECT/SWAPDB exempt); the
+  pre-existing identical quirk in the global `--maxmemory` gate is
+  documented but deliberately left unfixed (out of scope — shared,
+  widely-used eviction code).
+- Fixed a real, pre-existing bug: `WS DROP`'s best-effort key cleanup
+  only swept logical db 0 (hardcoded), silently leaking a workspace's
+  keys forever if its connection ever `SELECT`ed to a non-zero db before
+  writing (`WS AUTH` and `SELECT` are orthogonal connection state). Now
+  sweeps every db on the owning shard. Proven via RED/GREEN TDD
+  (`test_workspace_drop_cleans_keys_across_all_dbs`).
+- New `docs/guides/isolation.md` — honest "isolation semantics" reference
+  covering logical dbs, workspaces, and per-db quotas: what each
+  guarantees, and every discovered limit (FLUSHDB is whole-db not
+  workspace-scoped; MOVE/SWAPDB reconciled lazily by a background sweep,
+  not synchronously; no disk-offload spill integration for db-quota
+  eviction; FT.* indexes remain keyspace-global, not workspace-scoped —
+  handoff note for the concurrent WS5a db-scoped-FT-index work).
+- New tests: 9 unit tests in `src/config.rs` (CLI/CONFIG parsing), 7 in
+  `src/storage/db_quota.rs` (accounting + enforcement), 6 in
+  `src/command/config.rs` (CONFIG GET/SET), 3 new workspace hardening
+  tests in `tests/workspace_integration.rs` (WS DROP all-dbs regression,
+  cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
+  `tests/db_maxmemory_quota.rs` real-server integration test.
+
+### Fixed — WS5a round 4: write-path db-isolation leak in auto-index/auto-delete hooks (adversarial review)
+
+A follow-up adversarial delta-review of round 3 (below) confirmed all of
+round 3's fixes, then found one more **CRITICAL, data-integrity-severity**
+gap: the auto-index/auto-unindex WRITE-path hooks were never db-scoped,
+despite the round-2 CHANGELOG entry (further below) explicitly claiming
+they were. Unlike the read-path leak fixed in round 3 (a foreign db could
+merely *see* another db's search results), this gap let a foreign db
+*corrupt or erase* another db's index contents — and it triggers at
+`--shards 1` (no multi-shard fan-out required):
+
+- **`auto_index_hset`** (`src/shard/spsc_handler.rs`, private; reached via
+  `auto_index_hset_public`/`_public_txn` from `handler_single.rs`,
+  `handler_monoio/mod.rs`, `handler_sharded/mod.rs`, `server/conn/shared.rs`,
+  and the sharded MULTI/EXEC replay path) called UNSCOPED
+  `vector_store.find_matching_index_names(key)` /
+  `text_store.find_matching_index_names(key)`. An `HSET` issued from ANY db
+  whose key happened to match another db's index PREFIX silently fed that
+  foreign index. Fixed via `find_matching_index_names_for_db`, with
+  `db_index: u8` threaded through both public wrappers and every call site
+  (`conn.selected_db as u8` / `sel_db as u8` / `db_idx as u8`, matching the
+  idiom already established for FLUSHDB scoping at each of those sites).
+- **`auto_delete_vectors`** (same file) called UNSCOPED
+  `vector_store.mark_deleted_for_key`, so a `DEL`/`UNLINK` issued from ANY
+  db could tombstone another db's vector entry for a same-named key — the
+  already-existing, already-unit-tested `mark_deleted_for_key_for_db` had
+  **zero production callers** before this fix. Now threaded the same way.
+- **`auto_hdel_vectors`** (bonus fix, same bug class, not explicitly named
+  by the review but caught while auditing the surrounding code): also
+  called unscoped `find_matching_index_names`; now uses
+  `find_matching_index_names_for_db`.
+- **The inline `DEL`/`UNLINK` unindex path** inside `ShardMessage::Execute`
+  (`spsc_handler.rs` ~line 747) called unscoped `mark_deleted_for_key`
+  directly (not through `auto_delete_vectors`) — fixed to
+  `mark_deleted_for_key_for_db(key, db_idx)`.
+- **Restart-time reconciliation** (`RecoveryState::reconcile_key` in
+  `src/vector/persistence/recover_v2.rs`, called from `event_loop.rs`'s
+  per-db rescan loop) had the SAME unscoped `find_matching_index_names`
+  call and delegated to the unscoped `auto_index_hset_public`. Left
+  unfixed, this would have silently RE-INTRODUCED the exact write-path leak
+  on every server restart even after the live-write fix above — closed by
+  threading `db_index: u8` through `reconcile_key`, sourced from
+  `event_loop.rs`'s existing `for db_idx in 0..db_count` loop (the caller
+  already had the right value; it just wasn't being passed in).
+- **Checked and cleared**: active expiry (`expire_cycle`/`expire_cycle_direct`
+  in `src/server/expiration.rs`, ticked per-db by `run_active_expiry` in
+  `src/shard/timers.rs`) and hash-field lazy/active expiry do not call any
+  vector/text unindex hook at all — `Database::remove` is a pure KV-layer
+  operation with no vector_store/text_store hook. There is therefore no
+  unscoped call to fix on the expiry path; this is a separate, pre-existing
+  "TTL'd keys never get unindexed at all" gap (vectors/text entries for an
+  expired key linger until an explicit DEL or HDEL), out of scope for a
+  db-isolation fix and not new in this pass.
+- New integration tests in `tests/vector_db_isolation.rs`:
+  `write_path_auto_index_does_not_leak_across_db` (FT.CREATE in db 0, HSET
+  of a prefix-matching key from db 5, assert db 0's `FT.INFO num_docs`
+  unchanged and FT.SEARCH does not return the foreign doc) and
+  `write_path_auto_delete_does_not_leak_across_db` (HSET in db 0, DEL of
+  the same key name from db 5, assert the db-0 document remains
+  searchable). Both verified RED against the unfixed hooks (real
+  cross-db corruption reproduced with the exact documented symptoms),
+  GREEN after the fix. Note: `FT.INFO num_docs` is `mutable_segment.len()`
+  (append-only; a tombstone doesn't decrement it), so the DEL-side test
+  asserts on `FT.SEARCH` hit count instead — an early draft of that
+  assertion only checked "not Nil", which a foreign-db tombstone's
+  empty-but-OK `[0]` result also satisfies, and silently passed against
+  the unfixed code; corrected to check for a real (`> 0`) hit count.
+
+### Fixed — WS5a round 3: multi-shard text-search db-isolation leak + hardening (adversarial review)
+
+A fix-first adversarial review of round 2 (below) found the headline
+"index created in db N is invisible from every other db" promise still
+had a **critical multi-shard gap**: `scatter_text_search` (the plain-text/
+BM25 FT.SEARCH scatter path), plus the remote legs of `scatter_hybrid_search`
+and `scatter_text_aggregate`, took no `db_index` at all — on `--shards >= 2`
+a connection on any db got real results from another db's TEXT index. Round
+2's own suite only spawned single-shard servers, so the bug was invisible
+to CI (single-shard scatter degenerates to the already-scoped local path).
+
+- **`scatter_text_search`** (`src/shard/coordinator.rs`) now threads
+  `db_index` through its `num_shards == 1` fast path AND its true
+  multi-shard DFS fan-out (both the local DocFreq/TextSearch legs and the
+  remote `DocFreq`/`TextSearch` SPSC legs), via new `db_index: u8` fields
+  on `TextSearchPayload`, `InvertedSearchPayload`, and a newly-boxed
+  `DocFreqPayload` (boxing was required to keep `ShardMessage` within its
+  64-byte cache-line cap after adding the field to the previously-inline
+  `DocFreq` variant). The dead `scatter_text_search_filter` was scoped the
+  same way rather than left as a latent unscoped copy.
+- **`scatter_hybrid_search`'s remote leg** and **`scatter_text_aggregate`'s
+  remote leg** — previously documented below as an open residual gap — are
+  now also `db_index`-scoped (`FtHybridPayload`/`TextAggregatePayload` gain
+  the field; `execute_hybrid_search_local_raw_streams` and
+  `execute_local_partial` take it as a parameter). **The "known gap" note
+  in the round-2 entry below is superseded: both legs are closed.**
+- **`VACUUM VECTOR`** (`src/command/server_admin.rs::vacuum_vector`) was an
+  unscoped existence oracle — any db could merge/compact/probe another
+  db's vector index by name. Now takes `db_index` and resolves ownership
+  via `get_index_for_db`/`get_index_mut_for_db` before any mutation or
+  existence check; the subsequent unscoped `needs_merge`/
+  `immutable_segment_count`/`force_merge_index` calls are safe unchanged
+  (index names are globally unique per shard, so an ownership check by
+  name is sufficient once performed).
+- **`--databases` is now bounded to 256** (`ServerConfig::MAX_DATABASES`,
+  `validate_databases_bound()`, checked unconditionally at both normal
+  boot and `--check-config`). Vector/text index db-scoping uses a `u8`
+  tag; an unbounded `--databases` (e.g. 300) silently aliased `SELECT 256`
+  onto db 0's indexes. Deliberately NOT widened to `u16` — 256 dbs is
+  already far beyond Redis's default of 16.
+- **New multi-shard coverage** in `tests/vector_db_isolation.rs`
+  (`--shards 4`): plain-text FT.SEARCH cross-db invisibility (the exact
+  finding-1 scenario), KNN cross-db invisibility, and FT._LIST scoping,
+  all under real multi-shard fan-out. Verified RED (real cross-db hits
+  leaked) against the unfixed `scatter_text_search`, GREEN after the fix.
+- Stale comments in `handler_monoio/ft.rs` / `handler_sharded/ft.rs` /
+  `coordinator.rs`'s test module claiming `execute_text_search_local` is
+  the multi-shard path were corrected — that function is dead code outside
+  its own unit tests; the real multi-shard path is `scatter_text_search`
+  → `run_text_query_on_index`.
+
+### Fixed — WS5a: db-scoped vector/text index isolation (headline bug closed)
+
+Round 1 shipped only the data model (see below) — FT.CREATE still tagged
+every index `db_index: 0`, so no read-path scoping had any observable
+effect outside db 0. Round 2 closes the headline promise: **an index
+created in db N is invisible from every other db, across all three
+dispatch paths (`handler_single`, `handler_sharded`/tokio,
+`handler_monoio`), including the multi-shard scatter/broadcast legs.**
+
+- **`IndexMeta`/`TextIndex`** gain a `db_index: u8` tag (vector sidecar
+  format bumped to v4, text sidecar to v2; legacy sidecars default to db 0,
+  fully backward compatible).
+- **FT.CREATE now tags the connection's actual SELECTed db** instead of a
+  hardcoded 0. Naming decision: index **names stay globally unique per
+  shard** (not a composite `(db, name)` key) — each index is bound to
+  exactly one db; `FT.CREATE` of a name that already exists in ANY db
+  (including the same db) errors `"Index already exists"`, unchanged from
+  pre-WS5a behavior. This avoids migrating the `HashMap<Bytes, _>` key
+  type across ~150+ call sites for a benefit (same name reusable per db)
+  nobody asked for; an operator wanting per-db name reuse renames (e.g.
+  `idx_db0`, `idx_db1`).
+- **Full read-path scoping**: FT.SEARCH, FT.INFO, FT._LIST, FT.DROPINDEX,
+  FT.COMPACT, FT.CONFIG (GET/SET), FT.AGGREGATE, FT.CACHESEARCH,
+  FT.RECOMMEND, FT.NAVIGATE, FT.INVALIDATE_RANGE, and hybrid search all
+  resolve indexes scoped to the caller's current db across every dispatch
+  path — ~45 call sites migrated from `get_index`/`get_index_mut` to
+  `get_index_for_db`/`get_index_mut_for_db` (or the equivalent scoped
+  helper), no new hot-path allocations (same `O(n)` filter shape as the
+  unscoped originals).
+- **Write-path scoping (claim corrected by round 4 below): this entry
+  originally claimed `auto_index_hset` and the DEL/HDEL auto-unindex hooks
+  only touched indexes bound to the write's db via
+  `mark_deleted_for_key_for_db`. That claim was FALSE — the round-4
+  adversarial review found `auto_index_hset`, `auto_delete_vectors`, and
+  `auto_hdel_vectors` all called their UNSCOPED counterparts
+  (`find_matching_index_names`/`mark_deleted_for_key`), and
+  `mark_deleted_for_key_for_db` had zero production callers at the time
+  this was written. See the "WS5a round 4" entry above for the actual fix.**
+- **Cross-shard scatter/broadcast fully threaded**: `ShardMessage::VectorCommand`
+  and `VectorSearchPayload` now carry `db_index` across the SPSC boundary;
+  `broadcast_vector_command`, `scatter_ft_info`, `scatter_invalidate_range`,
+  `scatter_vector_search`/`_remote` all honor it. `scatter_hybrid_search`
+  and `scatter_text_aggregate`'s multi-shard DFS legs honor it on the
+  `num_shards == 1` fast path; the true multi-shard remote leg of hybrid
+  search and FT.AGGREGATE's `execute_local_partial`, **and the
+  plain-text/BM25 `scatter_text_search` scatter path itself, were left
+  fully unscoped** — a critical gap an adversarial review caught (single-
+  shard-only test coverage hid it). **Closed in the WS5a round 3 entry
+  above** — do not treat this note as still-open.
+- **Bonus fix found in the same code path**: `scatter_text_aggregate`'s
+  single-shard fast path always hardcoded `s.databases.first()` (db 0)
+  for `@field` value materialization regardless of the caller's SELECTed
+  db — fixed alongside the db_index threading (was a pre-existing bug,
+  not a WS5a regression).
+- **Known gaps, explicitly NOT implemented this pass** (see
+  `.planning/v0.6.0-release/WS5A-NOTES.md` for the full design rationale):
+  - **SWAPDB** does not retag index ownership. `SWAPDB a b` swaps the KV
+    keyspace but leaves every index's `db_index` tag untouched — an index
+    created in db `a` stays visible only from db `a` even after its data
+    moves to db `b`. Target design (swap `db_index` on every index owned
+    by either swapped db) is documented but not coded.
+  - **MOVE/COPY** of an indexed hash does not re-index the key into the
+    target db's matching index — operator must re-HSET in the target db.
+  - **Graph engine** (`src/graph/store.rs`) is a single per-shard
+    `GraphStore`, structurally global across all 16 logical dbs — same
+    shape vector/text stores had before this fix, but NOT scoped in this
+    pass (see "Known Limitations" below). Timeboxed analysis confirmed no
+    per-db concept exists anywhere in the graph engine (no `db_index`, no
+    per-db FLUSHDB differentiation); scoping it would require the same
+    class of work done here for vector/text, sized as its own follow-up.
+- Legacy (pre-v0.6.0) persisted sidecars continue to load with
+  `db_index` defaulting to 0 (unit-tested, unchanged from round 1).
+- New integration suite `tests/vector_db_isolation.rs` (real spawned
+  server, real TCP client): cross-db invisibility both directions,
+  FT._LIST db scoping, FT.CREATE cross-db name-collision error, and a
+  true process-restart round-trip proving a db-1-scoped index reloads
+  still bound to db 1.
+
+### Fixed — WS5a: FLUSHDB no longer clears vector/text index contents across dbs (foundation)
+
+- **`IndexMeta`/`TextIndex`** gain a `db_index: u8` tag (vector sidecar
+  format bumped to v4, text sidecar to v2; legacy sidecars default to db 0,
+  fully backward compatible).
+- **FLUSHDB now scopes** to the connection's selected db —
+  `VectorStore::clear_all_contents_for_db` /
+  `TextStore::clear_all_contents_for_db`, wired through all 3 dispatch
+  paths (`handler_single`, `handler_sharded`, `handler_monoio`) plus the
+  cross-shard MULTI/EXEC replay path. FLUSHALL is unchanged (still clears
+  every db). Previously FLUSHDB in ANY db cleared ALL index contents
+  keyspace-wide — direct fix, covered by a new integration test
+  (`tests/vector_flush_hdel_tombstone.rs`).
+- Db-scoped lookup/listing/delete primitives (`get_index_for_db`,
+  `index_names_for_db`, `find_matching_index_names_for_db`,
+  `mark_deleted_for_key_for_db`, `drop_index_for_db`) added alongside the
+  existing unscoped methods on both `VectorStore` and `TextStore`, unit
+  tested.
 
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 

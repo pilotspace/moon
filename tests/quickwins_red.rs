@@ -47,6 +47,7 @@ mod qw7 {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 
