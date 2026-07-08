@@ -356,6 +356,50 @@ reduction. Round 2 fixes the actual memory problem:
   `src/vector/persistence/warm_search.rs` unit tests cover the sidecar
   round-trip and the corrected MVCC entry parsing.
 
+### Fixed — WS6: self-inflicted write lockout on an over-quota key (HIGH, adversarial review 2026-07-08)
+
+- **HIGH, release-blocking**: making container growth visible to
+  `used_memory` (see the accounting-gap fix below) made a second,
+  previously-unreachable bug reachable: `run_write_eviction_gate`
+  (`src/server/conn/handler_monoio/mod.rs`) and
+  `check_db_maxmemory_for_command` (`src/storage/db_quota.rs`) applied
+  the `noeviction` reject to **every** write command uniformly — so once
+  a key's growth tripped the global `--maxmemory` gate or a db's
+  `--db-maxmemory` quota, a pure-shrink command on that SAME key —
+  `HDEL`, `SREM`, `LPOP`, `ZREM`, ... — was *also* rejected. A tenant
+  that grew a key past the boundary had **no self-recovery path** short
+  of `FLUSHALL`/restart, undermining the WS5b per-db-quota guarantee
+  this same release ships.
+- Fixed with a static, provably shrink-only command classification,
+  `db_quota::is_shrink_only_command` (`src/storage/db_quota.rs`),
+  mirroring Redis's `CMD_DENYOOM` semantics: `DEL`/`UNLINK`,
+  `HDEL`/`HGETDEL`, `SREM`/`SPOP`, `LPOP`/`RPOP`/`LREM`/`LTRIM`/`LMPOP`/
+  `BLMPOP`, `ZREM`/`ZPOPMIN`/`ZPOPMAX`/`ZMPOP`/`BZPOPMIN`/`BZPOPMAX`/
+  `BZMPOP`/`ZREMRANGEBYSCORE`/`ZREMRANGEBYRANK`/`ZREMRANGEBYLEX`,
+  `GETDEL`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`PERSIST`,
+  `FLUSHDB`/`FLUSHALL` now bypass the *reject* from both the global
+  maxmemory gate and the per-db quota gate — eviction is still attempted
+  first (an evicting policy may as well reclaim while the write lock is
+  already held); only the reject is skipped. Deliberately conservative
+  — commands that can grow a destination key (`LMOVE`/`SMOVE`/`COPY`/
+  `RESTORE`/any `*STORE` variant) or aren't statically classifiable
+  (`SET`, even with a shorter value) are excluded ("when in doubt,
+  exclude").
+- Applied at all three connection-handler write-path chokepoints:
+  `handler_monoio::run_write_eviction_gate`, the inline eviction block in
+  `handler_sharded`'s sharded write path, and both inline blocks in
+  `handler_single` (the pipelined-dispatch loop and the single-command
+  write path).
+- RED/GREEN: `test_hdel_self_recovery_past_maxmemory_boundary` and
+  `test_hdel_self_recovery_past_db_maxmemory_boundary`
+  (`tests/container_growth_memory_accounting.rs`) — confirmed RED against
+  the pre-fix handler/db_quota code (`git stash`): both failed with the
+  exact OOM-on-HDEL symptom described above. Each test now: grows a hash
+  past its cap (asserting the growing HSET IS rejected with the correct
+  OOM flavor), asserts `HDEL` on that same over-cap key succeeds, drains
+  the rest, then asserts a follow-up `HSET` succeeds once back under
+  budget.
+
 ### Fixed — WS6: container-growth memory accounting gap (HSET/LPUSH/SADD/ZADD... growth was invisible to `--maxmemory`)
 
 - **Critical**: `used_memory` was charged once at key-creation time for an
@@ -407,15 +451,10 @@ reduction. Round 2 fixes the actual memory problem:
   bytes back). Unit tests per container family (hash/list/set/zset
   `mod.rs`) assert `estimated_memory()` rises/falls with insert/remove/
   overwrite, including a same-length overwrite netting a zero delta.
-- **Known follow-up, NOT fixed here**: `run_write_eviction_gate`
-  (`src/server/conn/handler_monoio/mod.rs`) gates every write command
-  uniformly, including pure-shrink ones (`HDEL`/`SREM`/`LREM`/`ZREM`/...).
-  Moon has no Redis-`CMD_DENYOOM`-equivalent classification exempting
-  memory-freeing commands, so once a key's (now correctly visible) growth
-  trips `noeviction` `--maxmemory`, an `HDEL` on that SAME key is also
-  rejected — unreachable before this fix (growth-triggered single-key OOM
-  essentially never happened), now newly observable. See
-  `docs/guides/isolation.md` for detail; recommend a dedicated follow-up.
+- Making this growth visible surfaced a second, previously-unreachable
+  bug — a self-inflicted write lockout where even shrink commands like
+  `HDEL` were rejected on an over-quota key. Now fixed; see the dedicated
+  entry above.
 
 ### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
 

@@ -109,6 +109,85 @@ fn command_exempt_from_db_quota(cmd: &[u8]) -> bool {
     cmd.eq_ignore_ascii_case(b"SELECT") || cmd.eq_ignore_ascii_case(b"SWAPDB")
 }
 
+/// Commands that are structurally incapable of GROWING the memory footprint
+/// of the key(s) they touch — they only remove data, shrink a container, or
+/// hasten reclamation. Mirrors real Redis's `CMD_DENYOOM` semantics: neither
+/// the global `--maxmemory` `noeviction` gate nor the per-db `--db-maxmemory`
+/// quota gate may reject these, or a key/db that crosses its `noeviction`
+/// boundary has no self-recovery path — a tenant wedges permanently, unable
+/// to even `HDEL` its way back under budget (WS6 adversarial-review finding,
+/// HIGH, 2026-07-08; the finding was previously unreachable because container
+/// growth itself was invisible to `used_memory` before that same WS6 fix, so
+/// this is newly OBSERVABLE, not newly introduced).
+///
+/// This is a deliberately conservative, provably-shrink-only allowlist —
+/// "when in doubt, exclude":
+///
+/// - `DEL` / `UNLINK`: whole-key removal.
+/// - `HDEL` / `HGETDEL`: hash field removal.
+/// - `SREM` / `SPOP`: set member removal.
+/// - `LPOP` / `RPOP` / `LREM` / `LTRIM` / `LMPOP` / `BLMPOP`: list shrink —
+///   a blocking pop only ever removes on the success path that reaches this
+///   gate at all.
+/// - `ZREM` / `ZPOPMIN` / `ZPOPMAX` / `ZMPOP` / `BZPOPMIN` / `BZPOPMAX` /
+///   `BZMPOP` / `ZREMRANGEBYSCORE` / `ZREMRANGEBYRANK` / `ZREMRANGEBYLEX`:
+///   sorted-set shrink.
+/// - `GETDEL`: string delete-on-read.
+/// - `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` / `PERSIST`: can only
+///   hasten or cancel reclamation of an already-live key; a TTL sidecar's
+///   fixed-size cost is already charged, a shorter (or removed) TTL never
+///   adds bytes.
+/// - `FLUSHDB` / `FLUSHALL`: keyspace wipe.
+///
+/// Deliberately EXCLUDED (can grow a destination key, or is not statically
+/// classifiable as shrink-only):
+///
+/// - `LMOVE` / `SMOVE` / `COPY` / `RESTORE` / any `*STORE` variant
+///   (`ZUNIONSTORE`, `ZINTERSTORE`, `ZRANGESTORE`, `SINTERSTORE`,
+///   `SUNIONSTORE`, `SDIFFSTORE`, `GEORADIUS...STORE`, ...): these write a
+///   (possibly new, possibly larger) destination key.
+/// - `SET`, even with a value shorter than the key's current one: not
+///   statically classifiable (KEEPTTL/EX/PX interactions, and the general
+///   overwrite path is the primary growth vector this whole gate exists to
+///   catch in the first place).
+#[inline]
+#[must_use]
+pub fn is_shrink_only_command(cmd: &[u8]) -> bool {
+    const SHRINK_ONLY: &[&[u8]] = &[
+        b"DEL",
+        b"UNLINK",
+        b"HDEL",
+        b"HGETDEL",
+        b"SREM",
+        b"SPOP",
+        b"LPOP",
+        b"RPOP",
+        b"LREM",
+        b"LTRIM",
+        b"LMPOP",
+        b"BLMPOP",
+        b"ZREM",
+        b"ZPOPMIN",
+        b"ZPOPMAX",
+        b"ZMPOP",
+        b"BZPOPMIN",
+        b"BZPOPMAX",
+        b"BZMPOP",
+        b"ZREMRANGEBYSCORE",
+        b"ZREMRANGEBYRANK",
+        b"ZREMRANGEBYLEX",
+        b"GETDEL",
+        b"EXPIRE",
+        b"PEXPIRE",
+        b"EXPIREAT",
+        b"PEXPIREAT",
+        b"PERSIST",
+        b"FLUSHDB",
+        b"FLUSHALL",
+    ];
+    SHRINK_ONLY.iter().any(|c| cmd.eq_ignore_ascii_case(c))
+}
+
 /// Like [`check_db_maxmemory`] but skips enforcement for commands exempted
 /// by [`command_exempt_from_db_quota`] (`SELECT`, `SWAPDB`). Use this at any
 /// write-path chokepoint that gates on `metadata::is_write` and therefore

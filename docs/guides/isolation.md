@@ -185,24 +185,39 @@ if a guarantee isn't listed here, don't assume it holds.
   tests in each container command family's `mod.rs`. The eviction loop's
   before/after `estimated_memory()` delta arithmetic needed no changes —
   it was already reading the (now-correct) live accumulator.
-  - **Known follow-up, NOT fixed here**: `run_write_eviction_gate`
-    (`src/server/conn/handler_monoio/mod.rs`) applies the same
-    over-budget pre-check to every write command uniformly, including
-    pure-shrink ones (`HDEL`/`SREM`/`LREM`/`ZREM`/...). Unlike Redis's
-    `CMD_DENYOOM` classification — which explicitly exempts
-    memory-freeing commands so an operator can recover from an OOM state
-    without `FLUSHALL`/restart — moon has no such classification today.
-    Once a key's growth (now correctly visible) trips `noeviction`
-    `--maxmemory`, an `HDEL` on that SAME key is *also* rejected, even
-    though it would only shrink it. This was unreachable before WS6 (the
-    accounting bug meant growth-triggered OOM on a single key essentially
-    never happened), so the container-growth fix makes this pre-existing
-    gate-classification gap newly observable. Reproduced manually
-    (grow a hash to the `noeviction` boundary, then `HDEL` a field on it —
-    also rejected) and worked around in the credit-on-delete test by
-    staying under budget throughout rather than draining from an
-    already-OOM'd key. Recommend a `CommandFlags::DENYOOM`-equivalent
-    (or an explicit allow-list) as separate follow-up work.
+  - **Self-inflicted write lockout (WS6, fixed — adversarial review
+    2026-07-08, HIGH)**: making container growth visible to `used_memory`
+    (above) made a second, previously-unreachable bug reachable:
+    `run_write_eviction_gate` / `check_db_maxmemory_for_command` applied
+    the noeviction reject to *every* write command uniformly, so once a
+    key's growth tripped `--maxmemory` or a db's `--db-maxmemory` quota,
+    a pure-shrink command on that SAME key or db — `HDEL`, `SREM`,
+    `LPOP`, `ZREM`, ... — was *also* rejected. A tenant that grew a key
+    past the boundary had no self-recovery path short of `FLUSHALL` or a
+    restart, undermining the WS5b per-db-quota guarantee. Fixed with a
+    static, provably shrink-only command classification
+    (`db_quota::is_shrink_only_command` in `src/storage/db_quota.rs`),
+    mirroring Redis's `CMD_DENYOOM` semantics:
+    `DEL`/`UNLINK`, `HDEL`/`HGETDEL`, `SREM`/`SPOP`, `LPOP`/`RPOP`/`LREM`/
+    `LTRIM`/`LMPOP`/`BLMPOP`, `ZREM`/`ZPOPMIN`/`ZPOPMAX`/`ZMPOP`/
+    `BZPOPMIN`/`BZPOPMAX`/`BZMPOP`/`ZREMRANGEBYSCORE`/`ZREMRANGEBYRANK`/
+    `ZREMRANGEBYLEX`, `GETDEL`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/
+    `PEXPIREAT`/`PERSIST`, `FLUSHDB`/`FLUSHALL` bypass the *reject* from
+    both the global maxmemory gate and the per-db quota gate (eviction is
+    still attempted first — an evicting policy may as well reclaim while
+    the write lock is held; only the reject is skipped). Deliberately
+    conservative allow-list — commands that can grow a destination key
+    (`LMOVE`/`SMOVE`/`COPY`/`RESTORE`/any `*STORE` variant) or aren't
+    statically classifiable (`SET`, even with a shorter value) are
+    excluded. Applied at all three connection-handler call sites
+    (`handler_monoio::run_write_eviction_gate`, the inline block in
+    `handler_sharded`, and both inline blocks in `handler_single`).
+    Covered by `test_hdel_self_recovery_past_maxmemory_boundary` and
+    `test_hdel_self_recovery_past_db_maxmemory_boundary` in
+    `tests/container_growth_memory_accounting.rs` — each grows a key past
+    its cap (asserting the growing write IS rejected), then asserts an
+    `HDEL` on that same over-cap key succeeds, then asserts a follow-up
+    write succeeds once back under budget.
 
 ## FT.* / vector indexes and workspaces (handoff note — WS5a scope)
 

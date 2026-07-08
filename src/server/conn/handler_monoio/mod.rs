@@ -98,13 +98,24 @@ fn run_write_eviction_gate(
     } else {
         try_evict_if_needed_budget(db, &rt, budget)
     };
-    global_result?;
+    // WS6 fix (HIGH, adversarial review 2026-07-08): a command that can only
+    // shrink memory (HDEL, SREM, LPOP, ...) must never be REJECTED by either
+    // gate below, or a key/db that crosses its noeviction boundary has no
+    // self-recovery path. Eviction is still attempted above — an evicting
+    // policy may as well reclaim while the write lock is already held; only
+    // the reject is bypassed. See `db_quota::is_shrink_only_command`.
+    let shrink_only = crate::storage::db_quota::is_shrink_only_command(cmd);
+    if !shrink_only {
+        global_result?;
+    }
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
     // maxmemory gate above. Zero-cost when unconfigured for this db.
     // `_for_command` exempts SELECT/SWAPDB — see `db_quota::command_exempt_from_db_quota`
     // (this chokepoint runs on `metadata::is_write`-flagged commands, which
     // includes SELECT despite it not writing to the current db).
-    crate::storage::db_quota::check_db_maxmemory_for_command(db, sel_db, &rt, cmd)
+    let db_quota_result =
+        crate::storage::db_quota::check_db_maxmemory_for_command(db, sel_db, &rt, cmd);
+    if shrink_only { Ok(()) } else { db_quota_result }
 }
 
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).

@@ -111,6 +111,45 @@ fn spawn_moon_maxmemory(port: u16, dir: &std::path::Path, maxmemory_bytes: u64) 
     ServerGuard(child)
 }
 
+/// Spawn moon with the GLOBAL `--maxmemory` gate disabled (0 = unlimited) and
+/// a single per-db `--db-maxmemory <db>:<bytes>` quota instead, `noeviction`
+/// policy, AOF/disk-offload disabled. Isolates the db-quota gate
+/// (`db_quota::check_db_maxmemory_for_command`) from the global gate
+/// (`eviction::try_evict_if_needed_budget`) so the shrink-only bypass is
+/// exercised on each independently.
+fn spawn_moon_db_maxmemory(
+    port: u16,
+    dir: &std::path::Path,
+    db_maxmemory_bytes: u64,
+) -> ServerGuard {
+    let child = Command::new(find_moon_binary())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            "1",
+            "--appendonly",
+            "no",
+            "--maxmemory",
+            "0",
+            "--maxmemory-policy",
+            "noeviction",
+            "--disk-offload",
+            "disable",
+            "--db-maxmemory",
+            &format!("0:{db_maxmemory_bytes}"),
+            "--disk-free-min-pct",
+            "0",
+        ])
+        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .spawn()
+        .expect("spawn moon");
+    ServerGuard(child)
+}
+
 // ---------------------------------------------------------------------------
 // Minimal RESP client (binary-safe args, full-frame parser) — same shape as
 // tests/db_maxmemory_quota.rs's Client, duplicated rather than shared:
@@ -323,17 +362,10 @@ fn test_lpush_growth_on_single_key_hits_maxmemory() {
 // ---------------------------------------------------------------------------
 // Case C: deleting fields back down must credit the freed memory. Stays
 // UNDER budget throughout (HDEL always succeeds well before OOM) so this
-// isolates credit-on-delete correctness from a separate, pre-existing gap:
-// `run_write_eviction_gate` (src/server/conn/handler_monoio/mod.rs) applies
-// the same pre-check to EVERY write command, including pure-shrink ones
-// (HDEL/SREM/LREM/ZREM/...) -- unlike Redis's `CMD_DENYOOM` classification,
-// which explicitly exempts memory-freeing commands so an operator can
-// recover from an OOM state without FLUSHALL/restart. Once a key trips the
-// gate, HDEL on THAT key is rejected too, even though it would only shrink
-// it. This is orthogonal to the accounting fix (confirmed by reproducing it
-// against a manually-driven server: growing a hash to the OOM boundary, the
-// literal next HDEL of an already-written field is *also* rejected) and is
-// flagged as follow-up work in the WS6 summary rather than fixed here.
+// isolates credit-on-delete correctness from the shrink-only gate bypass
+// exercised end-to-end (grow past the cap, THEN delete) by
+// `test_hdel_self_recovery_past_maxmemory_boundary` and
+// `test_hdel_self_recovery_past_db_maxmemory_boundary` below.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -383,5 +415,163 @@ fn test_hdel_credits_memory_after_growth() {
         "a ~100 KB write after fully draining a ~100 KB hash must succeed under a \
          256 KB budget -- got {r:?} (credit-on-delete broken: HDEL isn't freeing \
          the deleted fields' bytes)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case D: self-recovery PAST the noeviction boundary. Adversarial review
+// (2026-07-08) found that once WS6's accounting fix makes container growth
+// visible to the write-eviction gate, a NEW self-inflicted lockout becomes
+// reachable: `run_write_eviction_gate` / `check_db_maxmemory_for_command`
+// applied the noeviction reject to EVERY write command uniformly, so once a
+// key crossed its cap, even a pure-shrink command like HDEL on that SAME key
+// was also rejected -- a tenant wedges permanently with no self-recovery path
+// short of FLUSHALL/restart. Fixed via a static shrink-only classification
+// (`db_quota::is_shrink_only_command`) applied at all three connection
+// handler call sites (handler_monoio, handler_sharded, handler_single x2).
+//
+// Both flavors of the gate (global `--maxmemory` and per-db
+// `--db-maxmemory`) are covered here, sharing the identical shape:
+//   1. grow a hash PAST the cap -> HSET must be rejected with OOM.
+//   2. HDEL a field on that SAME (over-cap) key -> must SUCCEED (this is the
+//      exact scenario the pre-fix code rejected).
+//   3. HSET again, now under budget -> must succeed (proves the freed bytes
+//      were both credited AND usable, not just "not rejected").
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_hdel_self_recovery_past_maxmemory_boundary() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    // Small budget so ~10 x 1 KB fields comfortably crosses it.
+    let _guard = spawn_moon_maxmemory(port, dir.path(), 4 * 1024);
+    let mut c = wait_ready(port);
+
+    let value = vec![b'v'; 1024];
+    let mut fields_written: Vec<String> = Vec::new();
+    let mut saw_oom = false;
+    for i in 0..40 {
+        let field = format!("field{i}");
+        let r = c.cmd(&[b"HSET", b"wedgeme", field.as_bytes(), &value]);
+        if r.is_oom_error() {
+            saw_oom = true;
+            break;
+        }
+        assert_eq!(
+            r,
+            V::Integer(1),
+            "HSET of a brand-new field must return 1 (or OOM), got {r:?} at i={i}"
+        );
+        fields_written.push(field);
+    }
+    assert!(
+        saw_oom,
+        "setup: expected an HSET to be rejected with OOM once `wedgeme` crosses \
+         the 4 KB --maxmemory cap -- growth accounting must be broken if this fails"
+    );
+    assert!(
+        !fields_written.is_empty(),
+        "setup: at least one field must have been written before the cap hit"
+    );
+
+    // THE FIX UNDER TEST: HDEL on the same over-cap key must SUCCEED, not be
+    // rejected by the noeviction gate alongside the growth-causing HSETs.
+    let victim = &fields_written[0];
+    let r = c.cmd(&[b"HDEL", b"wedgeme", victim.as_bytes()]);
+    assert_eq!(
+        r,
+        V::Integer(1),
+        "HDEL on an over---maxmemory-cap key must SUCCEED (shrink-only commands \
+         must bypass the noeviction reject) -- got {r:?}. A tenant that grows a \
+         key past the cap must retain a self-recovery path via HDEL/SREM/LPOP/etc."
+    );
+
+    // Drain the rest so the key is comfortably back under budget, then prove
+    // a subsequent HSET succeeds again (the freed bytes are both credited and
+    // usable, not merely "the reject was skipped once").
+    for field in &fields_written[1..] {
+        let r = c.cmd(&[b"HDEL", b"wedgeme", field.as_bytes()]);
+        assert_eq!(
+            r,
+            V::Integer(1),
+            "follow-up HDEL of field {field} must also succeed, got {r:?}"
+        );
+    }
+    let r = c.cmd(&[b"HSET", b"wedgeme", b"recovered-field", &value]);
+    assert_eq!(
+        r,
+        V::Integer(1),
+        "HSET must succeed again once the key is back under budget after \
+         draining -- got {r:?} (freed memory must be usable again, not just \
+         the reject bypassed)"
+    );
+}
+
+#[test]
+fn test_hdel_self_recovery_past_db_maxmemory_boundary() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    // Global --maxmemory is 0 (unlimited); only db 0's quota is small.
+    let _guard = spawn_moon_db_maxmemory(port, dir.path(), 4 * 1024);
+    let mut c = wait_ready(port);
+
+    let value = vec![b'v'; 1024];
+    let mut fields_written: Vec<String> = Vec::new();
+    let mut saw_oom = false;
+    for i in 0..40 {
+        let field = format!("field{i}");
+        let r = c.cmd(&[b"HSET", b"wedgeme", field.as_bytes(), &value]);
+        if let V::Err(msg) = &r {
+            assert!(
+                msg.to_uppercase().contains("MOONERR")
+                    && msg.to_lowercase().contains("db maxmemory"),
+                "expected a db-maxmemory-flavored rejection, got {r:?}"
+            );
+            saw_oom = true;
+            break;
+        }
+        assert_eq!(
+            r,
+            V::Integer(1),
+            "HSET of a brand-new field must return 1 (or db-quota reject), got {r:?} at i={i}"
+        );
+        fields_written.push(field);
+    }
+    assert!(
+        saw_oom,
+        "setup: expected an HSET to be rejected once `wedgeme` crosses the \
+         4 KB --db-maxmemory quota for db 0 -- got no rejection within 40 HSETs"
+    );
+    assert!(
+        !fields_written.is_empty(),
+        "setup: at least one field must have been written before the quota hit"
+    );
+
+    // THE FIX UNDER TEST: HDEL on the same over-quota key must SUCCEED under
+    // the PER-DB gate too, not just the global --maxmemory gate covered by
+    // `test_hdel_self_recovery_past_maxmemory_boundary` above.
+    let victim = &fields_written[0];
+    let r = c.cmd(&[b"HDEL", b"wedgeme", victim.as_bytes()]);
+    assert_eq!(
+        r,
+        V::Integer(1),
+        "HDEL on an over-db-maxmemory-quota key must SUCCEED (shrink-only \
+         commands must bypass the db-quota reject too) -- got {r:?}"
+    );
+
+    for field in &fields_written[1..] {
+        let r = c.cmd(&[b"HDEL", b"wedgeme", field.as_bytes()]);
+        assert_eq!(
+            r,
+            V::Integer(1),
+            "follow-up HDEL of field {field} must also succeed, got {r:?}"
+        );
+    }
+    let r = c.cmd(&[b"HSET", b"wedgeme", b"recovered-field", &value]);
+    assert_eq!(
+        r,
+        V::Integer(1),
+        "HSET must succeed again once db 0 is back under its quota after \
+         draining -- got {r:?}"
     );
 }

@@ -922,17 +922,39 @@ pub async fn handle_connection(
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     if is_write {
                                         let rt = runtime_config.read();
-                                        if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                            responses[resp_idx] = oom_frame;
-                                            continue;
+                                        // WS6 fix (HIGH, adversarial review
+                                        // 2026-07-08): a command that can only
+                                        // shrink memory (HDEL, SREM, LPOP, ...)
+                                        // must never be REJECTED by either gate
+                                        // below, or a key/db that crosses its
+                                        // noeviction boundary has no
+                                        // self-recovery path. Eviction is still
+                                        // attempted; only the reject is
+                                        // bypassed. See
+                                        // `db_quota::is_shrink_only_command`.
+                                        let shrink_only =
+                                            crate::storage::db_quota::is_shrink_only_command(
+                                                d_cmd,
+                                            );
+                                        let evict_result =
+                                            try_evict_if_needed(&mut *guard, &rt);
+                                        if !shrink_only {
+                                            if let Err(oom_frame) = evict_result {
+                                                responses[resp_idx] = oom_frame;
+                                                continue;
+                                            }
                                         }
                                         // WS5b: per-db quota, additive to the
                                         // whole-instance gate above. `_for_command`
                                         // exempts SELECT/SWAPDB — see
                                         // `db_quota::command_exempt_from_db_quota`.
-                                        if let Err(oom_frame) = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, conn.selected_db, &rt, d_cmd) {
-                                            responses[resp_idx] = oom_frame;
-                                            continue;
+                                        let db_quota_result =
+                                            crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, conn.selected_db, &rt, d_cmd);
+                                        if !shrink_only {
+                                            if let Err(oom_frame) = db_quota_result {
+                                                responses[resp_idx] = oom_frame;
+                                                continue;
+                                            }
                                         }
                                     }
                                     let dispatch_start = std::time::Instant::now();
@@ -2087,16 +2109,31 @@ pub async fn handle_connection(
                                 #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
                                 let rt = runtime_config.read();
-                                if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                    responses[resp_idx] = oom_frame;
-                                    continue;
+                                // WS6 fix (HIGH, adversarial review 2026-07-08): a
+                                // command that can only shrink memory (HDEL, SREM,
+                                // LPOP, ...) must never be REJECTED by either gate
+                                // below, or a key/db that crosses its noeviction
+                                // boundary has no self-recovery path. Eviction is
+                                // still attempted; only the reject is bypassed.
+                                // See `db_quota::is_shrink_only_command`.
+                                let shrink_only =
+                                    crate::storage::db_quota::is_shrink_only_command(d_cmd);
+                                let evict_result = try_evict_if_needed(&mut *guard, &rt);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = evict_result {
+                                        responses[resp_idx] = oom_frame;
+                                        continue;
+                                    }
                                 }
                                 // WS5b: per-db quota, additive to the whole-instance
                                 // gate above. `_for_command` exempts SELECT/SWAPDB so
                                 // a quota'd db doesn't trap the connection.
-                                if let Err(oom_frame) = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, current_db, &rt, d_cmd) {
-                                    responses[resp_idx] = oom_frame;
-                                    continue;
+                                let db_quota_result = crate::storage::db_quota::check_db_maxmemory_for_command(&mut *guard, current_db, &rt, d_cmd);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = db_quota_result {
+                                        responses[resp_idx] = oom_frame;
+                                        continue;
+                                    }
                                 }
                                 drop(rt);
 

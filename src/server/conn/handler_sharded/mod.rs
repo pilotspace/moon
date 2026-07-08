@@ -1424,9 +1424,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 } else {
                                     try_evict_if_needed_budget(db, &rt, budget)
                                 };
-                                if let Err(oom_frame) = evict_result {
-                                    drop(rt);
-                                    return Err(oom_frame);
+                                // WS6 fix (HIGH, adversarial review 2026-07-08): a
+                                // command that can only shrink memory (HDEL, SREM,
+                                // LPOP, ...) must never be REJECTED by either gate
+                                // below, or a key/db that crosses its noeviction
+                                // boundary has no self-recovery path. Eviction is
+                                // still attempted above; only the reject is
+                                // bypassed. See `db_quota::is_shrink_only_command`.
+                                let shrink_only =
+                                    crate::storage::db_quota::is_shrink_only_command(cmd);
+                                if !shrink_only {
+                                    if let Err(oom_frame) = evict_result {
+                                        drop(rt);
+                                        return Err(oom_frame);
+                                    }
                                 }
                                 // WS5b: per-db quota, additive and finer-grained
                                 // than the whole-instance maxmemory gate above.
@@ -1436,16 +1447,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // commands, which includes SELECT despite it not
                                 // writing to the current db — see
                                 // `db_quota::command_exempt_from_db_quota`).
-                                if let Err(oom_frame) =
+                                let db_quota_result =
                                     crate::storage::db_quota::check_db_maxmemory_for_command(
                                         db,
                                         conn.selected_db,
                                         &rt,
                                         cmd,
-                                    )
-                                {
-                                    drop(rt);
-                                    return Err(oom_frame);
+                                    );
+                                if !shrink_only {
+                                    if let Err(oom_frame) = db_quota_result {
+                                        drop(rt);
+                                        return Err(oom_frame);
+                                    }
                                 }
                                 drop(rt);
 
