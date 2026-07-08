@@ -210,6 +210,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
   `tests/db_maxmemory_quota.rs` real-server integration test.
 
+### Fixed — WS5a: db-scoped vector/text index isolation (headline bug closed)
+
+Round 1 shipped only the data model (see below) — FT.CREATE still tagged
+every index `db_index: 0`, so no read-path scoping had any observable
+effect outside db 0. Round 2 closes the headline promise: **an index
+created in db N is invisible from every other db, across all three
+dispatch paths (`handler_single`, `handler_sharded`/tokio,
+`handler_monoio`), including the multi-shard scatter/broadcast legs.**
+
+- **`IndexMeta`/`TextIndex`** gain a `db_index: u8` tag (vector sidecar
+  format bumped to v4, text sidecar to v2; legacy sidecars default to db 0,
+  fully backward compatible).
+- **FT.CREATE now tags the connection's actual SELECTed db** instead of a
+  hardcoded 0. Naming decision: index **names stay globally unique per
+  shard** (not a composite `(db, name)` key) — each index is bound to
+  exactly one db; `FT.CREATE` of a name that already exists in ANY db
+  (including the same db) errors `"Index already exists"`, unchanged from
+  pre-WS5a behavior. This avoids migrating the `HashMap<Bytes, _>` key
+  type across ~150+ call sites for a benefit (same name reusable per db)
+  nobody asked for; an operator wanting per-db name reuse renames (e.g.
+  `idx_db0`, `idx_db1`).
+- **Full read-path scoping**: FT.SEARCH, FT.INFO, FT._LIST, FT.DROPINDEX,
+  FT.COMPACT, FT.CONFIG (GET/SET), FT.AGGREGATE, FT.CACHESEARCH,
+  FT.RECOMMEND, FT.NAVIGATE, FT.INVALIDATE_RANGE, and hybrid search all
+  resolve indexes scoped to the caller's current db across every dispatch
+  path — ~45 call sites migrated from `get_index`/`get_index_mut` to
+  `get_index_for_db`/`get_index_mut_for_db` (or the equivalent scoped
+  helper), no new hot-path allocations (same `O(n)` filter shape as the
+  unscoped originals).
+- **Write-path scoping**: `auto_index_hset` (HSET auto-index hook) and the
+  DEL/HDEL/expiry auto-unindex hooks (`mark_deleted_for_key_for_db`) only
+  touch indexes bound to the write's db.
+- **Cross-shard scatter/broadcast fully threaded**: `ShardMessage::VectorCommand`
+  and `VectorSearchPayload` now carry `db_index` across the SPSC boundary;
+  `broadcast_vector_command`, `scatter_ft_info`, `scatter_invalidate_range`,
+  `scatter_vector_search`/`_remote` all honor it. `scatter_hybrid_search`
+  and `scatter_text_aggregate`'s multi-shard DFS legs honor it on the
+  `num_shards == 1` fast path; the true multi-shard remote leg of hybrid
+  search and FT.AGGREGATE's `execute_local_partial` remain unscoped —
+  documented residual gap (affects only >1-shard deployments using those
+  two specific commands with db ≠ 0).
+- **Bonus fix found in the same code path**: `scatter_text_aggregate`'s
+  single-shard fast path always hardcoded `s.databases.first()` (db 0)
+  for `@field` value materialization regardless of the caller's SELECTed
+  db — fixed alongside the db_index threading (was a pre-existing bug,
+  not a WS5a regression).
+- **Known gaps, explicitly NOT implemented this pass** (see
+  `.planning/v0.6.0-release/WS5A-NOTES.md` for the full design rationale):
+  - **SWAPDB** does not retag index ownership. `SWAPDB a b` swaps the KV
+    keyspace but leaves every index's `db_index` tag untouched — an index
+    created in db `a` stays visible only from db `a` even after its data
+    moves to db `b`. Target design (swap `db_index` on every index owned
+    by either swapped db) is documented but not coded.
+  - **MOVE/COPY** of an indexed hash does not re-index the key into the
+    target db's matching index — operator must re-HSET in the target db.
+  - **Graph engine** (`src/graph/store.rs`) is a single per-shard
+    `GraphStore`, structurally global across all 16 logical dbs — same
+    shape vector/text stores had before this fix, but NOT scoped in this
+    pass (see "Known Limitations" below). Timeboxed analysis confirmed no
+    per-db concept exists anywhere in the graph engine (no `db_index`, no
+    per-db FLUSHDB differentiation); scoping it would require the same
+    class of work done here for vector/text, sized as its own follow-up.
+- Legacy (pre-v0.6.0) persisted sidecars continue to load with
+  `db_index` defaulting to 0 (unit-tested, unchanged from round 1).
+- New integration suite `tests/vector_db_isolation.rs` (real spawned
+  server, real TCP client): cross-db invisibility both directions,
+  FT._LIST db scoping, FT.CREATE cross-db name-collision error, and a
+  true process-restart round-trip proving a db-1-scoped index reloads
+  still bound to db 1.
+
 ### Fixed — WS5a: FLUSHDB no longer clears vector/text index contents across dbs (foundation)
 
 - **`IndexMeta`/`TextIndex`** gain a `db_index: u8` tag (vector sidecar
@@ -228,11 +298,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mark_deleted_for_key_for_db`, `drop_index_for_db`) added alongside the
   existing unscoped methods on both `VectorStore` and `TextStore`, unit
   tested.
-- **Not yet complete**: FT.CREATE still tags every index db 0 (the
-  connection's selected db isn't threaded to it yet), and FT.SEARCH /
-  FT.INFO / FT._LIST / auto-index-on-HSET / auto-unindex-on-DEL remain
-  unscoped. Full call-site punch list in
-  `.planning/v0.6.0-release/WS5A-NOTES.md`. Graph engine not attempted.
 
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
