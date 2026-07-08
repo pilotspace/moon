@@ -19,7 +19,8 @@ recommendation here is backed by measurements on dedicated-vCPU GCE instances
 | Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores |
 | High-concurrency API backend (8+ conns) | `--shards 4` (+ busy-poll on dedicated cores) |
 | Pipelined / batch ingest | `--shards 4` or more; pipeline depth ≥ 16 |
-| Durable primary store | defaults (`--appendonly yes --appendfsync everysec`); `always` only if you accept the write-latency cost |
+| Durable primary store | defaults (`--appendonly yes --appendfsync everysec`, ~1.32× Redis at depth); `always` for RPO 0 — disk-fsync-bound, pipelines fine |
+| Pub/sub fan-out (many subscribers) | defaults; delivery coalesces automatically — no tuning |
 | Bulk load | `--initial-keyspace-hint <expected keys>` |
 | Container / CI / WSL | `--io-driver epoll --memory-arenas-cap 2` |
 | Vector search | see [Vector search guide](../vector-search-guide.md); match quantization to dimension |
@@ -69,20 +70,54 @@ The trade-offs are explicit:
 
 ## Persistence: what durability costs
 
-Measured on GCE with the default single shard:
+Moon's AOF write path is engineered so that durability is cheap at pipeline depth and
+device-bound (not server-bound) when you demand fsync-per-write. The mechanics below are
+**automatic — there are no knobs to turn** — but knowing them tells you which policy fits
+your workload. Measured on GCE `c3-standard-8` (pd-ssd), `--shards 2`, vs Redis 7.0.15;
+full matrix in [`BENCHMARK.md` §7.3](../../BENCHMARK.md).
 
-- **`everysec` (default): free.** Throughput is indistinguishable from `--appendonly no`
-  in steady state. There is no reason to turn AOF off for speed alone.
-- **`always`: −9% at depth 1** on unpipelined SET (still 1.27× Redis with busy-poll), but
-  under *pipelined* writes each batch waits for its fsync barrier and tail latencies grow
-  to the `--aof-fsync-timeout-ms` bound (2 s default) plus queue time. Use `always` only
-  for genuinely fsync-per-write requirements, and avoid deep pipelines on that path.
+- **`everysec` (default): a win, not just free.** At pipeline depth SET runs **~1.32×
+  Redis** (the writer coalesces each batch into one `write_all` and polls its queue
+  park-free, so it never bottlenecks on write syscalls or futex wakes); non-pipelined SET
+  is at **parity**. There is no reason to turn AOF off for speed. RPO ≤ 1 s.
+- **`always` (RPO = 0): now safe to pipeline.** Every write reaches disk before its `+OK`.
+  - *Non-pipelined* throughput is **bounded by your disk's fsync rate**, not by Moon: one
+    `fdatasync` per write. On network-attached cloud disks (pd-ssd) that is a few thousand
+    writes/sec; on local NVMe it is tens of thousands. Redis hits the same wall, so this is
+    **parity with any correct engine** — the disk sets the ceiling.
+  - *Pipelined* writes used to collapse (each command awaited its own fsync). Moon now
+    **group-commits**: a whole pipeline batch is made durable by one fsync barrier, so P16
+    SET recovered from 0.12× to **~0.91× Redis**. Deep pipelines on `always` are fine now —
+    the per-batch barrier amortizes the fsync. Under sustained overload a batch can still
+    wait up to `--aof-fsync-timeout-ms` (2 s default) for its barrier; raise it only if you
+    prefer a longer stall over an error under disk saturation.
 - **`--appendonly no`** for pure caches: saves the disk I/O entirely and removes recovery
   time. Pair with `--maxmemory` + `--maxmemory-policy allkeys-lru` (or `allkeys-lfu`).
 - **Multi-shard + AOF note:** at `--shards ≥ 2` Moon currently writes both the AOF and
   the per-shard WAL (~2.7× the disk *volume* of the data ingested; throughput is
   unaffected — the tax is disk bandwidth/wear). If you run multi-shard as a cache, turn
   `--appendonly no`; if you need durability, budget the disk accordingly.
+
+**Which policy?** Use `everysec` unless a compliance/financial requirement demands zero
+data loss on a host crash; then use `always` and size expectations to your disk's fsync
+rate (or provision faster storage). Both preserve their guarantee under SIGKILL —
+validated by the crash-recovery matrix (100% of acked writes recovered).
+
+## Pub/sub fan-out
+
+Moon's subscriber delivery path **coalesces automatically** — when a publish burst queues
+faster than a subscriber's socket drains, the whole burst is delivered in one `write_all`
+instead of one syscall per message. In practice this means a fast publisher fanning out to
+many subscribers is no longer syscall-bound: measured fan-out delivery reached **5.09M
+msg/s (≈1.04× Redis) with zero drops**, versus near-total message loss on a per-message
+write path (see [`BENCHMARK.md` §7.3](../../BENCHMARK.md)). There are no knobs to turn.
+
+The one thing to know: each subscriber has a bounded in-flight queue (256 messages). A
+subscriber that stays slower than the publish rate will still have messages **dropped** —
+this is the intentional slow-subscriber policy (a slow consumer must not stall the
+publisher or grow memory unbounded). If you see drops, the fix is on the consumer side
+(read faster, or fan out through more subscribers), not a server setting. Pub/sub messages
+are fire-and-forget and never persisted, regardless of `--appendonly`.
 
 ## Memory
 

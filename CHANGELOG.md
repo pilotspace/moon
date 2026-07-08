@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate); multi-shard verified (`--shards 4`: per-shard triggers, 9
   segments, FT.COMPACT 1.57s).
 
+### Docs — tuning guide: durability + pub/sub enhancements (PR #TBD)
+
+- `docs/guides/tuning.md`: rewrote the "Persistence: what durability costs"
+  section to match the write-path campaign — `everysec` is now a win at
+  pipeline depth (~1.32× Redis), `always` is disk-fsync-bound (parity floor)
+  and safe to pipeline via group commit (P16 0.12×→0.91×), with a
+  "which policy?" decision line. All framed as automatic behavior (no knobs).
+- New "Pub/sub fan-out" section: coalesced delivery (5.09M msg/s, zero drops)
+  and the intentional slow-subscriber drop policy (256-msg queue cap).
+- Quick-recipe table: refreshed the durable-store row and added a pub/sub row.
+  Cross-links to `BENCHMARK.md` §7.3.
+
 ### Docs — durability write-path benchmark results (PR #TBD)
 
 - `BENCHMARK.md` §7.3: new section recording the 2026-07-08 durability
