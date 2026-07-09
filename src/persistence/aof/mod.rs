@@ -7,7 +7,7 @@
 //! |---------|---------------|-----------|
 //! | `AofWriter::append` (hot path) | **fire-and-forget** | Channel send; no Result needed |
 //! | `aof_writer_task` | **must-panic** | Writer task; errors logged inline |
-//! | `replay_aof` | **should-recover** (`Result<_, MoonError>`) | Startup replay; log+skip on corruption |
+//! | `replay_aof` | **should-recover** (`Result<_, MoonError>`) | Startup replay; stop at mid-stream corruption (keep valid prefix) |
 //! | `rewrite_aof` | **should-recover** (`Result<_, MoonError>`) | Background rewrite; caller logs error |
 //! | `#[cfg(test)]` code (55 unwraps) | **test-only** | Panics are appropriate in tests |
 // Suppressions narrowed: only keep what's needed for conditional compilation
@@ -503,14 +503,28 @@ pub fn serialize_command(frame: &Frame) -> Bytes {
     buf.freeze()
 }
 
+/// Whether legacy best-effort skip-and-resync on mid-stream AOF corruption is
+/// enabled (prod-hardening #12). Default OFF: a hard parse error stops replay
+/// (keeping the valid prefix) rather than skipping forward to the next `*` and
+/// risking dispatch of misaligned bytes as live commands. Operators who want
+/// the old behavior opt in with `MOON_AOF_BEST_EFFORT_RESYNC=1`.
+fn aof_best_effort_resync_enabled() -> bool {
+    std::env::var("MOON_AOF_BEST_EFFORT_RESYNC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("enable"))
+        .unwrap_or(false)
+}
+
 /// Replay an AOF file by parsing RESP commands and dispatching them.
 ///
 /// Returns the number of commands successfully replayed.
 ///
-/// **Corruption recovery:** On mid-stream parse errors, logs a warning with the
-/// byte offset, skips to the next RESP array marker (`*`), and continues replay.
-/// At EOF, reports total corrupted entries skipped. Truncated tails are handled
-/// gracefully (warn + stop).
+/// **Corruption recovery (#12):** A clean truncated tail is handled gracefully
+/// (warn + stop). On genuine mid-stream corruption the default is to STOP
+/// replay — keeping only the valid prefix already applied and never dispatching
+/// bytes past the corruption point (which, in unframed RESP, could be a `*`
+/// inside a binary value → misaligned garbage commands). Set
+/// `MOON_AOF_BEST_EFFORT_RESYNC=1` to opt into the legacy skip-to-next-`*`
+/// resync (loud warnings; may misapply corrupted data).
 pub fn replay_aof(
     databases: &mut [Database],
     path: &Path,
@@ -597,14 +611,41 @@ pub fn replay_aof(
             }
             Err(e) => {
                 let error_offset = total_len - buf.len();
-                warn!(
-                    "AOF parse error at byte offset {} after {} commands: {}. Attempting skip.",
-                    error_offset, count, e
-                );
                 corruption_count += 1;
 
-                // Skip past the corrupt byte(s) to the next RESP array marker ('*')
-                // Always discard at least 1 byte to guarantee forward progress.
+                // Prod-hardening #12: DO NOT skip-and-resync by default.
+                // `appendonly.aof` is raw unframed RESP with no per-record
+                // length/CRC, and a `*` byte appears freely inside binary
+                // value blobs — resuming at "the next `*`" can land mid-value
+                // and dispatch misaligned garbage as live SET/DEL/etc. against
+                // the recovering keyspace (silent data corruption). Clean
+                // tail-truncation is already handled by the `Ok(None)` arm;
+                // reaching here means genuine mid-stream corruption. The safe
+                // default (matching the per-shard `shard_replay` sibling)
+                // stops here, keeping only the valid prefix already applied,
+                // and never dispatches anything past the corruption point.
+                if !aof_best_effort_resync_enabled() {
+                    error!(
+                        "AOF corruption at byte offset {} after {} commands: {}. \
+                         Stopping replay to avoid dispatching misaligned bytes as \
+                         live commands; the {} commands before this point are kept. \
+                         Run redis-check-aof (or set MOON_AOF_BEST_EFFORT_RESYNC=1 to \
+                         opt into the legacy skip-and-resync, which MAY misapply \
+                         corrupted data).",
+                        error_offset, count, e, count
+                    );
+                    break;
+                }
+
+                // Opt-in legacy best-effort resync (loud): skip past the
+                // corrupt byte(s) to the next RESP array marker ('*'). Always
+                // discard at least 1 byte to guarantee forward progress.
+                warn!(
+                    "AOF parse error at byte offset {} after {} commands: {}. \
+                     MOON_AOF_BEST_EFFORT_RESYNC set — attempting skip (data may be \
+                     misapplied).",
+                    error_offset, count, e
+                );
                 let _ = buf.split_to(1);
                 if let Some(pos) = buf.iter().position(|&b| b == b'*') {
                     let _ = buf.split_to(pos);
@@ -693,6 +734,40 @@ mod tests {
         assert_eq!(entry.value.as_bytes().unwrap(), b"v1");
         let entry = dbs[0].get(b"k2").unwrap();
         assert_eq!(entry.value.as_bytes().unwrap(), b"v2");
+    }
+
+    #[test]
+    fn test_aof_replay_stops_at_midstream_corruption_by_default() {
+        // Prod-hardening #12: a genuine mid-stream parse error must STOP replay
+        // (keeping the valid prefix), NOT skip forward to the next `*` and
+        // dispatch misaligned bytes as live commands. Default = no
+        // MOON_AOF_BEST_EFFORT_RESYNC (the test suite never sets it).
+        let dir = tempdir().unwrap();
+        let aof_path = dir.path().join("corrupt.aof");
+
+        let mut aof_data = BytesMut::new();
+        // Valid prefix.
+        serialize::serialize(&make_command(&[b"SET", b"before", b"1"]), &mut aof_data);
+        // Corruption: `*` marker with a non-integer count — complete (has CRLF)
+        // so it is a hard parse Err, not an Incomplete/tail-truncation.
+        aof_data.extend_from_slice(b"*Z\r\n");
+        // A perfectly valid command AFTER the corruption that must NOT be
+        // replayed once we stop at the corruption point.
+        serialize::serialize(&make_command(&[b"SET", b"after", b"2"]), &mut aof_data);
+        std::fs::write(&aof_path, &aof_data).unwrap();
+
+        let mut dbs = vec![Database::new()];
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
+
+        assert_eq!(count, 1, "only the pre-corruption command is replayed");
+        assert!(
+            dbs[0].get(b"before").is_some(),
+            "valid prefix command must be applied"
+        );
+        assert!(
+            dbs[0].get(b"after").is_none(),
+            "post-corruption command must NOT be dispatched (no skip-resync by default)"
+        );
     }
 
     #[test]
