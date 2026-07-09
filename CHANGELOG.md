@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Hardening: APPEND 512MB cap + reject FT.* inside MULTI on prod handlers (PR #TBD)
+
+- **APPEND** now enforces the 512MB max-string-size limit (matching
+  SETRANGE/SETBIT); repeated APPENDs previously grew a value past the documented
+  limit unbounded. (audit finding 22)
+- **FT.\*** commands are now explicitly rejected inside MULTI/EXEC on the
+  production sharded + monoio handlers (they aren't wired through the txn
+  execution path), matching the existing handler_single guard — a clear
+  "not supported inside MULTI/EXEC" error instead of an incidental one.
+  (audit finding 25)
+
 ### Changed — Vector storage: fence experimental DiskANN cold tier + drop dead vector WAL (PR #TBD)
 
 - The DiskANN cold tier (WARM→COLD segment demotion + on-disk Vamana beam

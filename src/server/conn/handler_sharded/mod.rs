@@ -1044,6 +1044,16 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- MULTI queue mode ---
                     if conn.in_multi {
+                        // FT.* vector commands aren't wired through the txn
+                        // execution path; reject them explicitly inside MULTI
+                        // (matches handler_single) instead of an incidental
+                        // later error.
+                        if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR FT.* commands are not supported inside MULTI/EXEC",
+                            )));
+                            continue;
+                        }
                         conn.command_queue.push(frame);
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;

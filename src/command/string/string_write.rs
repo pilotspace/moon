@@ -515,6 +515,15 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         None => (None, 0),
     };
 
+    // Enforce the 512MB max string size (matches SETRANGE/SETBIT); APPEND
+    // previously let a string grow past the documented limit unbounded.
+    let combined_len = existing_data.as_ref().map_or(0, |v| v.len()) + append_val.len();
+    if combined_len > 512 * 1024 * 1024 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR string exceeds maximum allowed size (512MB)",
+        ));
+    }
+
     let new_val = match existing_data {
         Some(existing) => {
             let mut combined = Vec::with_capacity(existing.len() + append_val.len());
