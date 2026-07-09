@@ -368,6 +368,21 @@ pub fn build_quantized_lut(
 /// `norms`: Precomputed norms from PostingList.
 /// `count`: Number of vectors in the posting list.
 /// `k`: Number of results to keep.
+/// `l2_adjust`: apply the metric-faithful L2 correction below. TQ encodes a
+///   unit DIRECTION plus a stored norm; ranking by `sphere_dist * ||a||^2`
+///   (the plain `adc * norm * norm` reconstruction) is only metric-valid on
+///   the unit sphere (COSINE / INNER_PRODUCT, where the encode side also
+///   normalizes). For raw L2 queries against un-normalized data that
+///   collapses recall: a tiny-norm vector scores near-zero regardless of
+///   direction. When `true`, the true squared distance is reconstructed
+///   from the stored document norm and `q_norm`:
+///   `||a - q||^2 = (||a|| - ||q||)^2 + ||a|| * ||q|| * d_sphere^2`.
+///   See commit 2f5c29d2 ("metric-faithful TQ ADC scoring for raw L2
+///   queries") for the equivalent fix applied to the mutable/HNSW/immutable
+///   TQ scoring paths. Callers must gate this on `metric == L2` -- passing
+///   `true` for COSINE/INNER_PRODUCT would silently corrupt those rankings.
+/// `q_norm`: query vector L2 norm, computed once per query by the caller
+///   (ignored when `l2_adjust` is `false`).
 /// `results`: Output buffer for SearchResults (caller-provided SmallVec).
 #[allow(clippy::too_many_arguments)]
 pub fn scan_posting_list(
@@ -379,6 +394,8 @@ pub fn scan_posting_list(
     norms: &[f32],
     count: u32,
     k: usize,
+    l2_adjust: bool,
+    q_norm: f32,
     results: &mut SmallVec<[SearchResult; 32]>,
 ) {
     let dispatch = fastscan_dispatch();
@@ -406,7 +423,19 @@ pub fn scan_posting_list(
             let global_idx = vec_start + v;
             let norm = norms[global_idx];
             let adc = block_dists[v] as f32 * inv_scale + params.bias;
-            let dist_f32 = adc * norm * norm;
+            let sphere_scaled = adc * norm * norm;
+
+            let dist_f32 = if l2_adjust {
+                // Metric-faithful L2 correction (see doc comment above).
+                let diff = norm - q_norm;
+                if norm <= 0.0 {
+                    diff * diff
+                } else {
+                    diff * diff + (q_norm / norm) * sphere_scaled
+                }
+            } else {
+                sphere_scaled
+            };
             results.push(SearchResult::new(dist_f32, VectorId(ids[global_idx])));
         }
     }
@@ -603,6 +632,8 @@ mod tests {
             &norms,
             n as u32,
             3,
+            false,
+            0.0,
             &mut results,
         );
 
@@ -614,6 +645,126 @@ mod tests {
         for w in results.windows(2) {
             assert!(w[0].distance <= w[1].distance, "results not sorted");
         }
+    }
+
+    #[test]
+    fn test_scan_posting_list_l2_adjust_matches_formula() {
+        // Pins the metric-faithful L2 correction to its exact closed form:
+        // ||a-q||^2 = (||a||-||q||)^2 + ||a||*||q|| * d_sphere^2, where
+        // d_sphere^2 * ||a||^2 is the existing (pre-fix) ADC reconstruction.
+        init_fastscan();
+
+        let dim_half = 1;
+        let padded_dim = 2;
+        let mut codes = vec![0u8; dim_half * BLOCK_SIZE];
+        let mut lut = vec![0u8; padded_dim * 16];
+        for coord in 0..padded_dim {
+            for k in 0..16 {
+                lut[coord * 16 + k] = (k * 2) as u8;
+            }
+        }
+        // Vector 0: lo_idx=3, hi_idx=5 -> byte = 0x53.
+        codes[0] = 0x53;
+
+        let ids = vec![7u32];
+        let norm = 2.5f32;
+        let norms = vec![norm];
+        let params = LutParams {
+            scale: 4.0,
+            bias: 1.5,
+        };
+        let q_norm = 3.0f32;
+
+        // raw = lut[lo=3] + lut[hi=5] = 6 + 10 = 16.
+        let raw = 16.0f32;
+        let adc = raw / params.scale + params.bias;
+        let sphere_scaled = adc * norm * norm;
+        let diff = norm - q_norm;
+        let expected = diff * diff + (q_norm / norm) * sphere_scaled;
+
+        let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+        scan_posting_list(
+            &codes,
+            &lut,
+            params,
+            dim_half,
+            &ids,
+            &norms,
+            1,
+            1,
+            true,
+            q_norm,
+            &mut results,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            (results[0].distance - expected).abs() < 1e-4,
+            "l2_adjust distance {} != expected {expected}",
+            results[0].distance
+        );
+
+        // l2_adjust=false must reproduce the pre-fix unit-sphere reconstruction
+        // byte-for-byte (COSINE / INNER_PRODUCT behavior is unaffected).
+        let mut results_off: SmallVec<[SearchResult; 32]> = SmallVec::new();
+        scan_posting_list(
+            &codes,
+            &lut,
+            params,
+            dim_half,
+            &ids,
+            &norms,
+            1,
+            1,
+            false,
+            q_norm,
+            &mut results_off,
+        );
+        assert!(
+            (results_off[0].distance - sphere_scaled).abs() < 1e-4,
+            "l2_adjust=false must be unchanged: {} != {sphere_scaled}",
+            results_off[0].distance
+        );
+    }
+
+    #[test]
+    fn test_scan_posting_list_l2_adjust_zero_norm_degenerate() {
+        // norm <= 0.0 edge case: the correction degenerates to diff^2 =
+        // q_norm^2 (a zero-norm document sits exactly q_norm away from the
+        // query regardless of direction) -- see the `na <= 0.0` branch.
+        init_fastscan();
+
+        let dim_half = 1;
+        let padded_dim = 2;
+        let codes = vec![0u8; dim_half * BLOCK_SIZE];
+        let lut = vec![0u8; padded_dim * 16];
+        let ids = vec![1u32];
+        let norms = vec![0.0f32];
+        let params = LutParams {
+            scale: 1.0,
+            bias: 0.0,
+        };
+        let q_norm = 4.0f32;
+
+        let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+        scan_posting_list(
+            &codes,
+            &lut,
+            params,
+            dim_half,
+            &ids,
+            &norms,
+            1,
+            1,
+            true,
+            q_norm,
+            &mut results,
+        );
+        assert!(
+            (results[0].distance - q_norm * q_norm).abs() < 1e-6,
+            "zero-norm doc distance {} != q_norm^2 {}",
+            results[0].distance,
+            q_norm * q_norm
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -124,9 +124,12 @@ fn compact_parallel(
     seed: u64,
 ) -> crate::vector::hnsw::graph::HnswGraph {
     let n = live_f32.len();
-    let num_cells = std::thread::available_parallelism()
-        .map(|p| p.get().min(16))
-        .unwrap_or(4)
+    // system_parallelism, NOT available_parallelism: this can run on
+    // core-pinned shard/compactor threads whose affinity mask makes
+    // available_parallelism() report 1, silently forcing the sequential
+    // path (see the identical rationale in `build_graph_auto` above).
+    let num_cells = crate::shard::numa::system_parallelism()
+        .min(16)
         .min(((n as f32).sqrt() as usize / 31).saturating_add(1))
         .max(2);
 

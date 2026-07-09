@@ -1506,6 +1506,7 @@ mod tests {
             dim,
             n_clusters,
             &sign_flips,
+            DistanceMetric::L2,
         );
 
         assert_eq!(ivf_seg.total_vectors(), n as u64);

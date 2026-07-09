@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — IVF scorer metric-faithful L2 + compact_parallel core count (PR #TBD)
+
+- **IVF segment search** now applies the metric-faithful L2 correction
+  `‖a−q‖² = (‖a‖−‖q‖)² + ‖a‖·‖q‖·d_sphere²` for raw-L2 TQ4 queries, matching
+  the fix already in the mutable/HNSW/immutable scoring paths (commit
+  2f5c29d2). Without it, `sphere_dist·‖a‖²` ranking collapses recall on
+  un-normalized L2 data (tiny-norm vectors score near-zero regardless of
+  direction). `IvfSegment` now carries its collection `metric`; the
+  correction is gated on `metric == L2 && quantization == TurboQuant4Bit`
+  and the query norm is computed once per query. IVF segments are still
+  built only in tests today, so this unblocks wiring IVF into compaction.
+- **`compact_parallel`** now sizes its cell fan-out from
+  `numa::system_parallelism()` instead of `std::thread::available_parallelism()`,
+  which reports 1 on core-pinned shard/compactor threads and silently forced
+  the sequential build — matching the existing `build_graph_auto` fix. This
+  path is test-only, so it is correctness/consistency, not a production change.
+
 ### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #TBD)
 
 - **`--vector-ef-runtime` / `--vector-rerank-mult` / `--vector-exact-beam`**

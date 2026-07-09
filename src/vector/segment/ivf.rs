@@ -11,7 +11,7 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance::fastscan;
 use crate::vector::turbo_quant::codebook::scaled_centroids;
 use crate::vector::turbo_quant::encoder::padded_dimension;
-use crate::vector::types::SearchResult;
+use crate::vector::types::{DistanceMetric, SearchResult};
 
 /// Quantization method used within IVF posting lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +150,10 @@ pub struct IvfSegment {
     n_clusters: u32,
     /// Quantization method for posting list codes.
     quantization: IvfQuantization,
+    /// Distance metric this segment's collection was created with. Gates
+    /// the metric-faithful L2 correction in `search()` -- see
+    /// [`fastscan::scan_posting_list`]'s `l2_adjust` doc comment.
+    metric: DistanceMetric,
     /// Original vector dimension.
     dimension: u32,
     /// Padded dimension (next power of 2).
@@ -169,6 +173,7 @@ impl IvfSegment {
         posting_lists: Vec<PostingList>,
         n_clusters: u32,
         quantization: IvfQuantization,
+        metric: DistanceMetric,
         dimension: u32,
         sign_flips: AlignedBuffer<f32>,
     ) -> Self {
@@ -178,6 +183,7 @@ impl IvfSegment {
             posting_lists,
             n_clusters,
             quantization,
+            metric,
             dimension,
             padded_dim,
             sign_flips,
@@ -207,6 +213,12 @@ impl IvfSegment {
     #[inline]
     pub fn quantization(&self) -> IvfQuantization {
         self.quantization
+    }
+
+    /// Distance metric this segment's collection was created with.
+    #[inline]
+    pub fn metric(&self) -> DistanceMetric {
+        self.metric
     }
 
     /// Reference to cluster centroids.
@@ -251,15 +263,25 @@ impl IvfSegment {
     ) -> SmallVec<[SearchResult; 32]> {
         // Build the quantized u8 distance LUT from the rotated query using the
         // same dimension-scaled codebook the stored codes were encoded with.
-        //
-        // TODO(metric-faithful L2): this scorer still ranks by unit-sphere
-        // distance scaled by norm² and lacks the l2_adjust/tq_fin correction
-        // that mutable.rs and hnsw/search.rs apply for raw-L2 queries. IVF
-        // segments are not yet built on any production path (holder.ivf is
-        // only populated by tests) — the correction MUST be added here before
-        // wiring IVF into compaction, or L2 recall collapses on
-        // high-magnitude datasets (see the gist-960 TQ-L2 fix).
         let lut_params = fastscan::build_quantized_lut(q_rotated, &self.lut_centroids, lut_buf);
+
+        // Metric-faithful L2 correction (see `fastscan::scan_posting_list`'s
+        // `l2_adjust` doc comment): TQ codes store a unit DIRECTION plus a
+        // stored norm, so the plain ADC reconstruction ranks by
+        // sphere_dist * ||a||^2 -- metric-valid only on the unit sphere
+        // (COSINE / INNER_PRODUCT). For raw L2 queries this collapses
+        // recall on un-normalized data. Gated on TurboQuant4Bit: other
+        // quantization schemes (e.g. PQ) do not decode to a unit-sphere
+        // direction and are unaffected by this bug, so the correction must
+        // not apply to them. `q_norm` is computed once per query (not per
+        // candidate).
+        let l2_adjust = self.metric == DistanceMetric::L2
+            && self.quantization == IvfQuantization::TurboQuant4Bit;
+        let q_norm: f32 = if l2_adjust {
+            query_f32.iter().map(|x| x * x).sum::<f32>().sqrt()
+        } else {
+            0.0
+        };
 
         let dim = self.dimension as usize;
         let pdim = self.padded_dim as usize;
@@ -290,6 +312,8 @@ impl IvfSegment {
                 &pl.norms,
                 pl.count,
                 k,
+                l2_adjust,
+                q_norm,
                 &mut results,
             );
         }
@@ -484,6 +508,7 @@ pub fn find_nprobe_nearest(
 ///
 /// Runs k-means, assigns vectors to clusters, builds interleaved posting lists.
 /// This is a compaction-time operation -- allocations are acceptable.
+#[allow(clippy::too_many_arguments)]
 pub fn build_ivf_segment(
     vectors_f32: &[f32],
     tq_codes: &[Vec<u8>],
@@ -492,6 +517,7 @@ pub fn build_ivf_segment(
     dim: usize,
     n_clusters: usize,
     sign_flips: &[f32],
+    metric: DistanceMetric,
 ) -> IvfSegment {
     let n_vectors = vectors_f32.len() / dim;
     let actual_k = n_clusters.min(n_vectors);
@@ -547,6 +573,7 @@ pub fn build_ivf_segment(
         posting_lists,
         actual_k as u32,
         IvfQuantization::TurboQuant4Bit,
+        metric,
         dim as u32,
         sf_buf,
     )
@@ -759,6 +786,7 @@ mod tests {
             posting_lists,
             n_clusters,
             IvfQuantization::TurboQuant4Bit,
+            DistanceMetric::L2,
             dim,
             AlignedBuffer::new(1024),
         );
@@ -767,6 +795,7 @@ mod tests {
         assert_eq!(seg.dimension(), 768);
         assert_eq!(seg.padded_dim(), 1024);
         assert_eq!(seg.quantization(), IvfQuantization::TurboQuant4Bit);
+        assert_eq!(seg.metric(), DistanceMetric::L2);
         assert_eq!(seg.total_vectors(), 0);
         assert_eq!(seg.centroids().len(), (4 * 768) as usize);
     }
@@ -794,6 +823,7 @@ mod tests {
             vec![pl1, pl2],
             n_clusters,
             IvfQuantization::TurboQuant4Bit,
+            DistanceMetric::L2,
             dim,
             AlignedBuffer::new(padded_dimension(dim) as usize),
         );
@@ -900,6 +930,7 @@ mod tests {
             vec![pl0, pl1],
             2,
             IvfQuantization::TurboQuant4Bit,
+            DistanceMetric::L2,
             dim as u32,
             sf_buf,
         );
@@ -951,6 +982,7 @@ mod tests {
             vec![pl0, pl1],
             2,
             IvfQuantization::TurboQuant4Bit,
+            DistanceMetric::L2,
             dim as u32,
             sf_buf,
         );
@@ -995,6 +1027,7 @@ mod tests {
             vec![pl],
             1,
             IvfQuantization::TurboQuant4Bit,
+            DistanceMetric::L2,
             dim as u32,
             sf_buf,
         );
@@ -1041,7 +1074,16 @@ mod tests {
             tq_codes.push(vec![(i & 0xFF) as u8; dim_half]);
         }
 
-        let seg = build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, n_clusters, &signs);
+        let seg = build_ivf_segment(
+            &vectors,
+            &tq_codes,
+            &norms,
+            &ids,
+            dim,
+            n_clusters,
+            &signs,
+            DistanceMetric::L2,
+        );
         assert_eq!(seg.n_clusters() as usize, n_clusters);
         assert_eq!(seg.total_vectors(), n as u64);
         assert_eq!(seg.dimension(), dim as u32);
@@ -1108,7 +1150,16 @@ mod tests {
         }
 
         // Build IVF segment.
-        let seg = build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, n_clusters, &signs);
+        let seg = build_ivf_segment(
+            &vectors,
+            &tq_codes,
+            &norms,
+            &ids,
+            dim,
+            n_clusters,
+            &signs,
+            DistanceMetric::L2,
+        );
 
         // Ground truth: IVF search with nprobe = ALL clusters (exhaustive).
         // Recall measures partition quality: how many true top-k (by IVF metric)
@@ -1149,6 +1200,152 @@ mod tests {
         assert!(
             avg_recall >= 0.80,
             "recall@10 = {avg_recall:.4} < 0.80 at nprobe={nprobe}"
+        );
+    }
+
+    #[test]
+    fn test_ivf_l2_unnormalized_norm_variation_recall() {
+        // Metric-faithful L2 correction (see `fastscan::scan_posting_list`'s
+        // `l2_adjust` param): TQ codes store a unit DIRECTION plus a stored
+        // norm. Ranking IVF candidates by sphere_dist * ||a||^2 is only
+        // metric-valid on the unit sphere (COSINE / INNER_PRODUCT). For raw
+        // L2 queries against widely-varying-norm vectors this collapses
+        // recall: a tiny-norm vector scores near-zero regardless of
+        // direction, so the beam fills with the smallest-norm vectors
+        // (the gist-960 recall collapse -- see commit 2f5c29d2 for the
+        // equivalent mutable/HNSW/immutable fix).
+        //
+        // nprobe is set to n_clusters (exhaustive scan of every posting
+        // list) so this test isolates the scoring-formula fix from
+        // cluster-partition recall: it compares IVF's own top-k against an
+        // INDEPENDENT exact f32 brute-force L2 ground truth, not against
+        // IVF's own exhaustive search (unlike `test_recall_at_10_nprobe_32`
+        // above, which measures partition quality against a self-referential
+        // ground truth and would pass trivially regardless of scoring
+        // fidelity).
+        crate::vector::distance::init();
+
+        let dim = 32;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let n_vectors = 400;
+        let n_clusters = 8;
+        let n_queries = 30;
+        let k = 10;
+        let signs = test_sign_flips(pdim, 42);
+        let boundaries = crate::vector::turbo_quant::codebook::scaled_boundaries(pdim as u32);
+
+        // Unit-direction vectors scaled to norms spanning 0.5..40.5 -- wide
+        // enough that norm-scaled sphere ranking (the bug) forces every
+        // tiny-norm vector to the front of the beam regardless of direction.
+        let mut vectors = Vec::with_capacity(n_vectors * dim);
+        for i in 0..n_vectors {
+            let mut v = det_f32(dim, 5_000 + i as u64);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for x in v.iter_mut() {
+                    *x *= inv;
+                }
+            }
+            let scale = 0.5 + (i % 41) as f32;
+            for x in v.iter_mut() {
+                *x *= scale;
+            }
+            vectors.extend_from_slice(&v);
+        }
+
+        // Norms + real TQ codes (encoded with the same codebook the segment
+        // will score against -- fake/hash codes would not exercise the
+        // ADC scoring path meaningfully).
+        let mut norms = Vec::with_capacity(n_vectors);
+        let mut tq_codes = Vec::with_capacity(n_vectors);
+        let ids: Vec<u32> = (0..n_vectors as u32).collect();
+
+        for i in 0..n_vectors {
+            let v = &vectors[i * dim..(i + 1) * dim];
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(if norm > 0.0 { norm } else { 1.0 });
+
+            let mut work_buf = vec![0.0f32; pdim];
+            let code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(
+                v,
+                &signs,
+                &boundaries,
+                &mut work_buf,
+            );
+            tq_codes.push(code.codes);
+        }
+
+        let seg = build_ivf_segment(
+            &vectors,
+            &tq_codes,
+            &norms,
+            &ids,
+            dim,
+            n_clusters,
+            &signs,
+            DistanceMetric::L2,
+        );
+
+        let mut total_recall = 0.0f64;
+        for q_idx in 0..n_queries {
+            let mut query = det_f32(dim, 900_000 + q_idx as u64);
+            let dir_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if dir_norm > 0.0 {
+                let inv = 1.0 / dir_norm;
+                for x in query.iter_mut() {
+                    *x *= inv;
+                }
+            }
+            let qscale = 5.0 + (q_idx % 10) as f32;
+            for x in query.iter_mut() {
+                *x *= qscale;
+            }
+
+            // Independent exact ground truth: brute-force f32 L2 against the
+            // ORIGINAL (unencoded) vectors.
+            let mut exact: Vec<(f32, u32)> = (0..n_vectors)
+                .map(|i| {
+                    let v = &vectors[i * dim..(i + 1) * dim];
+                    let d: f32 = v
+                        .iter()
+                        .zip(query.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
+                    (d, i as u32)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let want: std::collections::HashSet<u32> =
+                exact.iter().take(k).map(|&(_, id)| id).collect();
+
+            // Rotate the query direction for LUT precomputation (mirrors
+            // production callers -- see holder.rs's IVF fan-out).
+            let mut q_rotated = vec![0.0f32; pdim];
+            q_rotated[..dim].copy_from_slice(&query);
+            let qn: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if qn > 0.0 {
+                let inv = 1.0 / qn;
+                for x in q_rotated[..dim].iter_mut() {
+                    *x *= inv;
+                }
+            }
+            crate::vector::turbo_quant::fwht::fwht(&mut q_rotated, &signs);
+
+            let mut lut_buf = vec![0u8; pdim * 16];
+            let results = seg.search(&query, &q_rotated, k, n_clusters, &mut lut_buf);
+            let got: std::collections::HashSet<u32> = results.iter().map(|r| r.id.0).collect();
+
+            let hits = want.intersection(&got).count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / n_queries as f64;
+        assert!(
+            avg_recall >= 0.8,
+            "IVF TQ4+L2 recall@{k} on unnormalized varying-norm data (0.5..40.5): \
+             {avg_recall:.4} -- norm-scaled sphere ranking is metric-unfaithful \
+             without the L2 correction"
         );
     }
 
