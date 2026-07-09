@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — Vector: COLD-segment reload moved off the shard event loop (PR #251)
+
+- Under `--disk-offload`, an idle vector segment is demoted to the COLD tier
+  (`UnloadedSegment` stub, everything in-memory dropped). The first FT.SEARCH to
+  touch it must reload it — `WarmSearchSegment::from_files`: mmap + page-in (+
+  optional mlock) of a whole segment. That reload ran **inline on the
+  single-threaded shard event loop** (`promote_unloaded` at the top of the
+  yielding search capture), so it stalled EVERY other connection on the shard for
+  the full reload (hundreds of ms–seconds on real NVMe/EBS with a cold page
+  cache) — a multi-tenancy violation (audit finding 18).
+- A new process-global `SegmentReloadPool` (`src/vector/reload_pool.rs`, auto-on;
+  `MOON_VEC_RELOAD_WORKERS=0` disables) now performs the reload I/O on dedicated
+  worker threads. The yielding capture path calls `submit_unloaded_reloads`
+  (non-blocking): it submits each COLD stub off-loop and stashes the `flume`
+  receivers in the `SearchSnapshot`; the handler `await`s them
+  (`await_pending_reloads`) before scanning, which parks only the triggering
+  query's **task** (not the OS thread) and then splices the reloaded segments
+  into that query's own snapshot. Result: the dense-KNN query that triggered the
+  reload still sees **full recall**, while sibling connections on the shard keep
+  running. Reloads are **single-flight** (concurrent first-touches of one segment
+  share a job) and cached until the next capture installs them into WARM
+  (reclaiming the stub's memory).
+- Design-for-failure: a reload that errors or whose worker panics/dies replies
+  `Err`/disconnect to every waiter — the query answers with degraded recall
+  (segment stays COLD, retried next touch) rather than hanging or crashing. When
+  the pool is disabled, `submit_unloaded_reloads` falls back to the blocking
+  `promote_unloaded`, preserving exact pre-#18 behavior. Non-yielding sync search
+  paths are unchanged (still block); HYBRID/SPARSE/RANGE/non-default-field
+  queries do not take the off-loop path (accepted follow-up).
+
 ### Docs — engineering roadmap suite under `docs/roadmap/` (PR #254)
 
 - New planning docs (excluded from the published docs site via `mkdocs.yml`

@@ -13,6 +13,7 @@ pub mod keymap;
 pub mod metrics;
 pub mod mvcc;
 pub mod persistence;
+pub mod reload_pool;
 pub mod search_pool;
 pub mod segment;
 pub mod sparse;

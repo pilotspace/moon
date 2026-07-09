@@ -488,6 +488,19 @@ fn main() -> anyhow::Result<()> {
         info!("FT.SEARCH worker pool: {ft_workers} threads");
     }
 
+    // #18: off-loop COLD-segment reload pool. Moves the mmap+page-in of an
+    // idle-demoted vector segment off the shard event loop so the first
+    // FT.SEARCH that touches it doesn't stall sibling connections. Auto-on with
+    // a small worker count (reloads are rare + single-flight); disable with
+    // MOON_VEC_RELOAD_WORKERS=0 to fall back to the blocking reload.
+    let reload_workers = moon::vector::reload_pool::default_workers(num_shards);
+    moon::vector::reload_pool::init_global(reload_workers);
+    if reload_workers > 0 {
+        info!("vector COLD-segment reload pool: {reload_workers} threads");
+    } else {
+        info!("vector COLD-segment reload pool: disabled (blocking reload)");
+    }
+
     // Checked cast: --shards is bounded by clap's value_parser, but `as u16`
     // would silently wrap for values > 65535. Fail loudly instead.
     // ALLOW: panic is appropriate here — this is `main`, not library code.

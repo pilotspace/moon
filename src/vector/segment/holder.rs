@@ -217,6 +217,72 @@ pub struct SearchSnapshot {
     /// Per-index recall/QPS knobs (FT.CONFIG RERANK_MULT / EXACT_BEAM),
     /// copied from `IndexMeta` at capture.
     pub tuning: crate::vector::types::SearchTuning,
+    /// #18 (off-loop reload): receivers for COLD→WARM reloads that were
+    /// SUBMITTED (not blocked-on) at capture. Empty on the common path (no
+    /// unloaded segments) and whenever the reload pool is disabled (then the
+    /// capture blocked on `promote_unloaded` exactly as before). The yielding
+    /// handler `await`s these before scanning (`await_pending_reloads`), so the
+    /// triggering dense-KNN query sees FULL recall while sibling connections on
+    /// the shard keep running (the reload I/O is off the event loop).
+    pub pending_reloads: Vec<flume::Receiver<crate::vector::reload_pool::ReloadOutcome>>,
+}
+
+impl SearchSnapshot {
+    /// #18: await every off-loop COLD→WARM reload submitted at capture, then
+    /// splice the reloaded segments into THIS snapshot's WARM tier (and drop the
+    /// matching stubs from `unloaded`) so the scan sees full recall.
+    ///
+    /// Called by the yielding FT.SEARCH handler BEFORE `search_mvcc_yielding`.
+    /// Awaiting a `flume` receiver parks the connection *task* (not the OS
+    /// thread), so sibling connections on the shard keep running while the
+    /// reload I/O completes on a pool worker. Design-for-failure: a reload that
+    /// errors or whose worker died is logged and skipped — the segment stays in
+    /// `unloaded` (retried at the next capture) and this query answers with
+    /// degraded recall rather than hanging or crashing. No-op (no await) when
+    /// nothing was submitted, i.e. the common path.
+    pub async fn await_pending_reloads(&mut self) {
+        if self.pending_reloads.is_empty() {
+            return;
+        }
+        let receivers = std::mem::take(&mut self.pending_reloads);
+        let mut reloaded: Vec<Arc<crate::vector::persistence::warm_search::WarmSearchSegment>> =
+            Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            match rx.recv_async().await {
+                Ok(Ok(seg)) => reloaded.push(seg),
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    "off-loop COLD segment reload failed -- query answers with degraded recall"
+                ),
+                Err(_) => tracing::warn!(
+                    "off-loop COLD segment reload worker dropped -- query answers with degraded recall"
+                ),
+            }
+        }
+        if reloaded.is_empty() {
+            return;
+        }
+
+        let cur = &self.segments;
+        let mut new_warm = cur.warm.clone();
+        let reloaded_ids: std::collections::HashSet<u64> =
+            reloaded.iter().map(|s| s.segment_id()).collect();
+        new_warm.extend(reloaded);
+        let new_unloaded: Vec<_> = cur
+            .unloaded
+            .iter()
+            .filter(|stub| !reloaded_ids.contains(&stub.segment_id()))
+            .cloned()
+            .collect();
+        self.segments = Arc::new(SegmentList {
+            mutable: Arc::clone(&cur.mutable),
+            immutable: cur.immutable.clone(),
+            ivf: cur.ivf.clone(),
+            warm: new_warm,
+            cold: cur.cold.clone(),
+            unloaded: new_unloaded,
+        });
+    }
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -1119,6 +1185,145 @@ mod tests {
             v.push((s >> 24) as i8);
         }
         v
+    }
+
+    /// #18: build a real COLD `UnloadedSegment` stub backed by minimal on-disk
+    /// `.mpf` files (0 vectors) — enough for `reload()` to round-trip a
+    /// `WarmSearchSegment` with the given `seg_id`.
+    fn make_unloaded_stub(
+        dir: &std::path::Path,
+        seg_id: u64,
+    ) -> Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment> {
+        use crate::storage::tiered::SegmentHandle;
+        use crate::vector::hnsw::graph::HnswGraph;
+        use crate::vector::persistence::unloaded_segment::UnloadedSegment;
+        use crate::vector::persistence::warm_search::WarmSearchSegment;
+        use crate::vector::persistence::warm_segment::{
+            write_codes_mpf, write_graph_mpf, write_mvcc_mpf,
+        };
+
+        let seg_dir = dir.join(format!("seg-{seg_id}"));
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        let graph_bytes = empty_graph.to_bytes();
+        write_codes_mpf(&seg_dir.join("codes.mpf"), seg_id, &[]).unwrap();
+        write_graph_mpf(&seg_dir.join("graph.mpf"), seg_id, &graph_bytes).unwrap();
+        write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), seg_id, &[]).unwrap();
+
+        let handle = SegmentHandle::new(seg_id, seg_dir.clone());
+        let warm = WarmSearchSegment::from_files(
+            &seg_dir,
+            seg_id,
+            make_test_collection(128),
+            handle,
+            false,
+        )
+        .unwrap();
+        Arc::new(UnloadedSegment::from_warm(&warm, false))
+    }
+
+    /// #18 (holder half): with the reload pool enabled, `submit_unloaded_reloads`
+    /// must NOT block — it submits the stub off-loop (returns a receiver) and a
+    /// later capture installs the finished reload into WARM, emptying `unloaded`.
+    #[test]
+    fn test_submit_unloaded_reloads_installs_off_loop() {
+        distance::init();
+        crate::vector::reload_pool::init_global(1);
+        // If a prior test disabled the global pool, this exercises the blocking
+        // fallback instead — still correct, asserted the same way below.
+        let pool_on = crate::vector::reload_pool::global().is_some();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = make_test_collection(128);
+        let holder = SegmentHolder::new(128, collection.clone());
+        holder.swap(SegmentList {
+            mutable: Arc::new(MutableSegment::new(128, collection)),
+            immutable: Vec::new(),
+            ivf: Vec::new(),
+            warm: Vec::new(),
+            cold: Vec::new(),
+            unloaded: vec![make_unloaded_stub(tmp.path(), 1)],
+        });
+
+        let receivers = holder.submit_unloaded_reloads();
+        if pool_on {
+            assert_eq!(receivers.len(), 1, "one off-loop reload submitted");
+            let outcome = receivers[0].recv().expect("worker replies");
+            assert!(outcome.is_ok(), "reload succeeds");
+            // Next capture installs the completed reload into WARM.
+            let again = holder.submit_unloaded_reloads();
+            assert!(again.is_empty(), "nothing left to submit after install");
+        }
+        // Fallback path already promoted synchronously; either way, converged:
+        let snap = holder.load();
+        assert_eq!(snap.warm.len(), 1, "segment now resident in WARM");
+        assert!(snap.unloaded.is_empty(), "no COLD stubs remain");
+    }
+
+    /// #18 (snapshot half): `await_pending_reloads` splices a reloaded segment
+    /// into the snapshot's OWN warm tier and drops the matching cold stub, so
+    /// the scan that follows sees full recall.
+    #[test]
+    fn test_await_pending_reloads_splices_into_snapshot() {
+        distance::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = make_test_collection(128);
+        let stub = make_unloaded_stub(tmp.path(), 7);
+
+        // Local pool (no global-state coupling) to produce a real receiver.
+        let pool = crate::vector::reload_pool::SegmentReloadPool::new(1);
+        let rx = pool.submit(Arc::clone(&stub));
+
+        let segments = Arc::new(SegmentList {
+            mutable: Arc::new(MutableSegment::new(128, collection)),
+            immutable: Vec::new(),
+            ivf: Vec::new(),
+            warm: Vec::new(),
+            cold: Vec::new(),
+            unloaded: vec![stub],
+        });
+        let mut snap = SearchSnapshot {
+            segments,
+            query_f32: vec![0.0f32; 128],
+            k: 1,
+            ef_search: 16,
+            filter_bitmap: None,
+            filter_strategy: crate::vector::filter::selectivity::FilterStrategy::Unfiltered,
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: std::sync::Arc::new(roaring::RoaringTreemap::new()),
+            dimension: 128,
+            mutable_len: 0,
+            scratch: crate::vector::hnsw::search::SearchScratch::new(0, padded_dimension(128)),
+            key_hash_to_key: crate::vector::keymap::BucketedKeyMap::new(),
+            ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning::default(),
+            pending_reloads: vec![rx],
+        };
+
+        assert_eq!(snap.segments.unloaded.len(), 1);
+        assert_eq!(snap.segments.warm.len(), 0);
+
+        futures::executor::block_on(snap.await_pending_reloads());
+
+        assert_eq!(snap.segments.warm.len(), 1, "reloaded segment spliced in");
+        assert!(
+            snap.segments.unloaded.is_empty(),
+            "cold stub dropped after splice"
+        );
+        assert!(snap.pending_reloads.is_empty(), "receivers drained");
     }
 
     #[test]

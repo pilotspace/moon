@@ -88,4 +88,80 @@ impl SegmentHolder {
         }
         promoted
     }
+
+    /// #18 (off-loop reload): the non-blocking counterpart to
+    /// [`Self::promote_unloaded`], for the yielding FT.SEARCH capture path.
+    ///
+    /// Instead of blocking the shard event loop on `UnloadedSegment::reload`
+    /// (mmap + page-in of a whole segment) it:
+    /// 1. installs any reload that ALREADY completed (submitted by an earlier
+    ///    query) into `warm` — a cheap in-memory swap, the memory-reclaim step;
+    /// 2. SUBMITS every still-cold stub to the process reload pool and returns
+    ///    the receivers so the caller can stash them in the `SearchSnapshot`
+    ///    and `await` them off-loop (see `SearchSnapshot::await_pending_reloads`).
+    ///
+    /// Falls back to the blocking `promote_unloaded` (returning no receivers)
+    /// when the pool is disabled/uninitialized — identical to pre-#18 behavior,
+    /// which is also exactly what non-yielding sync search paths still do.
+    ///
+    /// Fast path: a single `is_empty()` check with no lock and no allocation
+    /// when there are no COLD segments (the overwhelmingly common case).
+    pub fn submit_unloaded_reloads(
+        &self,
+    ) -> Vec<flume::Receiver<crate::vector::reload_pool::ReloadOutcome>> {
+        {
+            let snap = self.segments.load();
+            if snap.unloaded.is_empty() {
+                return Vec::new();
+            }
+        }
+        let Some(pool) = crate::vector::reload_pool::global() else {
+            // Pool disabled: preserve the blocking pre-#18 contract exactly.
+            self.promote_unloaded();
+            return Vec::new();
+        };
+
+        let _guard = self.reload_lock.lock();
+        let snap = self.segments.load();
+        if snap.unloaded.is_empty() {
+            return Vec::new();
+        }
+
+        let mut new_warm = snap.warm.clone();
+        let mut still_unloaded: Vec<
+            Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>,
+        > = Vec::new();
+        let mut receivers = Vec::new();
+        let mut installed = 0usize;
+        for stub in snap.unloaded.iter() {
+            if let Some(seg) = pool.take_completed(stub.segment_id()) {
+                // A prior query already reloaded this off-loop — install it now
+                // so future queries hit WARM and the stub's memory is freed.
+                tracing::info!(
+                    segment_id = stub.segment_id(),
+                    "COLD segment installed from completed off-loop reload"
+                );
+                new_warm.push(seg);
+                installed += 1;
+            } else {
+                // Not ready yet: submit (single-flight in the pool) and keep the
+                // stub cold; this query awaits the receiver for full recall.
+                receivers.push(pool.submit(Arc::clone(stub)));
+                still_unloaded.push(Arc::clone(stub));
+            }
+        }
+
+        if installed > 0 {
+            let new_list = SegmentList {
+                mutable: Arc::clone(&snap.mutable),
+                immutable: snap.immutable.clone(),
+                ivf: snap.ivf.clone(),
+                warm: new_warm,
+                cold: snap.cold.clone(),
+                unloaded: still_unloaded,
+            };
+            self.segments.store(Arc::new(new_list));
+        }
+        receivers
+    }
 }
