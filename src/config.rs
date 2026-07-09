@@ -429,10 +429,12 @@ pub struct ServerConfig {
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
     pub vec_codes_mlock: String,
 
-    /// Maximum resident bytes allowed across all warm-tier vector segments on
-    /// this shard (e.g. "2gb", "512mb", "0"). When the total exceeds this
-    /// limit the budget enforcer drops LRU warm segments from memory; they
-    /// are reloaded from disk on next access. Set to "0" to disable.
+    /// Maximum resident bytes allowed across all warm-tier vector segments
+    /// on this INSTANCE (e.g. "2gb", "512mb", "0"), divided evenly across
+    /// shards — matching `--maxmemory` semantics (A5, tiering-v2 D3). When a
+    /// shard's share is exceeded the budget enforcer demotes LRU warm
+    /// segments to reloadable COLD stubs; they reload from disk on next
+    /// access. Set to "0" to disable.
     ///
     /// Default: "2gb". Tune down for cgroup-constrained containers.
     #[arg(long = "vec-warm-mmap-budget", default_value = "2gb")]
@@ -1038,6 +1040,22 @@ impl ServerConfig {
     /// Default is 2 GiB.
     pub fn vec_warm_mmap_budget_bytes(&self) -> u64 {
         Self::parse_size(&self.vec_warm_mmap_budget).unwrap_or(2 * 1024 * 1024 * 1024)
+    }
+
+    /// Per-shard share of `--vec-warm-mmap-budget` (accounting-spine A5,
+    /// tiering-v2 D3): the flag is an INSTANCE-TOTAL cap divided across
+    /// shards, matching `maxmemory_per_shard` semantics. Previously each
+    /// shard applied the full value — an N-shard instance silently allowed
+    /// N× the configured WARM memory. `0` still disables enforcement; a
+    /// nonzero total floors at 1 byte per shard (0 would flip semantics to
+    /// "unlimited", the unsafe direction). Division floor is fine otherwise:
+    /// under-allocating a soft budget is the safe direction.
+    pub fn vec_warm_mmap_budget_bytes_per_shard(&self) -> u64 {
+        let total = self.vec_warm_mmap_budget_bytes();
+        if total == 0 {
+            return 0;
+        }
+        (total / self.shards.max(1) as u64).max(1)
     }
 
     /// Returns the effective disk offload directory, falling back to --dir.
@@ -2443,6 +2461,41 @@ mod tests {
         assert!((config.segment_cold_min_qps - 0.1).abs() < f64::EPSILON);
         assert_eq!(config.vec_diskann_beam_width, 8);
         assert_eq!(config.vec_diskann_cache_levels, 3);
+    }
+
+    /// Accounting-spine A5 (tiering-v2 D3): `--vec-warm-mmap-budget` is an
+    /// INSTANCE-TOTAL cap divided across shards, matching
+    /// `maxmemory_per_shard` semantics. Previously each shard applied the
+    /// full value — an N-shard instance silently allowed N× the configured
+    /// WARM memory. RED until the per-shard accessor exists and divides.
+    #[test]
+    fn test_vec_warm_budget_divided_per_shard() {
+        let mut config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+
+        // 4 shards × default "2gb" ⇒ 512 MiB per shard.
+        config.shards = 4;
+        assert_eq!(
+            config.vec_warm_mmap_budget_bytes_per_shard(),
+            512 * 1024 * 1024
+        );
+
+        // Single shard: unchanged (full 2 GiB).
+        config.shards = 1;
+        assert_eq!(
+            config.vec_warm_mmap_budget_bytes_per_shard(),
+            2 * 1024 * 1024 * 1024
+        );
+
+        // "0" disables enforcement regardless of shard count.
+        config.vec_warm_mmap_budget = "0".to_string();
+        config.shards = 8;
+        assert_eq!(config.vec_warm_mmap_budget_bytes_per_shard(), 0);
+
+        // A tiny budget over many shards must floor at 1 byte, NOT 0 —
+        // 0 flips semantics to "unlimited", the unsafe direction.
+        config.vec_warm_mmap_budget = "100".to_string();
+        config.shards = 128;
+        assert_eq!(config.vec_warm_mmap_budget_bytes_per_shard(), 1);
     }
 
     #[test]
