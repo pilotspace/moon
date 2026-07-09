@@ -177,8 +177,10 @@ pub(super) async fn try_handle_txn_commit(
                                 mq_lost.get_or_insert((owner, intent_count));
                                 continue;
                             }
-                            // Await the ack before replying OK to the client.
-                            let _ = reply_rx.recv().await;
+                            // Await the ack before replying OK to the client
+                            // (bounded: a stuck owner shard must not hang the
+                            // connection forever).
+                            let _ = crate::shard::coordinator::recv_reply_bounded(reply_rx).await;
                         }
                     }
                     if let Some((owner, intent_count)) = mq_lost {
@@ -305,12 +307,13 @@ pub(super) async fn try_handle_temporal_invalidate(
                             &ctx.spsc_notifiers,
                         )
                         .await;
-                        let response = match reply_rx.recv().await {
-                            Ok(f) => f,
-                            Err(_) => Frame::Error(Bytes::from_static(
-                                b"ERR cross-shard reply channel closed",
-                            )),
-                        };
+                        let response =
+                            match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+                                Ok(f) => f,
+                                Err(_) => Frame::Error(Bytes::from_static(
+                                    b"ERR cross-shard reply channel closed",
+                                )),
+                            };
                         responses.push(response);
                         return true;
                     }

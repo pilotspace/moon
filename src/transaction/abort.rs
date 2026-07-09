@@ -508,7 +508,10 @@ pub async fn abort_cross_store_txn_routed(
             );
             continue;
         }
-        if reply_rx.recv().await.is_err() {
+        if crate::shard::coordinator::recv_reply_bounded(reply_rx)
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 txn_id,
                 owner,

@@ -196,7 +196,7 @@ const XSHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// dropped the reply sender) OR expiry of [`XSHARD_REPLY_TIMEOUT`] — both mean
 /// "no usable reply", so every call site's existing error handling applies
 /// unchanged; the point is that neither case can hang the connection forever.
-async fn recv_reply_bounded<T: Send + 'static>(
+pub(crate) async fn recv_reply_bounded<T: Send + 'static>(
     reply_rx: channel::OneshotReceiver<T>,
 ) -> Result<T, channel::RecvError> {
     use crate::runtime::race::{Arm, race2};
@@ -1252,8 +1252,28 @@ async fn coordinate_mset(
         }
     }
 
+    // Drain ALL remote acks even after a failure (every leg was already
+    // dispatched, and the local leg below must still persist what this shard
+    // applied) — but a timed-out, closed, or errored leg must NOT collapse
+    // into OK: that would acknowledge an unconfirmed distributed write.
+    let mut leg_err: Option<Frame> = None;
     for reply_rx in pending_shards {
-        let _ = recv_reply_bounded(reply_rx).await;
+        match recv_reply_bounded(reply_rx).await {
+            Ok(frames) => {
+                if leg_err.is_none()
+                    && let Some(err) = frames.into_iter().find(|f| matches!(f, Frame::Error(_)))
+                {
+                    leg_err = Some(err);
+                }
+            }
+            Err(_) => {
+                if leg_err.is_none() {
+                    leg_err = Some(Frame::Error(Bytes::from_static(
+                        b"ERR cross-shard MSET leg unconfirmed (timeout or closed reply channel); write may be partially applied",
+                    )));
+                }
+            }
+        }
     }
 
     // Local leg (review Finding 1): persist a synthesized MSET over ONLY the
@@ -1271,6 +1291,9 @@ async fn coordinate_mset(
         }
     }
 
+    if let Some(err) = leg_err {
+        return err;
+    }
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 

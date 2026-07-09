@@ -152,21 +152,41 @@ mod tests {
     }
 
     #[test]
-    fn test_srandmember_huge_negative_count_capped_no_abort() {
-        // A huge negative COUNT must be capped (members.len()*10), never drive
-        // an unbounded Vec::with_capacity -> allocator abort (Batch A DoS guard).
+    fn test_srandmember_negative_count_exact_redis_contract() {
+        // Redis contract: SRANDMEMBER key -N returns EXACTLY N elements
+        // (duplicates allowed) even when N exceeds the cardinality — a
+        // relative cap that silently truncates is a compliance break.
         let mut db = Database::new();
         setup_set(&mut db, b"s", &[b"a", b"b", b"c"]);
         match srandmember(&mut db, &[bs(b"s"), bs(b"-1000")]) {
             Frame::Array(items) => {
-                assert_eq!(items.len(), 30, "expected cap 3*10=30, got {}", items.len())
+                assert_eq!(items.len(), 1000, "exactly |count| elements required")
             }
             other => panic!("expected array, got {other:?}"),
         }
-        // The read-only twin shares the same guard.
+        // The read-only twin shares the same contract.
         match srandmember_readonly(&db, &[bs(b"s"), bs(b"-1000")], 0) {
-            Frame::Array(items) => assert_eq!(items.len(), 30),
+            Frame::Array(items) => assert_eq!(items.len(), 1000),
             other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_srandmember_huge_negative_count_errors_no_abort() {
+        // Batch A DoS guard: a COUNT beyond RAND_DUP_COUNT_MAX must be refused
+        // loudly (never drive an unbounded Vec::with_capacity -> allocator
+        // abort, and never return a silently short reply).
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"a", b"b", b"c"]);
+        let huge = format!("-{}", crate::command::RAND_DUP_COUNT_MAX + 1);
+        match srandmember(&mut db, &[bs(b"s"), bs(huge.as_bytes())]) {
+            Frame::Error(e) => assert_eq!(&e[..], crate::command::ERR_RAND_COUNT_RANGE),
+            other => panic!("expected error, got {other:?}"),
+        }
+        // i64::MIN: unsigned_abs() of the most extreme input stays guarded.
+        match srandmember_readonly(&db, &[bs(b"s"), bs(i64::MIN.to_string().as_bytes())], 0) {
+            Frame::Error(e) => assert_eq!(&e[..], crate::command::ERR_RAND_COUNT_RANGE),
+            other => panic!("expected error, got {other:?}"),
         }
     }
 

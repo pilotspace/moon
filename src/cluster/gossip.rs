@@ -455,6 +455,12 @@ pub async fn run_gossip_ticker(
                                     let mut len_buf = [0u8; 4];
                                     if stream.read_exact(&mut len_buf).await.is_ok() {
                                         let pong_len = u32::from_be_bytes(len_buf) as usize;
+                                        // Alloc guard: the length prefix is
+                                        // peer-controlled — cap it like the bus
+                                        // listener before sizing the buffer.
+                                        if pong_len > crate::cluster::bus::MAX_GOSSIP_FRAME_LEN {
+                                            return;
+                                        }
                                         let mut pong_buf = vec![0u8; pong_len];
                                         if stream.read_exact(&mut pong_buf).await.is_ok() {
                                             if let Ok(pong) = deserialize_gossip(&pong_buf) {
@@ -578,22 +584,30 @@ pub async fn run_gossip_ticker(
                                         if wr.is_err() { return; }
                                         let (wr, _) = stream.write_all(data).await;
                                         if wr.is_err() { return; }
-                                        // Read PONG response
-                                        let len_buf = vec![0u8; 4];
-                                        let (res, len_buf) = stream.read(len_buf).await;
-                                        if let Ok(4) = res {
-                                            let pong_len = u32::from_be_bytes(
-                                                len_buf[..4].try_into().unwrap(),
-                                            ) as usize;
-                                            let pong_buf = vec![0u8; pong_len];
-                                            let (res, pong_buf) = stream.read(pong_buf).await;
-                                            if let Ok(n) = res {
-                                                if n == pong_len {
-                                                    if let Ok(pong) = deserialize_gossip(&pong_buf) {
-                                                        let mut cs2 = cs.write().unwrap();
-                                                        merge_gossip_into_state(&mut cs2, &pong);
-                                                    }
-                                                }
+                                        // Read PONG response. Exact-read loops:
+                                        // a single `read()` can return short, and
+                                        // dropping a fragmented-but-valid PONG
+                                        // leaves `pong_recv_ms` stale, pushing a
+                                        // healthy peer toward PFAIL. Length is
+                                        // capped like the bus listener (the prefix
+                                        // is peer-controlled and sizes an alloc).
+                                        if let Ok(len_buf) =
+                                            crate::cluster::bus::monoio_read_exact(&mut stream, 4).await
+                                        {
+                                            let pong_len = u32::from_be_bytes([
+                                                len_buf[0], len_buf[1], len_buf[2], len_buf[3],
+                                            ]) as usize;
+                                            if pong_len <= crate::cluster::bus::MAX_GOSSIP_FRAME_LEN
+                                                && let Ok(pong_buf) =
+                                                    crate::cluster::bus::monoio_read_exact(
+                                                        &mut stream,
+                                                        pong_len,
+                                                    )
+                                                    .await
+                                                && let Ok(pong) = deserialize_gossip(&pong_buf)
+                                            {
+                                                let mut cs2 = cs.write().unwrap();
+                                                merge_gossip_into_state(&mut cs2, &pong);
                                             }
                                         }
                                     }

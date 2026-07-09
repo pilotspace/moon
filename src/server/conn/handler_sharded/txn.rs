@@ -193,7 +193,7 @@ pub(super) async fn try_handle_txn_commit(
                             mq_lost.get_or_insert((owner, intent_count));
                             continue;
                         }
-                        match reply_rx.recv().await {
+                        match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
                             Ok(()) => {}
                             Err(_) => {
                                 tracing::warn!(
@@ -329,12 +329,13 @@ pub(super) async fn try_handle_temporal_invalidate(
                             &ctx.spsc_notifiers,
                         )
                         .await;
-                        let response = match reply_rx.recv().await {
-                            Ok(f) => f,
-                            Err(_) => Frame::Error(Bytes::from_static(
-                                b"ERR cross-shard reply channel closed",
-                            )),
-                        };
+                        let response =
+                            match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+                                Ok(f) => f,
+                                Err(_) => Frame::Error(Bytes::from_static(
+                                    b"ERR cross-shard reply channel closed",
+                                )),
+                            };
                         responses.push(response);
                         return true;
                     }

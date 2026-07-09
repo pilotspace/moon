@@ -667,8 +667,13 @@ pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
             Frame::Array(result.into())
         }
     } else {
-        // Negative count: allow duplicates. Cap to entries.len() to prevent OOM on i64::MIN.
-        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        // Negative count: allow duplicates — exactly |COUNT| of them (Redis
+        // contract). The DoS guard refuses extreme counts (i64::MIN → OOM)
+        // loudly instead of silently truncating.
+        let n = count.unsigned_abs() as usize;
+        if n > crate::command::RAND_DUP_COUNT_MAX {
+            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
+        }
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for _ in 0..n {
@@ -777,8 +782,13 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
             Frame::Array(result.into())
         }
     } else {
-        // Negative count: allow duplicates. Cap to prevent OOM on extreme values.
-        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        // Negative count: allow duplicates — exactly |COUNT| of them (Redis
+        // contract). The DoS guard refuses extreme counts loudly instead of
+        // silently truncating.
+        let n = count.unsigned_abs() as usize;
+        if n > crate::command::RAND_DUP_COUNT_MAX {
+            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
+        }
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for _ in 0..n {

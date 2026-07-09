@@ -37,6 +37,11 @@ pub type SharedVoteTx =
 /// accept capacity. On expiry we return an error, dropping the connection.
 const GOSSIP_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Maximum accepted gossip frame length (alloc guard: the 4-byte length prefix
+/// is attacker-controlled, so it must never size an allocation unchecked).
+/// Shared with the PING/PONG probe path in `gossip.rs`.
+pub(crate) const MAX_GOSSIP_FRAME_LEN: usize = 64 * 1024;
+
 /// Run the cluster bus listener loop.
 ///
 /// Spawns a new task for each incoming peer connection.
@@ -107,7 +112,7 @@ async fn handle_cluster_peer(
             _ = shutdown.cancelled() => return Ok(()),
         }
         let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len > 64 * 1024 {
+        if msg_len > MAX_GOSSIP_FRAME_LEN {
             anyhow::bail!("gossip message too large: {} bytes", msg_len);
         }
 
@@ -201,7 +206,7 @@ async fn handle_cluster_peer(
 ///
 /// Monoio has no `read_exact` — we loop on `stream.read()` accumulating bytes.
 #[cfg(feature = "runtime-monoio")]
-async fn monoio_read_exact(
+pub(crate) async fn monoio_read_exact(
     stream: &mut monoio::net::TcpStream,
     total: usize,
 ) -> std::io::Result<Vec<u8>> {
@@ -289,7 +294,7 @@ async fn handle_cluster_peer(
         };
         let len_buf: [u8; 4] = len_data[..4].try_into().unwrap();
         let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len > 64 * 1024 {
+        if msg_len > MAX_GOSSIP_FRAME_LEN {
             anyhow::bail!("gossip message too large: {} bytes", msg_len);
         }
 
