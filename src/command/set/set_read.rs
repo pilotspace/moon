@@ -298,7 +298,10 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         Frame::Array(chosen.into())
     } else {
         // Allow duplicates
-        let n = count.unsigned_abs() as usize;
+        // DoS guard: cap the with-duplicates count so a huge negative COUNT
+        // can't drive an unbounded Vec::with_capacity -> allocator abort.
+        // Matches the cap already used by HRANDFIELD/ZRANDMEMBER.
+        let n = std::cmp::min(count.unsigned_abs() as usize, members.len() * 10);
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(chosen) = members.choose(&mut rng) else {
@@ -658,7 +661,10 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
             .collect();
         Frame::Array(chosen.into())
     } else {
-        let n = count.unsigned_abs() as usize;
+        // DoS guard: cap the with-duplicates count so a huge negative COUNT
+        // can't drive an unbounded Vec::with_capacity -> allocator abort.
+        // Matches the cap already used by HRANDFIELD/ZRANDMEMBER.
+        let n = std::cmp::min(count.unsigned_abs() as usize, members.len() * 10);
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(chosen) = members.choose(&mut rng) else {

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Security: bound client-controlled allocation counts (DoS class, PR #TBD)
+
+- Six wire-reachable command paths fed a client-supplied count straight into
+  `Vec::with_capacity` / `Vec::resize` with no upper bound. On a real host the
+  oversized request fails allocation and Rust's `handle_alloc_error` calls
+  `abort()` — uncatchable, crashing every shard and connection. A single
+  unauthenticated request was a full-process DoS. Fixed by clamping each count
+  before allocating: **FT.SEARCH HIGHLIGHT/SUMMARIZE FIELDS** (bound by
+  remaining tokens), **HSCAN COUNT** (`count.min(total)`), **SRANDMEMBER**
+  negative count (`members.len()*10`, matching HRANDFIELD/ZRANDMEMBER),
+  **BITFIELD SET/INCRBY** offset (reject past the 512MB limit, matching SETBIT;
+  GET exempt), and **ZMPOP COUNT** (`pop_count.min(card)` — this last site was
+  missed by the audit finders and caught by the allocation sweep). Each fix has
+  a red/green test. From the production-hardening audit (Batch A).
+
 ### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #TBD)
 
 - **`--vector-ef-runtime` / `--vector-rerank-mult` / `--vector-exact-beam`**

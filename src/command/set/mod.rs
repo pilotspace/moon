@@ -152,6 +152,25 @@ mod tests {
     }
 
     #[test]
+    fn test_srandmember_huge_negative_count_capped_no_abort() {
+        // A huge negative COUNT must be capped (members.len()*10), never drive
+        // an unbounded Vec::with_capacity -> allocator abort (Batch A DoS guard).
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"a", b"b", b"c"]);
+        match srandmember(&mut db, &[bs(b"s"), bs(b"-1000")]) {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 30, "expected cap 3*10=30, got {}", items.len())
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        // The read-only twin shares the same guard.
+        match srandmember_readonly(&db, &[bs(b"s"), bs(b"-1000")], 0) {
+            Frame::Array(items) => assert_eq!(items.len(), 30),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_srem_basic() {
         let mut db = Database::new();
         setup_set(&mut db, b"myset", &[b"a", b"b", b"c"]);

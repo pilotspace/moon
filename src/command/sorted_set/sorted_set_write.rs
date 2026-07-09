@@ -807,7 +807,10 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
 
-        let mut popped = Vec::with_capacity(pop_count);
+        // DoS guard: bound the pre-size by the set's cardinality so a huge
+        // COUNT can't drive an unbounded Vec::with_capacity -> allocator abort
+        // (matches LMPOP's count.min(list_len); loop already breaks when empty).
+        let mut popped = Vec::with_capacity(pop_count.min(card));
         let mut credit: usize = 0;
         for _ in 0..pop_count {
             let entry = if is_min {
