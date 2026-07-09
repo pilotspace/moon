@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Durability: legacy AOF replay stops at mid-stream corruption instead of resyncing (PR #TBD)
+
+- The default startup path `replay_aof` (single-file `appendonly.aof`, unframed
+  RESP with no per-record length/CRC) treated ANY mid-stream parse error by
+  discarding one byte, scanning forward to the next `*`, and resuming dispatch —
+  but a `*` appears freely inside binary value blobs, so the resync could land
+  mid-value and execute misaligned garbage as live SET/DEL/etc. against the
+  recovering keyspace (silent data corruption, WARN-only). The per-shard
+  `shard_replay` sibling already rejects exactly this. `replay_aof` now STOPS at
+  the first genuine mid-stream corruption (clean tail-truncation is still handled
+  gracefully), keeping only the valid prefix already applied and never
+  dispatching past the corruption point; it logs a loud error with the byte
+  offset and points at `redis-check-aof`. Operators who want the old best-effort
+  behavior can opt in with `MOON_AOF_BEST_EFFORT_RESYNC=1`. (audit finding 12)
+
 ### Fixed — Xshard: bound cross-shard reply wait so a wedged shard can't hang a client (PR #TBD)
 
 - Every cross-shard leg (MGET/MSET/DEL/UNLINK/EXISTS/BITOP/COPY/MSETNX remote
