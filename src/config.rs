@@ -438,14 +438,19 @@ pub struct ServerConfig {
     #[arg(long = "vec-warm-mmap-budget", default_value = "2gb")]
     pub vec_warm_mmap_budget: String,
 
-    // ── Cold-tier / DiskANN config stubs (not yet consumed) ─────────
+    // ── Cold-tier / DiskANN (EXPERIMENTAL — gated by MOON_VEC_COLD_TIER) ──
+    // The DiskANN cold tier is incomplete (no cold-segment deletion, ADC-only
+    // recall, restart reload of PQ codebooks unfinished). The WARM->COLD
+    // transition is a NO-OP unless an operator sets `MOON_VEC_COLD_TIER=1`;
+    // warm-tier mmap + LRU eviction handles out-of-RAM indexes by default.
     /// Seconds after last access before a WARM segment is promoted to COLD.
-    /// Not yet consumed — reserved for the WARM->COLD transition timer.
+    /// Consumed by the cold-transition timer ONLY when the experimental cold
+    /// tier is enabled (`MOON_VEC_COLD_TIER=1`); otherwise inert.
     #[arg(long = "segment-cold-after", default_value_t = 86_400)]
     pub segment_cold_after: u64,
 
     /// Minimum queries-per-second threshold; segments below this are COLD candidates.
-    /// Not yet consumed — reserved for the WARM->COLD transition heuristic.
+    /// Not yet consumed — reserved for the experimental cold-tier heuristic.
     #[arg(long = "segment-cold-min-qps", default_value_t = 0.1)]
     pub segment_cold_min_qps: f64,
 
@@ -458,12 +463,14 @@ pub struct ServerConfig {
     pub memory_arenas_cap: u32,
 
     /// DiskANN beam width for disk-resident vector search.
-    /// Not yet consumed — reserved for the DiskANN search implementation.
+    /// Not yet consumed — reserved for the experimental cold-tier search path
+    /// (gated by MOON_VEC_COLD_TIER).
     #[arg(long = "vec-diskann-beam-width", default_value_t = 8)]
     pub vec_diskann_beam_width: u32,
 
     /// Number of HNSW upper levels cached in memory for DiskANN hybrid search.
-    /// Not yet consumed — reserved for the DiskANN cache layer.
+    /// Not yet consumed — reserved for the experimental cold-tier cache layer
+    /// (gated by MOON_VEC_COLD_TIER).
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
 

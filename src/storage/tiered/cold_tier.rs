@@ -250,7 +250,7 @@ pub fn transition_to_cold(
         graph.entry_point(),
         graph.max_degree(),
         cold_file_id,
-    );
+    )?;
 
     Ok(segment)
 }

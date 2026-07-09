@@ -72,15 +72,18 @@ impl DiskAnnSegment {
         entry_point: u32,
         max_degree: u32,
         file_id: u64,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         debug_assert_eq!(
             pq_codes.len(),
             num_vectors as usize * pq.m(),
             "pq_codes length must be num_vectors * m"
         );
+        // Propagate the open error instead of panicking: this runs on the shard
+        // event loop during a WARM->COLD transition, and a library-code panic
+        // here would abort the whole shard. The caller skips + logs the
+        // transition on error.
         #[cfg(unix)]
-        let vamana_file = std::fs::File::open(&vamana_path)
-            .unwrap_or_else(|e| panic!("DiskAnnSegment: cannot open {:?}: {}", vamana_path, e));
+        let vamana_file = std::fs::File::open(&vamana_path)?;
 
         // Try to open with O_DIRECT for io_uring beam search. Falls back
         // gracefully on filesystems that don't support O_DIRECT (e.g., tmpfs
@@ -102,7 +105,7 @@ impl DiskAnnSegment {
             }
         };
 
-        Self {
+        Ok(Self {
             pq_codes,
             pq,
             vamana_path,
@@ -115,7 +118,7 @@ impl DiskAnnSegment {
             entry_point,
             max_degree,
             file_id,
-        }
+        })
     }
 
     /// Load a DiskAnnSegment from on-disk files.
@@ -571,7 +574,8 @@ mod tests {
             graph.entry_point(),
             graph.max_degree(),
             1,
-        );
+        )
+        .expect("build DiskAnnSegment");
 
         (seg, vectors, tmp)
     }
@@ -643,7 +647,8 @@ mod tests {
             0,
             4,
             0,
-        );
+        )
+        .expect("build DiskAnnSegment");
         let results = seg.search(&[0.0; 32], 5, 8);
         assert!(results.is_empty());
     }
@@ -733,7 +738,8 @@ mod tests {
             graph.entry_point(),
             graph.max_degree(),
             1,
-        );
+        )
+        .expect("build DiskAnnSegment");
 
         // If uring is None (tmpfs / O_DIRECT unsupported), skip gracefully.
         if !seg.has_uring() {
