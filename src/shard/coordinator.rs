@@ -177,6 +177,42 @@ fn run_local(
     crate::shard::slice::with_shard_db(db_index, run)
 }
 
+/// Maximum time to wait for a cross-shard reply after the request was
+/// successfully pushed into the target shard's ring buffer (prod-hardening
+/// #11). `spsc_send`'s retry budget only bounds getting the message INTO the
+/// ring; once the push succeeds, if the target shard then stalls while
+/// executing the command (a wedged-disk fsync during snapshot/AOF, an
+/// uninterruptible D-state I/O stall, or a dead shard), `reply_rx.recv().await`
+/// has no way to wake on its own and the awaiting client connection hangs
+/// forever with no response and no cancel. This is a safety ceiling far above
+/// any legitimate cross-shard command latency (including group-commit fsync
+/// under load) — it exists only so a genuinely wedged shard surfaces an error
+/// instead of an unbounded hang.
+const XSHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Await a cross-shard `reply_rx` with a bounded timeout (#11).
+///
+/// Returns `Err(RecvError)` on EITHER a closed channel (the target shard
+/// dropped the reply sender) OR expiry of [`XSHARD_REPLY_TIMEOUT`] — both mean
+/// "no usable reply", so every call site's existing error handling applies
+/// unchanged; the point is that neither case can hang the connection forever.
+async fn recv_reply_bounded<T: Send + 'static>(
+    reply_rx: channel::OneshotReceiver<T>,
+) -> Result<T, channel::RecvError> {
+    use crate::runtime::race::{Arm, race2};
+    let recv = std::pin::pin!(reply_rx);
+    #[cfg(feature = "runtime-tokio")]
+    let sleep = std::pin::pin!(tokio::time::sleep(XSHARD_REPLY_TIMEOUT));
+    #[cfg(feature = "runtime-monoio")]
+    let sleep = std::pin::pin!(monoio::time::sleep(XSHARD_REPLY_TIMEOUT));
+    // race2 polls the recv arm first, so a ready reply always wins the tie and
+    // the timer future is dropped un-fired (cheap deregister on both runtimes).
+    match race2(recv, sleep).await {
+        Arm::First(r) => r,
+        Arm::Second(()) => Err(channel::RecvError),
+    }
+}
+
 /// Send one full command to a REMOTE shard and await its reply.
 async fn run_remote(
     target_shard: usize,
@@ -196,7 +232,7 @@ async fn run_remote(
         reply_tx,
     };
     let _ = spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
-    match reply_rx.recv().await {
+    match recv_reply_bounded(reply_rx).await {
         Ok(mut frames) if !frames.is_empty() => frames.swap_remove(0),
         _ => Frame::Error(Bytes::from_static(b"ERR cross-shard reply channel closed")),
     }
@@ -227,7 +263,7 @@ pub(crate) async fn execute_txn_on_owner(
     };
     let msg = ShardMessage::TxnExecute(Box::new(payload));
     let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
-    reply_rx.recv().await.ok()
+    recv_reply_bounded(reply_rx).await.ok()
 }
 
 /// Run one full command on whichever shard owns `routing_key`.
@@ -536,7 +572,7 @@ async fn coordinate_bitop(
         }
     }
     for (indices, reply_rx) in pending {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
                 for (idx, frame) in indices.into_iter().zip(frames) {
                     match frame {
@@ -977,7 +1013,7 @@ pub(crate) async fn coordinate_flush_broadcast(
             failed.get_or_insert(target);
             continue;
         }
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(frames) if frames.iter().all(|f| !matches!(f, Frame::Error(_))) => {}
             _ => {
                 failed.get_or_insert(target);
@@ -1088,7 +1124,7 @@ async fn coordinate_mget(
 
     // Await all remote results
     for (indices, reply_rx) in pending_shards {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
                 for (idx, frame) in indices.into_iter().zip(frames) {
                     results[idx] = Some(frame);
@@ -1217,7 +1253,7 @@ async fn coordinate_mset(
     }
 
     for reply_rx in pending_shards {
-        let _ = reply_rx.recv().await;
+        let _ = recv_reply_bounded(reply_rx).await;
     }
 
     // Local leg (review Finding 1): persist a synthesized MSET over ONLY the
@@ -1455,7 +1491,7 @@ async fn coordinate_multi_del_or_exists(
     }
 
     for reply_rx in pending_shards {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
                 for frame in frames {
                     match frame {
@@ -1536,7 +1572,7 @@ pub async fn coordinate_keys(
 
     // Collect remote results
     for reply_rx in pending_shards {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(Frame::Array(keys)) => all_keys.extend(keys),
             Ok(_) => {} // Non-array response (e.g., error) — skip
             Err(_) => {
@@ -1620,7 +1656,7 @@ pub async fn coordinate_scan(
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(frame) => frame,
             Err(_) => Frame::Error(Bytes::from_static(
                 b"ERR cross-shard reply channel closed during SCAN",
@@ -1706,7 +1742,7 @@ pub async fn coordinate_dbsize(
     }
 
     for reply_rx in pending_shards {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(Frame::Integer(n)) => total += n,
             Ok(_) => {} // Non-integer response — skip
             Err(_) => {
@@ -1766,7 +1802,7 @@ pub async fn coordinate_hotkeys(
     }
 
     for reply_rx in pending_shards {
-        match reply_rx.recv().await {
+        match recv_reply_bounded(reply_rx).await {
             Ok(Frame::Array(entries)) => {
                 for entry in entries.iter() {
                     if let Frame::Array(pair) = entry

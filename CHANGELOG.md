@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Xshard: bound cross-shard reply wait so a wedged shard can't hang a client (PR #TBD)
+
+- Every cross-shard leg (MGET/MSET/DEL/UNLINK/EXISTS/BITOP/COPY/MSETNX remote
+  legs, MULTI-on-owner, and the flush/scatter-gather loops) pushed a message via
+  the backoff-retried `spsc_send` and then did `reply_rx.recv().await` with **no
+  timeout**. `spsc_send`'s retry budget only bounds getting the message INTO the
+  target ring buffer; if the push succeeds but the target shard then stalls while
+  executing (wedged-disk fsync during snapshot/AOF, uninterruptible D-state I/O,
+  or a dead shard), the awaiting connection parked forever with no response and
+  no way to cancel. Added a `recv_reply_bounded` helper (races the receiver
+  against a runtime-agnostic 30s `XSHARD_REPLY_TIMEOUT` via `race2`) and applied
+  it to all 11 reply-await sites in the coordinator — a genuinely wedged shard
+  now surfaces the existing cross-shard-reply error instead of hanging. (audit finding 11)
+
 ### Fixed — Hardening: bound TLS handshake + cluster-bus body reads against slow-loris (PR #TBD)
 
 - **TLS handshake has no timeout (#17):** after `try_accept_connection` consumed
