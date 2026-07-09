@@ -106,3 +106,6 @@ tmp/
 /target-check-monoio/
 /target-check/
 target-fast/
+
+# replication test-run artifact (written to CWD by save_replication_state)
+replication.state

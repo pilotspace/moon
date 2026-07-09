@@ -49,6 +49,23 @@ jobs:
             echo "version=${REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: actions/checkout@v7
+        if: github.event_name == 'push'
+
+      # Release-ledger gate: a version tag whose entry is missing from
+      # RELEASES.md fails here, before any build minutes are spent.
+      # (v0.6.0 shipped 2026-07-08 with no ledger entry until 2026-07-10 —
+      # this step makes that class of lag structurally impossible.)
+      - name: Require RELEASES.md entry for this tag
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if ! grep -q "^## ${VERSION} " RELEASES.md; then
+            echo "::error file=RELEASES.md::No '## ${VERSION} — <date>' entry in RELEASES.md. Land the ledger entry before (or with) the tag."
+            exit 1
+          fi
+
   # ── 1. Build web console ──────────────────────────────────────────────────
   prepare-console:
     name: Build Console
