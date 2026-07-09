@@ -6,6 +6,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
+
+- **`--maxmemory` now counts vector segment memory.** The background eviction
+  check compared only KV bytes against the per-shard budget, so a pure-vector
+  workload could drive RSS to OOM while eviction reported "under budget".
+  `timers::run_eviction` now adds the shard's published vector resident bytes
+  (one Relaxed load per 100ms tick) to the used total. When the un-evictable
+  vector term alone exceeds the budget, the bounded loop drains KV then
+  returns OOM; the pressure cascade (which shrinks vectors via offload) fires
+  earlier at `--disk-offload-threshold`, so with disk-offload enabled vectors
+  shed first.
+- **Elastic budget classification is vector-aware.** A vector-heavy/KV-light
+  shard was misclassified as an idle donor, lending headroom to siblings while
+  its true footprint was over base — and the pressure cascade compared a
+  vector-inclusive used-term against a budget inflated by that donation. The
+  donor/hot snapshot now sums KV + vector per shard; a vector-heavy shard is
+  classified hot and borrows instead of donating.
+- **`--vec-warm-mmap-budget` is now an instance-total cap divided across
+  shards** (matching `--maxmemory` semantics). Each shard previously applied
+  the full value — an N-shard instance silently allowed N× the configured WARM
+  memory. **Behavior change:** multi-shard deployments relying on the old
+  per-shard meaning should multiply their flag value by the shard count. A
+  nonzero total floors at 1 byte/shard ("0" still disables enforcement).
+- **IVF and DiskANN-cold segments report real `resident_bytes()`.** Both tiers
+  contributed a hardcoded 0 to the roll-up (untracked RAM: IVF centroids +
+  posting lists; DiskANN PQ codes + codebook). They now feed the pressure
+  trigger, MEMORY DOCTOR, and Prometheus like every other tier.
+- **`INFO reclamation_mmap_warm_bytes` reports the live WARM counter.** The
+  field read a never-incremented local static (permanent 0) while the real
+  `MmapBudget` counter was write-only. It now reads the live counter, and a
+  new `reclamation_mmap_budget_evictions_total` field exposes cumulative
+  byte-cap evictions.
+- **D9 (DiskANN retention) quarantine:** config docs now disambiguate
+  COLD-stub (`unloaded`, exact reload-on-touch default valve) vs COLD-ann
+  (`cold`, DiskANN serve-from-disk, inert behind `MOON_VEC_COLD_TIER`); the
+  dead knobs are marked `[reserved: M3/M5]`. Keep-vs-delete is decided at the
+  M3 exit-review on real per-index query-frequency telemetry.
+
 ### Fixed — Vector: memory-aware WARM offload with a real, reloadable ceiling (PR #252)
 
 - **Reloadable byte-cap eviction (A).** `MmapBudget::enforce_budget` (the
