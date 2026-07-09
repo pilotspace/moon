@@ -364,6 +364,13 @@ pub async fn run_gossip_ticker(
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut election_spawned = false;
+    // Bound outstanding PING probes: a dead/partitioned peer must not leak a
+    // new connect+read task every 100ms. `ping_in_flight` allows at most one
+    // outstanding probe at a time; `ping_rotation` spreads probes across peers
+    // (the "random peer" the doc promised — the old code always picked the
+    // first non-self node).
+    let ping_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut ping_rotation: usize = 0;
     loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -408,36 +415,60 @@ pub async fn run_gossip_ticker(
                         }
                     }
 
-                    let target = cs.nodes.values()
+                    // Rotate across peers instead of always pinging the first.
+                    let peer_count = cs
+                        .nodes
+                        .values()
                         .filter(|n| n.node_id != cs.node_id)
-                        .next()
-                        .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port));
+                        .count();
+                    let target = if peer_count == 0 {
+                        None
+                    } else {
+                        let idx = ping_rotation % peer_count;
+                        ping_rotation = ping_rotation.wrapping_add(1);
+                        cs.nodes
+                            .values()
+                            .filter(|n| n.node_id != cs.node_id)
+                            .nth(idx)
+                            .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port))
+                    };
                     let msg = build_message(&cs, self_addr, GossipMsgType::Ping);
                     cs.messages_sent += 1;
                     (target, msg)
                 };
                 if let Some(target_addr) = target_addr {
-                    let cs = cluster_state.clone();
-                    tokio::spawn(async move {
-                        if let Ok(mut stream) = TcpStream::connect(target_addr).await {
-                            let data = serialize_gossip(&ping_msg);
-                            let len = (data.len() as u32).to_be_bytes();
-                            let _ = stream.write_all(&len).await;
-                            let _ = stream.write_all(&data).await;
-                            // Read PONG response
-                            let mut len_buf = [0u8; 4];
-                            if stream.read_exact(&mut len_buf).await.is_ok() {
-                                let pong_len = u32::from_be_bytes(len_buf) as usize;
-                                let mut pong_buf = vec![0u8; pong_len];
-                                if stream.read_exact(&mut pong_buf).await.is_ok() {
-                                    if let Ok(pong) = deserialize_gossip(&pong_buf) {
-                                        let mut cs2 = cs.write().unwrap();
-                                        merge_gossip_into_state(&mut cs2, &pong);
+                    // Skip if the previous probe hasn't resolved yet — bounds
+                    // outstanding tasks to one even against a dead peer.
+                    if !ping_in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let cs = cluster_state.clone();
+                        let inflight = ping_in_flight.clone();
+                        let probe_timeout =
+                            Duration::from_millis((node_timeout_ms / 2).max(100));
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(probe_timeout, async move {
+                                if let Ok(mut stream) = TcpStream::connect(target_addr).await {
+                                    let data = serialize_gossip(&ping_msg);
+                                    let len = (data.len() as u32).to_be_bytes();
+                                    let _ = stream.write_all(&len).await;
+                                    let _ = stream.write_all(&data).await;
+                                    // Read PONG response
+                                    let mut len_buf = [0u8; 4];
+                                    if stream.read_exact(&mut len_buf).await.is_ok() {
+                                        let pong_len = u32::from_be_bytes(len_buf) as usize;
+                                        let mut pong_buf = vec![0u8; pong_len];
+                                        if stream.read_exact(&mut pong_buf).await.is_ok() {
+                                            if let Ok(pong) = deserialize_gossip(&pong_buf) {
+                                                let mut cs2 = cs.write().unwrap();
+                                                merge_gossip_into_state(&mut cs2, &pong);
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                    });
+                            })
+                            .await;
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                 }
             }
             _ = shutdown.cancelled() => break,
@@ -460,6 +491,10 @@ pub async fn run_gossip_ticker(
     repl_state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
 ) {
     let mut election_spawned = false;
+    // Bound outstanding PING probes (see the tokio variant): one probe at a
+    // time, rotating across peers, so a dead peer can't leak a task per tick.
+    let ping_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut ping_rotation: usize = 0;
     loop {
         monoio::select! {
             _ = monoio::time::sleep(Duration::from_millis(100)) => {
@@ -502,45 +537,72 @@ pub async fn run_gossip_ticker(
                         }
                     }
 
-                    let target = cs.nodes.values()
+                    // Rotate across peers instead of always pinging the first.
+                    let peer_count = cs
+                        .nodes
+                        .values()
                         .filter(|n| n.node_id != cs.node_id)
-                        .next()
-                        .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port));
+                        .count();
+                    let target = if peer_count == 0 {
+                        None
+                    } else {
+                        let idx = ping_rotation % peer_count;
+                        ping_rotation = ping_rotation.wrapping_add(1);
+                        cs.nodes
+                            .values()
+                            .filter(|n| n.node_id != cs.node_id)
+                            .nth(idx)
+                            .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port))
+                    };
                     let msg = build_message(&cs, self_addr, GossipMsgType::Ping);
                     cs.messages_sent += 1;
                     (target, msg)
                 };
                 if let Some(target_addr) = target_addr {
-                    let cs = cluster_state.clone();
-                    monoio::spawn(async move {
-                        if let Ok(mut stream) = monoio::net::TcpStream::connect(target_addr).await {
-                            let data = serialize_gossip(&ping_msg);
-                            let len = (data.len() as u32).to_be_bytes();
-                            let len_vec = len.to_vec();
-                            let (wr, _) = stream.write_all(len_vec).await;
-                            if wr.is_err() { return; }
-                            let (wr, _) = stream.write_all(data).await;
-                            if wr.is_err() { return; }
-                            // Read PONG response
-                            let len_buf = vec![0u8; 4];
-                            let (res, len_buf) = stream.read(len_buf).await;
-                            if let Ok(4) = res {
-                                let pong_len = u32::from_be_bytes(
-                                    len_buf[..4].try_into().unwrap(),
-                                ) as usize;
-                                let pong_buf = vec![0u8; pong_len];
-                                let (res, pong_buf) = stream.read(pong_buf).await;
-                                if let Ok(n) = res {
-                                    if n == pong_len {
-                                        if let Ok(pong) = deserialize_gossip(&pong_buf) {
-                                            let mut cs2 = cs.write().unwrap();
-                                            merge_gossip_into_state(&mut cs2, &pong);
+                    // Skip if the previous probe hasn't resolved yet — bounds
+                    // outstanding tasks to one even against a dead peer, and a
+                    // sleep-race timeout cancels a hung connect/read.
+                    if !ping_in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let cs = cluster_state.clone();
+                        let inflight = ping_in_flight.clone();
+                        let probe_timeout =
+                            Duration::from_millis((node_timeout_ms / 2).max(100));
+                        monoio::spawn(async move {
+                            monoio::select! {
+                                _ = async {
+                                    if let Ok(mut stream) = monoio::net::TcpStream::connect(target_addr).await {
+                                        let data = serialize_gossip(&ping_msg);
+                                        let len = (data.len() as u32).to_be_bytes();
+                                        let len_vec = len.to_vec();
+                                        let (wr, _) = stream.write_all(len_vec).await;
+                                        if wr.is_err() { return; }
+                                        let (wr, _) = stream.write_all(data).await;
+                                        if wr.is_err() { return; }
+                                        // Read PONG response
+                                        let len_buf = vec![0u8; 4];
+                                        let (res, len_buf) = stream.read(len_buf).await;
+                                        if let Ok(4) = res {
+                                            let pong_len = u32::from_be_bytes(
+                                                len_buf[..4].try_into().unwrap(),
+                                            ) as usize;
+                                            let pong_buf = vec![0u8; pong_len];
+                                            let (res, pong_buf) = stream.read(pong_buf).await;
+                                            if let Ok(n) = res {
+                                                if n == pong_len {
+                                                    if let Ok(pong) = deserialize_gossip(&pong_buf) {
+                                                        let mut cs2 = cs.write().unwrap();
+                                                        merge_gossip_into_state(&mut cs2, &pong);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                }
+                                } => {}
+                                _ = monoio::time::sleep(probe_timeout) => {}
                             }
-                        }
-                    });
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                 }
             }
             _ = shutdown.cancelled() => break,

@@ -330,7 +330,14 @@ impl super::Shard {
                                     // which relinquished ownership. We take sole ownership here.
                                     unsafe { std::net::TcpStream::from_raw_fd(fd) }
                                 };
-                                if tx.send(std_stream).is_err() {
+                                // send_async (not the blocking send): the accept
+                                // task shares this shard's single monoio thread
+                                // with the event-loop consumer, so a blocking
+                                // send on a full channel would stall the loop
+                                // that drains it -> shard deadlock. Awaiting
+                                // yields cooperatively and keeps backpressure
+                                // (no dropped connections).
+                                if tx.send_async(std_stream).await.is_err() {
                                     break; // receiver dropped, shard shutting down
                                 }
                             }

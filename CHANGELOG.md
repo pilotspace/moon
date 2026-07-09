@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Cluster: gossip PING task leak + non-blocking accept send (PR #TBD)
+
+- The gossip PING ticker (both tokio + monoio) spawned an unbounded
+  connect+write+read task every 100ms with **no timeout**; against a dead or
+  partitioned peer the tasks piled up forever (task/FD/memory leak), and the
+  "random peer" it documented was always the first non-self node. Now a single
+  in-flight guard bounds outstanding probes to one, a probe timeout
+  (`node_timeout/2`, ≥100ms) cancels a hung connect/read, and targets rotate
+  across peers. (audit finding 7)
+- The monoio per-shard accept task used the **blocking** `flume::Sender::send()`
+  on a bounded channel; because the accept task shares the shard's single
+  monoio thread with the event-loop consumer, a full channel deadlocked the
+  loop that drains it under connection-storm churn. Fixed by `send_async().await`
+  (cooperative yield, keeps backpressure). (audit finding 8, Batch B)
+
 ### Fixed — Security: bound client-controlled allocation counts (DoS class, PR #TBD)
 
 - Six wire-reachable command paths fed a client-supplied count straight into
