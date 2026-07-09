@@ -134,6 +134,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wall-clock timeout with zero actual test failures. Bumped to 30m to match
   the Windows Test step's headroom; removes recurring false-negative reds on
   rebased branches.
+### Fixed — Disk-offload: crash recovery no longer resurrects deleted cold keys, nor drops the AOF after a spill (PR #TBD)
+
+- **Deleted/flushed cold keys stayed deleted only until the next crash.** A
+  DEL/UNLINK/FLUSHALL/FLUSHDB of a spilled key tombstones the in-memory
+  ColdIndex, but the manifest entry stays `Active` until the orphan sweep. A
+  kill-9 inside that window lost the tombstone, and boot-time replay could not
+  re-apply it: the replayed DEL ran against databases whose `cold_index` was
+  `None` — a silent cold-plane no-op — so the key resurrected via cold
+  read-through (measured 85–97/200 probes under `--appendonly yes` +
+  `--disk-offload`). Two detach points fixed: (a) `recover_shard_v3_pitr` now
+  attaches the Phase-3-rebuilt ColdIndex to the databases BEFORE Phase 4 WAL
+  replay (was: stashed on `RecoveryResult`, merged only after recovery
+  returned); (b) the per-shard/multi-part AOF replay now keeps cold wiring
+  live during incr replay — main.rs re-attaches it after the pre-replay hot
+  wipe, and `replay_per_shard`/`replay_multi_part` bridge it across
+  `rdb::load`'s wholesale database swap (which silently dropped it). New
+  crash suite `tests/crash_recovery_cold_del_resurrection.rs` (DEL + FLUSHALL
+  scenarios, kill-9 inside the pre-sweep window).
+- **Any disk-offload spill silently discarded the AOF on the next restart.**
+  The "WAL replayed 0 commands → fall back to the AOF" gate counted vector +
+  file-lifecycle records: after a spill wrote `FileCreate` records into the
+  shard WAL, the gate saw a "non-empty" WAL, skipped `appendonly.aof` (the
+  only complete KV history — `--wal-kv-log` is auto-off when the AOF is the
+  authority), and every KV write since the last snapshot was lost. The gate
+  now keys on KV `Command` records only.
 
 ### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #250)
 

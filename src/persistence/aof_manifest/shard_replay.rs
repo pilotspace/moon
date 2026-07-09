@@ -6,6 +6,40 @@
 
 use super::*;
 
+/// Cold-tier wiring (`cold_shard_dir` + `cold_index`) captured per database so
+/// it survives the `rdb::load` swap. See [`take_cold_wiring`].
+type ColdWiring = Vec<(
+    Option<std::path::PathBuf>,
+    Option<crate::storage::tiered::cold_index::ColdIndex>,
+)>;
+
+/// Detach cold-tier wiring from every database before an `rdb::load`.
+///
+/// `rdb::load` loads the base RDB into fresh `Database::new()` temporaries and
+/// swaps them wholesale into the live databases (`*live = temp`). That swap
+/// silently drops `cold_shard_dir` and the recovery-rebuilt `cold_index` —
+/// live-tier topology, not part of the RDB hot snapshot. Capture both here and
+/// re-attach with [`restore_cold_wiring`] BEFORE the incr replay: replayed
+/// DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane, and with
+/// `cold_index == None` those paths (`remove_counting_cold()`/`clear()`) are
+/// silent cold no-ops, so a key deleted in the incr tail resurrects via cold
+/// read-through after restart (its manifest entry stays Active until the
+/// orphan sweep).
+fn take_cold_wiring(databases: &mut [crate::storage::Database]) -> ColdWiring {
+    databases
+        .iter_mut()
+        .map(|db| (db.cold_shard_dir.take(), db.cold_index.take()))
+        .collect()
+}
+
+/// Re-attach wiring captured by [`take_cold_wiring`].
+fn restore_cold_wiring(databases: &mut [crate::storage::Database], wiring: ColdWiring) {
+    for (db, (cold_shard_dir, cold_index)) in databases.iter_mut().zip(wiring) {
+        db.cold_shard_dir = cold_shard_dir;
+        db.cold_index = cold_index;
+    }
+}
+
 /// Replay multi-part AOF: load base RDB then replay incremental RESP.
 ///
 /// Returns total keys/commands loaded.
@@ -16,10 +50,15 @@ pub fn replay_multi_part(
 ) -> Result<usize, crate::error::MoonError> {
     let mut total = 0usize;
 
-    // Load base RDB
+    // Load base RDB. Cold wiring must survive the swap AND be live for the
+    // incr replay below (replayed DEL/FLUSH must tombstone the cold plane) —
+    // see take_cold_wiring.
     let base_path = manifest.base_path();
     if base_path.exists() {
-        match crate::persistence::rdb::load(databases, &base_path) {
+        let cold_wiring = take_cold_wiring(databases);
+        let load_result = crate::persistence::rdb::load(databases, &base_path);
+        restore_cold_wiring(databases, cold_wiring);
+        match load_result {
             Ok(n) => {
                 info!(
                     "AOF base RDB loaded: {} keys from {}",
@@ -439,9 +478,15 @@ pub fn replay_per_shard(
                 let mut shard_max_lsn: u64 = 0;
                 let mut shard_ordered: Vec<OrderedEntry> = Vec::new();
 
-                // Load this shard's base RDB.
+                // Load this shard's base RDB. Cold wiring must survive the
+                // swap AND be live for the incr replay below (replayed
+                // DEL/FLUSH must tombstone the cold plane) — see
+                // take_cold_wiring.
                 if base_path.exists() {
-                    match crate::persistence::rdb::load(*databases, &base_path) {
+                    let cold_wiring = take_cold_wiring(databases);
+                    let load_result = crate::persistence::rdb::load(*databases, &base_path);
+                    restore_cold_wiring(databases, cold_wiring);
+                    match load_result {
                         Ok(n) => {
                             info!(
                                 "AOF shard-{} base RDB loaded: {} keys from {}",

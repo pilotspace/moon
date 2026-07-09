@@ -170,6 +170,11 @@ impl Shard {
                         );
                         // Initialize cold_index + cold_shard_dir on all databases
                         // so cold_read_through can find keys spilled to NVMe.
+                        // The recovered index itself was already attached to
+                        // databases[0] BEFORE Phase 4 replay (inside
+                        // recover_shard_v3_pitr) so replayed DEL/FLUSH/EXPIRE
+                        // tombstone the cold plane; here we only backfill empty
+                        // indexes on the remaining databases.
                         {
                             let cold_dir = shard_dir.clone();
                             for db in &mut self.databases {
@@ -177,11 +182,6 @@ impl Shard {
                                 if db.cold_index.is_none() {
                                     db.cold_index =
                                         Some(crate::storage::tiered::cold_index::ColdIndex::new());
-                                }
-                            }
-                            if let Some(recovered_ci) = result.cold_index {
-                                if let Some(ref mut ci) = self.databases[0].cold_index {
-                                    ci.merge(recovered_ci);
                                 }
                             }
                         }

@@ -1174,12 +1174,13 @@ fn main() -> anyhow::Result<()> {
     // (eviction.rs::next_spill_file_id_seed): the seed keeps recovered cold
     // files immutable so these preserved entries stay valid until the
     // steady-state cascade refreshes them.
-    let preserved_cold_wiring: Vec<
+    type PreservedColdWiring = Vec<
         Vec<(
             Option<std::path::PathBuf>,
             Option<moon::storage::tiered::cold_index::ColdIndex>,
         )>,
-    > = if disk_offload_base.is_some() {
+    >;
+    let mut preserved_cold_wiring: PreservedColdWiring = if disk_offload_base.is_some() {
         shards
             .iter_mut()
             .map(|s| {
@@ -1192,6 +1193,23 @@ fn main() -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
+    // Consuming re-attach: first call restores the wiring, later calls no-op.
+    // Called (a) after each replay branch's hot wipe and BEFORE its replay —
+    // replayed DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane,
+    // and with `cold_index == None` those paths are silent cold no-ops, so a
+    // key deleted in the AOF tail resurrects via cold read-through after
+    // restart — and (b) unconditionally after the whole block for the
+    // branches that never replay (fresh boot, tokio single-shard).
+    // `rdb::load`'s wholesale `*live = temp` swap inside the replay is
+    // bridged separately (take/restore around the load in shard_replay.rs).
+    fn reattach_cold_wiring(shards: &mut [moon::shard::Shard], wiring: &mut PreservedColdWiring) {
+        for (shard, dbs) in shards.iter_mut().zip(std::mem::take(wiring)) {
+            for (db, (cold_shard_dir, cold_index)) in shard.databases.iter_mut().zip(dbs) {
+                db.cold_shard_dir = cold_shard_dir;
+                db.cold_index = cold_index;
+            }
+        }
+    }
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -1220,6 +1238,8 @@ fn main() -> anyhow::Result<()> {
                     for db in shards[0].databases.iter_mut() {
                         db.clear();
                     }
+                    // Cold wiring live during replay — see reattach_cold_wiring.
+                    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                     let loaded = moon::persistence::aof_manifest::replay_multi_part(
                         &mut shards[0].databases,
                         manifest,
@@ -1280,6 +1300,8 @@ fn main() -> anyhow::Result<()> {
                         db.clear();
                     }
                 }
+                // Cold wiring live during replay — see reattach_cold_wiring.
+                reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
 
                 // Borrow each shard's `databases` mutably and route through
                 // `replay_per_shard`. The split_at_mut walk constructs a
@@ -1470,19 +1492,14 @@ fn main() -> anyhow::Result<()> {
     // removed: multi-shard PerShard AOF is now loaded on tokio too, and the
     // single-shard tokio warn is emitted inline above.)
 
-    // ── B-2: re-attach cold-tier wiring dropped by the rdb::load swap ───────
-    // Restore the `cold_shard_dir` + rebuilt `cold_index` captured before the
-    // AOF replay block. Without this, the handler reads a database with
-    // `cold_shard_dir = None`, so every read-through of a re-evicted key misses
-    // and disk-offload silently loses data across a restart.
-    if !preserved_cold_wiring.is_empty() {
-        for (shard, dbs) in shards.iter_mut().zip(preserved_cold_wiring) {
-            for (db, (cold_shard_dir, cold_index)) in shard.databases.iter_mut().zip(dbs) {
-                db.cold_shard_dir = cold_shard_dir;
-                db.cold_index = cold_index;
-            }
-        }
-    }
+    // ── B-2: re-attach cold-tier wiring for the branches that never replayed ─
+    // The replay branches above already consumed the wiring (it must be live
+    // DURING replay so DEL/FLUSH tombstone the cold plane); this covers fresh
+    // boots and the tokio single-shard path. Without it, the handler reads a
+    // database with `cold_shard_dir = None`, so every read-through of a
+    // re-evicted key misses and disk-offload silently loses data across a
+    // restart. No-op when already consumed.
+    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
 
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
