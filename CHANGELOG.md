@@ -11,12 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--maxmemory` now counts vector segment memory.** The background eviction
   check compared only KV bytes against the per-shard budget, so a pure-vector
   workload could drive RSS to OOM while eviction reported "under budget".
-  `timers::run_eviction` now adds the shard's published vector resident bytes
-  (one Relaxed load per 100ms tick) to the used total. When the un-evictable
-  vector term alone exceeds the budget, the bounded loop drains KV then
-  returns OOM; the pressure cascade (which shrinks vectors via offload) fires
+  `timers::run_eviction` now gates on the shard AGGREGATE — Σ all dbs' KV +
+  the shard's published vector bytes, computed once per 100ms tick — and
+  evicts across dbs only until the aggregate is back under budget (adversarial
+  review caught the initial per-db formulation, which both under-detected with
+  KV spread across dbs and over-evicted sibling dbs). When the un-evictable
+  vector term alone exceeds the budget, KV drains then errors OOM
+  (shared-budget semantics; per-db quotas remain the tenant-isolation
+  mechanism); the pressure cascade (which shrinks vectors via offload) fires
   earlier at `--disk-offload-threshold`, so with disk-offload enabled vectors
-  shed first.
+  shed first. **Known limitation:** the on-write eviction gate still checks
+  KV-only, so under `noeviction` a vector-heavy shard over the vector-aware
+  budget does not yet reject client writes — RSS is bounded by the pressure
+  cascade and the RSS watchdog instead (write-gate consistency is a tracked
+  M1 follow-up).
 - **Elastic budget classification is vector-aware.** A vector-heavy/KV-light
   shard was misclassified as an idle donor, lending headroom to siblings while
   its true footprint was over base — and the pressure cascade compared a

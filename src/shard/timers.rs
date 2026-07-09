@@ -50,24 +50,47 @@ pub(crate) fn run_eviction(
         // toward maxmemory — it is data-plane memory. Published by the same
         // 100ms tick (`run_eviction_tick` stores it before calling us; lag
         // ≤ 1 tick, documented acceptable). One Relaxed load per tick, no
-        // recompute on this path. When the un-evictable vector term alone
-        // exceeds the budget, the bounded loop drains KV then returns OOM;
-        // the pressure cascade (which CAN shrink vectors via offload to
-        // COLD) fires earlier at `--disk-offload-threshold` (0.85×budget),
-        // so with disk-offload enabled vectors shed first.
+        // recompute on this path.
+        //
+        // REVIEW FIX (CRITICAL, perf+security reviews concurring): the
+        // used-term is an AGGREGATE — Σ all dbs' KV + the shard's vector
+        // bytes, computed ONCE — never the shard-wide vector term re-added
+        // to each logical db's independent check. Per-db duplication both
+        // under-detected (KV spread across dbs, no single db + vector over
+        // budget ⇒ nothing evicted while aggregate RSS overran) and
+        // over-evicted (vector term over budget ⇒ every db drained instead
+        // of stopping at the aggregate target).
+        //
+        // Semantics when the un-evictable vector term alone exceeds the
+        // budget: KV drains then errors OOM — the vector tier legitimately
+        // owns that memory (shared-budget, same as one tenant's KV growth
+        // evicting siblings under allkeys-lru); per-db quotas (WS5b) remain
+        // the tenant-isolation mechanism. The pressure cascade (which CAN
+        // shrink vectors via offload to COLD) fires earlier at
+        // `--disk-offload-threshold` (0.85×budget), so with disk-offload
+        // enabled vectors shed first.
         let vector_bytes = shard_databases.store_memory_per_shard[shard_id]
             .vector
             .load(std::sync::atomic::Ordering::Relaxed);
         let db_count = shard_databases.db_count();
+        let mut kv_total: usize = 0;
+        for i in 0..db_count {
+            kv_total = kv_total.saturating_add(crate::shard::slice::with_shard_db(i, |db| {
+                db.estimated_memory()
+            }));
+        }
+        // Running aggregate: each db's eviction reduces it by what that db
+        // actually freed; once it drops to the budget, remaining dbs see an
+        // under-budget total and return immediately (no eviction).
+        let mut remaining = kv_total.saturating_add(vector_bytes);
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
+                let before = db.estimated_memory();
                 let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
-                    db,
-                    &rt,
-                    None,
-                    db.estimated_memory().saturating_add(vector_bytes),
-                    budget,
+                    db, &rt, None, remaining, budget,
                 );
+                let freed = before.saturating_sub(db.estimated_memory());
+                remaining = remaining.saturating_sub(freed);
             });
         }
     }
@@ -396,6 +419,68 @@ mod tests {
     use bytes::Bytes;
     use std::sync::atomic::Ordering;
 
+    /// A3 review fix (CRITICAL, both adversarial reviews): the shard-wide
+    /// vector term must gate an AGGREGATE check (Σ all dbs' KV + vector),
+    /// not be re-added to every logical db's independent check. The per-db
+    /// duplication had two failure modes:
+    ///  1. under-detection — KV spread across dbs where no single
+    ///     `db_i + vector` crosses budget ⇒ nothing evicts while true
+    ///     aggregate RSS overruns (the very bug A3 claimed to fix);
+    ///  2. over-eviction — a vector term over budget independently drained
+    ///     EVERY db on the shard (multi-tenant blast radius), instead of
+    ///     evicting only until the aggregate is back under budget.
+    /// This test pins both: two dbs each individually under budget with the
+    /// vector term, aggregate over — eviction must fire (kills mode 1) and
+    /// must stop once the aggregate is satisfied, leaving db 1 untouched
+    /// (kills mode 2).
+    #[test]
+    fn test_run_eviction_gates_on_aggregate_not_per_db() {
+        let dbs = vec![vec![Database::new(), Database::new()]];
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
+
+        // ~256 KiB of KV per db (64 keys × 4 KiB values).
+        for db_idx in 0..2 {
+            crate::shard::slice::with_shard_db(db_idx, |db| {
+                for i in 0..64u32 {
+                    db.set_string(
+                        Bytes::from(format!("db{db_idx}:key:{i}")),
+                        Bytes::from(vec![b'v'; 4096]),
+                    );
+                }
+            });
+        }
+
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1024 * 1024; // 1 MiB budget, 1 shard
+        rt.num_shards = 1;
+        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
+
+        // 700 KiB vector term: each db alone is ~256K + 700K < 1 MiB (the
+        // per-db check would pass ⇒ old code evicts NOTHING), but the
+        // aggregate ~512K + 700K > 1 MiB must evict.
+        shared.store_memory_per_shard[0]
+            .vector
+            .store(700 * 1024, Ordering::Relaxed);
+        run_eviction(&shared, 0, &runtime_config);
+
+        let len0 = crate::shard::slice::with_shard_db(0, |db| db.len());
+        let len1 = crate::shard::slice::with_shard_db(1, |db| db.len());
+        assert!(
+            len0 < 64,
+            "aggregate over budget must evict even when no single db crosses it (db0 {len0})"
+        );
+        // The overage (~190 KiB) is smaller than db0's ~256 KiB, so eviction
+        // must satisfy the aggregate within db0 and never touch db1.
+        assert_eq!(
+            len1, 64,
+            "eviction must stop at the aggregate target, not drain sibling dbs"
+        );
+    }
+
     /// A3 (accounting spine): published vector resident bytes must count
     /// toward the background maxmemory eviction check. A vector-heavy shard
     /// whose KV alone is under budget previously never evicted — vector RAM
@@ -403,10 +488,13 @@ mod tests {
     /// RSS to OOM while eviction reported "under budget". RED until
     /// `run_eviction` adds the published vector term to the used total.
     ///
-    /// Note on semantics: when the un-evictable vector term alone exceeds the
-    /// budget, the bounded eviction loop drains the db then returns OOM — the
-    /// vector tier legitimately owns that memory, and the pressure cascade
-    /// (which CAN shrink vectors via offload) fires earlier at 0.85×budget.
+    /// Note on semantics: when the un-evictable vector term alone exceeds
+    /// the budget, KV on the shard fully drains then errors OOM — the vector
+    /// tier legitimately owns that memory (shared-budget semantics, same as
+    /// one tenant's KV growth evicting siblings under allkeys-lru), and the
+    /// pressure cascade (which CAN shrink vectors via offload) fires earlier
+    /// at 0.85×budget. Per-db tenant isolation remains the per-db quota
+    /// mechanism (WS5b), not --maxmemory.
     #[test]
     fn test_run_eviction_counts_vector_memory() {
         let dbs = vec![vec![Database::new()]];

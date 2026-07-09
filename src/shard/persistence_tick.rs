@@ -336,30 +336,13 @@ pub(crate) fn run_eviction_tick(
     // per 100ms tick. Siblings read the published snapshot on their own
     // ticks, so every budget is at most one tick stale — the same slack the
     // static scheme already has between eviction passes.
-    {
-        let rt = runtime_config.read();
-        // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
-        // lock acquisitions (avoids per-DB read locks; estimated_memory() is
-        // an O(1) accumulator read). Published unconditionally: MEMORY DOCTOR
-        // and the Prometheus KV gauge read this atomic even when maxmemory is
-        // unlimited — gating it on maxmemory > 0 left them at a permanent 0.
-        let used = crate::shard::slice::with_shard(|s| {
-            s.databases
-                .iter()
-                .map(|db| db.estimated_memory())
-                .sum::<usize>()
-        });
-        shard_databases.publish_memory(shard_id, used);
-        // Elastic budgets only exist under a finite maxmemory cap.
-        if rt.maxmemory > 0 {
-            shard_databases.recompute_elastic_budget(shard_id, &rt);
-        }
-    }
-
     // C5 / M4: publish vector/text/graph store memory for lock-free observers.
     // Uses the existing lock path (Wave E collapses to slice). Runs every tick
     // so Prometheus and MEMORY DOCTOR never see stale zero values for long.
-    // C5 / M4: publish vector/text/graph store-memory atomics via thread-local slice.
+    // A4 review (LOW): published BEFORE the KV publish + elastic recompute
+    // below so the recompute's vector-aware donor/hot classification reads
+    // THIS tick's vector figure, not last tick's (siblings' figures remain
+    // ≤ 1 tick stale by design).
     let vector_resident_bytes = crate::shard::slice::with_shard(|s| {
         use std::sync::atomic::Ordering;
         let (mutable, immutable) = s.vector_store.resident_bytes();
@@ -384,6 +367,26 @@ pub(crate) fn run_eviction_tick(
         // below can factor it in (memory-triggered vector offload, C).
         mutable + immutable
     });
+
+    {
+        let rt = runtime_config.read();
+        // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
+        // lock acquisitions (avoids per-DB read locks; estimated_memory() is
+        // an O(1) accumulator read). Published unconditionally: MEMORY DOCTOR
+        // and the Prometheus KV gauge read this atomic even when maxmemory is
+        // unlimited — gating it on maxmemory > 0 left them at a permanent 0.
+        let used = crate::shard::slice::with_shard(|s| {
+            s.databases
+                .iter()
+                .map(|db| db.estimated_memory())
+                .sum::<usize>()
+        });
+        shard_databases.publish_memory(shard_id, used);
+        // Elastic budgets only exist under a finite maxmemory cap.
+        if rt.maxmemory > 0 {
+            shard_databases.recompute_elastic_budget(shard_id, &rt);
+        }
+    }
 
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
@@ -630,6 +633,16 @@ pub(crate) fn handle_memory_pressure(
     // Compare this shard's aggregate (across its DBs) against the PER-SHARD
     // budget (maxmemory/num_shards) so the summed eviction across shards bounds
     // aggregate RSS at the whole-instance maxmemory.
+    //
+    // A3 review (MEDIUM): this used-term stays KV-only DELIBERATELY, unlike
+    // `timers::run_eviction` (the disk-offload-off path), which adds the
+    // shard's vector bytes. Inside the cascade the vector term has already
+    // pulled its weight: it fired the trigger (`should_run_pressure_cascade`
+    // is vector-inclusive) and step 2 sheds vector memory directly via
+    // offload-to-COLD. Adding it here too would evict KV to pay for memory
+    // that step 2 is already reclaiming more cheaply; the trigger refires
+    // every 100ms tick, so the cascade converges with vectors shedding
+    // first and KV eviction as the residual step.
     //
     // When a SpillThread is available, use the async path: entries are removed
     // from DashTable immediately (freeing RAM) and pwrite is deferred to the
