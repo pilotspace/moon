@@ -106,7 +106,11 @@ jobs:
         run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
       - name: Test (tokio)
         run: cargo test --no-default-features --features runtime-tokio,jemalloc
-        timeout-minutes: 15
+        # 15m was too tight: the step budget includes compilation, and a
+        # cold/rebased cache spends ~11m compiling + ~8m testing (>15m),
+        # tripping a wall-clock timeout with zero test failures. Match the
+        # Windows Test step's 30m headroom.
+        timeout-minutes: 30
       # Cross-build for Intel Mac (build only — no jemalloc: release matrix
       # ships x86_64-macos WITHOUT jemalloc to match what ships in releases.
       # console excluded here: rust_embed requires console/dist/ from `pnpm build`

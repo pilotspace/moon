@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — CI: give the macOS `Test (tokio)` step 30m (was 15m)
+
+- The macOS `Test (tokio)` step budget includes compilation. On a cold or
+  rebased cache, ~11m compile + ~8m test suite exceeds 15m and trips a
+  wall-clock timeout with zero actual test failures. Bumped to 30m to match
+  the Windows Test step's headroom; removes recurring false-negative reds on
+  rebased branches.
+
 ### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #250)
 
 - Under the monoio runtime, each shard binds `bind:port` via `SO_REUSEPORT`, but
