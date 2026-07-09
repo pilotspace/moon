@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 use super::{SegmentHolder, SegmentList};
 
+use crate::vector::persistence::unloaded_segment::UnloadedSegment;
+
 impl SegmentHolder {
     /// Reload every COLD (`unloaded`) segment into `warm`, synchronously.
     /// Returns the number of segments promoted.
@@ -49,9 +51,7 @@ impl SegmentHolder {
         }
 
         let mut new_warm = snap.warm.clone();
-        let mut still_unloaded: Vec<
-            Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>,
-        > = Vec::new();
+        let mut still_unloaded: Vec<Arc<UnloadedSegment>> = Vec::new();
         let mut promoted = 0usize;
         for stub in snap.unloaded.iter() {
             match stub.reload() {
@@ -128,9 +128,7 @@ impl SegmentHolder {
         }
 
         let mut new_warm = snap.warm.clone();
-        let mut still_unloaded: Vec<
-            Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>,
-        > = Vec::new();
+        let mut still_unloaded: Vec<Arc<UnloadedSegment>> = Vec::new();
         let mut receivers = Vec::new();
         let mut installed = 0usize;
         for stub in snap.unloaded.iter() {

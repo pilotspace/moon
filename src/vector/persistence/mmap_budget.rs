@@ -13,10 +13,12 @@
 //! `MmapBudget` is a per-shard LRU tracker over `WarmSearchSegment` instances.
 //! On every search the caller records an access (bumps LRU position). The
 //! budget enforcer is called periodically (from the warm-check timer) and
-//! removes the least-recently-accessed `WarmSearchSegment` Arcs from the
-//! `SegmentList.warm` list until the tracked resident bytes fall below the
-//! configured budget. The on-disk .mpf files remain intact; the next search
-//! against an evicted segment causes `from_files` to reload it transparently.
+//! demotes the least-recently-accessed `WarmSearchSegment`s from the
+//! `SegmentList.warm` list to reloadable COLD `UnloadedSegment` stubs (pushed
+//! into `SegmentList.unloaded`) until the tracked resident bytes fall below the
+//! configured budget. The heap copy is freed; the on-disk .mpf files remain
+//! intact, and the next search against an evicted segment reloads it via
+//! `promote_unloaded`/`submit_unloaded_reloads` (the COLD→WARM reload path).
 //!
 //! This mirrors `MADV_DONTNEED` semantics at the segment level: we release the
 //! resident pages (owned Vec<u8>) to the OS and lazily fault them back on
@@ -47,7 +49,8 @@ use crate::vector::segment::SegmentList;
 /// Statistics returned by `enforce_budget`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EnforceStats {
-    /// Number of warm segments evicted (Arcs dropped from `SegmentList.warm`).
+    /// Number of warm segments evicted (demoted from `SegmentList.warm` to
+    /// reloadable COLD stubs in `SegmentList.unloaded`).
     pub segments_evicted: u64,
     /// Resident bytes freed by eviction.
     pub bytes_freed: u64,
@@ -234,12 +237,32 @@ impl MmapBudget {
             };
         }
 
-        // Remove evicted segments from segment_list.warm.
-        // Arc drop triggers SegmentHandle refcount decrement; directory removal
-        // only occurs if the handle is tombstoned AND refcount hits zero.
-        segment_list
-            .warm
-            .retain(|arc| !evict_ids.contains(&arc.segment_id()));
+        // Demote evicted WARM segments to reloadable COLD stubs instead of
+        // dropping the Arc outright. Every WARM segment is durably disk-backed
+        // (`transition_to_warm` wrote its .mpf files before `from_files` ever
+        // loaded it), so `UnloadedSegment::from_warm` captures a stub that
+        // reloads byte-identically on next touch (segment_id + a cloned
+        // SegmentHandle keeping the directory alive + any tombstones). The heap
+        // copy is freed when the old `Arc<WarmSearchSegment>` drops. Previously
+        // this dropped the Arc with no stub, so a budget-evicted segment
+        // silently vanished from search until process restart (recall loss).
+        let mut stubs: Vec<
+            std::sync::Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>,
+        > = Vec::with_capacity(evict_ids.len());
+        segment_list.warm.retain(|arc| {
+            if evict_ids.contains(&arc.segment_id()) {
+                stubs.push(std::sync::Arc::new(
+                    crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(
+                        arc.as_ref(),
+                        false,
+                    ),
+                ));
+                false
+            } else {
+                true
+            }
+        });
+        segment_list.unloaded.extend(stubs);
 
         // Update the tracker.
         for seg_id in &evict_ids {
@@ -437,6 +460,51 @@ mod tests {
             "warm list should have shrunk; len={}",
             list.warm.len()
         );
+    }
+
+    /// A: budget eviction must DEMOTE the segment to a reloadable COLD stub in
+    /// `unloaded` — not drop it outright. This is the fix for the documented
+    /// silent-recall-loss bug (evicted segment vanished until restart).
+    #[test]
+    fn test_eviction_demotes_to_reloadable_stub() {
+        distance::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let w1 = make_warm_segment(tmp.path(), 1);
+        let w2 = make_warm_segment(tmp.path(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let w3 = make_warm_segment(tmp.path(), 3);
+        // Make seg 3 the MRU so it is protected; 1 and 2 are the LRU victims.
+        {
+            let query = vec![0.0f32; 128];
+            let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+            let _ = w3.search(&query, 1, 10, &mut scratch);
+        }
+
+        let mut budget = MmapBudget::new(1);
+        budget.register_segment(1, 1_000_000);
+        budget.register_segment(2, 1_000_000);
+        budget.register_segment(3, 1_000_000);
+
+        let mut list = empty_segment_list(vec![w1, w2, w3]);
+        let stats = budget.enforce_budget(&mut list);
+
+        assert!(stats.segments_evicted >= 1, "expected eviction; {stats:?}");
+        // Evicted segments are NOT lost — every one lands in `unloaded` as a stub.
+        assert_eq!(
+            list.unloaded.len() as u64,
+            stats.segments_evicted,
+            "every evicted WARM segment must become a COLD stub, not vanish"
+        );
+        // Warm shrank by exactly the eviction count; MRU (seg 3) survives.
+        assert_eq!(list.warm.len(), 3 - stats.segments_evicted as usize);
+        assert!(
+            list.warm.iter().any(|w| w.segment_id() == 3),
+            "MRU segment 3 must stay resident"
+        );
+        // The stub is genuinely reloadable from its on-disk .mpf files.
+        let stub = &list.unloaded[0];
+        let reloaded = stub.reload().expect("evicted stub reloads from disk");
+        assert_eq!(reloaded.segment_id(), stub.segment_id());
     }
 
     /// The segment most recently touched by a search is protected from eviction.

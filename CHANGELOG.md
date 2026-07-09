@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Vector: memory-aware WARM offload with a real, reloadable ceiling (PR #252)
+
+- **Reloadable byte-cap eviction (A).** `MmapBudget::enforce_budget` (the
+  per-shard `--vec-warm-mmap-budget` cap, default 2gb) evicted a WARM segment by
+  dropping its `Arc` outright with no COLD stub — so a byte-cap eviction silently
+  removed the segment from search until process restart (recall loss), despite
+  the doc claiming reload-on-touch. It now demotes each evicted segment to a
+  reloadable `UnloadedSegment` stub in `unloaded` (every WARM segment is durably
+  disk-backed via `transition_to_warm`, so the stub reloads byte-identically).
+  This makes `--vec-warm-mmap-budget` a real, reloadable memory ceiling. The
+  eviction tick now also takes the holder `reload_lock` so it serializes with
+  the reload/install path instead of relying solely on shard-thread affinity.
+- **WARM memory accounting fix.** `SegmentHolder::resident_bytes()` hardcoded the
+  WARM/COLD tiers to 0, so a shard whose HOT segments had aged into WARM reported
+  ~0 vector memory — blinding both INFO/Prometheus and the memory-pressure
+  trigger below. It now sums the WARM tier (the dominant term for a long-lived
+  shard) plus COLD stubs. (IVF/DiskANN-cold still lack a resident accessor.)
+- **Memory-triggered early offload (C).** Vector segment memory was invisible to
+  every pressure mechanism, so a vector-heavy shard (the primary disk-offload
+  case) only ever offloaded on the wall-clock idle timer
+  (`--engine-offload-idle-secs`, default 3600s), never on RAM pressure; and the
+  pressure cascade's step 2 demoted HOT→WARM (no RSS win). Now the shard's vector
+  resident bytes (HOT immutable + WARM) count toward the pressure trigger, and
+  under pressure step 2 offloads idle vector segments straight to COLD (real RAM
+  reclaim, reloadable) at an aggressive 60s idle floor. Known follow-up:
+  HOT-immutable memory still has no standalone byte budget (only idle/pressure
+  demotion bounds it).
+
 ### Performance — Vector: COLD-segment reload moved off the shard event loop (PR #251)
 
 - Under `--disk-offload`, an idle vector segment is demoted to the COLD tier

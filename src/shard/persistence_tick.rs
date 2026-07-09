@@ -360,7 +360,7 @@ pub(crate) fn run_eviction_tick(
     // Uses the existing lock path (Wave E collapses to slice). Runs every tick
     // so Prometheus and MEMORY DOCTOR never see stale zero values for long.
     // C5 / M4: publish vector/text/graph store-memory atomics via thread-local slice.
-    crate::shard::slice::with_shard(|s| {
+    let vector_resident_bytes = crate::shard::slice::with_shard(|s| {
         use std::sync::atomic::Ordering;
         let (mutable, immutable) = s.vector_store.resident_bytes();
         s.store_memory
@@ -380,10 +380,19 @@ pub(crate) fn run_eviction_tick(
         s.store_memory
             .lua
             .store(script_cache.borrow().resident_bytes(), Ordering::Relaxed);
+        // Return the vector resident total (HOT + WARM) so the pressure check
+        // below can factor it in (memory-triggered vector offload, C).
+        mutable + immutable
     });
 
     if server_config.disk_offload_enabled()
-        && should_run_pressure_cascade(runtime_config, server_config, shard_databases, shard_id)
+        && should_run_pressure_cascade(
+            runtime_config,
+            server_config,
+            shard_databases,
+            shard_id,
+            vector_resident_bytes,
+        )
     {
         handle_memory_pressure(
             page_cache,
@@ -499,6 +508,14 @@ fn apply_completion_vec(
 // Memory pressure cascade (design section 8.5)
 // ---------------------------------------------------------------------------
 
+/// Aggressive idle floor (seconds) used by the memory-pressure cascade to
+/// offload idle vector segments to COLD early (C). Far below the normal
+/// `--engine-offload-idle-secs` (default 3600s): once a shard is over its
+/// memory budget, a segment untouched for a minute is worth shedding to reclaim
+/// RAM rather than waiting out the full idle timeout. Actively-queried segments
+/// (idle < this) stay resident; anything shed reloads on next touch.
+const PRESSURE_OFFLOAD_IDLE_SECS: u64 = 60;
+
 /// Check if memory usage exceeds the disk offload threshold.
 ///
 /// Returns `true` when the pressure cascade should run. Uses actual
@@ -508,6 +525,7 @@ pub(crate) fn should_run_pressure_cascade(
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
+    vector_resident_bytes: usize,
 ) -> bool {
     let rt = runtime_config.read();
     if rt.maxmemory == 0 {
@@ -525,7 +543,16 @@ pub(crate) fn should_run_pressure_cascade(
     let threshold = (budget as f64 * server_config.disk_offload_threshold) as usize;
     // C5 / Phase 3: read the already-published per-shard KV memory (written
     // earlier this same tick by `run_eviction_tick`). Lock-free Relaxed load.
-    let used = shard_databases.published_shard_memory(shard_id);
+    //
+    // Memory-triggered vector offload (C): add the shard's vector resident
+    // bytes (HOT immutable + WARM, computed this same tick) so a vector-heavy
+    // workload — the primary disk-offload use case, where KV is light but
+    // vector segments are the RAM hog — actually triggers the cascade. Without
+    // this, vector memory was invisible to every pressure mechanism and idle
+    // segments only ever offloaded on the wall-clock idle timer.
+    let used = shard_databases
+        .published_shard_memory(shard_id)
+        .saturating_add(vector_resident_bytes);
     used > threshold
 }
 
@@ -564,29 +591,37 @@ pub(crate) fn handle_memory_pressure(
         }
     }
 
-    // Step 2: Force-demote oldest HOT ImmutableSegments to WARM.
-    // Use half the normal warm_after threshold to be more aggressive under pressure.
+    // Step 2: Force-offload idle vector segments straight to COLD (memory-
+    // triggered early offload, C). Previously this demoted HOT->WARM, which
+    // frees NO resident bytes (a WarmSearchSegment is a same-size heap copy of
+    // the HOT segment). Under genuine memory pressure we instead shed the
+    // segments that have been idle beyond an aggressive floor
+    // (`PRESSURE_OFFLOAD_IDLE_SECS`, far below the normal
+    // `--engine-offload-idle-secs`) all the way to COLD (`UnloadedSegment`
+    // stub), which actually returns RAM — and stays reloadable-on-touch. We
+    // pass `warm_after = u64::MAX` so the age-based HOT->WARM path stays
+    // disabled here; only the idle->COLD path fires.
     if let Some(ref mut manifest) = *shard_manifest {
-        let aggressive_threshold = server_config.segment_warm_after / 2;
         let shard_dir = server_config
             .effective_disk_offload_dir()
             .join(format!("shard-{}", shard_id));
         let count = crate::shard::slice::with_shard(|s| {
-            s.vector_store.try_warm_transitions_all(
+            s.vector_store.try_warm_transitions_all_idle(
                 &shard_dir,
                 manifest,
-                aggressive_threshold,
+                u64::MAX,
+                PRESSURE_OFFLOAD_IDLE_SECS,
                 next_file_id,
                 wal_v3,
             )
         });
         if count > 0 {
             tracing::info!(
-                "Shard {}: memory pressure step 2 -- force-demoted {} segment(s) HOT->WARM",
+                "Shard {}: memory pressure step 2 -- offloaded {} idle vector segment(s) to COLD",
                 shard_id,
                 count
             );
-            return; // Freed memory via warm transition; re-evaluate next tick
+            return; // Freed RAM via cold offload; re-evaluate next tick
         }
     }
 
@@ -1515,7 +1550,7 @@ mod tests {
         // Below the 85% threshold (e.g. 50%): must NOT trigger the cascade.
         shared.publish_memory(0, (1024 * 1024) / 2);
         assert!(
-            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0),
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
             "50% used_memory must stay below the 85% disk-offload-threshold"
         );
 
@@ -1524,7 +1559,7 @@ mod tests {
         // whole point of WS3 priority 3.
         shared.publish_memory(0, (1024 * 1024 * 90) / 100);
         assert!(
-            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0),
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
             "90% used_memory must cross the 85% disk-offload-threshold and \
              trigger the pressure cascade well before maxmemory is reached"
         );
@@ -1537,9 +1572,42 @@ mod tests {
             let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
             shared.publish_memory(0, usize::MAX / 2);
             assert!(
-                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0),
+                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0, 0),
                 "no memory limit configured => no pressure possible"
             );
         }
+    }
+
+    /// C: vector resident bytes must count toward the pressure trigger — a
+    /// vector-heavy shard with near-zero KV memory still fires the cascade
+    /// (previously vector memory was invisible to every pressure mechanism).
+    #[test]
+    fn test_pressure_cascade_triggered_by_vector_memory_alone() {
+        use clap::Parser;
+        let dbs = vec![vec![Database::new()]];
+        let (shared, _inits) = ShardDatabases::new(dbs);
+
+        let mut rt = crate::config::RuntimeConfig::default();
+        rt.maxmemory = 1024 * 1024; // 1 MiB per-shard budget (1 shard)
+        rt.num_shards = 1;
+        let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
+        let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
+            [],
+        ));
+
+        // KV memory is trivial (well under the 85% threshold on its own)...
+        shared.publish_memory(0, 1024);
+        assert!(
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            "KV alone is far below threshold => no cascade without vector accounting"
+        );
+
+        // ...but the shard is holding ~950 KiB of resident vector segments,
+        // pushing total past the 85% (~892 KiB) threshold.
+        let vec_bytes = (1024 * 1024 * 93) / 100;
+        assert!(
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes),
+            "vector resident memory must contribute to the pressure trigger"
+        );
     }
 }
