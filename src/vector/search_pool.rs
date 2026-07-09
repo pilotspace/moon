@@ -302,6 +302,7 @@ mod tests {
             key_hash_to_key: idx.key_hash_to_key.clone(),
             ef_defaulted: false,
             tuning: crate::vector::types::SearchTuning::default(),
+            pending_reloads: Vec::new(),
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
                             key_hash_to_key: key_map.clone(),
                             ef_defaulted: false,
                             tuning: crate::vector::types::SearchTuning::default(),
+                            pending_reloads: Vec::new(),
                         };
                         let results = futures::executor::block_on(
                             SegmentHolder::search_mvcc_yielding_with_pool(

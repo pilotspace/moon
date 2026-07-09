@@ -667,11 +667,15 @@ fn capture_dense_knn_snapshot(
     let filter_strategy =
         crate::vector::filter::selectivity::select_strategy(filter_bitmap.as_ref(), total_vectors);
 
-    // WS3 round 2: the yielding (worker-pool) search path captures its
+    // WS3 round 2 + #18: the yielding (worker-pool) search path captures its
     // segment snapshot here, separately from `SegmentHolder::search_filtered`'s
-    // own promote-before-search call -- must reload any COLD segments before
-    // this capture too, or a query on this path would silently skip them.
-    idx.segments.promote_unloaded();
+    // own promote-before-search call. Rather than BLOCK the shard event loop on
+    // COLD-segment reloads, submit them off-loop and stash the receivers in the
+    // snapshot; the handler awaits them (parking only this query's task) before
+    // scanning, so siblings never stall. When the reload pool is disabled this
+    // falls back to the blocking `promote_unloaded` (no receivers), exactly as
+    // before, so a COLD segment is never silently skipped.
+    let pending_reloads = idx.segments.submit_unloaded_reloads();
     let segments = idx.segments.load_full();
     let mutable_len = segments.mutable.len();
 
@@ -696,6 +700,7 @@ fn capture_dense_knn_snapshot(
             rerank_mult: idx.meta.rerank_mult,
             exact_beam: idx.meta.exact_beam,
         },
+        pending_reloads,
     })
 }
 
