@@ -1044,6 +1044,22 @@ pub(crate) fn handle_checkpoint_tick(
             false
         }
         CheckpointAction::Finalize { redo_lsn } => {
+            // Prod-hardening #13: a failed finalize leaves the state machine in
+            // `Finalizing`, so the next 1ms tick re-enters this arm and
+            // re-appends a WAL Checkpoint record (step 1) with no backoff.
+            // Under a sustained failure (slow/degraded disk causing repeated
+            // `wait_durable` timeouts, or a persistent `graph_save` failure)
+            // this floods the WAL with a Checkpoint marker every millisecond,
+            // and because `last_checkpoint_lsn` never advances,
+            // `recycle_segments_before` never fires — WAL usage grows fastest
+            // exactly during the disk-pressure incident. Gate re-attempts on an
+            // exponential backoff so a stuck finalize retries on a bounded
+            // schedule instead of hammering every tick.
+            let now = std::time::Instant::now();
+            if !checkpoint_mgr.finalize_ready(now) {
+                return false;
+            }
+
             // 1. Write WAL checkpoint record with redo_lsn payload
             let mut payload = [0u8; 8];
             payload.copy_from_slice(&redo_lsn.to_le_bytes());
@@ -1059,12 +1075,14 @@ pub(crate) fn handle_checkpoint_tick(
                 crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
             ) {
                 tracing::error!("Checkpoint WAL flush failed: {}", e);
+                checkpoint_mgr.note_finalize_failed(now);
                 return false;
             }
 
             // 3. Commit manifest (atomic dual-root write)
             if let Err(e) = manifest.commit() {
                 tracing::error!("Checkpoint manifest commit failed: {}", e);
+                checkpoint_mgr.note_finalize_failed(now);
                 return false;
             }
 
@@ -1109,6 +1127,7 @@ pub(crate) fn handle_checkpoint_tick(
             // exactly on `current_lsn()` and must NOT be skipped).
             if !graph_save(wal.current_lsn().saturating_sub(1)) {
                 tracing::error!("Checkpoint aborted: graph snapshot failed");
+                checkpoint_mgr.note_finalize_failed(now);
                 return false;
             }
 
@@ -1117,10 +1136,11 @@ pub(crate) fn handle_checkpoint_tick(
             control.last_checkpoint_epoch = manifest.epoch();
             if let Err(e) = control.write(control_path) {
                 tracing::error!("Checkpoint control file update failed: {}", e);
+                checkpoint_mgr.note_finalize_failed(now);
                 return false;
             }
 
-            // 5. Mark checkpoint complete
+            // 5. Mark checkpoint complete (also clears the finalize backoff).
             checkpoint_mgr.complete();
 
             // 6. Recycle old WAL segments that are fully before redo_lsn

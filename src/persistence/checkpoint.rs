@@ -114,6 +114,15 @@ pub enum CheckpointAction {
 pub struct CheckpointManager {
     state: CheckpointState,
     trigger: CheckpointTrigger,
+    /// Backoff deadline for the Finalize step (prod-hardening #13). When a
+    /// finalize attempt fails, the state stays `Finalizing`, so without this
+    /// the next 1ms tick re-runs finalize (re-appending a WAL Checkpoint
+    /// record) immediately — flooding the WAL every millisecond under a
+    /// sustained failure. `None` = ready now; `Some(t)` = the next attempt is
+    /// gated until `t`.
+    finalize_retry_at: Option<Instant>,
+    /// Consecutive failed finalize attempts, driving exponential backoff.
+    finalize_attempts: u32,
 }
 
 impl CheckpointManager {
@@ -122,7 +131,37 @@ impl CheckpointManager {
         Self {
             state: CheckpointState::Idle,
             trigger,
+            finalize_retry_at: None,
+            finalize_attempts: 0,
         }
+    }
+
+    /// Whether the Finalize step may be attempted at `now` (prod-hardening
+    /// #13). Returns `true` when no backoff is pending or the backoff window
+    /// has elapsed. The caller checks this BEFORE doing any finalize I/O
+    /// (notably the WAL checkpoint-record append) so a stuck finalize retries
+    /// on a bounded schedule instead of every tick.
+    #[inline]
+    pub fn finalize_ready(&self, now: Instant) -> bool {
+        self.finalize_retry_at.map_or(true, |t| now >= t)
+    }
+
+    /// Record a failed finalize attempt and arm an exponential backoff
+    /// (50ms, 100ms, … capped at 5s) before the next attempt is allowed.
+    pub fn note_finalize_failed(&mut self, now: Instant) {
+        self.finalize_attempts = self.finalize_attempts.saturating_add(1);
+        // 50ms << (attempts-1), capped at 5s.
+        let shift = (self.finalize_attempts - 1).min(7);
+        let backoff =
+            std::time::Duration::from_millis(50u64 << shift).min(std::time::Duration::from_secs(5));
+        self.finalize_retry_at = Some(now + backoff);
+    }
+
+    /// Clear any finalize backoff (called on success / when leaving Finalizing).
+    #[inline]
+    fn reset_finalize_backoff(&mut self) {
+        self.finalize_retry_at = None;
+        self.finalize_attempts = 0;
     }
 
     /// Begin a new checkpoint.
@@ -202,6 +241,7 @@ impl CheckpointManager {
     pub fn complete(&mut self) {
         self.state = CheckpointState::Idle;
         self.trigger.reset();
+        self.reset_finalize_backoff();
     }
 
     /// Force-begin a checkpoint regardless of trigger conditions.
@@ -235,6 +275,7 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn make_trigger(timeout_secs: u64, max_wal_bytes: u64, completion: f64) -> CheckpointTrigger {
         CheckpointTrigger::new(timeout_secs, max_wal_bytes, completion)
@@ -318,6 +359,54 @@ mod tests {
             }
             _ => panic!("expected InProgress state"),
         }
+    }
+
+    #[test]
+    fn test_finalize_backoff_gates_retries() {
+        // Prod-hardening #13: after a failed finalize, finalize_ready must
+        // return false until the exponential backoff window elapses, so the
+        // caller does not re-append a WAL checkpoint record every tick.
+        let trigger = make_trigger(300, 256 * 1024 * 1024, 0.9);
+        let mut mgr = CheckpointManager::new(trigger);
+
+        let t0 = Instant::now();
+        // No failures yet → always ready.
+        assert!(mgr.finalize_ready(t0));
+
+        // First failure arms a 50ms backoff.
+        mgr.note_finalize_failed(t0);
+        assert!(!mgr.finalize_ready(t0), "immediately after failure: gated");
+        assert!(
+            !mgr.finalize_ready(t0 + Duration::from_millis(49)),
+            "still within the 50ms window"
+        );
+        assert!(
+            mgr.finalize_ready(t0 + Duration::from_millis(50)),
+            "ready once the 50ms window elapses"
+        );
+
+        // Second consecutive failure doubles the backoff to 100ms.
+        let t1 = t0 + Duration::from_millis(50);
+        mgr.note_finalize_failed(t1);
+        assert!(!mgr.finalize_ready(t1 + Duration::from_millis(99)));
+        assert!(mgr.finalize_ready(t1 + Duration::from_millis(100)));
+
+        // complete() clears the backoff so the next checkpoint starts clean.
+        mgr.complete();
+        assert!(mgr.finalize_ready(t1));
+    }
+
+    #[test]
+    fn test_finalize_backoff_caps_at_5s() {
+        let trigger = make_trigger(300, 256 * 1024 * 1024, 0.9);
+        let mut mgr = CheckpointManager::new(trigger);
+        let t = Instant::now();
+        // Many consecutive failures must saturate at the 5s cap, not overflow.
+        for _ in 0..40 {
+            mgr.note_finalize_failed(t);
+        }
+        assert!(!mgr.finalize_ready(t + Duration::from_millis(4999)));
+        assert!(mgr.finalize_ready(t + Duration::from_secs(5)));
     }
 
     #[test]

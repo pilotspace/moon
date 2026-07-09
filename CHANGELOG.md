@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Durability: checkpoint Finalize backs off on repeated failure instead of flooding the WAL (PR #TBD)
+
+- When a checkpoint's Finalize step failed (`wal.wait_durable`, `manifest.commit`,
+  `graph_save`, or the control-file write), the state machine stayed `Finalizing`
+  and the next 1ms persistence tick re-ran finalize from step 1 — re-appending a
+  WAL Checkpoint record every single millisecond with no backoff. Under a
+  sustained failure (slow/degraded disk) this floods the WAL, and since
+  `last_checkpoint_lsn` never advances, `recycle_segments_before` never fires —
+  WAL disk usage grows fastest exactly during the disk-pressure incident it
+  should be backing off from. `CheckpointManager` now arms an exponential backoff
+  (50ms→5s cap) on each failed finalize; the tick checks `finalize_ready(now)`
+  before doing any finalize I/O, so retries are bounded instead of per-tick, and
+  a successful `complete()` clears it. (audit finding 13)
+
 ### Fixed — Durability: legacy AOF replay stops at mid-stream corruption instead of resyncing (PR #TBD)
 
 - The default startup path `replay_aof` (single-file `appendonly.aof`, unframed
