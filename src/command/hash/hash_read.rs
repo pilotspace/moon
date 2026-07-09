@@ -275,7 +275,9 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let total = entries.len();
-    let mut results = Vec::with_capacity(count * 2);
+    // DoS guard: bound the pre-size by the actual field count so a huge COUNT
+    // hint can't drive an unbounded Vec::with_capacity -> allocator abort.
+    let mut results = Vec::with_capacity(count.min(total).saturating_mul(2));
     let mut pos = cursor;
     let mut checked = 0;
 

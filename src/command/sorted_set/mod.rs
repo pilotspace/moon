@@ -597,6 +597,37 @@ mod tests {
         zcard(db, &frames)
     }
 
+    #[test]
+    fn test_zmpop_huge_count_no_abort() {
+        // A huge COUNT must not drive an unbounded Vec::with_capacity ->
+        // allocator abort. This site was MISSED by the audit finders and
+        // caught by the Batch A allocation sweep (unlike LMPOP it lacked a
+        // .min(card) cap).
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b"]);
+        match zmpop(
+            &mut db,
+            &[
+                bulk(b"1"),
+                bulk(b"z"),
+                bulk(b"MIN"),
+                bulk(b"COUNT"),
+                bulk(b"5000000000"),
+            ],
+        ) {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 2, "ZMPOP returns [key, popped]");
+                match &items[1] {
+                    Frame::Array(popped) => {
+                        assert_eq!(popped.len(), 2, "only 2 members exist to pop")
+                    }
+                    other => panic!("expected popped array, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
     fn run_zincrby(db: &mut Database, args: &[&[u8]]) -> Frame {
         let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
         zincrby(db, &frames)

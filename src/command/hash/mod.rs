@@ -31,6 +31,27 @@ mod tests {
     }
 
     #[test]
+    fn test_hscan_huge_count_no_abort() {
+        // A huge COUNT hint must not drive an unbounded Vec::with_capacity ->
+        // allocator abort (Batch A DoS guard); the scan still returns the
+        // real fields.
+        let mut db = Database::new();
+        hset(&mut db, &make_args(&[b"h", b"f1", b"v1", b"f2", b"v2"]));
+        match hscan(&mut db, &make_args(&[b"h", b"0", b"COUNT", b"5000000000"])) {
+            Frame::Array(top) => {
+                assert_eq!(top.len(), 2, "HSCAN returns [cursor, entries]");
+                match &top[1] {
+                    Frame::Array(kv) => {
+                        assert_eq!(kv.len(), 4, "expected 2 field/value pairs")
+                    }
+                    other => panic!("expected inner array, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_hset_update_existing() {
         let mut db = Database::new();
         let args = make_args(&[b"myhash", b"f1", b"v1"]);

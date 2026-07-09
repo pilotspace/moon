@@ -860,6 +860,18 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
 
+        // DoS guard: SET/INCRBY grow the buffer to cover bit_offset; reject
+        // offsets past the 512MB string limit (matches SETBIT) so a client
+        // offset can't drive an unbounded Vec::resize -> allocator abort. GET
+        // is exempt (bf_get reads within data.len(), returning 0 past the end).
+        if !subcmd.eq_ignore_ascii_case(b"GET")
+            && bit_offset.saturating_add(bits as usize) > 512 * 1024 * 1024 * 8
+        {
+            return Frame::Error(Bytes::from_static(
+                b"ERR bit offset is not an integer or out of range",
+            ));
+        }
+
         if subcmd.eq_ignore_ascii_case(b"GET") {
             let val = bf_get(&buf, bit_offset, bits, signed);
             results.push(Frame::Integer(val));
@@ -1160,6 +1172,36 @@ mod tests {
         let mut db = make_db();
         let result = getbit(&mut db, &[bs(b"key"), bs(b"0")]);
         assert_eq!(result, Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_bitfield_huge_offset_rejected_no_abort() {
+        // A bit offset past the 512MB string limit must be rejected, never
+        // drive an unbounded Vec::resize -> allocator abort (Batch A DoS guard).
+        let mut db = make_db();
+        let r = bitfield(
+            &mut db,
+            &[
+                bs(b"k"),
+                bs(b"SET"),
+                bs(b"u8"),
+                bs(b"#999999999999"),
+                bs(b"1"),
+            ],
+        );
+        assert!(
+            matches!(r, Frame::Error(_)),
+            "huge BITFIELD SET offset must return an error, got {r:?}"
+        );
+        // A normal offset still works (guard doesn't break legitimate use).
+        let ok = bitfield(
+            &mut db,
+            &[bs(b"k"), bs(b"SET"), bs(b"u8"), bs(b"0"), bs(b"200")],
+        );
+        assert!(
+            matches!(ok, Frame::Array(_)),
+            "normal BITFIELD SET should succeed, got {ok:?}"
+        );
     }
 
     #[test]

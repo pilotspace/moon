@@ -118,6 +118,10 @@ pub fn parse_highlight_clause(args: &[Frame]) -> Option<HighlightOpts> {
                 _ => 0,
             };
             i += 1;
+            // DoS guard: there can never be more field tokens than remaining
+            // args; clamp so a huge FIELDS count can't drive an unbounded
+            // Vec::with_capacity -> allocator abort.
+            let count = count.min(args.len().saturating_sub(i));
             if count > 0 {
                 let mut fields = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -203,6 +207,10 @@ pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
                 _ => 0,
             };
             i += 1;
+            // DoS guard: there can never be more field tokens than remaining
+            // args; clamp so a huge FIELDS count can't drive an unbounded
+            // Vec::with_capacity -> allocator abort.
+            let count = count.min(args.len().saturating_sub(i));
             if count > 0 {
                 let mut fields = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -2077,6 +2085,23 @@ mod tests {
             .iter()
             .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
             .collect()
+    }
+
+    #[test]
+    fn parse_highlight_fields_huge_count_no_abort() {
+        // A huge FIELDS count must not drive an unbounded Vec::with_capacity ->
+        // allocator abort (Batch A DoS guard); fields are bounded by the real
+        // number of remaining tokens.
+        let args = args_of(&["HIGHLIGHT", "FIELDS", "999999999999", "title"]);
+        let opts = parse_highlight_clause(&args).expect("highlight opts");
+        assert_eq!(opts.fields.as_deref().map(<[Bytes]>::len), Some(1));
+    }
+
+    #[test]
+    fn parse_summarize_fields_huge_count_no_abort() {
+        let args = args_of(&["SUMMARIZE", "FIELDS", "999999999999", "body"]);
+        let opts = parse_summarize_clause(&args).expect("summarize opts");
+        assert_eq!(opts.fields.as_deref().map(<[Bytes]>::len), Some(1));
     }
 
     #[test]
