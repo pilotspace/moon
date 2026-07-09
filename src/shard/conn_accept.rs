@@ -31,6 +31,15 @@ use super::shared_databases::ShardDatabases;
 /// from parking_lot::RwLock (used for pubsub types).
 type StdRwLock<T> = std::sync::RwLock<T>;
 
+/// Maximum time a client may take to complete the TLS handshake after the
+/// TCP connection is accepted (prod-hardening #17). Without a bound, a peer
+/// that completes the TCP 3-way handshake on the TLS port and then sends no
+/// (or a partial) ClientHello parks the task, its fd, AND its already-consumed
+/// `maxclients` slot indefinitely — a zero-CPU slow-loris that can exhaust the
+/// connection limit for legitimate TLS clients. On expiry we drop the stream
+/// and release the slot via `record_connection_closed()`.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Process-wide TCP listen backlog (S-5, `--tcp-backlog`). Set once at
 /// startup before any listener binds; 1024 is the historical hardcoded
 /// value. A process-wide static (rather than threading a param through the
@@ -272,8 +281,10 @@ pub(crate) fn spawn_tokio_connection(
             #[cfg(not(unix))]
             let kill_fd = -1;
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-            match acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => {
+            // #17: bound the handshake so a stalled ClientHello cannot pin the
+            // fd + maxclients slot forever.
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream)).await {
+                Ok(Ok(tls_stream)) => {
                     let _ = handle_connection_sharded_inner(
                         tls_stream,
                         peer_addr,
@@ -287,8 +298,15 @@ pub(crate) fn spawn_tokio_connection(
                     )
                     .await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Shard {}: TLS handshake timed out after {}s",
+                        shard_id,
+                        TLS_HANDSHAKE_TIMEOUT.as_secs()
+                    );
                 }
             }
             crate::admin::metrics_setup::record_connection_closed();
@@ -655,8 +673,12 @@ pub(crate) fn spawn_monoio_connection(
                         return;
                     }
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
-                    match acceptor.accept(tcp_stream).await {
-                        Ok(tls_stream) => {
+                    // #17: bound the handshake so a stalled ClientHello cannot
+                    // pin the fd + maxclients slot forever.
+                    match monoio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream))
+                        .await
+                    {
+                        Ok(Ok(tls_stream)) => {
                             let _ = handle_connection_sharded_monoio(
                                 tls_stream,
                                 peer_addr,
@@ -671,11 +693,18 @@ pub(crate) fn spawn_monoio_connection(
                             )
                             .await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(
                                 "Shard {}: Monoio TLS handshake failed: {}",
                                 shard_id,
                                 e
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Shard {}: Monoio TLS handshake timed out after {}s",
+                                shard_id,
+                                TLS_HANDSHAKE_TIMEOUT.as_secs()
                             );
                         }
                     }

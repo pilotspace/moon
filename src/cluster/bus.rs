@@ -27,6 +27,16 @@ use crate::cluster::gossip::{
 pub type SharedVoteTx =
     Arc<parking_lot::Mutex<Option<crate::runtime::channel::MpscSender<String>>>>;
 
+/// Maximum time to wait for a gossip message BODY after its 4-byte length
+/// prefix has been read (prod-hardening #10). Without this bound, any TCP
+/// client that can reach the cluster bus port can send a valid length header
+/// and then never send the body — the spawned `handle_cluster_peer` task
+/// blocks in `read_exact` forever, is immune to graceful shutdown (the
+/// cancellation token was only checked on the length read), and never releases
+/// its socket/fd. A handful of such connections exhaust the bus listener's
+/// accept capacity. On expiry we return an error, dropping the connection.
+const GOSSIP_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run the cluster bus listener loop.
 ///
 /// Spawns a new task for each incoming peer connection.
@@ -101,9 +111,21 @@ async fn handle_cluster_peer(
             anyhow::bail!("gossip message too large: {} bytes", msg_len);
         }
 
-        // Read message body
+        // Read message body — #10: bound with a timeout + shutdown-cancel so a
+        // client that sends the length prefix but stalls the body cannot pin
+        // the task/socket forever or dodge graceful shutdown.
         let mut buf = vec![0u8; msg_len];
-        stream.read_exact(&mut buf).await?;
+        tokio::select! {
+            result = stream.read_exact(&mut buf) => { result?; }
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(GOSSIP_BODY_READ_TIMEOUT) => {
+                anyhow::bail!(
+                    "gossip body read from {} timed out after {}s",
+                    peer_addr,
+                    GOSSIP_BODY_READ_TIMEOUT.as_secs()
+                );
+            }
+        }
 
         // Deserialize
         let msg = match deserialize_gossip(&buf) {
@@ -271,10 +293,22 @@ async fn handle_cluster_peer(
             anyhow::bail!("gossip message too large: {} bytes", msg_len);
         }
 
-        // Read message body
-        let buf = monoio_read_exact(&mut stream, msg_len)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // Read message body — #10: bound with a timeout + shutdown-cancel so a
+        // client that sends the length prefix but stalls the body cannot pin
+        // the task/socket forever or dodge graceful shutdown.
+        let buf = monoio::select! {
+            result = monoio_read_exact(&mut stream, msg_len) => {
+                result.map_err(|e| anyhow::anyhow!(e))?
+            }
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = monoio::time::sleep(GOSSIP_BODY_READ_TIMEOUT) => {
+                anyhow::bail!(
+                    "gossip body read from {} timed out after {}s",
+                    peer_addr,
+                    GOSSIP_BODY_READ_TIMEOUT.as_secs()
+                );
+            }
+        };
 
         // Deserialize
         let msg = match deserialize_gossip(&buf) {
