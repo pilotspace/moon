@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs — engineering roadmap suite under `docs/roadmap/` (PR #254)
+
+- New planning docs (excluded from the published docs site via `mkdocs.yml`
+  `exclude_docs`): product roadmap v0.7→v1.0 with features mindmap and
+  task-level execution plans (`ROADMAP.md`), scale/HA architecture incl.
+  multi-shard PSYNC wire-format draft and failover timeline
+  (`scale-ha-architecture.md`), and the standalone horizontal-scale deep
+  dive (`standalone-horizontal-scale.md`). Commercial/EE planning is
+  maintained privately.
+- Docs only — no runtime code changes.
+
 ### Changed — CI: give the macOS `Test (tokio)` step 30m (was 15m)
 
 - The macOS `Test (tokio)` step budget includes compilation. On a cold or
