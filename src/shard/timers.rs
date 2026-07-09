@@ -46,10 +46,28 @@ pub(crate) fn run_eviction(
     if rt.maxmemory > 0 {
         // GAP-1: enforce the elastic budget (0 = static fallback inside).
         let budget = shard_databases.elastic_budget(shard_id);
+        // A3 (accounting spine, tiering-v2 D3): vector segment memory counts
+        // toward maxmemory — it is data-plane memory. Published by the same
+        // 100ms tick (`run_eviction_tick` stores it before calling us; lag
+        // ≤ 1 tick, documented acceptable). One Relaxed load per tick, no
+        // recompute on this path. When the un-evictable vector term alone
+        // exceeds the budget, the bounded loop drains KV then returns OOM;
+        // the pressure cascade (which CAN shrink vectors via offload to
+        // COLD) fires earlier at `--disk-offload-threshold` (0.85×budget),
+        // so with disk-offload enabled vectors shed first.
+        let vector_bytes = shard_databases.store_memory_per_shard[shard_id]
+            .vector
+            .load(std::sync::atomic::Ordering::Relaxed);
         let db_count = shard_databases.db_count();
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
-                let _ = crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget);
+                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                    db,
+                    &rt,
+                    None,
+                    db.estimated_memory().saturating_add(vector_bytes),
+                    budget,
+                );
             });
         }
     }
@@ -367,6 +385,63 @@ pub(crate) fn run_mvcc_sweep(
             oldest_snapshot_age_secs = age_secs,
             imm_count,
             "mvcc_sweep: pruned committed + swept zombies + killed old snapshots",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::db::Database;
+    use bytes::Bytes;
+    use std::sync::atomic::Ordering;
+
+    /// A3 (accounting spine): published vector resident bytes must count
+    /// toward the background maxmemory eviction check. A vector-heavy shard
+    /// whose KV alone is under budget previously never evicted — vector RAM
+    /// was invisible to `--maxmemory`, so a pure-vector workload could drive
+    /// RSS to OOM while eviction reported "under budget". RED until
+    /// `run_eviction` adds the published vector term to the used total.
+    ///
+    /// Note on semantics: when the un-evictable vector term alone exceeds the
+    /// budget, the bounded eviction loop drains the db then returns OOM — the
+    /// vector tier legitimately owns that memory, and the pressure cascade
+    /// (which CAN shrink vectors via offload) fires earlier at 0.85×budget.
+    #[test]
+    fn test_run_eviction_counts_vector_memory() {
+        let dbs = vec![vec![Database::new()]];
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
+
+        crate::shard::slice::with_shard_db(0, |db| {
+            for i in 0..100u32 {
+                db.set_string(Bytes::from(format!("key:{i}")), Bytes::from(vec![b'v'; 64]));
+            }
+        });
+
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1024 * 1024;
+        rt.num_shards = 1;
+        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
+
+        // KV alone (~tens of KB) is far under the 1 MiB budget: no eviction.
+        run_eviction(&shared, 0, &runtime_config);
+        let before = crate::shard::slice::with_shard_db(0, |db| db.len());
+        assert_eq!(before, 100, "KV under budget must not evict");
+
+        // 2 MiB of published vector-segment memory pushes the shard over
+        // budget: KV must now be evicted (vector memory is data-plane memory).
+        shared.store_memory_per_shard[0]
+            .vector
+            .store(2 * 1024 * 1024, Ordering::Relaxed);
+        run_eviction(&shared, 0, &runtime_config);
+        let after = crate::shard::slice::with_shard_db(0, |db| db.len());
+        assert!(
+            after < before,
+            "vector bytes over budget must trigger KV eviction ({after} vs {before})"
         );
     }
 }
