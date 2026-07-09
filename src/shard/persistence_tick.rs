@@ -1055,6 +1055,10 @@ pub(crate) fn handle_checkpoint_tick(
             // exactly during the disk-pressure incident. Gate re-attempts on an
             // exponential backoff so a stuck finalize retries on a bounded
             // schedule instead of hammering every tick.
+            // `now` gates readiness only; failure branches below re-stamp
+            // Instant::now() because wait_durable/commit/graph_save can take
+            // longer than the backoff — arming from this pre-work timestamp
+            // would put the retry deadline in the past (instant re-retry).
             let now = std::time::Instant::now();
             if !checkpoint_mgr.finalize_ready(now) {
                 return false;
@@ -1075,14 +1079,14 @@ pub(crate) fn handle_checkpoint_tick(
                 crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
             ) {
                 tracing::error!("Checkpoint WAL flush failed: {}", e);
-                checkpoint_mgr.note_finalize_failed(now);
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
 
             // 3. Commit manifest (atomic dual-root write)
             if let Err(e) = manifest.commit() {
                 tracing::error!("Checkpoint manifest commit failed: {}", e);
-                checkpoint_mgr.note_finalize_failed(now);
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
 
@@ -1127,7 +1131,7 @@ pub(crate) fn handle_checkpoint_tick(
             // exactly on `current_lsn()` and must NOT be skipped).
             if !graph_save(wal.current_lsn().saturating_sub(1)) {
                 tracing::error!("Checkpoint aborted: graph snapshot failed");
-                checkpoint_mgr.note_finalize_failed(now);
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
 
@@ -1136,7 +1140,7 @@ pub(crate) fn handle_checkpoint_tick(
             control.last_checkpoint_epoch = manifest.epoch();
             if let Err(e) = control.write(control_path) {
                 tracing::error!("Checkpoint control file update failed: {}", e);
-                checkpoint_mgr.note_finalize_failed(now);
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
 

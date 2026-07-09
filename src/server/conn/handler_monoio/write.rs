@@ -166,7 +166,8 @@ pub(super) async fn try_handle_ws_command(
                                         &ctx.spsc_notifiers,
                                     )
                                     .await;
-                                    let _ = reply_rx.recv().await;
+                                    let _ = crate::shard::coordinator::recv_reply_bounded(reply_rx)
+                                        .await;
                                 }
                             }
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
@@ -568,7 +569,7 @@ async fn mq_hop_or_local(
             &ctx.spsc_notifiers,
         )
         .await;
-        match reply_rx.recv().await {
+        match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
             Ok(f) => f,
             Err(_) => crate::protocol::Frame::Error(bytes::Bytes::from_static(
                 b"ERR cross-shard MQ reply channel closed",
@@ -842,12 +843,13 @@ pub(super) async fn try_handle_graph_command(
                     &ctx.spsc_notifiers,
                 )
                 .await;
-                let mut response = match reply_rx.recv().await {
-                    Ok(f) => f,
-                    Err(_) => Frame::Error(bytes::Bytes::from_static(
-                        b"ERR cross-shard reply channel closed",
-                    )),
-                };
+                let mut response =
+                    match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+                        Ok(f) => f,
+                        Err(_) => Frame::Error(bytes::Bytes::from_static(
+                            b"ERR cross-shard reply channel closed",
+                        )),
+                    };
                 // Phase 166: explicit ADDNODE/ADDEDGE intents are captured
                 // from the routed RESPONSE id, exactly like the local path;
                 // the abort path routes the rollback back to the owner.

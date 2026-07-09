@@ -169,12 +169,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `abort()` — uncatchable, crashing every shard and connection. A single
   unauthenticated request was a full-process DoS. Fixed by clamping each count
   before allocating: **FT.SEARCH HIGHLIGHT/SUMMARIZE FIELDS** (bound by
-  remaining tokens), **HSCAN COUNT** (`count.min(total)`), **SRANDMEMBER**
-  negative count (`members.len()*10`, matching HRANDFIELD/ZRANDMEMBER),
-  **BITFIELD SET/INCRBY** offset (reject past the 512MB limit, matching SETBIT;
-  GET exempt), and **ZMPOP COUNT** (`pop_count.min(card)` — this last site was
-  missed by the audit finders and caught by the allocation sweep). Each fix has
-  a red/green test. From the production-hardening audit (Batch A).
+  remaining tokens), **HSCAN COUNT** (`count.min(total)`),
+  **SRANDMEMBER / HRANDFIELD / ZRANDMEMBER** negative COUNT (absolute 2²⁰ cap
+  with a loud `ERR COUNT is out of range` beyond it — the first-cut relative
+  `len()*10` cap silently truncated legitimate requests on small collections,
+  breaking Redis's exact-|COUNT|-with-duplicates contract; caught in review and
+  fixed at all six sites including the pre-existing HRANDFIELD/ZRANDMEMBER
+  ones), **BITFIELD SET/INCRBY** offset (reject past the 512MB limit, matching
+  SETBIT; GET exempt), and **ZMPOP COUNT** (`pop_count.min(card)` — this last
+  site was missed by the audit finders and caught by the allocation sweep).
+  Each fix has a red/green test. From the production-hardening audit (Batch A).
+
+### Fixed — Review follow-ups on the hardening sweep (PR #250)
+
+- **Gossip PONG fragmentation (monoio):** the failure-detector's PING probe read
+  the 4-byte length and the PONG body with single `read()` calls, so a valid
+  frame arriving fragmented was silently dropped — leaving `pong_recv_ms` stale
+  and pushing a healthy peer toward PFAIL. Both reads now use the bus listener's
+  exact-read loop, and both runtimes' probes cap the peer-supplied PONG length
+  at the bus's 64KB frame bound before sizing the buffer (the tokio probe
+  previously allocated an unchecked `vec![0u8; pong_len]`).
+- **AOF corruption offsets are file-absolute:** replay's truncation/corruption
+  logs reported offsets relative to the RESP section; with an RDB preamble the
+  operator-facing repair guidance (redis-check-aof, truncation point) pointed at
+  the wrong file location. Offsets now include the preamble length.
+- **Cross-shard MSET no longer OKs an unconfirmed leg:** a timed-out, closed, or
+  errored remote `MultiExecute` ack was discarded and the client still got `OK`.
+  All legs are drained (each was already dispatched, and the local leg still
+  persists), but any failed leg now surfaces as an error instead of a false ack.
+- **`recv_reply_bounded` extended to the handler plane:** the coordinator's 30s
+  bounded reply-await now also covers the 11 remaining direct cross-shard acks
+  (WS.DROP cleanup, routed MQ commands, routed graph commands, TXN.COMMIT MQ
+  materialization acks, and the txn-abort remote rollback ack, on both
+  handler_monoio and handler_sharded) — a wedged owner shard can no longer park
+  those connections forever. MQ/graph/TXN owner execution is synchronous on the
+  shard thread (no blocking-wait commands route through these paths), so the
+  bound cannot cut off a legitimate long wait.
+- **Checkpoint finalize backoff arms from the failure time:** the backoff was
+  armed with a timestamp captured before the finalize I/O; when
+  `wait_durable`/`manifest.commit`/`graph_save`/control-write took longer than
+  the backoff window, the retry deadline was already in the past and the next
+  1ms tick retried immediately — exactly the flood the backoff exists to stop.
 
 ### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #TBD)
 

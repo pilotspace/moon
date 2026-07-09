@@ -1751,8 +1751,13 @@ pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
         }
         Frame::Array(result.into())
     } else {
-        // Negative count: allow duplicates. Cap to prevent OOM on extreme values.
-        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        // Negative count: allow duplicates — exactly |COUNT| of them (Redis
+        // contract). The DoS guard refuses extreme counts loudly instead of
+        // silently truncating.
+        let n = count.unsigned_abs() as usize;
+        if n > crate::command::RAND_DUP_COUNT_MAX {
+            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
+        }
         let cap = if withscores { n * 2 } else { n };
         let mut result = Vec::with_capacity(cap);
         for _ in 0..n {
@@ -2033,7 +2038,13 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
         Frame::Array(result.into())
     } else {
-        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        // Negative count: allow duplicates — exactly |COUNT| of them (Redis
+        // contract). The DoS guard refuses extreme counts loudly instead of
+        // silently truncating.
+        let n = count.unsigned_abs() as usize;
+        if n > crate::command::RAND_DUP_COUNT_MAX {
+            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
+        }
         let cap = if withscores { n * 2 } else { n };
         let mut result = Vec::with_capacity(cap);
         for _ in 0..n {

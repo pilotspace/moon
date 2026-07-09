@@ -43,6 +43,18 @@ pub enum DispatchResult {
     Quit(Frame),
 }
 
+/// Upper bound for the with-duplicates (negative COUNT) arms of
+/// SRANDMEMBER / HRANDFIELD / ZRANDMEMBER. Redis returns exactly |COUNT|
+/// elements; Moon honors that up to this cap and returns an error beyond it —
+/// never a silently short reply. An unchecked |COUNT| would let one command
+/// drive an arbitrarily large `Vec::with_capacity` (i64::MIN → allocator
+/// abort), and the previous relative cap (`len() * 10`) silently truncated
+/// legitimate requests on small collections.
+pub(crate) const RAND_DUP_COUNT_MAX: usize = 1 << 20;
+
+/// Error returned when a negative COUNT exceeds [`RAND_DUP_COUNT_MAX`].
+pub(crate) const ERR_RAND_COUNT_RANGE: &[u8] = b"ERR COUNT is out of range";
+
 /// Dispatch a pre-extracted command to the appropriate handler.
 ///
 /// Uses two-level dispatch: match on `(command_length, first_byte_lowercase)` to narrow
