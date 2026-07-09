@@ -211,10 +211,82 @@ fn bench_mutable_scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// IVF posting-list scan: isolates the per-candidate cost of the
+/// metric-faithful L2 correction. `l2_adjust=false` is byte-for-byte the
+/// pre-fix (main) path (`dist = adc * norm^2`); `l2_adjust=true` applies
+/// `||a-q||^2 = (||a||-||q||)^2 + ||a||*||q|| * d_sphere^2`. Same FastScan
+/// kernel + reconstruction feed both arms — the only delta is the final
+/// distance transform, so off-vs-on measures exactly the added branch.
+fn bench_scan_posting_list(c: &mut Criterion) {
+    use moon::vector::segment::ivf::interleave_posting_list;
+    use moon::vector::types::SearchResult;
+    use smallvec::SmallVec;
+
+    fastscan::init_fastscan();
+    let mut group = c.benchmark_group("ivf_scan_posting_list_1024");
+
+    for &padded_dim in PADDED_DIMS {
+        let dim_half = padded_dim / 2;
+        let centroids = scaled_centroids(padded_dim as u32);
+        let q = make_query(padded_dim, 42);
+        let mut lut = vec![0u8; padded_dim * 16];
+        let params = fastscan::build_quantized_lut(&q, &centroids, &mut lut);
+
+        // Realistic posting list: 1024 vectors with WIDELY varying norms
+        // (0.5..40.5) — the L2 weak spot the correction targets.
+        let n = 1024usize;
+        let mut s = 11u32;
+        let mut packed: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut ids: Vec<u32> = Vec::with_capacity(n);
+        let mut norms: Vec<f32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut code = vec![0u8; dim_half];
+            for b in code.iter_mut() {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (s >> 24) as u8;
+            }
+            packed.push(code);
+            ids.push(i as u32);
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            norms.push(0.5 + (s as f32 / u32::MAX as f32) * 40.0);
+        }
+        let pl = interleave_posting_list(&packed, &ids, &norms);
+        let q_norm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        for &(label, l2_adjust) in &[("l2_off_main_baseline", false), ("l2_on_fix", true)] {
+            group.bench_with_input(
+                BenchmarkId::new(label, padded_dim),
+                &padded_dim,
+                |bench, _| {
+                    bench.iter(|| {
+                        let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+                        fastscan::scan_posting_list(
+                            black_box(pl.codes.as_slice()),
+                            black_box(&lut),
+                            params,
+                            dim_half,
+                            &pl.ids,
+                            &pl.norms,
+                            pl.count,
+                            10,
+                            black_box(l2_adjust),
+                            black_box(q_norm),
+                            &mut results,
+                        );
+                        black_box(results.len())
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fastscan_block,
     bench_build_lut,
-    bench_mutable_scan
+    bench_mutable_scan,
+    bench_scan_posting_list
 );
 criterion_main!(benches);
