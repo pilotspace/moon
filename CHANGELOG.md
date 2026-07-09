@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Vector: DEL tombstones secondary fields + FT.INFO num_docs accuracy (PR #TBD)
+
+- **Multi-vector-field deletion resurrection (#20):** `DEL`/`UNLINK`/`HDEL` on a
+  document only tombstoned the *default* vector field. Secondary VECTOR fields
+  live in a separate `field_segments` map that `tombstone_key_in_index` never
+  iterated, so a subsequent `FT.SEARCH idx '@field2:[...]'` still returned the
+  deleted document (under a synthetic `vec:<id>` key, since the shared
+  key-hash→key map was cleared). Now every field's segments are tombstoned.
+- **FT.INFO `num_docs` over/under-count (#28):** the mutable segment's `len()`
+  counts tombstoned entries in place until compaction, inflating `num_docs` by
+  up to `compact_threshold` under DEL/HSET churn — switched to a new `live_len()`
+  that excludes tombstones. Separately, DiskANN cold-tier segments (experimental,
+  gated by `MOON_VEC_COLD_TIER`) were never summed at all even though cold docs
+  ARE returned by FT.SEARCH; added a `snap.cold` counting loop. (audit findings 20, 28)
+
 ### Fixed — Vector: GraphUnion merge recall gate no longer lets a total collapse through (PR #TBD)
 
 - The background/manual GraphUnion merge recall gate read
