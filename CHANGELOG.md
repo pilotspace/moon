@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Vector: GraphUnion merge recall gate no longer lets a total collapse through (PR #TBD)
+
+- The background/manual GraphUnion merge recall gate read
+  `recall < tolerance && recall > 0.0`, so a merge whose verified recall was
+  **exactly 0.0** (total collapse) slipped past the guard and committed. Since
+  `verify_merge_recall` returns 1.0 (not 0.0) for the too-few-vectors cases,
+  0.0 only ever means a real measured collapse — the `&& recall > 0.0` clause
+  was removed so such a merge now aborts. (audit finding 21)
+
 ### Fixed — Hardening: APPEND 512MB cap + reject FT.* inside MULTI on prod handlers (PR #TBD)
 
 - **APPEND** now enforces the 512MB max-string-size limit (matching

@@ -1502,7 +1502,11 @@ fn merge_graph_union(
     // search across the original segments.
     let recall = verify_merge_recall(&graph, &tq_bfs, segments, collection, dim, n, seed);
 
-    if recall < recall_tolerance && recall > 0.0 {
+    // NOTE: no `&& recall > 0.0` guard — recall == 0.0 is a genuine total
+    // collapse that MUST abort. verify_merge_recall returns 1.0 (not 0.0) for
+    // the "too few vectors to measure" cases, so 0.0 only ever means a real
+    // measured zero-recall merge.
+    if recall < recall_tolerance {
         tracing::warn!(
             "merge recall {recall:.4} < tolerance {recall_tolerance:.4}; aborting merge"
         );
