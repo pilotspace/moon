@@ -1274,6 +1274,22 @@ impl MutableSegment {
         self.inner.read().entries.len()
     }
 
+    /// Returns the number of LIVE (non-tombstoned) entries.
+    ///
+    /// [`Self::len`] counts every slot including tombstoned ones —
+    /// `mark_deleted_*` only flips `delete_lsn` in place and never removes
+    /// the entry until the next compaction. FT.INFO's `num_docs` must use
+    /// this (prod-hardening #28): otherwise up to `compact_threshold`
+    /// DEL/HSET-update dead docs silently inflate the reported count.
+    pub fn live_len(&self) -> usize {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .filter(|e| e.delete_lsn == 0)
+            .count()
+    }
+
     /// Returns true if no entries.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
@@ -2352,6 +2368,26 @@ mod tests {
         seg.mark_deleted(0, 42);
         let frozen = seg.freeze();
         assert_eq!(frozen.entries[0].delete_lsn, 42);
+    }
+
+    #[test]
+    fn test_live_len_excludes_tombstoned() {
+        // Prod-hardening #28: live_len() must NOT count tombstoned entries,
+        // while len() keeps counting them until compaction.
+        distance::init();
+        let col = make_collection(128);
+        let seg = MutableSegment::new(128, col);
+        for i in 0..5u64 {
+            seg.append(1000 + i, &make_f32_vector(128, (i + 1) as u32), i + 1);
+        }
+        assert_eq!(seg.len(), 5);
+        assert_eq!(seg.live_len(), 5);
+        // Tombstone two entries by key_hash — they stay in the Vec (len
+        // unchanged) but must drop out of live_len.
+        assert_eq!(seg.mark_deleted_by_key_hash(1000, 100), 1);
+        assert_eq!(seg.mark_deleted_by_key_hash(1002, 100), 1);
+        assert_eq!(seg.len(), 5, "len still counts tombstoned entries");
+        assert_eq!(seg.live_len(), 3, "live_len drops the two tombstoned");
     }
 
     #[test]

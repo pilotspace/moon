@@ -186,6 +186,17 @@ impl DiskAnnSegment {
         })
     }
 
+    /// Number of vectors stored in this cold-tier segment.
+    ///
+    /// DiskANN segments have no tombstone/MVCC layer yet (see prod-hardening
+    /// #19), so this is the raw stored count — used by FT.INFO `num_docs`
+    /// (#28) so cold-tier documents are counted at all rather than silently
+    /// dropped from the total once a segment ages into the cold tier.
+    #[inline]
+    pub fn num_docs(&self) -> usize {
+        self.num_vectors as usize
+    }
+
     /// Approximate nearest neighbor search using PQ asymmetric distance
     /// and buffered Vamana beam traversal from disk.
     ///

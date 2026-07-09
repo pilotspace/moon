@@ -2225,11 +2225,12 @@ impl VectorStore {
         }
     }
 
-    fn tombstone_key_in_index(&mut self, idx_name: &Bytes, key_hash: u64) -> bool {
-        let Some(idx) = self.indexes.get_mut(idx_name) else {
-            return false;
-        };
-        let snap = idx.segments.load();
+    /// Tombstone `key_hash` across every tier of one [`SegmentHolder`]'s
+    /// current snapshot (mutable + immutable + warm + unloaded/cold-stub).
+    /// Shared by the default field and each secondary VECTOR field so a
+    /// deleted document cannot resurrect through any field's search path.
+    fn tombstone_key_in_holder(holder: &SegmentHolder, key_hash: u64) {
+        let snap = holder.load();
         // Tombstone in mutable segment (always present).
         snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
         // Also tombstone any already-compacted immutable segments that
@@ -2248,7 +2249,24 @@ impl VectorStore {
         for stub in snap.unloaded.iter() {
             stub.mark_deleted_by_key_hash(key_hash);
         }
-        drop(snap);
+    }
+
+    fn tombstone_key_in_index(&mut self, idx_name: &Bytes, key_hash: u64) -> bool {
+        let Some(idx) = self.indexes.get_mut(idx_name) else {
+            return false;
+        };
+        // Default field (`vector_fields[0]`).
+        Self::tombstone_key_in_holder(&idx.segments, key_hash);
+        // Prod-hardening #20: secondary VECTOR fields live in a separate
+        // `field_segments` map that the default-field loop above never
+        // touches. Without this, `DEL`/`HDEL`/`UNLINK` on a doc leaves the
+        // vector alive in every non-default field's segments — a subsequent
+        // `FT.SEARCH idx '@field2:[...]'` resurrects the deleted document
+        // (under a synthetic `vec:<id>` key, since the shared
+        // key_hash_to_key map below is cleared unconditionally).
+        for fs in idx.field_segments.values() {
+            Self::tombstone_key_in_holder(&fs.segments, key_hash);
+        }
         // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
         // they track LIVE keys, not historical inserts — without this
         // they grow monotonically under key churn (~1GB / 24M deletes).
@@ -4362,6 +4380,66 @@ mod bg_compact_tests {
         assert!(
             !after.contains(&target_hash),
             "doc:3 must be absent after steady-state tombstone"
+        );
+    }
+
+    /// Prod-hardening #20: DEL of a doc must tombstone its vector in EVERY
+    /// vector field, not just the default field. A secondary VECTOR field
+    /// lives in `idx.field_segments`, which `tombstone_key_in_index` used to
+    /// skip entirely — leaving the deleted doc alive in that field's search.
+    #[test]
+    fn test_del_tombstones_secondary_vector_field() {
+        distance::init();
+        let dim = 64u32;
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        // Two-field schema: vector_fields[0] is the default field, [1] is a
+        // secondary field that create_index materializes into field_segments.
+        meta.vector_fields = vec![
+            VectorFieldMeta {
+                field_name: Bytes::from_static(b"vec"),
+                dimension: dim,
+                padded_dimension: padded_dimension(dim),
+                metric: DistanceMetric::L2,
+                quantization: QuantizationConfig::TurboQuant4,
+                build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
+            },
+            VectorFieldMeta {
+                field_name: Bytes::from_static(b"vec2"),
+                dimension: dim,
+                padded_dimension: padded_dimension(dim),
+                metric: DistanceMetric::L2,
+                quantization: QuantizationConfig::TurboQuant4,
+                build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
+            },
+        ];
+        store.create_index(meta).unwrap();
+
+        let key = b"doc:1";
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        // Default field insert (also registers key_hash_to_key).
+        insert(&mut store, key, random_vec(dim as usize, 1));
+        // Secondary-field insert: mirror the production insert path by
+        // appending straight into vec2's mutable segment.
+        {
+            let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+            let fs = idx.field_segments.get(b"vec2".as_ref()).unwrap();
+            let snap = fs.segments.load();
+            snap.mutable
+                .append(key_hash, &random_vec(dim as usize, 2), 1);
+            assert_eq!(snap.mutable.live_len(), 1, "vec2 has the live doc");
+        }
+
+        // DEL doc:1 → both fields must be tombstoned.
+        store.mark_deleted_for_key(key);
+
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let fs = idx.field_segments.get(b"vec2".as_ref()).unwrap();
+        let snap = fs.segments.load();
+        assert_eq!(
+            snap.mutable.live_len(),
+            0,
+            "secondary field vec2 must have no live docs after DEL (#20)"
         );
     }
 

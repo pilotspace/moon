@@ -45,7 +45,10 @@ pub fn ft_info(
     // fully searchable (see FT.INFO doc comment above re: summing across
     // segments).
     let snap = idx.segments.load();
-    let mut num_docs = snap.mutable.len();
+    // Prod-hardening #28: use live_len(), NOT len() — the mutable segment
+    // keeps tombstoned entries in place until compaction, so len() would
+    // over-count deleted docs by up to compact_threshold under DEL/HSET churn.
+    let mut num_docs = snap.mutable.live_len();
     for imm in snap.immutable.iter() {
         num_docs += imm.live_count() as usize;
     }
@@ -56,6 +59,13 @@ pub fn ft_info(
     // stub itself (captured at unload time), so this needs no reload.
     for stub in snap.unloaded.iter() {
         num_docs += stub.live_count() as usize;
+    }
+    // Prod-hardening #28: DiskANN cold-tier segments (experimental, gated by
+    // MOON_VEC_COLD_TIER) were never summed — cold docs ARE returned by
+    // FT.SEARCH, so omitting them under-reported num_docs once any segment
+    // aged into the cold tier.
+    for cold in snap.cold.iter() {
+        num_docs += cold.num_docs();
     }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
@@ -146,7 +156,8 @@ pub fn ft_info(
         let (field_num_docs, field_mutable, field_immutable_count) = if i == 0 {
             // Default field: use top-level segments
             let s = idx.segments.load();
-            let mut docs = s.mutable.len();
+            // #28: live_len() excludes tombstoned mutable entries.
+            let mut docs = s.mutable.live_len();
             let imm_count = s.immutable.len();
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
@@ -157,10 +168,13 @@ pub fn ft_info(
             for stub in s.unloaded.iter() {
                 docs += stub.live_count() as usize;
             }
-            (docs, s.mutable.len(), imm_count)
+            for cold in s.cold.iter() {
+                docs += cold.num_docs();
+            }
+            (docs, s.mutable.live_len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
             let s = fs.segments.load();
-            let mut docs = s.mutable.len();
+            let mut docs = s.mutable.live_len();
             let imm_count = s.immutable.len();
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
@@ -171,7 +185,10 @@ pub fn ft_info(
             for stub in s.unloaded.iter() {
                 docs += stub.live_count() as usize;
             }
-            (docs, s.mutable.len(), imm_count)
+            for cold in s.cold.iter() {
+                docs += cold.num_docs();
+            }
+            (docs, s.mutable.live_len(), imm_count)
         } else {
             (0, 0, 0)
         };
