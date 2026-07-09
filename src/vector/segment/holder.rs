@@ -333,11 +333,29 @@ impl SegmentHolder {
         self.segments.store(Arc::new(new_list));
     }
 
+    /// Acquire the single-flight reload lock. Any caller doing a
+    /// load-mutate-`swap` on the segment list — the WARM mmap-budget eviction
+    /// tick (`enforce_segment_holder_budget`) as well as
+    /// `promote_unloaded`/`submit_unloaded_reloads` — takes this so the three
+    /// read-modify-write paths serialize on the lock rather than solely on the
+    /// shard-thread-affinity invariant (perf-review defense-in-depth: guards
+    /// against a future worker-pool install or off-thread sweep turning the
+    /// unsynchronized swaps into a lost update). Never held across `.await`.
+    pub(crate) fn reload_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.reload_lock.lock()
+    }
+
     /// Resident bytes split into (mutable_bytes, immutable_bytes).
     ///
     /// Mutable = brute-force buffer (TQ codes + raw f32 + entries).
-    /// Immutable = HNSW graph + TQ codes + QJL signs + norms + MVCC.
-    /// IVF/warm/cold segments are counted in the immutable total.
+    /// Immutable = HNSW graph + TQ codes + QJL signs + norms + MVCC, PLUS the
+    /// WARM tier (fully-materialized `WarmSearchSegment` heap copies) and COLD
+    /// stubs (tiny). WARM is the same-size heap copy of a demoted HOT segment,
+    /// so once segments age past `--segment-warm-after` it dominates resident
+    /// vector memory — it MUST be counted here or the memory-pressure trigger
+    /// (see `should_run_pressure_cascade`) and INFO/Prometheus go blind to it.
+    /// IVF and DiskANN-cold segments have no resident accessor yet (IVF is
+    /// in-memory but small; cold lives on disk) and still contribute 0.
     pub fn resident_bytes(&self) -> (usize, usize) {
         let snapshot = self.load();
         let mutable = snapshot.mutable.resident_bytes();
@@ -345,9 +363,15 @@ impl SegmentHolder {
         for seg in &snapshot.immutable {
             immutable += seg.resident_bytes();
         }
-        // IVF, warm, and cold segments are also immutable-tier memory.
-        // Their resident_bytes accessors can be added when those tiers
-        // gain memory tracking; for now they contribute 0.
+        // WARM tier: fully-resident heap copies — the dominant term for a
+        // long-lived shard whose HOT segments have aged into WARM.
+        for warm in &snapshot.warm {
+            immutable += warm.resident_bytes();
+        }
+        // COLD stubs: metadata-only (data on disk), but cheap and accurate.
+        for stub in &snapshot.unloaded {
+            immutable += stub.resident_bytes();
+        }
         (mutable, immutable)
     }
 
@@ -1232,6 +1256,84 @@ mod tests {
         )
         .unwrap();
         Arc::new(UnloadedSegment::from_warm(&warm, false))
+    }
+
+    /// Build a resident WARM segment whose footprint is dominated by a
+    /// `codes_len`-byte codes payload, so tests can assert byte accounting.
+    fn make_warm_sized(
+        dir: &std::path::Path,
+        seg_id: u64,
+        codes_len: usize,
+    ) -> Arc<crate::vector::persistence::warm_search::WarmSearchSegment> {
+        use crate::storage::tiered::SegmentHandle;
+        use crate::vector::hnsw::graph::HnswGraph;
+        use crate::vector::persistence::warm_search::WarmSearchSegment;
+        use crate::vector::persistence::warm_segment::{
+            write_codes_mpf, write_graph_mpf, write_mvcc_mpf,
+        };
+
+        let seg_dir = dir.join(format!("warm-{seg_id}"));
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        write_codes_mpf(&seg_dir.join("codes.mpf"), seg_id, &vec![0u8; codes_len]).unwrap();
+        write_graph_mpf(&seg_dir.join("graph.mpf"), seg_id, &empty_graph.to_bytes()).unwrap();
+        write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), seg_id, &[]).unwrap();
+        let handle = SegmentHandle::new(seg_id, seg_dir.clone());
+        Arc::new(
+            WarmSearchSegment::from_files(
+                &seg_dir,
+                seg_id,
+                make_test_collection(128),
+                handle,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Perf-review finding #1 (HIGH): `resident_bytes()` must count the WARM
+    /// tier — a shard whose HOT segments have aged into WARM would otherwise
+    /// report ~0 vector memory, blinding the memory-pressure trigger (C).
+    #[test]
+    fn test_resident_bytes_includes_warm_tier() {
+        distance::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = make_test_collection(128);
+        let holder = SegmentHolder::new(128, collection.clone());
+
+        // Baseline: empty holder reports ~0 immutable-tier bytes.
+        let (_, base_imm) = holder.resident_bytes();
+
+        // Put a ~40 KB WARM segment in the tier (no HOT immutable segments).
+        let warm = make_warm_sized(tmp.path(), 1, 40_000);
+        let warm_bytes = warm.resident_bytes();
+        assert!(warm_bytes >= 40_000);
+        holder.swap(SegmentList {
+            mutable: Arc::new(MutableSegment::new(128, collection)),
+            immutable: Vec::new(),
+            ivf: Vec::new(),
+            warm: vec![warm],
+            cold: Vec::new(),
+            unloaded: Vec::new(),
+        });
+
+        let (_, imm) = holder.resident_bytes();
+        assert!(
+            imm >= base_imm + 40_000,
+            "WARM tier must contribute to resident_bytes: {imm} (base {base_imm})"
+        );
     }
 
     /// #18 (holder half): with the reload pool enabled, `submit_unloaded_reloads`

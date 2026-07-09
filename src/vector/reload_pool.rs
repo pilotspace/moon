@@ -202,24 +202,6 @@ pub fn global() -> Option<&'static SegmentReloadPool> {
     GLOBAL_POOL.get().and_then(|p| p.as_ref())
 }
 
-/// Per-shard WARM-tier resident-byte cap (`--vec-warm-mmap-budget`), mirrored
-/// here so the reload/install path can bound WARM growth immediately instead of
-/// waiting for the 10s `MmapBudget` tick. `0` = disabled (no install-time gate).
-/// Set once at startup; the same per-shard value applies uniformly to every
-/// shard, so a single global atomic suffices.
-static WARM_BUDGET_PER_SHARD_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Publish the per-shard WARM budget (bytes) for the reload-install gate.
-pub fn set_warm_budget_per_shard(bytes: u64) {
-    WARM_BUDGET_PER_SHARD_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Current per-shard WARM budget (bytes); `0` disables the install-time gate.
-pub fn warm_budget_per_shard() -> u64 {
-    WARM_BUDGET_PER_SHARD_BYTES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Resolve the default reload-worker count.
 ///
 /// `MOON_VEC_RELOAD_WORKERS=<n>` overrides (0 = disable, falling back to the

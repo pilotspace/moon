@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — Vector: memory-aware WARM/reload offload with a real, reloadable ceiling (PR #252)
+### Fixed — Vector: memory-aware WARM offload with a real, reloadable ceiling (PR #252)
 
 - **Reloadable byte-cap eviction (A).** `MmapBudget::enforce_budget` (the
   per-shard `--vec-warm-mmap-budget` cap, default 2gb) evicted a WARM segment by
@@ -15,16 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the doc claiming reload-on-touch. It now demotes each evicted segment to a
   reloadable `UnloadedSegment` stub in `unloaded` (every WARM segment is durably
   disk-backed via `transition_to_warm`, so the stub reloads byte-identically).
-  This makes `--vec-warm-mmap-budget` a real, reloadable memory ceiling.
-- **Reload-admission gate (B).** The COLD→WARM reload/install path
-  (`promote_unloaded` + the off-loop `submit_unloaded_reloads`) grew the WARM
-  tier with no bound — a query burst first-touching many COLD segments could
-  balloon resident heap and OOM before the 10s budget tick. After a reload
-  installs freshly-hot segments, the tier is now trimmed by LRU (idle segments
-  demoted to reloadable stubs) to fit the per-shard cap, protecting the segments
-  the current query just reloaded (the full-recall floor). Live WARM stays
-  ≤ cap between ticks. The cap is mirrored into a process-global atomic set at
-  startup (`0` disables the gate).
+  This makes `--vec-warm-mmap-budget` a real, reloadable memory ceiling. The
+  eviction tick now also takes the holder `reload_lock` so it serializes with
+  the reload/install path instead of relying solely on shard-thread affinity.
+- **WARM memory accounting fix.** `SegmentHolder::resident_bytes()` hardcoded the
+  WARM/COLD tiers to 0, so a shard whose HOT segments had aged into WARM reported
+  ~0 vector memory — blinding both INFO/Prometheus and the memory-pressure
+  trigger below. It now sums the WARM tier (the dominant term for a long-lived
+  shard) plus COLD stubs. (IVF/DiskANN-cold still lack a resident accessor.)
 - **Memory-triggered early offload (C).** Vector segment memory was invisible to
   every pressure mechanism, so a vector-heavy shard (the primary disk-offload
   case) only ever offloaded on the wall-clock idle timer

@@ -2944,6 +2944,11 @@ fn enforce_segment_holder_budget(
     holder: &SegmentHolder,
     budget: &mut crate::vector::persistence::mmap_budget::MmapBudget,
 ) -> u64 {
+    // Serialize with promote_unloaded/submit_unloaded_reloads: all three do a
+    // load-mutate-swap on the same ArcSwap, and only shard-thread affinity keeps
+    // them from clobbering each other today (perf-review defense-in-depth). Held
+    // only across synchronous work, never an .await.
+    let _reload_guard = holder.reload_guard();
     let snapshot = holder.load();
 
     // Collect the set of IDs currently in the warm list.

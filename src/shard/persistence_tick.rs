@@ -1591,8 +1591,9 @@ mod tests {
         rt.maxmemory = 1024 * 1024; // 1 MiB per-shard budget (1 shard)
         rt.num_shards = 1;
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
-        let server_config =
-            Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>([]));
+        let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
+            [],
+        ));
 
         // KV memory is trivial (well under the 85% threshold on its own)...
         shared.publish_memory(0, 1024);

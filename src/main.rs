@@ -500,10 +500,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         info!("vector COLD-segment reload pool: disabled (blocking reload)");
     }
-    // Reload-admission gate: mirror the per-shard WARM byte cap so the
-    // reload/install path bounds WARM growth immediately (between MmapBudget
-    // ticks). 0 = no gate (the tick alone enforces the cap).
-    moon::vector::reload_pool::set_warm_budget_per_shard(config.vec_warm_mmap_budget_bytes());
 
     // Checked cast: --shards is bounded by clap's value_parser, but `as u16`
     // would silently wrap for values > 65535. Fail loudly instead.
