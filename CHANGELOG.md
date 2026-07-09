@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `promote_unloaded`, preserving exact pre-#18 behavior. Non-yielding sync search
   paths are unchanged (still block); HYBRID/SPARSE/RANGE/non-default-field
   queries do not take the off-loop path (accepted follow-up).
+### Ops — v0.6.0 release-ledger closure + hygiene (PR #256)
+
+- `RELEASES.md` gains the missing v0.6.0 entry (shipped 2026-07-08, ledger
+  lagged); `release.yml` now fails a version-tag push whose entry is absent
+  from `RELEASES.md` — the ledger can never lag a tag again.
+- `replication.state` (root artifact from replication test runs) gitignored.
 
 ### Docs — engineering roadmap suite under `docs/roadmap/` (PR #254)
 

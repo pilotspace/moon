@@ -1,5 +1,10 @@
 # Releases
 
+## v0.6.0 — 2026-07-08
+milestones: v0.6.0-release (PR #249, six workstreams)
+waivers: shardslice-migration (expires 2026-08-01; retirement planned with v0.7 L4 cross-shard-read work)
+evidence: Squash-merged 9edf7a9c (PR #249): multi-db isolation (db-scoped FT/graph/full-text indexes; per-db maxmemory quotas with truthful container-growth accounting), vector engine HOT→WARM→COLD offload (−26% RSS measured), `--profile standalone`, command-parity audit. Adversarial pre-merge reviews caught the install-time idle-clock and shrink-lockout blockers; historical WS DROP key leak fixed with operator callout in CHANGELOG. Full CI green including Windows. Ledger entry recorded 2026-07-10 (two days after ship) — the release-ledger CI gate added alongside this entry makes a tag without a ledger entry fail, so the lag cannot recur.
+
 ## v0.5.1 — 2026-07-04
 milestones: none
 waivers: none
