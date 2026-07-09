@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Hardening: bound TLS handshake + cluster-bus body reads against slow-loris (PR #TBD)
+
+- **TLS handshake has no timeout (#17):** after `try_accept_connection` consumed
+  a `maxclients` slot, `acceptor.accept(tcp_stream).await` ran with no deadline
+  on both the monoio and tokio TLS paths. A peer that completed the TCP handshake
+  on the TLS port and then sent no (or a partial) ClientHello pinned the task,
+  its fd, and its `maxclients` slot indefinitely at zero CPU cost — a classic
+  slow-loris that could exhaust the connection limit. Wrapped both accepts in a
+  10s `TLS_HANDSHAKE_TIMEOUT`, releasing the slot via `record_connection_closed()`
+  on expiry.
+- **Cluster-bus gossip body read has no timeout (#10):** `handle_cluster_peer`
+  guarded only the 4-byte length-prefix read with a shutdown-cancel select; once
+  a valid length was read, the body `read_exact` had no timeout and no
+  shutdown arm. A client could send a valid length header and never send the
+  body, blocking the spawned task forever (immune to graceful shutdown, socket
+  never reclaimed). Both runtimes now read the body under a
+  `GOSSIP_BODY_READ_TIMEOUT` (10s) + shutdown-cancel select.
+
 ### Fixed — Txn: MULTI locality analysis honors SORT/GEORADIUS STORE destination (PR #TBD)
 
 - In a multi-shard deployment, `MULTI; SORT src STORE dst; EXEC` (or
