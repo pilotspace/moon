@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Vector storage: fence experimental DiskANN cold tier + drop dead vector WAL (PR #TBD)
+
+- The DiskANN cold tier (WARM→COLD segment demotion + on-disk Vamana beam
+  search) was running by default (`--disk-offload` defaults on, `--segment-cold-after`
+  defaults 86400) despite being incomplete — **no cold-segment deletion**
+  (DEL/HDEL never removes cold docs), blocking per-hop uring I/O holding the
+  segment mutex, `FT.INFO num_docs` under-counting cold segments, unfinished
+  restart reload of PQ codebooks, and a library-code `panic!` in
+  `DiskAnnSegment::new`. It is now **fenced behind the experimental
+  `MOON_VEC_COLD_TIER=1` env gate** (default off); the WARM→COLD transition is
+  a no-op otherwise. Warm-tier mmap + LRU eviction (`--vec-warm-mmap-budget`)
+  continues to handle out-of-RAM indexes. (audit findings 19, 24, 28)
+- `DiskAnnSegment::new` now returns `io::Result` instead of panicking on a
+  file-open error, so a cold transition can never abort the shard.
+- Removed the dead vector WAL module (`vector/persistence/wal_record.rs`): it
+  was never on the live recovery path (superseded by manifest + segment +
+  keymap + dedup rescan) and carried a documented double-apply footgun.
+
 ### Fixed — Cluster: gossip PING task leak + non-blocking accept send (PR #TBD)
 
 - The gossip PING ticker (both tokio + monoio) spawned an unbounded

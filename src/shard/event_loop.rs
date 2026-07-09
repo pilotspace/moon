@@ -36,6 +36,18 @@ use super::shared_databases::ShardDatabases;
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
+/// EXPERIMENTAL DiskANN cold-tier gate. The WARM->COLD transition + on-disk
+/// Vamana beam search are incomplete (no cold-segment deletion, ADC-only
+/// recall, restart reload of PQ codebooks unfinished — see the audit), so the
+/// transition is a no-op unless an operator explicitly opts in via
+/// `MOON_VEC_COLD_TIER=1`. Warm-tier mmap + LRU eviction (`--vec-warm-mmap-budget`)
+/// handles out-of-RAM indexes by default.
+fn cold_tier_experimental_enabled() -> bool {
+    std::env::var("MOON_VEC_COLD_TIER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("enable"))
+        .unwrap_or(false)
+}
+
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
@@ -1575,7 +1587,10 @@ impl super::Shard {
                 }
                 // Cold tier transition check (60s, disk-offload only)
                 _ = cold_check_interval.0.tick() => {
-                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                    if cold_tier_experimental_enabled()
+                        && server_config.disk_offload_enabled()
+                        && server_config.segment_cold_after > 0
+                    {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
@@ -2235,7 +2250,9 @@ impl super::Shard {
                 }
                 // Cold tier check: every cold_poll_secs * 1000 ticks
                 if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {
-                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0
+                    if cold_tier_experimental_enabled()
+                        && server_config.disk_offload_enabled()
+                        && server_config.segment_cold_after > 0
                     {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config
