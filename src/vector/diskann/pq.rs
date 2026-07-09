@@ -192,6 +192,12 @@ impl ProductQuantizer {
     pub fn dim(&self) -> usize {
         self.dim
     }
+
+    /// Estimated resident heap bytes of the trained quantizer: the flat
+    /// codebook (`m * ksub * dsub` floats) plus fixed struct overhead.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.centroids.len() * std::mem::size_of::<f32>()
+    }
 }
 
 /// Scalar squared-L2 for sub-vectors.

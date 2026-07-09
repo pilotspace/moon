@@ -354,8 +354,9 @@ impl SegmentHolder {
     /// so once segments age past `--segment-warm-after` it dominates resident
     /// vector memory — it MUST be counted here or the memory-pressure trigger
     /// (see `should_run_pressure_cascade`) and INFO/Prometheus go blind to it.
-    /// IVF and DiskANN-cold segments have no resident accessor yet (IVF is
-    /// in-memory but small; cold lives on disk) and still contribute 0.
+    /// IVF (centroids + posting lists) and DiskANN-cold (PQ codes + codebook;
+    /// graph on NVMe excluded) are counted too (accounting-spine A1) — every
+    /// tier that pins heap reports it here.
     pub fn resident_bytes(&self) -> (usize, usize) {
         let snapshot = self.load();
         let mutable = snapshot.mutable.resident_bytes();
@@ -371,6 +372,15 @@ impl SegmentHolder {
         // COLD stubs: metadata-only (data on disk), but cheap and accurate.
         for stub in &snapshot.unloaded {
             immutable += stub.resident_bytes();
+        }
+        // IVF: in-memory centroids + interleaved posting lists.
+        for ivf_seg in &snapshot.ivf {
+            immutable += ivf_seg.resident_bytes();
+        }
+        // DiskANN cold (COLD-ann, distinct from the COLD stubs above): PQ
+        // codes + codebook stay resident; the Vamana graph lives on disk.
+        for cold_seg in &snapshot.cold {
+            immutable += cold_seg.resident_bytes();
         }
         (mutable, immutable)
     }
@@ -1333,6 +1343,83 @@ mod tests {
         assert!(
             imm >= base_imm + 40_000,
             "WARM tier must contribute to resident_bytes: {imm} (base {base_imm})"
+        );
+    }
+
+    /// Accounting-spine A1: the IVF and DiskANN-cold tiers hold real heap
+    /// memory (IVF: centroids + posting lists; DiskANN: PQ codes + codebook)
+    /// but contributed a hardcoded 0 to the roll-up — blinding the pressure
+    /// trigger and observability for those tiers. RED until the roll-up sums
+    /// both tiers' `resident_bytes()`.
+    #[test]
+    fn test_resident_bytes_includes_ivf_and_cold_tiers() {
+        use crate::vector::diskann::pq::ProductQuantizer;
+        use crate::vector::diskann::segment::DiskAnnSegment;
+        use crate::vector::segment::ivf;
+
+        distance::init();
+        let dim = 8usize;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+
+        // Small IVF segment (20 vectors, 2 clusters).
+        let n = 20;
+        let mut sign_flips = vec![1.0f32; pdim];
+        for (i, s) in sign_flips.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *s = -1.0;
+            }
+        }
+        let mut vectors = Vec::with_capacity(n * dim);
+        let mut tq_codes = Vec::with_capacity(n);
+        let mut norms = Vec::with_capacity(n);
+        let ids: Vec<u32> = (1000..1000 + n as u32).collect();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|d| (i * dim + d) as f32 * 0.01).collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(if norm > 0.0 { norm } else { 1.0 });
+            vectors.extend_from_slice(&v);
+            tq_codes.push(vec![(i & 0xF) as u8; dim_half]);
+        }
+        let ivf_seg =
+            ivf::build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, 2, &sign_flips);
+        let ivf_bytes = ivf_seg.resident_bytes();
+        assert!(ivf_bytes > 0);
+
+        // Small DiskANN cold segment: PQ trained on the same vectors; the
+        // vamana graph lives on disk (constructor only opens the file).
+        let tmp = tempfile::tempdir().unwrap();
+        let vamana_path = tmp.path().join("vamana.mpf");
+        std::fs::write(&vamana_path, vec![0u8; 4096]).unwrap();
+        let m = 4usize;
+        let pq = ProductQuantizer::train(&vectors, dim, m, 8);
+        let mut pq_codes = Vec::with_capacity(n * m);
+        for i in 0..n {
+            pq_codes.extend_from_slice(&pq.encode(&vectors[i * dim..(i + 1) * dim]));
+        }
+        let cold_seg =
+            DiskAnnSegment::new(pq_codes, pq, vamana_path, dim, n as u32, 0, 8, 1).unwrap();
+        let cold_bytes = cold_seg.resident_bytes();
+        assert!(cold_bytes > 0);
+
+        let collection = make_test_collection(dim as u32);
+        let holder = SegmentHolder::new(dim as u32, collection.clone());
+        let (_, base_imm) = holder.resident_bytes();
+
+        holder.swap(SegmentList {
+            mutable: Arc::new(MutableSegment::new(dim as u32, collection)),
+            immutable: Vec::new(),
+            ivf: vec![Arc::new(ivf_seg)],
+            warm: Vec::new(),
+            cold: vec![Arc::new(cold_seg)],
+            unloaded: Vec::new(),
+        });
+
+        let (_, imm) = holder.resident_bytes();
+        assert!(
+            imm >= base_imm + ivf_bytes + cold_bytes,
+            "IVF + cold tiers must contribute to resident_bytes: {imm} \
+             (base {base_imm}, ivf {ivf_bytes}, cold {cold_bytes})"
         );
     }
 

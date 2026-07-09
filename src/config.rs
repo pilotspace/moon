@@ -439,10 +439,19 @@ pub struct ServerConfig {
     pub vec_warm_mmap_budget: String,
 
     // ── Cold-tier / DiskANN (EXPERIMENTAL — gated by MOON_VEC_COLD_TIER) ──
+    // Two distinct COLD concepts exist (tiering-v2 decision D9):
+    //   COLD-stub (`SegmentList.unloaded`, `UnloadedSegment`) — the DEFAULT
+    //     valve: exact, ~0 RAM, reload-on-touch. Always available.
+    //   COLD-ann (`SegmentList.cold`, `DiskAnnSegment`) — THIS section:
+    //     approximate serve-from-disk (PQ in RAM + Vamana on NVMe), kept
+    //     inert behind MOON_VEC_COLD_TIER until the M5 production gate
+    //     (promote-back, delete, restart recovery, recall gate); an M3-exit
+    //     review decides productionize-vs-delete on real EWMA telemetry.
     // The DiskANN cold tier is incomplete (no cold-segment deletion, ADC-only
     // recall, restart reload of PQ codebooks unfinished). The WARM->COLD
     // transition is a NO-OP unless an operator sets `MOON_VEC_COLD_TIER=1`;
-    // warm-tier mmap + LRU eviction handles out-of-RAM indexes by default.
+    // warm-tier byte-budget LRU demotion to COLD-stub handles out-of-RAM
+    // indexes by default.
     /// Seconds after last access before a WARM segment is promoted to COLD.
     /// Consumed by the cold-transition timer ONLY when the experimental cold
     /// tier is enabled (`MOON_VEC_COLD_TIER=1`); otherwise inert.
@@ -450,7 +459,8 @@ pub struct ServerConfig {
     pub segment_cold_after: u64,
 
     /// Minimum queries-per-second threshold; segments below this are COLD candidates.
-    /// Not yet consumed — reserved for the experimental cold-tier heuristic.
+    /// [reserved: M3] — becomes the per-index EWMA boundary between COLD-stub
+    /// (idle) and COLD-ann (queried) demotion in the frequency classifier.
     #[arg(long = "segment-cold-min-qps", default_value_t = 0.1)]
     pub segment_cold_min_qps: f64,
 
@@ -463,14 +473,14 @@ pub struct ServerConfig {
     pub memory_arenas_cap: u32,
 
     /// DiskANN beam width for disk-resident vector search.
-    /// Not yet consumed — reserved for the experimental cold-tier search path
-    /// (gated by MOON_VEC_COLD_TIER).
+    /// [reserved: M5] — consumed when the COLD-ann search path is
+    /// productionized (gated by MOON_VEC_COLD_TIER until then).
     #[arg(long = "vec-diskann-beam-width", default_value_t = 8)]
     pub vec_diskann_beam_width: u32,
 
     /// Number of HNSW upper levels cached in memory for DiskANN hybrid search.
-    /// Not yet consumed — reserved for the experimental cold-tier cache layer
-    /// (gated by MOON_VEC_COLD_TIER).
+    /// [reserved: M5] — consumed when the COLD-ann cache layer is
+    /// productionized (gated by MOON_VEC_COLD_TIER until then).
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
 
