@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Txn: MULTI locality analysis honors SORT/GEORADIUS STORE destination (PR #TBD)
+
+- In a multi-shard deployment, `MULTI; SORT src STORE dst; EXEC` (or
+  `GEORADIUS ... STORE/STOREDIST dst`) where `src` and `dst` hash to different
+  shards was misclassified as single-shard and routed entirely to `src`'s
+  shard — writing `dst` into the WRONG shard's dataset, invisible to a later
+  normally-routed `GET dst`. The STORE/STOREDIST destination is positional
+  (the arg after the token) and so was not covered by the fixed command-metadata
+  key specs `analyze_txn_locality` consulted. It now detects the STORE clause
+  and forces a CrossShard classification, which the caller rejects with
+  CROSSSLOT instead of silently misrouting. (audit finding 15)
+
 ### Fixed — Vector: DEL tombstones secondary fields + FT.INFO num_docs accuracy (PR #TBD)
 
 - **Multi-vector-field deletion resurrection (#20):** `DEL`/`UNLINK`/`HDEL` on a
