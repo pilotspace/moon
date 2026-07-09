@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #TBD)
+### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #250)
 
 - Under the monoio runtime, each shard binds `bind:port` via `SO_REUSEPORT`, but
   the central listener bound the same port with a plain
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binds via `create_reuseport_socket` + `from_std` like the tokio path (plain-bind
   fallback on non-unix / unparseable addr). (audit finding 16)
 
-### Fixed — Durability: checkpoint Finalize backs off on repeated failure instead of flooding the WAL (PR #TBD)
+### Fixed — Durability: checkpoint Finalize backs off on repeated failure instead of flooding the WAL (PR #250)
 
 - When a checkpoint's Finalize step failed (`wal.wait_durable`, `manifest.commit`,
   `graph_save`, or the control-file write), the state machine stayed `Finalizing`
@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before doing any finalize I/O, so retries are bounded instead of per-tick, and
   a successful `complete()` clears it. (audit finding 13)
 
-### Fixed — Durability: legacy AOF replay stops at mid-stream corruption instead of resyncing (PR #TBD)
+### Fixed — Durability: legacy AOF replay stops at mid-stream corruption instead of resyncing (PR #250)
 
 - The default startup path `replay_aof` (single-file `appendonly.aof`, unframed
   RESP with no per-record length/CRC) treated ANY mid-stream parse error by
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offset and points at `redis-check-aof`. Operators who want the old best-effort
   behavior can opt in with `MOON_AOF_BEST_EFFORT_RESYNC=1`. (audit finding 12)
 
-### Fixed — Xshard: bound cross-shard reply wait so a wedged shard can't hang a client (PR #TBD)
+### Fixed — Xshard: bound cross-shard reply wait so a wedged shard can't hang a client (PR #250)
 
 - Every cross-shard leg (MGET/MSET/DEL/UNLINK/EXISTS/BITOP/COPY/MSETNX remote
   legs, MULTI-on-owner, and the flush/scatter-gather loops) pushed a message via
@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to all 11 reply-await sites in the coordinator — a genuinely wedged shard
   now surfaces the existing cross-shard-reply error instead of hanging. (audit finding 11)
 
-### Fixed — Hardening: bound TLS handshake + cluster-bus body reads against slow-loris (PR #TBD)
+### Fixed — Hardening: bound TLS handshake + cluster-bus body reads against slow-loris (PR #250)
 
 - **TLS handshake has no timeout (#17):** after `try_accept_connection` consumed
   a `maxclients` slot, `acceptor.accept(tcp_stream).await` ran with no deadline
@@ -81,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never reclaimed). Both runtimes now read the body under a
   `GOSSIP_BODY_READ_TIMEOUT` (10s) + shutdown-cancel select.
 
-### Fixed — Txn: MULTI locality analysis honors SORT/GEORADIUS STORE destination (PR #TBD)
+### Fixed — Txn: MULTI locality analysis honors SORT/GEORADIUS STORE destination (PR #250)
 
 - In a multi-shard deployment, `MULTI; SORT src STORE dst; EXEC` (or
   `GEORADIUS ... STORE/STOREDIST dst`) where `src` and `dst` hash to different
@@ -93,7 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and forces a CrossShard classification, which the caller rejects with
   CROSSSLOT instead of silently misrouting. (audit finding 15)
 
-### Fixed — Vector: DEL tombstones secondary fields + FT.INFO num_docs accuracy (PR #TBD)
+### Fixed — Vector: DEL tombstones secondary fields + FT.INFO num_docs accuracy (PR #250)
 
 - **Multi-vector-field deletion resurrection (#20):** `DEL`/`UNLINK`/`HDEL` on a
   document only tombstoned the *default* vector field. Secondary VECTOR fields
@@ -108,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gated by `MOON_VEC_COLD_TIER`) were never summed at all even though cold docs
   ARE returned by FT.SEARCH; added a `snap.cold` counting loop. (audit findings 20, 28)
 
-### Fixed — Vector: GraphUnion merge recall gate no longer lets a total collapse through (PR #TBD)
+### Fixed — Vector: GraphUnion merge recall gate no longer lets a total collapse through (PR #250)
 
 - The background/manual GraphUnion merge recall gate read
   `recall < tolerance && recall > 0.0`, so a merge whose verified recall was
@@ -117,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.0 only ever means a real measured collapse — the `&& recall > 0.0` clause
   was removed so such a merge now aborts. (audit finding 21)
 
-### Fixed — Hardening: APPEND 512MB cap + reject FT.* inside MULTI on prod handlers (PR #TBD)
+### Fixed — Hardening: APPEND 512MB cap + reject FT.* inside MULTI on prod handlers (PR #250)
 
 - **APPEND** now enforces the 512MB max-string-size limit (matching
   SETRANGE/SETBIT); repeated APPENDs previously grew a value past the documented
@@ -128,7 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "not supported inside MULTI/EXEC" error instead of an incidental one.
   (audit finding 25)
 
-### Changed — Vector storage: fence experimental DiskANN cold tier + drop dead vector WAL (PR #TBD)
+### Changed — Vector storage: fence experimental DiskANN cold tier + drop dead vector WAL (PR #250)
 
 - The DiskANN cold tier (WARM→COLD segment demotion + on-disk Vamana beam
   search) was running by default (`--disk-offload` defaults on, `--segment-cold-after`
@@ -146,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was never on the live recovery path (superseded by manifest + segment +
   keymap + dedup rescan) and carried a documented double-apply footgun.
 
-### Fixed — Cluster: gossip PING task leak + non-blocking accept send (PR #TBD)
+### Fixed — Cluster: gossip PING task leak + non-blocking accept send (PR #250)
 
 - The gossip PING ticker (both tokio + monoio) spawned an unbounded
   connect+write+read task every 100ms with **no timeout**; against a dead or
@@ -161,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop that drains it under connection-storm churn. Fixed by `send_async().await`
   (cooperative yield, keeps backpressure). (audit finding 8, Batch B)
 
-### Fixed — Security: bound client-controlled allocation counts (DoS class, PR #TBD)
+### Fixed — Security: bound client-controlled allocation counts (DoS class, PR #250)
 
 - Six wire-reachable command paths fed a client-supplied count straight into
   `Vec::with_capacity` / `Vec::resize` with no upper bound. On a real host the
