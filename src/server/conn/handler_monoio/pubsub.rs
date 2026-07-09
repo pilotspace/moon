@@ -32,17 +32,27 @@ pub(super) fn try_handle_publish(
     }
     let channel = extract_bytes(&cmd_args[0]);
     let message = extract_bytes(&cmd_args[1]);
-    // ACL channel permission check for PUBLISH
-    if let Some(ref ch) = channel {
-        let denied = {
-            #[allow(clippy::unwrap_used)]
-            // std RwLock: poison = prior panic = unrecoverable
-            let acl_guard = ctx.acl_table.read().unwrap();
-            acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
-        };
-        if let Some(deny_reason) = denied {
+    // ACL command- AND channel-permission check for PUBLISH (H-3): the
+    // command-level `-@pubsub`/allow-list gate was previously skipped here —
+    // only the `&pattern` channel rule was consulted — so a `-@pubsub`
+    // carve-out was silently ineffective for a user with `&*`.
+    {
+        #[allow(clippy::unwrap_used)]
+        // std RwLock: poison = prior panic = unrecoverable
+        let acl_guard = ctx.acl_table.read().unwrap();
+        if let Some(deny_reason) =
+            acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
+        {
             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
             return true;
+        }
+        if let Some(ref ch) = channel {
+            if let Some(deny_reason) =
+                acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
+            {
+                responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                return true;
+            }
         }
     }
     match (channel, message) {
@@ -145,6 +155,23 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
         )));
         responses.push(err);
         return SubscribeResult::ArgError;
+    }
+    // Command-level ACL check (H-3) BEFORE entering subscriber mode: the
+    // per-channel `&pattern` check below is not enough — a `-@pubsub`
+    // carve-out must block SUBSCRIBE/PSUBSCRIBE at the command level. Push a
+    // NOPERM error and bail via ArgError (caller flushes it and continues,
+    // never entering the subscriber loop).
+    {
+        #[allow(clippy::unwrap_used)]
+        // std RwLock: poison = prior panic = unrecoverable
+        let acl_guard = ctx.acl_table.read().unwrap();
+        if let Some(deny_reason) =
+            acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
+        {
+            drop(acl_guard);
+            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+            return SubscribeResult::ArgError;
+        }
     }
     // Allocate pubsub channel if not yet created
     if conn.pubsub_tx.is_none() {

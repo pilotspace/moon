@@ -860,10 +860,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-            // CDC.READ (8) — stateless WAL reader, no shard state involved.
-            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
-                continue;
-            }
             // PSYNC: arrives only on a master, hijacks the connection. Encode
             // any pending responses, flush, then return the stream so the
             // caller can drive the resync handshake.
@@ -987,6 +983,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
+                continue;
+            }
+            // CLIENT TRACKING mutates server-side invalidation state — post-ACL
+            // (H-3), matching handler_sharded's placement of all CLIENT subcmds.
+            if cmd_len == 6
+                && dispatch::try_handle_client_tracking(
+                    cmd,
+                    cmd_args,
+                    client_id,
+                    &mut conn,
+                    ctx,
+                    &mut responses,
+                )
+            {
+                continue;
+            }
+            // CDC.READ (8) — stateless WAL reader, no shard state involved.
+            // Post-ACL (H-3): it reads arbitrary WAL directories off disk, so
+            // it must be deniable (-@dangerous / allow-list users).
+            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
                 continue;
             }
             if dispatch::try_handle_functions(

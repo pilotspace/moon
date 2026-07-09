@@ -1066,6 +1066,18 @@ pub async fn handle_connection(
                             if break_outer {
                                 break;
                             }
+                            // Command-level ACL (H-3): -@pubsub must block
+                            // SUBSCRIBE/PSUBSCRIBE at the command level, not
+                            // just per-channel, before entering subscriber mode.
+                            if let Some(err) = crate::server::conn::shared::pubsub_command_acl_deny(
+                                &acl_table,
+                                &conn.current_user,
+                                cmd,
+                                cmd_args,
+                            ) {
+                                let _ = framed.send(err).await;
+                                continue;
+                            }
                             // Handle subscribe
                             if cmd_args.is_empty() {
                                 let cmd_lower = if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") { "subscribe" } else { "psubscribe" };
@@ -1127,6 +1139,17 @@ pub async fn handle_connection(
                         // C2 fix: inside MULTI, PUBLISH must fall through to
                         // the queue instead of executing immediately.
                         if !conn.in_multi && cmd.eq_ignore_ascii_case(b"PUBLISH") {
+                            // Command-level ACL (H-3): -@pubsub must block
+                            // PUBLISH itself, not just specific channels.
+                            if let Some(err) = crate::server::conn::shared::pubsub_command_acl_deny(
+                                &acl_table,
+                                &conn.current_user,
+                                cmd,
+                                cmd_args,
+                            ) {
+                                responses.push(err);
+                                continue;
+                            }
                             if cmd_args.len() != 2 {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),

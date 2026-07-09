@@ -264,6 +264,14 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
             "psync",
             "replconf",
             "failover",
+            // Moon extensions handled by connection-handler intercepts (H-3):
+            // without these, +@all-expansion-based rules never know the
+            // tokens and category carve-outs silently skip them.
+            "txn",
+            "temporal",
+            "ws",
+            "mq",
+            "cdc.read",
         ],
         "read" => &[
             "get",
@@ -384,6 +392,10 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
             "copy",
             "move",
             "sort",
+            // Moon extensions (H-3): MQ ops and MVCC TXN commits mutate
+            // shard state.
+            "mq",
+            "txn",
         ],
         "string" => &[
             "get",
@@ -509,6 +521,10 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
             "failover",
             "cluster",
             "dbsize",
+            // Moon extensions handled by connection-handler intercepts (H-3):
+            // ws = workspace lifecycle/tenancy, cdc.read = raw WAL reads.
+            "ws",
+            "cdc.read",
         ],
         "dangerous" => &[
             "flushdb",
@@ -522,6 +538,10 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
             "migrate",
             "replicaof",
             "failover",
+            // Moon extensions (H-3): WS switches/destroys whole tenancies;
+            // CDC.READ reads arbitrary WAL directories off the server disk.
+            "ws",
+            "cdc.read",
         ],
         "keyspace" => &[
             "del", "exists", "expire", "pexpire", "ttl", "pttl", "persist", "type", "unlink",
@@ -531,7 +551,11 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
         "connection" => &[
             "auth", "hello", "ping", "quit", "select", "command", "client", "reset",
         ],
-        "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
+        // txn/temporal are Moon's MVCC transaction extensions (H-3) —
+        // deniable the same way as MULTI/EXEC.
+        "transaction" => &[
+            "multi", "exec", "discard", "watch", "unwatch", "txn", "temporal",
+        ],
         "scripting" => &["eval", "evalsha", "script"],
         "cluster" => &["cluster", "asking", "readonly", "readwrite"],
         _ => &[],
