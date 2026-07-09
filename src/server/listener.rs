@@ -492,6 +492,27 @@ pub async fn run_sharded(
     affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
+    // Prod-hardening #16: the per-shard monoio listeners bind this same
+    // `bind:port` via SO_REUSEPORT (`create_reuseport_socket`, see
+    // event_loop.rs). Linux requires EVERY socket sharing a REUSEPORT port —
+    // including this central one — to set the option; a plain `bind` here
+    // either loses the race (EADDRINUSE, propagated out of run_sharded) or
+    // wins it and forces every shard's REUSEPORT bind to fail, collapsing the
+    // per-shard accept fast-path onto this single loop. Join the group like
+    // the tokio sibling does. On non-unix (no socket2 REUSEPORT) fall back.
+    #[cfg(unix)]
+    let listener = match crate::shard::conn_accept::create_reuseport_socket(&addr) {
+        Ok(std_listener) => monoio::net::TcpListener::from_std(std_listener)?,
+        Err(e) => {
+            tracing::warn!(
+                "central SO_REUSEPORT bind failed ({}); falling back to plain bind on {}",
+                e,
+                addr
+            );
+            monoio::net::TcpListener::bind(&addr)?
+        }
+    };
+    #[cfg(not(unix))]
     let listener = monoio::net::TcpListener::bind(&addr)?;
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);

@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #TBD)
+
+- Under the monoio runtime, each shard binds `bind:port` via `SO_REUSEPORT`, but
+  the central listener bound the same port with a plain
+  `monoio::net::TcpListener::bind` — unlike the tokio sibling, which uses
+  `create_reuseport_socket`. Linux requires every socket sharing a REUSEPORT port
+  to set the option, so depending on startup scheduling the central bind either
+  lost the race (EADDRINUSE propagated out of `run_sharded`, silently killing the
+  TLS listener + `conn_rx` fallback) or won it (forcing every shard's REUSEPORT
+  bind to fail and collapsing all traffic onto the single central accept loop) —
+  both silent and nondeterministic run-to-run. The monoio central listener now
+  binds via `create_reuseport_socket` + `from_std` like the tokio path (plain-bind
+  fallback on non-unix / unparseable addr). (audit finding 16)
+
 ### Fixed — Durability: checkpoint Finalize backs off on repeated failure instead of flooding the WAL (PR #TBD)
 
 - When a checkpoint's Finalize step failed (`wal.wait_durable`, `manifest.commit`,
