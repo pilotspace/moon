@@ -664,16 +664,38 @@ pub(crate) enum TxnLocality {
 /// honored identically to the normal routing path.
 pub(crate) fn analyze_txn_locality(command_queue: &[Frame], num_shards: usize) -> TxnLocality {
     let mut owner: Option<usize> = None;
+    let visit = |key: &[u8], owner: &mut Option<usize>| -> bool {
+        let s = crate::shard::dispatch::key_to_shard(key, num_shards);
+        match *owner {
+            None => {
+                *owner = Some(s);
+                true
+            }
+            Some(existing) => existing == s,
+        }
+    };
     for frame in command_queue {
         let Some((cmd, args)) = extract_command(frame) else {
             continue;
         };
         for key in crate::tracking::invalidation::command_keys(cmd, args) {
-            let s = crate::shard::dispatch::key_to_shard(&key, num_shards);
-            match owner {
-                None => owner = Some(s),
-                Some(existing) if existing != s => return TxnLocality::CrossShard,
-                _ => {}
+            if !visit(&key, &mut owner) {
+                return TxnLocality::CrossShard;
+            }
+        }
+        // Prod-hardening #15: SORT/GEORADIUS/GEORADIUSBYMEMBER declare only
+        // their SOURCE key in command metadata (first_key==last_key==1); the
+        // optional `STORE`/`STOREDIST` destination is positional (the arg
+        // after the token) and is NOT covered by `command_keys`. Without
+        // this, `MULTI; SORT src STORE dst; EXEC` where src and dst hash to
+        // different shards is misclassified as SingleShard(owner-of-src) and
+        // the whole body routes to that one shard — `dst` gets written to the
+        // WRONG shard's dataset and is invisible to a later normally-routed
+        // `GET dst`. Detecting the STORE dest here forces CrossShard, which
+        // the caller rejects with CROSSSLOT instead of silently misrouting.
+        if let Some(dest) = store_clause_dest(cmd, args) {
+            if !visit(dest, &mut owner) {
+                return TxnLocality::CrossShard;
             }
         }
     }
@@ -681,6 +703,36 @@ pub(crate) fn analyze_txn_locality(command_queue: &[Frame], num_shards: usize) -
         None => TxnLocality::Keyless,
         Some(s) => TxnLocality::SingleShard(s),
     }
+}
+
+/// Extract the `STORE`/`STOREDIST` destination key from a SORT or GEORADIUS
+/// family command, if present. Returns `None` for commands that have no such
+/// clause or when the token has no following argument.
+///
+/// The destination is positional (the argument immediately after a `STORE`
+/// or `STOREDIST` token in `args`, where `args` excludes the command name),
+/// so it cannot be captured by the fixed `first_key/last_key/step` metadata
+/// key specs the normal routing path uses.
+fn store_clause_dest<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a [u8]> {
+    let is_store_cmd = cmd.eq_ignore_ascii_case(b"SORT")
+        || cmd.eq_ignore_ascii_case(b"GEORADIUS")
+        || cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER");
+    if !is_store_cmd {
+        return None;
+    }
+    let mut i = 0;
+    while i < args.len() {
+        if let Frame::BulkString(tok) = &args[i] {
+            if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
+                if let Some(Frame::BulkString(dest)) = args.get(i + 1) {
+                    return Some(dest.as_ref());
+                }
+                return None;
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -920,6 +972,62 @@ mod txn_locality_tests {
         }
         let other = other.expect("two keys on different shards must exist");
         let q = [cmd(&["MSET", "m0", "1", &other, "2"])];
+        assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
+
+    #[test]
+    fn sort_store_dest_on_other_shard_is_cross_shard() {
+        // Prod-hardening #15: `SORT src STORE dst` where src and dst hash to
+        // different shards must classify CrossShard (→ CROSSSLOT reject), not
+        // silently SingleShard(owner-of-src) and misroute the STORE write.
+        let num = 8;
+        let base = crate::shard::dispatch::key_to_shard(b"src", num);
+        let mut dst = None;
+        for i in 0..1000 {
+            let k = format!("dst{i}");
+            if crate::shard::dispatch::key_to_shard(k.as_bytes(), num) != base {
+                dst = Some(k);
+                break;
+            }
+        }
+        let dst = dst.expect("a dst on a different shard than src must exist");
+        let q = [cmd(&["SORT", "src", "STORE", &dst])];
+        assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
+
+    #[test]
+    fn sort_store_dest_same_shard_stays_single_shard() {
+        // Co-located source + STORE dest (hash tag) stays SingleShard — the
+        // STORE clause must not spuriously force CrossShard.
+        let q = [cmd(&["SORT", "{t}:src", "STORE", "{t}:dst"])];
+        let owner = crate::shard::dispatch::key_to_shard(b"t", 8);
+        assert_eq!(analyze_txn_locality(&q, 8), TxnLocality::SingleShard(owner));
+    }
+
+    #[test]
+    fn georadius_storedist_dest_participates_in_locality() {
+        // GEORADIUS ... STOREDIST dst — the dest key must be considered too.
+        let num = 8;
+        let base = crate::shard::dispatch::key_to_shard(b"geo", num);
+        let mut dst = None;
+        for i in 0..1000 {
+            let k = format!("gd{i}");
+            if crate::shard::dispatch::key_to_shard(k.as_bytes(), num) != base {
+                dst = Some(k);
+                break;
+            }
+        }
+        let dst = dst.expect("a dst on a different shard must exist");
+        let q = [cmd(&[
+            "GEORADIUS",
+            "geo",
+            "15",
+            "37",
+            "200",
+            "km",
+            "STOREDIST",
+            &dst,
+        ])];
         assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
     }
 }
