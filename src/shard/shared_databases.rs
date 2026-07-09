@@ -234,10 +234,21 @@ impl ShardDatabases {
         // SmallVec: most deployments run <=16 shards, so this 100ms-tick
         // snapshot stays fully on the stack; only larger shard counts spill
         // to a single heap allocation (still one per call, same as before).
+        //
+        // A4 (accounting spine, tiering-v2 D3): each shard's used-term is
+        // KV + published vector resident bytes. A vector-heavy/KV-light
+        // shard was misclassified as an idle donor — it lent headroom to
+        // siblings while its true footprint was already over base, and the
+        // pressure cascade then compared a vector-INCLUSIVE used against a
+        // budget inflated by that donation. Two Relaxed loads per shard.
         let used: SmallVec<[usize; 16]> = self
             .memory_per_shard
             .iter()
-            .map(|a| a.load(Ordering::Relaxed))
+            .zip(self.store_memory_per_shard.iter())
+            .map(|(kv, store)| {
+                kv.load(Ordering::Relaxed)
+                    .saturating_add(store.vector.load(Ordering::Relaxed))
+            })
             .collect();
         let budget = crate::storage::eviction::compute_elastic_budget(shard_id, base, &used);
         self.elastic_budgets[shard_id].store(budget, Ordering::Relaxed);
@@ -890,6 +901,45 @@ mod tests {
         assert_eq!(shared.elastic_budget(0), 370);
         // Idle shards keep base.
         assert_eq!(shared.recompute_elastic_budget(1, &rt), 100);
+    }
+
+    /// Accounting-spine A4 (tiering-v2 D3): the donor/hot classification must
+    /// see vector resident bytes. A vector-heavy/KV-light shard was
+    /// misclassified as an idle donor — it lent per-shard headroom to
+    /// siblings while its true resident footprint (KV + vector) was already
+    /// over base, inflating the budget the pressure cascade later compares a
+    /// vector-INCLUSIVE used-term against. RED until `recompute_elastic_budget`
+    /// adds the published vector bytes to its `used` snapshot.
+    #[test]
+    fn recompute_elastic_budget_vector_heavy_shard_not_donor() {
+        let shared = new_shared(4, 1);
+        let rt = rt_config(400, 4); // base = 100 per shard
+
+        shared.publish_memory(0, 120); // hot
+        shared.publish_memory(1, 10); // KV-light...
+        shared.store_memory_per_shard[1]
+            .vector
+            .store(200, Ordering::Relaxed); // ...but 200 of vector RAM
+        shared.publish_memory(2, 10);
+        shared.publish_memory(3, 10);
+
+        // KV-blind math: shard 1 looks idle (10 < 100) and donates 90 —
+        // surplus 270, one hot shard ⇒ shard 0 budget 370.
+        // Vector-aware: shard 1's true used is 210 > base — it is HOT, not
+        // a donor. Surplus = 90 + 90 (shards 2,3), split across the two hot
+        // shards ⇒ 100 + 180/2 = 190 each.
+        assert_eq!(
+            shared.recompute_elastic_budget(0, &rt),
+            190,
+            "vector-heavy shard must not be classified as an idle donor"
+        );
+        assert_eq!(
+            shared.recompute_elastic_budget(1, &rt),
+            190,
+            "the vector-heavy shard itself is hot and shares the pool"
+        );
+        // True idle shards keep base.
+        assert_eq!(shared.recompute_elastic_budget(2, &rt), 100);
     }
 
     #[test]

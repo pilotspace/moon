@@ -104,10 +104,6 @@ pub static RECL_MANIFEST_ACTIVE: AtomicU64 = AtomicU64::new(0);
 /// P1 wires this alongside RECL_MANIFEST_ACTIVE.
 pub static RECL_MANIFEST_TOMBSTONES: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes mapped by mmap'd warm vector segment files (OS page-cache backed).
-/// TODO(P10→Wave2): wire from WarmSearchSegment on map/unmap.
-pub static RECL_MMAP_WARM_BYTES: AtomicU64 = AtomicU64::new(0);
-
 /// Number of committed transactions in the MVCC treemap (RoaringTreemap::len()).
 /// MA2 wires this; emits 0 until pruning is implemented.
 pub static RECL_MVCC_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -273,10 +269,15 @@ pub fn write_reclamation_section(buf: &mut String) {
     );
 
     // -- Mmap warm bytes --
+    // Re-pointed at the LIVE warm-tier resident counter maintained by
+    // `MmapBudget` (add/sub on register/evict). The former local
+    // `RECL_MMAP_WARM_BYTES` static here was never incremented (permanent 0).
     let _ = write!(
         buf,
-        "reclamation_mmap_warm_bytes:{}\r\n",
-        RECL_MMAP_WARM_BYTES.load(Ordering::Relaxed)
+        "reclamation_mmap_warm_bytes:{}\r\n\
+         reclamation_mmap_budget_evictions_total:{}\r\n",
+        crate::admin::recl_atomics::warm_resident_bytes(),
+        crate::admin::recl_atomics::budget_evictions_total()
     );
 
     // -- MVCC --
@@ -492,6 +493,41 @@ mod tests {
         assert!(
             buf.contains("reclamation_wal_bytes:12345678\r\n"),
             "RECL_WAL_BYTES store must be visible in section output"
+        );
+    }
+
+    /// The `reclamation_mmap_warm_bytes` INFO field must reflect the LIVE
+    /// warm-tier resident-bytes counter maintained by `MmapBudget`
+    /// (`admin::recl_atomics`), not a dead never-incremented local static.
+    ///
+    /// RED until the emit is re-pointed at `recl_atomics::warm_resident_bytes()`:
+    /// the pre-existing `info_reclamation::RECL_MMAP_WARM_BYTES` is never
+    /// incremented anywhere, so the field is a permanent `0`.
+    ///
+    /// Robust to parallel `MmapBudget` tests touching the same process-global
+    /// counter: we hold a known `DELTA` across the emit so the live counter has
+    /// a provable floor (`>= DELTA`); balanced add/sub in sibling tests cannot
+    /// erase our contribution before our own `sub`.
+    #[test]
+    fn info_reclamation_mmap_warm_bytes_reflects_live_counter() {
+        use crate::admin::recl_atomics;
+        const DELTA: u64 = 4_096;
+        recl_atomics::add_warm_resident(DELTA);
+        let mut buf = String::new();
+        write_reclamation_section(&mut buf);
+        recl_atomics::sub_warm_resident(DELTA); // restore
+
+        let emitted = buf
+            .lines()
+            .find_map(|l| l.strip_prefix("reclamation_mmap_warm_bytes:"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .expect("reclamation_mmap_warm_bytes field must be present and numeric");
+
+        assert!(
+            emitted >= DELTA,
+            "INFO reclamation_mmap_warm_bytes ({emitted}) must reflect the live \
+             warm-resident counter (>= {DELTA} while we hold a delta); the dead \
+             never-incremented static emits a permanent 0"
         );
     }
 }

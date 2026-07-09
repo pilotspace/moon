@@ -226,6 +226,25 @@ impl IvfSegment {
         self.posting_lists.iter().map(|pl| pl.count as u64).sum()
     }
 
+    /// Estimated resident heap bytes of this segment (accounting-spine A1).
+    ///
+    /// Counts the centroid table, FWHT sign flips, and every posting list's
+    /// interleaved codes + ids + norms, plus fixed struct overhead. Feeds
+    /// `SegmentHolder::resident_bytes()` → memory-pressure trigger,
+    /// MEMORY DOCTOR, and Prometheus — previously this tier reported 0.
+    pub fn resident_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes += self.centroids.len() * std::mem::size_of::<f32>();
+        bytes += self.sign_flips.len() * std::mem::size_of::<f32>();
+        for pl in &self.posting_lists {
+            bytes += std::mem::size_of::<PostingList>();
+            bytes += pl.codes.len(); // u8 codes
+            bytes += pl.ids.len() * std::mem::size_of::<u32>();
+            bytes += pl.norms.len() * std::mem::size_of::<f32>();
+        }
+        bytes
+    }
+
     /// Reference to the FWHT sign flips for query rotation.
     #[inline]
     pub fn sign_flips(&self) -> &[f32] {
@@ -1045,6 +1064,45 @@ mod tests {
         assert_eq!(seg.n_clusters() as usize, n_clusters);
         assert_eq!(seg.total_vectors(), n as u64);
         assert_eq!(seg.dimension(), dim as u32);
+    }
+
+    /// Accounting-spine A1: IVF segments hold real heap memory (centroids,
+    /// interleaved posting-list codes, ids, norms) but contributed a hardcoded
+    /// 0 to `SegmentHolder::resident_bytes()` — invisible to the memory-pressure
+    /// trigger, MEMORY DOCTOR, and Prometheus. RED until `resident_bytes()`
+    /// exists and counts at least the known heap floor.
+    #[test]
+    fn test_ivf_resident_bytes_accounts_heap() {
+        crate::vector::distance::init();
+        let dim = 8;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+        let n = 100;
+        let n_clusters = 4;
+        let signs = test_sign_flips(pdim, 42);
+
+        let mut vectors = Vec::with_capacity(n * dim);
+        let mut tq_codes = Vec::with_capacity(n);
+        let mut norms = Vec::with_capacity(n);
+        let ids: Vec<u32> = (0..n as u32).collect();
+        for i in 0..n {
+            let v = det_f32(dim, i as u64 + 1);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(norm);
+            vectors.extend_from_slice(&v);
+            tq_codes.push(vec![(i & 0xFF) as u8; dim_half]);
+        }
+        let seg = build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, n_clusters, &signs);
+
+        // Provable heap floor: interleaved codes are >= n * dim_half bytes
+        // (32-block round-up only adds), ids + norms are 8 bytes/vector, and
+        // centroids are n_clusters * pdim floats.
+        let floor = n * dim_half + n * 8 + n_clusters * pdim * 4;
+        let rb = seg.resident_bytes();
+        assert!(
+            rb >= floor,
+            "IVF resident_bytes ({rb}) must count codes+ids+norms+centroids (>= {floor})"
+        );
     }
 
     #[test]

@@ -659,8 +659,9 @@ impl super::Shard {
 
         // Per-shard warm-segment mmap budget enforcer.
         // Owned exclusively by this event-loop task; no locking needed.
+        // A5: the flag is an instance-total cap; each shard enforces its share.
         let mut warm_mmap_budget = crate::vector::persistence::mmap_budget::MmapBudget::new(
-            server_config.vec_warm_mmap_budget_bytes(),
+            server_config.vec_warm_mmap_budget_bytes_per_shard(),
         );
         // Tokio path doesn't take these into the spawn signatures; suppress warnings.
         let (_, _, _) = (&spill_sender, &spill_file_id, &disk_offload_dir);

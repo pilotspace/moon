@@ -489,6 +489,16 @@ impl DiskAnnSegment {
         self.num_vectors
     }
 
+    /// Estimated resident heap bytes of this cold segment (accounting-spine
+    /// A1): PQ codes (`num_vectors * m` bytes, kept in RAM) + the trained
+    /// codebook, plus fixed struct overhead. The Vamana graph lives on NVMe
+    /// and is deliberately excluded; the Linux io_uring read buffers are
+    /// small, bounded, and also excluded. Previously this tier reported 0 —
+    /// untracked resident memory (D9 quarantine).
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.pq_codes.len() + self.pq.resident_bytes()
+    }
+
     /// Maximum graph degree (R parameter).
     #[inline]
     pub fn max_degree(&self) -> u32 {
@@ -589,6 +599,25 @@ mod tests {
         .expect("build DiskAnnSegment");
 
         (seg, vectors, tmp)
+    }
+
+    /// Accounting-spine A1: DiskANN cold segments keep PQ codes + codebook in
+    /// RAM but contributed a hardcoded 0 to `SegmentHolder::resident_bytes()`
+    /// — untracked resident memory. RED until `resident_bytes()` exists and
+    /// counts at least the PQ-code floor plus a non-empty codebook.
+    #[test]
+    fn test_diskann_resident_bytes_accounts_pq() {
+        let n = 64usize;
+        let m = 4usize;
+        let (seg, _, _tmp) = build_test_segment(n, 16, m, 8);
+        let rb = seg.resident_bytes();
+        // pq_codes alone are n*m bytes; the trained codebook (m*ksub*dsub
+        // floats) must push the total strictly above that floor.
+        assert!(
+            rb > n * m,
+            "DiskANN resident_bytes ({rb}) must count pq_codes + codebook (> {})",
+            n * m
+        );
     }
 
     #[test]
