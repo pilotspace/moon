@@ -490,12 +490,15 @@ fn apply_completion_vec(
             }
         }
 
-        // Insert one ColdIndex entry per KV within this file.
+        // Insert one ColdIndex entry per KV within this file. `ttl_ms` rides
+        // along from the `SpillCompletionEntry` so the proactive TTL sweep
+        // (R1, H-2) can judge expiry from the in-RAM index alone.
         for entry in c.entries {
             let location = crate::storage::tiered::cold_index::ColdLocation {
                 file_id,
                 page_idx: entry.page_idx,
                 slot_idx: entry.slot_idx,
+                ttl_ms: entry.ttl_ms,
             };
 
             crate::shard::slice::with_shard_db(entry.db_index, |db| {

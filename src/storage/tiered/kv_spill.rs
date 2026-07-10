@@ -190,7 +190,9 @@ pub fn spill_to_datafile(
     });
     manifest.commit()?;
 
-    // Update cold index with the spilled key's disk location
+    // Update cold index with the spilled key's disk location. `ttl_ms` is
+    // threaded through so the proactive TTL sweep (R1, H-2) can judge expiry
+    // from the in-RAM index alone, without reading this file back.
     if let Some(ci) = cold_index {
         ci.insert(
             Bytes::copy_from_slice(key),
@@ -198,6 +200,7 @@ pub fn spill_to_datafile(
                 file_id,
                 page_idx: 0,
                 slot_idx: 0,
+                ttl_ms,
             },
         );
     }
@@ -800,6 +803,7 @@ mod tests {
                 file_id,
                 page_idx,
                 slot_idx,
+                ttl_ms: None,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -851,6 +855,7 @@ mod tests {
                 file_id,
                 page_idx,
                 slot_idx,
+                ttl_ms: None,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(

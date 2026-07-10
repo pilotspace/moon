@@ -449,6 +449,82 @@ mod tests {
         );
     }
 
+    /// R1 (H-2, proactive reclaim): a cold entry that EXPIRES and is NEVER
+    /// re-read must still be reclaimed. The on-read reclaim proven above only
+    /// fires when a caller actually issues a `GET` — a TTL'd key that expires
+    /// and is never touched again (the exact shape of the flagship offload
+    /// use case: sessions, caches) previously leaked its index entry (RAM,
+    /// full key bytes) and its backing file (disk) forever, because nothing
+    /// else in the system ever inspected a cold entry's TTL except a read
+    /// that never comes.
+    ///
+    /// Exercises the REAL production insert path (`spill_to_datafile` via
+    /// `db_with_spilled_key`, same helper the on-read test above uses) rather
+    /// than hand-rolling a `ColdLocation`, so it proves the full plumbing:
+    /// `Entry::has_expiry`/`expires_at_ms` -> spill flags -> `ColdLocation
+    /// ::ttl_ms` -> `ColdIndex::sweep_expired`.
+    #[test]
+    fn test_never_read_expired_cold_entry_reclaimed_by_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        // TTL 1ms in the past relative to the sweep below. Crucially: this
+        // key is NEVER read (no `db.get` call anywhere in this test) — the
+        // on-read reclaim path above never has a chance to fire.
+        let mut db = db_with_spilled_key(shard_dir, b"never-read", b"leaked-on-r1", Some(1));
+
+        // Precondition: the key is cold-indexed and its file exists on disk
+        // (file_id=40 is `db_with_spilled_key`'s fixed spill file id).
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"never-read")
+                .is_some(),
+            "precondition: key must be cold-indexed before the sweep"
+        );
+        let file_path = shard_dir.join("data").join("heap-000040.mpf");
+        assert!(file_path.exists(), "precondition: spill file must exist");
+
+        // Sweep at a time strictly after expiry, WITHOUT ever reading the key.
+        // NOTE: `Entry::set_expires_at_ms` quantizes to whole seconds
+        // (`ttl_secs = (ms / 1000).max(1)`), so the `Some(1)` passed to
+        // `db_with_spilled_key` above round-trips through the on-disk
+        // `KvEntry` as an absolute `ttl_ms` of 1000, not 1 — sweep strictly
+        // after that.
+        let stats = db
+            .cold_index
+            .as_mut()
+            .unwrap()
+            .sweep_expired(
+                1_001,
+                shard_dir,
+                None,
+                crate::storage::tiered::cold_index::MAX_EXPIRED_SWEEP_BATCH,
+            )
+            .unwrap();
+
+        assert_eq!(
+            stats.entries_reclaimed, 1,
+            "sweep must reclaim the never-read expired entry"
+        );
+        assert!(
+            stats.bytes_reclaimed > 0,
+            "sweep must reclaim the backing file's bytes (last live ref)"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"never-read")
+                .is_none(),
+            "index entry must be gone after sweep — this is the R1 leak fix"
+        );
+        assert!(
+            !file_path.exists(),
+            "backing DataFile must be unlinked after the sweep — this is the R1 disk leak fix"
+        );
+    }
+
     #[test]
     fn test_cold_read_overflow_entry() {
         let tmp = tempfile::tempdir().unwrap();
