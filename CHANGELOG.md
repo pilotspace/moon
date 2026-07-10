@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — test flakiness: sigterm-shutdown readiness + BGSAVE file polling
+
+- `tests/sigterm_shutdown.rs`: `wait_for_ready` now distinguishes a crashed
+  child (fails fast via `try_wait()` instead of burning the full deadline)
+  from a genuinely slow-to-start one, and every readiness panic surfaces the
+  captured `moon.stdout.log` / `moon.stderr.log` so a real failure stays
+  diagnosable. The readiness deadline also doubles under `CI` (60s → 120s) —
+  the observed flake was macOS CI runner startup latency under load, not a
+  hang in the SIGTERM path under test.
+- `tests/integration.rs`: `test_bgsave_creates_rdb_file` and its two siblings
+  that shut down and restart a server right after `bgsave_with_retry`
+  (`test_rdb_restore_on_startup`, `test_aof_priority_over_rdb`) asserted
+  `dump.rdb` existence off a fixed 200ms guess-sleep — BGSAVE queues the
+  write on a `spawn_blocking` thread and replies before it lands on disk.
+  Added a `wait_for_file` bounded-poll helper (50ms interval, 10s deadline)
+  and used it at all three call sites in place of the point-in-time
+  assumption. The MOON-magic-bytes assertion is unchanged.
+
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
 - Define Moon's native connection URI scheme in `docs/roadmap/ROADMAP.md` as a
