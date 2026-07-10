@@ -434,6 +434,11 @@ pub(crate) fn publish_channel_acl_deny(
 /// consulted — only the per-channel `&pattern` rule was — and a `-@pubsub`
 /// carve-out was silently ineffective for a user with `&*`. Returns the
 /// `NOPERM` error frame when the command itself is denied, else `None`.
+///
+/// Only the tokio single/sharded handlers call this helper; the monoio handler
+/// inlines the same check in `pubsub.rs`. Gate it to the tokio runtime so the
+/// default (monoio) build doesn't flag it as dead code.
+#[cfg(feature = "runtime-tokio")]
 pub(crate) fn pubsub_command_acl_deny(
     acl_table: &std::sync::RwLock<crate::acl::AclTable>,
     user: &str,

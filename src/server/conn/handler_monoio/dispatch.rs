@@ -728,7 +728,6 @@ pub(super) fn try_handle_client_early(
     cmd_args: &[Frame],
     client_id: u64,
     conn: &mut ConnectionState,
-    ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {

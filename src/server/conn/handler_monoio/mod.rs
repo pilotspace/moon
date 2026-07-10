@@ -920,7 +920,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     cmd_args,
                     client_id,
                     &mut conn,
-                    ctx,
                     &mut responses,
                 )
             {
