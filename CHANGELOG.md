@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
+
+- Define Moon's native connection URI scheme in `docs/roadmap/ROADMAP.md` as a
+  superset of Redis's `redis://` / `rediss://` (`moons://` = TLS 1.3 variant,
+  parity with `rediss://`). Adds the full cross-cutting spec (§8.5), the v0.6.1
+  spec-doc task (H-7), the v0.7.0 implementation workstream (R6), and a Protocol
+  node in the features mindmap. `redis://` / `rediss://` remain fully supported;
+  the native scheme adds a `?workspace=<tenant>` selector and a fail-fast,
+  no-opportunistic-downgrade TLS contract.
+
 ### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
 
 - **`--maxmemory` now counts vector segment memory.** The background eviction

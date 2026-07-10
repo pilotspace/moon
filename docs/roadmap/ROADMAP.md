@@ -135,6 +135,11 @@ mindmap
       Planned: MONITOR
       Planned: Helm chart + K8s operator
       Planned: JSON structured logs
+    Protocol
+      RESP2 / RESP3 wire
+      redis:// + rediss:// (compat)
+      Planned: moon:// + moons:// (native URI)
+      Planned: ?workspace= tenant select
     Security
       TLS 1.3 + mTLS + SIGHUP rotation
       ACL users/rules/categories
@@ -195,6 +200,9 @@ either side with zero acknowledged-write loss under `WAIT`-confirmed semantics, 
    observability the ecosystem expects; cheap wins with existing pub/sub + dispatch hooks.
 6. New CI job: replication crash matrix (master kill, replica kill, partial resync, promote) on
    both runtimes.
+7. **Native `moon://` / `moons://` connection URI scheme** (parity with `redis://` / `rediss://`) —
+   land the client-facing scheme so replication (`REPLICAOF moons://…`), cluster redirects, and
+   `--announce-url` speak Moon's own TLS-aware URL. Full spec: [§8.5](#85-cross-cutting-native-moon--moons-connection-uri-scheme).
 
 ### v0.8.0 — Cluster hardening (horizontal scale)
 
@@ -292,6 +300,7 @@ verification artifact (test/CI job/bench) in the same PR — no "tests later".
 | H-4 | Doc reconciliation: FT.AGGREGATE (verify against registry, fix `redis-compat.md:92`), hash-field TTL (`comparison-valkey.md`), SECURITY.md supported-versions | docs/ | Doc CI link check; grep-based consistency script | S |
 | H-5 | PRODUCTION-CONTRACT.md refresh: retick against v0.6.0 reality; convert to a checked table with evidence links; wire `scripts/check-production-contract.sh` (grep-based) into release workflow | `docs/PRODUCTION-CONTRACT.md` | Script exits non-zero on unticked GA-blocking rows at v1.0 tag | M |
 | H-6 | gitignore/relocate `replication.state` root artifact | repo root | clean `git status` | S |
+| H-7 | **`moon://` / `moons://` URI spec** (doc-only): write `docs/protocol/moon-uri.md` — ABNF grammar, `redis(s)://` parity table, TLS/downgrade failure semantics; implementation is v0.7.0 R6 | [§8.5](#85-cross-cutting-native-moon--moons-connection-uri-scheme) | Doc CI link check; grammar block present | S |
 
 ### 8.2 v0.7.0 — Replication GA
 
@@ -327,6 +336,19 @@ Workstream R5 — keyspace notifications + MONITOR (M): notifications publish th
 per-shard pubsub registry on write commit (flag-gated, off by default — measure overhead ≤2% when off);
 MONITOR taps dispatch with a fan-in channel, `SKIP_MONITOR` ACL flag already exists.
 
+Workstream R6 — native `moon://` / `moons://` URI scheme (M): implement the spec in §8.5.
+- R6a: `--announce-url moon(s)://host:port` config; the server advertises this canonical URL in
+  `INFO replication` (`master_announce_url`), cluster redirects, and replica handshakes.
+- R6b: `REPLICAOF` / `CLUSTER MEET`-adjacent inputs accept `moon(s)://…` in addition to `host port`;
+  `moons://` selects the TLS connector, `moon://` the plaintext one — **no opportunistic downgrade**
+  (a `moons://` target that answers plaintext is a hard connection error, not a silent fallback).
+- R6c: `moon-cli -u moon(s)://…` parsing (parity with `redis-cli -u`), shared parser in a new
+  `src/uri.rs` reused by client, replication, and cluster code paths.
+- Verification: `tests/uri_scheme.rs` parse matrix (valid/invalid/round-trip vs `redis(s)://`
+  equivalence), TLS-required enforcement test (`moons://` → non-TLS port fails fast with a
+  diagnostic, never hangs, never downgrades), workspace-selection test (`?workspace=t1` lands the
+  session in tenant `t1` pre-first-command).
+
 ### 8.3 v0.8.0 — Cluster hardening
 
 | ID | Task | Anchor | Verification | Size |
@@ -350,6 +372,65 @@ MONITOR taps dispatch with a fan-in channel, `SKIP_MONITOR` ACL flag already exi
 | E-5 | OTLP traces + `--log-format json` | trace visible in Jaeger CI container | M |
 | E-6 | FT.ALTER + FT.AGGREGATE closure; TQ⁺ low-d calibration (384d recall) | ANN bench: ≥0.95 R@10 at 384d SQ8-comparable QPS | L |
 | E-7 | K8s operator alpha (CRDs: MoonCluster, MoonBackup; reconcile: rolling upgrade, failover assist) | kind e2e: kill pod → operator-driven recovery | XL |
+
+### 8.5 Cross-cutting: native `moon://` / `moons://` connection URI scheme
+
+**Motivation.** Moon is Redis-wire-compatible, so `redis://` / `rediss://` connection strings work
+today and MUST keep working. But Moon is a multi-model engine with first-class multi-tenancy, TLS,
+and (soon) multi-shard replication — it deserves a native, self-branding URL just as Redis has its
+own. `moon://` / `moons://` are that scheme: a superset of the Redis URI that clients, replication,
+cluster redirects, and `--announce-url` all speak. `moons://` is the TLS variant (the trailing `s`,
+exactly like `rediss://` and `https://`).
+
+**Grammar (ABNF, canonical doc `docs/protocol/moon-uri.md`):**
+
+```
+moon-uri   = scheme "://" [ userinfo "@" ] host [ ":" port ] [ "/" db-index ] [ "?" query ]
+scheme     = "moon" / "moons"                 ; moons = TLS 1.3 transport
+userinfo   = [ username ] [ ":" password ]    ; maps to AUTH / AUTH <user> <pass>
+host       = IP-literal / IPv4 / reg-name / unix-path-encoded
+port       = 1*DIGIT                           ; default 6379 (moon) — moons has NO implicit
+                                               ;   port: it MUST be the configured --tls-port
+db-index   = 1*DIGIT                            ; SELECT <db> on connect
+query      = param *( "&" param )
+param      = key "=" value
+```
+
+**Semantics — parity + Moon-native extensions:**
+
+| Concern | `redis(s)://` behavior | `moon(s)://` behavior |
+|---|---|---|
+| Transport | `redis` plaintext / `rediss` TLS | `moon` plaintext / `moons` TLS 1.3 (rustls) — identical selection rule |
+| Auth | userinfo → `AUTH [user] pass` | same |
+| DB select | `/N` → `SELECT N` | same |
+| TLS options | `?ssl_cert_reqs=`, `?ssl_ca_certs=` | same keys accepted (alias) |
+| Timeouts | `?socket_timeout=`, `?socket_connect_timeout=` | same |
+| **Workspace** | *(none — needs post-connect `WS USE`)* | `?workspace=<tenant>` selects the Moon workspace **before the first command** (multi-tenancy is a shipped guarantee) |
+| **Announce** | *(n/a)* | server emits `moon(s)://` in `INFO replication`, cluster redirects, `REPLICAOF` |
+
+**Backward compatibility (non-negotiable):** the scheme is a *client-side transport + routing*
+convention only — **zero wire-protocol change**. `redis://` / `rediss://` remain fully accepted and
+semantically identical for the overlapping fields; `moon(s)://` is a strict superset. Any client that
+allows a scheme override already works; the native `moon-cli` and the Moon connection helper accept
+both families.
+
+**Design-for-failure (per CLAUDE.md IO-failure rules):**
+- **No opportunistic downgrade.** A `moons://` target that only answers plaintext is a *hard* error,
+  never a silent fallback to `moon://` — this closes the STARTTLS-strip downgrade vector. Symmetric:
+  `moon://` never auto-upgrades.
+- **Fail fast, never hang.** `moons://` against a server with no `--tls-port` returns a clear
+  `TLS required by scheme but server has no TLS listener` diagnostic within the connect timeout, not
+  a stalled handshake.
+- **Unknown scheme → immediate parse error**, no guessing.
+- **Bounded connect** — the URI's `?socket_connect_timeout=` (default from client config) bounds the
+  dial; retries/backoff are the client's existing policy, unchanged by the scheme.
+
+**Deliverables:**
+- Spec doc `docs/protocol/moon-uri.md` (ABNF + parity table + failure semantics) — lands in v0.6.1
+  as **H-7** (doc-only, S), ahead of the v0.7.0 implementation (Workstream **R6**).
+- Shared parser `src/uri.rs` (one impl reused by client, replication, cluster) with a fuzz target
+  (any new parser MUST have one — CLAUDE.md) and the `tests/uri_scheme.rs` conformance matrix.
+- `--announce-url moon(s)://host:port` config surfaced in `INFO` + redirects + replica handshake.
 
 ## 9. Measures of success (tracked per release)
 
