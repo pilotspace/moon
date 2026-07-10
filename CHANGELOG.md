@@ -51,6 +51,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`cold`, DiskANN serve-from-disk, inert behind `MOON_VEC_COLD_TIER`); the
   dead knobs are marked `[reserved: M3/M5]`. Keep-vs-delete is decided at the
   M3 exit-review on real per-index query-frequency telemetry.
+### Security — ACL now covers the early-intercepted command families (H-3) (PR #258)
+
+- **CDC.READ bypassed ACL entirely on the monoio runtime (the default build).**
+  It was dispatched ~117 lines before the ACL gate, so any authenticated user
+  — even a `+get`-only one — could run `CDC.READ <any-wal-dir> <lsn>` and read
+  arbitrary WAL directories off the server disk. Moved the CDC.READ intercept
+  to after the ACL gate (matching the tokio/sharded handler, which already
+  ordered it correctly).
+- **Category carve-outs silently didn't cover TXN/WS/MQ/TEMPORAL/CDC.READ (all
+  runtimes).** These connection-handler intercepts appeared in no
+  `get_category_commands()` arm, so the common deny-list idiom
+  (`+@all -@dangerous`, `+@all -@transaction`, `+@all -@write`) left them
+  allowed. Added them to the relevant categories: `ws`/`cdc.read` →
+  `@admin` + `@dangerous`; `txn`/`temporal` → `@transaction`; `mq`/`txn` →
+  `@write`; all five → `@all`.
+- **`-@pubsub` didn't block PUBLISH/SUBSCRIBE at the command level.** The
+  pub/sub intercepts consulted only the `&pattern` channel rule, so a
+  `-@pubsub` carve-out was ineffective for a user with `&*`. Added a
+  command-level ACL check to the PUBLISH and SUBSCRIBE/PSUBSCRIBE paths in the
+  monoio and tokio-single handlers (the sharded handler already gated them
+  post-ACL-gate).
+- **`CLIENT TRACKING` ran before the ACL gate on monoio.** Moved it to a
+  post-ACL `try_handle_client_tracking` (it registers server-side invalidation
+  state); `CLIENT ID`/`SETNAME`/`GETNAME` stay pre-ACL as connection-local
+  metadata.
+- Tests: new unit test pins the category expansion for all five families;
+  new integration tests prove end-to-end NOPERM for `CDC.READ` under
+  `-@dangerous` and `PUBLISH` under `-@pubsub`.
 
 ### Fixed — Vector: memory-aware WARM offload with a real, reloadable ceiling (PR #252)
 

@@ -1652,3 +1652,21 @@ async fn test_workspace_kv_isolation_multishard() {
 
     token.cancel();
 }
+
+// H-3 (sharded/monoio handler) deny-list coverage note:
+//
+// The deny-list idiom `+@all -@category` covering the early-intercepted
+// families (WS/TXN/MQ/TEMPORAL/CDC.READ) is proven at three levels without a
+// dedicated sharded end-to-end test here:
+//   * `src/acl/table.rs::early_intercept_families_carved_out_by_categories`
+//     pins the category-expansion data itself (runtime-agnostic).
+//   * `tests/integration.rs::test_acl_denies_{cdc_read_via_dangerous,pubsub}_*`
+//     prove end-to-end NOPERM enforcement on the connection handler.
+//   * `test_workspace_acl_grant` (above) proves the sharded handler runs the
+//     ACL gate BEFORE the WS intercept (allow-list path).
+// A sharded deny-list e2e test was intentionally not added: reproducing a
+// restricted user over this file's redis-rs multiplexed connections is
+// unreliable (redis-rs pipelines `CLIENT SETINFO`, which Moon answers
+// "unknown subcommand" for a user that actually holds the `client`
+// permission, and redis-rs treats that handshake reply as fatal — an
+// orthogonal test-infra limitation, not an ACL defect).

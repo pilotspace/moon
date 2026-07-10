@@ -428,6 +428,30 @@ pub(crate) fn publish_channel_acl_deny(
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
 }
 
+/// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
+/// PSUBSCRIBE are handled BEFORE the generic ACL gate in every handler, so
+/// without this the command-level `+`/`-`/`-@pubsub` rules were never
+/// consulted — only the per-channel `&pattern` rule was — and a `-@pubsub`
+/// carve-out was silently ineffective for a user with `&*`. Returns the
+/// `NOPERM` error frame when the command itself is denied, else `None`.
+///
+/// Only the tokio single/sharded handlers call this helper; the monoio handler
+/// inlines the same check in `pubsub.rs`. Gate it to the tokio runtime so the
+/// default (monoio) build doesn't flag it as dead code.
+#[cfg(feature = "runtime-tokio")]
+pub(crate) fn pubsub_command_acl_deny(
+    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    user: &str,
+    cmd: &[u8],
+    cmd_args: &[Frame],
+) -> Option<Frame> {
+    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+    let guard = acl_table.read().unwrap();
+    guard
+        .check_command_permission(user, cmd, cmd_args)
+        .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
+}
+
 /// Fan out one EXEC-queued PUBLISH (C2): local shard synchronously, remote
 /// shards via targeted `PubSubPublish` SPSC messages, awaited so the returned
 /// count matches the immediate-PUBLISH path. Called by the sharded handlers

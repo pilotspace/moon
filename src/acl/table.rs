@@ -724,6 +724,70 @@ mod tests {
     }
 
     #[test]
+    fn early_intercept_families_carved_out_by_categories() {
+        // H-3: TXN/WS/MQ/TEMPORAL/CDC.READ are connection-handler intercepts
+        // that never pass through the phf registry — but they MUST still be
+        // coverable by category carve-outs. Before this fix none of them
+        // appeared in ANY get_category_commands() arm, so the common
+        // deny-list idiom (+@all -@category) silently left them allowed
+        // (is_command_allowed: empty allowed + non-empty denied => default
+        // allow for anything not explicitly denied).
+        let mut table = AclTable::load_or_default(&make_config(None));
+        let args: Vec<Frame> = vec![Frame::BulkString(Bytes::from_static(b"arg"))];
+
+        // -@dangerous must cover WS (workspace lifecycle / tenancy switch)
+        // and CDC.READ (reads arbitrary WAL directories off disk).
+        table.apply_setuser("nodanger", &["on", "nopass", "~*", "+@all", "-@dangerous"]);
+        for cmd in [b"CDC.READ".as_ref(), b"WS".as_ref()] {
+            assert!(
+                table
+                    .check_command_permission("nodanger", cmd, &args)
+                    .is_some(),
+                "+@all -@dangerous must deny {}",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+
+        // -@transaction must cover Moon's MVCC TXN/TEMPORAL extensions the
+        // same way it covers MULTI/EXEC.
+        table.apply_setuser("notxn", &["on", "nopass", "~*", "+@all", "-@transaction"]);
+        for cmd in [b"TXN".as_ref(), b"TEMPORAL".as_ref()] {
+            assert!(
+                table
+                    .check_command_permission("notxn", cmd, &args)
+                    .is_some(),
+                "+@all -@transaction must deny {}",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+
+        // -@write must cover MQ (queue ops mutate shard state).
+        table.apply_setuser("nowrite", &["on", "nopass", "~*", "+@all", "-@write"]);
+        assert!(
+            table
+                .check_command_permission("nowrite", b"MQ", &args)
+                .is_some(),
+            "+@all -@write must deny MQ"
+        );
+
+        // Sanity: a plain +@all user keeps access to all five families.
+        table.apply_setuser("full", &["on", "nopass", "~*", "+@all"]);
+        for cmd in [
+            b"TXN".as_ref(),
+            b"TEMPORAL".as_ref(),
+            b"WS".as_ref(),
+            b"MQ".as_ref(),
+            b"CDC.READ".as_ref(),
+        ] {
+            assert!(
+                table.check_command_permission("full", cmd, &args).is_none(),
+                "+@all must allow {}",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    #[test]
     fn test_check_key_permission_multikey() {
         let mut table = AclTable::load_or_default(&make_config(None));
         table.apply_setuser("alice", &["on", "nopass", "~cache:*", "+@all"]);

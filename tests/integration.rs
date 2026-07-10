@@ -4912,6 +4912,110 @@ async fn test_acl_noperm_denied_write() {
     shutdown.cancel();
 }
 
+/// H-3: category carve-outs must cover the early-intercepted command
+/// families. CDC.READ is handled in the connection handler before the phf
+/// registry; pre-fix it appeared in no ACL category, so `+@all -@dangerous`
+/// (the common deny-list idiom) silently left it allowed.
+#[tokio::test]
+async fn test_acl_denies_cdc_read_via_dangerous_carveout() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("nodanger")
+        .arg("on")
+        .arg(">pass")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-@dangerous")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("AUTH")
+        .arg("nodanger")
+        .arg("pass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // GET still allowed.
+    let r: redis::RedisResult<Option<String>> =
+        redis::cmd("GET").arg("k").query_async(&mut con).await;
+    assert!(r.is_ok(), "GET must stay allowed, got: {:?}", r);
+
+    // CDC.READ must be NOPERM — not executed (pre-fix it ran and returned a
+    // WAL/IO error instead, proving the ACL never saw it).
+    let r: redis::RedisResult<redis::Value> = redis::cmd("CDC.READ")
+        .arg("/nonexistent-wal-dir")
+        .arg("0")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err(), "CDC.READ must be denied");
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("NOPERM") || err.contains("NoPerm"),
+        "Expected NOPERM for CDC.READ under -@dangerous, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// H-3: `-@pubsub` must deny PUBLISH/SUBSCRIBE at the COMMAND level. The
+/// pubsub intercepts only consulted check_channel_permission (the `&pattern`
+/// rules), so a command-level `-@pubsub` carve-out was silently ineffective
+/// for a user whose channel patterns allow everything (`&*`).
+#[tokio::test]
+async fn test_acl_denies_pubsub_command_carveout() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("nopubsub")
+        .arg("on")
+        .arg(">pass")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-@pubsub")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("AUTH")
+        .arg("nopubsub")
+        .arg("pass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // PUBLISH must be NOPERM despite `&*` allowing every channel pattern.
+    let r: redis::RedisResult<i64> = redis::cmd("PUBLISH")
+        .arg("chan")
+        .arg("msg")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err(), "PUBLISH must be denied under -@pubsub");
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("NOPERM") || err.contains("NoPerm"),
+        "Expected NOPERM for PUBLISH under -@pubsub, got: {}",
+        err
+    );
+
+    // SET still allowed (only pubsub was carved out).
+    let r: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("k")
+        .arg("v")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_ok(), "SET must stay allowed, got: {:?}", r);
+
+    shutdown.cancel();
+}
+
 /// ACL-06: Key pattern restriction - single key
 #[tokio::test]
 async fn test_acl_key_pattern_single() {

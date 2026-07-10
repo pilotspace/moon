@@ -714,18 +714,20 @@ pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> b
     false
 }
 
-/// Handle CLIENT subcommands that are checked BEFORE the ACL gate:
-/// ID, SETNAME, GETNAME, TRACKING.
+/// Handle CLIENT subcommands that are safe to run BEFORE the ACL gate:
+/// ID, SETNAME, GETNAME (connection-local metadata, like Redis's NO-AUTH
+/// connection commands). TRACKING is intentionally NOT here — it mutates
+/// server-side invalidation state and is gated post-ACL by
+/// `try_handle_client_tracking` (H-3).
 /// Returns `true` if a subcommand was consumed (caller should `continue`).
-/// Returns `false` for admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE, NO-EVICT, NO-TOUCH)
-/// which must pass through the ACL gate first.
+/// Returns `false` for TRACKING and admin subcommands (LIST, INFO, KILL, PAUSE,
+/// UNPAUSE, NO-EVICT, NO-TOUCH) which must pass through the ACL gate first.
 #[inline]
 pub(super) fn try_handle_client_early(
     cmd: &[u8],
     cmd_args: &[Frame],
     client_id: u64,
     conn: &mut ConnectionState,
-    ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {
@@ -762,55 +764,78 @@ pub(super) fn try_handle_client_early(
                 });
                 return true;
             }
-            if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
-                match crate::command::client::parse_tracking_args(cmd_args) {
-                    Ok(config_parsed) => {
-                        if config_parsed.enable {
-                            conn.tracking_state.enabled = true;
-                            conn.tracking_state.bcast = config_parsed.bcast;
-                            conn.tracking_state.noloop = config_parsed.noloop;
-                            conn.tracking_state.optin = config_parsed.optin;
-                            conn.tracking_state.optout = config_parsed.optout;
-
-                            if conn.tracking_rx.is_none() {
-                                let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                conn.tracking_state.invalidation_tx = Some(tx.clone());
-                                conn.tracking_rx = Some(rx);
-
-                                let mut table = ctx.tracking_table.lock();
-                                table.register_client(client_id, tx);
-                                if let Some(target) = config_parsed.redirect {
-                                    table.set_redirect(client_id, target);
-                                }
-                                for prefix in &config_parsed.prefixes {
-                                    table.register_prefix(
-                                        client_id,
-                                        prefix.clone(),
-                                        config_parsed.noloop,
-                                    );
-                                }
-                            }
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        } else {
-                            conn.tracking_state = TrackingState::default();
-                            ctx.tracking_table.lock().untrack_all(client_id);
-                            conn.tracking_rx = None;
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        }
-                        return true;
-                    }
-                    Err(err_frame) => {
-                        responses.push(err_frame);
-                        return true;
-                    }
-                }
-            }
+            // CLIENT TRACKING is handled post-ACL by
+            // `try_handle_client_tracking` (H-3) — it mutates server-side
+            // invalidation state, so it must not be exempt from the ACL gate.
             // Admin CLIENT subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE,
-            // NO-EVICT, NO-TOUCH) fall through to the ACL gate below.
+            // NO-EVICT, NO-TOUCH) also fall through to the ACL gate below.
         }
     }
     // Fall through -- admin subcommands handled after ACL check.
     false
+}
+
+/// Handle `CLIENT TRACKING` — placed AFTER the ACL gate (H-3) because it
+/// registers/tears down server-side invalidation state and must therefore be
+/// deniable like any other privileged command. Returns `true` if consumed.
+#[inline]
+pub(super) fn try_handle_client_tracking(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    client_id: u64,
+    conn: &mut ConnectionState,
+    ctx: &ConnectionContext,
+    responses: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"CLIENT") {
+        return false;
+    }
+    let Some(sub) = cmd_args.first() else {
+        return false;
+    };
+    let Some(sub_bytes) = extract_bytes(sub) else {
+        return false;
+    };
+    if !sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+        return false;
+    }
+    match crate::command::client::parse_tracking_args(cmd_args) {
+        Ok(config_parsed) => {
+            if config_parsed.enable {
+                conn.tracking_state.enabled = true;
+                conn.tracking_state.bcast = config_parsed.bcast;
+                conn.tracking_state.noloop = config_parsed.noloop;
+                conn.tracking_state.optin = config_parsed.optin;
+                conn.tracking_state.optout = config_parsed.optout;
+
+                if conn.tracking_rx.is_none() {
+                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
+                    conn.tracking_state.invalidation_tx = Some(tx.clone());
+                    conn.tracking_rx = Some(rx);
+
+                    let mut table = ctx.tracking_table.lock();
+                    table.register_client(client_id, tx);
+                    if let Some(target) = config_parsed.redirect {
+                        table.set_redirect(client_id, target);
+                    }
+                    for prefix in &config_parsed.prefixes {
+                        table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
+                    }
+                }
+                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+            } else {
+                conn.tracking_state = TrackingState::default();
+                ctx.tracking_table.lock().untrack_all(client_id);
+                conn.tracking_rx = None;
+                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+            }
+            true
+        }
+        Err(err_frame) => {
+            responses.push(err_frame);
+            true
+        }
+    }
 }
 
 /// Handle CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE, NO-EVICT, NO-TOUCH).
