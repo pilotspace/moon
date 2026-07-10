@@ -1,6 +1,13 @@
 # cargo-deny configuration for Moon (v2 format).
 # Run: cargo deny check
-# CI: .github/workflows/ci.yml safety-audit job
+#
+# CI: this config is NOT currently wired into any GitHub Actions job — run
+# it locally / ad hoc. The "Lint" job in .github/workflows/ci.yml runs
+# scripts/audit-unsafe.sh + scripts/audit-unwrap.sh (SAFETY-comment coverage
+# and an unwrap ratchet), which is a different check and does not invoke
+# `cargo deny` or `cargo audit`.
+# TODO(ci): wire `cargo deny check` into a blocking CI job (tracked
+# separately — not part of this change).
 
 [graph]
 targets = []
