@@ -140,6 +140,12 @@ fn main() -> anyhow::Result<()> {
     // once if an operator still sets any of them away from their default.
     config.warn_deprecated_cold_tier_flags();
 
+    // GCP benchmark finding (2026-07-10): --disk-offload enable without a
+    // durability backstop (--appendonly yes or --save) leaves the cold-spill
+    // tier silently inert — --maxmemory becomes a hard reject-at-cap instead
+    // of spilling. Warn once at startup; behavior is intentionally unchanged.
+    config.warn_disk_offload_without_durability();
+
     // ── --profile tuning presets (WS4, v0.6.0) ──────────────────────────────
     // Fill-only: a preset only sets flags the operator left at their default
     // (see `ServerConfig::apply_profile`); anything explicitly passed on the

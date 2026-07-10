@@ -210,6 +210,29 @@ resident forever:
   backing both the KV cold-read cache and vector/graph page I/O; it starts
   empty and grows lazily, so setting it high does not pre-commit RAM.
 
+> **Requires a durability backstop.** The KV cold-spill path above needs a
+> `ShardManifest`, which is only threaded through the tick-driven
+> memory-pressure cascade — itself gated on `--appendonly yes` or `--save`
+> being configured. With `--disk-offload enable` (the default) but
+> `--appendonly no` and no `--save`, the inline write-path eviction gate has
+> no manifest access and cannot durably spill: cold data is **never spilled
+> to disk** in this combination, regardless of `--maxmemory-policy`. The
+> **"Pure cache (no durability)" recipe above still works correctly** —
+> `allkeys-lru` (and the other evicting policies) fall back to Redis-style
+> cache eviction: victims are DROPPED outright (no tiering, no durability
+> claim needed since nothing is meant to survive a restart) to keep
+> `--maxmemory` honored. `noeviction` rejects writes with OOM once the budget
+> is hit, and an evicting policy also returns OOM when no eligible victim
+> remains (e.g. no TTL-bearing key is left under a `volatile-*` policy) — same
+> as with disk-offload off. This
+> spill-inertness is intentional (correctness over availability for the
+> *tiering* feature specifically) — Moon warns about it once at startup
+> (`ServerConfig::warn_disk_offload_without_durability`). Enable
+> `--appendonly yes` or configure `--save` to activate disk-offload spill
+> (durable tiering instead of dropping), or pass `--disk-offload disable` if
+> you only want in-memory `--maxmemory-policy` eviction with no spill code
+> path involved at all.
+
 ## Vector/FTS/graph idle-unload
 
 Immutable vector segments (`ImmutableSegment`: full in-memory HNSW graph +

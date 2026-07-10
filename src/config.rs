@@ -931,6 +931,54 @@ impl ServerConfig {
         }
     }
 
+    /// True when `--disk-offload enable` is configured but neither AOF
+    /// (`--appendonly yes`) nor RDB (`--save`) durability is on (GCP
+    /// benchmark finding, 2026-07-10).
+    ///
+    /// The durable-spill eviction path (`evict_batch_durable_no_aof`) needs
+    /// a `ShardManifest`, which today is only threaded through the
+    /// tick-driven memory-pressure cascade
+    /// (`shard::persistence_tick::handle_memory_pressure`) — itself gated on
+    /// `persistence_dir`, which `main.rs` only constructs when
+    /// `appendonly == "yes" || save.is_some()` (see `main.rs`'s
+    /// `persistence_dir` binding). The inline per-connection write-path
+    /// eviction gate has no manifest access and, under this combination,
+    /// cannot durably spill — cold data is NOT tiered to disk regardless of
+    /// policy. What happens to the *write* itself is now policy-aware
+    /// (`src/storage/eviction.rs`, the `manifest is None` branch of
+    /// `try_evict_if_needed_async_spill_with_total_budget`): an evicting
+    /// policy (`allkeys-*`/`volatile-*`) still honors `--maxmemory` by
+    /// DROPPING victims outright (Redis cache semantics, no tiering, no
+    /// crash-durability claim needed since nothing needs to survive a
+    /// restart); `noeviction` — and any evicting policy once no eligible
+    /// victim remains (e.g. `volatile-*` with no TTL keys left) — rejects
+    /// writes with OOM at the cap. This
+    /// predicate stays orthogonal to `maxmemory_policy` — spill IS still
+    /// inert either way — and exists only to make that degradation loud.
+    pub fn disk_offload_spill_inert(&self) -> bool {
+        self.disk_offload_enabled() && self.appendonly != "yes" && self.save.is_none()
+    }
+
+    /// Warn once at startup when [`disk_offload_spill_inert`] holds — see
+    /// that method's docs for the full mechanism. Behavior is unchanged;
+    /// this only surfaces the pre-existing silent degradation.
+    ///
+    /// [`disk_offload_spill_inert`]: Self::disk_offload_spill_inert
+    pub fn warn_disk_offload_without_durability(&self) {
+        if self.disk_offload_spill_inert() {
+            tracing::warn!(
+                "--disk-offload is enabled but persistence is off (appendonly=no and no \
+                 --save). The disk-offload cold-spill tier requires a durability backstop \
+                 to function: without one, cold data is NOT spilled to disk. Evicting \
+                 policies (allkeys-*/volatile-*) fall back to DROPPING eligible \
+                 victims with no tiering; noeviction — and any evicting policy once \
+                 no eligible victim remains (e.g. volatile-* with no TTL keys) — \
+                 rejects writes with OOM at the cap. Enable \
+                 --appendonly yes or --save to activate durable spill."
+            );
+        }
+    }
+
     /// Validate `--databases` fits the `u8` db_index tag used by vector/text
     /// index scoping (WS5a round 2). Returns an error message (not a
     /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot
@@ -2367,6 +2415,33 @@ mod tests {
         assert_eq!(config.wal_segment_size, "16mb");
         assert!(config.vec_codes_mlock_enabled());
         assert_eq!(config.pagecache_size, None);
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_true_without_durability_backstop() {
+        // disk-offload defaults to enabled; explicitly turning off both AOF
+        // and RDB durability with no backstop leaves cold-spill inert.
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "no"]);
+        assert!(config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_appendonly_yes() {
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "yes"]);
+        assert!(!config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_save_configured() {
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "no", "--save", "3600 1"]);
+        assert!(!config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_disk_offload_disabled() {
+        let config =
+            ServerConfig::parse_from(["moon", "--appendonly", "no", "--disk-offload", "disable"]);
+        assert!(!config.disk_offload_spill_inert());
     }
 
     #[test]
