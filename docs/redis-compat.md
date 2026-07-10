@@ -89,9 +89,10 @@ These commands are deliberately not implemented — not oversights:
 | `FT.INFO` | Implemented |
 | `FT.SEARCH` | Implemented (KNN, hybrid filter) |
 | `FT.COMPACT` | Implemented |
-| `FT.AGGREGATE` | Not implemented |
+| `FT.AGGREGATE` | Implemented (`GROUPBY`/`REDUCE`/`SORTBY`/`LIMIT`, scatter-gather across shards; `APPLY` is parsed but rejected at parse time as an explicit v1 stub, and a top-level `FILTER` clause is parsed but treated as a no-op — filtering happens via the query prefix instead) |
 | `FT.ALTER` | Not implemented |
 
 ---
 
-*Last updated: 2026-07-08 — v0.6.0 WS1 command-parity audit (regenerated against `src/command/metadata.rs`; fixed stale WAIT/FUNCTION/ACL LOG/CLIENT LIST/OBJECT HELP claims, added BITFIELD_RO/SORT_RO/GEORADIUS_RO/GEORADIUSBYMEMBER_RO, documented explicit non-goals)*
+*Last updated: 2026-07-10 — H-4 doc reconciliation: `FT.AGGREGATE` corrected from "Not implemented" to "Implemented". It is dispatched from `src/command/vector_search/ft_aggregate.rs` / `src/text/aggregate.rs` through a linear `else-if` chain in `src/command/mod.rs` and the sharded/monoio `FT.*` handlers (`src/server/conn/handler_{single,sharded,monoio}/ft.rs`) — reachable on both the read and write dispatch paths, single-shard and multi-shard. It intentionally has **no entry in the `phf` `COMMAND_META` table** in `src/command/metadata.rs` (a documented design choice — see the module doc comment atop `ft_aggregate.rs`), so `COMMAND INFO FT.AGGREGATE` / `COMMAND DOCS FT.AGGREGATE` return no metadata even though the command itself executes normally. Requires the `text-index` feature, which has been a **default** Cargo feature since v0.6.0.*
+*Previously updated: 2026-07-08 — v0.6.0 WS1 command-parity audit (regenerated against `src/command/metadata.rs`; fixed stale WAIT/FUNCTION/ACL LOG/CLIENT LIST/OBJECT HELP claims, added BITFIELD_RO/SORT_RO/GEORADIUS_RO/GEORADIUSBYMEMBER_RO, documented explicit non-goals)*

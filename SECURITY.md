@@ -2,9 +2,17 @@
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | Yes       |
+Moon is pre-1.0 and moves fast: only the **latest released minor line** gets security
+fixes. There is no backport/LTS commitment before v1.0 — the roadmap (`docs/roadmap/ROADMAP.md`)
+sets an 18-month LTS + security-backport policy starting at the v1.0.0 GA tag, not before.
+If you need a fix on an older line, upgrade to latest or open an issue to discuss.
+
+| Version | Supported      |
+|---------|-----------------|
+| 0.6.x   | Yes (current)   |
+| < 0.6   | No              |
+
+This table is updated at every minor release; see `RELEASES.md` for the current tag.
 
 ## Reporting a Vulnerability
 
