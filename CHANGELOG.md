@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — startup warning: `--disk-offload` without a durability backstop is silently inert
+
+- **GCP benchmark finding (2026-07-10)**: with `--disk-offload enable` (the
+  default) but `--appendonly no` and no `--save`, the durable-spill eviction
+  path added to fix the crash window above (`evict_batch_durable_no_aof`)
+  never runs, because it needs a `ShardManifest` that is only threaded
+  through the tick-driven memory-pressure cascade
+  (`shard::persistence_tick::handle_memory_pressure`), itself gated on
+  `persistence_dir`, which `main.rs` only constructs when
+  `appendonly == "yes" || save.is_some()`. The inline write-path eviction
+  gate has no manifest access and, per the fix above, bails rather than risk
+  an unrecoverable crash-loss window — so `--maxmemory` silently degrades
+  from "spill cold data to disk" to a hard reject-at-cap (writes
+  OOM-rejected at the cap), and cold data is never spilled. This is an
+  intentional trade-off (correctness over availability), not a bug, but it
+  was silent.
+- **Fix**: `ServerConfig::disk_offload_spill_inert` (new predicate,
+  `src/config.rs`) plus `ServerConfig::warn_disk_offload_without_durability`
+  (mirrors `warn_deprecated_cold_tier_flags`) now emit a single
+  `tracing::warn!` at startup when this combination is detected, called from
+  `main.rs` right after the existing cold-tier-flags warning. No behavior
+  change — the eviction/spill logic is untouched. Documented in
+  `docs/guides/tuning.md`'s "Tiered memory offload" section.
+
 ### Fixed — test flakiness: oom_bypass_closure readiness on loaded CI runners
 
 - `tests/oom_bypass_closure.rs`: the readiness path used a fixed 30s connect

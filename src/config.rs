@@ -931,6 +931,45 @@ impl ServerConfig {
         }
     }
 
+    /// True when `--disk-offload enable` is configured but neither AOF
+    /// (`--appendonly yes`) nor RDB (`--save`) durability is on (GCP
+    /// benchmark finding, 2026-07-10).
+    ///
+    /// The durable-spill eviction path (`evict_batch_durable_no_aof`) needs
+    /// a `ShardManifest`, which today is only threaded through the
+    /// tick-driven memory-pressure cascade
+    /// (`shard::persistence_tick::handle_memory_pressure`) — itself gated on
+    /// `persistence_dir`, which `main.rs` only constructs when
+    /// `appendonly == "yes" || save.is_some()` (see `main.rs`'s
+    /// `persistence_dir` binding). The inline per-connection write-path
+    /// eviction gate has no manifest access and, under this combination,
+    /// bails rather than manufacture a crash-loss window — so
+    /// `--maxmemory` degrades from "spill cold data to disk" to a hard
+    /// reject-at-cap (writes OOM-rejected) with no cold-spill ever
+    /// happening. This is an intentional correctness-over-availability
+    /// trade-off, not a bug; this predicate exists only to make the
+    /// resulting degradation loud instead of silent.
+    pub fn disk_offload_spill_inert(&self) -> bool {
+        self.disk_offload_enabled() && self.appendonly != "yes" && self.save.is_none()
+    }
+
+    /// Warn once at startup when [`disk_offload_spill_inert`] holds — see
+    /// that method's docs for the full mechanism. Behavior is unchanged;
+    /// this only surfaces the pre-existing silent degradation.
+    ///
+    /// [`disk_offload_spill_inert`]: Self::disk_offload_spill_inert
+    pub fn warn_disk_offload_without_durability(&self) {
+        if self.disk_offload_spill_inert() {
+            tracing::warn!(
+                "--disk-offload is enabled but persistence is off (appendonly=no and no \
+                 --save). The disk-offload cold-spill tier requires a durability backstop \
+                 to function: without one, --maxmemory acts as a HARD reject cap (writes \
+                 are rejected with OOM at the cap) and cold data is NOT spilled to disk. \
+                 Enable --appendonly yes or configure --save to activate disk-offload spill."
+            );
+        }
+    }
+
     /// Validate `--databases` fits the `u8` db_index tag used by vector/text
     /// index scoping (WS5a round 2). Returns an error message (not a
     /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot
@@ -2367,6 +2406,33 @@ mod tests {
         assert_eq!(config.wal_segment_size, "16mb");
         assert!(config.vec_codes_mlock_enabled());
         assert_eq!(config.pagecache_size, None);
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_true_without_durability_backstop() {
+        // disk-offload defaults to enabled; explicitly turning off both AOF
+        // and RDB durability with no backstop leaves cold-spill inert.
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "no"]);
+        assert!(config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_appendonly_yes() {
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "yes"]);
+        assert!(!config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_save_configured() {
+        let config = ServerConfig::parse_from(["moon", "--appendonly", "no", "--save", "3600 1"]);
+        assert!(!config.disk_offload_spill_inert());
+    }
+
+    #[test]
+    fn disk_offload_spill_inert_false_when_disk_offload_disabled() {
+        let config =
+            ServerConfig::parse_from(["moon", "--appendonly", "no", "--disk-offload", "disable"]);
+        assert!(!config.disk_offload_spill_inert());
     }
 
     #[test]

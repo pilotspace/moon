@@ -210,6 +210,21 @@ resident forever:
   backing both the KV cold-read cache and vector/graph page I/O; it starts
   empty and grows lazily, so setting it high does not pre-commit RAM.
 
+> **Requires a durability backstop.** The KV cold-spill path above needs a
+> `ShardManifest`, which is only threaded through the tick-driven
+> memory-pressure cascade — itself gated on `--appendonly yes` or `--save`
+> being configured. With `--disk-offload enable` (the default) but
+> `--appendonly no` and no `--save`, the inline write-path eviction gate has
+> no manifest access and bails rather than risk an unrecoverable crash-loss
+> window: cold data is **never spilled to disk**, and `--maxmemory` instead
+> behaves as a hard reject-at-cap (writes fail with OOM once the budget is
+> hit), regardless of `--maxmemory-policy`. This is intentional
+> (correctness over availability) — Moon warns about it once at startup
+> (`ServerConfig::warn_disk_offload_without_durability`). Enable
+> `--appendonly yes` or configure `--save` to activate disk-offload spill,
+> or pass `--disk-offload disable` if you only want in-memory
+> `--maxmemory-policy` eviction with no spill.
+
 ## Vector/FTS/graph idle-unload
 
 Immutable vector segments (`ImmutableSegment`: full in-memory HNSW graph +
