@@ -64,6 +64,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `meta.mpf`/`undo.mpf` continue to load — the loader opens files by name and
   never scans the segment directory, so the extra files are silently ignored
   (verified by a new regression test with stray legacy files on disk).
+### Fixed — RDB DoS hardening
+
+- **Two untrusted-input allocation-DoS vectors in RDB/snapshot loading are
+  now bounds-checked.** `shard_snapshot_load`'s `SEGMENT_BLOCK_MARKER`
+  branch (`src/persistence/snapshot.rs`) read an untrusted `entry_count:
+  u32` and passed it straight to `Vec::with_capacity` with no gate; the
+  Redis-RDB reader (`src/persistence/redis_rdb.rs`) did the same for
+  `read_redis_string`'s length-prefixed byte buffer and for the
+  list/set/hash/zset collection decoders, where `read_length`'s 8-byte
+  (`0x81`) form can return up to `u64::MAX`. Both are on the server-startup
+  / replica-full-sync path, so a single crafted or corrupt file could drive
+  a multi-gigabyte allocation before a byte of the claimed data was read —
+  aborting the process (release builds use `panic = "abort"`) or OOM-killing
+  it. Fixed by promoting `rdb::validate_count` to `pub(crate)` and calling it
+  before the snapshot segment's `Vec::with_capacity`, and by adding a
+  matching `check_alloc_bound` helper in `redis_rdb.rs` that bounds every
+  untrusted length/count against the bytes actually remaining in the input
+  before allocating. No wire-format or valid-file behavior changes — a
+  legitimate length/count always fits within the remaining input.
 
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 

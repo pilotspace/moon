@@ -1446,7 +1446,7 @@ pub(crate) fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), MoonErro
 
 /// Validate a collection count against remaining cursor data before allocating.
 /// `min_bytes_per_item` is the minimum bytes each item will read from the cursor.
-fn validate_count(
+pub(crate) fn validate_count(
     cursor: &Cursor<&[u8]>,
     count: usize,
     min_bytes_per_item: usize,

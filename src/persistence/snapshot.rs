@@ -782,6 +782,15 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
                 // Read all entry bytes for CRC verification
                 let data_start = cursor.position() as usize;
 
+                // Bound the untrusted entry_count against remaining input before
+                // allocating — a crafted/corrupt file can otherwise claim
+                // u32::MAX entries and drive a multi-GB Vec::with_capacity
+                // before a single byte of entry data is validated (DoS: OOM /
+                // allocator abort under `panic = "abort"`). Minimum bytes a
+                // single entry can consume: type_tag(1) + key_len(4) +
+                // ttl(8) + value_len_or_count(4) = 17.
+                rdb::validate_count(&cursor, entry_count as usize, 17, "segment_entries")?;
+
                 // First pass: read entries, tracking bytes consumed
                 let mut entries: Vec<(Bytes, Entry)> = Vec::with_capacity(entry_count as usize);
                 let mut segment_parse_failed = false;
@@ -1270,5 +1279,81 @@ mod tests {
         assert_eq!(count, 2);
         assert!(loaded[0].get(b"async_k1").is_some());
         assert!(loaded[0].get(b"async_k2").is_some());
+    }
+
+    /// Locates the byte offset of the `entry_count` field within the first
+    /// segment block that actually carries entries (skipping empty
+    /// segments, which are still legally written for near-empty
+    /// databases). Mirrors the writer's known layout — see
+    /// `write_header_if_needed` / `advance_segment_inner` above.
+    fn find_entry_count_offset(data: &[u8]) -> usize {
+        let version = data[8];
+        let preamble_len = if version == SHARD_RDB_VERSION_V1 {
+            19
+        } else {
+            35
+        };
+        let mut pos = preamble_len;
+        loop {
+            let tag = data[pos];
+            pos += 1;
+            match tag {
+                EOF_MARKER => panic!("reached EOF before finding a non-empty segment"),
+                DB_SELECTOR => pos += 1, // db_idx byte
+                SEGMENT_BLOCK_MARKER => {
+                    let entry_count =
+                        u32::from_le_bytes(data[pos + 4..pos + 8].try_into().expect("4 bytes"));
+                    if entry_count > 0 {
+                        return pos + 4;
+                    }
+                    // Empty segment: seg_idx(4) + entry_count(4) + data(0) + crc(4).
+                    pos += 12;
+                }
+                other => panic!("unexpected tag byte {other:#x}"),
+            }
+        }
+    }
+
+    /// Security regression (untrusted-input DoS): a crafted/corrupt segment
+    /// block that lies about its `entry_count` (e.g. claims u32::MAX
+    /// entries while the file has only a handful of bytes left) must be
+    /// rejected before `Vec::with_capacity(entry_count as usize)` runs.
+    ///
+    /// Before the fix, this allocation had no bound at all: a hostile or
+    /// corrupt snapshot file on the server-startup / replica-full-sync path
+    /// would drive a multi-gigabyte allocation before a single entry byte
+    /// was read, aborting the process (release builds use `panic =
+    /// "abort"`) or OOM-killing it.
+    #[test]
+    fn test_segment_entry_count_dos_rejected() {
+        let (_dir, path) = snap_path();
+        let mut dbs = vec![Database::new()];
+        dbs[0].set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        let entry_count_off = find_entry_count_offset(&data);
+        data[entry_count_off..entry_count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        // Recompute the global CRC32 so the corruption is caught by the
+        // entry_count bound check, not the outer whole-file checksum gate.
+        let payload_len = data.len() - 4;
+        let mut hasher = Hasher::new();
+        hasher.update(&data[..payload_len]);
+        let new_global_crc = hasher.finalize();
+        data[payload_len..].copy_from_slice(&new_global_crc.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let mut loaded = vec![Database::new()];
+        let result = shard_snapshot_load(&mut loaded, &path);
+        assert!(
+            result.is_err(),
+            "a lying entry_count must be rejected with a clean error, not drive an unbounded allocation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("segment_entries") && err.contains("exceeds remaining data"),
+            "expected the validate_count bounds-check error, got: {err}"
+        );
     }
 }
