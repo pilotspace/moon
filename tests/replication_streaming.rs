@@ -186,6 +186,64 @@ impl Drop for Killer {
     }
 }
 
+/// Send one command as a RESP array (binary-safe — vector blobs contain
+/// arbitrary bytes) and return the whole reply, lossy-decoded, read until the
+/// server goes quiet. FT.SEARCH replies are nested arrays; tests only need
+/// substring assertions, not structured parsing.
+fn send_resp(addr: &str, parts: &[&[u8]]) -> String {
+    let Ok(mut stream) = TcpStream::connect(addr) else {
+        return String::new();
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
+    let mut req = Vec::new();
+    req.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+    for p in parts {
+        req.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        req.extend_from_slice(p);
+        req.extend_from_slice(b"\r\n");
+    }
+    if stream.write_all(&req).is_err() {
+        return String::new();
+    }
+    stream.flush().ok();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match Read::read(&mut stream, &mut buf) {
+            Ok(0) | Err(_) => break, // closed or quiet for 500ms — reply done
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Little-endian FP32 blob for a 4-dim vector.
+fn vec4(a: f32, b: f32, c: f32, d: f32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    for f in [a, b, c, d] {
+        v.extend_from_slice(&f.to_le_bytes());
+    }
+    v
+}
+
+/// FT.SEARCH KNN over `idx` for the query vector, returning the raw reply text.
+fn knn_search(addr: &str, idx: &str, query: &[u8]) -> String {
+    send_resp(
+        addr,
+        &[
+            b"FT.SEARCH",
+            idx.as_bytes(),
+            b"*=>[KNN 4 @vec $q]",
+            b"PARAMS",
+            b"2",
+            b"q",
+            query,
+        ],
+    )
+}
+
 /// REPL-STREAM-01: replica applies the initial snapshot AND subsequent live
 /// writes streamed from the master.
 #[test]
@@ -296,5 +354,168 @@ fn replica_applies_snapshot_and_live_stream() {
         get_in_db(replica_addr, 1, "cpkey2").as_deref(),
         Some("orig"),
         "cross-db COPY did not land in replica db1"
+    );
+}
+
+/// REPL-STREAM-02 (v0.7 R0.5): the vector/text index plane replicates —
+/// definitions AND contents.
+///
+/// Before R0.5 only the KV plane replicated: the replica applied HSET into the
+/// hash but never fed `auto_index_hset` (FT.SEARCH on the replica returned
+/// nothing), never tombstoned on DEL (ghosts), never cleared on FLUSHALL, and
+/// FT.CREATE was not streamed at all (FT._LIST on the replica was empty).
+#[test]
+#[ignore]
+fn replica_syncs_vector_index_defs_and_contents() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16710";
+    let replica_addr = "127.0.0.1:16711";
+
+    let _master = Killer(start_moon(16710, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+
+    // Pre-attach state: index definition + one indexed document. Both must
+    // reach the replica via the FULLRESYNC snapshot (defs) + backfill (docs).
+    let created = send_resp(
+        master_addr,
+        &[
+            b"FT.CREATE",
+            b"repidx",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"v:",
+            b"SCHEMA",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"DIM",
+            b"4",
+            b"TYPE",
+            b"FLOAT32",
+            b"DISTANCE_METRIC",
+            b"L2",
+        ],
+    );
+    assert!(created.contains("OK"), "FT.CREATE failed: {created}");
+    let v1 = vec4(1.0, 0.0, 0.0, 0.0);
+    send_resp(master_addr, &[b"HSET", b"v:1", b"vec", &v1]);
+    // Sanity: master itself must find it.
+    let q = vec4(1.0, 0.0, 0.0, 0.0);
+    assert!(
+        knn_search(master_addr, "repidx", &q).contains("v:1"),
+        "master should find v:1 before attach"
+    );
+
+    let _replica = Killer(start_moon(16711, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    send_cmd(replica_addr, &format!("REPLICAOF 127.0.0.1 {}", 16710));
+
+    // 1. Index DEFINITION must arrive with the snapshot.
+    let def_synced = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &[b"FT._LIST"]).contains("repidx")
+    });
+    assert!(
+        def_synced,
+        "replica FT._LIST never listed repidx (index defs not in snapshot): {}",
+        send_resp(replica_addr, &[b"FT._LIST"])
+    );
+
+    // 2. Pre-attach CONTENT must be searchable (snapshot backfill).
+    let content_synced = wait_until(Duration::from_secs(10), || {
+        knn_search(replica_addr, "repidx", &q).contains("v:1")
+    });
+    assert!(
+        content_synced,
+        "replica never indexed snapshot doc v:1: {}",
+        knn_search(replica_addr, "repidx", &q)
+    );
+
+    // 3. Live HSET must be indexed on the replica (apply-side auto-index hook).
+    let v2 = vec4(0.0, 1.0, 0.0, 0.0);
+    send_resp(master_addr, &[b"HSET", b"v:2", b"vec", &v2]);
+    let live_indexed = wait_until(Duration::from_secs(10), || {
+        knn_search(replica_addr, "repidx", &q).contains("v:2")
+    });
+    assert!(
+        live_indexed,
+        "replica never indexed live-streamed v:2: {}",
+        knn_search(replica_addr, "repidx", &q)
+    );
+
+    // 4. Live DEL must tombstone on the replica (apply-side delete hook).
+    send_cmd(master_addr, "DEL v:1");
+    let deleted = wait_until(Duration::from_secs(10), || {
+        !knn_search(replica_addr, "repidx", &q).contains("v:1")
+    });
+    assert!(
+        deleted,
+        "replica still returns deleted v:1 (ghost): {}",
+        knn_search(replica_addr, "repidx", &q)
+    );
+
+    // 5. Live FT.CREATE must stream (def created AFTER attach).
+    let created2 = send_resp(
+        master_addr,
+        &[
+            b"FT.CREATE",
+            b"repidx2",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"w:",
+            b"SCHEMA",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"DIM",
+            b"4",
+            b"TYPE",
+            b"FLOAT32",
+            b"DISTANCE_METRIC",
+            b"L2",
+        ],
+    );
+    assert!(
+        created2.contains("OK"),
+        "second FT.CREATE failed: {created2}"
+    );
+    let live_def = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &[b"FT._LIST"]).contains("repidx2")
+    });
+    assert!(
+        live_def,
+        "replica FT._LIST never listed live-created repidx2: {}",
+        send_resp(replica_addr, &[b"FT._LIST"])
+    );
+
+    // 6. FLUSHALL clears index CONTENTS on the replica but keeps definitions.
+    send_cmd(master_addr, "FLUSHALL");
+    let flushed = wait_until(Duration::from_secs(10), || {
+        !knn_search(replica_addr, "repidx", &q).contains("v:2")
+    });
+    assert!(
+        flushed,
+        "replica still returns flushed v:2 (ghost): {}",
+        knn_search(replica_addr, "repidx", &q)
+    );
+    let list_after_flush = send_resp(replica_addr, &[b"FT._LIST"]);
+    assert!(
+        list_after_flush.contains("repidx") && list_after_flush.contains("repidx2"),
+        "FLUSHALL must keep index definitions on the replica: {list_after_flush}"
     );
 }

@@ -20,6 +20,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Added — vector/text index-plane replication sync (v0.7 R0.5)
+
+- **Before this change a replica synchronized only the KV keyspace** — FT index
+  definitions never left the master (FT.CREATE/FT.DROPINDEX/FT.CONFIG are
+  handled at the connection layer and never reached the replication fanout),
+  and the replica's `apply` path ran generic dispatch only, skipping the
+  master's auto-index parity hooks. A replica answered `FT._LIST` with nothing
+  and `FT.SEARCH` with errors even while its hashes matched the master.
+- **Snapshot leg:** the FULLRESYNC RDB now carries the master's vector + text
+  index *definitions* as moon-private RDB AUX fields (opcode `0xFA`, keys
+  `moon-vector-defs` / `moon-text-defs`), reusing the sidecar codecs
+  (`serialize_index_metas_v5`, `serialize_text_index_metas`). Standard RDB
+  loaders skip AUX fields, so the snapshot stays Redis-tool-compatible. On
+  load the replica drops all local indexes (full resync = authoritative
+  replace), installs the master's definitions, and backfills them by
+  rescanning matching HASH keys — the same "restart semantics" rescan restart
+  recovery performs.
+- **Live leg:** successful FT.CREATE / FT.DROPINDEX / FT.CONFIG SET on the
+  master now fan out verbatim to the backlog + connected replicas via a new
+  `ShardMessage::ReplicateVerbatim` (offset-accounted like any replicated
+  write; durability remains the sidecar's job — no WAL/AOF leg). The replica
+  applies them through the same `ft_create`/`ft_dropindex`/`ft_config`
+  handlers, and runs the master's index-parity hooks after every applied KV
+  write (HSET auto-index, DEL/UNLINK tombstone, HDEL vector-field tombstone,
+  FLUSHDB/FLUSHALL content clear) so replica indexes track replica keyspace.
+- New black-box acceptance test (`replica_syncs_vector_index_defs_and_contents`)
+  covering snapshot defs + backfill, live HSET indexing, live DEL tombstoning,
+  live FT.CREATE streaming, and FLUSHALL clear-contents-keep-defs semantics.
+- **Scope:** single-shard master (matches R0); multi-shard FT.* replication
+  rides the R2 broadcast redesign. Graph-plane replication is a separate
+  v0.7 workstream.
+
 ### Added — replica now applies the replication stream end-to-end (v0.7 R0)
 
 - **Foundational fix**: before this change a `REPLICAOF` replica completed the

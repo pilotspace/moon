@@ -174,6 +174,16 @@ pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
             );
         }
 
+        // FT.* index-definition commands (v0.7 R0.5) are streamed verbatim by
+        // the master's connection layer (`ShardMessage::ReplicateVerbatim`) —
+        // generic `dispatch()` does not know them. Route through the same
+        // handlers the master's connection layer uses.
+        if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+            let resp = apply_ft(s, cmd, args, db_idx);
+            warn_on_error(cmd, &resp);
+            return;
+        }
+
         // MOVE / cross-db COPY touch two databases at once and are intercepted
         // BEFORE generic dispatch on the master (see `spsc_two_db`). Generic
         // `dispatch()` cannot apply them — it returns an error for MOVE and
@@ -188,17 +198,104 @@ pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
             // COPY with no DB clause / same-db COPY: fall through to dispatch.
         }
 
-        let db = &mut s.databases[db_idx];
-        // Replica applies off the shard's periodic clock tick; refresh directly
-        // so command-relative expiries (EXPIRE/SETEX) compute against real time.
-        db.refresh_now();
-        let mut selected = db_idx;
-        let resp = match cmd_dispatch(db, cmd, args, &mut selected, db_count) {
-            DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
+        let resp = {
+            let db = &mut s.databases[db_idx];
+            // Replica applies off the shard's periodic clock tick; refresh
+            // directly so command-relative expiries (EXPIRE/SETEX) compute
+            // against real time.
+            db.refresh_now();
+            let mut selected = db_idx;
+            match cmd_dispatch(db, cmd, args, &mut selected, db_count) {
+                DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
+            }
         };
+        // Index-plane parity (v0.7 R0.5): mirror of the master's
+        // connection-layer hook block — every dispatch path that applies KV
+        // writes MUST run these, or the replica's FT indexes silently diverge
+        // from its own keyspace (wire-parity requirement, see
+        // `auto_delete_vectors` docs).
+        if !matches!(resp, Frame::Error(_)) {
+            apply_index_parity_hooks(s, cmd, args, db_idx as u8);
+        }
         warn_on_error(cmd, &resp);
     })
     .is_some()
+}
+
+/// Apply a replicated FT.* index-definition command (FT.CREATE / FT.DROPINDEX
+/// / FT.CONFIG SET) through the same handlers the master's connection layer
+/// uses. Deliberately NO keyspace backfill on live FT.CREATE — master parity:
+/// FT.CREATE never indexes pre-existing keys outside restart recovery (and,
+/// on a replica, the snapshot-load path below).
+fn apply_ft(
+    s: &mut crate::shard::slice::ShardSlice,
+    cmd: &[u8],
+    args: &[Frame],
+    db_idx: usize,
+) -> Frame {
+    use crate::command::vector_search::{ft_admin, ft_config, ft_create};
+    let db_index = db_idx as u8;
+    if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+        ft_create::ft_create(&mut s.vector_store, &mut s.text_store, args, db_index)
+    } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+        ft_admin::ft_dropindex(
+            &mut s.vector_store,
+            &mut s.text_store,
+            s.databases.get_mut(db_idx),
+            args,
+            db_index,
+        )
+    } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+        ft_config::ft_config(&mut s.vector_store, &mut s.text_store, args, db_index)
+    } else {
+        // Only def mutations are streamed; any other FT.* here is unexpected —
+        // skip quietly rather than fabricate a divergence warning.
+        tracing::debug!(
+            "replica apply: ignoring non-replicable FT command {}",
+            String::from_utf8_lossy(cmd)
+        );
+        Frame::Null
+    }
+}
+
+/// Mirror of the master's connection-layer index-parity block
+/// (`handler_monoio/mod.rs`, "HSET auto-index" onwards): HSET feeds the
+/// auto-indexer, DEL/UNLINK tombstone, HDEL of a vector field tombstones,
+/// FLUSHDB/FLUSHALL clear index contents (definitions survive).
+fn apply_index_parity_hooks(
+    s: &mut crate::shard::slice::ShardSlice,
+    cmd: &[u8],
+    args: &[Frame],
+    db_index: u8,
+) {
+    use crate::shard::spsc_handler as hooks;
+    if cmd.eq_ignore_ascii_case(b"HSET") {
+        if let Some(key) = args
+            .first()
+            .and_then(crate::server::connection::extract_bytes)
+        {
+            // Return value (txn vector-intents) is only meaningful inside an
+            // active CrossStoreTxn; replica apply has none.
+            let _ = hooks::auto_index_hset_public(
+                &mut s.vector_store,
+                &mut s.text_store,
+                key.as_ref(),
+                args,
+                db_index,
+            );
+        }
+    } else if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
+        hooks::auto_delete_vectors(&mut s.vector_store, args, db_index);
+    } else if cmd.eq_ignore_ascii_case(b"HDEL") {
+        hooks::auto_hdel_vectors(&mut s.vector_store, args, db_index);
+    } else if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+        hooks::auto_flush_indexes(
+            &mut s.vector_store,
+            &mut s.text_store,
+            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+            db_index,
+        );
+    }
 }
 
 /// A replicated write that fails to apply is a silent-divergence risk — log it
@@ -259,17 +356,195 @@ fn apply_two_db(
 /// Returns the number of keys loaded, or an error if this thread has no
 /// `ShardSlice` or the RDB is malformed.
 pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
+    use crate::persistence::redis_rdb;
+    // Moon-private aux fields (written by the master right after the RDB
+    // header) carry the FT index DEFINITIONS; standard RDB loaders skip them.
+    let vec_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_VECTOR_DEFS);
+    let text_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_TEXT_DEFS);
     match crate::shard::slice::try_with_shard(|s| {
         for db in s.databases.iter_mut() {
             db.clear();
         }
-        crate::persistence::redis_rdb::load_rdb(&mut s.databases, rdb)
+        let loaded = redis_rdb::load_rdb(&mut s.databases, rdb)?;
+        install_snapshot_index_defs(s, vec_defs.as_deref(), text_defs.as_deref());
+        Ok(loaded)
     }) {
         Some(r) => r,
         None => Err(anyhow::anyhow!(
             "replica snapshot load: no ShardSlice on this thread"
         )),
     }
+}
+
+/// Full resync = authoritative replace: drop every replica-local FT index,
+/// install the master's definitions, then backfill them from the just-loaded
+/// keyspace. Backfill here is "restart semantics" — the same matching-hash
+/// rescan restart recovery performs (`event_loop.rs`, "Auto-reindex existing
+/// HASH keys"); live FT.CREATE apply deliberately does NOT backfill.
+fn install_snapshot_index_defs(
+    s: &mut crate::shard::slice::ShardSlice,
+    vec_defs: Option<&[u8]>,
+    text_defs: Option<&[u8]>,
+) {
+    let names: Vec<bytes::Bytes> = s.vector_store.index_names().into_iter().cloned().collect();
+    for n in &names {
+        s.vector_store.drop_index(n);
+    }
+    for n in s.text_store.index_names() {
+        s.text_store.drop_index(&n);
+    }
+
+    // (db_index, key_prefix) pairs feeding the backfill scan below.
+    let mut prefixes: Vec<(u8, bytes::Bytes)> = Vec::new();
+
+    if let Some(blob) = vec_defs {
+        match crate::vector::index_persist::deserialize_index_metas_with_weights(blob) {
+            Ok(pairs) => {
+                for (meta, weight) in pairs {
+                    for p in &meta.key_prefixes {
+                        prefixes.push((meta.db_index, p.clone()));
+                    }
+                    let name = meta.name.clone();
+                    if let Err(e) = s.vector_store.create_index(meta) {
+                        tracing::warn!(
+                            "replica snapshot: failed to create vector index '{}': {}",
+                            String::from_utf8_lossy(&name),
+                            e
+                        );
+                        continue;
+                    }
+                    if weight != 1.0
+                        && let Some(idx) = s.vector_store.get_index_mut(&name)
+                    {
+                        idx.set_compaction_weight(weight);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                "replica snapshot: vector index defs unreadable ({}); vector indexes NOT replicated",
+                e
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "text-index"))]
+    if text_defs.is_some() {
+        tracing::warn!(
+            "replica snapshot: master streamed text index defs but this build lacks the \
+             text-index feature; text indexes NOT replicated"
+        );
+    }
+    #[cfg(feature = "text-index")]
+    if let Some(blob) = text_defs {
+        match crate::text::index_persist::deserialize_text_index_metas(blob) {
+            Ok(metas) => {
+                for meta in metas {
+                    for p in &meta.key_prefixes {
+                        prefixes.push((meta.db_index, p.clone()));
+                    }
+                    let mut text_index = crate::text::store::TextIndex::new(
+                        meta.name.clone(),
+                        meta.key_prefixes.clone(),
+                        meta.text_fields.clone(),
+                        meta.bm25_config,
+                    );
+                    // Carry the master's db binding forward (WS5a) — same as
+                    // the restart-recovery restore path.
+                    text_index.db_index = meta.db_index;
+                    if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
+                        tracing::warn!(
+                            "replica snapshot: failed to create text index '{}': {}",
+                            String::from_utf8_lossy(&meta.name),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                "replica snapshot: text index defs unreadable ({}); text indexes NOT replicated",
+                e
+            ),
+        }
+    }
+
+    if prefixes.is_empty() {
+        return;
+    }
+    let db_count = s.databases.len();
+    let mut backfilled = 0usize;
+    for db_idx in 0..db_count {
+        let wanted: Vec<&bytes::Bytes> = prefixes
+            .iter()
+            .filter(|(d, _)| *d as usize == db_idx)
+            .map(|(_, p)| p)
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let matching = collect_matching_hash_args(&s.databases[db_idx], |key| {
+            wanted.iter().any(|p| key.starts_with(&p[..]))
+        });
+        for (key, args) in &matching {
+            let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                &mut s.vector_store,
+                &mut s.text_store,
+                key,
+                args,
+                db_idx as u8,
+            );
+        }
+        backfilled += matching.len();
+    }
+    if backfilled > 0 {
+        tracing::info!(
+            "replica snapshot: backfilled {} hash key(s) into replicated FT indexes",
+            backfilled
+        );
+    }
+}
+
+/// Collect `(key, HSET-shaped args)` for every HASH key in `db` matching
+/// `key_matches` — args are `[key, field, value, ...]`, ready for
+/// `auto_index_hset_public`. Same extraction as restart recovery's rescan
+/// closure in `event_loop.rs`.
+fn collect_matching_hash_args(
+    db: &crate::storage::Database,
+    key_matches: impl Fn(&[u8]) -> bool,
+) -> Vec<(Vec<u8>, Vec<Frame>)> {
+    use crate::storage::compact_value::RedisValueRef;
+    let mut matching = Vec::new();
+    for (key, entry) in db.data().iter() {
+        let key_bytes = key.as_bytes();
+        if !key_matches(key_bytes) {
+            continue;
+        }
+        let mut args = Vec::new();
+        args.push(Frame::BulkString(bytes::Bytes::copy_from_slice(key_bytes)));
+        match entry.as_redis_value() {
+            RedisValueRef::Hash(map) => {
+                for (field, value) in map.iter() {
+                    args.push(Frame::BulkString(bytes::Bytes::copy_from_slice(field)));
+                    args.push(Frame::BulkString(bytes::Bytes::copy_from_slice(value)));
+                }
+            }
+            RedisValueRef::HashListpack(lp) => {
+                let entries: Vec<_> = lp.iter().collect();
+                let mut j = 0;
+                while j + 1 < entries.len() {
+                    args.push(Frame::BulkString(bytes::Bytes::from(entries[j].as_bytes())));
+                    args.push(Frame::BulkString(bytes::Bytes::from(
+                        entries[j + 1].as_bytes(),
+                    )));
+                    j += 2;
+                }
+            }
+            _ => continue,
+        }
+        if args.len() > 1 {
+            matching.push((key_bytes.to_vec(), args));
+        }
+    }
+    matching
 }
 
 #[cfg(test)]

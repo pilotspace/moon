@@ -2493,6 +2493,26 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);
         }
+        ShardMessage::ReplicateVerbatim { bytes } => {
+            // Replication legs only: backlog + offset + live replica fan-out.
+            // WAL writer / AOF pool are deliberately None — the commands routed
+            // here (FT.CREATE / FT.DROPINDEX / FT.CONFIG SET) are durable via
+            // the vector/text sidecars, and an AOF copy would double-apply on
+            // recovery. `wal_fanout_has_work` no-ops the whole call when no
+            // replica has ever attached.
+            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+            let _ = wal_append_and_fanout(
+                &bytes,
+                &mut None,
+                repl_backlog,
+                replica_txs,
+                repl_state,
+                shard_id,
+                None,
+                false,
+                &mut aof_budget,
+            );
+        }
         ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
             // not dispatched through handle_shard_message_shared.

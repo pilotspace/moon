@@ -466,6 +466,15 @@ pub enum ShardMessage {
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
     UnregisterReplica { replica_id: u64 },
+    /// Fan a pre-serialized RESP command verbatim into the replication plane
+    /// (backlog + live replica streams + offset) WITHOUT touching WAL/AOF.
+    ///
+    /// For connection-layer commands that never cross the SPSC write path but
+    /// must replicate — FT.CREATE / FT.DROPINDEX / FT.CONFIG SET (v0.7 R0.5):
+    /// their durability is the vector/text sidecar, not the AOF, so only the
+    /// replication legs of `wal_append_and_fanout` apply. No-ops when no
+    /// replica has ever attached (no backlog, no replica_txs).
+    ReplicateVerbatim { bytes: bytes::Bytes },
     /// Register a CDC subscriber with this shard's fan-out registry (C3b-2).
     ///
     /// The connection handler creates a bounded channel, ships the sender

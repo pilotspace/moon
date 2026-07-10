@@ -647,7 +647,44 @@ pub async fn handle_psync_inline_single_shard(
                 // Shard 0 is this thread's shard — use the thread-local slice.
                 crate::shard::slice::with_shard(|s| {
                     let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
-                    crate::persistence::redis_rdb::write_rdb_refs(&refs, &mut rdb_buf);
+                    // v0.7 R0.5: carry vector/text index DEFINITIONS inside the
+                    // snapshot as moon-private RDB aux fields (reusing the
+                    // sidecar codecs), so a fresh replica can recreate the
+                    // indexes and backfill matching hashes after loading the
+                    // keyspace. Contents then stay in sync via the live stream.
+                    let vec_defs = {
+                        let pairs = s.vector_store.collect_index_metas_with_weights();
+                        if pairs.is_empty() {
+                            None
+                        } else {
+                            Some(crate::vector::index_persist::serialize_index_metas_v5(
+                                &pairs,
+                            ))
+                        }
+                    };
+                    let text_defs = {
+                        let metas = s.text_store.collect_index_metas();
+                        if metas.is_empty() {
+                            None
+                        } else {
+                            Some(crate::text::index_persist::serialize_text_index_metas(
+                                &metas,
+                            ))
+                        }
+                    };
+                    let mut moon_aux: Vec<(&[u8], &[u8])> = Vec::new();
+                    if let Some(ref v) = vec_defs {
+                        moon_aux
+                            .push((crate::persistence::redis_rdb::MOON_AUX_VECTOR_DEFS, &v[..]));
+                    }
+                    if let Some(ref t) = text_defs {
+                        moon_aux.push((crate::persistence::redis_rdb::MOON_AUX_TEXT_DEFS, &t[..]));
+                    }
+                    crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
+                        &refs,
+                        &moon_aux,
+                        &mut rdb_buf,
+                    );
                 });
             }
             let header = format!("${}\r\n", rdb_buf.len());

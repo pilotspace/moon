@@ -11,6 +11,22 @@ use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::shared::resolve_ft_search_as_of_lsn;
 use crate::workspace::strip_workspace_prefix_from_response;
 
+/// True for the FT.* commands whose SUCCESS mutates index definitions and
+/// therefore must fan out to replicas (v0.7 R0.5): FT.CREATE, FT.DROPINDEX,
+/// and FT.CONFIG SET (GET is a read). Content mutations (HSET/DEL/…) already
+/// replicate via the KV stream; FT.COMPACT is a local optimization.
+fn is_replicated_ft_def_mutation(cmd: &[u8], cmd_args: &[Frame]) -> bool {
+    if cmd.eq_ignore_ascii_case(b"FT.CREATE") || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+        return true;
+    }
+    if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+        if let Some(Frame::BulkString(sub) | Frame::SimpleString(sub)) = cmd_args.first() {
+            return sub.eq_ignore_ascii_case(b"SET");
+        }
+    }
+    false
+}
+
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.
@@ -763,6 +779,28 @@ pub(super) async fn try_handle_ft_command(
                 Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
             }
         });
+        // v0.7 R0.5: index-DEFINITION mutations must reach replicas. FT.*
+        // executes here at the connection layer (never crosses the SPSC write
+        // path), so on success fan the ORIGINAL command bytes into the
+        // replication plane via ReplicateVerbatim — exact parity, no
+        // reconstruction. Single-shard only (multi-shard FT.* replication
+        // rides the R2 broadcast redesign). The replica applies it through
+        // the same ft_create/ft_dropindex/ft_config handlers.
+        if !matches!(response, Frame::Error(_)) && is_replicated_ft_def_mutation(cmd, cmd_args) {
+            use ringbuf::traits::Producer;
+            let serialized = crate::persistence::aof::serialize_command(frame);
+            let mut producers = ctx.dispatch_tx.borrow_mut();
+            if let Some(prod) = producers.get_mut(0) {
+                let msg =
+                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim { bytes: serialized };
+                if prod.try_push(msg).is_err() {
+                    tracing::warn!(
+                        "replication: SPSC full, {} not fanned to replicas (replicas must full-resync)",
+                        String::from_utf8_lossy(cmd)
+                    );
+                }
+            }
+        }
         let mut response = response;
         if let Some(ws_id) = conn.workspace_id.as_ref() {
             strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
