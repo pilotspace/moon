@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `txn_kv_wiring` integration test port-collision flake
+
+- `start_txn_server` picked a port from a throwaway `bind(:0)` probe, dropped
+  it, then let `run_sharded` rebind it — a TOCTOU window where a parallel test
+  (this binary or another) could steal the freed ephemeral port, after which a
+  blind 200ms sleep handed the caller a dead/wrong port. Now: a process-global
+  reservation set (`reserve_unique_port`) guarantees no two tests in the same
+  binary are handed the same recycled port, and an active connect+PING
+  readiness probe (`await_server_ready`) replaces the fixed sleep and lets the
+  start retry on a fresh port when a bind is lost to another process. Verified
+  flake-free across repeated fully-parallel runs (no `--test-threads=1`).
+
 ### Fixed — `--disk-offload` without a durability backstop broke the default LRU cache recipe
 
 - **GCP benchmark finding (2026-07-10)**: with `--disk-offload enable` (the

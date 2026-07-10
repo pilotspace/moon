@@ -23,126 +23,148 @@ use tokio::net::TcpListener;
 // Test server infrastructure
 // ---------------------------------------------------------------------------
 
-/// Start a full sharded Moon server on a random OS-assigned port.
-///
-/// Uses the same shard-thread + `run_sharded` pattern as `main.rs`, so
-/// TXN.* handler intercepts are active.
-///
-/// `persistence_dir` is the data directory for WAL/AOF files. Pass an empty
-/// string to use the current directory with `appendonly = "no"`.
 async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, CancellationToken) {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
-    let token = CancellationToken::new();
-
     let (appendonly, dir) = if persistence_dir.is_empty() {
         ("no".to_string(), ".".to_string())
     } else {
         ("yes".to_string(), persistence_dir.to_string())
     };
 
-    let config = ServerConfig {
-        bind: "127.0.0.1".to_string(),
-        port,
-        tcp_backlog: 1024,
-        databases: 16,
-        requirepass: None,
-        db_maxmemory: Vec::new(),
-        profile: None,
-        appendonly,
-        unsafe_multishard_aof: false,
-        experimental_per_shard_rewrite: false,
-        appendfsync: "everysec".to_string(),
-        aof_fsync_timeout_ms: 2000,
-        save: None,
-        dir,
-        dbfilename: "dump.rdb".to_string(),
-        appendfilename: "appendonly.aof".to_string(),
-        maxmemory: Some(0),
-        maxmemory_policy: "noeviction".to_string(),
-        maxmemory_samples: 5,
-        shards: num_shards,
-        cluster_enabled: false,
-        cluster_node_timeout: 15000,
-        aclfile: None,
-        protected_mode: "no".to_string(),
-        acllog_max_len: 128,
-        tls_port: 0,
-        tls_cert_file: None,
-        tls_key_file: None,
-        tls_ca_cert_file: None,
-        tls_ciphersuites: None,
-        disk_offload: "disable".to_string(),
-        disk_offload_dir: None,
-        disk_offload_threshold: 0.85,
-        segment_warm_after: 3600,
-        engine_offload_idle_secs: 3600,
-        pagecache_size: None,
-        checkpoint_timeout: 300,
-        checkpoint_completion: 0.9,
-        max_wal_size: "256mb".to_string(),
-        wal_fpi: "enable".to_string(),
-        wal_compression: "lz4".to_string(),
-        wal_segment_size: "16mb".to_string(),
-        vec_codes_mlock: "enable".to_string(),
-        segment_cold_after: 86400,
-        segment_cold_min_qps: 0.1,
-        vec_diskann_beam_width: 8,
-        vec_diskann_cache_levels: 3,
-        uring_sqpoll_ms: None,
-        io_driver: "auto".to_string(),
-        io_busy_poll_us: 0,
-        ft_search_workers: None,
-        admin_port: 0,
-        slowlog_log_slower_than: 10000,
-        slowlog_max_len: 128,
-        check_config: false,
-        initial_keyspace_hint: 0,
-        memory_arenas_cap: 8,
-        maxclients: 10000,
-        timeout: 0,
-        tcp_keepalive: 300,
-        console_auth_required: false,
-        console_auth_secret: String::new(),
-        console_cors_origin: vec![],
-        console_rate_limit: 1000.0,
-        console_rate_burst: 2000.0,
-        wal_max_checkpoint_lag_ms: 10_000,
-        wal_kv_log: "auto".to_string(),
-        recovery_target_lsn: None,
-        recovery_target_time: None,
-        manifest_tombstone_retain_epochs: 2,
-        manifest_tombstone_retain_secs: 300,
-        disk_free_min_pct: 5,
-        mem_full_pct: 0,
-        mvcc_committed_prune_margin: 1000,
-        max_unflushed_immutable_segments: 20,
-        mvcc_old_snapshot_threshold_secs: 600,
-        autovacuum: "enable".to_string(),
-        autovacuum_budget_ms_min: 5,
-        autovacuum_budget_ms_max: 200,
-        autovacuum_target_p95_ms: 10,
-        autovacuum_interval_secs: 30,
-        graph_merge_max_segments: 8,
-        graph_dead_edge_trigger: 0.20,
-        graph_timeout_ms: 30_000,
-        autovacuum_starvation_cap_secs: 300,
-        vec_warm_mmap_budget: "2gb".to_string(),
-        cold_orphan_sweep_interval_secs: 300,
-        migrate_aof_from: None,
-        migrate_aof_to: None,
-        migrate_aof_shards: 0,
-        graph_result_cache_entries: 256,
-        graph_result_cache_bytes: 4_194_304,
-        vector_ef_runtime: 0,
-        vector_rerank_mult: 4,
-        vector_exact_beam: false,
-    };
+    // The OS-assigned port from a throwaway probe listener is only a HINT:
+    // between dropping the probe and `run_sharded` rebinding the port, a
+    // parallel test (in this or another test binary) can win the same freed
+    // ephemeral port — a TOCTOU race that used to leave callers holding a dead
+    // port after a blind 200ms sleep. Two defenses: `reserve_unique_port`
+    // guarantees no two tests in THIS binary are ever handed the same recycled
+    // port, and an active connect+PING readiness probe (which also fixes the
+    // separate slow-CI-startup flake the fixed sleep had) lets us retry the
+    // whole start on a fresh port when the bind is lost to another process.
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let port = reserve_unique_port().await;
+        let token = CancellationToken::new();
 
-    let cancel = token.clone();
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            port,
+            tcp_backlog: 1024,
+            databases: 16,
+            requirepass: None,
+            db_maxmemory: Vec::new(),
+            profile: None,
+            appendonly: appendonly.clone(),
+            unsafe_multishard_aof: false,
+            experimental_per_shard_rewrite: false,
+            appendfsync: "everysec".to_string(),
+            aof_fsync_timeout_ms: 2000,
+            save: None,
+            dir: dir.clone(),
+            dbfilename: "dump.rdb".to_string(),
+            appendfilename: "appendonly.aof".to_string(),
+            maxmemory: Some(0),
+            maxmemory_policy: "noeviction".to_string(),
+            maxmemory_samples: 5,
+            shards: num_shards,
+            cluster_enabled: false,
+            cluster_node_timeout: 15000,
+            aclfile: None,
+            protected_mode: "no".to_string(),
+            acllog_max_len: 128,
+            tls_port: 0,
+            tls_cert_file: None,
+            tls_key_file: None,
+            tls_ca_cert_file: None,
+            tls_ciphersuites: None,
+            disk_offload: "disable".to_string(),
+            disk_offload_dir: None,
+            disk_offload_threshold: 0.85,
+            segment_warm_after: 3600,
+            engine_offload_idle_secs: 3600,
+            pagecache_size: None,
+            checkpoint_timeout: 300,
+            checkpoint_completion: 0.9,
+            max_wal_size: "256mb".to_string(),
+            wal_fpi: "enable".to_string(),
+            wal_compression: "lz4".to_string(),
+            wal_segment_size: "16mb".to_string(),
+            vec_codes_mlock: "enable".to_string(),
+            segment_cold_after: 86400,
+            segment_cold_min_qps: 0.1,
+            vec_diskann_beam_width: 8,
+            vec_diskann_cache_levels: 3,
+            uring_sqpoll_ms: None,
+            io_driver: "auto".to_string(),
+            io_busy_poll_us: 0,
+            ft_search_workers: None,
+            admin_port: 0,
+            slowlog_log_slower_than: 10000,
+            slowlog_max_len: 128,
+            check_config: false,
+            initial_keyspace_hint: 0,
+            memory_arenas_cap: 8,
+            maxclients: 10000,
+            timeout: 0,
+            tcp_keepalive: 300,
+            console_auth_required: false,
+            console_auth_secret: String::new(),
+            console_cors_origin: vec![],
+            console_rate_limit: 1000.0,
+            console_rate_burst: 2000.0,
+            wal_max_checkpoint_lag_ms: 10_000,
+            wal_kv_log: "auto".to_string(),
+            recovery_target_lsn: None,
+            recovery_target_time: None,
+            manifest_tombstone_retain_epochs: 2,
+            manifest_tombstone_retain_secs: 300,
+            disk_free_min_pct: 5,
+            mem_full_pct: 0,
+            mvcc_committed_prune_margin: 1000,
+            max_unflushed_immutable_segments: 20,
+            mvcc_old_snapshot_threshold_secs: 600,
+            autovacuum: "enable".to_string(),
+            autovacuum_budget_ms_min: 5,
+            autovacuum_budget_ms_max: 200,
+            autovacuum_target_p95_ms: 10,
+            autovacuum_interval_secs: 30,
+            graph_merge_max_segments: 8,
+            graph_dead_edge_trigger: 0.20,
+            graph_timeout_ms: 30_000,
+            autovacuum_starvation_cap_secs: 300,
+            vec_warm_mmap_budget: "2gb".to_string(),
+            cold_orphan_sweep_interval_secs: 300,
+            migrate_aof_from: None,
+            migrate_aof_to: None,
+            migrate_aof_shards: 0,
+            graph_result_cache_entries: 256,
+            graph_result_cache_bytes: 4_194_304,
+            vector_ef_runtime: 0,
+            vector_rerank_mult: 4,
+            vector_exact_beam: false,
+        };
 
+        spawn_txn_server_thread(config, num_shards, token.clone());
+
+        if await_server_ready(port, std::time::Duration::from_secs(3)).await {
+            return (port, token);
+        }
+
+        // The port was lost to another process, or the listener otherwise
+        // failed to bind: tear the half-started server down and retry fresh.
+        token.cancel();
+        eprintln!(
+            "start_txn_server: server on port {port} not ready \
+             (attempt {attempt}/{MAX_ATTEMPTS}); retrying on a new port"
+        );
+    }
+
+    panic!("start_txn_server: could not bring up a server after {MAX_ATTEMPTS} attempts");
+}
+
+/// Spawn the background OS thread that runs the sharded listener + per-shard
+/// runtimes for a test server. Fire-and-forget: the thread tears itself down
+/// when `cancel` fires (or exits early if `run_sharded` fails to bind, which
+/// `start_txn_server` detects via [`await_server_ready`] and retries).
+fn spawn_txn_server_thread(config: ServerConfig, num_shards: usize, cancel: CancellationToken) {
     std::thread::spawn(move || {
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
         let conn_txs: Vec<channel::MpscSender<(tokio::net::TcpStream, bool)>> =
@@ -264,11 +286,46 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             let _ = handle.join();
         }
     });
+}
 
-    // Give the server time to bind and start shards.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+/// Reserve an OS-assigned ephemeral port that no other test in THIS binary has
+/// already been handed. A throwaway probe listener discovers a free port; a
+/// process-global set rejects any port the OS recycled from a just-finished
+/// sibling test — the intra-binary half of the bind-drop-rebind TOCTOU race,
+/// which no amount of readiness-polling can otherwise disambiguate (the
+/// sibling's live server would answer PING on the very port we lost).
+async fn reserve_unique_port() -> u16 {
+    static HANDED_OUT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        if HANDED_OUT.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+}
 
-    (port, token)
+/// Poll until the server accepts a TCP connection and answers PING, or
+/// `timeout` elapses. A successful PING means `run_sharded` bound the intended
+/// port and the accept loop is live — a real readiness signal that also
+/// tolerates slow CI startup, unlike the fixed sleep it replaced.
+async fn await_server_ready(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}")) {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                let pong: redis::RedisResult<String> =
+                    redis::cmd("PING").query_async(&mut conn).await;
+                if pong.is_ok() {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
 }
 
 /// Start a single-shard server with no persistence (fast, for lifecycle tests).
