@@ -91,7 +91,10 @@ pub fn build_info_replication(repl_state: &ReplicationState) -> String {
             s.push_str(&format!("master_repl_offset:{}\r\n", offset));
             s.push_str("second_repl_offset:-1\r\n");
             s.push_str("repl_backlog_active:1\r\n");
-            s.push_str("repl_backlog_size:1048576\r\n");
+            s.push_str(&format!(
+                "repl_backlog_size:{}\r\n",
+                repl_state.backlog_capacity
+            ));
             s.push_str("repl_backlog_first_byte_offset:1\r\n");
             s.push_str(&format!("repl_backlog_histlen:{}\r\n", offset));
             for (i, replica) in repl_state.replicas.iter().enumerate() {

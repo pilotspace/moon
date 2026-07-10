@@ -421,6 +421,12 @@ async fn register_replica_with_shards(
     // Share the write_half across per-shard sender tasks
     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
 
+    // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
+    let backlog_capacity = repl_state
+        .read()
+        .map(|g| g.backlog_capacity)
+        .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
+
     let channel_capacity = 1024;
     let mut shard_txs = Vec::with_capacity(num_shards);
     let mut ack_offsets = Vec::with_capacity(num_shards);
@@ -432,7 +438,11 @@ async fn register_replica_with_shards(
 
         // Send RegisterReplica to the shard's SPSC
         if let Some(prod) = shard_producers.get_mut(shard_id) {
-            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica { replica_id, tx };
+            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
+                replica_id,
+                tx,
+                backlog_capacity,
+            };
             let _ = prod.try_push(msg);
         }
 
@@ -498,6 +508,12 @@ async fn register_replica_with_shards(
     // Single-threaded cooperative scheduling ensures no concurrent borrows.
     let shared_stream: Rc<RefCell<monoio::net::TcpStream>> = Rc::new(RefCell::new(stream));
 
+    // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
+    let backlog_capacity = repl_state
+        .read()
+        .map(|g| g.backlog_capacity)
+        .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
+
     let channel_capacity = 1024;
     let mut shard_txs = Vec::with_capacity(num_shards);
     let mut ack_offsets = Vec::with_capacity(num_shards);
@@ -509,7 +525,11 @@ async fn register_replica_with_shards(
 
         // Send RegisterReplica to the shard's SPSC
         if let Some(prod) = shard_producers.get_mut(shard_id) {
-            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica { replica_id, tx };
+            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
+                replica_id,
+                tx,
+                backlog_capacity,
+            };
             let _ = prod.try_push(msg);
         }
 
@@ -696,11 +716,17 @@ async fn register_replica_inline_single_shard(
     // tx into its local replica_txs Vec — the sole authority used by
     // wal_append_and_fanout for live write streaming.
     {
+        // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
+        let backlog_capacity = repl_state
+            .read()
+            .map(|g| g.backlog_capacity)
+            .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
         let mut prods = dispatch_tx.borrow_mut();
         if let Some(prod) = prods.get_mut(0) {
             let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
                 replica_id,
                 tx: tx.clone(),
+                backlog_capacity,
             };
             if prod.try_push(msg).is_err() {
                 anyhow::bail!("failed to push RegisterReplica onto shard 0 SPSC");

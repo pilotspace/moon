@@ -2472,14 +2472,20 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }
-        ShardMessage::RegisterReplica { replica_id, tx } => {
+        ShardMessage::RegisterReplica {
+            replica_id,
+            tx,
+            backlog_capacity,
+        } => {
             // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
             // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
             // ReplicationState — see ReplicationState::ensure_backlogs_allocated for the
-            // earlier allocation point triggered by REPLCONF.
+            // earlier allocation point triggered by REPLCONF. Capacity is carried
+            // in the message (from `--repl-backlog-size`) so this fallback can't
+            // silently diverge from the handshake-path allocation.
             let mut guard = repl_backlog.lock();
             if guard.is_none() {
-                *guard = Some(ReplicationBacklog::new(1024 * 1024));
+                *guard = Some(ReplicationBacklog::new(backlog_capacity));
             }
             drop(guard);
             replica_txs.push((replica_id, tx));

@@ -20,6 +20,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Added — replica now applies the replication stream end-to-end (v0.7 R0)
+
+- **Foundational fix**: before this change a `REPLICAOF` replica completed the
+  PSYNC2 handshake but applied **nothing** — `run_handshake_and_stream`
+  discarded the FULLRESYNC RDB (logged "received … bytes" only) and
+  `stream_commands` did `buf.clear()` after advancing the offset. A freshly
+  attached replica reported `DBSIZE 0`. This went unnoticed because every
+  `replication_hardening.rs` test is `#[ignore]`d and never runs in CI.
+- The replica now (1) loads the full-resync RDB snapshot into its local shard
+  and (2) parses the live RESP command stream and applies each write, tracking
+  `SELECT`. Both runtime variants (monoio, tokio). Apply runs synchronously on
+  the shard thread via the thread-local `ShardSlice` (single-shard: every
+  command is local, no SPSC self-hop), bypassing the connection-layer read-only
+  guard as a replica must.
+- Also fixes a wire bug: the replica read the diskless full-resync RDB bulk as
+  `len + 2` bytes (assuming a trailing `\r\n` that diskless replication does not
+  send), stealing the first two bytes of the command stream and desyncing it.
+  Now reads exactly `len`. The replication offset advances by bytes *consumed*
+  by complete frames, not the raw socket read count.
+- `MOVE` and cross-db `COPY ... DB n` are applied through the same two-db core
+  helpers the master's handler-level intercept uses (generic dispatch cannot
+  apply them), so they replicate correctly. A replicated command that still
+  fails to apply is logged loudly rather than dropped silently.
+- New pure, unit-tested stream router (`replication::apply`) and a black-box
+  streaming acceptance test (`tests/replication_streaming.rs`, covering
+  snapshot + live SET/DEL/MOVE/COPY).
+- **Scope:** single-shard (`--shards 1`), logical **db 0**. A multi-shard
+  replica refuses to start replication loudly (rather than diverging silently).
+  Non-default-db writes are a known follow-up — the master's live fanout does
+  not yet stream `SELECT`, so `SELECT n; SET` replicates into db 0. Per-shard
+  WAIT/ACK and multi-shard PSYNC build on this in R1/R2.
+
+### Added — `--repl-backlog-size` (Redis `repl-backlog-size` parity)
+
+- New flag: per-shard replication backlog capacity in raw bytes (default
+  1 MiB, clamped to the 16 KiB Redis floor). Bounds how far a disconnected
+  replica may fall behind and still partial-resync. Previously the capacity
+  was hardcoded at three sites (handshake allocation ×2, SPSC lazy fallback)
+  and `replication_hardening::full_resync_outside_backlog` failed at spawn
+  with `unexpected argument` — the master process never started.
+  `ReplicationState.backlog_capacity` is now the single source of truth,
+  carried into `ShardMessage::RegisterReplica` for the fallback-init and
+  reported truthfully by `INFO replication` `repl_backlog_size`.
+
+### Fixed — `replication_hardening` harness could never complete
+
+- Test teardown used `SHUTDOWN NOSAVE` + `Child::wait()`, but SHUTDOWN is not
+  implemented on the production path (the dispatch arm is an error stub and no
+  connection handler intercepts it) — every test hung forever at cleanup and
+  a mid-test assert failure leaked live servers that wedged later tests'
+  ports. Teardown is now a kill-on-drop guard (panic-safe). Implementing a
+  real `SHUTDOWN [NOSAVE|SAVE]` is tracked separately.
+
 ### Fixed — `txn_kv_wiring` integration test port-collision flake
 
 - `start_txn_server` picked a port from a throwaway `bind(:0)` probe, dropped

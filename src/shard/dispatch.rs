@@ -456,9 +456,12 @@ pub enum ShardMessage {
     /// Register a connected replica's per-shard sender channel with this shard.
     /// Called once per shard per replica when a new replica connection is established.
     /// The shard adds `tx` to its replica_txs list for WAL fan-out.
+    /// `backlog_capacity` (`--repl-backlog-size`) sizes the lazy backlog
+    /// fallback-init so it can't diverge from the handshake-path allocation.
     RegisterReplica {
         replica_id: u64,
         tx: channel::MpscSender<bytes::Bytes>,
+        backlog_capacity: usize,
     },
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.

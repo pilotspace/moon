@@ -200,9 +200,12 @@ pub async fn run_embedded(
     // event loop still expects a populated state object.
     let (repl_id, repl_id2) =
         crate::replication::state::load_replication_state(std::path::Path::new(&config.dir));
-    let repl_state = Arc::new(std::sync::RwLock::new(
-        crate::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
-    ));
+    let repl_state = {
+        let mut rs =
+            crate::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2);
+        rs.set_backlog_capacity(config.repl_backlog_size);
+        Arc::new(std::sync::RwLock::new(rs))
+    };
     crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 
     // ACL table (loads aclfile if configured; default no-op otherwise).

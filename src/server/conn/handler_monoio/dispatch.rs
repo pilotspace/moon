@@ -511,7 +511,7 @@ pub(super) fn try_handle_replconf(
     if let Some(ref rs) = ctx.repl_state {
         if let Ok(g) = rs.read() {
             if matches!(g.role, crate::replication::state::ReplicationRole::Master) {
-                g.ensure_backlogs_allocated(1024 * 1024);
+                g.ensure_backlogs_allocated();
             }
         }
     }
@@ -584,7 +584,7 @@ pub(super) fn try_handle_psync(
             return None;
         }
         if let Some(g) = g {
-            g.ensure_backlogs_allocated(1024 * 1024);
+            g.ensure_backlogs_allocated();
         }
     }
     let repl_id = match &cmd_args[0] {

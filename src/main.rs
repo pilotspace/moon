@@ -891,9 +891,11 @@ fn main() -> anyhow::Result<()> {
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
         moon::replication::state::load_replication_state(std::path::Path::new(&config.dir));
-    let repl_state = std::sync::Arc::new(std::sync::RwLock::new(
-        moon::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
-    ));
+    let repl_state = {
+        let mut rs = moon::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2);
+        rs.set_backlog_capacity(config.repl_backlog_size);
+        std::sync::Arc::new(std::sync::RwLock::new(rs))
+    };
 
     // Register repl_state globally for INFO command queries.
     moon::admin::metrics_setup::set_global_repl_state(repl_state.clone());
