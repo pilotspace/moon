@@ -512,7 +512,6 @@ impl VectorIndex {
                     immutable: imm_list,
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
-                    cold: snap.cold.clone(),
                     unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
@@ -629,7 +628,6 @@ impl VectorIndex {
                         immutable: imm_list,
                         ivf: old.ivf.clone(),
                         warm: old.warm.clone(),
-                        cold: old.cold.clone(),
                         unloaded: old.unloaded.clone(),
                     };
                     segments.swap(new_list);
@@ -964,7 +962,6 @@ impl VectorIndex {
             immutable: imm_list,
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
-            cold: snap.cold.clone(),
             unloaded: snap.unloaded.clone(),
         };
         drop(snap);
@@ -1203,7 +1200,6 @@ impl VectorIndex {
             immutable: new_immutable,
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
-            cold: snap.cold.clone(),
             unloaded: snap.unloaded.clone(),
         };
         drop(snap);
@@ -1373,13 +1369,13 @@ impl VectorIndex {
                     // The ImmutableSegment is purely in-memory (no on-disk files),
                     // so it needs no SegmentHandle tombstoning -- it's simply dropped.
                     //
-                    // Tombstone lifecycle for the NEW warm/cold segment:
+                    // Tombstone lifecycle for the NEW warm/cold-stub segment:
                     //   1. `handle` (SegmentHandle) is passed to WarmSearchSegment below
                     //   2. WarmSearchSegment stores it as `_handle` (Arc refcount);
-                    //      for a COLD destination, `UnloadedSegment::from_warm`
+                    //      for a COLD-stub destination, `UnloadedSegment::from_warm`
                     //      captures a clone of the same handle before the
                     //      WarmSearchSegment is dropped.
-                    //   3. When later transitioned to cold (WARM->COLD/DiskAnn):
+                    //   3. When later idle-transitioned WARM -> COLD-stub:
                     //      mark_tombstoned() is called
                     //   4. On index drop / FLUSH: mark_tombstoned() is called
                     //   5. Directory is deleted only when last Arc ref drops AND tombstoned
@@ -1455,98 +1451,13 @@ impl VectorIndex {
         if transitioned > 0 {
             // Functional-update clone-and-patch (item 6, adversarial review):
             // only the 3 fields this function actually touches are named;
-            // `mutable`/`ivf`/`cold` come along via `..(**snapshot).clone()`
-            // without being enumerated here.
+            // `mutable`/`ivf` come along via `..(**snapshot).clone()` without
+            // being enumerated here.
             let new_list = SegmentList {
                 immutable: new_immutable,
                 warm: new_warm,
                 unloaded: new_unloaded,
                 ..(**snapshot).clone()
-            };
-            self.segments.swap(new_list);
-        }
-        transitioned
-    }
-}
-
-impl VectorIndex {
-    /// Check each warm segment's age. If older than `cold_after_secs`,
-    /// transition it to cold tier (PQ codes in RAM + Vamana graph on NVMe).
-    ///
-    /// After transition, the warm segment is replaced by a DiskAnnSegment
-    /// that performs approximate search via PQ asymmetric distance and
-    /// Vamana beam traversal from disk. The warm segment is tombstoned.
-    ///
-    /// Returns the number of segments transitioned.
-    pub fn try_cold_transitions(
-        &self,
-        shard_dir: &std::path::Path,
-        manifest: &mut crate::persistence::manifest::ShardManifest,
-        cold_after_secs: u64,
-        next_file_id: &mut u64,
-    ) -> usize {
-        let snapshot = self.segments.load();
-        let mut to_cold: Vec<usize> = Vec::new();
-        for (i, warm) in snapshot.warm.iter().enumerate() {
-            if warm.age_secs() >= cold_after_secs {
-                to_cold.push(i);
-            }
-        }
-        if to_cold.is_empty() {
-            return 0;
-        }
-
-        let mut new_warm = snapshot.warm.clone();
-        let mut new_cold = snapshot.cold.clone();
-        let mut transitioned = 0usize;
-        let dim = self.meta.dimension as usize;
-
-        // Process in reverse order to maintain valid indices during removal.
-        for &idx in to_cold.iter().rev() {
-            let warm_seg = &snapshot.warm[idx];
-            let warm_file_id = warm_seg.segment_id();
-            let cold_file_id = *next_file_id;
-            *next_file_id += 1;
-
-            match crate::storage::tiered::cold_tier::transition_to_cold(
-                shard_dir,
-                warm_seg,
-                warm_file_id,
-                cold_file_id,
-                dim,
-                manifest,
-            ) {
-                Ok(diskann_seg) => {
-                    new_warm.remove(idx);
-                    new_cold.push(Arc::new(diskann_seg));
-                    tracing::info!(
-                        "Cold transition: segment {} ({} vectors, age {}s) -> DiskANN cold",
-                        cold_file_id,
-                        warm_seg.total_count(),
-                        warm_seg.age_secs(),
-                    );
-                    // Mark the old warm segment for cleanup when refs drop.
-                    warm_seg.mark_tombstoned();
-                    transitioned += 1;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Cold transition failed for warm segment {}: {}",
-                        warm_file_id,
-                        e
-                    );
-                }
-            }
-        }
-
-        if transitioned > 0 {
-            let new_list = SegmentList {
-                mutable: Arc::clone(&snapshot.mutable),
-                immutable: snapshot.immutable.clone(),
-                ivf: snapshot.ivf.clone(),
-                warm: new_warm,
-                cold: new_cold,
-                unloaded: snapshot.unloaded.clone(),
             };
             self.segments.swap(new_list);
         }
@@ -2459,28 +2370,6 @@ impl VectorStore {
         total
     }
 
-    /// Attempt cold transitions for ALL indexes. Called from persistence tick.
-    ///
-    /// Scans warm segments in each index, transitions those older than
-    /// `cold_after_secs` to DiskANN cold tier. Returns total count.
-    pub fn try_cold_transitions_all(
-        &self,
-        shard_dir: &std::path::Path,
-        manifest: &mut crate::persistence::manifest::ShardManifest,
-        cold_after_secs: u64,
-        next_file_id: &mut u64,
-    ) -> usize {
-        let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
-        let mut total = 0;
-        for name in names {
-            if let Some(idx) = self.indexes.get(&name) {
-                total +=
-                    idx.try_cold_transitions(shard_dir, manifest, cold_after_secs, next_file_id);
-            }
-        }
-        total
-    }
-
     /// Register warm segments recovered from disk into the appropriate indexes.
     ///
     /// Called during shard restore after v3 recovery identifies warm-tier segments
@@ -2511,7 +2400,6 @@ impl VectorStore {
                             immutable: old.immutable.clone(),
                             ivf: old.ivf.clone(),
                             warm: new_warm,
-                            cold: old.cold.clone(),
                             unloaded: old.unloaded.clone(),
                         };
                         idx.segments.swap(new_list);
@@ -2566,42 +2454,6 @@ impl VectorStore {
         }
 
         total_evicted
-    }
-
-    /// Register cold DiskANN segments recovered from disk into the appropriate indexes.
-    ///
-    /// Called during shard restore after v3 recovery identifies cold-tier segments
-    /// in the manifest. For each (segment_id, segment_dir), logs the discovery.
-    ///
-    /// Full DiskAnnSegment reconstruction from disk requires serialized PQ codebooks
-    /// (future work). For now, this discovers and logs cold segments so they are
-    /// tracked by the system. Full loading will be added when PQ codebook
-    /// serialization is implemented.
-    pub fn register_cold_segments(&mut self, cold_segments: Vec<(u64, std::path::PathBuf)>) {
-        let mut loaded = 0usize;
-        for (segment_id, segment_dir) in &cold_segments {
-            // Try each index -- the segment belongs to whichever collection matches.
-            for idx in self.indexes.values() {
-                let seg_vamana = segment_dir.join("vamana.mpf");
-                if seg_vamana.exists() {
-                    tracing::info!(
-                        "Cold segment {} at {:?} discovered for index {:?} (full loading requires stored PQ codebook)",
-                        segment_id,
-                        segment_dir,
-                        std::str::from_utf8(&idx.meta.name).unwrap_or("<non-utf8>"),
-                    );
-                    loaded += 1;
-                    break; // Segment belongs to one index only
-                }
-            }
-        }
-        if loaded > 0 {
-            tracing::info!(
-                "Discovered {}/{} cold segments on startup",
-                loaded,
-                cold_segments.len()
-            );
-        }
     }
 
     // ── P2: Segment merge public API ──────────────────────────────────────────
@@ -2766,7 +2618,6 @@ impl VectorStore {
                     immutable: new_immutable,
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
-                    cold: snap.cold.clone(),
                     unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
@@ -2838,7 +2689,6 @@ impl VectorStore {
                     immutable: vec![Arc::new(merged)],
                     ivf: old.ivf.clone(),
                     warm: old.warm.clone(),
-                    cold: old.cold.clone(),
                     unloaded: old.unloaded.clone(),
                 };
                 idx.segments.swap(new_list);
@@ -2979,7 +2829,6 @@ fn enforce_segment_holder_budget(
         immutable: snapshot.immutable.clone(),
         ivf: snapshot.ivf.clone(),
         warm: snapshot.warm.clone(),
-        cold: snapshot.cold.clone(),
         unloaded: snapshot.unloaded.clone(),
     };
 
@@ -3557,7 +3406,6 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         };
         idx.segments.swap(new_list);
@@ -3643,7 +3491,6 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
         drop(old_snap);
@@ -3704,34 +3551,6 @@ mod tests {
         let idx = store.get_index(b"idx_default").unwrap();
         assert_eq!(idx.collection.codebook.len(), 16);
         assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant4);
-    }
-
-    // -- Cold segment registration tests (Phase 79-04) --
-
-    #[test]
-    fn test_register_cold_segments_empty() {
-        let mut store = VectorStore::new();
-        store
-            .create_index(make_meta("idx", 128, &["doc:"]))
-            .unwrap();
-        // Should not panic with empty input
-        store.register_cold_segments(Vec::new());
-    }
-
-    #[test]
-    fn test_register_cold_segments_discovers() {
-        let mut store = VectorStore::new();
-        store
-            .create_index(make_meta("idx", 128, &["doc:"]))
-            .unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let seg_dir = tmp.path().join("segment-10-diskann");
-        std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("vamana.mpf"), [0u8; 64]).unwrap();
-
-        // Should discover the segment without panicking
-        store.register_cold_segments(vec![(10, seg_dir)]);
     }
 }
 

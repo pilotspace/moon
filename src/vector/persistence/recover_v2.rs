@@ -482,7 +482,6 @@ fn load_segments_and_keymap(
         immutable,
         ivf: Vec::new(),
         warm: Vec::new(),
-        cold: Vec::new(),
         // WS3 round 2: COLD (unloaded) segments are on-disk stubs with no
         // restart-time restoration path today, same as WARM -- they simply
         // don't survive a restart as stubs; the segment directories they

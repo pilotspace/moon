@@ -36,18 +36,6 @@ use super::shared_databases::ShardDatabases;
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
-/// EXPERIMENTAL DiskANN cold-tier gate. The WARM->COLD transition + on-disk
-/// Vamana beam search are incomplete (no cold-segment deletion, ADC-only
-/// recall, restart reload of PQ codebooks unfinished — see the audit), so the
-/// transition is a no-op unless an operator explicitly opts in via
-/// `MOON_VEC_COLD_TIER=1`. Warm-tier mmap + LRU eviction (`--vec-warm-mmap-budget`)
-/// handles out-of-RAM indexes by default.
-fn cold_tier_experimental_enabled() -> bool {
-    std::env::var("MOON_VEC_COLD_TIER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("enable"))
-        .unwrap_or(false)
-}
-
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
@@ -722,15 +710,6 @@ impl super::Shard {
         let warm_poll_ms = (warm_trigger_secs * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
         #[cfg(feature = "runtime-tokio")]
         let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
-        // Cold tier transition check: poll at min(60s, segment_cold_after) so the
-        // timer fires within one cold-age window (default 60s; short for testing).
-        let cold_poll_secs = if server_config.segment_cold_after > 0 {
-            server_config.segment_cold_after.min(60)
-        } else {
-            60
-        };
-        #[cfg(feature = "runtime-tokio")]
-        let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
         // Cold-tier orphan sweeper: 5-minute default (P9). Disabled when interval is 0.
         // Shared by both tokio (select! branch) and monoio (counter-based dispatch).
         let orphan_sweep_interval_secs = server_config.cold_orphan_sweep_interval_secs;
@@ -1586,28 +1565,6 @@ impl super::Shard {
                         );
                     });
                 }
-                // Cold tier transition check (60s, disk-offload only)
-                _ = cold_check_interval.0.tick() => {
-                    if cold_tier_experimental_enabled()
-                        && server_config.disk_offload_enabled()
-                        && server_config.segment_cold_after > 0
-                    {
-                        if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config.effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
-                            crate::shard::slice::with_shard(|s| {
-                                persistence_tick::check_cold_transitions(
-                                    &s.vector_store,
-                                    &shard_dir,
-                                    manifest,
-                                    server_config.segment_cold_after,
-                                    &mut next_file_id,
-                                    shard_id,
-                                );
-                            });
-                        }
-                    }
-                }
                 // Cold-tier orphan sweeper (P9): runs every cold_orphan_sweep_interval_secs.
                 // Identifies cold index entries whose key is now in the hot DashTable
                 // (hot write shadowed the spilled copy) and deletes the stale DataFile.
@@ -2249,29 +2206,6 @@ impl super::Shard {
                             shard_id,
                         );
                     });
-                }
-                // Cold tier check: every cold_poll_secs * 1000 ticks
-                if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {
-                    if cold_tier_experimental_enabled()
-                        && server_config.disk_offload_enabled()
-                        && server_config.segment_cold_after > 0
-                    {
-                        if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config
-                                .effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
-                            crate::shard::slice::with_shard(|s| {
-                                persistence_tick::check_cold_transitions(
-                                    &s.vector_store,
-                                    &shard_dir,
-                                    manifest,
-                                    server_config.segment_cold_after,
-                                    &mut next_file_id,
-                                    shard_id,
-                                );
-                            });
-                        }
-                    }
                 }
                 // MA12: Disk free-space poll (every 5000 ticks = 5s, shard 0 only).
                 if shard_id == 0 && monoio_tick_counter % 5000 == 0 {

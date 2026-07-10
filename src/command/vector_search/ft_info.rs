@@ -60,13 +60,6 @@ pub fn ft_info(
     for stub in snap.unloaded.iter() {
         num_docs += stub.live_count() as usize;
     }
-    // Prod-hardening #28: DiskANN cold-tier segments (experimental, gated by
-    // MOON_VEC_COLD_TIER) were never summed — cold docs ARE returned by
-    // FT.SEARCH, so omitting them under-reported num_docs once any segment
-    // aged into the cold tier.
-    for cold in snap.cold.iter() {
-        num_docs += cold.num_docs();
-    }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
     // distances only — surfacing the count makes a dropped sidecar (e.g. an
@@ -168,9 +161,6 @@ pub fn ft_info(
             for stub in s.unloaded.iter() {
                 docs += stub.live_count() as usize;
             }
-            for cold in s.cold.iter() {
-                docs += cold.num_docs();
-            }
             (docs, s.mutable.live_len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
             let s = fs.segments.load();
@@ -184,9 +174,6 @@ pub fn ft_info(
             }
             for stub in s.unloaded.iter() {
                 docs += stub.live_count() as usize;
-            }
-            for cold in s.cold.iter() {
-                docs += cold.num_docs();
             }
             (docs, s.mutable.live_len(), imm_count)
         } else {

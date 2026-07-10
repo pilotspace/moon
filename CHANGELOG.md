@@ -185,6 +185,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untrusted length/count against the bytes actually remaining in the input
   before allocating. No wire-format or valid-file behavior changes — a
   legitimate length/count always fits within the remaining input.
+### Removed — Experimental DiskANN COLD vector tier
+
+- **Deleted the experimental "COLD-ann" vector tier** (`src/storage/tiered/cold_tier.rs`,
+  the whole `src/vector/diskann/` module — Vamana graph, product quantizer,
+  co-located page format, io_uring beam search). It was gated off by default
+  (`MOON_VEC_COLD_TIER=1`), incomplete by its own docs (no cold-segment
+  deletion, ADC-only recall, no restart-time PQ-codebook reload), and had no
+  restart recovery story. The M3-exit review decided delete-over-finish. The
+  default COLD valve remains `SegmentList.unloaded` (`UnloadedSegment`,
+  exact, near-zero RAM, reload-on-touch) plus WARM byte-budget LRU eviction
+  (`--vec-warm-mmap-budget`) — neither is affected by this removal.
+- Removed the dead call chain: `VectorIndex::try_cold_transitions[_all]`,
+  `VectorStore::register_cold_segments`, the COLD 60s event-loop timer arm
+  (tokio + monoio), `cold_tier_experimental_enabled()`, cold-segment manifest
+  discovery in `src/persistence/recovery.rs` (`RecoveryResult::cold_segments`
+  / `cold_segments_loaded`), and the `snap.cold` fan-out in `FT.SEARCH` /
+  `FT.INFO` / `SegmentHolder::resident_bytes`/`total_vectors`.
+- `--segment-cold-after`, `--segment-cold-min-qps`, `--vec-diskann-beam-width`,
+  `--vec-diskann-cache-levels` are kept as **parseable, inert no-ops** (rather
+  than a hard CLI break) so existing `moon.conf` files/launch scripts do not
+  fail to start; a startup `tracing::warn!` fires once if any is set away
+  from its historical default (`ServerConfig::warn_deprecated_cold_tier_flags`,
+  called from `main.rs`).
+- `StorageTier::Cold`/`Archive` (the shared on-disk tier-byte enum in
+  `src/persistence/manifest.rs`, format §4.3) are left in place — they are
+  part of the stable `FileEntry.tier` wire format and shared with the
+  unrelated KV disk-offload subsystem's `ColdIndex`/`sweep_orphans` (which
+  this change does not touch).
 
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 

@@ -365,7 +365,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm,
-            cold: Vec::new(),
             unloaded: Vec::new(),
         }
     }

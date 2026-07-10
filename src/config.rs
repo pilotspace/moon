@@ -440,29 +440,31 @@ pub struct ServerConfig {
     #[arg(long = "vec-warm-mmap-budget", default_value = "2gb")]
     pub vec_warm_mmap_budget: String,
 
-    // ── Cold-tier / DiskANN (EXPERIMENTAL — gated by MOON_VEC_COLD_TIER) ──
-    // Two distinct COLD concepts exist (tiering-v2 decision D9):
-    //   COLD-stub (`SegmentList.unloaded`, `UnloadedSegment`) — the DEFAULT
-    //     valve: exact, ~0 RAM, reload-on-touch. Always available.
-    //   COLD-ann (`SegmentList.cold`, `DiskAnnSegment`) — THIS section:
-    //     approximate serve-from-disk (PQ in RAM + Vamana on NVMe), kept
-    //     inert behind MOON_VEC_COLD_TIER until the M5 production gate
-    //     (promote-back, delete, restart recovery, recall gate); an M3-exit
-    //     review decides productionize-vs-delete on real EWMA telemetry.
-    // The DiskANN cold tier is incomplete (no cold-segment deletion, ADC-only
-    // recall, restart reload of PQ codebooks unfinished). The WARM->COLD
-    // transition is a NO-OP unless an operator sets `MOON_VEC_COLD_TIER=1`;
-    // warm-tier byte-budget LRU demotion to COLD-stub handles out-of-RAM
-    // indexes by default.
-    /// Seconds after last access before a WARM segment is promoted to COLD.
-    /// Consumed by the cold-transition timer ONLY when the experimental cold
-    /// tier is enabled (`MOON_VEC_COLD_TIER=1`); otherwise inert.
+    // ── DEPRECATED: DiskANN cold-tier (removed) ─────────────────────
+    // The experimental "COLD-ann" tier (`SegmentList.cold`, `DiskAnnSegment`
+    // — approximate serve-from-disk via PQ codes in RAM + Vamana graph on
+    // NVMe, gated off by default behind `MOON_VEC_COLD_TIER=1`) was DELETED:
+    // it never left experimental status, had no restart recovery story (no
+    // PQ-codebook reload, no cold-segment delete) and ADC-only recall. The
+    // M3-exit review decided delete-over-finish. See CHANGELOG.
+    //
+    // The four flags below are kept as parseable, inert no-ops (rather than
+    // hard-removed) so existing `moon.conf` files / scripts that still pass
+    // them do not fail to start — the DEFAULT COLD valve remains
+    // `SegmentList.unloaded` (`UnloadedSegment`, exact, ~0 RAM,
+    // reload-on-touch, always available) plus warm-tier byte-budget LRU
+    // eviction (`--vec-warm-mmap-budget`), neither of which this section
+    // ever gated. A future release may remove these flags entirely (clap
+    // will then error on unknown args) — see `warn_deprecated_cold_tier_flags`
+    // in `main.rs`, which logs once at startup if any of these four were set
+    // away from their default.
+    /// DEPRECATED, no-op: was consumed only by the removed DiskANN cold
+    /// tier's transition timer.
     #[arg(long = "segment-cold-after", default_value_t = 86_400)]
     pub segment_cold_after: u64,
 
-    /// Minimum queries-per-second threshold; segments below this are COLD candidates.
-    /// [reserved: M3] — becomes the per-index EWMA boundary between COLD-stub
-    /// (idle) and COLD-ann (queried) demotion in the frequency classifier.
+    /// DEPRECATED, no-op: was reserved for the removed DiskANN cold tier's
+    /// EWMA frequency classifier (never implemented).
     #[arg(long = "segment-cold-min-qps", default_value_t = 0.1)]
     pub segment_cold_min_qps: f64,
 
@@ -474,15 +476,13 @@ pub struct ServerConfig {
     #[arg(long = "memory-arenas-cap", value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub memory_arenas_cap: u32,
 
-    /// DiskANN beam width for disk-resident vector search.
-    /// [reserved: M5] — consumed when the COLD-ann search path is
-    /// productionized (gated by MOON_VEC_COLD_TIER until then).
+    /// DEPRECATED, no-op: DiskANN beam width for the removed cold-tier
+    /// disk-resident search path.
     #[arg(long = "vec-diskann-beam-width", default_value_t = 8)]
     pub vec_diskann_beam_width: u32,
 
-    /// Number of HNSW upper levels cached in memory for DiskANN hybrid search.
-    /// [reserved: M5] — consumed when the COLD-ann cache layer is
-    /// productionized (gated by MOON_VEC_COLD_TIER until then).
+    /// DEPRECATED, no-op: HNSW upper-level cache depth for the removed
+    /// DiskANN cold-tier hybrid search path.
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
 
@@ -899,6 +899,38 @@ fn decide_dir(
 pub const MAX_DATABASES: usize = 256;
 
 impl ServerConfig {
+    /// Warn once at startup if an operator set any of the four deprecated
+    /// DiskANN cold-tier flags (`--segment-cold-after`,
+    /// `--segment-cold-min-qps`, `--vec-diskann-beam-width`,
+    /// `--vec-diskann-cache-levels`) away from their historical default —
+    /// the tier they configured was deleted (see CHANGELOG) and these flags
+    /// are now pure no-ops kept only so existing `moon.conf` files / launch
+    /// scripts do not fail to start.
+    pub fn warn_deprecated_cold_tier_flags(&self) {
+        let mut touched: Vec<&str> = Vec::new();
+        if self.segment_cold_after != 86_400 {
+            touched.push("--segment-cold-after");
+        }
+        if (self.segment_cold_min_qps - 0.1).abs() > f64::EPSILON {
+            touched.push("--segment-cold-min-qps");
+        }
+        if self.vec_diskann_beam_width != 8 {
+            touched.push("--vec-diskann-beam-width");
+        }
+        if self.vec_diskann_cache_levels != 3 {
+            touched.push("--vec-diskann-cache-levels");
+        }
+        if !touched.is_empty() {
+            tracing::warn!(
+                "{} set but ignored: the experimental DiskANN cold tier was removed \
+                 (delete-over-finish decision — incomplete restart recovery, ADC-only \
+                 recall). WARM eviction (--vec-warm-mmap-budget) and the default \
+                 COLD-stub reload-on-touch valve are unaffected.",
+                touched.join(", ")
+            );
+        }
+    }
+
     /// Validate `--databases` fits the `u8` db_index tag used by vector/text
     /// index scoping (WS5a round 2). Returns an error message (not a
     /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot

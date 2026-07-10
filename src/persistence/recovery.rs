@@ -43,11 +43,6 @@ pub struct RecoveryResult {
     pub warm_segments: Vec<(u64, std::path::PathBuf)>,
     /// Number of KV entries reloaded from heap DataFiles.
     pub kv_heap_entries_loaded: usize,
-    /// Cold DiskANN segment paths recovered from manifest.
-    /// Each tuple: (file_id, segment_dir_path).
-    pub cold_segments: Vec<(u64, std::path::PathBuf)>,
-    /// Number of cold segments discovered.
-    pub cold_segments_loaded: usize,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -354,29 +349,6 @@ pub fn recover_shard_v3_pitr(
                 info!(
                     "Shard {}: swept {} crash-orphaned heap file(s)",
                     shard_id, swept
-                );
-            }
-        }
-    }
-
-    // Phase 3 continued: Discover cold DiskANN segments from manifest.
-    // tier=Cold, status=Active entries point to on-disk DiskAnnSegment directories.
-    if manifest_path.exists() {
-        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let vectors_dir = shard_dir.join("vectors");
-            for entry in manifest.files() {
-                if entry.tier == StorageTier::Cold && entry.status == FileStatus::Active {
-                    let seg_dir = vectors_dir.join(format!("segment-{}-diskann", entry.file_id));
-                    if seg_dir.exists() && seg_dir.join("vamana.mpf").exists() {
-                        result.cold_segments.push((entry.file_id, seg_dir));
-                        result.cold_segments_loaded += 1;
-                    }
-                }
-            }
-            if result.cold_segments_loaded > 0 {
-                info!(
-                    "Shard {}: discovered {} cold DiskANN segment(s) from manifest",
-                    shard_id, result.cold_segments_loaded
                 );
             }
         }
@@ -1150,63 +1122,6 @@ mod tests {
             databases[0].get(b"key3").is_some(),
             "key3 should be in database"
         );
-    }
-
-    #[test]
-    fn test_recover_cold_segments_from_manifest() {
-        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
-        use crate::persistence::page::PageType;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let shard_dir = tmp.path().join("shard-0");
-        std::fs::create_dir_all(&shard_dir).unwrap();
-
-        // Create manifest with a Cold/Active entry
-        let manifest_path = shard_dir.join("shard-0.manifest");
-        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id: 50,
-            file_type: PageType::VecCodes as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Cold,
-            page_size_log2: 16,
-            page_count: 8,
-            byte_size: 524288,
-            created_lsn: 10,
-            min_key_hash: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 10,
-        });
-        // Also add a non-cold entry that should be ignored
-        manifest.add_file(FileEntry {
-            file_id: 51,
-            file_type: PageType::VecCodes as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Warm,
-            page_size_log2: 16,
-            page_count: 4,
-            byte_size: 262144,
-            created_lsn: 11,
-            min_key_hash: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 11,
-        });
-        manifest.commit().unwrap();
-        drop(manifest);
-
-        // Create the cold segment directory with vamana.mpf
-        let seg_dir = shard_dir.join("vectors").join("segment-50-diskann");
-        std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("vamana.mpf"), [0u8; 128]).unwrap();
-
-        let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
-
-        assert_eq!(result.cold_segments_loaded, 1);
-        assert_eq!(result.cold_segments.len(), 1);
-        assert_eq!(result.cold_segments[0].0, 50);
-        assert_eq!(result.cold_segments[0].1, seg_dir);
     }
 
     // ── Legacy-dir AOF authority + WAL v3 last-resort fallback (review

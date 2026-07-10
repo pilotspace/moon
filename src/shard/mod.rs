@@ -158,13 +158,12 @@ impl Shard {
                 ) {
                     Ok(result) => {
                         info!(
-                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={}, warm={}, cold={}, kv_heap={}, txn_rollback={})",
+                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={}, warm={}, kv_heap={}, txn_rollback={})",
                             self.id,
                             result.commands_replayed,
                             result.fpi_applied,
                             result.last_lsn,
                             result.warm_segments_loaded,
-                            result.cold_segments_loaded,
                             result.kv_heap_entries_loaded,
                             result.txns_rolled_back,
                         );

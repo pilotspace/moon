@@ -11,7 +11,6 @@ use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
-use crate::vector::diskann::segment::DiskAnnSegment;
 use crate::vector::filter::selectivity::{FilterStrategy, select_strategy};
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::keymap::BucketedKeyMap;
@@ -70,8 +69,6 @@ pub struct SegmentList {
     pub ivf: Vec<Arc<IvfSegment>>,
     /// Warm segments: mmap-backed, searchable after HOT->WARM transition.
     pub warm: Vec<Arc<WarmSearchSegment>>,
-    /// Cold segments: DiskANN PQ+Vamana search from NVMe.
-    pub cold: Vec<Arc<DiskAnnSegment>>,
     /// Unloaded (COLD) segments: on-disk only, reloaded into `warm` on touch.
     pub unloaded: Vec<Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>>,
 }
@@ -114,7 +111,7 @@ impl SegmentList {
 /// starved for the whole search.
 #[derive(Clone, Copy, Debug)]
 pub struct YieldBudget {
-    /// Yield after this many immutable/warm/cold/ivf segments (default 1: per-segment).
+    /// Yield after this many immutable/warm/ivf segments (default 1: per-segment).
     pub max_segments_per_chunk: usize,
     /// Reserved cap for yielding inside one large HNSW segment's traversal
     /// (per-node). Honored where the traversal exposes a yield point; bounds the
@@ -279,7 +276,6 @@ impl SearchSnapshot {
             immutable: cur.immutable.clone(),
             ivf: cur.ivf.clone(),
             warm: new_warm,
-            cold: cur.cold.clone(),
             unloaded: new_unloaded,
         });
     }
@@ -306,7 +302,6 @@ impl SegmentHolder {
                 immutable: Vec::new(),
                 ivf: Vec::new(),
                 warm: Vec::new(),
-                cold: Vec::new(),
                 unloaded: Vec::new(),
             }),
             reload_lock: parking_lot::Mutex::new(()),
@@ -354,9 +349,8 @@ impl SegmentHolder {
     /// so once segments age past `--segment-warm-after` it dominates resident
     /// vector memory — it MUST be counted here or the memory-pressure trigger
     /// (see `should_run_pressure_cascade`) and INFO/Prometheus go blind to it.
-    /// IVF (centroids + posting lists) and DiskANN-cold (PQ codes + codebook;
-    /// graph on NVMe excluded) are counted too (accounting-spine A1) — every
-    /// tier that pins heap reports it here.
+    /// IVF (centroids + posting lists) is counted too (accounting-spine A1)
+    /// — every tier that pins heap reports it here.
     pub fn resident_bytes(&self) -> (usize, usize) {
         let snapshot = self.load();
         let mutable = snapshot.mutable.resident_bytes();
@@ -377,11 +371,6 @@ impl SegmentHolder {
         for ivf_seg in &snapshot.ivf {
             immutable += ivf_seg.resident_bytes();
         }
-        // DiskANN cold (COLD-ann, distinct from the COLD stubs above): PQ
-        // codes + codebook stay resident; the Vamana graph lives on disk.
-        for cold_seg in &snapshot.cold {
-            immutable += cold_seg.resident_bytes();
-        }
         (mutable, immutable)
     }
 
@@ -397,9 +386,6 @@ impl SegmentHolder {
         }
         for warm_seg in &snapshot.warm {
             total += warm_seg.total_count();
-        }
-        for cold_seg in &snapshot.cold {
-            total += cold_seg.total_count();
         }
         for stub in &snapshot.unloaded {
             total += stub.total_count();
@@ -444,9 +430,8 @@ impl SegmentHolder {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm + cold).
-        let segment_count =
-            1 + snapshot.immutable.len() + snapshot.warm.len() + snapshot.cold.len();
+        // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm).
+        let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
         // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
@@ -568,12 +553,6 @@ impl SegmentHolder {
                     }
                 }
             }
-        }
-
-        // Fan-out to cold (DiskANN) segments -- unfiltered PQ beam search.
-        // Filter support for cold segments is future work (no global ID mapping yet).
-        for cold_seg in &snapshot.cold {
-            all.extend(cold_seg.search(query_f32, k, 8));
         }
 
         // Fan-out to IVF segments.
@@ -725,12 +704,7 @@ impl SegmentHolder {
             }
         }
 
-        // 2b. Cold segment search (DiskANN, committed by definition).
-        for cold_seg in &snapshot.cold {
-            all.extend(cold_seg.search(query_f32, k, 8));
-        }
-
-        // 2c. IVF segment search (IVF entries are committed by definition).
+        // 2b. IVF segment search (IVF entries are committed by definition).
         if !snapshot.ivf.is_empty() {
             let dim = query_f32.len();
             let pdim = padded_dimension(dim as u32) as usize;
@@ -794,7 +768,7 @@ impl SegmentHolder {
     /// BYTE-IDENTICAL result (§3 G-IDENTITY): the mutable brute-force is chunked
     /// over the append-only captured range `[0, mutable_len)` and each chunk's
     /// top-k merges into the same global top-k a single full scan yields;
-    /// immutable/warm/cold/ivf segments are committed-by-definition and yielded
+    /// immutable/warm/ivf segments are committed-by-definition and yielded
     /// between. Relinquishes to the shard event loop (and bumps the C5 proxy
     /// counter) between bounded chunks (§3 G-PROGRESS).
     pub async fn search_mvcc_yielding(
@@ -1120,18 +1094,7 @@ impl SegmentHolder {
             }
         }
 
-        // 2b. Cold segment search (DiskANN, committed by definition).
-        for cold_seg in &segments.cold {
-            all.extend(cold_seg.search(query_f32, k, 8));
-            since_yield += 1;
-            if since_yield >= seg_cap {
-                since_yield = 0;
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
-            }
-        }
-
-        // 2c. IVF segment search (IVF entries are committed by definition).
+        // 2b. IVF segment search (IVF entries are committed by definition).
         if !segments.ivf.is_empty() {
             let dim = query_f32.len();
             let pdim = padded_dimension(dim as u32) as usize;
@@ -1335,7 +1298,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: vec![warm],
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
 
@@ -1346,15 +1308,16 @@ mod tests {
         );
     }
 
-    /// Accounting-spine A1: the IVF and DiskANN-cold tiers hold real heap
-    /// memory (IVF: centroids + posting lists; DiskANN: PQ codes + codebook)
-    /// but contributed a hardcoded 0 to the roll-up — blinding the pressure
-    /// trigger and observability for those tiers. RED until the roll-up sums
-    /// both tiers' `resident_bytes()`.
+    /// Accounting-spine A1: the IVF tier holds real heap memory (centroids +
+    /// posting lists) but contributed a hardcoded 0 to the roll-up —
+    /// blinding the pressure trigger and observability for that tier. RED
+    /// until the roll-up sums its `resident_bytes()`.
+    ///
+    /// (This test previously also covered the DiskANN COLD tier, removed
+    /// — see CHANGELOG: the tier was experimental, gated off by default,
+    /// and incomplete. IVF coverage is unaffected by that removal.)
     #[test]
-    fn test_resident_bytes_includes_ivf_and_cold_tiers() {
-        use crate::vector::diskann::pq::ProductQuantizer;
-        use crate::vector::diskann::segment::DiskAnnSegment;
+    fn test_resident_bytes_includes_ivf_tier() {
         use crate::vector::segment::ivf;
 
         distance::init();
@@ -1386,22 +1349,6 @@ mod tests {
         let ivf_bytes = ivf_seg.resident_bytes();
         assert!(ivf_bytes > 0);
 
-        // Small DiskANN cold segment: PQ trained on the same vectors; the
-        // vamana graph lives on disk (constructor only opens the file).
-        let tmp = tempfile::tempdir().unwrap();
-        let vamana_path = tmp.path().join("vamana.mpf");
-        std::fs::write(&vamana_path, vec![0u8; 4096]).unwrap();
-        let m = 4usize;
-        let pq = ProductQuantizer::train(&vectors, dim, m, 8);
-        let mut pq_codes = Vec::with_capacity(n * m);
-        for i in 0..n {
-            pq_codes.extend_from_slice(&pq.encode(&vectors[i * dim..(i + 1) * dim]));
-        }
-        let cold_seg =
-            DiskAnnSegment::new(pq_codes, pq, vamana_path, dim, n as u32, 0, 8, 1).unwrap();
-        let cold_bytes = cold_seg.resident_bytes();
-        assert!(cold_bytes > 0);
-
         let collection = make_test_collection(dim as u32);
         let holder = SegmentHolder::new(dim as u32, collection.clone());
         let (_, base_imm) = holder.resident_bytes();
@@ -1411,15 +1358,14 @@ mod tests {
             immutable: Vec::new(),
             ivf: vec![Arc::new(ivf_seg)],
             warm: Vec::new(),
-            cold: vec![Arc::new(cold_seg)],
             unloaded: Vec::new(),
         });
 
         let (_, imm) = holder.resident_bytes();
         assert!(
-            imm >= base_imm + ivf_bytes + cold_bytes,
-            "IVF + cold tiers must contribute to resident_bytes: {imm} \
-             (base {base_imm}, ivf {ivf_bytes}, cold {cold_bytes})"
+            imm >= base_imm + ivf_bytes,
+            "IVF tier must contribute to resident_bytes: {imm} \
+             (base {base_imm}, ivf {ivf_bytes})"
         );
     }
 
@@ -1442,7 +1388,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: vec![make_unloaded_stub(tmp.path(), 1)],
         });
 
@@ -1480,7 +1425,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: vec![stub],
         });
         let mut snap = SearchSnapshot {
@@ -1545,7 +1489,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
 
@@ -1842,7 +1785,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
 
@@ -1924,7 +1866,6 @@ mod tests {
             immutable: Vec::new(),
             ivf: vec![Arc::new(ivf_seg)],
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
 
