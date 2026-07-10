@@ -23,6 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Added a `wait_for_file` bounded-poll helper (50ms interval, 10s deadline)
   and used it at all three call sites in place of the point-in-time
   assumption. The MOON-magic-bytes assertion is unchanged.
+### Fixed — CI: nightly fuzz shard (`graph_props_record`) + stale `deny.toml` comment
+
+- **Missing fuzz harness**: `fuzz/Cargo.toml` and `.github/workflows/fuzz.yml`
+  both declared a `graph_props_record` fuzz target, but
+  `fuzz/fuzz_targets/graph_props_record.rs` didn't exist — that matrix shard
+  failed every nightly run (audit finding, `docs/PRODUCTION-CONTRACT.md`
+  FUZZ-01). The target function is real: `src/graph/csr/props.rs`'s module
+  doc even names it (`fuzz target: graph_props_record`) — the v5 node/edge
+  property-record codec (`decode_node_props`, `decode_node_prop`,
+  `decode_node_embedding`, `node_record_len`, `decode_edge_weight`,
+  `decode_edge_props`, `decode_edge_prop`, `edge_record_len`) decodes bytes
+  read straight off a `.csr` segment file and is documented to return
+  `None`/empty on malformed input rather than panic. Added the missing
+  harness so the shard actually fuzzes it, following the exact pattern of
+  the sibling targets (`wal_v3_record.rs`, `gossip_deser.rs`).
+- **Stale comment**: `deny.toml`'s header claimed a `ci.yml` "safety-audit"
+  job runs `cargo audit`/`cargo deny`; no such job exists. The actual "Lint"
+  job runs `scripts/audit-unsafe.sh` + `scripts/audit-unwrap.sh` (SAFETY-
+  comment coverage / unwrap ratchet) — a different, unrelated check.
+  Corrected the comment to describe reality and left a `TODO(ci):` marking
+  the gap (wiring `cargo deny check` into CI is a separate decision, out of
+  scope here).
 
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
