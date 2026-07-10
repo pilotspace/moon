@@ -70,6 +70,17 @@ pub struct Shard {
     pub pubsub_registry: PubSubRegistry,
     /// Per-shard vector store -- no Arc, no Mutex, fully owned by shard thread.
     pub vector_store: VectorStore,
+    /// WARM-tier vector segments discovered during `restore_from_persistence`'s
+    /// v3 recovery pass (`RecoveryResult.warm_segments`), staged here because
+    /// the `vector_store` populated on THIS struct is a throwaway (discarded
+    /// wholesale in `event_loop.rs` in favor of `ShardSlice.vector_store` --
+    /// see that file's comment). `event_loop.rs` drains this field via
+    /// `std::mem::take` and calls `VectorStore::register_warm_segments` on the
+    /// LIVE store right after B3 recovery (`RecoveryState::finish`) completes,
+    /// so a restart re-attaches WARM segments instead of silently losing the
+    /// RSS win (they used to never be reattached at all -- discovered, then
+    /// discarded along with the rest of this throwaway store).
+    pub recovered_warm_segments: Vec<(u64, std::path::PathBuf)>,
 }
 
 impl Shard {
@@ -116,6 +127,7 @@ impl Shard {
             runtime_config: config,
             pubsub_registry: PubSubRegistry::new(),
             vector_store: VectorStore::new(),
+            recovered_warm_segments: Vec::new(),
         }
     }
 
@@ -191,7 +203,15 @@ impl Shard {
                         // favor of `ShardSlice.vector_store` — see that
                         // file's comment for the real recovery contract
                         // (sidecar definitions + manifest/segments/keymap +
-                        // dedup rescan, B3). Nothing to do on this struct.
+                        // dedup rescan, B3). The WARM-tier segments Stack A's
+                        // recovery just discovered from the manifest are the
+                        // one piece worth keeping: stage them on `self` so
+                        // `event_loop.rs` can reattach them to the LIVE store
+                        // once it exists (`register_warm_segments`) — they
+                        // used to be discovered here and then silently
+                        // dropped along with the rest of this throwaway
+                        // struct, so WARM's RSS win never survived a restart.
+                        self.recovered_warm_segments = result.warm_segments;
                         return result.commands_replayed;
                     }
                     Err(e) => {

@@ -214,6 +214,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrelated KV disk-offload subsystem's `ColdIndex`/`sweep_orphans` (which
   this change does not touch).
 
+### Fixed — Vector: WARM segments now survive a restart, and stop leaking superseded segment directories
+
+- **Restart-recovery dead wiring fixed.** `VectorStore::register_warm_segments`
+  had zero non-test callers: `Shard::restore_from_persistence`'s v3 recovery
+  pass discovered WARM segments from the manifest (`RecoveryResult.warm_segments`)
+  into a throwaway `Shard`-owned `vector_store` that `event_loop.rs` discards
+  wholesale in favor of the live `ShardSlice.vector_store` — so the discovery
+  result was thrown away with it, and WARM's RSS win evaporated on every
+  restart. Fixed by staging the discovered segments on a new
+  `Shard::recovered_warm_segments` field and draining them into the live
+  store via `register_warm_segments` right after B3 recovery
+  (`RecoveryState::finish`) completes in `event_loop.rs`.
+- **Superseded segment-directory leak fixed.** `VectorIndex::try_warm_transitions_idle`
+  never told Stack B's durability manifest (`vector/persistence/manifest.rs`)
+  that a segment had left the immutable tier, so the old
+  `idx-<hex>/segment-<old_id>/` directory it left behind was never garbage
+  collected — permanent disk growth on every HOT→WARM/COLD transition, and
+  (independently) the reason a restart used to silently reload the segment
+  as a fully-materialized HOT copy of stale data instead of respecting the
+  WARM tier it had just been moved to. Fixed by calling the existing
+  `persist_hook_after_install` durability hook after every transition; its
+  manifest diff (`run_snapshot_job`) now GCs the superseded directory the
+  same way a normal compact/merge already does.
+- `VectorIndex::persist_hook_after_install` changed from `&mut self` to
+  `&self` so `try_warm_transitions_idle` (which only holds `&self`) can call
+  it; `next_snapshot_seq` changed from `u64` to `AtomicU64` to keep
+  `VectorIndex`/`VectorStore` `Sync` (`fetch_add`, `Relaxed` — every actual
+  writer is still the single owning shard thread, so this only needs to be a
+  valid value, not a cross-thread synchronization point).
+- COLD (`SegmentList.unloaded`, the reload-on-touch stub tier) is
+  unaffected in the case that already worked (WARM→COLD idle transitions —
+  those segments were never in Stack B's `segment_ids` to begin with) and
+  loses only an accidental, undocumented side effect in the other case
+  (HOT→COLD-direct transitions used to reload as stale HOT on restart due to
+  the same leak this fixes) — it still has no dedicated restart-recovery
+  path of its own; a restart now correctly falls through to the existing
+  dedup-rescan/AOF-replay self-heal instead (same fallback as any index with
+  no durable manifest state), never silent data loss.
+- New TDD regression test (`vector::persistence::recover_v2::tests::
+  warm_transition_leak_fix_and_restart_recovery`) proves, on real
+  force-compacted on-disk state: (a) the superseded segment directory is
+  GC'd within a bounded wait, (b) a simulated restart does NOT reload it as
+  a phantom HOT segment, (c) `register_warm_segments` reattaches it as WARM,
+  and (d) post-restart search returns the identical top-1 `global_id` as the
+  pre-transition baseline — no recall regression. Verified red (fails with
+  the leak-fix call removed) before green.
+
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
 - Define Moon's native connection URI scheme in `docs/roadmap/ROADMAP.md` as a

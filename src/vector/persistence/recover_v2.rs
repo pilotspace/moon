@@ -481,12 +481,27 @@ fn load_segments_and_keymap(
         mutable,
         immutable,
         ivf: Vec::new(),
+        // WARM segments DO survive a restart, but not through this function:
+        // `VectorIndex::try_warm_transitions_idle` now calls
+        // `persist_hook_after_install` after every transition, which drops
+        // the departed segment's id from this index's Stack B `segment_ids`
+        // (so the scan above never re-discovers it here, and its now-stale
+        // `idx-<hex>/segment-<old_id>/` directory gets GC'd instead of
+        // leaking). The real restore path is Stack A: `Shard::restore_from_persistence`
+        // discovers WARM segments from the `ShardManifest` and stages them on
+        // `Shard::recovered_warm_segments`; `event_loop.rs` reattaches them via
+        // `VectorStore::register_warm_segments` right after this function's
+        // caller (`RecoveryState::finish`) returns.
         warm: Vec::new(),
-        // WS3 round 2: COLD (unloaded) segments are on-disk stubs with no
-        // restart-time restoration path today, same as WARM -- they simply
-        // don't survive a restart as stubs; the segment directories they
-        // point at are reloaded as fresh HOT/immutable segments by the scan
-        // above `loaded_segments` performs, exactly like WARM already does.
+        // COLD (unloaded) segments are on-disk stubs with no restart-time
+        // restoration path today: same leak fix as WARM drops their id from
+        // `segment_ids` too (their data lives under the identical Stack A
+        // `shard_dir/vectors/segment-<id>/` layout as WARM -- see
+        // `try_warm_transitions_idle`), but there is no Stack A discovery +
+        // reattachment step for the `unloaded` tier yet. They simply don't
+        // survive a restart as stubs or segments; the dedup rescan below
+        // re-indexes their live keys from the keyspace instead (self-healing,
+        // same fallback as any index with no durable manifest state).
         unloaded: Vec::new(),
     });
     idx.key_hash_to_key = key_hash_to_key;
@@ -848,6 +863,218 @@ mod tests {
             post_results.first().copied(),
             Some(expected_global_id),
             "post-recovery search must return the same top-1 global_id as the pre-persist baseline"
+        );
+    }
+
+    /// WARM restart-recovery hardening: proves the two paired fixes end to
+    /// end on real, force-compacted, on-disk state (not a manually
+    /// constructed segment, which cannot exercise Stack B's GC diff — it has
+    /// no `disk_segment_id`).
+    ///
+    /// (a) LEAK FIX: `VectorIndex::try_warm_transitions_idle` now calls
+    ///     `persist_hook_after_install` after every transition, so a segment
+    ///     that just left `immutable` drops out of Stack B's `segment_ids`
+    ///     too — its superseded `idx-<hex>/segment-<old_id>/` directory gets
+    ///     GC'd by the next snapshot job's manifest diff (`run_snapshot_job`)
+    ///     instead of leaking on disk forever.
+    /// (b) RESTART-WIRING FIX: `Shard::restore_from_persistence` stages
+    ///     `RecoveryResult.warm_segments` on `Shard::recovered_warm_segments`;
+    ///     `event_loop.rs` reattaches them via
+    ///     `VectorStore::register_warm_segments` right after
+    ///     `RecoveryState::finish`. This test calls the exact same two
+    ///     functions directly (no live shard/event-loop needed) to prove a
+    ///     "restart" reattaches the segment as WARM — not silently dropped,
+    ///     not reloaded as a phantom HOT copy of stale data — with identical
+    ///     recall to the pre-transition baseline.
+    #[test]
+    fn warm_transition_leak_fix_and_restart_recovery() {
+        use crate::protocol::Frame;
+
+        crate::vector::distance::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let dim = 8usize;
+
+        // ---- Build + persist ----
+        let mut store = VectorStore::new();
+        store.set_persist_dir(tmp.path().to_path_buf());
+        let meta = make_meta("idx", dim as u32, "doc:");
+        store.create_index(meta.clone()).unwrap();
+
+        let n = 12usize;
+        for i in 0..n {
+            let key = format!("doc:{i}");
+            let blob = f32_blob(dim, i as u32 + 1);
+            let args = vec![
+                Frame::BulkString(Bytes::from(key.clone())),
+                Frame::BulkString(Bytes::from_static(b"vec")),
+                Frame::BulkString(blob),
+            ];
+            let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                &mut store,
+                &mut TextStore::new(),
+                key.as_bytes(),
+                &args,
+                0,
+            );
+        }
+
+        {
+            let idx = store.get_index_mut(b"idx").unwrap();
+            idx.force_compact();
+        }
+        let idx_dir = manifest::index_persist_dir(tmp.path(), b"idx");
+        let loaded_manifest = wait_for_manifest(&idx_dir)
+            .expect("manifest must land within the timeout via global_snapshot_pool()");
+        assert_eq!(
+            loaded_manifest.segment_ids.len(),
+            1,
+            "force_compact must produce exactly 1 immutable segment"
+        );
+        let old_segment_id = loaded_manifest.segment_ids[0];
+        let old_segment_dir = idx_dir.join(format!("segment-{old_segment_id}"));
+        assert!(
+            old_segment_dir.exists(),
+            "sanity: compacted segment directory must exist on disk"
+        );
+
+        // Pre-transition search baseline (exact-match query -> itself, distance 0).
+        let query_idx = 3usize;
+        let query_key = format!("doc:{query_idx}");
+        let query_blob_bytes = f32_blob(dim, query_idx as u32 + 1);
+        let query_f32: Vec<f32> = query_blob_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let expected_global_id = {
+            let idx = store.get_index(b"idx").unwrap();
+            let kh = xxhash_rust::xxh64::xxh64(query_key.as_bytes(), 0);
+            *idx.key_hash_to_global_id.get(&kh).unwrap()
+        };
+        let pre_results = store.search_index(b"idx", &query_f32, 1, 64).unwrap();
+        assert_eq!(
+            pre_results.first().copied(),
+            Some(expected_global_id),
+            "sanity: pre-transition search must return the exact-match vector as top-1"
+        );
+
+        // ---- HOT -> WARM transition (warm_after_secs=0: everything qualifies) ----
+        // `shard_dir == tmp.path()`, matching production's disk-offload mode
+        // where Stack A's `shard_dir` and Stack B's `vector_persist_dir` are
+        // the SAME directory (see `event_loop.rs`).
+        let shard_dir = tmp.path().to_path_buf();
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut shard_manifest =
+            crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+        let transitioned = store.try_warm_transitions_all(
+            &shard_dir,
+            &mut shard_manifest,
+            0,
+            &mut next_file_id,
+            &mut None,
+        );
+        assert_eq!(transitioned, 1);
+
+        {
+            let idx = store.get_index(b"idx").unwrap();
+            let snap = idx.segments.load();
+            assert_eq!(
+                snap.immutable.len(),
+                0,
+                "segment must have left the immutable tier"
+            );
+            assert_eq!(
+                snap.warm.len(),
+                1,
+                "segment must now be resident in the warm tier"
+            );
+        }
+        // `try_warm_transitions_idle` assigns `file_id = *next_file_id` THEN
+        // increments, so the just-used id is `next_file_id - 1`.
+        let warm_file_id = next_file_id - 1;
+        let warm_segment_dir = shard_dir
+            .join("vectors")
+            .join(format!("segment-{warm_file_id}"));
+        assert!(
+            warm_segment_dir.exists(),
+            "warm_tier::transition_to_warm must have written the segment's files"
+        );
+
+        // Search must still work identically while WARM (searchable, not stale).
+        let warm_results = store.search_index(b"idx", &query_f32, 1, 64).unwrap();
+        assert_eq!(
+            warm_results.first().copied(),
+            Some(expected_global_id),
+            "search through a WARM segment must return the same top-1 as pre-transition"
+        );
+
+        // ---- (a) LEAK FIX: the superseded Stack-B directory must be GC'd ----
+        // `persist_hook_after_install` (now called from inside
+        // `try_warm_transitions_idle`) resubmits a manifest whose
+        // `segment_ids` no longer contains `old_segment_id`;
+        // `run_snapshot_job`'s diff physically removes `old_segment_dir`.
+        let gc_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !old_segment_dir.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < gc_deadline,
+                "superseded segment directory {old_segment_dir:?} was never GC'd \
+                 after the WARM transition"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let post_transition_manifest = wait_for_manifest(&idx_dir).unwrap();
+        assert!(
+            !post_transition_manifest
+                .segment_ids
+                .contains(&old_segment_id),
+            "the post-transition manifest must no longer track the superseded segment id"
+        );
+
+        // ---- (b) RESTART-WIRING FIX: simulate a restart into a FRESH store ----
+        let mut fresh = VectorStore::new();
+        fresh.set_persist_dir(tmp.path().to_path_buf());
+        let mut state = RecoveryState::new();
+        state.create_index(&mut fresh, tmp.path(), &meta);
+
+        {
+            let idx = fresh.get_index(b"idx").unwrap();
+            assert_eq!(
+                idx.segments.load().immutable.len(),
+                0,
+                "the GC'd segment must NOT be reloaded as a phantom HOT segment"
+            );
+        }
+
+        state.finish(&mut fresh, tmp.path());
+
+        // Mirrors the real recovery contract exactly: `Shard::
+        // restore_from_persistence` stashes `RecoveryResult.warm_segments`
+        // on `self.recovered_warm_segments`; `event_loop.rs` calls
+        // `register_warm_segments` right after `RecoveryState::finish`
+        // returns (never before — B3's dedup rescan must reconcile whatever
+        // Stack B *did* recover first).
+        fresh.register_warm_segments(vec![(warm_file_id, warm_segment_dir.clone())]);
+
+        {
+            let idx = fresh.get_index(b"idx").unwrap();
+            let snap = idx.segments.load();
+            assert_eq!(
+                snap.warm.len(),
+                1,
+                "the WARM segment must survive the simulated restart"
+            );
+            assert_eq!(snap.immutable.len(), 0);
+        }
+
+        let post_restart_results = fresh.search_index(b"idx", &query_f32, 1, 64).unwrap();
+        assert_eq!(
+            post_restart_results.first().copied(),
+            Some(expected_global_id),
+            "post-restart search through the reattached WARM segment must return the same \
+             top-1 global_id as the pre-transition baseline — no recall regression"
         );
     }
 

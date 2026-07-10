@@ -1044,6 +1044,31 @@ impl super::Shard {
                     recovery_state.finish(&mut s.vector_store, vdir);
                 });
             }
+
+            // Reattach WARM-tier segments Stack A's v3 recovery discovered
+            // from the manifest (`Shard::restore_from_persistence`, staged on
+            // `self.recovered_warm_segments` because that pass populates a
+            // throwaway store discarded above). Without this, WARM's RSS win
+            // evaporated on every restart: the segment was still tracked by
+            // Stack B's manifest (a `disk_segment_id` never GC'd -- see the
+            // `persist_hook_after_install` call added to
+            // `try_warm_transitions_idle`), so `RecoveryState::finish` above
+            // reloaded it as a fully-materialized HOT/immutable segment
+            // instead of a WARM one. Order matters: this must run AFTER
+            // `finish()` so B3's dedup rescan has already reconciled the
+            // keyspace against whatever Stack B *did* recover.
+            let recovered_warm_segments = std::mem::take(&mut self.recovered_warm_segments);
+            if !recovered_warm_segments.is_empty() {
+                let n = recovered_warm_segments.len();
+                crate::shard::slice::with_shard(|s| {
+                    s.vector_store
+                        .register_warm_segments(recovered_warm_segments);
+                });
+                info!(
+                    "Shard {}: reattached {} WARM vector segment(s) after restart",
+                    shard_id, n
+                );
+            }
         }
 
         // Waker relay, swept after every drain cycle. HISTORICAL NOTE: this was

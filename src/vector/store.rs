@@ -294,7 +294,18 @@ pub struct VectorIndex {
     /// doubles as the keymap epoch (`keymap-<seq>.bin`) — one counter, so
     /// there is no separate race between "job ordering" and "which keymap
     /// file is current".
-    next_snapshot_seq: u64,
+    ///
+    /// `AtomicU64`, not a plain `u64`: `persist_hook_after_install` is called
+    /// from both a `&mut self` context (compact/merge install) and a `&self`
+    /// context (`try_warm_transitions_idle`, which only holds `&self` because
+    /// its caller iterates `self.indexes.values()` — see that fn's callsite).
+    /// `VectorIndex` (via `HashMap<Bytes, VectorIndex>` inside `VectorStore`)
+    /// must stay `Sync` — see `vector_store_version_token_monotonic_concurrent`
+    /// — which rules out `Cell`; `Relaxed` ordering is enough since every
+    /// actual writer is the single owning shard thread (this only needs to be
+    /// a valid *value*, not a cross-thread synchronization point), matching
+    /// `version_token`'s existing atomic-counter pattern on `VectorStore`.
+    next_snapshot_seq: AtomicU64,
     /// Shared watermark of the highest snapshot `seq` durably committed for
     /// this index (B2). Cloned into every snapshot job; the worker holds
     /// this lock across its entire write+GC critical section so a stale job
@@ -683,7 +694,15 @@ impl VectorIndex {
     /// maps are `Arc`-wrapped with copy-on-write writers) plus a handful of
     /// scalars; the actual keymap build (iterating every live key) and all
     /// file I/O happens on the snapshot worker thread.
-    fn persist_hook_after_install(&mut self) {
+    ///
+    /// `&self`, not `&mut self` (see `next_snapshot_seq`'s doc comment): also
+    /// called from `try_warm_transitions_idle`, which only has shared access.
+    /// Rebuilding `segment_ids` from `snap.immutable` alone (never
+    /// `snap.warm`) is what drives the WARM-transition leak fix — once a
+    /// segment moves to `snap.warm` it drops out of this list, so the next
+    /// snapshot job's manifest diff GCs its now-superseded
+    /// `idx-<hex>/segment-<old_id>/` directory (see `run_snapshot_job`).
+    fn persist_hook_after_install(&self) {
         let Some(dir) = self.persist_dir.clone() else {
             return;
         };
@@ -698,8 +717,7 @@ impl VectorIndex {
         let next_global_id = snap.mutable.next_global_id();
         drop(snap);
 
-        self.next_snapshot_seq += 1;
-        let seq = self.next_snapshot_seq;
+        let seq = self.next_snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1;
 
         let manifest = crate::vector::persistence::manifest::IndexManifest {
             format_version: crate::vector::persistence::manifest::MANIFEST_FORMAT_VERSION,
@@ -1460,6 +1478,17 @@ impl VectorIndex {
                 ..(**snapshot).clone()
             };
             self.segments.swap(new_list);
+
+            // Leak fix (WARM restart-recovery hardening): a segment that
+            // just left `immutable` (moved to `warm` or `unloaded`) must
+            // drop out of Stack B's durable `segment_ids` too, or its old
+            // `idx-<hex>/segment-<old_id>/` directory is never GC'd (it
+            // sits there forever — see `run_snapshot_job`'s manifest diff)
+            // and a future restart would reload it as a fully-materialized
+            // HOT segment instead of respecting the WARM/COLD tier it was
+            // just moved to. Cheap + a no-op when `persist_dir` is unset
+            // (disk-offload/persistence both off).
+            self.persist_hook_after_install();
         }
         transitioned
     }
@@ -1682,7 +1711,7 @@ impl VectorStore {
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: floor_next_segment_id,
-                next_snapshot_seq: floor_next_snapshot_seq,
+                next_snapshot_seq: AtomicU64::new(floor_next_snapshot_seq),
                 persist_seq_watermark: Arc::new(parking_lot::Mutex::new(floor_next_snapshot_seq)),
                 autocompact_enabled: true,
                 merge_recall_tolerance: 0.70,
@@ -1810,7 +1839,7 @@ impl VectorStore {
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: manifest.next_segment_id,
-                next_snapshot_seq: manifest.keymap_epoch,
+                next_snapshot_seq: AtomicU64::new(manifest.keymap_epoch),
                 persist_seq_watermark: Arc::new(parking_lot::Mutex::new(manifest.keymap_epoch)),
                 autocompact_enabled: true,
                 merge_recall_tolerance: 0.70,
