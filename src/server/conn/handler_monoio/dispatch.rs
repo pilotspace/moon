@@ -854,6 +854,14 @@ pub(super) fn try_handle_client_admin(
     }
     if let Some(sub) = cmd_args.first() {
         if let Some(sub_bytes) = extract_bytes(sub) {
+            // TRACKING is owned by `try_handle_client_tracking`, which runs
+            // AFTER this handler in the frame loop (both are post-ACL). The
+            // unknown-subcommand fallback below must not swallow it — that
+            // regression (H-3 reorder, #258) made CLIENT TRACKING answer
+            // "unknown subcommand" on the entire monoio runtime.
+            if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+                return false;
+            }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
                 crate::client_registry::update(client_id, |e| {
                     e.live.touch(
