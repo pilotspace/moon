@@ -521,7 +521,10 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 /// truncated buffer, an unknown key, or any parse hiccup — the RDB loader
 /// proper is where malformed data gets reported.
 pub fn read_moon_aux(data: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 9 || &data[..5] != REDIS_RDB_MAGIC {
+    // Version bytes are checked too (matching `load_rdb`): the fixed
+    // `set_position(9)` below is only valid for a 4-byte version field, and a
+    // foreign version would silently misalign the opcode walk.
+    if data.len() < 9 || &data[..5] != REDIS_RDB_MAGIC || &data[5..9] != REDIS_RDB_VERSION {
         return None;
     }
     let mut cursor = Cursor::new(data);

@@ -238,6 +238,18 @@ impl OffsetHandle {
     pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
         let _ = self.issue_lsn(shard_id, delta);
     }
+
+    /// Current offset of one shard. Used by the `RegisterReplica` reply to
+    /// tell the PSYNC task exactly where live fan-out begins, so its backlog
+    /// catch-up read covers `[snapshot_offset, this)` with no gap and no
+    /// overlap.
+    #[inline]
+    pub fn shard_offset(&self, shard_id: usize) -> u64 {
+        self.shard_offsets
+            .get(shard_id)
+            .map(|o| o.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
 }
 
 const ZEROED_ID: &str = "0000000000000000000000000000000000000000";

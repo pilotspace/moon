@@ -2476,6 +2476,7 @@ pub(crate) fn handle_shard_message_shared(
             replica_id,
             tx,
             backlog_capacity,
+            registered,
         } => {
             // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
             // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
@@ -2489,6 +2490,18 @@ pub(crate) fn handle_shard_message_shared(
             }
             drop(guard);
             replica_txs.push((replica_id, tx));
+            // Reply with the offset at which live fan-out begins. This runs
+            // synchronously between drains, so every fanout message queued
+            // BEFORE this registration has already advanced the offset, and
+            // every one after it will reach `tx` — the PSYNC task's catch-up
+            // read below this offset is therefore gap-free and overlap-free.
+            if let Some(reg_tx) = registered {
+                let offset = repl_state
+                    .as_ref()
+                    .map(|h| h.shard_offset(shard_id))
+                    .unwrap_or(0);
+                let _ = reg_tx.send(offset);
+            }
         }
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);

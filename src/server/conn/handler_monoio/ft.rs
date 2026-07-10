@@ -27,6 +27,22 @@ fn is_replicated_ft_def_mutation(cmd: &[u8], cmd_args: &[Frame]) -> bool {
     false
 }
 
+/// True once the replication plane has anything to feed: a registered replica
+/// or an allocated backlog (a PSYNC handshake allocates the backlog before any
+/// snapshot is captured, so an FT.* mutation racing a first-ever attach still
+/// fans out). Gates the serialize+SPSC round trip so servers that never
+/// replicate pay nothing — mirrors `wal_fanout_has_work` on the KV path.
+fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
+    ctx.repl_state.as_ref().is_some_and(|rs| {
+        rs.read().is_ok_and(|g| {
+            !g.replicas.is_empty()
+                || g.per_shard_backlogs
+                    .first()
+                    .is_some_and(|slot| slot.lock().is_some())
+        })
+    })
+}
+
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.
@@ -786,7 +802,10 @@ pub(super) async fn try_handle_ft_command(
         // reconstruction. Single-shard only (multi-shard FT.* replication
         // rides the R2 broadcast redesign). The replica applies it through
         // the same ft_create/ft_dropindex/ft_config handlers.
-        if !matches!(response, Frame::Error(_)) && is_replicated_ft_def_mutation(cmd, cmd_args) {
+        if !matches!(response, Frame::Error(_))
+            && is_replicated_ft_def_mutation(cmd, cmd_args)
+            && replication_fanout_active(ctx)
+        {
             use ringbuf::traits::Producer;
             let serialized = crate::persistence::aof::serialize_command(frame);
             let mut producers = ctx.dispatch_tx.borrow_mut();

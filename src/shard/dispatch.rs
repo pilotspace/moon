@@ -462,6 +462,14 @@ pub enum ShardMessage {
         replica_id: u64,
         tx: channel::MpscSender<bytes::Bytes>,
         backlog_capacity: usize,
+        /// When set, the event loop replies with the shard's replication
+        /// offset AT registration — the exact point where live fan-out to
+        /// `tx` begins. The PSYNC task sends backlog catch-up bytes strictly
+        /// below this offset, closing the race where a write drained between
+        /// the catch-up read and registration reached neither leg (silent
+        /// replica gap). `None` = legacy fire-and-forget registration (the
+        /// multi-shard paths, redesigned in R2).
+        registered: Option<channel::MpscSender<u64>>,
     },
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.

@@ -442,6 +442,10 @@ async fn register_replica_with_shards(
                 replica_id,
                 tx,
                 backlog_capacity,
+                // Fire-and-forget: the multi-shard register paths are superseded
+                // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
+                // protocol is wired on the single-shard inline path only.
+                registered: None,
             };
             let _ = prod.try_push(msg);
         }
@@ -529,6 +533,10 @@ async fn register_replica_with_shards(
                 replica_id,
                 tx,
                 backlog_capacity,
+                // Fire-and-forget: the multi-shard register paths are superseded
+                // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
+                // protocol is wired on the single-shard inline path only.
+                registered: None,
             };
             let _ = prod.try_push(msg);
         }
@@ -599,7 +607,10 @@ pub async fn handle_psync_inline_single_shard(
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
 
-    let (repl_id, repl_id2, current_offset, backlog_slot) = {
+    // The snapshot offset is NOT read here: FullResync re-reads it inside the
+    // same synchronous stretch as the RDB capture (see below) so no write can
+    // slip between the two.
+    let (repl_id, repl_id2, backlog_slot) = {
         let rs = repl_state
             .read()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
@@ -608,12 +619,7 @@ pub async fn handle_psync_inline_single_shard(
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("backlog slot missing"))?;
-        (
-            rs.repl_id.clone(),
-            rs.repl_id2.clone(),
-            rs.total_offset(),
-            slot,
-        )
+        (rs.repl_id.clone(), rs.repl_id2.clone(), slot)
     };
 
     // Decide full vs partial resync against the single-shard backlog.
@@ -633,17 +639,24 @@ pub async fn handle_psync_inline_single_shard(
 
     match decision {
         PsyncDecision::FullResync => {
-            let snapshot_offset = current_offset;
-            let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);
-            let (wr, _) = stream.write_all(response.into_bytes()).await;
-            wr.map_err(|e| anyhow::anyhow!(e))?;
-
-            // Generate RDB inline by reading all databases on shard 0.
+            // Snapshot-offset read and RDB capture share ONE synchronous
+            // stretch (no `.await` between them): tasks on this thread are
+            // cooperatively scheduled, so nothing can advance the offset or
+            // mutate the keyspace in between. Reading the offset at fn entry
+            // (before the FULLRESYNC line was written) let a write land both
+            // inside the RDB AND above snapshot_offset — re-delivered via
+            // catch-up, double-applying non-idempotent commands (INCR).
+            //
+            // The RDB is generated inline by reading all databases on shard 0.
             // Hold read guards across the synchronous write to avoid any
             // Clone requirement on Database (the type intentionally is not
             // Clone — its internal DashTable + FT/graph indices are large).
             let mut rdb_buf: Vec<u8> = Vec::new();
-            {
+            let snapshot_offset = {
+                let off = repl_state
+                    .read()
+                    .map(|g| g.total_offset())
+                    .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
                 // Shard 0 is this thread's shard — use the thread-local slice.
                 crate::shard::slice::with_shard(|s| {
                     let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
@@ -686,7 +699,11 @@ pub async fn handle_psync_inline_single_shard(
                         &mut rdb_buf,
                     );
                 });
-            }
+                off
+            };
+            let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);
+            let (wr, _) = stream.write_all(response.into_bytes()).await;
+            wr.map_err(|e| anyhow::anyhow!(e))?;
             let header = format!("${}\r\n", rdb_buf.len());
             let (wr, _) = stream.write_all(header.into_bytes()).await;
             wr.map_err(|e| anyhow::anyhow!(e))?;
@@ -696,15 +713,22 @@ pub async fn handle_psync_inline_single_shard(
             // string with \r\n during diskless full resync; the next bytes are
             // backlog/replication stream. Match that wire format.
 
-            // Stream any backlog bytes appended between snapshot capture and now.
-            if let Some(bytes) = backlog_bytes_from(&backlog_slot, snapshot_offset) {
-                if !bytes.is_empty() {
-                    let (wr, _) = stream.write_all(bytes).await;
-                    wr.map_err(|e| anyhow::anyhow!(e))?;
-                }
-            }
+            // Register FIRST, then catch up to exactly the registration
+            // offset. The event loop replies with the offset at which live
+            // fan-out to this replica begins; every byte below it comes from
+            // the backlog read, every byte at or above it arrives on the
+            // replica channel. Reading the backlog BEFORE registering (the
+            // old order) left a window where a write drained in between
+            // reached neither leg — a silent, unlogged replica gap.
+            let reg = push_register_replica_inline(&repl_state, &dispatch_tx)?;
+            let reg_offset = reg
+                .reg_rx
+                .recv_async()
+                .await
+                .map_err(|_| anyhow::anyhow!("event loop dropped registration reply"))?;
+            send_backlog_range(&mut stream, &backlog_slot, snapshot_offset, reg_offset).await?;
 
-            register_replica_inline_single_shard(replica_addr, stream, repl_state, dispatch_tx)
+            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state, dispatch_tx)
                 .await?;
         }
         PsyncDecision::PartialResync { from_offset } => {
@@ -712,35 +736,87 @@ pub async fn handle_psync_inline_single_shard(
             let (wr, _) = stream.write_all(response.into_bytes()).await;
             wr.map_err(|e| anyhow::anyhow!(e))?;
 
-            if let Some(bytes) = backlog_bytes_from(&backlog_slot, from_offset) {
-                if !bytes.is_empty() {
-                    let (wr, _) = stream.write_all(bytes).await;
-                    wr.map_err(|e| anyhow::anyhow!(e))?;
-                }
-            }
-            register_replica_inline_single_shard(replica_addr, stream, repl_state, dispatch_tx)
+            // Same register-then-catch-up ordering as the FullResync arm.
+            let reg = push_register_replica_inline(&repl_state, &dispatch_tx)?;
+            let reg_offset = reg
+                .reg_rx
+                .recv_async()
+                .await
+                .map_err(|_| anyhow::anyhow!("event loop dropped registration reply"))?;
+            send_backlog_range(&mut stream, &backlog_slot, from_offset, reg_offset).await?;
+
+            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state, dispatch_tx)
                 .await?;
         }
     }
     Ok(())
 }
 
-/// Single-shard inline replica registration.
-///
-/// Creates an MPSC channel, pushes `RegisterReplica` onto shard 0's SPSC
-/// producer so the event loop picks up the tx into its local `replica_txs`
-/// (the authority for live write fan-out), and also records the replica in
-/// `ReplicationState.replicas` for WAIT / INFO bookkeeping. Then drains the
-/// channel onto the replica's socket until the peer disconnects.
+/// Send backlog bytes `[from, to)` to the replica, or fail LOUDLY if the
+/// backlog can no longer serve that range (evicted mid-sync). Aborting drops
+/// the connection so the replica retries with a fresh full resync — strictly
+/// better than the silent gap the old `if let Some(...)` skip produced.
 #[cfg(feature = "runtime-monoio")]
-#[allow(clippy::await_holding_refcell_ref)]
-async fn register_replica_inline_single_shard(
-    addr: std::net::SocketAddr,
-    stream: monoio::net::TcpStream,
-    repl_state: Arc<RwLock<ReplicationState>>,
-    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
+async fn send_backlog_range(
+    stream: &mut monoio::net::TcpStream,
+    backlog_slot: &SharedBacklog,
+    from: u64,
+    to: u64,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
+
+    if to <= from {
+        return Ok(());
+    }
+    let need = (to - from) as usize;
+    let bytes = backlog_bytes_from(backlog_slot, from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "replication backlog evicted during catch-up ({}..{}); aborting sync so the \
+             replica retries a fresh full resync",
+            from,
+            to
+        )
+    })?;
+    if bytes.len() < need {
+        // The event loop appended [from, to) before replying with `to`, so a
+        // shorter read means the head of the range was evicted.
+        anyhow::bail!(
+            "replication backlog short read during catch-up (have {} bytes, need {}); \
+             aborting sync so the replica retries a fresh full resync",
+            bytes.len(),
+            need
+        );
+    }
+    // Bytes past `to` are already queued on the replica channel by live
+    // fan-out — truncate to avoid delivering them twice.
+    let (wr, _) = stream.write_all(bytes[..need].to_vec()).await;
+    wr.map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+/// Everything the PSYNC task holds between pushing `RegisterReplica` and
+/// draining the replica channel: the id, the receive half of the live
+/// fan-out channel, its keep-alive tx (for WAIT/INFO bookkeeping), and the
+/// registration-offset reply receiver.
+#[cfg(feature = "runtime-monoio")]
+struct InlineReplicaRegistration {
+    replica_id: u64,
+    tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
+    rx: crate::runtime::channel::MpscReceiver<bytes::Bytes>,
+    reg_rx: crate::runtime::channel::MpscReceiver<u64>,
+}
+
+/// Push `RegisterReplica` onto shard 0's SPSC so the event loop captures the
+/// tx into its local `replica_txs` Vec — the sole authority used by
+/// `wal_append_and_fanout` for live write streaming. The message carries a
+/// reply channel; the event loop answers with the shard offset at which live
+/// fan-out begins, which the caller uses to bound its backlog catch-up read
+/// (see `handle_psync_inline_single_shard`).
+#[cfg(feature = "runtime-monoio")]
+fn push_register_replica_inline(
+    repl_state: &Arc<RwLock<ReplicationState>>,
+    dispatch_tx: &Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
+) -> anyhow::Result<InlineReplicaRegistration> {
     use ringbuf::traits::Producer;
     use std::sync::atomic::Ordering;
 
@@ -748,32 +824,58 @@ async fn register_replica_inline_single_shard(
     let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
 
     let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(1024);
+    let (reg_tx, reg_rx) = crate::runtime::channel::mpsc_bounded::<u64>(1);
 
-    // Push RegisterReplica onto shard 0's SPSC so the event loop captures the
-    // tx into its local replica_txs Vec — the sole authority used by
-    // wal_append_and_fanout for live write streaming.
-    {
-        // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
-        let backlog_capacity = repl_state
-            .read()
-            .map(|g| g.backlog_capacity)
-            .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
-        let mut prods = dispatch_tx.borrow_mut();
-        if let Some(prod) = prods.get_mut(0) {
-            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
-                replica_id,
-                tx: tx.clone(),
-                backlog_capacity,
-            };
-            if prod.try_push(msg).is_err() {
-                anyhow::bail!("failed to push RegisterReplica onto shard 0 SPSC");
-            }
-        } else {
-            anyhow::bail!("shard 0 producer missing");
+    // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
+    let backlog_capacity = repl_state
+        .read()
+        .map(|g| g.backlog_capacity)
+        .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
+    let mut prods = dispatch_tx.borrow_mut();
+    if let Some(prod) = prods.get_mut(0) {
+        let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
+            replica_id,
+            tx: tx.clone(),
+            backlog_capacity,
+            registered: Some(reg_tx),
+        };
+        if prod.try_push(msg).is_err() {
+            anyhow::bail!("failed to push RegisterReplica onto shard 0 SPSC");
         }
+    } else {
+        anyhow::bail!("shard 0 producer missing");
     }
+    Ok(InlineReplicaRegistration {
+        replica_id,
+        tx,
+        rx,
+        reg_rx,
+    })
+}
 
-    // Also bookkeeping for WAIT/INFO.
+/// Single-shard inline replica drain: record the replica in
+/// `ReplicationState.replicas` for WAIT / INFO bookkeeping, then pump the
+/// live fan-out channel onto the replica's socket until the peer disconnects.
+#[cfg(feature = "runtime-monoio")]
+#[allow(clippy::await_holding_refcell_ref)]
+async fn drain_replica_inline_single_shard(
+    reg: InlineReplicaRegistration,
+    addr: std::net::SocketAddr,
+    stream: monoio::net::TcpStream,
+    repl_state: Arc<RwLock<ReplicationState>>,
+    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
+) -> anyhow::Result<()> {
+    use monoio::io::AsyncWriteRentExt;
+    use ringbuf::traits::Producer;
+
+    let InlineReplicaRegistration {
+        replica_id,
+        tx,
+        rx,
+        reg_rx: _,
+    } = reg;
+
+    // Bookkeeping for WAIT/INFO.
     let replica_info = ReplicaInfo {
         id: replica_id,
         addr,

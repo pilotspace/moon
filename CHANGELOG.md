@@ -20,6 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Fixed — PSYNC attach races closed (adversarial-review findings on R0/R0.5)
+
+- **Registration-bounded catch-up:** the master now registers the replica with
+  the event loop BEFORE reading backlog catch-up bytes, and the event loop
+  replies with the exact offset where live fan-out begins
+  (`RegisterReplica.registered` reply channel). Catch-up sends exactly
+  `[snapshot_offset, registration_offset)` — previously a write drained
+  between the catch-up read and registration reached neither the RDB, the
+  catch-up, nor the live stream: a silent, unlogged replica gap (worst for
+  FT.* def mutations, whose fanout always crosses the SPSC queue).
+- **Atomic snapshot capture:** the FULLRESYNC snapshot offset is read in the
+  same synchronous stretch as the RDB capture (no `.await` between), closing
+  the inverse race where a write landed inside the RDB *and* above the
+  advertised offset — double-applying non-idempotent commands (INCR) on the
+  replica.
+- **Backlog eviction during catch-up now aborts the sync loudly** (replica
+  retries a fresh full resync) instead of silently skipping the missing bytes.
+- A replica whose full resync carries NO index definitions (pre-R0.5 master
+  or def-serialization failure) now logs a warning when the authoritative
+  replace drops local indexes with no replacement.
+- New race-guard e2e `replica_attach_races_live_ft_create` (30 FT.CREATEs
+  racing a mid-stream attach, exact index-list parity required).
+- Hygiene: `read_moon_aux` validates RDB version bytes like `load_rdb`; the
+  FT.* fanout hook skips the serialize+SPSC round trip until a replica or
+  backlog exists.
+
 ### Added — vector/text index-plane replication sync (v0.7 R0.5)
 
 - **Before this change a replica synchronized only the KV keyspace** — FT index

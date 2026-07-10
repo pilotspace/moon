@@ -519,3 +519,91 @@ fn replica_syncs_vector_index_defs_and_contents() {
         "FLUSHALL must keep index definitions on the replica: {list_after_flush}"
     );
 }
+
+/// REPL-STREAM-03 (C1 regression guard): FT.CREATE traffic racing a replica
+/// attach must never lose a definition. The master's PSYNC path registers the
+/// replica BEFORE the backlog catch-up read and bounds that read to the
+/// registration offset; before that fix, a def-mutation drained between the
+/// catch-up read and registration reached neither the RDB, the catch-up, nor
+/// the live stream — a silent gap. This test hammers FT.CREATE from a side
+/// thread while the replica attaches mid-stream, then requires exact
+/// index-list parity. Probabilistic per run, deterministic across CI history:
+/// any hit is a real ordering regression.
+#[test]
+#[ignore]
+fn replica_attach_races_live_ft_create() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16720";
+    let replica_addr = "127.0.0.1:16721";
+
+    let _master = Killer(start_moon(16720, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+
+    // Side thread: create rc_idx_0..rc_idx_29 with tiny gaps so creations
+    // interleave with every phase of the attach (handshake, RDB write,
+    // catch-up, registration).
+    const N: usize = 30;
+    let writer = std::thread::spawn(move || {
+        for i in 0..N {
+            let name = format!("rc_idx_{i}");
+            let prefix = format!("rc{i}:");
+            let created = send_resp(
+                "127.0.0.1:16720",
+                &[
+                    b"FT.CREATE",
+                    name.as_bytes(),
+                    b"ON",
+                    b"HASH",
+                    b"PREFIX",
+                    b"1",
+                    prefix.as_bytes(),
+                    b"SCHEMA",
+                    b"vec",
+                    b"VECTOR",
+                    b"HNSW",
+                    b"6",
+                    b"DIM",
+                    b"4",
+                    b"TYPE",
+                    b"FLOAT32",
+                    b"DISTANCE_METRIC",
+                    b"L2",
+                ],
+            );
+            assert!(created.contains("OK"), "FT.CREATE {name} failed: {created}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    // Attach the replica mid-stream (~1/4 of the creations done).
+    std::thread::sleep(Duration::from_millis(150));
+    let _replica = Killer(start_moon(16721, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    let attach = send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16720");
+    assert!(attach.starts_with("+OK"), "REPLICAOF failed: {attach}");
+
+    writer.join().expect("FT.CREATE writer thread panicked");
+
+    // Every index the master knows must reach the replica — via RDB aux,
+    // catch-up, or live stream; which leg is timing-dependent, parity is not.
+    let synced = wait_until(Duration::from_secs(15), || {
+        let list = send_resp(replica_addr, &[b"FT._LIST"]);
+        (0..N).all(|i| list.contains(&format!("rc_idx_{i}")))
+    });
+    let master_list = send_resp(master_addr, &[b"FT._LIST"]);
+    let replica_list = send_resp(replica_addr, &[b"FT._LIST"]);
+    assert!(
+        synced,
+        "replica lost FT.CREATE(s) during attach race.\nmaster:  {master_list}\nreplica: {replica_list}"
+    );
+}

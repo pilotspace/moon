@@ -387,11 +387,30 @@ fn install_snapshot_index_defs(
     text_defs: Option<&[u8]>,
 ) {
     let names: Vec<bytes::Bytes> = s.vector_store.index_names().into_iter().cloned().collect();
+    let local_text_names = s.text_store.index_names();
+    let (local_vec, local_text) = (names.len(), local_text_names.len());
     for n in &names {
         s.vector_store.drop_index(n);
     }
-    for n in s.text_store.index_names() {
+    for n in local_text_names {
         s.text_store.drop_index(&n);
+    }
+    // The authoritative drop above is silent when the master streams no defs
+    // at all (pre-R0.5 master, or def serialization failed) — but wiping a
+    // replica's local indexes with zero replacement is exactly the scenario an
+    // operator needs to hear about (mixed-version rolling upgrade, REPLICAOF
+    // pointed at the wrong host).
+    if vec_defs.is_none() && text_defs.is_none() {
+        if local_vec + local_text > 0 {
+            tracing::warn!(
+                "replica full resync: dropped {} local vector and {} local text index(es); \
+                 the master's snapshot carried NO index definitions (pre-R0.5 master or \
+                 def-serialization failure) — FT indexes are gone on this replica",
+                local_vec,
+                local_text
+            );
+        }
+        return;
     }
 
     // (db_index, key_prefix) pairs feeding the backfill scan below.
