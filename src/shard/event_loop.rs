@@ -909,6 +909,56 @@ impl super::Shard {
                 });
             }
 
+            // Reattach WARM-tier segments Stack A's v3 recovery discovered
+            // from the manifest (`Shard::restore_from_persistence`, staged on
+            // `self.recovered_warm_segments` because that pass populates a
+            // throwaway store discarded above). Without this, WARM's RSS win
+            // evaporated on every restart: the segment was still tracked by
+            // Stack B's manifest (a `disk_segment_id` never GC'd -- see the
+            // `persist_hook_after_install` call added to
+            // `try_warm_transitions_idle`), so `RecoveryState::finish` below
+            // reloaded it as a fully-materialized HOT/immutable segment
+            // instead of a WARM one.
+            //
+            // Ordering (PR review round 2, commit 4): this MUST run right
+            // here — after all `create_index` calls above (ownership
+            // decisions need every sidecar index to already exist), but
+            // BEFORE the keyspace dedup rescan below. Running it after
+            // `RecoveryState::finish()` (an earlier revision did) let the
+            // rescan see every WARM key as unknown — `key_hash_to_key`/
+            // `key_hash_to_global_id` are the only things `reconcile_key`
+            // consults, and `load_segments_and_keymap` never populates them
+            // for WARM keys (see `recover_v2`'s `segment_resident` gate) —
+            // forcing a full re-encode into the mutable segment for every
+            // WARM doc on every normal restart; the duplication check in
+            // `register_warm_segments` then saw those just-re-indexed keys
+            // as "already covered" and retired (deleted) the WARM segment.
+            // See `VectorStore::register_warm_segments`'s own docs for the
+            // full ordering rationale and the keymap-population fix.
+            let recovered_warm_segments = std::mem::take(&mut self.recovered_warm_segments);
+            if !recovered_warm_segments.is_empty() {
+                let n = recovered_warm_segments.len();
+                crate::shard::slice::with_shard(|s| {
+                    s.vector_store
+                        .register_warm_segments(recovered_warm_segments);
+                });
+                info!(
+                    "Shard {}: reattached {} WARM vector segment(s) after restart",
+                    shard_id, n
+                );
+            }
+
+            // Phase 1.5: snapshot the deletion-probe baseline now that both
+            // Stack B's HOT/immutable load (`create_index`, above) AND WARM
+            // reattachment (just above) have settled — see
+            // `RecoveryState::snapshot_recovered_baseline`'s docs for why
+            // this can't happen any earlier without silently excluding
+            // every WARM key from `finish()`'s deletion probe. Must run
+            // before the rescan loop below (phase 2).
+            crate::shard::slice::with_shard(|s| {
+                recovery_state.snapshot_recovered_baseline(&s.vector_store);
+            });
+
             // Restore text indexes from sidecar metadata.
             #[cfg(feature = "text-index")]
             if let Some(ref text_metas) = text_metas {
@@ -1043,31 +1093,6 @@ impl super::Shard {
                 crate::shard::slice::with_shard(|s| {
                     recovery_state.finish(&mut s.vector_store, vdir);
                 });
-            }
-
-            // Reattach WARM-tier segments Stack A's v3 recovery discovered
-            // from the manifest (`Shard::restore_from_persistence`, staged on
-            // `self.recovered_warm_segments` because that pass populates a
-            // throwaway store discarded above). Without this, WARM's RSS win
-            // evaporated on every restart: the segment was still tracked by
-            // Stack B's manifest (a `disk_segment_id` never GC'd -- see the
-            // `persist_hook_after_install` call added to
-            // `try_warm_transitions_idle`), so `RecoveryState::finish` above
-            // reloaded it as a fully-materialized HOT/immutable segment
-            // instead of a WARM one. Order matters: this must run AFTER
-            // `finish()` so B3's dedup rescan has already reconciled the
-            // keyspace against whatever Stack B *did* recover.
-            let recovered_warm_segments = std::mem::take(&mut self.recovered_warm_segments);
-            if !recovered_warm_segments.is_empty() {
-                let n = recovered_warm_segments.len();
-                crate::shard::slice::with_shard(|s| {
-                    s.vector_store
-                        .register_warm_segments(recovered_warm_segments);
-                });
-                info!(
-                    "Shard {}: reattached {} WARM vector segment(s) after restart",
-                    shard_id, n
-                );
             }
         }
 

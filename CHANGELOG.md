@@ -316,6 +316,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix satisfies) against the prior "first successful `from_files`"
   implementation before green.
 
+### Fixed — Vector: WARM restart recovery was still defeated on every NORMAL restart (not just a crash) by call-site ordering
+
+- **CRITICAL — round 2 of hand-review found the previous fix's own wiring re-triggered its own duplication check.** The full production B3 sequence is `create_index` -> keyspace dedup rescan (`reconcile_key`, once per matching HASH key) -> `finish` -> `register_warm_segments`. `load_segments_and_keymap` never populates `key_hash_to_key`/`key_hash_to_global_id` for WARM keys (see its `segment_resident` gate — nothing has attached the WARM segment to `idx.segments` yet at that point in `create_index`), so with `register_warm_segments` running LAST, the rescan saw every WARM key as unknown and re-encoded it into the mutable segment (full HNSW/TQ rebuild, not just metadata) on every boot. The duplication check added in the previous fix then saw those just-re-indexed keys as "already covered by a live HOT copy" and retired (permanently deleted) the WARM segment — the exact failure this feature exists to prevent, triggered by the fix's own ordering, on every normal restart. Fixed: `VectorStore::register_warm_segments` now runs immediately after the sidecar `create_index` loop, BEFORE the keyspace rescan (`event_loop.rs`) — ownership decisions only need every sidecar index to already exist, which they do by then.
+- **On a clean attach, `register_warm_segments` now populates `key_hash_to_key`/`key_hash_to_global_id`/`key_hash_to_vec_checksum`** for the segment's keys, sourced from the same owner-evidence persisted-keymap entries already read for the ownership decision (no extra disk read). This is what lets the rescan (which runs right after) see the keys as known/checksum-unchanged instead of re-encoding them, and lets `FT.SEARCH` resolve a WARM doc's real key bytes via `key_hash_to_key` (the exact map `resolve_hybrid_doc_key` consults) instead of falling through to a synthetic `vec:<id>`. A segment key_hash absent from the owner's persisted keymap (an earlier async-snapshot job never committed for it — the same class of race as the crash-before-GC finding, at per-key rather than per-segment granularity) is left out of the maps, so the rescan self-heals it into mutable, and is tombstoned in the warm copy for that one key_hash (`WarmSearchSegment::seed_tombstones`) so the stale warm copy and the freshly re-indexed mutable copy never coexist as live duplicates.
+- **`RecoveryState`'s deletion-probe baseline moved to a new explicit phase, `snapshot_recovered_baseline`.** Previously `create_index` snapshotted the baseline immediately (before any WARM segment existed in-memory), which — now that `register_warm_segments` populates WARM keys into `key_hash_to_key` — would have permanently excluded every WARM key from `finish()`'s deletion probe: a WARM key whose underlying HASH was deleted while the server was down would never be recognized as "used to exist, now doesn't," and would silently survive as a stale search hit forever. `event_loop.rs` now calls `snapshot_recovered_baseline` once, after BOTH `create_index` (all indexes) AND `register_warm_segments` have settled, and before the keyspace rescan begins — the baseline is then complete for the deletion probe to catch a delete-while-down WARM key too (`VectorIndex::mark_deleted_for_key_in_index` already tombstones across every tier including WARM, so once the probe fires the fix is mechanical).
+- New TDD integration-level regression test,
+  `vector::persistence::recover_v2::tests::warm_tests::warm_recovery_full_production_sequence_matches_real_boot_order`,
+  drives the FULL real sequence in order (`create_index` -> `register_warm_segments`
+  -> keyspace rescan, replaying every key except one to simulate a delete-while-down
+  -> `finish`) and asserts: (a) the WARM segment attaches and is not retired, (b) every
+  still-live WARM key is counted `verified_unchanged` (0 `re_indexed`, nothing lands in
+  the mutable segment), (c) search resolves the ORIGINAL key bytes for a WARM doc via
+  `key_hash_to_key` (not `vec:<id>`), (d) no duplicate `key_hash` across results, (e) the
+  delete-while-down key is tombstoned by the deletion probe and absent from search.
+  Verified red by hand (temporarily moving `register_warm_segments` back to run after
+  the rescan/`finish`, matching the prior ordering): (a) fails first — the WARM segment
+  is retired as a false-positive duplicate (`warm.len() == 0`) instead of attaching,
+  which also makes (b)/(c) unreachable. The three existing WARM tests from the previous
+  fix (`warm_transition_leak_fix_and_restart_recovery`,
+  `warm_reattach_dedups_against_crash_before_gc_race`,
+  `warm_reattach_picks_correct_index_among_same_dim_indexes`) and one pre-existing
+  deletion-probe test (`recover_finish_tombstones_keys_missing_from_rescan`) were
+  updated to call `register_warm_segments`/`snapshot_recovered_baseline` in the new
+  production order so they keep testing real behavior instead of a now-stale sequence;
+  two of them needed a full keyspace-rescan replay added (previously implicit/absent)
+  to avoid the deletion probe wrongly tombstoning their now-baseline-visible WARM keys.
+  `crash_recovery_vector_durability.rs`'s six real-server-spawning scenarios (`s1`-`s6`)
+  were re-run against a release-fast build as an additional non-WARM regression check
+  on the reordered `event_loop.rs` sequence — all pass unchanged.
+- `vector::persistence::recover_v2`'s test module, having grown past the 1500-line file
+  size guideline with these additions, was split: `recover_v2_tests.rs` keeps the
+  non-WARM B3 recovery tests + shared helpers, and a new nested
+  `recover_v2_warm_tests.rs` (`#[path]`-included as `mod warm_tests` from within
+  `recover_v2_tests.rs`) holds all WARM-specific tests.
+
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
 - Define Moon's native connection URI scheme in `docs/roadmap/ROADMAP.md` as a

@@ -2443,8 +2443,18 @@ impl VectorStore {
     /// Register warm segments recovered from disk into the appropriate indexes.
     ///
     /// Called during shard restore after v3 recovery identifies warm-tier segments
-    /// in the manifest (`Shard::recovered_warm_segments`, staged after
-    /// `RecoveryState::finish`).
+    /// in the manifest (`Shard::recovered_warm_segments`, staged after Stack A's
+    /// `restore_from_persistence`). **Ordering (PR review round 2, commit 4):**
+    /// this MUST run right after the sidecar `create_index` loop, BEFORE the
+    /// keyspace dedup rescan (`RecoveryState::reconcile_key`) — see
+    /// `event_loop.rs`. Running it after the rescan (as an earlier revision
+    /// did) let the rescan observe warm keys as "unknown" (never loaded into
+    /// `key_hash_to_key`/`key_hash_to_global_id` here — see point 2 below),
+    /// forcing a full re-encode into the mutable segment; that re-encode then
+    /// made the duplication check below see the just-re-indexed keys as
+    /// "already covered" and RETIRE the warm segment, permanently deleting
+    /// it and re-quantizing its vectors — the exact failure this feature
+    /// exists to prevent, on every normal restart, not just a crash.
     ///
     /// Two evidence-based safety checks guard every segment, both keyed off
     /// its own `key_hash` set (read cheaply from `mvcc.mpf` via
@@ -2479,7 +2489,26 @@ impl VectorStore {
     ///    `key_hash_to_key` (i.e. what Stack B actually recovered) already
     ///    covers this segment's key_hashes, the HOT copy wins: skip
     ///    attaching the warm copy and retire its on-disk files instead.
+    ///
+    /// On a clean (non-duplicate) attach, this also **populates**
+    /// `key_hash_to_key`/`key_hash_to_global_id`/`key_hash_to_vec_checksum`
+    /// for the segment's keys from the SAME owner-evidence keymap entries
+    /// used for ownership above — without this, `recover_v2::reconcile_key`
+    /// would see every warm key as unknown (full re-encode, see the
+    /// ordering note above) and `FT.SEARCH` would resolve warm docs to a
+    /// synthetic `vec:<id>` instead of their real key (the map that backs
+    /// key-bytes resolution is exactly this one). A segment key_hash absent
+    /// from the owner's persisted keymap means the async snapshot job that
+    /// would have durably recorded it never committed before an earlier
+    /// crash (the same class of race as finding #1, at per-key rather than
+    /// per-segment granularity, e.g. a key written between the last
+    /// snapshot and the transition-then-crash): left out of the in-memory
+    /// maps so the rescan re-indexes it fresh into mutable, AND tombstoned
+    /// in the warm copy for that specific key_hash (`seed_tombstones`) so
+    /// the stale warm copy doesn't sit alongside the freshly re-indexed one
+    /// — same no-dedup `search_mvcc` hazard as finding #1, just narrower.
     pub fn register_warm_segments(&mut self, warm_segments: Vec<(u64, std::path::PathBuf)>) {
+        use crate::vector::persistence::manifest::KeymapEntry;
         use crate::vector::persistence::warm_search::{WarmSearchSegment, peek_key_hashes};
 
         let mut loaded = 0usize;
@@ -2502,9 +2531,14 @@ impl VectorStore {
                 seg_key_hashes.iter().copied().collect();
 
             // Finding #2: decide ownership from persisted keymap evidence
-            // (majority-match), never from `from_files` success alone.
+            // (majority-match), never from `from_files` success alone. The
+            // winning candidate's keymap entries are RETAINED (not just
+            // counted) — they're the evidence source for populating the
+            // in-memory maps below, avoiding a second disk read (and a
+            // second TOCTOU window) for the same file.
             let mut owner: Option<Bytes> = None;
             let mut owner_matches = 0usize;
+            let mut owner_entries: Vec<KeymapEntry> = Vec::new();
             let mut ambiguous = false;
             if !seg_key_hash_set.is_empty() {
                 if let Some(store_dir) = self.persist_dir.clone() {
@@ -2526,6 +2560,7 @@ impl VectorStore {
                             std::cmp::Ordering::Greater => {
                                 owner = Some(name.clone());
                                 owner_matches = matches;
+                                owner_entries = entries;
                                 ambiguous = false;
                             }
                             std::cmp::Ordering::Equal if owner.as_ref() != Some(name) => {
@@ -2560,7 +2595,7 @@ impl VectorStore {
             // reloaded HOT copy (the crash-before-GC race)? Check the
             // owner's CURRENT in-memory key_hash_to_key, which reflects
             // exactly what Stack B's own recovery pass actually attached.
-            let Some(idx) = self.indexes.get(&owner_name) else {
+            let Some(idx) = self.indexes.get_mut(&owner_name) else {
                 unregistered += 1;
                 continue;
             };
@@ -2596,6 +2631,42 @@ impl VectorStore {
                 false, // mlock_codes off during recovery (can be changed later)
             ) {
                 Ok(warm_seg) => {
+                    // Populate the in-memory maps from the owner-evidence
+                    // keymap entries so the rescan (which runs right after
+                    // this) sees these keys as known/unchanged instead of
+                    // re-indexing them, and FT.SEARCH resolves real key
+                    // bytes for them. Any key_hash missing from the
+                    // persisted keymap is left out (rescan self-heals it
+                    // into mutable) and tombstoned in this warm copy so the
+                    // two never coexist as live duplicates.
+                    let entries_by_hash: std::collections::HashMap<u64, &KeymapEntry> =
+                        owner_entries.iter().map(|e| (e.key_hash, e)).collect();
+                    let mut missing_from_keymap: Vec<u64> = Vec::new();
+                    for kh in &seg_key_hash_set {
+                        if let Some(entry) = entries_by_hash.get(kh) {
+                            idx.key_hash_to_key
+                                .insert(entry.key_hash, entry.key.clone());
+                            idx.key_hash_to_global_id
+                                .insert(entry.key_hash, entry.global_id);
+                            idx.key_hash_to_vec_checksum
+                                .insert(entry.key_hash, entry.vec_checksum);
+                        } else {
+                            missing_from_keymap.push(*kh);
+                        }
+                    }
+                    if !missing_from_keymap.is_empty() {
+                        warm_seg.seed_tombstones(&missing_from_keymap);
+                        tracing::warn!(
+                            "warm segment {segment_id} for index {:?}: {} key_hash(es) missing \
+                             from the persisted keymap (an earlier async-snapshot job never \
+                             committed for them) — left out of the in-memory keymap and \
+                             tombstoned in the warm copy; the keyspace rescan will re-index \
+                             them fresh into the mutable segment",
+                            String::from_utf8_lossy(&owner_name),
+                            missing_from_keymap.len()
+                        );
+                    }
+
                     let old = idx.segments.load();
                     let mut new_warm = old.warm.clone();
                     new_warm.push(std::sync::Arc::new(warm_seg));

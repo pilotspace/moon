@@ -145,12 +145,37 @@ impl RecoveryState {
         };
 
         if let Some(counters) = recovered_counters {
-            if let Some(idx) = vector_store.get_index(&name) {
+            self.recovered_names.insert(name.clone());
+            self.counters.insert(name.clone(), counters);
+        }
+    }
+
+    /// Phase 1.5: snapshot every recovered index's key_hash set as the
+    /// deletion probe's baseline (see [`Self::finish`]). Call exactly once,
+    /// after ALL of phase 1 (every [`Self::create_index`] call) AND after
+    /// `VectorStore::register_warm_segments` has reattached any WARM
+    /// segments — in that order — but BEFORE phase 2
+    /// ([`Self::reconcile_key`]) begins.
+    ///
+    /// This is deliberately NOT folded into `create_index` itself (an
+    /// earlier revision snapshotted right there, immediately after each
+    /// index's Stack B load). `load_segments_and_keymap` only populates
+    /// `key_hash_to_key` from LOADED (immutable/HOT) segments — a WARM
+    /// segment's keys are phantom-dropped (see the `segment_resident` gate
+    /// below) since nothing has attached it to `idx.segments` yet at that
+    /// point. Snapshotting there would permanently exclude every WARM key
+    /// from the deletion probe's baseline: a WARM key whose KV hash was
+    /// deleted while the server was down would never be recognized as
+    /// "used to exist, now doesn't" and would never get tombstoned. Calling
+    /// this AFTER `register_warm_segments` (which does populate
+    /// `key_hash_to_key` for cleanly-attached WARM keys — see its own docs)
+    /// makes the baseline complete.
+    pub fn snapshot_recovered_baseline(&mut self, vector_store: &VectorStore) {
+        for name in &self.recovered_names {
+            if let Some(idx) = vector_store.get_index(name) {
                 self.original_key_hashes
                     .insert(name.clone(), idx.key_hash_to_key.keys().copied().collect());
             }
-            self.recovered_names.insert(name.clone());
-            self.counters.insert(name.clone(), counters);
         }
     }
 
