@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — startup warning: `--disk-offload` without a durability backstop is silently inert
+### Fixed — `--disk-offload` without a durability backstop broke the default LRU cache recipe
 
 - **GCP benchmark finding (2026-07-10)**: with `--disk-offload enable` (the
   default) but `--appendonly no` and no `--save`, the durable-spill eviction
@@ -16,19 +16,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`shard::persistence_tick::handle_memory_pressure`), itself gated on
   `persistence_dir`, which `main.rs` only constructs when
   `appendonly == "yes" || save.is_some()`. The inline write-path eviction
-  gate has no manifest access and, per the fix above, bails rather than risk
-  an unrecoverable crash-loss window — so `--maxmemory` silently degrades
-  from "spill cold data to disk" to a hard reject-at-cap (writes
-  OOM-rejected at the cap), and cold data is never spilled. This is an
-  intentional trade-off (correctness over availability), not a bug, but it
-  was silent.
-- **Fix**: `ServerConfig::disk_offload_spill_inert` (new predicate,
-  `src/config.rs`) plus `ServerConfig::warn_disk_offload_without_durability`
-  (mirrors `warn_deprecated_cold_tier_flags`) now emit a single
-  `tracing::warn!` at startup when this combination is detected, called from
-  `main.rs` right after the existing cold-tier-flags warning. No behavior
-  change — the eviction/spill logic is untouched. Documented in
-  `docs/guides/tuning.md`'s "Tiered memory offload" section.
+  gate has no manifest access, so durable spill is impossible from that call
+  site — but the pre-fix `manifest is None` branch OOM'd **unconditionally**
+  regardless of `--maxmemory-policy`, silently breaking the documented
+  "Pure cache (no durability)" recipe
+  (`--appendonly no --maxmemory <bytes> --maxmemory-policy allkeys-lru`): a
+  classic LRU cache rejected writes at the cap instead of evicting.
+- **Behavior fix** (`src/storage/eviction.rs`,
+  `try_evict_if_needed_async_spill_with_total_budget`'s `manifest is None`
+  branch): made the fail-close policy-aware, matching Redis semantics. When
+  `total_memory <= budget` nothing happens; when `policy == NoEviction` it
+  still OOMs (correct — noeviction always rejects); otherwise (any evicting
+  policy — `allkeys-*`/`volatile-*`) it now reclaims the budget by
+  **dropping** victims via `evict_one_with_spill(.., spill: None)` (the same
+  plain-drop helper the disk-offload-disabled write path already uses — no
+  new victim-selection logic), looping until the budget is satisfied or no
+  eligible victim remains (then OOM). No durable spill is attempted here —
+  that still only happens via the tick's `evict_batch_durable_no_aof` when a
+  manifest is reachable. Three new tests in `src/storage/eviction.rs`:
+  `async_spill_no_aof_backstop_no_manifest_allkeys_lru_evicts_pure_cache`
+  (the regression test — fails with OOM on pre-fix code, passes after),
+  `async_spill_no_aof_backstop_no_manifest_noeviction_still_rejects`
+  (unchanged noeviction OOM behavior), and
+  `async_spill_no_aof_backstop_no_manifest_volatile_lru_scoped_to_ttl_keys`
+  (`volatile-*` only evicts keys with a TTL, never a persistent key). The
+  `--appendonly yes` async-spill path and the manifest-reachable durable
+  batch-spill path are untouched.
+- **Startup warning**: `ServerConfig::disk_offload_spill_inert` (new
+  predicate, `src/config.rs`) plus
+  `ServerConfig::warn_disk_offload_without_durability` (mirrors
+  `warn_deprecated_cold_tier_flags`) emit a single `tracing::warn!` at
+  startup when `--disk-offload enable` + no durability backstop is
+  detected, called from `main.rs` right after the existing cold-tier-flags
+  warning: disk-offload's cold-spill tiering is still inert in this
+  combination (evicting policies now drop instead of tiering; only
+  `noeviction` still OOMs). Documented in `docs/guides/tuning.md`'s "Tiered
+  memory offload" section.
 
 ### Fixed — test flakiness: oom_bypass_closure readiness on loaded CI runners
 

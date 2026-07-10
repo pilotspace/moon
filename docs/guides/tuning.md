@@ -215,15 +215,21 @@ resident forever:
 > memory-pressure cascade — itself gated on `--appendonly yes` or `--save`
 > being configured. With `--disk-offload enable` (the default) but
 > `--appendonly no` and no `--save`, the inline write-path eviction gate has
-> no manifest access and bails rather than risk an unrecoverable crash-loss
-> window: cold data is **never spilled to disk**, and `--maxmemory` instead
-> behaves as a hard reject-at-cap (writes fail with OOM once the budget is
-> hit), regardless of `--maxmemory-policy`. This is intentional
-> (correctness over availability) — Moon warns about it once at startup
+> no manifest access and cannot durably spill: cold data is **never spilled
+> to disk** in this combination, regardless of `--maxmemory-policy`. The
+> **"Pure cache (no durability)" recipe above still works correctly** —
+> `allkeys-lru` (and the other evicting policies) fall back to Redis-style
+> cache eviction: victims are DROPPED outright (no tiering, no durability
+> claim needed since nothing is meant to survive a restart) to keep
+> `--maxmemory` honored. Only `maxmemory-policy noeviction` rejects writes
+> with OOM once the budget is hit, same as with disk-offload off. This
+> spill-inertness is intentional (correctness over availability for the
+> *tiering* feature specifically) — Moon warns about it once at startup
 > (`ServerConfig::warn_disk_offload_without_durability`). Enable
-> `--appendonly yes` or configure `--save` to activate disk-offload spill,
-> or pass `--disk-offload disable` if you only want in-memory
-> `--maxmemory-policy` eviction with no spill.
+> `--appendonly yes` or configure `--save` to activate disk-offload spill
+> (durable tiering instead of dropping), or pass `--disk-offload disable` if
+> you only want in-memory `--maxmemory-policy` eviction with no spill code
+> path involved at all.
 
 ## Vector/FTS/graph idle-unload
 

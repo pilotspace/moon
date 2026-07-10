@@ -943,12 +943,16 @@ impl ServerConfig {
     /// `appendonly == "yes" || save.is_some()` (see `main.rs`'s
     /// `persistence_dir` binding). The inline per-connection write-path
     /// eviction gate has no manifest access and, under this combination,
-    /// bails rather than manufacture a crash-loss window — so
-    /// `--maxmemory` degrades from "spill cold data to disk" to a hard
-    /// reject-at-cap (writes OOM-rejected) with no cold-spill ever
-    /// happening. This is an intentional correctness-over-availability
-    /// trade-off, not a bug; this predicate exists only to make the
-    /// resulting degradation loud instead of silent.
+    /// cannot durably spill — cold data is NOT tiered to disk regardless of
+    /// policy. What happens to the *write* itself is now policy-aware
+    /// (`src/storage/eviction.rs`, the `manifest is None` branch of
+    /// `try_evict_if_needed_async_spill_with_total_budget`): an evicting
+    /// policy (`allkeys-*`/`volatile-*`) still honors `--maxmemory` by
+    /// DROPPING victims outright (Redis cache semantics, no tiering, no
+    /// crash-durability claim needed since nothing needs to survive a
+    /// restart); only `noeviction` rejects writes with OOM at the cap. This
+    /// predicate stays orthogonal to `maxmemory_policy` — spill IS still
+    /// inert either way — and exists only to make that degradation loud.
     pub fn disk_offload_spill_inert(&self) -> bool {
         self.disk_offload_enabled() && self.appendonly != "yes" && self.save.is_none()
     }
@@ -963,9 +967,10 @@ impl ServerConfig {
             tracing::warn!(
                 "--disk-offload is enabled but persistence is off (appendonly=no and no \
                  --save). The disk-offload cold-spill tier requires a durability backstop \
-                 to function: without one, --maxmemory acts as a HARD reject cap (writes \
-                 are rejected with OOM at the cap) and cold data is NOT spilled to disk. \
-                 Enable --appendonly yes or configure --save to activate disk-offload spill."
+                 to function: without one, cold data is NOT spilled to disk. Evicting \
+                 policies (allkeys-*/volatile-*) fall back to DROPPING keys with no \
+                 tiering, and noeviction rejects writes with OOM at the cap. Enable \
+                 --appendonly yes or --save to activate durable spill."
             );
         }
     }

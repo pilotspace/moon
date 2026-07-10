@@ -615,12 +615,29 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
     if config.appendonly != "yes" {
         let Some(manifest) = manifest else {
             // No manifest reachable from this call site and no AOF backstop:
-            // cannot guarantee durability, so do not evict anything here.
-            return if total_memory > budget {
-                Err(oom_error())
-            } else {
-                Ok(())
-            };
+            // durable spill (evict_batch_durable_no_aof, below) is impossible
+            // here. That does NOT mean the cap goes unenforced, though: an
+            // evicting policy (AllKeys*/Volatile*) must still honor Redis
+            // semantics and reclaim the budget by DROPPING victims with no
+            // tiering (`evict_one_with_spill` with `spill: None`, the exact
+            // plain-drop helper the disk-offload-disabled write path already
+            // uses) -- only `noeviction` rejects with OOM. A durable spill
+            // still happens whenever a manifest IS reachable (the
+            // tick-driven memory-pressure cascade, handled below) or once
+            // `--appendonly yes` / `--save` gives this call site a backstop.
+            let mut current_total = total_memory;
+            while current_total > budget {
+                if policy == EvictionPolicy::NoEviction {
+                    return Err(oom_error());
+                }
+                let before = db.estimated_memory();
+                if !evict_one_with_spill(db, config, &policy, None) {
+                    return Err(oom_error());
+                }
+                let after = db.estimated_memory();
+                current_total = current_total.saturating_sub(before.saturating_sub(after));
+            }
+            return Ok(());
         };
         let mut current_total = total_memory;
         while current_total > budget {
@@ -1801,14 +1818,75 @@ mod tests {
         );
     }
 
-    /// GREEN: when no `ShardManifest` is reachable (e.g. the inline
-    /// per-connection write-path eviction gate) AND there is no AOF backstop,
-    /// eviction MUST NOT drop the hot value -- there is no way to guarantee
-    /// durability from this call site, so it must bail (OOM surfaced, value
-    /// retained) rather than manufacture a crash-loss window. The periodic
-    /// memory-pressure tick (which does have a manifest) picks up the slack.
+    /// RED→GREEN (GCP benchmark finding, 2026-07-10 -- policy-aware
+    /// fail-close): when no `ShardManifest` is reachable (e.g. the inline
+    /// per-connection write-path eviction gate) AND there is no AOF
+    /// backstop, durable spill (`evict_batch_durable_no_aof`) is impossible.
+    /// That must NOT mean the cap goes unenforced for an evicting policy,
+    /// though -- Redis semantics require `allkeys-lru` (and friends) to
+    /// honor `--maxmemory` by DROPPING victims (no tiering) when no durable
+    /// spill path exists; only `noeviction` may reject. Before this fix, the
+    /// `manifest is None` branch OOM'd unconditionally regardless of policy,
+    /// which silently broke the documented "Pure cache (no durability)"
+    /// recipe (`--appendonly no --maxmemory ... --maxmemory-policy
+    /// allkeys-lru`) -- a classic LRU cache rejected writes at the cap
+    /// instead of evicting. This test reproduces exactly that regression:
+    /// it FAILS (OOM, value retained) on the pre-fix code and PASSES
+    /// (evicted, `Ok`) after.
     #[test]
-    fn async_spill_no_aof_backstop_no_manifest_retains_hot_value() {
+    fn async_spill_no_aof_backstop_no_manifest_allkeys_lru_evicts_pure_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        let total = db.estimated_memory();
+
+        // budget of 1 byte: always over, for any non-empty value.
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "no".to_string();
+
+        let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
+
+        let result = try_evict_if_needed_async_spill_with_total_budget(
+            &mut db,
+            &config,
+            &tx,
+            shard_dir,
+            &mut next_file_id,
+            total,
+            0,
+            0,
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "an evicting policy must reclaim budget by dropping, not OOM: {result:?}"
+        );
+        assert_eq!(
+            db.len(),
+            0,
+            "victim must be dropped (no spill, no manifest) to honor the cap"
+        );
+        assert!(
+            !shard_dir.join("data").exists(),
+            "this is a plain drop, not a spill -- no file should be written"
+        );
+        assert!(
+            _rx.try_recv().is_err(),
+            "the plain-drop path must bypass the SpillThread channel entirely"
+        );
+    }
+
+    /// GREEN (unchanged): `noeviction` rejects writes with OOM regardless of
+    /// manifest/AOF availability -- there is no policy under which
+    /// `noeviction` may drop a key. The periodic memory-pressure tick (which
+    /// does have a manifest, when a durability backstop exists) is
+    /// irrelevant here since `noeviction` never evicts anywhere.
+    #[test]
+    fn async_spill_no_aof_backstop_no_manifest_noeviction_still_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path();
         let mut next_file_id = 1u64;
@@ -1816,7 +1894,7 @@ mod tests {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
 
-        let mut config = make_config(1, "allkeys-lru");
+        let mut config = make_config(1, "noeviction");
         config.appendonly = "no".to_string();
 
         let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
@@ -1826,9 +1904,9 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "no manifest + no AOF backstop must surface OOM, never silently evict"
+            "noeviction must surface OOM, never silently evict"
         );
-        assert_eq!(db.len(), 1, "hot value must be retained, not dropped");
+        assert_eq!(db.len(), 1, "hot value must be retained under noeviction");
         assert!(db.data().get(&b"k1"[..]).is_some());
         // Nothing was queued either -- no half-done spill left dangling.
         assert!(_rx.try_recv().is_err());
@@ -1836,6 +1914,89 @@ mod tests {
             !shard_dir.join("data").exists(),
             "no spill file should have been written"
         );
+    }
+
+    /// GREEN: `volatile-lru` must only evict keys carrying a TTL -- a
+    /// persistent key must never be dropped to satisfy this policy's cap,
+    /// matching Redis's documented "volatile-*" scope. When no volatile
+    /// victim exists (only a persistent key remains) the cap cannot be
+    /// honored at all, so this must OOM rather than drop the persistent key.
+    #[test]
+    fn async_spill_no_aof_backstop_no_manifest_volatile_lru_scoped_to_ttl_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"persistent"), Bytes::from_static(b"v"));
+        // Budget the persistent key alone comfortably fits under, but the
+        // persistent+volatile total exceeds -- so eviction must stop exactly
+        // once the volatile key is gone, without needing a "drop everything"
+        // budget that would otherwise force a second (impossible) eviction
+        // attempt against the persistent-only remainder within the same
+        // internal `while current_total > budget` loop.
+        let persistent_only_memory = db.estimated_memory();
+
+        let future_ms = current_time_ms() + 3_600_000;
+        db.set_string_with_expiry(
+            Bytes::from_static(b"volatile"),
+            Bytes::from_static(b"v"),
+            future_ms,
+        );
+        let total_with_both = db.estimated_memory();
+        assert!(
+            total_with_both > persistent_only_memory,
+            "adding the volatile key must increase estimated memory"
+        );
+
+        let mut config = make_config(persistent_only_memory, "volatile-lru");
+        config.appendonly = "no".to_string();
+
+        let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
+
+        let result = try_evict_if_needed_async_spill_with_total_budget(
+            &mut db,
+            &config,
+            &tx,
+            shard_dir,
+            &mut next_file_id,
+            total_with_both,
+            0,
+            0,
+            None,
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(db.len(), 1, "only the volatile key may be dropped");
+        assert!(
+            db.data().contains_key(b"persistent" as &[u8]),
+            "persistent key must survive volatile-lru eviction"
+        );
+        assert!(!db.data().contains_key(b"volatile" as &[u8]));
+
+        // Only the persistent key remains now: tighten the budget so it's
+        // over-budget with no volatile candidate left to satisfy it -- the
+        // cap cannot be honored, so this must OOM, never drop a persistent
+        // key under a `volatile-*` policy.
+        let mut config2 = make_config(1, "volatile-lru");
+        config2.appendonly = "no".to_string();
+        let current = db.estimated_memory();
+        let result2 = try_evict_if_needed_async_spill_with_total_budget(
+            &mut db,
+            &config2,
+            &tx,
+            shard_dir,
+            &mut next_file_id,
+            current,
+            0,
+            0,
+            None,
+        );
+        assert!(
+            result2.is_err(),
+            "volatile-lru with no volatile candidate must OOM, not drop a persistent key"
+        );
+        assert_eq!(db.len(), 1);
     }
 
     /// GREEN (spill-failure retention, no-AOF path): if the durable
