@@ -221,8 +221,10 @@ resident forever:
 > `allkeys-lru` (and the other evicting policies) fall back to Redis-style
 > cache eviction: victims are DROPPED outright (no tiering, no durability
 > claim needed since nothing is meant to survive a restart) to keep
-> `--maxmemory` honored. Only `maxmemory-policy noeviction` rejects writes
-> with OOM once the budget is hit, same as with disk-offload off. This
+> `--maxmemory` honored. `noeviction` rejects writes with OOM once the budget
+> is hit, and an evicting policy also returns OOM when no eligible victim
+> remains (e.g. no TTL-bearing key is left under a `volatile-*` policy) — same
+> as with disk-offload off. This
 > spill-inertness is intentional (correctness over availability for the
 > *tiering* feature specifically) — Moon warns about it once at startup
 > (`ServerConfig::warn_disk_offload_without_durability`). Enable

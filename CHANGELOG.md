@@ -49,8 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   startup when `--disk-offload enable` + no durability backstop is
   detected, called from `main.rs` right after the existing cold-tier-flags
   warning: disk-offload's cold-spill tiering is still inert in this
-  combination (evicting policies now drop instead of tiering; only
-  `noeviction` still OOMs). Documented in `docs/guides/tuning.md`'s "Tiered
+  combination (evicting policies drop eligible victims instead of tiering;
+  `noeviction` — and any evicting policy with no eligible victim left, e.g.
+  `volatile-*` once its TTL-bearing keys are gone — returns OOM). Documented
+  in `docs/guides/tuning.md`'s "Tiered
   memory offload" section.
 
 ### Fixed — test flakiness: oom_bypass_closure readiness on loaded CI runners

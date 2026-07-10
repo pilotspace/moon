@@ -950,7 +950,9 @@ impl ServerConfig {
     /// policy (`allkeys-*`/`volatile-*`) still honors `--maxmemory` by
     /// DROPPING victims outright (Redis cache semantics, no tiering, no
     /// crash-durability claim needed since nothing needs to survive a
-    /// restart); only `noeviction` rejects writes with OOM at the cap. This
+    /// restart); `noeviction` — and any evicting policy once no eligible
+    /// victim remains (e.g. `volatile-*` with no TTL keys left) — rejects
+    /// writes with OOM at the cap. This
     /// predicate stays orthogonal to `maxmemory_policy` — spill IS still
     /// inert either way — and exists only to make that degradation loud.
     pub fn disk_offload_spill_inert(&self) -> bool {
@@ -968,8 +970,10 @@ impl ServerConfig {
                 "--disk-offload is enabled but persistence is off (appendonly=no and no \
                  --save). The disk-offload cold-spill tier requires a durability backstop \
                  to function: without one, cold data is NOT spilled to disk. Evicting \
-                 policies (allkeys-*/volatile-*) fall back to DROPPING keys with no \
-                 tiering, and noeviction rejects writes with OOM at the cap. Enable \
+                 policies (allkeys-*/volatile-*) fall back to DROPPING eligible \
+                 victims with no tiering; noeviction — and any evicting policy once \
+                 no eligible victim remains (e.g. volatile-* with no TTL keys) — \
+                 rejects writes with OOM at the cap. Enable \
                  --appendonly yes or --save to activate durable spill."
             );
         }
