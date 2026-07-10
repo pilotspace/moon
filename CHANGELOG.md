@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — CI: fts_query_parse missing from fuzz matrix
+
+- `.github/workflows/fuzz.yml`: the `fts_query_parse` fuzz target was
+  registered in `fuzz/Cargo.toml` but absent from both the PR and nightly
+  CI matrices, so it never ran. Added to both. Also corrected CLAUDE.md's
+  stale fuzz-target count (7 → 12) and target list.
+
 ### Fixed — test flakiness: sigterm-shutdown readiness + BGSAVE file polling
 
 - `tests/sigterm_shutdown.rs`: `wait_for_ready` now distinguishes a crashed
