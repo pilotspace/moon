@@ -187,7 +187,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Every new command needs at least one unit test and one consistency test entry.
 - Integration tests use real server instances — no mocking.
 - Benchmarks use Criterion with `black_box()` on inputs and outputs.
-- **Fuzzing:** 7 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target. CI runs 15 min/target on PRs and 6h nightly.
+- **Fuzzing:** 12 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target. CI runs 15 min/target on PRs and 6h nightly.
 - **Loom:** model tests in `tests/loom_response_slot.rs` for lock-free data structures. Any new atomic state machine MUST have a loom model.
 
 ### Module Structure
@@ -253,7 +253,7 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 - `cargo fmt --check` — enforced formatting
 - MSRV check — `cargo build` with Rust 1.94 toolchain
 - **Safety audit** — `scripts/audit-unsafe.sh` (100% SAFETY comment coverage on unsafe blocks) + `scripts/audit-unwrap.sh` (unwrap ratchet prevents new unannotated unwraps)
-- **Fuzz** — `cargo-fuzz` 15 min/target on PR, 6h nightly (`resp_parse`, `resp_parse_differential`, `inline_parse`, `wal_v3_record`, `gossip_deser`, `acl_rule`). Uses nightly compiler; `rust-toolchain.toml` is removed in CI for this job.
+- **Fuzz** — `cargo-fuzz` 15 min/target on PR, 6h nightly (all 12 targets: resp/inline/RESP-differential, wal_v3_record, gossip_deser, acl_rule, rdb_load, cypher_parse, conf_parse, csr_from_bytes, graph_props_record, fts_query_parse). Uses nightly compiler; `rust-toolchain.toml` is removed in CI for this job.
 - CodeQL (Rust) — weekly + on push/PR
 - Claude Code Review — runs on PRs
 
