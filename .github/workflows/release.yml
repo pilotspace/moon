@@ -66,6 +66,17 @@ jobs:
             exit 1
           fi
 
+      # Production-contract gate: docs/PRODUCTION-CONTRACT.md is a checked
+      # ledger of GA exit criteria (ROADMAP §8.1 H-5). Pre-v1.0 tags only get
+      # a report of what is still unticked — Moon is deliberately pre-GA.
+      # A v1.0* tag hard-fails here if any GA-blocking row is still unticked,
+      # so v1.0 cannot ship a known, undocumented broken promise.
+      - name: Check production contract ledger
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: bash scripts/check-production-contract.sh --tag "${VERSION}"
+
   # ── 1. Build web console ──────────────────────────────────────────────────
   prepare-console:
     name: Build Console
