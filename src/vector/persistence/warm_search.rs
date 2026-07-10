@@ -709,6 +709,55 @@ mod tests {
         );
     }
 
+    /// Back-compat: segments written before meta.mpf/undo.mpf were dropped
+    /// (both were unread VecMeta/VecUndo placeholders -- no code ever opened
+    /// them) still load correctly. `from_files` opens only the four named
+    /// files it needs (codes/graph/mvcc/vectors) and never scans the segment
+    /// directory, so a stray extra file must be silently ignored.
+    #[test]
+    fn test_warm_search_segment_loads_with_stray_legacy_meta_undo_files() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        let graph_bytes = empty_graph.to_bytes();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-1");
+        write_test_mpf_segment(&seg_dir, 1, &[], &graph_bytes, &[]);
+
+        // Simulate a segment written by an older Moon build that still
+        // emitted these two placeholder files. Content is irrelevant --
+        // the loader must never open files by anything other than name.
+        std::fs::write(seg_dir.join("meta.mpf"), b"legacy-meta-placeholder").unwrap();
+        std::fs::write(seg_dir.join("undo.mpf"), b"legacy-undo-placeholder").unwrap();
+
+        let handle = SegmentHandle::new(1, seg_dir.clone());
+        let warm = WarmSearchSegment::from_files(&seg_dir, 1, collection, handle, false)
+            .expect("stray legacy meta.mpf/undo.mpf files must not break loading");
+
+        assert_eq!(warm.total_count(), 0);
+        assert_eq!(warm.segment_id(), 1);
+    }
+
     /// WS3: a `vectors.mpf` sidecar written by the HOT->WARM transition
     /// (`crate::storage::tiered::warm_tier::transition_to_warm`) must survive
     /// the round trip through `WarmSearchSegment::from_files` byte-for-byte

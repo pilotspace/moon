@@ -14,8 +14,7 @@ use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, Storage
 use crate::persistence::page::PageType;
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::persistence::warm_segment::{
-    write_codes_mpf, write_graph_mpf, write_meta_mpf, write_mvcc_mpf, write_undo_mpf,
-    write_vectors_mpf,
+    write_codes_mpf, write_graph_mpf, write_mvcc_mpf, write_vectors_mpf,
 };
 
 /// Transition a HOT vector segment to WARM (mmap-backed on disk).
@@ -60,10 +59,6 @@ pub fn transition_to_warm(
     if let Some(vdata) = vectors_data {
         write_vectors_mpf(&staging.join("vectors.mpf"), file_id, vdata)?;
     }
-
-    // Write meta.mpf (collection metadata placeholder) and undo.mpf (empty undo log)
-    write_meta_mpf(&staging.join("meta.mpf"), file_id, &[])?;
-    write_undo_mpf(&staging.join("undo.mpf"), file_id)?;
 
     // Write empty deletion bitmap (no vectors deleted in fresh warm segment)
     {
@@ -165,6 +160,10 @@ mod tests {
         assert!(seg_dir.join("graph.mpf").exists());
         assert!(seg_dir.join("mvcc.mpf").exists());
         assert!(!seg_dir.join("vectors.mpf").exists()); // None passed
+        // meta.mpf / undo.mpf were unread placeholders (VecMeta/VecUndo pages
+        // with zero readers anywhere in the codebase) -- no longer written.
+        assert!(!seg_dir.join("meta.mpf").exists());
+        assert!(!seg_dir.join("undo.mpf").exists());
     }
 
     #[test]

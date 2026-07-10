@@ -1,14 +1,15 @@
 //! Immutable segment disk I/O: write and read segment directories.
 //!
-//! Each immutable segment is stored as a directory containing 6 files:
+//! Each immutable segment is stored as a directory containing 4 files, plus
+//! an optional exact-rerank sidecar:
 //! ```text
 //! {persist_dir}/segment-{segment_id}/
 //!   hnsw_graph.bin      -- HnswGraph::to_bytes() output
-//!   tq_codes.bin        -- raw TQ code bytes
-//!   sq_vectors.bin      -- raw SQ vector bytes (i8 as u8)
-//!   f32_vectors.bin     -- raw f32 vector bytes (BFS-ordered, for HNSW search)
-//!   mvcc_headers.bin    -- [count:u32 LE][MvccHeader; count] (20 bytes each)
+//!   tq_codes.bin        -- raw TQ code bytes (TQ-ADC used for search)
+//!   mvcc_headers.bin    -- [version:u8][count:u32 LE][MvccHeader; count] (32 bytes each, v2)
 //!   segment_meta.json   -- JSON metadata with checksum verification
+//!   raw_f16.bin         -- optional HQ-1 exact-rerank sidecar (f16 halves,
+//!                          BFS-ordered); absent when built without raw vectors
 //! ```
 
 use std::fs;
@@ -212,10 +213,7 @@ fn write_segment_files(
     fs::write(&tq_path, segment.vectors_tq().as_slice())?;
     fsync_file(&tq_path)?;
 
-    // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
-    // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
-
-    // 3c. raw_f16.bin — exact-rerank sidecar (HQ-1): u16 LE halves, BFS-ordered,
+    // 3. raw_f16.bin — exact-rerank sidecar (HQ-1): u16 LE halves, BFS-ordered,
     // `dimension` per entry. Optional: absent when the segment was built without
     // raw vectors. Readers treat a missing file as "no sidecar" (backward and
     // forward compatible — old readers ignore the extra file).
