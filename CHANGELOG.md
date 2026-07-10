@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Corrected the comment to describe reality and left a `TODO(ci):` marking
   the gap (wiring `cargo deny check` into CI is a separate decision, out of
   scope here).
+### Changed — Tiering: drop unused meta/undo placeholder files
+
+- `transition_to_warm` (HOT->WARM segment seal) no longer writes `meta.mpf`
+  (VecMeta) or `undo.mpf` (VecUndo) — both were always-empty placeholders with
+  zero readers anywhere in the codebase (the WARM load path
+  `WarmSearchSegment::from_files` only ever opens `codes.mpf`/`graph.mpf`/
+  `mvcc.mpf`/optional `vectors.mpf` by name). Removes 2 extra
+  `File::create` + fsync round-trips per WARM segment seal. `write_meta_mpf`
+  and `write_undo_mpf` (`src/vector/persistence/warm_segment.rs`) are removed
+  as they had no other callers.
+- `src/vector/persistence/segment_io.rs`: removed the dead
+  `sq_vectors.bin`/`f32_vectors.bin` comment-only branch (never emitted since
+  SQ8/f32 storage was dropped from `ImmutableSegment` in favor of TQ-ADC) and
+  corrected the module doc header, which still listed both files as if
+  written.
+- Back-compat: old WARM segments written by a prior build that still contain
+  `meta.mpf`/`undo.mpf` continue to load — the loader opens files by name and
+  never scans the segment directory, so the extra files are silently ignored
+  (verified by a new regression test with stray legacy files on disk).
 
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
