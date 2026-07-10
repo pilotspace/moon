@@ -25,7 +25,8 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-/// Readiness poll deadline (RSS/CPU wave 5, item C8).
+/// Readiness poll deadline (RSS/CPU wave 5, item C8; widened again below for
+/// the sigterm-shutdown flake hardening pass).
 ///
 /// Was a fixed 15s, hardcoded independently at each `wait_for_ready` call
 /// site — PR #218 documented this as a flake under host load (shared/
@@ -36,6 +37,33 @@ fn moon_binary() -> std::path::PathBuf {
 /// actually-broken server (the 100ms poll notices readiness within one
 /// tick of it happening), but tolerates a slow CI host without flaking.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// CI-aware readiness deadline: doubles `READY_TIMEOUT` when the `CI` env var
+/// is set (GitHub Actions and effectively every other CI provider sets it).
+///
+/// A loaded macOS CI runner just needs longer to fork+exec+bind+listen the
+/// spawned `moon` binary — this is startup latency, not a hang, and the poll
+/// loop already retries every 100ms rather than sleeping once and giving up.
+/// Local `cargo test` runs stay at the already-generous 60s base so a
+/// genuinely broken server still fails a local run promptly.
+fn ready_timeout() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        READY_TIMEOUT * 2
+    } else {
+        READY_TIMEOUT
+    }
+}
+
+/// Read a captured child-process log file for diagnostics. Tolerates a
+/// missing/unreadable file — this runs on a failure path and must never
+/// itself panic (that would mask the real failure with a confusing one).
+fn read_log(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) if s.trim().is_empty() => "<empty>".to_string(),
+        Ok(s) => s,
+        Err(e) => format!("<unreadable: {e}>"),
+    }
+}
 
 /// Pick an ephemeral port by binding :0 and releasing it.
 ///
@@ -49,11 +77,33 @@ fn free_port() -> u16 {
     p
 }
 
-/// Poll TCP connect until the server is ready or deadline expires.
-/// Returns true if we received a PONG within the deadline.
-fn wait_for_ready(port: u16, deadline: Duration) -> bool {
+/// Outcome of polling for server readiness.
+enum Readiness {
+    /// TCP connect + PING/PONG round-tripped within the deadline.
+    Ready,
+    /// The child process exited (crashed, or exited some other way) before
+    /// ever becoming ready — a REAL failure, distinct from "just slow".
+    Exited(std::process::ExitStatus),
+    /// Neither happened before the deadline. On a loaded CI host this is
+    /// almost always still-starting-up, not a hang.
+    TimedOut,
+}
+
+/// Poll TCP connect until the server is ready, the child process exits, or
+/// the deadline expires.
+///
+/// Checking `try_wait()` every iteration means a genuinely crashed server
+/// fails fast (within one 100ms tick) instead of burning the entire
+/// `deadline` budget polling a socket nothing will ever bind — the old
+/// bool-returning version couldn't distinguish "slow to start" from "already
+/// dead", so a real crash looked identical to a loaded CI host and both
+/// produced the same uninformative "did not become ready" panic.
+fn wait_for_ready(child: &mut std::process::Child, port: u16, deadline: Duration) -> Readiness {
     let start = Instant::now();
     while start.elapsed() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Readiness::Exited(status);
+        }
         let addr = format!("127.0.0.1:{port}");
         if let Ok(mut s) =
             TcpStream::connect_timeout(&addr.parse().expect("addr"), Duration::from_millis(200))
@@ -64,14 +114,40 @@ fn wait_for_ready(port: u16, deadline: Duration) -> bool {
                 let mut buf = [0u8; 16];
                 if let Ok(n) = s.read(&mut buf) {
                     if buf[..n].windows(4).any(|w| w == b"PONG") {
-                        return true;
+                        return Readiness::Ready;
                     }
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    false
+    Readiness::TimedOut
+}
+
+/// Build a diagnostic panic message for a non-`Ready` outcome, surfacing the
+/// child's captured stdout/stderr so a REAL failure (crash, bind error, panic
+/// in `main`) is still diagnosable instead of just "did not become ready".
+fn readiness_failure_message(
+    label: &str,
+    port: u16,
+    dir: &std::path::Path,
+    deadline: Duration,
+    outcome: &Readiness,
+) -> String {
+    let stdout = read_log(&dir.join("moon.stdout.log"));
+    let stderr = read_log(&dir.join("moon.stderr.log"));
+    let what = match outcome {
+        Readiness::Exited(status) => {
+            format!("server process exited with {status:?} before becoming ready")
+        }
+        Readiness::TimedOut => {
+            format!("server did not become ready within {deadline:?} (process still running)")
+        }
+        Readiness::Ready => unreachable!("readiness_failure_message called with Ready"),
+    };
+    format!(
+        "[{label}] {what} on port {port}\n--- moon.stdout.log ---\n{stdout}\n--- moon.stderr.log ---\n{stderr}"
+    )
 }
 
 /// Send SIGTERM to the given PID using `kill -TERM`.
@@ -143,16 +219,16 @@ fn assert_sigterm_clean_exit_shards(
 
     let pid = child.id();
 
-    // Wait for the server to be ready (load-tolerant deadline; see
-    // READY_TIMEOUT doc comment).
-    let ready = wait_for_ready(port, READY_TIMEOUT);
-    if !ready {
+    // Wait for the server to be ready (CI-aware, load-tolerant deadline; see
+    // ready_timeout() doc comment). wait_for_ready also fails fast on an
+    // early process exit rather than burning the whole budget.
+    let deadline = ready_timeout();
+    let outcome = wait_for_ready(&mut child, port, deadline);
+    if !matches!(outcome, Readiness::Ready) {
+        let msg = readiness_failure_message(label, port, &dir, deadline, &outcome);
         let _ = child.kill();
         let _ = child.wait();
-        panic!(
-            "[{}] server did not become ready within {:?} on port {}",
-            label, READY_TIMEOUT, port
-        );
+        panic!("{msg}");
     }
 
     // Optionally hold a live client connection across the SIGTERM (verified
@@ -287,10 +363,13 @@ fn sigterm_clean_exit_under_write_storm() {
         .expect("spawn moon");
     let pid = child.id();
 
-    if !wait_for_ready(port, READY_TIMEOUT) {
+    let deadline = ready_timeout();
+    let outcome = wait_for_ready(&mut child, port, deadline);
+    if !matches!(outcome, Readiness::Ready) {
+        let msg = readiness_failure_message("storm", port, &dir, deadline, &outcome);
         let _ = child.kill();
         let _ = child.wait();
-        panic!("[storm] server did not become ready within {READY_TIMEOUT:?} on port {port}");
+        panic!("{msg}");
     }
 
     // 16 writer threads, each pipelining SETs in a tight loop until the

@@ -1293,13 +1293,21 @@ async fn test_hscan() {
 // ===== Phase 4: Persistence Integration Tests =====
 
 /// Issue BGSAVE, retrying if another test's save is still in progress (global AtomicBool).
+///
+/// The 200ms sleep below is only a brief settle before returning to the
+/// caller — BGSAVE queues the write on a `spawn_blocking` thread
+/// (`bgsave_start` in `src/command/persistence.rs`) and replies immediately,
+/// so the sleep is NOT a completion guarantee. Callers that depend on the RDB
+/// file actually being on disk (e.g. before asserting its existence, or
+/// before shutting the server down for a restart-and-restore test) MUST poll
+/// via `wait_for_file` — a fixed sleep here is a point-in-time guess that
+/// flakes under CI host load (thread-pool scheduling delay).
 async fn bgsave_with_retry(conn: &mut redis::aio::MultiplexedConnection) {
     for attempt in 0..20 {
         let result: Result<String, _> = redis::cmd("BGSAVE").query_async(conn).await;
         match result {
             Ok(msg) => {
                 assert_eq!(msg, "Background saving started");
-                // Wait for save to complete
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 return;
             }
@@ -1310,6 +1318,30 @@ async fn bgsave_with_retry(conn: &mut redis::aio::MultiplexedConnection) {
                 }
             }
         }
+    }
+}
+
+/// Poll for a file to exist and be non-empty, with a bounded deadline.
+///
+/// Use after `bgsave_with_retry` (or any other command that queues
+/// background disk I/O) instead of asserting the file's presence
+/// immediately or after a fixed guess-sleep — the write completes on a
+/// separate thread whose scheduling is host-load dependent, so a
+/// point-in-time check flakes under CI load even though the save always
+/// eventually completes.
+async fn wait_for_file(path: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if std::fs::metadata(path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -1442,9 +1474,15 @@ async fn test_bgsave_creates_rdb_file() {
     // BGSAVE (retry if another test's save is still in progress)
     bgsave_with_retry(&mut conn).await;
 
-    // Verify dump.rdb exists
+    // Verify dump.rdb exists. BGSAVE replies as soon as the save is queued
+    // (the write itself happens on a spawn_blocking thread), so poll with a
+    // bounded deadline instead of asserting immediately -- see
+    // `wait_for_file` doc comment.
     let rdb_path = dir.join("dump.rdb");
-    assert!(rdb_path.exists(), "dump.rdb should exist after BGSAVE");
+    assert!(
+        wait_for_file(&rdb_path, std::time::Duration::from_secs(10)).await,
+        "dump.rdb should exist after BGSAVE (timed out waiting for the background save)"
+    );
 
     // Verify file starts with MOON magic bytes
     let data = std::fs::read(&rdb_path).unwrap();
@@ -1506,6 +1544,14 @@ async fn test_rdb_restore_on_startup() {
 
         // BGSAVE
         bgsave_with_retry(&mut conn).await;
+
+        // Make sure the RDB actually landed on disk before shutting the
+        // server down -- otherwise the restart-and-restore below can race
+        // the background save under CI host load.
+        assert!(
+            wait_for_file(&dir.join("dump.rdb"), std::time::Duration::from_secs(10)).await,
+            "dump.rdb should exist after BGSAVE (timed out waiting for the background save)"
+        );
 
         shutdown.cancel();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1671,6 +1717,14 @@ async fn test_aof_priority_over_rdb() {
         // Set initial value and BGSAVE (RDB snapshot)
         let _: () = conn.set("key1", "rdb_value").await.unwrap();
         bgsave_with_retry(&mut conn).await;
+
+        // Make sure the RDB snapshot ("rdb_value") actually landed on disk
+        // before shutdown -- otherwise the restart below can race the
+        // background save under CI host load.
+        assert!(
+            wait_for_file(&dir.join("dump.rdb"), std::time::Duration::from_secs(10)).await,
+            "dump.rdb should exist after BGSAVE (timed out waiting for the background save)"
+        );
 
         // Overwrite in AOF (but RDB already has "rdb_value")
         let _: () = conn.set("key1", "aof_value").await.unwrap();
