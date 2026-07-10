@@ -116,6 +116,11 @@ pub struct SpillCompletionEntry {
     pub page_idx: u32,
     /// Slot index within that leaf page.
     pub slot_idx: u16,
+    /// Absolute TTL in milliseconds, carried through from the originating
+    /// `SpillRequest` so the event loop can populate
+    /// `ColdLocation::ttl_ms` (R1, H-2: proactive TTL-expiry sweep) without
+    /// re-reading the just-written file.
+    pub ttl_ms: Option<u64>,
 }
 
 /// Completion sent from background thread back to event loop.
@@ -220,6 +225,7 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                                 db_index: buffer[buf_idx].db_index,
                                 page_idx,
                                 slot_idx,
+                                ttl_ms: buffer[buf_idx].ttl_ms,
                             })
                             .collect();
                         completions.push(SpillCompletion {
@@ -294,6 +300,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     db_index: req.db_index,
                     page_idx: 0,
                     slot_idx: 0,
+                    ttl_ms: req.ttl_ms,
                 }],
                 success: true,
             },
@@ -671,6 +678,7 @@ mod tests {
             file_id: c.file_entry.file_id,
             page_idx: entry.page_idx,
             slot_idx: entry.slot_idx,
+            ttl_ms: entry.ttl_ms,
         };
         let result = read_cold_entry_at(tmp.path(), loc, 0);
         assert!(result.is_some(), "should read entry back");
@@ -901,6 +909,7 @@ mod tests {
                     file_id: c.file_entry.file_id,
                     page_idx: entry.page_idx,
                     slot_idx: entry.slot_idx,
+                    ttl_ms: entry.ttl_ms,
                 };
                 let result =
                     crate::storage::tiered::cold_read::read_cold_entry_at(tmp.path(), loc, 0);

@@ -33,6 +33,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementer as an open decision instead of assuming it away.
 - `mkdocs.yml`: adds a "Protocol" nav section for the new page so `mkdocs build
   --strict` doesn't fail on an orphan doc.
+### Fixed — Cold-tier proactive TTL reclaim (H-2, R1: tmp/OFFLOAD-COMPRESSION-REVIEW.md)
+
+- **TTL-expired disk-offload cold entries that are never re-read no longer
+  leak forever.** The on-read reclaim path (`cold_read.rs`) only reclaimed an
+  expired `ColdIndex` entry when a caller issued a `GET` against it; a key
+  that expired and was never touched again (the flagship offload use case —
+  TTL'd sessions, caches) permanently leaked its index entry (RAM, full key
+  bytes) and pinned its backing DataFile's refcount (disk), because nothing
+  else in the system ever inspected a cold entry's TTL.
+- `ColdLocation` now carries `ttl_ms: Option<u64>`, a cached copy of the
+  on-disk `KvEntry::ttl_ms` populated at spill time and re-derived fresh by
+  `rebuild_from_manifest` on every restart — so the sweep can judge expiry
+  from the in-RAM index alone, without a pread of the cold file. No on-disk
+  format changed and `ColdIndex` has no serialized form of its own, so there
+  is no index format to version and no old file that could fail to load.
+- New `ColdIndex::sweep_expired` runs in the same tick as the existing
+  cold-tier orphan sweep (`--cold-orphan-sweep-interval-secs`, default 5
+  minutes), bounded to `MAX_EXPIRED_SWEEP_BATCH` (4096) entries per call so
+  an expiry storm against a large cold index cannot stall the shard event
+  loop; any remainder is picked up by the next tick. Batch-file colocation is
+  preserved exactly like the orphan sweep (an expired key never drags down a
+  co-located live key's file).
+- New `INFO` fields `reclamation_cold_expired_reclaimed_total` /
+  `reclamation_cold_expired_bytes_reclaimed_total` (distinct from the
+  existing orphan counters, which count any zero-ref file unlink regardless
+  of cause).
 
 ### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
 

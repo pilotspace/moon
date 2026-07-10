@@ -1626,6 +1626,7 @@ impl super::Shard {
                         shard_id,
                         &shard_dir,
                         shard_manifest.as_mut(),
+                        cached_clock.ms(),
                     );
                 }
                 // Expire timed-out blocked clients every 10ms
@@ -2313,6 +2314,7 @@ impl super::Shard {
                         shard_id,
                         &shard_dir,
                         shard_manifest.as_mut(),
+                        cached_clock.ms(),
                     );
                 }
             }

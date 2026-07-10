@@ -8,6 +8,11 @@ use std::path::Path;
 
 use bytes::Bytes;
 
+/// Maximum TTL-expired cold entries reclaimed per [`ColdIndex::sweep_expired`]
+/// call. Bounds one sweep tick's work so a large cold index under an expiry
+/// storm cannot turn the shard's periodic sweep into an unbounded stall.
+pub const MAX_EXPIRED_SWEEP_BATCH: usize = 4096;
+
 /// Statistics returned by [`ColdIndex::orphan_sweep`].
 ///
 /// An orphan is a cold entry whose key has been re-written to the hot
@@ -34,6 +39,21 @@ pub struct ColdLocation {
     pub page_idx: u32,
     /// Slot index within the KvLeafPage at `page_idx`.
     pub slot_idx: u16,
+    /// Absolute expiry time in milliseconds, mirroring the on-disk
+    /// `KvEntry::ttl_ms` this location points at. `None` = no TTL.
+    ///
+    /// R1 (H-2, tmp/OFFLOAD-COMPRESSION-REVIEW.md): populated at insert time
+    /// (spill / recovery rebuild) purely so the proactive sweep
+    /// ([`ColdIndex::sweep_expired`]) can judge expiry from the in-RAM index
+    /// alone — WITHOUT a pread of the cold file. This is a cached copy, not a
+    /// new source of truth: the on-disk `KvLeafPage` entry stays authoritative
+    /// and is exactly what [`Self::rebuild_from_manifest`] re-derives this
+    /// field from after a restart. No on-disk format changed by this field;
+    /// `ColdIndex` itself has no serialized form of its own (it is rebuilt
+    /// fresh from the manifest + heap files on every startup), so there is no
+    /// index format to version and no old-format file that could ever fail to
+    /// load because of it.
+    pub ttl_ms: Option<u64>,
 }
 
 /// In-memory index from key to cold disk location.
@@ -314,6 +334,119 @@ impl ColdIndex {
         Ok(stats)
     }
 
+    /// Sweep cold entries whose TTL has passed WITHOUT ever being re-read
+    /// (R1, H-2: `tmp/OFFLOAD-COMPRESSION-REVIEW.md`).
+    ///
+    /// The on-read reclaim in `cold_read.rs` only fires when a caller
+    /// actually issues a `GET` against an expired cold key. A key that
+    /// expires and is never touched again previously leaked its index entry
+    /// (RAM, full key bytes) and pinned its file's refcount (disk) forever —
+    /// unbounded growth for the flagship offload use case (TTL'd sessions,
+    /// caches). This sweep judges expiry from [`ColdLocation::ttl_ms`] alone,
+    /// so it never reads the cold file itself.
+    ///
+    /// # Bounded work (design-for-failure)
+    ///
+    /// Scans at most `max_batch` expired entries per call, so an expiry storm
+    /// against a very large cold index cannot turn one sweep tick into an
+    /// unbounded stall of the shard event loop. If more expired entries
+    /// remain than fit in this call's batch, a `tracing::warn!` is emitted
+    /// and the remainder is picked up by the next scheduled sweep tick — no
+    /// entry is skipped permanently, reclamation is just spread across ticks.
+    ///
+    /// # Concurrency safety
+    ///
+    /// Same contract as [`Self::orphan_sweep`]: the caller must have
+    /// exclusive access to this shard's database for the duration of the
+    /// call (in practice: invoked from the shard's own single-threaded event
+    /// loop via `with_shard_db`, never from another thread). Spill and
+    /// read-promotion cannot race a sweep because they all run through the
+    /// same per-shard exclusivity.
+    ///
+    /// # Crash / partial-sweep safety
+    ///
+    /// Idempotent and safe to interrupt at any point:
+    /// - If the process crashes between removing an index entry (Phase 1)
+    ///   and the file unlink committing (Phase 2, [`Self::drain_pending_unlink`]),
+    ///   the in-RAM index entry is gone but the file may still be on disk with
+    ///   a stale or already-tombstoned manifest entry. Recovery rebuilds the
+    ///   index from the manifest + heap files ([`Self::rebuild_from_manifest`])
+    ///   and re-derives `ttl_ms` fresh from the on-disk `KvEntry` — an already
+    ///   expired-at-crash-time entry is simply expired again on the next
+    ///   sweep after restart. No corruption, no double free: `drain_pending_unlink`
+    ///   unlinks the file (idempotent — `NotFound` is treated as already-done)
+    ///   BEFORE the manifest commit, so a crash there leaves, at worst, a
+    ///   manifest entry pointing at an already-vanished file, which recovery
+    ///   already tolerates (`rebuild_from_manifest` skips unreadable files).
+    /// - A key that gets promoted back to hot (via a concurrent `GET`) or
+    ///   re-spilled between Phase 1's scan and Phase 2's removal cannot
+    ///   happen under the single-threaded-per-shard model this sweep runs
+    ///   under — there is no window for that race to open.
+    pub fn sweep_expired(
+        &mut self,
+        now_ms: u64,
+        shard_dir: &Path,
+        manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+        max_batch: usize,
+    ) -> std::io::Result<SweepStats> {
+        // Phase 1: identify expired keys, bounded to `max_batch`. HashMap
+        // iteration order is unspecified and may differ call-to-call; that is
+        // fine here — an entry left behind by the cap is simply picked up by
+        // a later sweep, it is never permanently skipped.
+        let mut expired_keys: Vec<Bytes> = Vec::new();
+        let mut more_remain = false;
+        for (key, loc) in self.map.iter() {
+            if loc.ttl_ms.is_some_and(|t| now_ms > t) {
+                if expired_keys.len() >= max_batch {
+                    more_remain = true;
+                    break;
+                }
+                expired_keys.push(key.clone());
+            }
+        }
+
+        if more_remain {
+            tracing::warn!(
+                capped_at = max_batch,
+                "cold_expired_sweep: more TTL-expired entries remain than fit this tick's \
+                 batch cap; deferring the remainder to the next sweep tick",
+            );
+        }
+
+        if expired_keys.is_empty() {
+            return Ok(SweepStats::default());
+        }
+
+        // Phase 2: remove entries + decrement their files' ref counts (same
+        // shape as `sweep_known_orphans`).
+        let mut stats = SweepStats::default();
+        for key in &expired_keys {
+            if let Some(old) = self.map.remove(key.as_ref()) {
+                stats.entries_reclaimed += 1;
+                if self.ref_dec(old.file_id) {
+                    self.pending_unlink.push(old.file_id);
+                }
+            }
+        }
+
+        // Phase 3: unlink now-zero-ref files (off the hot path).
+        stats.bytes_reclaimed = self.drain_pending_unlink(shard_dir, manifest)?;
+
+        if stats.entries_reclaimed > 0 {
+            crate::command::info_reclamation::record_cold_expired_reclaim(
+                stats.entries_reclaimed as u64,
+                stats.bytes_reclaimed,
+            );
+            tracing::info!(
+                entries = stats.entries_reclaimed,
+                bytes = stats.bytes_reclaimed,
+                "cold_expired_sweep: reclaimed TTL-expired cold entries that were never re-read",
+            );
+        }
+
+        Ok(stats)
+    }
+
     /// Unlink every `pending_unlink` file that still has zero live refs,
     /// tombstone its manifest entry, and commit once. Returns bytes reclaimed.
     ///
@@ -430,6 +563,7 @@ impl ColdIndex {
                                         file_id: entry.file_id,
                                         page_idx: page_idx as u32,
                                         slot_idx,
+                                        ttl_ms: kv.ttl_ms,
                                     },
                                 );
                             }
@@ -453,6 +587,7 @@ mod tests {
             file_id: 1,
             page_idx: 0,
             slot_idx: 0,
+            ttl_ms: None,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         assert_eq!(idx.len(), 1);
@@ -501,6 +636,7 @@ mod tests {
                 file_id: 5,
                 page_idx: 0,
                 slot_idx: 0,
+                ttl_ms: None,
             },
         );
         ci.insert(
@@ -509,6 +645,7 @@ mod tests {
                 file_id: 5,
                 page_idx: 0,
                 slot_idx: 1,
+                ttl_ms: None,
             },
         );
 
@@ -542,6 +679,7 @@ mod tests {
                 file_id: 7,
                 page_idx: 0,
                 slot_idx: 0,
+                ttl_ms: None,
             },
         );
         ci.insert(
@@ -550,6 +688,7 @@ mod tests {
                 file_id: 7,
                 page_idx: 0,
                 slot_idx: 1,
+                ttl_ms: None,
             },
         );
 
@@ -586,6 +725,7 @@ mod tests {
                 file_id: 10,
                 page_idx: 0,
                 slot_idx: 0,
+                ttl_ms: None,
             },
         );
         // Key re-spilled to a NEW file (re-eviction) -> file 10 orphaned.
@@ -595,6 +735,7 @@ mod tests {
                 file_id: 11,
                 page_idx: 0,
                 slot_idx: 0,
+                ttl_ms: None,
             },
         );
 
@@ -610,5 +751,225 @@ mod tests {
             "live file (11) wrongly deleted",
         );
         assert_eq!(ci.lookup(b"k").map(|l| l.file_id), Some(11));
+    }
+
+    // ── R1 / H-2: proactive TTL-expiry sweep ────────────────────────────────
+
+    /// RED->GREEN: a cold entry whose TTL has passed and which is NEVER
+    /// re-read (no GET touches it — the on-read reclaim path never fires)
+    /// must still be reclaimed by `sweep_expired`. This is the exact leak
+    /// described in tmp/OFFLOAD-COMPRESSION-REVIEW.md R1: before this fix,
+    /// nothing else in the system ever looks at a cold entry's TTL except a
+    /// read that never comes.
+    #[test]
+    fn test_sweep_expired_reclaims_never_read_entry() {
+        let tmp = make_shard_with_heap(&[20]);
+        let shard_dir = tmp.path();
+
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"stale_session"),
+            ColdLocation {
+                file_id: 20,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: Some(1_000), // expires at t=1000ms
+            },
+        );
+
+        // Sweep strictly after expiry. The key was never read.
+        let stats = ci
+            .sweep_expired(2_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
+            .unwrap();
+
+        assert_eq!(
+            stats.entries_reclaimed, 1,
+            "sweep must reclaim the never-read expired entry"
+        );
+        assert!(
+            stats.bytes_reclaimed > 0,
+            "sweep must reclaim the backing file's bytes (last live ref)"
+        );
+        assert!(
+            ci.lookup(b"stale_session").is_none(),
+            "index entry must be gone after sweep"
+        );
+        assert!(
+            !heap_path(shard_dir, 20).exists(),
+            "backing DataFile must be unlinked once its last live ref expires"
+        );
+    }
+
+    /// A cold entry with no TTL (`ttl_ms: None`) or a TTL still in the future
+    /// must NEVER be swept — only entries strictly past `now_ms` are expired.
+    #[test]
+    fn test_sweep_expired_ignores_live_entries() {
+        let tmp = make_shard_with_heap(&[21]);
+        let shard_dir = tmp.path();
+
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"no_ttl"),
+            ColdLocation {
+                file_id: 21,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+            },
+        );
+        ci.insert(
+            Bytes::from_static(b"future_ttl"),
+            ColdLocation {
+                file_id: 21,
+                page_idx: 0,
+                slot_idx: 1,
+                ttl_ms: Some(5_000),
+            },
+        );
+
+        let stats = ci
+            .sweep_expired(1_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
+            .unwrap();
+
+        assert_eq!(stats.entries_reclaimed, 0, "no entry has expired yet");
+        assert!(ci.lookup(b"no_ttl").is_some());
+        assert!(ci.lookup(b"future_ttl").is_some());
+        assert!(
+            heap_path(shard_dir, 21).exists(),
+            "file must survive when nothing has expired"
+        );
+    }
+
+    /// Batch-file colocation must hold for the TTL sweep exactly as it does
+    /// for the orphan-shadow sweep: an expired key must NOT drag down a
+    /// co-located LIVE key's file. The file unlinks only once BOTH entries
+    /// are gone (mirrors `test_sweep_deletes_file_only_when_last_ref_removed`).
+    #[test]
+    fn test_sweep_expired_retains_file_with_colocated_live_key() {
+        let tmp = make_shard_with_heap(&[22]);
+        let shard_dir = tmp.path();
+
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"expired"),
+            ColdLocation {
+                file_id: 22,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: Some(1_000),
+            },
+        );
+        ci.insert(
+            Bytes::from_static(b"still_live"),
+            ColdLocation {
+                file_id: 22,
+                page_idx: 0,
+                slot_idx: 1,
+                ttl_ms: Some(9_999_000),
+            },
+        );
+
+        // First sweep: only "expired" is past TTL.
+        let stats1 = ci
+            .sweep_expired(2_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
+            .unwrap();
+        assert_eq!(stats1.entries_reclaimed, 1);
+        assert!(ci.lookup(b"expired").is_none());
+        assert!(
+            ci.lookup(b"still_live").is_some(),
+            "co-located live-TTL key must remain resolvable"
+        );
+        assert!(
+            heap_path(shard_dir, 22).exists(),
+            "DATA LOSS: file holding a live co-located key was deleted"
+        );
+
+        // Second sweep, now past the second key's TTL too: last ref drops,
+        // file must finally be reclaimed.
+        let stats2 = ci
+            .sweep_expired(9_999_001, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
+            .unwrap();
+        assert_eq!(stats2.entries_reclaimed, 1);
+        assert!(
+            !heap_path(shard_dir, 22).exists(),
+            "file must be reclaimed once its last live ref also expires"
+        );
+    }
+
+    /// Design-for-failure: `max_batch` bounds one call's work. With more
+    /// expired entries than the cap, a single call must reclaim at most
+    /// `max_batch` of them (never zero, never more) — the remainder is
+    /// picked up by a subsequent call, proving no per-tick unbounded stall.
+    #[test]
+    fn test_sweep_expired_respects_batch_cap() {
+        let tmp = make_shard_with_heap(&[23]);
+        let shard_dir = tmp.path();
+
+        let mut ci = ColdIndex::new();
+        for i in 0..10u16 {
+            ci.insert(
+                Bytes::from(format!("k{i}")),
+                ColdLocation {
+                    file_id: 23,
+                    page_idx: 0,
+                    slot_idx: i,
+                    ttl_ms: Some(1_000),
+                },
+            );
+        }
+        assert_eq!(ci.len(), 10);
+
+        // Cap at 3 per call.
+        let stats1 = ci.sweep_expired(2_000, shard_dir, None, 3).unwrap();
+        assert_eq!(
+            stats1.entries_reclaimed, 3,
+            "one call must reclaim exactly max_batch entries when more are expired"
+        );
+        assert_eq!(ci.len(), 7, "the other 7 must remain for the next sweep");
+
+        // Draining the rest across further capped calls must eventually
+        // reach zero — no entry is permanently skipped by the cap.
+        let mut total_reclaimed = stats1.entries_reclaimed;
+        for _ in 0..10 {
+            if ci.len() == 0 {
+                break;
+            }
+            let s = ci.sweep_expired(2_000, shard_dir, None, 3).unwrap();
+            total_reclaimed += s.entries_reclaimed;
+        }
+        assert_eq!(
+            ci.len(),
+            0,
+            "all 10 expired entries must eventually reclaim"
+        );
+        assert_eq!(total_reclaimed, 10);
+    }
+
+    /// A sweep call with nothing expired must be a true no-op: zero entries
+    /// reclaimed, zero bytes, and it must not touch `pending_unlink` state
+    /// belonging to unrelated (non-TTL) reclamation paths.
+    #[test]
+    fn test_sweep_expired_noop_when_nothing_expired() {
+        let tmp = make_shard_with_heap(&[24]);
+        let shard_dir = tmp.path();
+
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"k"),
+            ColdLocation {
+                file_id: 24,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+            },
+        );
+
+        let stats = ci
+            .sweep_expired(1_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
+            .unwrap();
+        assert_eq!(stats.entries_reclaimed, 0);
+        assert_eq!(stats.bytes_reclaimed, 0);
+        assert!(!ci.has_pending_unlink());
+        assert_eq!(ci.len(), 1);
     }
 }

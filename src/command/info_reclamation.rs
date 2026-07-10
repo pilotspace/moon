@@ -340,6 +340,18 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
     );
 
+    // -- Cold-tier TTL-expiry reclamation (R1 / H-2: proactive reclaim of
+    //    never-re-read expired cold entries — a subset of the orphan
+    //    counters above, which count ANY zero-ref file unlink regardless of
+    //    cause; this counter isolates the TTL-expiry cause specifically) --
+    let _ = write!(
+        buf,
+        "reclamation_cold_expired_reclaimed_total:{}\r\n\
+         reclamation_cold_expired_bytes_reclaimed_total:{}\r\n",
+        RECL_COLD_EXPIRED_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    );
+
     buf.push_str("\r\n");
 }
 
@@ -530,6 +542,44 @@ mod tests {
              never-incremented static emits a permanent 0"
         );
     }
+
+    /// R1 / H-2: `record_cold_expired_reclaim` must be visible in the INFO
+    /// `# Reclamation` section, distinct from the (pre-existing) orphan
+    /// counters. Delta-based rather than store/restore-to-zero (matches the
+    /// `mmap_warm_bytes` test's approach) because this is a monotonic
+    /// cumulative counter that other tests/production sweeps may also touch
+    /// concurrently — asserting a floor of "at least our own delta" is robust
+    /// to that, asserting an exact absolute value is not.
+    #[test]
+    fn info_reclamation_cold_expired_reclaim_wirable() {
+        let (entries_before, bytes_before) = snapshot_cold_expired_totals();
+        record_cold_expired_reclaim(3, 12_288);
+
+        let mut buf = String::new();
+        write_reclamation_section(&mut buf);
+
+        let entries_emitted = buf
+            .lines()
+            .find_map(|l| l.strip_prefix("reclamation_cold_expired_reclaimed_total:"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .expect("reclamation_cold_expired_reclaimed_total field must be present and numeric");
+        let bytes_emitted = buf
+            .lines()
+            .find_map(|l| l.strip_prefix("reclamation_cold_expired_bytes_reclaimed_total:"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .expect(
+                "reclamation_cold_expired_bytes_reclaimed_total field must be present and numeric",
+            );
+
+        assert!(
+            entries_emitted >= entries_before + 3,
+            "cold_expired_reclaimed_total must reflect record_cold_expired_reclaim's entries delta"
+        );
+        assert!(
+            bytes_emitted >= bytes_before + 12_288,
+            "cold_expired_bytes_reclaimed_total must reflect record_cold_expired_reclaim's bytes delta"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,5 +605,41 @@ pub fn snapshot_cold_orphan_totals() -> (u64, u64) {
     (
         RECL_COLD_ORPHANS_RECLAIMED_TOTAL.load(Ordering::Relaxed),
         RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// R1 / H-2: Cold-tier proactive TTL-expiry reclamation counters
+// ---------------------------------------------------------------------------
+//
+// Distinct from the orphan counters above: those count ANY zero-ref file
+// unlink (hot-shadow orphan, re-eviction overwrite, or TTL expiry all share
+// the same `drain_pending_unlink` file-reclaim machinery). These counters
+// isolate the TTL-expiry cause specifically — the R1 fix
+// (tmp/OFFLOAD-COMPRESSION-REVIEW.md) for cold entries that expired and were
+// NEVER re-read, which previously leaked forever because nothing else in the
+// system ever inspects a cold entry's TTL except a read that never comes.
+
+/// Total cold-tier index entries reclaimed by the proactive TTL-expiry sweep
+/// ([`crate::storage::tiered::cold_index::ColdIndex::sweep_expired`]) since
+/// server start.
+pub static RECL_COLD_EXPIRED_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total bytes reclaimed by the TTL-expiry sweep specifically.
+pub static RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record entries+bytes reclaimed by one TTL-expiry sweep call.
+#[inline]
+pub fn record_cold_expired_reclaim(entries: u64, bytes: u64) {
+    RECL_COLD_EXPIRED_RECLAIMED_TOTAL.fetch_add(entries, Ordering::Relaxed);
+    RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Read current TTL-expiry reclamation totals.
+#[inline]
+pub fn snapshot_cold_expired_totals() -> (u64, u64) {
+    (
+        RECL_COLD_EXPIRED_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
     )
 }

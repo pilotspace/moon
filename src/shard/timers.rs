@@ -199,24 +199,38 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 /// present in the hot DashTable (i.e. a hot write shadowed the spilled copy).
 /// The corresponding DataFile and manifest entry are tombstoned atomically.
 ///
+/// Also runs the proactive TTL-expiry sweep (R1, H-2:
+/// `tmp/OFFLOAD-COMPRESSION-REVIEW.md`) in the same tick: cold entries whose
+/// TTL has passed and which were never re-read (the on-read reclaim in
+/// `cold_read.rs` only fires on an actual `GET`) previously leaked their
+/// index entry and file refcount forever. Sharing this tick's cadence keeps
+/// the plumbing (interval config, disk-offload gate, manifest handle) single
+/// -sourced rather than adding a second timer for the same "sweep the cold
+/// tier" concern.
+///
 /// Called from the shard event loop on a low-priority 5-minute timer (or the
 /// interval configured via `--cold-orphan-sweep-interval-secs`).
 ///
 /// # Concurrency
 ///
-/// Each database is locked with `write_db` for the duration of its sweep.
-/// This is safe: spill, read-promotion, and eviction all run under the same
-/// per-db write lock, preventing TOCTOU races with the sweep.
+/// Each database is accessed via `with_shard_db`, which gives exclusive
+/// access for the duration of the closure on this shard's own event-loop
+/// thread (thread-per-core model — no other thread ever touches this
+/// shard's databases). Spill, read-promotion, and eviction all run through
+/// the same single-threaded exclusivity, preventing TOCTOU races with either
+/// sweep.
 pub(crate) fn run_cold_orphan_sweep(
     shard_databases: &Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     shard_dir: &std::path::Path,
     mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    now_ms: u64,
 ) {
-    use crate::storage::tiered::cold_index::SweepStats;
+    use crate::storage::tiered::cold_index::{MAX_EXPIRED_SWEEP_BATCH, SweepStats};
 
     let db_count = shard_databases.db_count();
     let mut total = SweepStats::default();
+    let mut total_expired = SweepStats::default();
 
     for db_idx in 0..db_count {
         // Phase 1: collect orphan keys and pending-unlink flag inside with_shard_db.
@@ -242,30 +256,61 @@ pub(crate) fn run_cold_orphan_sweep(
             (orphan_keys, has_pending_unlink)
         });
 
-        if orphan_keys.is_empty() && !has_pending_unlink {
-            continue;
+        if !orphan_keys.is_empty() || has_pending_unlink {
+            // Phase 2: delete files + update cold_index (orphan-shadow reclaim).
+            let stats = crate::shard::slice::with_shard_db(db_idx, |db| {
+                db.cold_index.as_mut().and_then(|ci| {
+                    ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
+                        .map_err(|e| {
+                            tracing::error!(
+                                shard = shard_id,
+                                db = db_idx,
+                                err = %e,
+                                "cold_orphan_sweep: manifest commit error",
+                            );
+                            e
+                        })
+                        .ok()
+                })
+            });
+
+            if let Some(s) = stats {
+                total.entries_reclaimed += s.entries_reclaimed;
+                total.bytes_reclaimed = total.bytes_reclaimed.saturating_add(s.bytes_reclaimed);
+            }
         }
 
-        // Phase 2: delete files + update cold_index.
-        let stats = crate::shard::slice::with_shard_db(db_idx, |db| {
+        // R1 / H-2: TTL-expiry sweep. Independent of the orphan-shadow state
+        // above — a cold entry can expire and never be re-read regardless of
+        // whether any OTHER key on this db is hot-shadowed or has a file
+        // unlink pending, so this always runs (when the db has a cold index)
+        // rather than being gated by the `continue` above.
+        let expired_stats = crate::shard::slice::with_shard_db(db_idx, |db| {
             db.cold_index.as_mut().and_then(|ci| {
-                ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
-                    .map_err(|e| {
-                        tracing::error!(
-                            shard = shard_id,
-                            db = db_idx,
-                            err = %e,
-                            "cold_orphan_sweep: manifest commit error",
-                        );
-                        e
-                    })
-                    .ok()
+                ci.sweep_expired(
+                    now_ms,
+                    shard_dir,
+                    manifest.as_deref_mut(),
+                    MAX_EXPIRED_SWEEP_BATCH,
+                )
+                .map_err(|e| {
+                    tracing::error!(
+                        shard = shard_id,
+                        db = db_idx,
+                        err = %e,
+                        "cold_expired_sweep: manifest commit error",
+                    );
+                    e
+                })
+                .ok()
             })
         });
 
-        if let Some(s) = stats {
-            total.entries_reclaimed += s.entries_reclaimed;
-            total.bytes_reclaimed = total.bytes_reclaimed.saturating_add(s.bytes_reclaimed);
+        if let Some(s) = expired_stats {
+            total_expired.entries_reclaimed += s.entries_reclaimed;
+            total_expired.bytes_reclaimed = total_expired
+                .bytes_reclaimed
+                .saturating_add(s.bytes_reclaimed);
         }
     }
 
@@ -275,6 +320,14 @@ pub(crate) fn run_cold_orphan_sweep(
             entries = total.entries_reclaimed,
             bytes = total.bytes_reclaimed,
             "cold_orphan_sweep: shard sweep complete",
+        );
+    }
+    if total_expired.entries_reclaimed > 0 {
+        tracing::info!(
+            shard = shard_id,
+            entries = total_expired.entries_reclaimed,
+            bytes = total_expired.bytes_reclaimed,
+            "cold_expired_sweep: shard sweep complete",
         );
     }
 }
