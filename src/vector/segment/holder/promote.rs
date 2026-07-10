@@ -81,7 +81,6 @@ impl SegmentHolder {
                 immutable: snap.immutable.clone(),
                 ivf: snap.ivf.clone(),
                 warm: new_warm,
-                cold: snap.cold.clone(),
                 unloaded: still_unloaded,
             };
             self.segments.store(Arc::new(new_list));
@@ -155,7 +154,6 @@ impl SegmentHolder {
                 immutable: snap.immutable.clone(),
                 ivf: snap.ivf.clone(),
                 warm: new_warm,
-                cold: snap.cold.clone(),
                 unloaded: still_unloaded,
             };
             self.segments.store(Arc::new(new_list));

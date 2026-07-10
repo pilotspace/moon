@@ -294,7 +294,18 @@ pub struct VectorIndex {
     /// doubles as the keymap epoch (`keymap-<seq>.bin`) — one counter, so
     /// there is no separate race between "job ordering" and "which keymap
     /// file is current".
-    next_snapshot_seq: u64,
+    ///
+    /// `AtomicU64`, not a plain `u64`: `persist_hook_after_install` is called
+    /// from both a `&mut self` context (compact/merge install) and a `&self`
+    /// context (`try_warm_transitions_idle`, which only holds `&self` because
+    /// its caller iterates `self.indexes.values()` — see that fn's callsite).
+    /// `VectorIndex` (via `HashMap<Bytes, VectorIndex>` inside `VectorStore`)
+    /// must stay `Sync` — see `vector_store_version_token_monotonic_concurrent`
+    /// — which rules out `Cell`; `Relaxed` ordering is enough since every
+    /// actual writer is the single owning shard thread (this only needs to be
+    /// a valid *value*, not a cross-thread synchronization point), matching
+    /// `version_token`'s existing atomic-counter pattern on `VectorStore`.
+    next_snapshot_seq: AtomicU64,
     /// Shared watermark of the highest snapshot `seq` durably committed for
     /// this index (B2). Cloned into every snapshot job; the worker holds
     /// this lock across its entire write+GC critical section so a stale job
@@ -512,7 +523,6 @@ impl VectorIndex {
                     immutable: imm_list,
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
-                    cold: snap.cold.clone(),
                     unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
@@ -629,7 +639,6 @@ impl VectorIndex {
                         immutable: imm_list,
                         ivf: old.ivf.clone(),
                         warm: old.warm.clone(),
-                        cold: old.cold.clone(),
                         unloaded: old.unloaded.clone(),
                     };
                     segments.swap(new_list);
@@ -685,7 +694,15 @@ impl VectorIndex {
     /// maps are `Arc`-wrapped with copy-on-write writers) plus a handful of
     /// scalars; the actual keymap build (iterating every live key) and all
     /// file I/O happens on the snapshot worker thread.
-    fn persist_hook_after_install(&mut self) {
+    ///
+    /// `&self`, not `&mut self` (see `next_snapshot_seq`'s doc comment): also
+    /// called from `try_warm_transitions_idle`, which only has shared access.
+    /// Rebuilding `segment_ids` from `snap.immutable` alone (never
+    /// `snap.warm`) is what drives the WARM-transition leak fix — once a
+    /// segment moves to `snap.warm` it drops out of this list, so the next
+    /// snapshot job's manifest diff GCs its now-superseded
+    /// `idx-<hex>/segment-<old_id>/` directory (see `run_snapshot_job`).
+    fn persist_hook_after_install(&self) {
         let Some(dir) = self.persist_dir.clone() else {
             return;
         };
@@ -700,8 +717,7 @@ impl VectorIndex {
         let next_global_id = snap.mutable.next_global_id();
         drop(snap);
 
-        self.next_snapshot_seq += 1;
-        let seq = self.next_snapshot_seq;
+        let seq = self.next_snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1;
 
         let manifest = crate::vector::persistence::manifest::IndexManifest {
             format_version: crate::vector::persistence::manifest::MANIFEST_FORMAT_VERSION,
@@ -964,7 +980,6 @@ impl VectorIndex {
             immutable: imm_list,
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
-            cold: snap.cold.clone(),
             unloaded: snap.unloaded.clone(),
         };
         drop(snap);
@@ -1203,7 +1218,6 @@ impl VectorIndex {
             immutable: new_immutable,
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
-            cold: snap.cold.clone(),
             unloaded: snap.unloaded.clone(),
         };
         drop(snap);
@@ -1373,13 +1387,13 @@ impl VectorIndex {
                     // The ImmutableSegment is purely in-memory (no on-disk files),
                     // so it needs no SegmentHandle tombstoning -- it's simply dropped.
                     //
-                    // Tombstone lifecycle for the NEW warm/cold segment:
+                    // Tombstone lifecycle for the NEW warm/cold-stub segment:
                     //   1. `handle` (SegmentHandle) is passed to WarmSearchSegment below
                     //   2. WarmSearchSegment stores it as `_handle` (Arc refcount);
-                    //      for a COLD destination, `UnloadedSegment::from_warm`
+                    //      for a COLD-stub destination, `UnloadedSegment::from_warm`
                     //      captures a clone of the same handle before the
                     //      WarmSearchSegment is dropped.
-                    //   3. When later transitioned to cold (WARM->COLD/DiskAnn):
+                    //   3. When later idle-transitioned WARM -> COLD-stub:
                     //      mark_tombstoned() is called
                     //   4. On index drop / FLUSH: mark_tombstoned() is called
                     //   5. Directory is deleted only when last Arc ref drops AND tombstoned
@@ -1455,8 +1469,8 @@ impl VectorIndex {
         if transitioned > 0 {
             // Functional-update clone-and-patch (item 6, adversarial review):
             // only the 3 fields this function actually touches are named;
-            // `mutable`/`ivf`/`cold` come along via `..(**snapshot).clone()`
-            // without being enumerated here.
+            // `mutable`/`ivf` come along via `..(**snapshot).clone()` without
+            // being enumerated here.
             let new_list = SegmentList {
                 immutable: new_immutable,
                 warm: new_warm,
@@ -1464,91 +1478,17 @@ impl VectorIndex {
                 ..(**snapshot).clone()
             };
             self.segments.swap(new_list);
-        }
-        transitioned
-    }
-}
 
-impl VectorIndex {
-    /// Check each warm segment's age. If older than `cold_after_secs`,
-    /// transition it to cold tier (PQ codes in RAM + Vamana graph on NVMe).
-    ///
-    /// After transition, the warm segment is replaced by a DiskAnnSegment
-    /// that performs approximate search via PQ asymmetric distance and
-    /// Vamana beam traversal from disk. The warm segment is tombstoned.
-    ///
-    /// Returns the number of segments transitioned.
-    pub fn try_cold_transitions(
-        &self,
-        shard_dir: &std::path::Path,
-        manifest: &mut crate::persistence::manifest::ShardManifest,
-        cold_after_secs: u64,
-        next_file_id: &mut u64,
-    ) -> usize {
-        let snapshot = self.segments.load();
-        let mut to_cold: Vec<usize> = Vec::new();
-        for (i, warm) in snapshot.warm.iter().enumerate() {
-            if warm.age_secs() >= cold_after_secs {
-                to_cold.push(i);
-            }
-        }
-        if to_cold.is_empty() {
-            return 0;
-        }
-
-        let mut new_warm = snapshot.warm.clone();
-        let mut new_cold = snapshot.cold.clone();
-        let mut transitioned = 0usize;
-        let dim = self.meta.dimension as usize;
-
-        // Process in reverse order to maintain valid indices during removal.
-        for &idx in to_cold.iter().rev() {
-            let warm_seg = &snapshot.warm[idx];
-            let warm_file_id = warm_seg.segment_id();
-            let cold_file_id = *next_file_id;
-            *next_file_id += 1;
-
-            match crate::storage::tiered::cold_tier::transition_to_cold(
-                shard_dir,
-                warm_seg,
-                warm_file_id,
-                cold_file_id,
-                dim,
-                manifest,
-            ) {
-                Ok(diskann_seg) => {
-                    new_warm.remove(idx);
-                    new_cold.push(Arc::new(diskann_seg));
-                    tracing::info!(
-                        "Cold transition: segment {} ({} vectors, age {}s) -> DiskANN cold",
-                        cold_file_id,
-                        warm_seg.total_count(),
-                        warm_seg.age_secs(),
-                    );
-                    // Mark the old warm segment for cleanup when refs drop.
-                    warm_seg.mark_tombstoned();
-                    transitioned += 1;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Cold transition failed for warm segment {}: {}",
-                        warm_file_id,
-                        e
-                    );
-                }
-            }
-        }
-
-        if transitioned > 0 {
-            let new_list = SegmentList {
-                mutable: Arc::clone(&snapshot.mutable),
-                immutable: snapshot.immutable.clone(),
-                ivf: snapshot.ivf.clone(),
-                warm: new_warm,
-                cold: new_cold,
-                unloaded: snapshot.unloaded.clone(),
-            };
-            self.segments.swap(new_list);
+            // Leak fix (WARM restart-recovery hardening): a segment that
+            // just left `immutable` (moved to `warm` or `unloaded`) must
+            // drop out of Stack B's durable `segment_ids` too, or its old
+            // `idx-<hex>/segment-<old_id>/` directory is never GC'd (it
+            // sits there forever — see `run_snapshot_job`'s manifest diff)
+            // and a future restart would reload it as a fully-materialized
+            // HOT segment instead of respecting the WARM/COLD tier it was
+            // just moved to. Cheap + a no-op when `persist_dir` is unset
+            // (disk-offload/persistence both off).
+            self.persist_hook_after_install();
         }
         transitioned
     }
@@ -1576,6 +1516,47 @@ pub struct VectorStore {
     /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
     /// - Failed writes (index-not-found, parse errors) do NOT bump the counter.
     version_token: AtomicU64,
+}
+
+/// Read `manifest.json` and the keymap file for whatever epoch it points to,
+/// as a matched pair, tolerating the narrow TOCTOU window where a concurrent
+/// snapshot job (`run_snapshot_job`) advances the manifest to a NEW epoch and
+/// GCs the OLD epoch's keymap file in between our manifest read and our
+/// keymap read. `write_keymap_atomic` always durably lands before
+/// `write_manifest_atomic` repoints `manifest.json` at it (see
+/// `run_snapshot_job`), so re-reading the manifest after a keymap miss is
+/// guaranteed to observe a keymap that IS present — bounded retry, no sleep,
+/// no production-relevant race (this window can only be hit by two snapshot
+/// jobs for the SAME index racing a concurrent `register_warm_segments`
+/// read; in production nothing submits a new job for an index between B3
+/// recovery finishing and this being called at boot).
+fn read_manifest_and_keymap_consistent(
+    idx_dir: &std::path::Path,
+) -> Option<Vec<crate::vector::persistence::manifest::KeymapEntry>> {
+    // `read_manifest_tolerant` + `read_keymap_tolerant` are two separate
+    // reads, not one atomic snapshot: a concurrent `run_snapshot_job` can
+    // advance `manifest.json` to a new keymap_epoch and GC the old
+    // `keymap-<epoch>.bin` in the gap between them. `run_snapshot_job`
+    // always durably writes the new keymap BEFORE repointing the manifest
+    // at it, so a manifest read that observes epoch E guarantees
+    // `keymap-E.bin` was written no later than that — the only way our
+    // second read can still miss it is if a LATER job's GC deleted it in
+    // between, which a short bounded retry (with real backoff, since the
+    // race is against fsync-bound disk I/O, not just CPU cache lines)
+    // resolves by re-reading both files against whatever epoch is current
+    // by then.
+    for attempt in 0..5 {
+        let m = crate::vector::persistence::manifest::read_manifest_tolerant(idx_dir)?;
+        if let Some(entries) =
+            crate::vector::persistence::manifest::read_keymap_tolerant(idx_dir, m.keymap_epoch)
+        {
+            return Some(entries);
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    None
 }
 
 impl VectorStore {
@@ -1771,7 +1752,7 @@ impl VectorStore {
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: floor_next_segment_id,
-                next_snapshot_seq: floor_next_snapshot_seq,
+                next_snapshot_seq: AtomicU64::new(floor_next_snapshot_seq),
                 persist_seq_watermark: Arc::new(parking_lot::Mutex::new(floor_next_snapshot_seq)),
                 autocompact_enabled: true,
                 merge_recall_tolerance: 0.70,
@@ -1899,7 +1880,7 @@ impl VectorStore {
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: manifest.next_segment_id,
-                next_snapshot_seq: manifest.keymap_epoch,
+                next_snapshot_seq: AtomicU64::new(manifest.keymap_epoch),
                 persist_seq_watermark: Arc::new(parking_lot::Mutex::new(manifest.keymap_epoch)),
                 autocompact_enabled: true,
                 merge_recall_tolerance: 0.70,
@@ -2459,85 +2440,272 @@ impl VectorStore {
         total
     }
 
-    /// Attempt cold transitions for ALL indexes. Called from persistence tick.
-    ///
-    /// Scans warm segments in each index, transitions those older than
-    /// `cold_after_secs` to DiskANN cold tier. Returns total count.
-    pub fn try_cold_transitions_all(
-        &self,
-        shard_dir: &std::path::Path,
-        manifest: &mut crate::persistence::manifest::ShardManifest,
-        cold_after_secs: u64,
-        next_file_id: &mut u64,
-    ) -> usize {
-        let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
-        let mut total = 0;
-        for name in names {
-            if let Some(idx) = self.indexes.get(&name) {
-                total +=
-                    idx.try_cold_transitions(shard_dir, manifest, cold_after_secs, next_file_id);
-            }
-        }
-        total
-    }
-
     /// Register warm segments recovered from disk into the appropriate indexes.
     ///
     /// Called during shard restore after v3 recovery identifies warm-tier segments
-    /// in the manifest. For each (segment_id, segment_dir), tries to open a
-    /// WarmSearchSegment and add it to whatever index matches the collection metadata.
+    /// in the manifest (`Shard::recovered_warm_segments`, staged after Stack A's
+    /// `restore_from_persistence`). **Ordering (PR review round 2, commit 4):**
+    /// this MUST run right after the sidecar `create_index` loop, BEFORE the
+    /// keyspace dedup rescan (`RecoveryState::reconcile_key`) — see
+    /// `event_loop.rs`. Running it after the rescan (as an earlier revision
+    /// did) let the rescan observe warm keys as "unknown" (never loaded into
+    /// `key_hash_to_key`/`key_hash_to_global_id` here — see point 2 below),
+    /// forcing a full re-encode into the mutable segment; that re-encode then
+    /// made the duplication check below see the just-re-indexed keys as
+    /// "already covered" and RETIRE the warm segment, permanently deleting
+    /// it and re-quantizing its vectors — the exact failure this feature
+    /// exists to prevent, on every normal restart, not just a crash.
+    ///
+    /// Two evidence-based safety checks guard every segment, both keyed off
+    /// its own `key_hash` set (read cheaply from `mvcc.mpf` via
+    /// `warm_search::peek_key_hashes` — no codes/graph mmap, no
+    /// `CollectionMetadata` dependency):
+    ///
+    /// 1. **Ownership** (PR review finding #2): the old implementation
+    ///    attached a segment to the FIRST index for which
+    ///    `WarmSearchSegment::from_files` happened to succeed —
+    ///    `from_files` accepts ANY caller-supplied collection and never
+    ///    validates it against the file contents, so with two indexes of
+    ///    the same dimension/quantization it could silently pick the WRONG
+    ///    one. Ownership is instead decided by reading each candidate
+    ///    index's persisted Stack-B keymap straight off disk (the file, not
+    ///    the in-memory `key_hash_to_key` — which is legitimately empty for
+    ///    a cleanly garbage-collected warm segment, see the leak fix in
+    ///    `try_warm_transitions_idle`) and picking whichever index has the
+    ///    most key_hash overlap. No match, or a tie between two indexes ->
+    ///    warn and leave the segment unregistered (files intact) rather
+    ///    than guess.
+    /// 2. **Duplication** (PR review finding #1, CRITICAL): `transition_to_warm`
+    ///    commits Stack A's shard manifest durably BEFORE
+    ///    `persist_hook_after_install`'s Stack B snapshot job (async,
+    ///    background thread) commits its own GC. A `kill -9` in that window
+    ///    leaves the OLD segment still tracked as HOT by Stack B (reloaded
+    ///    as an `immutable` segment by `recover_v2`, since its id is still
+    ///    in the stale `segment_ids`) *and* this WARM copy discovered by
+    ///    Stack A — the same vectors would live twice, permanently
+    ///    (`search_mvcc`'s merge has no key_hash dedup, and Stack B's next
+    ///    snapshot re-adopts the reloaded HOT copy into `segment_ids`, so
+    ///    it never self-heals). If the decided owner's CURRENT in-memory
+    ///    `key_hash_to_key` (i.e. what Stack B actually recovered) already
+    ///    covers this segment's key_hashes, the HOT copy wins: skip
+    ///    attaching the warm copy and retire its on-disk files instead.
+    ///
+    /// On a clean (non-duplicate) attach, this also **populates**
+    /// `key_hash_to_key`/`key_hash_to_global_id`/`key_hash_to_vec_checksum`
+    /// for the segment's keys from the SAME owner-evidence keymap entries
+    /// used for ownership above — without this, `recover_v2::reconcile_key`
+    /// would see every warm key as unknown (full re-encode, see the
+    /// ordering note above) and `FT.SEARCH` would resolve warm docs to a
+    /// synthetic `vec:<id>` instead of their real key (the map that backs
+    /// key-bytes resolution is exactly this one). A segment key_hash absent
+    /// from the owner's persisted keymap means the async snapshot job that
+    /// would have durably recorded it never committed before an earlier
+    /// crash (the same class of race as finding #1, at per-key rather than
+    /// per-segment granularity, e.g. a key written between the last
+    /// snapshot and the transition-then-crash): left out of the in-memory
+    /// maps so the rescan re-indexes it fresh into mutable, AND tombstoned
+    /// in the warm copy for that specific key_hash (`seed_tombstones`) so
+    /// the stale warm copy doesn't sit alongside the freshly re-indexed one
+    /// — same no-dedup `search_mvcc` hazard as finding #1, just narrower.
     pub fn register_warm_segments(&mut self, warm_segments: Vec<(u64, std::path::PathBuf)>) {
-        use crate::vector::persistence::warm_search::WarmSearchSegment;
+        use crate::vector::persistence::manifest::KeymapEntry;
+        use crate::vector::persistence::warm_search::{WarmSearchSegment, peek_key_hashes};
 
         let mut loaded = 0usize;
+        let mut retired_duplicates = 0usize;
+        let mut unregistered = 0usize;
+
         for (segment_id, segment_dir) in &warm_segments {
-            // Try each index — the segment belongs to whichever collection's metadata
-            // matches the codes data. In practice there's usually one index per shard.
-            for idx in self.indexes.values() {
-                let handle = SegmentHandle::new(*segment_id, segment_dir.clone());
-                match WarmSearchSegment::from_files(
-                    segment_dir,
-                    *segment_id,
-                    idx.collection.clone(),
-                    handle,
-                    false, // mlock_codes off during recovery (can be changed later)
-                ) {
-                    Ok(warm_seg) => {
-                        let old = idx.segments.load();
-                        let mut new_warm = old.warm.clone();
-                        new_warm.push(std::sync::Arc::new(warm_seg));
-                        let new_list = crate::vector::segment::SegmentList {
-                            mutable: std::sync::Arc::clone(&old.mutable),
-                            immutable: old.immutable.clone(),
-                            ivf: old.ivf.clone(),
-                            warm: new_warm,
-                            cold: old.cold.clone(),
-                            unloaded: old.unloaded.clone(),
+            let seg_key_hashes = match peek_key_hashes(segment_dir) {
+                Ok(hs) => hs,
+                Err(e) => {
+                    tracing::warn!(
+                        "warm segment {segment_id} at {segment_dir:?}: failed to read \
+                         mvcc.mpf for ownership attribution: {e} — leaving unregistered"
+                    );
+                    unregistered += 1;
+                    continue;
+                }
+            };
+            let seg_key_hash_set: std::collections::HashSet<u64> =
+                seg_key_hashes.iter().copied().collect();
+
+            // Finding #2: decide ownership from persisted keymap evidence
+            // (majority-match), never from `from_files` success alone. The
+            // winning candidate's keymap entries are RETAINED (not just
+            // counted) — they're the evidence source for populating the
+            // in-memory maps below, avoiding a second disk read (and a
+            // second TOCTOU window) for the same file.
+            let mut owner: Option<Bytes> = None;
+            let mut owner_matches = 0usize;
+            let mut owner_entries: Vec<KeymapEntry> = Vec::new();
+            let mut ambiguous = false;
+            if !seg_key_hash_set.is_empty() {
+                if let Some(store_dir) = self.persist_dir.clone() {
+                    for name in self.indexes.keys() {
+                        let idx_dir = crate::vector::persistence::manifest::index_persist_dir(
+                            &store_dir, name,
+                        );
+                        let Some(entries) = read_manifest_and_keymap_consistent(&idx_dir) else {
+                            continue;
                         };
-                        idx.segments.swap(new_list);
-                        loaded += 1;
-                        tracing::info!(
-                            "Registered warm segment {} from {:?}",
-                            segment_id,
-                            segment_dir
-                        );
-                        break; // Segment belongs to one index only
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "Warm segment {} not compatible with index: {}",
-                            segment_id,
-                            e
-                        );
+                        let matches = entries
+                            .iter()
+                            .filter(|e| seg_key_hash_set.contains(&e.key_hash))
+                            .count();
+                        if matches == 0 {
+                            continue;
+                        }
+                        match matches.cmp(&owner_matches) {
+                            std::cmp::Ordering::Greater => {
+                                owner = Some(name.clone());
+                                owner_matches = matches;
+                                owner_entries = entries;
+                                ambiguous = false;
+                            }
+                            std::cmp::Ordering::Equal if owner.as_ref() != Some(name) => {
+                                ambiguous = true;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
+
+            let Some(owner_name) = owner else {
+                tracing::warn!(
+                    "warm segment {segment_id} at {segment_dir:?}: no index's persisted \
+                     keymap contains any of its {} key_hash(es) — leaving unregistered \
+                     (files intact)",
+                    seg_key_hash_set.len()
+                );
+                unregistered += 1;
+                continue;
+            };
+            if ambiguous {
+                tracing::warn!(
+                    "warm segment {segment_id} at {segment_dir:?}: key_hash evidence matches \
+                     multiple indexes equally — refusing to guess, leaving unregistered"
+                );
+                unregistered += 1;
+                continue;
+            }
+
+            // Finding #1: is this segment's data ALREADY live via a
+            // reloaded HOT copy (the crash-before-GC race)? Check the
+            // owner's CURRENT in-memory key_hash_to_key, which reflects
+            // exactly what Stack B's own recovery pass actually attached.
+            let Some(idx) = self.indexes.get_mut(&owner_name) else {
+                unregistered += 1;
+                continue;
+            };
+            let already_covered = seg_key_hash_set
+                .iter()
+                .any(|kh| idx.key_hash_to_key.contains_key(kh));
+            if already_covered {
+                tracing::warn!(
+                    "warm segment {segment_id} for index {:?}: key_hashes already covered \
+                     by a live HOT segment (crash landed before Stack-B's GC of the \
+                     superseded segment committed) — retiring the warm copy instead of \
+                     attaching a duplicate",
+                    String::from_utf8_lossy(&owner_name)
+                );
+                if let Err(e) = std::fs::remove_dir_all(segment_dir) {
+                    tracing::warn!(
+                        "failed to retire superseded warm segment directory {segment_dir:?}: \
+                         {e} (harmless: Stack A's recovery already tolerates a manifest \
+                         entry whose directory is missing, so this is retried — as a no-op \
+                         once the directory is gone — every future restart until it succeeds)"
+                    );
+                }
+                retired_duplicates += 1;
+                continue;
+            }
+
+            let handle = SegmentHandle::new(*segment_id, segment_dir.clone());
+            match WarmSearchSegment::from_files(
+                segment_dir,
+                *segment_id,
+                idx.collection.clone(),
+                handle,
+                false, // mlock_codes off during recovery (can be changed later)
+            ) {
+                Ok(warm_seg) => {
+                    // Populate the in-memory maps from the owner-evidence
+                    // keymap entries so the rescan (which runs right after
+                    // this) sees these keys as known/unchanged instead of
+                    // re-indexing them, and FT.SEARCH resolves real key
+                    // bytes for them. Any key_hash missing from the
+                    // persisted keymap is left out (rescan self-heals it
+                    // into mutable) and tombstoned in this warm copy so the
+                    // two never coexist as live duplicates.
+                    let entries_by_hash: std::collections::HashMap<u64, &KeymapEntry> =
+                        owner_entries.iter().map(|e| (e.key_hash, e)).collect();
+                    let mut missing_from_keymap: Vec<u64> = Vec::new();
+                    for kh in &seg_key_hash_set {
+                        if let Some(entry) = entries_by_hash.get(kh) {
+                            idx.key_hash_to_key
+                                .insert(entry.key_hash, entry.key.clone());
+                            idx.key_hash_to_global_id
+                                .insert(entry.key_hash, entry.global_id);
+                            idx.key_hash_to_vec_checksum
+                                .insert(entry.key_hash, entry.vec_checksum);
+                        } else {
+                            missing_from_keymap.push(*kh);
+                        }
+                    }
+                    if !missing_from_keymap.is_empty() {
+                        warm_seg.seed_tombstones(&missing_from_keymap);
+                        tracing::warn!(
+                            "warm segment {segment_id} for index {:?}: {} key_hash(es) missing \
+                             from the persisted keymap (an earlier async-snapshot job never \
+                             committed for them) — left out of the in-memory keymap and \
+                             tombstoned in the warm copy; the keyspace rescan will re-index \
+                             them fresh into the mutable segment",
+                            String::from_utf8_lossy(&owner_name),
+                            missing_from_keymap.len()
+                        );
+                    }
+
+                    let old = idx.segments.load();
+                    let mut new_warm = old.warm.clone();
+                    new_warm.push(std::sync::Arc::new(warm_seg));
+                    let new_list = crate::vector::segment::SegmentList {
+                        mutable: std::sync::Arc::clone(&old.mutable),
+                        immutable: old.immutable.clone(),
+                        ivf: old.ivf.clone(),
+                        warm: new_warm,
+                        unloaded: old.unloaded.clone(),
+                    };
+                    idx.segments.swap(new_list);
+                    loaded += 1;
+                    tracing::info!(
+                        "Registered warm segment {} from {:?} into index {:?}",
+                        segment_id,
+                        segment_dir,
+                        String::from_utf8_lossy(&owner_name)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "warm segment {} at {:?}: open failed for owner index {:?}: {}",
+                        segment_id,
+                        segment_dir,
+                        String::from_utf8_lossy(&owner_name),
+                        e
+                    );
+                    unregistered += 1;
+                }
+            }
         }
-        if loaded > 0 {
+        if loaded > 0 || retired_duplicates > 0 || unregistered > 0 {
             tracing::info!(
-                "Registered {}/{} warm segments on startup",
+                "Registered {}/{} warm segments on startup ({} retired as duplicates, \
+                 {} left unregistered)",
                 loaded,
-                warm_segments.len()
+                warm_segments.len(),
+                retired_duplicates,
+                unregistered
             );
         }
     }
@@ -2566,42 +2734,6 @@ impl VectorStore {
         }
 
         total_evicted
-    }
-
-    /// Register cold DiskANN segments recovered from disk into the appropriate indexes.
-    ///
-    /// Called during shard restore after v3 recovery identifies cold-tier segments
-    /// in the manifest. For each (segment_id, segment_dir), logs the discovery.
-    ///
-    /// Full DiskAnnSegment reconstruction from disk requires serialized PQ codebooks
-    /// (future work). For now, this discovers and logs cold segments so they are
-    /// tracked by the system. Full loading will be added when PQ codebook
-    /// serialization is implemented.
-    pub fn register_cold_segments(&mut self, cold_segments: Vec<(u64, std::path::PathBuf)>) {
-        let mut loaded = 0usize;
-        for (segment_id, segment_dir) in &cold_segments {
-            // Try each index -- the segment belongs to whichever collection matches.
-            for idx in self.indexes.values() {
-                let seg_vamana = segment_dir.join("vamana.mpf");
-                if seg_vamana.exists() {
-                    tracing::info!(
-                        "Cold segment {} at {:?} discovered for index {:?} (full loading requires stored PQ codebook)",
-                        segment_id,
-                        segment_dir,
-                        std::str::from_utf8(&idx.meta.name).unwrap_or("<non-utf8>"),
-                    );
-                    loaded += 1;
-                    break; // Segment belongs to one index only
-                }
-            }
-        }
-        if loaded > 0 {
-            tracing::info!(
-                "Discovered {}/{} cold segments on startup",
-                loaded,
-                cold_segments.len()
-            );
-        }
     }
 
     // ── P2: Segment merge public API ──────────────────────────────────────────
@@ -2766,7 +2898,6 @@ impl VectorStore {
                     immutable: new_immutable,
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
-                    cold: snap.cold.clone(),
                     unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
@@ -2838,7 +2969,6 @@ impl VectorStore {
                     immutable: vec![Arc::new(merged)],
                     ivf: old.ivf.clone(),
                     warm: old.warm.clone(),
-                    cold: old.cold.clone(),
                     unloaded: old.unloaded.clone(),
                 };
                 idx.segments.swap(new_list);
@@ -2979,7 +3109,6 @@ fn enforce_segment_holder_budget(
         immutable: snapshot.immutable.clone(),
         ivf: snapshot.ivf.clone(),
         warm: snapshot.warm.clone(),
-        cold: snapshot.cold.clone(),
         unloaded: snapshot.unloaded.clone(),
     };
 
@@ -3557,7 +3686,6 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         };
         idx.segments.swap(new_list);
@@ -3643,7 +3771,6 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
-            cold: Vec::new(),
             unloaded: Vec::new(),
         });
         drop(old_snap);
@@ -3704,34 +3831,6 @@ mod tests {
         let idx = store.get_index(b"idx_default").unwrap();
         assert_eq!(idx.collection.codebook.len(), 16);
         assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant4);
-    }
-
-    // -- Cold segment registration tests (Phase 79-04) --
-
-    #[test]
-    fn test_register_cold_segments_empty() {
-        let mut store = VectorStore::new();
-        store
-            .create_index(make_meta("idx", 128, &["doc:"]))
-            .unwrap();
-        // Should not panic with empty input
-        store.register_cold_segments(Vec::new());
-    }
-
-    #[test]
-    fn test_register_cold_segments_discovers() {
-        let mut store = VectorStore::new();
-        store
-            .create_index(make_meta("idx", 128, &["doc:"]))
-            .unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let seg_dir = tmp.path().join("segment-10-diskann");
-        std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("vamana.mpf"), [0u8; 64]).unwrap();
-
-        // Should discover the segment without panicking
-        store.register_cold_segments(vec![(10, seg_dir)]);
     }
 }
 

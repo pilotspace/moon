@@ -185,6 +185,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untrusted length/count against the bytes actually remaining in the input
   before allocating. No wire-format or valid-file behavior changes — a
   legitimate length/count always fits within the remaining input.
+### Removed — Experimental DiskANN COLD vector tier
+
+- **Deleted the experimental "COLD-ann" vector tier** (`src/storage/tiered/cold_tier.rs`,
+  the whole `src/vector/diskann/` module — Vamana graph, product quantizer,
+  co-located page format, io_uring beam search). It was gated off by default
+  (`MOON_VEC_COLD_TIER=1`), incomplete by its own docs (no cold-segment
+  deletion, ADC-only recall, no restart-time PQ-codebook reload), and had no
+  restart recovery story. The M3-exit review decided delete-over-finish. The
+  default COLD valve remains `SegmentList.unloaded` (`UnloadedSegment`,
+  exact, near-zero RAM, reload-on-touch) plus WARM byte-budget LRU eviction
+  (`--vec-warm-mmap-budget`) — neither is affected by this removal.
+- Removed the dead call chain: `VectorIndex::try_cold_transitions[_all]`,
+  `VectorStore::register_cold_segments`, the COLD 60s event-loop timer arm
+  (tokio + monoio), `cold_tier_experimental_enabled()`, cold-segment manifest
+  discovery in `src/persistence/recovery.rs` (`RecoveryResult::cold_segments`
+  / `cold_segments_loaded`), and the `snap.cold` fan-out in `FT.SEARCH` /
+  `FT.INFO` / `SegmentHolder::resident_bytes`/`total_vectors`.
+- `--segment-cold-after`, `--segment-cold-min-qps`, `--vec-diskann-beam-width`,
+  `--vec-diskann-cache-levels` are kept as **parseable, inert no-ops** (rather
+  than a hard CLI break) so existing `moon.conf` files/launch scripts do not
+  fail to start; a startup `tracing::warn!` fires once if any is set away
+  from its historical default (`ServerConfig::warn_deprecated_cold_tier_flags`,
+  called from `main.rs`).
+- `StorageTier::Cold`/`Archive` (the shared on-disk tier-byte enum in
+  `src/persistence/manifest.rs`, format §4.3) are left in place — they are
+  part of the stable `FileEntry.tier` wire format and shared with the
+  unrelated KV disk-offload subsystem's `ColdIndex`/`sweep_orphans` (which
+  this change does not touch).
+
+### Fixed — Vector: WARM segments now survive a restart, and stop leaking superseded segment directories
+
+- **Restart-recovery dead wiring fixed.** `VectorStore::register_warm_segments`
+  had zero non-test callers: `Shard::restore_from_persistence`'s v3 recovery
+  pass discovered WARM segments from the manifest (`RecoveryResult.warm_segments`)
+  into a throwaway `Shard`-owned `vector_store` that `event_loop.rs` discards
+  wholesale in favor of the live `ShardSlice.vector_store` — so the discovery
+  result was thrown away with it, and WARM's RSS win evaporated on every
+  restart. Fixed by staging the discovered segments on a new
+  `Shard::recovered_warm_segments` field and draining them into the live
+  store via `register_warm_segments` right after B3 recovery
+  (`RecoveryState::finish`) completes in `event_loop.rs`.
+- **Superseded segment-directory leak fixed.** `VectorIndex::try_warm_transitions_idle`
+  never told Stack B's durability manifest (`vector/persistence/manifest.rs`)
+  that a segment had left the immutable tier, so the old
+  `idx-<hex>/segment-<old_id>/` directory it left behind was never garbage
+  collected — permanent disk growth on every HOT→WARM/COLD transition, and
+  (independently) the reason a restart used to silently reload the segment
+  as a fully-materialized HOT copy of stale data instead of respecting the
+  WARM tier it had just been moved to. Fixed by calling the existing
+  `persist_hook_after_install` durability hook after every transition; its
+  manifest diff (`run_snapshot_job`) now GCs the superseded directory the
+  same way a normal compact/merge already does.
+- `VectorIndex::persist_hook_after_install` changed from `&mut self` to
+  `&self` so `try_warm_transitions_idle` (which only holds `&self`) can call
+  it; `next_snapshot_seq` changed from `u64` to `AtomicU64` to keep
+  `VectorIndex`/`VectorStore` `Sync` (`fetch_add`, `Relaxed` — every actual
+  writer is still the single owning shard thread, so this only needs to be a
+  valid value, not a cross-thread synchronization point).
+- COLD (`SegmentList.unloaded`, the reload-on-touch stub tier) is
+  unaffected in the case that already worked (WARM→COLD idle transitions —
+  those segments were never in Stack B's `segment_ids` to begin with) and
+  loses only an accidental, undocumented side effect in the other case
+  (HOT→COLD-direct transitions used to reload as stale HOT on restart due to
+  the same leak this fixes) — it still has no dedicated restart-recovery
+  path of its own; a restart now correctly falls through to the existing
+  dedup-rescan/AOF-replay self-heal instead (same fallback as any index with
+  no durable manifest state), never silent data loss.
+- New TDD regression test (`vector::persistence::recover_v2::tests::
+  warm_transition_leak_fix_and_restart_recovery`) proves, on real
+  force-compacted on-disk state: (a) the superseded segment directory is
+  GC'd within a bounded wait, (b) a simulated restart does NOT reload it as
+  a phantom HOT segment, (c) `register_warm_segments` reattaches it as WARM,
+  and (d) post-restart search returns the identical top-1 `global_id` as the
+  pre-transition baseline — no recall regression. Verified red (fails with
+  the leak-fix call removed) before green.
+
+### Fixed — Vector: hand-review found `register_warm_segments` could permanently duplicate documents or attach a segment to the wrong index
+
+- **CRITICAL — crash-before-GC restart could leave the same vectors live
+  twice, forever.** `try_warm_transitions_idle` commits Stack A's shard
+  manifest durably (synchronous, fsync+commit) *before*
+  `persist_hook_after_install` merely schedules the async Stack B snapshot
+  job. A `kill -9` landing in that window left the old segment still
+  tracked by Stack B (reloaded as an ordinary HOT/immutable segment by
+  `recover_v2`) *and* the warm copy discovered by Stack A (reattached WARM
+  by the restart-recovery wiring above) — the same key_hashes live in two
+  segments. `search_mvcc`'s merge (`src/vector/segment/holder.rs`,
+  `all.sort_unstable(); all.truncate(k);`) has no key_hash dedup, so this
+  never self-healed: duplicate keys in `FT.SEARCH` results, inflated
+  `num_docs`, and the next snapshot re-adopted the reloaded HOT copy into
+  `segment_ids` forever. Fixed: `register_warm_segments` now checks a warm
+  segment's own key_hash set (`warm_search::peek_key_hashes`, a cheap
+  `mvcc.mpf`-only read — no codes/graph mmap, no `CollectionMetadata`
+  dependency) against its owning index's *current in-memory*
+  `key_hash_to_key`. If those keys are already covered by a live HOT
+  segment, Stack B wins: the warm copy is left unattached and its on-disk
+  directory is deleted (`std::fs::remove_dir_all`) instead of being
+  registered, so Stack B stays the single source of truth.
+- **HIGH — a warm segment could attach to the wrong index.** The
+  restart-recovery wiring above made a previously-dead code path live:
+  `register_warm_segments` attached each segment to the *first* index for
+  which `WarmSearchSegment::from_files` happened to succeed —
+  `from_files` accepts any caller-supplied `CollectionMetadata` and never
+  validates it against the on-disk codes/graph, so two indexes of the same
+  dimension/quantization made the outcome a coin flip (wrong collection,
+  wrong search results, no error). Fixed: ownership is now decided from
+  key/keymap evidence, never from `from_files` success. Each candidate
+  index's *persisted* Stack-B keymap (read straight off disk via a new
+  `read_manifest_and_keymap_consistent` helper — bounded retry with
+  backoff against the benign TOCTOU where a concurrent `run_snapshot_job`
+  advances the epoch and GCs the old keymap file between the manifest read
+  and the keymap read) is checked for key_hash overlap with the segment;
+  the index with the most matches wins. No match, or a tie between two
+  indexes, leaves the segment unregistered (files intact, logged via
+  `tracing::warn!`) rather than guessing.
+- Two new TDD regression tests in `vector::persistence::recover_v2::tests`:
+  `warm_reattach_dedups_against_crash_before_gc_race` stages the exact
+  crash-before-GC state (rolls the on-disk manifest/segment/keymap back to
+  pre-transition *after* waiting for the real background GC to land, so the
+  rollback is deterministically the last write) and asserts zero duplicate
+  `global_id`s in search results, `warm.len() == 0`, and the superseded
+  warm directory is deleted; `warm_reattach_picks_correct_index_among_same_dim_indexes`
+  builds two same-dimension indexes with disjoint keysets — where the old
+  first-match behavior would have funneled both segments into one index
+  regardless of `HashMap` iteration order — and proves each segment lands
+  on its true owner via an end-to-end recall check (a cross-attached
+  segment would still pass a bare `warm.len() == 1` count but return the
+  wrong top-1 result). Both verified red (fail at the exact assertion the
+  fix satisfies) against the prior "first successful `from_files`"
+  implementation before green.
+
+### Fixed — Vector: WARM restart recovery was still defeated on every NORMAL restart (not just a crash) by call-site ordering
+
+- **CRITICAL — round 2 of hand-review found the previous fix's own wiring re-triggered its own duplication check.** The full production B3 sequence is `create_index` -> keyspace dedup rescan (`reconcile_key`, once per matching HASH key) -> `finish` -> `register_warm_segments`. `load_segments_and_keymap` never populates `key_hash_to_key`/`key_hash_to_global_id` for WARM keys (see its `segment_resident` gate — nothing has attached the WARM segment to `idx.segments` yet at that point in `create_index`), so with `register_warm_segments` running LAST, the rescan saw every WARM key as unknown and re-encoded it into the mutable segment (full HNSW/TQ rebuild, not just metadata) on every boot. The duplication check added in the previous fix then saw those just-re-indexed keys as "already covered by a live HOT copy" and retired (permanently deleted) the WARM segment — the exact failure this feature exists to prevent, triggered by the fix's own ordering, on every normal restart. Fixed: `VectorStore::register_warm_segments` now runs immediately after the sidecar `create_index` loop, BEFORE the keyspace rescan (`event_loop.rs`) — ownership decisions only need every sidecar index to already exist, which they do by then.
+- **On a clean attach, `register_warm_segments` now populates `key_hash_to_key`/`key_hash_to_global_id`/`key_hash_to_vec_checksum`** for the segment's keys, sourced from the same owner-evidence persisted-keymap entries already read for the ownership decision (no extra disk read). This is what lets the rescan (which runs right after) see the keys as known/checksum-unchanged instead of re-encoding them, and lets `FT.SEARCH` resolve a WARM doc's real key bytes via `key_hash_to_key` (the exact map `resolve_hybrid_doc_key` consults) instead of falling through to a synthetic `vec:<id>`. A segment key_hash absent from the owner's persisted keymap (an earlier async-snapshot job never committed for it — the same class of race as the crash-before-GC finding, at per-key rather than per-segment granularity) is left out of the maps, so the rescan self-heals it into mutable, and is tombstoned in the warm copy for that one key_hash (`WarmSearchSegment::seed_tombstones`) so the stale warm copy and the freshly re-indexed mutable copy never coexist as live duplicates.
+- **`RecoveryState`'s deletion-probe baseline moved to a new explicit phase, `snapshot_recovered_baseline`.** Previously `create_index` snapshotted the baseline immediately (before any WARM segment existed in-memory), which — now that `register_warm_segments` populates WARM keys into `key_hash_to_key` — would have permanently excluded every WARM key from `finish()`'s deletion probe: a WARM key whose underlying HASH was deleted while the server was down would never be recognized as "used to exist, now doesn't," and would silently survive as a stale search hit forever. `event_loop.rs` now calls `snapshot_recovered_baseline` once, after BOTH `create_index` (all indexes) AND `register_warm_segments` have settled, and before the keyspace rescan begins — the baseline is then complete for the deletion probe to catch a delete-while-down WARM key too (`VectorIndex::mark_deleted_for_key_in_index` already tombstones across every tier including WARM, so once the probe fires the fix is mechanical).
+- New TDD integration-level regression test,
+  `vector::persistence::recover_v2::tests::warm_tests::warm_recovery_full_production_sequence_matches_real_boot_order`,
+  drives the FULL real sequence in order (`create_index` -> `register_warm_segments`
+  -> keyspace rescan, replaying every key except one to simulate a delete-while-down
+  -> `finish`) and asserts: (a) the WARM segment attaches and is not retired, (b) every
+  still-live WARM key is counted `verified_unchanged` (0 `re_indexed`, nothing lands in
+  the mutable segment), (c) search resolves the ORIGINAL key bytes for a WARM doc via
+  `key_hash_to_key` (not `vec:<id>`), (d) no duplicate `key_hash` across results, (e) the
+  delete-while-down key is tombstoned by the deletion probe and absent from search.
+  Verified red by hand (temporarily moving `register_warm_segments` back to run after
+  the rescan/`finish`, matching the prior ordering): (a) fails first — the WARM segment
+  is retired as a false-positive duplicate (`warm.len() == 0`) instead of attaching,
+  which also makes (b)/(c) unreachable. The three existing WARM tests from the previous
+  fix (`warm_transition_leak_fix_and_restart_recovery`,
+  `warm_reattach_dedups_against_crash_before_gc_race`,
+  `warm_reattach_picks_correct_index_among_same_dim_indexes`) and one pre-existing
+  deletion-probe test (`recover_finish_tombstones_keys_missing_from_rescan`) were
+  updated to call `register_warm_segments`/`snapshot_recovered_baseline` in the new
+  production order so they keep testing real behavior instead of a now-stale sequence;
+  two of them needed a full keyspace-rescan replay added (previously implicit/absent)
+  to avoid the deletion probe wrongly tombstoning their now-baseline-visible WARM keys.
+  `crash_recovery_vector_durability.rs`'s six real-server-spawning scenarios (`s1`-`s6`)
+  were re-run against a release-fast build as an additional non-WARM regression check
+  on the reordered `event_loop.rs` sequence — all pass unchanged.
+- `vector::persistence::recover_v2`'s test module, having grown past the 1500-line file
+  size guideline with these additions, was split: `recover_v2_tests.rs` keeps the
+  non-WARM B3 recovery tests + shared helpers, and a new nested
+  `recover_v2_warm_tests.rs` (`#[path]`-included as `mod warm_tests` from within
+  `recover_v2_tests.rs`) holds all WARM-specific tests.
 
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 

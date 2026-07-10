@@ -135,6 +135,11 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // DiskANN cold-tier removal: the four flags it consumed are now inert
+    // no-ops (kept parseable for config-file/script compatibility). Warn
+    // once if an operator still sets any of them away from their default.
+    config.warn_deprecated_cold_tier_flags();
+
     // ── --profile tuning presets (WS4, v0.6.0) ──────────────────────────────
     // Fill-only: a preset only sets flags the operator left at their default
     // (see `ServerConfig::apply_profile`); anything explicitly passed on the
