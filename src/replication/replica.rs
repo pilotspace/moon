@@ -35,6 +35,20 @@ pub struct ReplicaTaskConfig {
 #[cfg(feature = "runtime-tokio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     let addr = format!("{}:{}", cfg.master_host, cfg.master_port);
+    // R0 streaming replication is single-shard only. A multi-shard replica would
+    // misread the master's single diskless RDB bulk and mis-route the command
+    // stream (see `apply::load_snapshot`, which is thread-local and clears all
+    // dbs per call), silently diverging. Refuse loudly rather than loop forever
+    // on a broken sync. Multi-shard replica apply is tracked for R2.
+    if cfg.num_shards != 1 {
+        tracing::error!(
+            "Replica: streaming replication currently supports single-shard only \
+             (--shards 1); this node has {} shards. Not starting replication.",
+            cfg.num_shards
+        );
+        return;
+    }
+
     let mut backoff_ms = 500u64;
     const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -189,15 +203,30 @@ async fn run_handshake_and_stream(
             }
         }
 
-        // Read N per-shard RDB bulk strings ($<len>\r\n<bytes>\r\n)
-        // Simplified for Phase 19: read and discard RDB bytes (snapshot load via ShardMessage in Plan 04)
+        // Load the full-resync RDB snapshot into the local shard's databases.
+        //
+        // R0 targets single-shard replication: `num_shards == 1`, so the master
+        // (`handle_psync_inline_single_shard`) sends exactly one diskless RDB
+        // bulk and we load it into this thread's ShardSlice. `load_snapshot`
+        // clears existing state first (full resync = authoritative). Multi-shard
+        // replicas (merged-RDB load) are R2.
         for shard_id in 0..cfg.num_shards {
-            let rdb_bytes = read_bulk_string(&mut stream).await?;
-            info!(
-                "Replica: received shard {} RDB snapshot ({} bytes)",
-                shard_id,
-                rdb_bytes.len()
-            );
+            let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            match crate::replication::apply::load_snapshot(&rdb_bytes) {
+                Ok(keys) => info!(
+                    "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
+                    shard_id,
+                    rdb_bytes.len(),
+                    keys
+                ),
+                Err(e) => {
+                    warn!(
+                        "Replica: failed to load shard {} RDB snapshot: {}",
+                        shard_id, e
+                    );
+                    return Err(e);
+                }
+            }
         }
 
         // Enter streaming mode
@@ -229,6 +258,7 @@ async fn run_handshake_and_stream(
 #[cfg(feature = "runtime-tokio")]
 async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(65536);
+    let mut selected_db = 0usize;
 
     loop {
         let n = stream.read_buf(&mut buf).await?;
@@ -236,15 +266,29 @@ async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> any
             return Err(anyhow::anyhow!("Master closed connection"));
         }
 
-        // Update local replication offset
-        if let Ok(rs) = cfg.repl_state.read() {
-            rs.master_repl_offset.fetch_add(n as u64, Ordering::Relaxed);
+        // Parse every complete RESP command in the buffer and apply it to the
+        // local shard. The replication offset advances by CONSUMED bytes (whole
+        // frames), never the raw socket read count — a read may split a frame.
+        let outcome =
+            crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
+        for rc in &outcome.commands {
+            if !crate::replication::apply::apply_local(rc) {
+                return Err(anyhow::anyhow!(
+                    "replica has no ShardSlice on this thread — cannot apply replication stream"
+                ));
+            }
         }
-
-        // Parse and dispatch commands from the received bytes
-        // Full RESP parsing and per-key dispatch routing is added in Plan 04.
-        // For now, buffer is accumulated and will be wired in Plan 04.
-        buf.clear();
+        if outcome.consumed > 0 {
+            if let Ok(rs) = cfg.repl_state.read() {
+                rs.master_repl_offset
+                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
+            }
+        }
+        if outcome.fatal {
+            return Err(anyhow::anyhow!(
+                "replication stream parse error — dropping connection to force resync"
+            ));
+        }
     }
 }
 
@@ -257,6 +301,20 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     let addr: std::net::SocketAddr = format!("{}:{}", cfg.master_host, cfg.master_port)
         .parse()
         .expect("invalid master address");
+    // R0 streaming replication is single-shard only. A multi-shard replica would
+    // misread the master's single diskless RDB bulk and mis-route the command
+    // stream (see `apply::load_snapshot`, which is thread-local and clears all
+    // dbs per call), silently diverging. Refuse loudly rather than loop forever
+    // on a broken sync. Multi-shard replica apply is tracked for R2.
+    if cfg.num_shards != 1 {
+        tracing::error!(
+            "Replica: streaming replication currently supports single-shard only \
+             (--shards 1); this node has {} shards. Not starting replication.",
+            cfg.num_shards
+        );
+        return;
+    }
+
     let mut backoff_ms = 500u64;
     const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -410,14 +468,27 @@ async fn run_handshake_and_stream(
             }
         }
 
-        // Read N per-shard RDB bulk strings
+        // Load the full-resync RDB snapshot into the local shard's databases.
+        // R0 = single-shard: the master sends one diskless RDB bulk, loaded into
+        // this thread's ShardSlice (clears existing state first — full resync is
+        // authoritative). Multi-shard merged-RDB load is R2.
         for shard_id in 0..cfg.num_shards {
-            let rdb_bytes = read_bulk_string(&mut stream).await?;
-            info!(
-                "Replica: received shard {} RDB snapshot ({} bytes)",
-                shard_id,
-                rdb_bytes.len()
-            );
+            let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            match crate::replication::apply::load_snapshot(&rdb_bytes) {
+                Ok(keys) => info!(
+                    "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
+                    shard_id,
+                    rdb_bytes.len(),
+                    keys
+                ),
+                Err(e) => {
+                    warn!(
+                        "Replica: failed to load shard {} RDB snapshot: {}",
+                        shard_id, e
+                    );
+                    return Err(e);
+                }
+            }
         }
 
         if let Ok(mut rs) = cfg.repl_state.write() {
@@ -449,6 +520,7 @@ async fn stream_commands(
     use monoio::io::AsyncReadRent;
 
     let mut buf = BytesMut::with_capacity(65536);
+    let mut selected_db = 0usize;
 
     loop {
         let tmp = vec![0u8; 65536];
@@ -459,11 +531,29 @@ async fn stream_commands(
         }
         buf.extend_from_slice(&tmp[..n]);
 
-        if let Ok(rs) = cfg.repl_state.read() {
-            rs.master_repl_offset.fetch_add(n as u64, Ordering::Relaxed);
+        // Parse every complete RESP command in the buffer and apply it to the
+        // local shard. Offset advances by CONSUMED bytes (whole frames), never
+        // the raw read count — a read may split a frame across boundaries.
+        let outcome =
+            crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
+        for rc in &outcome.commands {
+            if !crate::replication::apply::apply_local(rc) {
+                return Err(anyhow::anyhow!(
+                    "replica has no ShardSlice on this thread — cannot apply replication stream"
+                ));
+            }
         }
-
-        buf.clear();
+        if outcome.consumed > 0 {
+            if let Ok(rs) = cfg.repl_state.read() {
+                rs.master_repl_offset
+                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
+            }
+        }
+        if outcome.fatal {
+            return Err(anyhow::anyhow!(
+                "replication stream parse error — dropping connection to force resync"
+            ));
+        }
     }
 }
 
@@ -495,9 +585,16 @@ async fn read_line(stream: &mut monoio::net::TcpStream) -> anyhow::Result<Vec<u8
     }
 }
 
-/// Read a RESP bulk string ($<len>\r\n<bytes>\r\n) from a monoio TcpStream.
+/// Read a diskless full-resync RDB payload (`$<len>\r\n<len bytes>`) from a
+/// monoio TcpStream.
+///
+/// Unlike a normal RESP bulk string, the master's full-resync RDB is NOT
+/// terminated with a trailing `\r\n` (diskless wire format — the bytes right
+/// after the RDB are the live replication command stream). Reading `len + 2`
+/// would steal the first two bytes of that stream and desync every command
+/// after it, so this reads EXACTLY `len` bytes and stops.
 #[cfg(feature = "runtime-monoio")]
-async fn read_bulk_string(stream: &mut monoio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+async fn read_rdb_bulk(stream: &mut monoio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
     use monoio::io::AsyncReadRent;
 
     let len_line = read_line(stream).await?;
@@ -508,19 +605,24 @@ async fn read_bulk_string(stream: &mut monoio::net::TcpStream) -> anyhow::Result
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("Invalid bulk length"))?;
-    let total = len + 2; // +2 for trailing \r\n
-    let mut data = Vec::with_capacity(total);
-    while data.len() < total {
-        let remaining = total - data.len();
+    // Guard against a corrupted/hostile length header driving a huge allocation
+    // (the normal RESP parser's bulk cap is bypassed here for the diskless
+    // no-CRLF format). 64 GiB is far above any legitimate snapshot.
+    const MAX_RDB_BYTES: usize = 64 * 1024 * 1024 * 1024;
+    if len > MAX_RDB_BYTES {
+        anyhow::bail!("RDB bulk length {len} exceeds sanity cap {MAX_RDB_BYTES}");
+    }
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        let remaining = len - data.len();
         let tmp = vec![0u8; remaining];
         let (result, tmp) = stream.read(tmp).await;
         let n = result?;
         if n == 0 {
-            anyhow::bail!("EOF during read_bulk_string");
+            anyhow::bail!("EOF during RDB read");
         }
         data.extend_from_slice(&tmp[..n]);
     }
-    data.truncate(len);
     Ok(data)
 }
 
@@ -542,9 +644,13 @@ async fn read_line(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Read a RESP bulk string ($<len>\r\n<bytes>\r\n).
+/// Read a diskless full-resync RDB payload (`$<len>\r\n<len bytes>`).
+///
+/// The master's full-resync RDB has NO trailing `\r\n` (diskless wire format);
+/// reading `len + 2` would steal the first two bytes of the live command stream
+/// that follows. Reads EXACTLY `len` bytes.
 #[cfg(feature = "runtime-tokio")]
-async fn read_bulk_string(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
+async fn read_rdb_bulk(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let len_line = read_line(stream).await?;
     if len_line.first() != Some(&b'$') {
         anyhow::bail!("Expected bulk string, got: {:?}", len_line);
@@ -553,8 +659,11 @@ async fn read_bulk_string(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("Invalid bulk length"))?;
-    let mut data = vec![0u8; len + 2]; // +2 for trailing \r\n
+    const MAX_RDB_BYTES: usize = 64 * 1024 * 1024 * 1024;
+    if len > MAX_RDB_BYTES {
+        anyhow::bail!("RDB bulk length {len} exceeds sanity cap {MAX_RDB_BYTES}");
+    }
+    let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
-    data.truncate(len);
     Ok(data)
 }
