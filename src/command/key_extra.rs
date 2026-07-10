@@ -426,8 +426,11 @@ fn sort_args_request_store(args: &[Frame]) -> bool {
     false
 }
 
-const SORT_RO_STORE_ERR: &[u8] =
-    b"ERR SORT_RO is read-only and does not accept the STORE parameter";
+// Redis parity: SORT_RO's argument grammar has no STORE branch, so a STORE
+// clause falls through to the generic `shared.syntaxerr` — `ERR syntax error`
+// (verified against redis 8.0.5, matching `SORT_RO key BOGUS` too). Moon used
+// to return a friendlier, non-parity message here.
+const SORT_RO_STORE_ERR: &[u8] = b"ERR syntax error";
 
 /// SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA]
 ///
@@ -868,7 +871,14 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
         let result = sort_ro(&mut db, &[bs(b"mylist"), bs(b"STORE"), bs(b"dest")]);
-        assert_eq!(result, Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR)));
+        // Redis parity: SORT_RO's grammar has no STORE branch, so STORE falls
+        // through to the shared syntax error (`ERR syntax error`) — verified
+        // against redis 8.0.5. Assert the literal text, not just the named
+        // constant, so a regression to a descriptive message is caught.
+        assert_eq!(
+            result,
+            Frame::Error(Bytes::from_static(b"ERR syntax error"))
+        );
         // Confirms read-only: STORE never ran.
         assert!(!db.exists(b"dest"));
     }
@@ -915,7 +925,11 @@ mod tests {
     fn test_sort_ro_readonly_rejects_store() {
         let db = Database::new();
         let result = sort_ro_readonly(&db, &[bs(b"mylist"), bs(b"STORE"), bs(b"dest")], 0);
-        assert_eq!(result, Frame::Error(Bytes::from_static(SORT_RO_STORE_ERR)));
+        // Redis parity — see `test_sort_ro_rejects_store`.
+        assert_eq!(
+            result,
+            Frame::Error(Bytes::from_static(b"ERR syntax error"))
+        );
     }
 
     #[test]

@@ -601,7 +601,9 @@ if should_run "key"; then
     assert_match "SORT ALPHA"          SORT k:sortl ALPHA
     assert_match "SORT LIMIT"          SORT k:sortl LIMIT 0 2
     assert_match "SORT_RO numeric"     SORT_RO k:sortl
-    assert_moon_contains "SORT_RO rejects STORE" "SORT_RO" SORT_RO k:sortl STORE k:sortdst
+    # Redis parity: SORT_RO + STORE returns the generic "ERR syntax error"
+    # (SORT_RO's grammar has no STORE branch), not a SORT_RO-specific message.
+    assert_moon_contains "SORT_RO rejects STORE" "syntax error" SORT_RO k:sortl STORE k:sortdst
 
     # GEO commands (incl. GEORADIUS/GEORADIUSBYMEMBER + _RO twins, WS1 parity)
     rcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
