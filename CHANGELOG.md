@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — test flakiness: oom_bypass_closure readiness on loaded CI runners
+
+- `tests/oom_bypass_closure.rs`: the readiness path used a fixed 30s connect
+  deadline with no CI allowance and no dead-child detection —
+  `test_case_e_cross_db_copy_oom` lost that race on a loaded macOS CI runner
+  (2026-07-10). Same remedy as the sigterm/bgsave harnesses (#264):
+  `wait_ready` now fails fast via `try_wait()` when the server process has
+  exited (surfacing `moon.stderr.log`/`moon.stdout.log` tails instead of
+  burning the deadline), retries in bounded 1s connect windows, and extends
+  the deadline 30s → 120s under `CI`.
+
 ### Fixed — CI: fts_query_parse missing from fuzz matrix
 
 - `.github/workflows/fuzz.yml`: the `fts_query_parse` fuzz target was

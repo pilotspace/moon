@@ -148,7 +148,13 @@ struct Client {
 }
 
 impl Client {
-    fn connect(port: u16) -> Self {
+    /// One bounded connection attempt window. Returns `None` instead of
+    /// panicking so the caller (`wait_ready`) can interleave dead-child
+    /// checks between windows — a fixed 30s in-loop panic here is exactly
+    /// what flaked `test_case_e_cross_db_copy_oom` on a loaded macOS CI
+    /// runner (2026-07-10) and, worse, burned the full deadline even when
+    /// the server process had already exited.
+    fn try_connect(port: u16, window: Duration) -> Option<Self> {
         let addr = format!("127.0.0.1:{port}")
             .to_socket_addrs()
             .unwrap()
@@ -158,20 +164,20 @@ impl Client {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
                 Ok(s) => break s,
-                Err(_) if start.elapsed() < Duration::from_secs(30) => {
+                Err(_) if start.elapsed() < window => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => panic!("server never accepted on port {port}: {e}"),
+                Err(_) => return None,
             }
         };
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let writer = stream.try_clone().unwrap();
-        Client {
+        Some(Client {
             reader: BufReader::new(stream),
             writer,
-        }
+        })
     }
 
     fn encode(args: &[&[u8]]) -> Vec<u8> {
@@ -254,18 +260,57 @@ impl Client {
     }
 }
 
-fn wait_ready(port: u16) -> Client {
+/// Readiness deadline, CI-aware: loaded CI runners (macOS especially) can
+/// take far longer than a dev machine to schedule + start a fresh server
+/// process. Same remedy as `tests/sigterm_shutdown.rs` (PR #264).
+fn readiness_deadline() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+/// Tail a server log for the panic message so a real startup failure stays
+/// diagnosable (the tempdir is deleted when the test unwinds).
+fn log_tail(dir: &std::path::Path, name: &str) -> String {
+    match std::fs::read_to_string(dir.join(name)) {
+        Ok(s) => {
+            let tail: Vec<&str> = s.lines().rev().take(20).collect();
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        }
+        Err(e) => format!("<unreadable: {e}>"),
+    }
+}
+
+fn wait_ready(guard: &mut ServerGuard, dir: &std::path::Path, port: u16) -> Client {
+    let deadline = readiness_deadline();
     let start = Instant::now();
     loop {
-        let mut c = Client::connect(port);
-        // Any I/O error (or a non-PONG answer, which would desync the framing)
-        // drops this connection and probes again on a new one.
-        if let Ok(true) = c.try_ping() {
-            return c;
+        // Fail fast on a crashed child instead of burning the full deadline:
+        // a dead server never starts accepting, and the exit status + logs
+        // are the actual diagnosis.
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            panic!(
+                "moon exited ({status}) before accepting on port {port}\n\
+                 --- moon.stderr.log (tail) ---\n{}\n\
+                 --- moon.stdout.log (tail) ---\n{}",
+                log_tail(dir, "moon.stderr.log"),
+                log_tail(dir, "moon.stdout.log"),
+            );
+        }
+        // Any I/O error (or a non-PONG answer, which would desync the
+        // framing) drops this connection and probes again on a new one.
+        if let Some(mut c) = Client::try_connect(port, Duration::from_secs(1)) {
+            if let Ok(true) = c.try_ping() {
+                return c;
+            }
         }
         assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "server never answered PING on port {port}"
+            start.elapsed() < deadline,
+            "server never answered PING on port {port} within {deadline:?}\n\
+             --- moon.stderr.log (tail) ---\n{}",
+            log_tail(dir, "moon.stderr.log"),
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -286,8 +331,8 @@ fn test_case_a_direct_set_control_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let _guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     let value = blob(64 * 1024, b'a'); // 64KB per key
     const MAX_ITERS: usize = 200; // ~32 expected before OOM; generous margin.
@@ -333,8 +378,8 @@ fn test_case_b_cross_shard_pipeline_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB whole-instance cap
-    let _guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 3000;
     const VALUE_SIZE: usize = 4096; // 4KB — total attempted ~12MB vs 2MB cap.
@@ -394,8 +439,8 @@ fn test_case_c_lua_redis_call_write_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let _guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // 2000 * 8KB = ~16MB attempted vs a 2MB cap — comfortably oversubscribed.
     let value = blob(8 * 1024, b'c');
@@ -431,8 +476,8 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let _guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // Drive the instance past its cap first (reuses case A's control setup).
     let value = blob(64 * 1024, b'd');
@@ -498,8 +543,8 @@ fn test_case_e_cross_db_copy_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB whole-instance cap
-    let _guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 300;
     const VALUE_SIZE: usize = 4096; // 4KB — N*VALUE_SIZE ~= 1.2MB, well under the 2MB cap.
@@ -673,8 +718,8 @@ fn spawn_moon_no_maxmemory(port: u16, dir: &std::path::Path, shards: u32) -> Ser
 fn test_case_f_config_set_maxmemory_publishes_atomic() {
     let dir = test_tmpdir();
     let port = free_port();
-    let _guard = spawn_moon_no_maxmemory(port, dir.path(), 4);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_no_maxmemory(port, dir.path(), 4);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 3000;
     const VALUE_SIZE: usize = 4096; // 4KB, same shape as case B.
@@ -793,8 +838,8 @@ fn test_case_g_fcall_internal_write_oom() {
     let dir = test_tmpdir();
     let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let _guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // Registered functions are called with zero Lua args (`call_function` in
     // src/scripting/functions.rs invokes `registered.call(())`) — like a
@@ -848,8 +893,8 @@ fn test_case_h_fcall_no_maxmemory_succeeds() {
     let port = free_port();
     // Reuse spawn_moon_no_maxmemory (Gap C's case F helper) so this
     // genuinely has no cap — spawn_moon_oom always sets one.
-    let _guard = spawn_moon_no_maxmemory(port, dir.path(), 1);
-    let mut c = wait_ready(port);
+    let mut guard = spawn_moon_no_maxmemory(port, dir.path(), 1);
+    let mut c = wait_ready(&mut guard, dir.path(), port);
 
     let lib_body: &[u8] = b"#!lua name=oklib\n\
         local function write_loop()\n\
