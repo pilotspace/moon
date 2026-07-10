@@ -15,6 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node in the features mindmap. `redis://` / `rediss://` remain fully supported;
   the native scheme adds a `?workspace=<tenant>` selector and a fail-fast,
   no-opportunistic-downgrade TLS contract.
+### Docs — `moon://` / `moons://` connection URI scheme spec (H-7, PR #TBD)
+
+- New `docs/protocol/moon-uri.md`: the authoritative, doc-only spec for Moon's native
+  `moon://` / `moons://` connection URI scheme — ABNF grammar, a field-by-field
+  `redis(s)://` parity table, a query-parameter reference (parity + Moon-native
+  `?workspace=`), the design-for-failure section (no opportunistic downgrade, no
+  auto-upgrade, fail-fast diagnostic text, unknown-scheme parse errors, bounded
+  connect), server-participation semantics (`--announce-url`, `INFO replication`,
+  cluster redirects, `REPLICAOF`), worked examples, and the conformance checklist the
+  v0.7.0 Workstream R6 implementation + `tests/uri_scheme.rs` must satisfy. No Rust
+  code changes — implementation is tracked separately as v0.7.0 R6.
+- Verified every cited flag/module against the current tree (`--tls-port` et al. in
+  `src/config.rs`, TLS 1.3/rustls/aws-lc-rs + SIGHUP hot-reload in `src/tls.rs`, `WS
+  AUTH` UUID-only argument in `src/command/workspace.rs`) rather than restating the
+  roadmap's prose uncritically; flags the `WS AUTH` UUID-vs-name gap for the R6
+  implementer as an open decision instead of assuming it away.
+- `mkdocs.yml`: adds a "Protocol" nav section for the new page so `mkdocs build
+  --strict` doesn't fail on an orphan doc.
 
 ### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
 

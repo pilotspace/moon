@@ -135,6 +135,8 @@ nav:
       - Command reference: commands.md
       - Redis compatibility: redis-compat.md
       - Moon vs Valkey: comparison-valkey.md
+  - Protocol:
+      - moon:// / moons:// URI scheme: protocol/moon-uri.md
   - Guides:
       - SDKs: guides/sdk.md
       - Memory engine: guides/memory-engine.md
