@@ -81,6 +81,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v0.6.0). Updated to the current v0.6.x line, with an explicit pre-1.0 support
   policy (latest-minor-only; no LTS/backport promise until the v1.0.0 GA tag, per
   `docs/roadmap/ROADMAP.md`'s stated 18-month LTS policy).
+### Docs — Production contract refresh + CI gate (ROADMAP H-5)
+
+- **`docs/PRODUCTION-CONTRACT.md` refreshed from its stale v0.1.3-era draft to
+  v0.6.0 reality** and converted into a checked, evidence-linked ledger (56
+  GA-blocking rows across toolchain/CI, correctness hardening, durability,
+  replication & HA, cluster mode, security, observability, compatibility, and
+  release engineering). Every ✅ row cites a real file/CI job/script that was
+  read and confirmed during this pass — no aspirational ticks. 33/56
+  GA-blocking rows are shipped today; 22 are honestly unticked (multi-shard
+  replication, `WAIT`/keyspace-notifications/`MONITOR`, monoio cluster
+  wiring, encryption at rest, and others already tracked in
+  `docs/roadmap/ROADMAP.md` §8). The verification pass also surfaced two
+  previously undocumented defects, left unticked rather than assumed fixed:
+  `deny.toml`'s header comment claims a `ci.yml` "safety-audit" job that does
+  not exist (`cargo audit`/`cargo deny` are not CI-blocking), and
+  `fuzz/Cargo.toml` + `.github/workflows/fuzz.yml` both reference a 12th fuzz
+  target (`graph_props_record`) whose source file is missing from the tree,
+  so that nightly fuzz matrix shard fails every run.
+- **New `scripts/check-production-contract.sh`** (grep-based, mirrors
+  `scripts/audit-unsafe.sh`'s style): reports unticked GA-blocking ledger rows
+  on every tag, and hard-fails only on a `v1.0*` tag if any remain unticked.
+  Wired into `.github/workflows/release.yml`'s `setup` job alongside the
+  existing RELEASES.md release-ledger gate, using the same env-var
+  interpolation pattern (`VERSION: ${{ steps.ver.outputs.version }}`, never
+  inline `${{ }}` in a `run:` body).
 
 ### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
 
