@@ -6,17 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — `SORT_RO ... STORE` now returns Redis-parity `ERR syntax error`
+### Fixed — `txn_kv_wiring` integration test port-collision flake
 
-- `SORT_RO key ... STORE dest` (and any unknown token) previously returned a
-  friendly Moon-specific message (`ERR SORT_RO is read-only and does not
-  accept the STORE parameter`). Redis's `SORT_RO` argument grammar simply has
-  no `STORE` branch, so the clause falls through to the shared syntax error —
-  `ERR syntax error` (verified against redis 8.0.5). Moon now matches, so
-  clients that pattern-match on the canonical error text behave identically.
-  Red/green unit tests (`test_sort_ro_rejects_store`,
-  `test_sort_ro_readonly_rejects_store`) assert the literal parity text;
-  `scripts/test-commands.sh` parity check updated accordingly.
+- `start_txn_server` picked a port from a throwaway `bind(:0)` probe, dropped
+  it, then let `run_sharded` rebind it — a TOCTOU window where a parallel test
+  (this binary or another) could steal the freed ephemeral port, after which a
+  blind 200ms sleep handed the caller a dead/wrong port. Now: a process-global
+  reservation set (`reserve_unique_port`) guarantees no two tests in the same
+  binary are handed the same recycled port, and an active connect+PING
+  readiness probe (`await_server_ready`) replaces the fixed sleep and lets the
+  start retry on a fresh port when a bind is lost to another process. Verified
+  flake-free across repeated fully-parallel runs (no `--test-threads=1`).
 
 ### Fixed — `--disk-offload` without a durability backstop broke the default LRU cache recipe
 
