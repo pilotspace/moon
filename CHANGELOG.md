@@ -12,6 +12,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered in `fuzz/Cargo.toml` but absent from both the PR and nightly
   CI matrices, so it never ran. Added to both. Also corrected CLAUDE.md's
   stale fuzz-target count (7 → 12) and target list.
+### Fixed — RDB stream consumer-group allocation-DoS gap (`src/persistence/rdb.rs`)
+
+- **Four more untrusted-length counts in the native RDB `TYPE_STREAM` decoder
+  were unvalidated**, the same vulnerability class fixed for
+  `snapshot.rs`/`redis_rdb.rs` above: `read_entry` and its zero-copy twin
+  `read_entry_zero_copy` (`src/persistence/rdb.rs`) read a stream's
+  `group_count`, `pel_count`, `consumer_count`, and `pending_count` straight
+  off the wire without bounding them against the bytes actually remaining in
+  the cursor, unlike every sibling count in the same functions
+  (`entry_count`, `field_count`, hash/list/set/zset counts), which already
+  went through `rdb::validate_count`. None of the four drives an eager
+  `with_capacity`/zero-fill today (they grow a `BTreeMap`/`HashMap`
+  incrementally), so this wasn't a single-allocation DoS, but it left a
+  structural inconsistency that a future refactor could easily turn into
+  one and skipped the fail-fast rejection every other count gets. Fixed by
+  adding `validate_count` calls with the true structural minimum bytes per
+  item (28 for a group: 4-byte empty name + 16-byte last-delivered-id +
+  4-byte pel_count + 4-byte consumer_count; 36 for a PEL entry: 16-byte
+  StreamId + 4-byte empty consumer name + 16-byte delivery time/count;
+  16 for a consumer: 4-byte empty name + 8-byte seen_time + 4-byte
+  pending_count; 16 for a pending id: StreamId) — chosen so no legitimate
+  file is ever rejected. Red/green TDD: 4 crafted-blob tests (one per
+  count) confirmed failing before the fix and passing after, plus a control
+  test asserting a fully-populated 1-group/1-pel/1-consumer/1-pending
+  stream is still accepted by both `read_entry` and `read_entry_zero_copy`.
 
 ### Fixed — test flakiness: sigterm-shutdown readiness + BGSAVE file polling
 

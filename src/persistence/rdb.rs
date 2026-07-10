@@ -710,6 +710,8 @@ fn read_entry_zero_copy(
                 stream.length += 1;
             }
             let group_count = read_u32(cursor)? as usize;
+            // min 4 (name len) + 16 (last_delivered_id) + 4 (pel_count) + 4 (consumer_count)
+            validate_count(cursor, group_count, 28, "stream_groups")?;
             for _ in 0..group_count {
                 let group_name = read_bytes(cursor)?;
                 let mut gld_ms = [0u8; 8];
@@ -721,6 +723,8 @@ fn read_entry_zero_copy(
                     seq: u64::from_le_bytes(gld_seq),
                 };
                 let pel_count = read_u32(cursor)? as usize;
+                // min 16 (StreamId) + 4 (consumer name len) + 16 (delivery_time+delivery_count)
+                validate_count(cursor, pel_count, 36, "stream_pel")?;
                 let mut pel = BTreeMap::new();
                 for _ in 0..pel_count {
                     let mut pid_ms = [0u8; 8];
@@ -746,6 +750,8 @@ fn read_entry_zero_copy(
                     );
                 }
                 let consumer_count = read_u32(cursor)? as usize;
+                // min 4 (name len) + 8 (seen_time) + 4 (pending_count)
+                validate_count(cursor, consumer_count, 16, "stream_consumers")?;
                 let mut consumers = HashMap::new();
                 for _ in 0..consumer_count {
                     let cname = read_bytes(cursor)?;
@@ -753,6 +759,8 @@ fn read_entry_zero_copy(
                     cursor.read_exact(&mut st_buf)?;
                     let seen_time = u64::from_le_bytes(st_buf);
                     let pending_count = read_u32(cursor)? as usize;
+                    // min 16 (StreamId)
+                    validate_count(cursor, pending_count, 16, "stream_pending")?;
                     let mut pending = BTreeMap::new();
                     for _ in 0..pending_count {
                         let mut cid_ms = [0u8; 8];
@@ -1336,6 +1344,8 @@ pub(crate) fn read_entry(
 
             // Consumer groups
             let group_count = read_u32(cursor)? as usize;
+            // min 4 (name len) + 16 (last_delivered_id) + 4 (pel_count) + 4 (consumer_count)
+            validate_count(cursor, group_count, 28, "stream_groups")?;
             for _ in 0..group_count {
                 let group_name = read_bytes(cursor)?;
                 let mut gld_ms = [0u8; 8];
@@ -1348,6 +1358,8 @@ pub(crate) fn read_entry(
                 };
 
                 let pel_count = read_u32(cursor)? as usize;
+                // min 16 (StreamId) + 4 (consumer name len) + 16 (delivery_time+delivery_count)
+                validate_count(cursor, pel_count, 36, "stream_pel")?;
                 let mut pel = BTreeMap::new();
                 for _ in 0..pel_count {
                     let mut pid_ms = [0u8; 8];
@@ -1374,6 +1386,8 @@ pub(crate) fn read_entry(
                 }
 
                 let consumer_count = read_u32(cursor)? as usize;
+                // min 4 (name len) + 8 (seen_time) + 4 (pending_count)
+                validate_count(cursor, consumer_count, 16, "stream_consumers")?;
                 let mut consumers = HashMap::new();
                 for _ in 0..consumer_count {
                     let cname = read_bytes(cursor)?;
@@ -1381,6 +1395,8 @@ pub(crate) fn read_entry(
                     cursor.read_exact(&mut st_buf)?;
                     let seen_time = u64::from_le_bytes(st_buf);
                     let pending_count = read_u32(cursor)? as usize;
+                    // min 16 (StreamId)
+                    validate_count(cursor, pending_count, 16, "stream_pending")?;
                     let mut pending = BTreeMap::new();
                     for _ in 0..pending_count {
                         let mut cid_ms = [0u8; 8];
@@ -1859,5 +1875,163 @@ mod tests {
             }
             _ => panic!("Expected Stream"),
         }
+    }
+
+    /// Build the byte body consumed by `read_entry` / `read_entry_zero_copy`
+    /// for a single entry: `[key_len(4)+key][ttl_ms i64(8, 0 = no ttl)][value_body]`.
+    /// Both functions expect the cursor positioned at the key field, with
+    /// the type tag passed separately — this mirrors that contract exactly.
+    fn build_entry_bytes(key: &[u8], value_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&0i64.to_le_bytes()); // ttl_ms = 0 (no expiry)
+        buf.extend_from_slice(value_body);
+        buf
+    }
+
+    /// Assert that a crafted `TYPE_STREAM` value body — a lying count paired
+    /// with insufficient trailing data to back it — is rejected by BOTH
+    /// `read_entry` (used by `load_from_bytes`, the AOF-preamble path) and
+    /// `read_entry_zero_copy` (used by `load`, the boot-time RDB path).
+    /// They are literal duplicates for this branch, so both must reject.
+    fn assert_stream_value_rejected(value_body: &[u8]) {
+        let entry_bytes = build_entry_bytes(b"k", value_body);
+
+        let mut cursor = Cursor::new(&entry_bytes[..]);
+        assert!(
+            read_entry(&mut cursor, TYPE_STREAM, false).is_err(),
+            "read_entry accepted a stream count exceeding remaining data \
+             (untrusted-length DoS gap)"
+        );
+
+        let mut cursor2 = Cursor::new(&entry_bytes[..]);
+        assert!(
+            read_entry_zero_copy(&mut cursor2, TYPE_STREAM, 0, false).is_err(),
+            "read_entry_zero_copy accepted a stream count exceeding remaining data \
+             (untrusted-length DoS gap)"
+        );
+    }
+
+    #[test]
+    fn test_stream_group_count_dos_rejected() {
+        // entry_count=0, last_id=(0,0), then group_count lies about ~4B groups
+        // with zero trailing bytes to back even one.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // entry_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.seq
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // group_count: lies
+        assert_stream_value_rejected(&body);
+    }
+
+    #[test]
+    fn test_stream_pel_count_dos_rejected() {
+        // One real (minimal) group, then pel_count lies with no data behind it.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // entry_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // group_count = 1
+        body.extend_from_slice(&0u32.to_le_bytes()); // group_name len = 0
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.seq
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // pel_count: lies
+        assert_stream_value_rejected(&body);
+    }
+
+    #[test]
+    fn test_stream_consumer_count_dos_rejected() {
+        // One real group with an empty (real) PEL, then consumer_count lies.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // entry_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // group_count = 1
+        body.extend_from_slice(&0u32.to_le_bytes()); // group_name len = 0
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.seq
+        body.extend_from_slice(&0u32.to_le_bytes()); // pel_count = 0 (real)
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // consumer_count: lies
+        assert_stream_value_rejected(&body);
+    }
+
+    #[test]
+    fn test_stream_pending_count_dos_rejected() {
+        // One real group + one real (empty-pending) consumer, then
+        // pending_count lies with no data behind it.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // entry_count
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // group_count = 1
+        body.extend_from_slice(&0u32.to_le_bytes()); // group_name len = 0
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.seq
+        body.extend_from_slice(&0u32.to_le_bytes()); // pel_count = 0 (real)
+        body.extend_from_slice(&1u32.to_le_bytes()); // consumer_count = 1 (real)
+        body.extend_from_slice(&0u32.to_le_bytes()); // consumer name len = 0
+        body.extend_from_slice(&0u64.to_le_bytes()); // seen_time
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // pending_count: lies
+        assert_stream_value_rejected(&body);
+    }
+
+    /// Control test: a small but fully-populated consumer group (1 group,
+    /// 1 PEL entry, 1 consumer, 1 pending id) must NOT be rejected by the
+    /// new validate_count guards — confirms the chosen min-bytes-per-item
+    /// bounds are the true structural minimum and never reject a valid file.
+    #[test]
+    fn test_stream_consumer_group_round_trip_not_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // entry_count = 0
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // group_count = 1
+        body.extend_from_slice(&1u32.to_le_bytes()); // group_name len = 1
+        body.extend_from_slice(b"g");
+        body.extend_from_slice(&5u64.to_le_bytes()); // last_delivered_id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // last_delivered_id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // pel_count = 1
+        body.extend_from_slice(&5u64.to_le_bytes()); // pel[0].id.ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // pel[0].id.seq
+        body.extend_from_slice(&1u32.to_le_bytes()); // pel[0].consumer name len = 1
+        body.extend_from_slice(b"c");
+        body.extend_from_slice(&1u64.to_le_bytes()); // delivery_time
+        body.extend_from_slice(&1u64.to_le_bytes()); // delivery_count
+        body.extend_from_slice(&1u32.to_le_bytes()); // consumer_count = 1
+        body.extend_from_slice(&1u32.to_le_bytes()); // consumer name len = 1
+        body.extend_from_slice(b"c");
+        body.extend_from_slice(&1u64.to_le_bytes()); // seen_time
+        body.extend_from_slice(&1u32.to_le_bytes()); // pending_count = 1
+        body.extend_from_slice(&5u64.to_le_bytes()); // pending[0].ms
+        body.extend_from_slice(&0u64.to_le_bytes()); // pending[0].seq
+
+        let entry_bytes = build_entry_bytes(b"k", &body);
+
+        let mut cursor = Cursor::new(&entry_bytes[..]);
+        let (_key, entry) = read_entry(&mut cursor, TYPE_STREAM, false)
+            .expect("legit 1-group/1-consumer/1-pel/1-pending stream must not be rejected");
+        match entry.value.as_redis_value() {
+            RedisValueRef::Stream(stream) => {
+                assert_eq!(stream.groups.len(), 1);
+                let group = stream.groups.get(&Bytes::from_static(b"g")).unwrap();
+                assert_eq!(group.pel.len(), 1);
+                assert_eq!(group.consumers.len(), 1);
+                assert_eq!(
+                    group
+                        .consumers
+                        .get(&Bytes::from_static(b"c"))
+                        .unwrap()
+                        .pending
+                        .len(),
+                    1
+                );
+            }
+            _ => panic!("Expected Stream"),
+        }
+
+        // Same body must also be accepted by the zero-copy variant.
+        let mut cursor2 = Cursor::new(&entry_bytes[..]);
+        assert!(read_entry_zero_copy(&mut cursor2, TYPE_STREAM, 0, false).is_ok());
     }
 }
