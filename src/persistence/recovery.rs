@@ -48,8 +48,9 @@ pub struct RecoveryResult {
     pub cold_segments: Vec<(u64, std::path::PathBuf)>,
     /// Number of cold segments discovered.
     pub cold_segments_loaded: usize,
-    /// Cold index rebuilt from heap DataFiles (None if no KvLeaf entries).
-    pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
+    // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
+    // replayed deletes tombstone the cold plane — see the Phase 3 comment.
 }
 
 /// 6-phase recovery protocol for disk-offload mode.
@@ -329,7 +330,20 @@ pub fn recover_shard_v3_pitr(
                     shard_id,
                     cold_idx.len()
                 );
-                result.cold_index = Some(cold_idx);
+                // Attach to the database BEFORE Phase 4 replay. Replayed
+                // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
+                // with `cold_index == None`, `remove_counting_cold()`/`clear()`
+                // are silent no-ops (`as_mut()` on None), so a key deleted in
+                // the WAL tail resurrects via cold read-through after restart
+                // whenever the crash lands inside the pre-orphan-sweep window
+                // (the manifest entry is still Active until the sweep).
+                if let Some(db0) = databases.first_mut() {
+                    db0.cold_shard_dir = Some(shard_dir.to_path_buf());
+                    match db0.cold_index.as_mut() {
+                        Some(existing) => existing.merge(cold_idx),
+                        None => db0.cold_index = Some(cold_idx),
+                    }
+                }
             }
             // Crash-orphan sweep: heap files written but never registered in
             // the manifest (crash between spill write and manifest commit)
@@ -369,6 +383,14 @@ pub fn recover_shard_v3_pitr(
     }
 
     // ── Phase 4: WAL REPLAY ───────────────────────────────────────────
+    // KV `Command` records counted separately from vector/file-lifecycle
+    // records: the Phase 4b "WAL gave us no KV history → fall back to the
+    // AOF" gate must key on THIS count. Gating on the aggregate
+    // `commands_replayed` silently skipped the AOF (the only complete KV
+    // history — `wal_kv_log` is auto-off when the AOF is the authority)
+    // whenever disk-offload spills had written FileCreate records into the
+    // WAL: every KV write since the last snapshot was lost on restart.
+    let mut kv_commands_replayed = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
         let mut selected_db = 0usize;
@@ -395,6 +417,7 @@ pub fn recover_shard_v3_pitr(
                                     &mut selected_db,
                                 );
                                 result.commands_replayed += 1;
+                                kv_commands_replayed += 1;
                             }
                         }
                     }
@@ -584,28 +607,38 @@ pub fn recover_shard_v3_pitr(
     }
 
     // ── Phase 4b: legacy-dir AOF / WAL v3 FALLBACK ─────────────────────
-    // When the disk-offload WAL v3 replay (Phase 4, above) produced 0
-    // commands and a legacy persistence directory is available, fall back to
-    // it. `appendonly.aof` is the AUTHORITY there (post-#211, WAL v3's KV
-    // coverage is intentionally partial: `--wal-kv-log` default-off, and
-    // connection-local writes bypass it even when on — a non-empty WAL v3
-    // must never shadow the AOF). Only when NO AOF exists at all does the
-    // legacy-mode WAL v3 directory (`v2_dir/shard-N/wal-v3/`, distinct from
-    // `shard_dir`'s Phase-4 WAL despite the shared name) serve as a
-    // last-resort partial recovery source. The WAL v2 rung (per-shard
-    // `shard-N.wal`) was removed in the pre-1.0 WAL-v3-only format freeze
-    // and is never replayed by this build.
-    if result.commands_replayed == 0 {
+    // When the disk-offload WAL v3 replay (Phase 4, above) produced 0 KV
+    // `Command` records and a legacy persistence directory is available, fall
+    // back to it. The gate is `kv_commands_replayed` — NOT the aggregate
+    // `commands_replayed`, which also counts vector + file-lifecycle records:
+    // disk-offload spills write FileCreate records into the same WAL, and
+    // gating on the aggregate skipped the AOF (the only complete KV history)
+    // on every post-spill restart. `appendonly.aof` is the AUTHORITY there
+    // (post-#211, WAL v3's KV coverage is intentionally partial:
+    // `--wal-kv-log` default-off, and connection-local writes bypass it even
+    // when on — a non-empty WAL v3 must never shadow the AOF). Only when NO
+    // AOF exists at all does the legacy-mode WAL v3 directory
+    // (`v2_dir/shard-N/wal-v3/`, distinct from `shard_dir`'s Phase-4 WAL
+    // despite the shared name) serve as a last-resort partial recovery
+    // source. The WAL v2 rung (per-shard `shard-N.wal`) was removed in the
+    // pre-1.0 WAL-v3-only format freeze and is never replayed by this build.
+    //
+    // Known follow-up: when the Phase-4 WAL DID carry some KV records
+    // (`--wal-kv-log on` / CDC active) alongside an existing AOF, this gate
+    // keeps the WAL's partial KV view and still skips the AOF (replaying
+    // both would double-apply non-idempotent commands). Resolving that needs
+    // an AOF-first redesign of Phase 4, tracked in the roadmap.
+    if kv_commands_replayed == 0 {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
             if aof_path.exists() {
                 info!(
-                    "Shard {}: WAL empty, falling back to AOF replay from {:?}",
+                    "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?}",
                     shard_id, aof_path
                 );
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
-                        result.commands_replayed = n;
+                        result.commands_replayed += n;
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
@@ -626,7 +659,7 @@ pub fn recover_shard_v3_pitr(
                 ) {
                     Ok(0) => {}
                     Ok(n) => {
-                        result.commands_replayed = n;
+                        result.commands_replayed += n;
                         tracing::warn!(
                             "Shard {}: no appendonly.aof found — replayed {} records \
                              from legacy-mode WAL v3 at {:?} as a LAST-RESORT \
@@ -1232,6 +1265,44 @@ mod tests {
             "appendonly.aof (2 records, the authority) must be replayed and \
              the KV-incomplete legacy WAL v3 (5 records) ignored -- got {} \
              (the WAL shadowed the AOF if this is 5)",
+            result.commands_replayed
+        );
+    }
+
+    #[test]
+    fn test_spill_lifecycle_records_do_not_suppress_aof_fallback() {
+        // Disk-offload spills write FileCreate/FileDelete/FileTierChange
+        // records into the shard's own wal-v3 — but NO KV Command records
+        // (`--wal-kv-log` is auto-off when the AOF is the authority). The
+        // Phase 4b gate must key on KV Command records only: gating on the
+        // aggregate count made any post-spill restart skip the AOF entirely,
+        // losing every KV write since the last snapshot (and resurrecting
+        // deleted cold keys, since the AOF'd DELs never replayed).
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let offload_wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&offload_wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        // One spill lifecycle record: 16-byte payload (file_id + page_offset).
+        write_wal_v3_record(&mut wal_data, 1, WalRecordType::FileCreate, &[0u8; 16]);
+        std::fs::write(offload_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let aof_payload = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n"; // 2 KV records
+        std::fs::write(v2_dir.join("appendonly.aof"), aof_payload).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
+                .unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 3,
+            "1 FileCreate lifecycle record + 2 AOF commands must all be \
+             replayed -- got {} (1 means the lifecycle record suppressed the \
+             AOF fallback and every KV write was dropped)",
             result.commands_replayed
         );
     }
