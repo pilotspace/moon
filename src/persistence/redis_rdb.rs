@@ -114,6 +114,35 @@ fn write_length(buf: &mut Vec<u8>, len: u64) {
     }
 }
 
+/// Bound an untrusted RDB length/count against the bytes remaining in the
+/// cursor before allocating. `read_length`'s 0x81 form can return up to
+/// `u64::MAX`; without this check a crafted/corrupt file drives a
+/// multi-gigabyte `Vec`/`HashMap`/`HashSet`/`VecDeque` allocation before a
+/// single byte of the claimed data is read, aborting the process (release
+/// builds use `panic = "abort"`) or OOM-killing it. `min_bytes_per_item` is
+/// the minimum bytes a single item consumes from the cursor (>=1).
+fn check_alloc_bound(
+    cursor: &Cursor<&[u8]>,
+    len_or_count: u64,
+    min_bytes_per_item: usize,
+    what: &str,
+) -> anyhow::Result<()> {
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    let max_items = (remaining / min_bytes_per_item.max(1)) as u64;
+    if len_or_count > max_items {
+        bail!(
+            "{} length/count {} exceeds remaining input ({} bytes)",
+            what,
+            len_or_count,
+            remaining
+        );
+    }
+    Ok(())
+}
+
 /// Read a Redis variable-length encoded integer.
 /// Returns (value, is_special_encoding).
 /// When the top 2 bits are 11, it's a special encoding (integer string),
@@ -186,6 +215,10 @@ fn read_redis_string(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<Vec<u8>> {
             other => bail!("Unknown RDB string encoding: {}", other),
         }
     } else {
+        // val must fit within the physically remaining bytes — the bound is
+        // exact (no per-item overhead) since read_exact below requires the
+        // bytes to actually exist.
+        check_alloc_bound(cursor, val, 1, "string")?;
         let mut data = vec![0u8; val as usize];
         cursor.read_exact(&mut data)?;
         Ok(data)
@@ -562,6 +595,7 @@ fn read_rdb_entry(
         }
         RDB_TYPE_LIST => {
             let (count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, count, 1, "list")?;
             let mut list = VecDeque::with_capacity(count as usize);
             for _ in 0..count {
                 let elem = read_redis_string(cursor)?;
@@ -575,6 +609,7 @@ fn read_rdb_entry(
         }
         RDB_TYPE_SET => {
             let (count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, count, 1, "set")?;
             let mut set = HashSet::with_capacity(count as usize);
             for _ in 0..count {
                 let member = read_redis_string(cursor)?;
@@ -588,6 +623,7 @@ fn read_rdb_entry(
         }
         RDB_TYPE_HASH => {
             let (count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, count, 1, "hash")?;
             let mut map = HashMap::with_capacity(count as usize);
             for _ in 0..count {
                 let field = read_redis_string(cursor)?;
@@ -602,6 +638,7 @@ fn read_rdb_entry(
         }
         RDB_TYPE_ZSET_2 => {
             let (count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, count, 1, "zset")?;
             let mut members = HashMap::with_capacity(count as usize);
             let mut scores = BTreeMap::new();
             for _ in 0..count {
@@ -1133,5 +1170,50 @@ mod tests {
             result.unwrap_err().to_string().contains("CRC64"),
             "Error should mention CRC64"
         );
+    }
+
+    /// Security regression (untrusted-input DoS): `read_length`'s 0x81
+    /// 8-byte form can return up to `u64::MAX`. Before the fix,
+    /// `read_redis_string` fed that value straight into
+    /// `vec![0u8; val as usize]` with no bound check, before the
+    /// `read_exact()` that would have rejected a length that doesn't fit
+    /// the input ever ran — on a crafted/corrupt RDB file (server startup
+    /// or PSYNC2 replica full-sync) this drives an allocation attempt that
+    /// either panics on capacity overflow or aborts the process via the
+    /// allocator's OOM handler (release builds use `panic = "abort"`).
+    #[test]
+    fn test_read_redis_string_rejects_oversized_length_dos() {
+        let mut buf = Vec::new();
+        write_length(&mut buf, u64::MAX); // lying length prefix, zero data bytes follow
+        let mut cursor = Cursor::new(buf.as_slice());
+        let result = read_redis_string(&mut cursor);
+        assert!(
+            result.is_err(),
+            "a string length exceeding the remaining input must be rejected, not allocated"
+        );
+    }
+
+    /// Security regression (untrusted-input DoS): same class as above but
+    /// for the collection decoders (`RDB_TYPE_LIST` / `RDB_TYPE_SET` /
+    /// `RDB_TYPE_HASH` / `RDB_TYPE_ZSET_2`), which fed an untrusted `count`
+    /// straight into `Vec`/`HashMap`/`HashSet`::with_capacity(count as
+    /// usize)` with no bound check.
+    #[test]
+    fn test_read_rdb_entry_collection_rejects_oversized_count_dos() {
+        for (type_tag, name) in [
+            (RDB_TYPE_LIST, "list"),
+            (RDB_TYPE_SET, "set"),
+            (RDB_TYPE_HASH, "hash"),
+            (RDB_TYPE_ZSET_2, "zset"),
+        ] {
+            let mut buf = Vec::new();
+            write_length(&mut buf, u64::MAX); // lying count, zero element data follows
+            let mut cursor = Cursor::new(buf.as_slice());
+            let result = read_rdb_entry(&mut cursor, type_tag, None);
+            assert!(
+                result.is_err(),
+                "{name}: a count exceeding the remaining input must be rejected, not allocated"
+            );
+        }
     }
 }
