@@ -195,6 +195,30 @@ fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
     (global_ids, key_hashes)
 }
 
+/// Read just the `key_hash` set out of a warm segment's `mvcc.mpf`, without
+/// touching `codes.mpf`/`graph.mpf` or requiring a `CollectionMetadata`.
+///
+/// Used by `VectorStore::register_warm_segments` to decide which recovered
+/// index actually owns a warm segment (PR review finding #2):
+/// `WarmSearchSegment::from_files` accepts ANY caller-supplied collection and
+/// never validates it against the file contents — codes/graph deserialize
+/// successfully regardless of whether the collection you pass matches the
+/// data that produced them (dimension/quantization only matter once you
+/// actually run a distance computation). With two same-dim indexes, "first
+/// index for which `from_files` succeeds" can silently pick the wrong one.
+/// Ownership must instead be decided by evidence — the segment's own
+/// key_hashes checked against each candidate index's persisted keymap — and
+/// this only needs the cheap mvcc.mpf read to get that evidence.
+pub(crate) fn peek_key_hashes(segment_dir: &Path) -> std::io::Result<Vec<u64>> {
+    use crate::vector::persistence::sealed_mmap::{AccessPattern, advise_pattern, map_sealed_file};
+
+    let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
+    advise_pattern(&mvcc_mmap, AccessPattern::Sequential)?;
+    let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
+    let (_global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
+    Ok(key_hashes)
+}
+
 impl WarmSearchSegment {
     /// Construct a WarmSearchSegment from .mpf files in a segment directory.
     ///

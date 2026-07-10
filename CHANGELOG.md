@@ -261,6 +261,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-transition baseline — no recall regression. Verified red (fails with
   the leak-fix call removed) before green.
 
+### Fixed — Vector: hand-review found `register_warm_segments` could permanently duplicate documents or attach a segment to the wrong index
+
+- **CRITICAL — crash-before-GC restart could leave the same vectors live
+  twice, forever.** `try_warm_transitions_idle` commits Stack A's shard
+  manifest durably (synchronous, fsync+commit) *before*
+  `persist_hook_after_install` merely schedules the async Stack B snapshot
+  job. A `kill -9` landing in that window left the old segment still
+  tracked by Stack B (reloaded as an ordinary HOT/immutable segment by
+  `recover_v2`) *and* the warm copy discovered by Stack A (reattached WARM
+  by the restart-recovery wiring above) — the same key_hashes live in two
+  segments. `search_mvcc`'s merge (`src/vector/segment/holder.rs`,
+  `all.sort_unstable(); all.truncate(k);`) has no key_hash dedup, so this
+  never self-healed: duplicate keys in `FT.SEARCH` results, inflated
+  `num_docs`, and the next snapshot re-adopted the reloaded HOT copy into
+  `segment_ids` forever. Fixed: `register_warm_segments` now checks a warm
+  segment's own key_hash set (`warm_search::peek_key_hashes`, a cheap
+  `mvcc.mpf`-only read — no codes/graph mmap, no `CollectionMetadata`
+  dependency) against its owning index's *current in-memory*
+  `key_hash_to_key`. If those keys are already covered by a live HOT
+  segment, Stack B wins: the warm copy is left unattached and its on-disk
+  directory is deleted (`std::fs::remove_dir_all`) instead of being
+  registered, so Stack B stays the single source of truth.
+- **HIGH — a warm segment could attach to the wrong index.** The
+  restart-recovery wiring above made a previously-dead code path live:
+  `register_warm_segments` attached each segment to the *first* index for
+  which `WarmSearchSegment::from_files` happened to succeed —
+  `from_files` accepts any caller-supplied `CollectionMetadata` and never
+  validates it against the on-disk codes/graph, so two indexes of the same
+  dimension/quantization made the outcome a coin flip (wrong collection,
+  wrong search results, no error). Fixed: ownership is now decided from
+  key/keymap evidence, never from `from_files` success. Each candidate
+  index's *persisted* Stack-B keymap (read straight off disk via a new
+  `read_manifest_and_keymap_consistent` helper — bounded retry with
+  backoff against the benign TOCTOU where a concurrent `run_snapshot_job`
+  advances the epoch and GCs the old keymap file between the manifest read
+  and the keymap read) is checked for key_hash overlap with the segment;
+  the index with the most matches wins. No match, or a tie between two
+  indexes, leaves the segment unregistered (files intact, logged via
+  `tracing::warn!`) rather than guessing.
+- Two new TDD regression tests in `vector::persistence::recover_v2::tests`:
+  `warm_reattach_dedups_against_crash_before_gc_race` stages the exact
+  crash-before-GC state (rolls the on-disk manifest/segment/keymap back to
+  pre-transition *after* waiting for the real background GC to land, so the
+  rollback is deterministically the last write) and asserts zero duplicate
+  `global_id`s in search results, `warm.len() == 0`, and the superseded
+  warm directory is deleted; `warm_reattach_picks_correct_index_among_same_dim_indexes`
+  builds two same-dimension indexes with disjoint keysets — where the old
+  first-match behavior would have funneled both segments into one index
+  regardless of `HashMap` iteration order — and proves each segment lands
+  on its true owner via an end-to-end recall check (a cross-attached
+  segment would still pass a bare `warm.len() == 1` count but return the
+  wrong top-1 result). Both verified red (fail at the exact assertion the
+  fix satisfies) against the prior "first successful `from_files`"
+  implementation before green.
+
 ### Docs — Roadmap: native `moon://` / `moons://` connection URI scheme
 
 - Define Moon's native connection URI scheme in `docs/roadmap/ROADMAP.md` as a
