@@ -669,7 +669,16 @@ pub(crate) fn handle_memory_pressure(
                     .join(format!("shard-{}", shard_id));
 
                 if let Some(spill_t) = spill_thread {
-                    // Async spill path: background thread does pwrite
+                    // Async spill path: background thread does pwrite under
+                    // `--appendonly yes` (AOF-backstopped fast path). Under
+                    // `--appendonly no` there is no AOF backstop, so
+                    // `evict_one_async_spill` needs `shard_manifest` to take
+                    // the durable synchronous fallback instead of risking the
+                    // crash window (see its doc comment in eviction.rs) --
+                    // this is the ONE call site that has a manifest to give
+                    // it (the inline per-connection write-path gate does
+                    // not, and stays on the pre-fix fast-path-or-bail
+                    // behavior).
                     let sender = spill_t.sender();
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
@@ -682,6 +691,7 @@ pub(crate) fn handle_memory_pressure(
                                 total_mem,
                                 i,
                                 budget,
+                                shard_manifest.as_mut(),
                             );
                         });
                     }

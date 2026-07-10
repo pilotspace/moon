@@ -48,6 +48,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count) confirmed failing before the fix and passing after, plus a control
   test asserting a fully-populated 1-group/1-pel/1-consumer/1-pending
   stream is still accepted by both `read_entry` and `read_entry_zero_copy`.
+### Fixed — KV disk-offload: make eviction spill durable before dropping the hot value
+
+- **Crash window** (`src/storage/eviction.rs`): under memory pressure with
+  `--disk-offload enable`, the async-spill eviction path (`evict_one_async_spill`,
+  driven from the shard event loop's memory-pressure tick) queued the
+  `SpillRequest` to the background `SpillThread` and immediately dropped the
+  hot value from RAM — before the pwrite, fsync, or manifest commit had
+  happened. Under `--appendonly yes` this is safe (a crash in that window is
+  covered by AOF replay of the original write), but under `--appendonly no`
+  there is no AOF to fall back on: the value existed nowhere (not in RAM, not
+  yet on disk, no WAL/AOF record) for the entire `SpillThread` batching
+  window (up to 256 entries or its 100ms tick, longer under backpressure). A
+  kill -9 in that window was unrecoverable, silent data loss.
+- **Fix**: `try_evict_if_needed_async_spill_with_total_budget` now branches on
+  `--appendonly`. With an AOF backstop the fast fire-and-forget path
+  (`evict_one_async_spill`, queue-then-drop over the `SpillThread` channel) is
+  unchanged (documented, intentional trade-off). Without one, it drives a new
+  `evict_batch_durable_no_aof`: collects up to 256 victims (mirroring
+  `SpillThread`'s own `FLUSH_ENTRY_CAP`) *without* removing them from RAM,
+  writes the whole batch as one durable, synchronous call to
+  `spill_thread::flush_buffer` (pwrite + fsync + manifest commit — the same
+  inline/oversized page routing the background thread itself uses, now made
+  `pub(crate)` for reuse), and only *then* removes from RAM the keys whose
+  file both pwrite-succeeded and manifest-committed, immediately populating
+  `ColdIndex` so each stays read-through-able (previously only a later
+  `SpillCompletion` — which never arrives on this path — did that). Batching
+  is required, not optional: an earlier draft did one fsync per evicted key
+  and stalled the single-threaded shard event loop under sustained pressure.
+  `try_evict_if_needed_async_spill_with_total_budget` gained an
+  `Option<&mut ShardManifest>` parameter to carry the manifest down; the
+  memory-pressure cascade (`handle_memory_pressure` in
+  `src/shard/persistence_tick.rs`) is the one call site that has a manifest
+  and passes it through. The four other callers (inline per-connection
+  write-path gate, sharded/monoio handlers, `spsc_handler`, the Lua scripting
+  bridge) have no manifest reachable; under `--appendonly no` they now bail
+  (retain the hot value, surface OOM) instead of risking the same crash
+  window — the next 100ms memory-pressure tick reclaims the memory via the
+  durable path instead. **Trade-off**: those inline call sites no longer
+  evict opportunistically under `--appendonly no` (that unconditional
+  fast-path eviction, regardless of durability, was the bug being fixed), so
+  a write burst that crosses `maxmemory` now converges to budget only as fast
+  as the 100ms tick reclaims it, evicting the minimum needed each pass rather
+  than eagerly on every write — verified live (per-shard `estimated_memory()`
+  accounting, not RSS) to converge correctly and stay converged.
+- **Second bug, same file** (`evict_one_with_spill`, the legacy fully-sync
+  spill path used when no `SpillThread` exists): on a spill I/O error it
+  logged a warning and *still* evicted the key from RAM — unconditional data
+  loss on every spill failure, independent of any crash. Now returns without
+  evicting on failure, matching the async path's fail-closed contract.
+- **Regression coverage**: `sync_spill_failure_retains_hot_value_no_silent_drop`,
+  `async_spill_no_aof_backstop_durably_spills_before_drop` (locks the durable
+  pwrite+fsync+manifest-commit-before-drop ordering and immediate
+  `ColdIndex` availability), `async_spill_no_aof_backstop_no_manifest_retains_hot_value`,
+  `async_spill_no_aof_backstop_spill_failure_retains_hot_value` — plus a
+  `db.remove()` (DEL) check after the new durable-spill path to guard against
+  reintroducing the DEL/cold-tombstone resurrection class (#257): an earlier
+  draft of this fix inserted into `ColdIndex` *before* `db.remove()`, and
+  `Database::remove`'s own cold-tier cleanup silently wiped the insert back
+  out — caught by this test suite, not by inspection.
 
 ### Fixed — test flakiness: sigterm-shutdown readiness + BGSAVE file polling
 
