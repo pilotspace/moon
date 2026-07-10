@@ -173,7 +173,14 @@ fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
 /// they are rare in typical workloads.
 ///
 /// Returns a `Vec<SpillCompletion>` (one per file written).  Never panics.
-fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
+///
+/// `pub(crate)`: also called synchronously (no channel, no background
+/// thread) by `crate::storage::eviction`'s no-AOF-backstop durable spill path
+/// (`--appendonly no`), which needs this exact inline/oversized batching to
+/// keep per-eviction I/O at ~1 fsync per up-to-`FLUSH_ENTRY_CAP` keys instead
+/// of 1 fsync per key -- reusing this function (rather than re-deriving the
+/// routing logic) keeps the two paths' on-disk layout identical.
+pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
     if buffer.is_empty() {
         return Vec::new();
     }

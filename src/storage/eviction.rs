@@ -470,14 +470,22 @@ pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
 /// background `SpillThread` instead of doing a synchronous pwrite on the event
 /// loop.
 ///
-/// Per victim (`evict_one_async_spill`): serialize the key/value into a
-/// `SpillRequest`, **`try_send` it to the spill channel BEFORE removing the
-/// entry from the hot tier, and only remove from RAM once the send succeeds.**
-/// This ordering is fail-safe: if the channel is full or disconnected the send
-/// fails, the key stays in RAM, and the eviction loop bails out to retry on the
-/// next tick — no acknowledged data is lost. The worst case under sustained
-/// backpressure is keys remaining resident (eventually an OOM write-rejection
-/// once at budget), which is correct behaviour, not data loss.
+/// Per victim (`evict_one_async_spill`): under `--appendonly yes`, serialize
+/// the key/value into a `SpillRequest`, **`try_send` it to the spill channel
+/// BEFORE removing the entry from the hot tier, and only remove from RAM
+/// once the send succeeds.** This ordering is fail-safe under an AOF
+/// backstop: if the channel is full or disconnected the send fails, the key
+/// stays in RAM, and the eviction loop bails out to retry on the next tick —
+/// no acknowledged data is lost, and a crash before the spill lands on disk
+/// is covered by AOF replay. The worst case under sustained backpressure is
+/// keys remaining resident (eventually an OOM write-rejection once at
+/// budget), which is correct behaviour, not data loss.
+///
+/// This family of wrappers has no `ShardManifest` available (only the
+/// tick-driven memory-pressure cascade does — see
+/// `try_evict_if_needed_async_spill_with_total_budget`'s `manifest`
+/// parameter), so under `--appendonly no` `evict_one_async_spill` bails
+/// rather than risk the crash window described on its doc comment.
 ///
 /// Callers must poll `SpillThread::drain_completions()` to apply the manifest
 /// and `ColdIndex` updates produced by completed spills.
@@ -519,6 +527,7 @@ pub fn try_evict_if_needed_async_spill_with_total(
         total_memory,
         db_index,
         0,
+        None,
     )
 }
 
@@ -542,11 +551,42 @@ pub fn try_evict_if_needed_async_spill_budget(
         db.estimated_memory(),
         db_index,
         budget_override,
+        None,
     )
 }
 
 /// Async spill eviction with an elastic budget override (GAP-1; see
 /// `try_evict_if_needed_with_spill_and_total_budget`).
+///
+/// ## Durability ordering (crash-window fix)
+///
+/// Under `--appendonly yes` this uses the AOF-backstopped fast path
+/// (`evict_one_async_spill`): queue the `SpillRequest` on the background
+/// `SpillThread`'s channel, then immediately free RAM. That ordering is safe
+/// ONLY because the AOF already durably records the original write — a
+/// crash between "dropped from RAM" and "spilled to disk" is fully
+/// recoverable by AOF replay on restart. This is a deliberate trade-off
+/// (RAM relief now, disk durability shortly after) that keeps pwrite I/O off
+/// the event loop.
+///
+/// Under `--appendonly no` there is no second copy of the value anywhere
+/// once it leaves RAM, so the fast path would be unconditional, unrecoverable
+/// data loss on a crash. This function instead batches victims into
+/// [`evict_batch_durable_no_aof`], which performs a **fully synchronous,
+/// durable spill (pwrite + fsync + manifest commit) before dropping any hot
+/// value**, provided a `ShardManifest` is available (today only the
+/// tick-driven memory-pressure cascade threads one through — see
+/// `crate::shard::persistence_tick::handle_memory_pressure`). Batching (up to
+/// `NO_AOF_BATCH_CAP` keys per fsync, mirroring the async path's own
+/// `FLUSH_ENTRY_CAP`) is required, not optional: an earlier version of this
+/// fix did one fsync per evicted key and stalled the single-threaded shard
+/// event loop under sustained eviction pressure (thousands of individual
+/// fsyncs serialized against a write-heavy workload). Callers with no
+/// manifest access (e.g. the inline per-connection write-path eviction gate)
+/// cannot safely spill durably under `--appendonly no` and bail (no
+/// eviction, hot values retained) rather than manufacture a crash-loss
+/// window; the next 100ms memory-pressure tick picks up the slack via the
+/// durable batched path.
 #[allow(clippy::too_many_arguments)]
 pub fn try_evict_if_needed_async_spill_with_total_budget(
     db: &mut Database,
@@ -557,6 +597,7 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
     total_memory: usize,
     db_index: usize,
     budget_override: usize,
+    manifest: Option<&mut ShardManifest>,
 ) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
@@ -570,6 +611,43 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
     } else {
         config.maxmemory_per_shard()
     };
+
+    if config.appendonly != "yes" {
+        let Some(manifest) = manifest else {
+            // No manifest reachable from this call site and no AOF backstop:
+            // cannot guarantee durability, so do not evict anything here.
+            return if total_memory > budget {
+                Err(oom_error())
+            } else {
+                Ok(())
+            };
+        };
+        let mut current_total = total_memory;
+        while current_total > budget {
+            if policy == EvictionPolicy::NoEviction {
+                return Err(oom_error());
+            }
+            let before = db.estimated_memory();
+            let deficit = current_total.saturating_sub(budget);
+            let reclaimed_keys = evict_batch_durable_no_aof(
+                db,
+                config,
+                &policy,
+                shard_dir,
+                next_file_id,
+                manifest,
+                db_index,
+                deficit,
+            );
+            if reclaimed_keys == 0 {
+                return Err(oom_error());
+            }
+            let after = db.estimated_memory();
+            current_total = current_total.saturating_sub(before.saturating_sub(after));
+        }
+        return Ok(());
+    }
+
     let mut current_total = total_memory;
     while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
@@ -594,10 +672,193 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
     Ok(())
 }
 
+/// Maximum victims collected into a single durable batch by
+/// [`evict_batch_durable_no_aof`], mirroring `SpillThread`'s own
+/// `FLUSH_ENTRY_CAP` (256) so the no-AOF-backstop path's on-disk batch size
+/// matches the async path's.
+const NO_AOF_BATCH_CAP: usize = 256;
+
+/// Bounded retries when victim sampling re-picks a key already staged in the
+/// current batch (possible because, unlike the single-victim paths, this
+/// function does NOT remove a key from `db` between picks -- removal must
+/// wait until the whole batch is durable). Random re-sampling (see
+/// `sample_random_keys`) makes an infinite repeat vanishingly unlikely; this
+/// only guards a pathological near-empty or heavily-duplicate keyspace.
+const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
+
+/// Batch-durable spill for the no-AOF-backstop case (`--appendonly no`).
+///
+/// Collects up to [`NO_AOF_BATCH_CAP`] distinct victims (or until the
+/// estimated bytes staged cover `deficit`, whichever comes first) WITHOUT
+/// removing any of them from RAM yet, then writes them as ONE durable batch
+/// by calling `spill_thread::flush_buffer` synchronously (the exact
+/// inline/oversized routing and multi-page batching the background
+/// `SpillThread` itself uses, just invoked directly instead of over a
+/// channel) -- ONE fsync (or a small, bounded number for any oversized
+/// entries) covers the whole batch, instead of one fsync per key. Only
+/// entries in a file that both pwrite-succeeded AND whose manifest commit
+/// succeeded are removed from RAM; any partial failure retains the
+/// corresponding hot values (never a silent drop) and is logged.
+///
+/// Returns the number of keys durably evicted (0 if nothing could be
+/// evicted -- the caller surfaces OOM).
+#[allow(clippy::too_many_arguments)]
+fn evict_batch_durable_no_aof(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    manifest: &mut ShardManifest,
+    db_index: usize,
+    deficit: usize,
+) -> usize {
+    let mut seen: std::collections::HashSet<CompactKey> = std::collections::HashSet::new();
+    let mut buffer: Vec<SpillRequest> = Vec::new();
+    let mut staged_bytes = 0usize;
+    let mut stall = 0usize;
+
+    while buffer.len() < NO_AOF_BATCH_CAP && staged_bytes < deficit {
+        let victim = match policy {
+            EvictionPolicy::NoEviction => None,
+            EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+            EvictionPolicy::AllKeysLfu => {
+                find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+            }
+            EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+            EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+            EvictionPolicy::VolatileLfu => {
+                find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+            }
+            EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+            EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+        };
+        let key = match victim {
+            Some(k) => k,
+            None => break,
+        };
+        if seen.contains(&key) {
+            stall += 1;
+            if stall >= NO_AOF_BATCH_STALL_LIMIT {
+                break;
+            }
+            continue;
+        }
+        stall = 0;
+        seen.insert(key.clone());
+
+        let Some(entry) = db.data().get(key.as_bytes()) else {
+            // Race with expiry: nothing to spill for this key, but it is
+            // already gone, so keep sampling for more victims.
+            continue;
+        };
+        let val_ref = entry.as_redis_value();
+        let collection_buf: Vec<u8>;
+        let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
+            RedisValueRef::String(s) => (ValueType::String, s),
+            ref other => {
+                let vt = match other {
+                    RedisValueRef::Hash(_)
+                    | RedisValueRef::HashListpack(_)
+                    | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
+                    RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
+                    RedisValueRef::Set(_)
+                    | RedisValueRef::SetListpack(_)
+                    | RedisValueRef::SetIntset(_) => ValueType::Set,
+                    RedisValueRef::SortedSet { .. }
+                    | RedisValueRef::SortedSetBPTree { .. }
+                    | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                    RedisValueRef::Stream(_) => ValueType::Stream,
+                    RedisValueRef::String(_) => unreachable!(),
+                };
+                collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
+                (vt, collection_buf.as_slice())
+            }
+        };
+        let mut flags: u8 = 0;
+        let ttl_ms = if entry.has_expiry() {
+            flags |= entry_flags::HAS_TTL;
+            Some(entry.expires_at_ms(0))
+        } else {
+            None
+        };
+
+        staged_bytes += key.as_bytes().len() + value_bytes.len();
+        let file_id = *next_file_id;
+        *next_file_id += 1;
+        buffer.push(SpillRequest {
+            key: Bytes::copy_from_slice(key.as_bytes()),
+            db_index,
+            value_bytes: Bytes::copy_from_slice(value_bytes),
+            value_type,
+            flags,
+            ttl_ms,
+            file_id,
+            shard_dir: PathBuf::from(shard_dir),
+        });
+    }
+
+    if buffer.is_empty() {
+        return 0;
+    }
+
+    // Durable write (pwrite + fsync[+ fsync dir]) for the whole batch, still
+    // fully in RAM at this point -- write-then-durable-then-drop.
+    let completions = crate::storage::tiered::spill_thread::flush_buffer(&mut buffer);
+    let mut reclaimed = 0usize;
+    for completion in completions {
+        if !completion.success {
+            warn!(
+                file_id = completion.file_entry.file_id,
+                "kv_spill: durable batch spill failed under appendonly=no; \
+                 retaining hot values for this file's keys (no silent drop)"
+            );
+            continue;
+        }
+
+        let file_id = completion.file_entry.file_id;
+        manifest.add_file(completion.file_entry);
+        if let Err(e) = manifest.commit() {
+            warn!(
+                file_id,
+                error = %e,
+                "kv_spill: manifest commit failed for durable batch spill under \
+                 appendonly=no; retaining hot values (spill file may be orphaned; \
+                 the orphan sweep reclaims it)"
+            );
+            continue;
+        }
+
+        for entry in completion.entries {
+            // `Database::remove` ALSO clears any cold copy of the key (D1:
+            // DEL must not resurrect a stale cold entry via read-through) --
+            // so the ColdIndex insert MUST come AFTER remove, never before,
+            // or `remove` wipes out the very entry being added.
+            db.remove(&entry.key);
+            if let Some(ref mut ci) = db.cold_index {
+                ci.insert(
+                    entry.key,
+                    crate::storage::tiered::cold_index::ColdLocation {
+                        file_id,
+                        page_idx: entry.page_idx,
+                        slot_idx: entry.slot_idx,
+                        ttl_ms: entry.ttl_ms,
+                    },
+                );
+            }
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
 /// Evict a single key via the async spill path.
 ///
-/// Extracts the entry, removes it from DashTable (immediate RAM relief),
-/// then sends a SpillRequest to the background thread for pwrite.
+/// AOF-backstopped fast path only (see the durability-ordering doc comment
+/// on [`try_evict_if_needed_async_spill_with_total_budget`], which routes to
+/// [`evict_batch_durable_no_aof`] instead when `--appendonly no`). Extracts
+/// the entry, removes it from DashTable (immediate RAM relief), then sends a
+/// `SpillRequest` to the background thread for pwrite.
 fn evict_one_async_spill(
     db: &mut Database,
     config: &RuntimeConfig,
@@ -712,6 +973,16 @@ fn evict_one_async_spill(
 /// `pub(crate)` so [`crate::storage::db_quota`] can reuse the exact same
 /// victim-selection + spill logic for per-db quota enforcement, keeping a
 /// single policy implementation for both the whole-instance and per-db gates.
+///
+/// Write-then-durable-then-drop: when a `SpillContext` is provided,
+/// [`kv_spill::spill_to_datafile`] performs pwrite + fsync + manifest commit
+/// synchronously, so by construction the file is durable BEFORE this
+/// function ever calls `db.remove`. On spill failure the hot value is
+/// retained (this function returns `false` without touching `db`) and the
+/// error is surfaced via the `warn!` below — never a silent drop. Previously
+/// this fell through to `db.remove` unconditionally even on an I/O error,
+/// which discarded the value with no copy anywhere (real, unconditional data
+/// loss on every spill failure, independent of any crash).
 pub(crate) fn evict_one_with_spill(
     db: &mut Database,
     config: &RuntimeConfig,
@@ -756,11 +1027,15 @@ pub(crate) fn evict_one_with_spill(
                     warn!(
                         key = %String::from_utf8_lossy(key.as_bytes()),
                         error = %e,
-                        "kv_spill: I/O error during spill, proceeding with eviction"
+                        "kv_spill: I/O error during spill; retaining hot value, \
+                         aborting this eviction attempt (no silent drop)"
                     );
-                } else {
-                    *ctx.next_file_id += 1;
+                    // Spill failed: the value has no durable copy anywhere.
+                    // Do NOT evict -- keep the hot value resident and let the
+                    // caller retry (or surface OOM) instead of losing data.
+                    return false;
                 }
+                *ctx.next_file_id += 1;
             }
         }
     }
@@ -1382,7 +1657,14 @@ mod tests {
         db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
 
         // Per-shard budget of 1 byte forces an eviction attempt for k1.
-        let config = make_config(1, "allkeys-lru");
+        // appendonly=yes: this test exercises the AOF-backstopped fast path's
+        // full-channel ordering specifically. Under appendonly=no (this
+        // crate's `make_config` default) `evict_one_async_spill` now bails
+        // before ever touching the channel (no manifest reachable here, no
+        // AOF backstop) — see `async_spill_no_aof_backstop_durably_spills_before_drop`
+        // below for that scenario's dedicated coverage.
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "yes".to_string();
 
         // bounded(1) PRE-FILLED so the eviction's `try_send` observes a FULL
         // channel (the reviewer's backpressure scenario) rather than a
@@ -1418,6 +1700,233 @@ mod tests {
             db.data().get(&b"k1"[..]).is_some(),
             "k1 must remain in the hot tier for retry on the next eviction tick"
         );
+    }
+
+    // ── Crash-window fix: write-then-durable-then-drop under appendonly=no ──
+    //
+    // Without an AOF backstop the async fast path's "queue-then-drop"
+    // ordering is a genuine, unconditional data-loss bug: the value would
+    // exist nowhere (not in RAM, not yet on disk, no AOF/WAL record) for the
+    // whole `SpillThread` batching window. Pre-fix, `evict_one_async_spill`
+    // had no `--appendonly` check at all and no way to spill synchronously,
+    // so a successful `try_send` was immediately followed by `db.remove` —
+    // exactly the crash window these tests lock shut.
+
+    /// GREEN: under `--appendonly no`, eviction must perform a fully durable
+    /// synchronous spill (pwrite + fsync + manifest commit) BEFORE dropping
+    /// the hot value, and must make the key immediately cold-read-through-able
+    /// (there is no later `SpillCompletion` on this path to do it for us).
+    #[test]
+    fn async_spill_no_aof_backstop_durably_spills_before_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        let total = db.estimated_memory();
+
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "no".to_string(); // no AOF backstop
+
+        // Channel is never touched by the durable path -- bounded(1) with
+        // nothing pre-filled proves that if the fast path ran instead, this
+        // assertion would still pass, so we additionally assert `_rx` stayed
+        // empty below to prove the queue was never used.
+        let (tx, rx) = flume::bounded::<SpillRequest>(4096);
+
+        let result = try_evict_if_needed_async_spill_with_total_budget(
+            &mut db,
+            &config,
+            &tx,
+            shard_dir,
+            &mut next_file_id,
+            total,
+            0,
+            0,
+            Some(&mut manifest),
+        );
+        assert!(
+            result.is_ok(),
+            "durable synchronous spill must succeed: {result:?}"
+        );
+        assert_eq!(db.len(), 0, "hot value dropped only after durable spill");
+        assert!(
+            rx.try_recv().is_err(),
+            "the durable fallback must bypass the SpillThread channel entirely"
+        );
+
+        // The .mpf file must already be fsynced on disk -- the durability
+        // barrier that has to complete before RAM is freed.
+        let file_path = shard_dir.join("data/heap-000001.mpf");
+        assert!(file_path.exists(), "spill file must be durable before drop");
+        let pages = read_datafile(&file_path).unwrap();
+        let entry = pages[0].get(0).unwrap();
+        assert_eq!(entry.key, b"k1");
+        assert_eq!(entry.value, b"v1");
+
+        // A FRESH manifest load from disk (simulating post-crash recovery)
+        // must already see the file -- the commit landed before drop.
+        let reloaded = crate::persistence::manifest::ShardManifest::open(&manifest_path)
+            .expect("manifest must be openable");
+        assert!(
+            reloaded.files().iter().any(|f| f.file_id == 1),
+            "manifest commit must be durable before the hot value is dropped"
+        );
+
+        // No SpillCompletion will ever arrive for this eviction (no
+        // SpillThread involved) -- ColdIndex must be populated inline or the
+        // key is unreadable until the next full restart.
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k1").is_some(),
+            "key must be immediately cold-read-through-able after a durable sync spill"
+        );
+
+        // Requirement (4) regression guard (#257 class): a DEL of a key that
+        // was just durably spilled by this new path must tombstone the cold
+        // copy too, never leave it resurrectable via read-through. This
+        // pins the fix's `db.remove()`-before-`ci.insert()` ordering (an
+        // earlier draft of this fix got that backwards: inserting into
+        // ColdIndex before `db.remove` let `Database::remove`'s own cold-tier
+        // cleanup wipe the entry right back out; this test would have caught
+        // the opposite bug too -- a DEL failing to clear a cold entry that
+        // durable-spill inserted).
+        db.remove(b"k1");
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k1").is_none(),
+            "DEL after a durable sync spill must not leave the key resurrectable from cold"
+        );
+    }
+
+    /// GREEN: when no `ShardManifest` is reachable (e.g. the inline
+    /// per-connection write-path eviction gate) AND there is no AOF backstop,
+    /// eviction MUST NOT drop the hot value -- there is no way to guarantee
+    /// durability from this call site, so it must bail (OOM surfaced, value
+    /// retained) rather than manufacture a crash-loss window. The periodic
+    /// memory-pressure tick (which does have a manifest) picks up the slack.
+    #[test]
+    fn async_spill_no_aof_backstop_no_manifest_retains_hot_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "no".to_string();
+
+        let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
+
+        let result =
+            try_evict_if_needed_async_spill(&mut db, &config, &tx, shard_dir, &mut next_file_id, 0);
+
+        assert!(
+            result.is_err(),
+            "no manifest + no AOF backstop must surface OOM, never silently evict"
+        );
+        assert_eq!(db.len(), 1, "hot value must be retained, not dropped");
+        assert!(db.data().get(&b"k1"[..]).is_some());
+        // Nothing was queued either -- no half-done spill left dangling.
+        assert!(_rx.try_recv().is_err());
+        assert!(
+            !shard_dir.join("data").exists(),
+            "no spill file should have been written"
+        );
+    }
+
+    /// GREEN (spill-failure retention, no-AOF path): if the durable
+    /// synchronous spill itself fails (I/O error), the hot value must be
+    /// retained -- never silently dropped. Simulated by pointing `shard_dir`
+    /// at a path whose parent is a regular file, so `create_dir_all("data")`
+    /// fails.
+    #[test]
+    fn async_spill_no_aof_backstop_spill_failure_retains_hot_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker_file = tmp.path().join("not_a_dir");
+        std::fs::write(&blocker_file, b"x").unwrap();
+        // shard_dir/data cannot be created because `shard_dir` itself is a
+        // regular file, not a directory.
+        let shard_dir = blocker_file.as_path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        let total = db.estimated_memory();
+
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "no".to_string();
+
+        let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
+
+        let result = try_evict_if_needed_async_spill_with_total_budget(
+            &mut db,
+            &config,
+            &tx,
+            shard_dir,
+            &mut next_file_id,
+            total,
+            0,
+            0,
+            Some(&mut manifest),
+        );
+
+        assert!(
+            result.is_err(),
+            "spill I/O failure must surface OOM, never a false success"
+        );
+        assert_eq!(
+            db.len(),
+            1,
+            "hot value must be retained when the durable spill fails"
+        );
+        assert!(db.data().get(&b"k1"[..]).is_some());
+    }
+
+    /// GREEN (bug #1 regression guard, sync path): `evict_one_with_spill`
+    /// previously fell through to `db.remove` unconditionally even when
+    /// `spill_to_datafile` failed, discarding the value with no copy
+    /// anywhere -- real, unconditional data loss on every spill I/O error,
+    /// independent of any crash. Same blocker-file trick as above.
+    #[test]
+    fn sync_spill_failure_retains_hot_value_no_silent_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker_file = tmp.path().join("not_a_dir");
+        std::fs::write(&blocker_file, b"x").unwrap();
+        let shard_dir = blocker_file.as_path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(
+            Bytes::from_static(b"spill_key"),
+            Bytes::from_static(b"spill_val"),
+        );
+
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+        };
+
+        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        assert!(
+            result.is_err(),
+            "spill I/O failure must surface OOM, never a false success"
+        );
+        assert_eq!(
+            db.len(),
+            1,
+            "hot value must be retained when the sync spill fails (no silent drop)"
+        );
+        assert!(db.data().get(&b"spill_key"[..]).is_some());
     }
 
     #[test]
