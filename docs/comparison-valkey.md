@@ -1,6 +1,6 @@
 # Moon vs Valkey — Deep Architectural Comparison
 
-*Reviewed: Moon v0.2.0 (~224K LOC Rust, traced from source) vs Valkey 9.1.0 (released 2026-05-19). Document date: 2026-05-25; version refreshed 2026-06-08.*
+*Reviewed: Moon v0.2.0 (~224K LOC Rust, traced from source) vs Valkey 9.1.0 (released 2026-05-19). Document date: 2026-05-25; version refreshed 2026-06-08; H-4 doc reconciliation 2026-07-10 (hash-field TTL corrected from "Moon does not implement" to "effective parity" — see §2).*
 
 ---
 
@@ -76,7 +76,6 @@ The right mental model is **Valkey = horizontal moat (ecosystem + governance), M
 - **Atomic slot migration** (9.0) — operational property Moon's cluster code does not yet match.
 - **Cluster-scale benchmarks** — 1B+ RPS, 2000 nodes demonstrated.
 - **Multi-language official client** — GLIDE 2.0 with server-side-aware semantics + OTel.
-- **Hash field expiration** (9.0) — `HEXPIRE` / `HTTL` family Moon does not implement.
 - **Operator / Helm tooling** — Helm chart, operators, GUI, managed cloud everywhere.
 
 ### Effective parity
@@ -87,6 +86,7 @@ The right mental model is **Valkey = horizontal moat (ecosystem + governance), M
 - PSYNC2 replication, diskless full sync.
 - Listpack-class compact encodings.
 - 240-250 command surface.
+- **Hash field expiration** — Moon implements the full `HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT`/`HTTL`/`HPTTL`/`HEXPIRETIME`/`HPEXPIRETIME`/`HPERSIST`/`HGETDEL`/`HGETEX` family (`src/command/hash/hash_write.rs`, `hash_read.rs`), wired on both the read and write dispatch paths and WAL-replayed on recovery (`src/persistence/replay.rs`). A same-instance 3-way benchmark against Redis 8.0.2 / Valkey 9.1.0 (`docs/perf/2026-05-27-hash-ttl-3way-bench.md`) found Moon functionally correct but 4-10% slower than Valkey on HEXPIRE-family ops (HGETEX is at parity, 0.99x) — a known, tracked perf gap, not a missing feature.
 
 ---
 
@@ -107,7 +107,7 @@ Both are valid; they will likely coexist.
 
 1. **The missing managed offering and third-party validation are a moat for Valkey.** Even with single-node v0.2.0 now production-grade, until Moon has a managed offering, a multi-year production reference, and an independent third-party benchmark validating the published numbers, Valkey wins every procurement conversation by default. **This is the single highest-leverage item.**
 2. **No module API** is starting to look like a strategic constraint, not a clean-architecture win. Valkey's ability to ship JSON, Bloom, LDAP, Search as modules — and to expose a Rust module SDK — means *the community can extend Valkey faster than Moon's core team can extend Moon*. Reconsider whether a sandboxed (WASM?) module surface is worth opening.
-3. **Cluster operational features** (atomic slot migration, CLUSTERSCAN, hash-field TTL, multi-DB-in-cluster) are real workload features Valkey shipped in 9.0 / 9.1 that Moon's cluster code does not yet match. These will surface in any serious operator evaluation.
+3. **Cluster operational features** (atomic slot migration, CLUSTERSCAN, multi-DB-in-cluster) are real workload features Valkey shipped in 9.0 / 9.1 that Moon's cluster code does not yet match. These will surface in any serious operator evaluation. (Hash-field TTL is *not* one of these gaps — see §2 "Effective parity"; Moon has shipped the full `HEXPIRE` family since before this document's 2026-06-08 refresh, unrelated to cluster mode.)
 4. **Valkey's vector module will add quantization.** It's the obvious next step and they have the contributor base. Moon's current TQ moat shrinks every quarter — lean into agentic / hybrid / temporal differentiation that's harder to copy.
 5. **Multi-language client story.** GLIDE 2.0 is a real asset; Moon's two SDKs (Rust + Python) are insufficient for adoption at scale.
 6. **Cluster-scale benchmark gap.** Moon has not published >1-node scaling numbers comparable to Valkey's 1B-RPS / 2000-node demonstration. The shared-nothing architecture *should* scale better than Valkey's main-thread bottleneck — but until that's shown publicly, it's a claim, not a fact.

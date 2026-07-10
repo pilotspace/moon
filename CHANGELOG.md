@@ -59,6 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reclamation_cold_expired_bytes_reclaimed_total` (distinct from the
   existing orphan counters, which count any zero-ref file unlink regardless
   of cause).
+### Docs — H-4 doc reconciliation (ROADMAP §8.1)
+
+- **`docs/redis-compat.md`**: `FT.AGGREGATE` was listed as "Not implemented"; it is
+  actually implemented and dispatched (`src/command/vector_search/ft_aggregate.rs` /
+  `src/text/aggregate.rs`, wired through `src/command/mod.rs` and the
+  single/sharded/monoio `FT.*` handlers on both read and write paths). Corrected to
+  "Implemented", noting the `APPLY`-stage v1 stub, the FILTER-clause no-op, and that
+  it has no `phf` `COMMAND_META` entry by design (so `COMMAND INFO`/`COMMAND DOCS`
+  return nothing for it even though it works).
+- **`docs/comparison-valkey.md`**: "Hash field expiration — `HEXPIRE`/`HTTL` family
+  Moon does not implement" was stale — Moon has shipped the full family (`HEXPIRE`,
+  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`,
+  `HPEXPIRETIME`, `HPERSIST`, `HGETDEL`, `HGETEX`) with full read+write dispatch and
+  WAL replay since before this document's last refresh. Moved from "Valkey wins
+  decisively" to "Effective parity" (Moon trails Valkey by 4-10% on these ops per
+  `docs/perf/2026-05-27-hash-ttl-3way-bench.md` — a tracked perf gap, not a missing
+  feature); also dropped it from the cluster-features risk bullet in §4, since it is
+  unrelated to cluster mode.
+- **`SECURITY.md`**: supported-versions table said "0.1.x" (stale since well before
+  v0.6.0). Updated to the current v0.6.x line, with an explicit pre-1.0 support
+  policy (latest-minor-only; no LTS/backport promise until the v1.0.0 GA tag, per
+  `docs/roadmap/ROADMAP.md`'s stated 18-month LTS policy).
 
 ### Changed — Memory: vector tiering accounting spine (M1, tiering-v2 D3/D9)
 
