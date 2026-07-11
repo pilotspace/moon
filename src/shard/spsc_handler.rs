@@ -2591,6 +2591,13 @@ pub(crate) fn handle_shard_message_shared(
             // the shard's own thread, so no mutation can slip between "inside
             // the snapshot" and "delivered live" (the same atomicity argument
             // as `handle_psync_inline_single_shard`, applied per shard).
+            //
+            // This additionally leans on the self-queue-FIRST drain order
+            // (see `drain_spsc_shared`): a local write visible to this body
+            // capture pushed its `ReplicaLiveFanout` BEFORE this arm could
+            // drain, and the self queue drains first — so that fan-out
+            // message no-ops against the not-yet-registered replica instead
+            // of double-delivering a record that is already in the body.
             let crate::shard::dispatch::PrepareReplicaSyncPayload {
                 replica_id,
                 tx,
