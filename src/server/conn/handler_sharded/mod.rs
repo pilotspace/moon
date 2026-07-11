@@ -867,7 +867,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- INFO ---
-                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses) {
+                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses).await {
                         continue;
                     }
 

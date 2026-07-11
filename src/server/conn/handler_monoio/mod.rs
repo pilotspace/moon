@@ -902,7 +902,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     continue;
                 }
             }
-            if cmd_len == 4 && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses)
+            if cmd_len == 4
+                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses).await
             {
                 continue;
             }

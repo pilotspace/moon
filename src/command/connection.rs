@@ -164,6 +164,11 @@ fn format_memory_human(bytes: u64) -> String {
 /// INFO command handler.
 ///
 /// Returns a BulkString with server info sections matching Redis INFO format.
+///
+/// The `# Keyspace` section reports the CALLING shard's `db` as `db0` only —
+/// the single-`Database` fallback for paths with no scatter access (generic
+/// dispatch). The connection handlers pass cross-shard, all-db stats through
+/// [`info_with_keyspace`] instead.
 pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     use std::fmt::Write as _;
     let mut sections = String::with_capacity(2048);
@@ -326,6 +331,38 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         );
     }
 
+    Frame::BulkString(Bytes::from(sections))
+}
+
+/// INFO with an externally-gathered `# Keyspace` section: one `(keys,
+/// expires)` entry per logical db, already summed across shards
+/// (`coordinate_keyspace_info`). Lists every NON-EMPTY db like Redis —
+/// previously the section always read `db0:` with the SELECTED db's local
+/// count, so `SELECT 2; SET k v; INFO` reported the db-2 count as db0 and
+/// every other db was invisible.
+pub fn info_with_keyspace(db: &Database, args: &[Frame], keyspace: &[(u64, u64)]) -> Frame {
+    use std::fmt::Write as _;
+    let base = match info(db, args) {
+        Frame::BulkString(b) => b,
+        other => return other,
+    };
+    let text = String::from_utf8_lossy(&base);
+    // Rebuild everything up to the fallback "# Keyspace" section, then emit
+    // the accurate per-db lines.
+    let Some(cut) = text.find("# Keyspace\r\n") else {
+        return Frame::BulkString(base);
+    };
+    let mut sections = String::with_capacity(text.len() + keyspace.len() * 32);
+    sections.push_str(&text[..cut]);
+    sections.push_str("# Keyspace\r\n");
+    for (db_idx, (keys, expires)) in keyspace.iter().enumerate() {
+        if *keys > 0 {
+            let _ = write!(
+                sections,
+                "db{db_idx}:keys={keys},expires={expires},avg_ttl=0\r\n"
+            );
+        }
+    }
     Frame::BulkString(Bytes::from(sections))
 }
 
@@ -867,6 +904,24 @@ pub fn hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn info_with_keyspace_lists_every_nonempty_db() {
+        let db = Database::new();
+        let stats = vec![(0u64, 0u64), (0, 0), (7, 2), (0, 0), (1, 0)];
+        let Frame::BulkString(b) = info_with_keyspace(&db, &[], &stats) else {
+            panic!("expected bulk string");
+        };
+        let text = String::from_utf8_lossy(&b);
+        assert!(text.contains("# Keyspace\r\n"));
+        assert!(text.contains("db2:keys=7,expires=2,avg_ttl=0\r\n"));
+        assert!(text.contains("db4:keys=1,expires=0,avg_ttl=0\r\n"));
+        assert!(!text.contains("db0:"), "empty dbs must not be listed");
+        assert!(!text.contains("db1:"));
+        assert!(!text.contains("db3:"));
+        // The fallback single-db section must have been replaced, not doubled.
+        assert_eq!(text.matches("# Keyspace").count(), 1);
+    }
 
     #[test]
     fn test_ping_no_args() {

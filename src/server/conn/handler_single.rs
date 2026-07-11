@@ -874,8 +874,19 @@ pub async fn handle_connection(
                         // --- INFO (append replication section) ---
                         if cmd.eq_ignore_ascii_case(b"INFO") {
                             if let Some(ref rs) = repl_state {
+                                // # Keyspace parity: every non-empty db, not
+                                // just the selected one mislabeled as db0.
+                                // Single shard — the local dbs are the truth.
+                                let keyspace: Vec<(u64, u64)> = db
+                                    .iter()
+                                    .map(|d| {
+                                        let g = d.read();
+                                        (g.len() as u64, g.expires_count() as u64)
+                                    })
+                                    .collect();
                                 let guard = db[conn.selected_db].read();
-                                let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
+                                let resp_frame =
+                                    conn_cmd::info_with_keyspace(&guard, cmd_args, &keyspace);
                                 drop(guard);
                                 let mut response_text = match resp_frame {
                                     Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
