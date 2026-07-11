@@ -10,7 +10,7 @@
 //! |------|-------------|--------------|
 //! | a – MVCC | `prune_committed` + `sweep_zombies_mut` + `sweep_graph_zombies_mut` | P3 already ran (see `run_mvcc_sweep` in `timers.rs` on 1 s timer) |
 //! | b – Manifest GC | `gc_tombstones(retain_epochs, retain_secs)` | persistence dir not configured |
-//! | c – WAL recycle | `recycle_aggressive(redo_lsn)` | WAL bytes ≤ max_wal_bytes |
+//! | c – WAL recycle | `recycle_aggressive(redo_lsn)` (disk-offload only — task #43) | WAL bytes ≤ max_wal_bytes, or no checkpoint floor (legacy mode) |
 //! | d – Vector compact | `force_compact_if_needed(threshold)` | immutable segments ≤ threshold |
 //! | e – Graph compact | _no-op placeholder_ | TODO(P7): wire graph auto-merge |
 //!
@@ -169,6 +169,10 @@ pub struct AutovacuumDaemon {
     last_budget_warn_at: Option<Instant>,
     /// MA5: maintenance-window schedule (cron-based budget multipliers).
     pub maintenance_schedule: crate::shard::maintenance_schedule::MaintenanceSchedule,
+    /// Task #43: warn-rate limiter for the legacy-mode "WAL over ceiling but
+    /// no checkpoint floor to recycle against" condition — suppresses spam
+    /// while the WAL sits over `--max-wal-size` every tick.
+    last_wal_recycle_warn_at: Option<Instant>,
 }
 
 impl AutovacuumDaemon {
@@ -184,6 +188,7 @@ impl AutovacuumDaemon {
             last_run_at: None,
             last_budget_warn_at: None,
             maintenance_schedule: crate::shard::maintenance_schedule::MaintenanceSchedule::new(),
+            last_wal_recycle_warn_at: None,
         }
     }
 
@@ -215,6 +220,19 @@ impl AutovacuumDaemon {
     /// * `wal_v3` — Per-shard WAL v3 writer (for WAL recycle pass).
     ///   Pass `None` when persistence is not configured.
     /// * `max_wal_bytes` — WAL size ceiling from `--max-wal-size`.
+    /// * `disk_offload_enabled` — whether the checkpoint protocol (real
+    ///   `redo_lsn` floor + periodic `persist_graph_at_checkpoint` snapshot)
+    ///   is active for this shard. **Task #43 (P1 data loss)**: outside
+    ///   disk-offload mode there is no periodic graph/workspace/MQ/temporal
+    ///   snapshot — `save_graph_store` runs only at graceful shutdown, and
+    ///   the workspace/MQ/temporal registries have no snapshot format at
+    ///   all (they replay purely from the WAL). Pass C's `recycle_aggressive`
+    ///   uses `wal.current_lsn()` (the LSN about to be assigned, i.e.
+    ///   "assume every sealed segment is durable elsewhere") as its floor —
+    ///   true only when a checkpoint backs it. When `false`, Pass C does
+    ///   NOT recycle; it logs a rate-limited warning and increments
+    ///   `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` instead. Disk-offload
+    ///   mode behavior is unchanged from before this fix.
     /// * `manifest_retain_epochs` / `manifest_retain_secs` — P1 config.
     /// * `max_immutable_segments` — trigger threshold for vector compact pass.
     /// * `shutdown_requested` — if true, abort immediately after the current pass.
@@ -225,6 +243,7 @@ impl AutovacuumDaemon {
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         wal_v3: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
         max_wal_bytes: u64,
+        disk_offload_enabled: bool,
         manifest_retain_epochs: u64,
         manifest_retain_secs: u64,
         max_immutable_segments: usize,
@@ -333,25 +352,64 @@ impl AutovacuumDaemon {
             // The stats() call does a read_dir — acceptable at 30 s cadence.
             match wal.stats() {
                 Ok(wal_stats) if max_wal_bytes > 0 && wal_stats.total_bytes > max_wal_bytes => {
-                    let redo_lsn = wal.current_lsn();
-                    match wal.recycle_aggressive(redo_lsn) {
-                        Ok(recycled) => {
-                            let pass_ms = pass_start.elapsed().as_millis() as u64;
-                            cumulative_ms += pass_ms;
-                            if recycled.segments_recycled > 0 {
-                                tracing::debug!(
-                                    segments_recycled = recycled.segments_recycled,
-                                    bytes_reclaimed = recycled.bytes_reclaimed,
-                                    pass_ms,
-                                    "autovacuum: pass C (WAL recycle) freed segments"
+                    if disk_offload_enabled {
+                        // Disk-offload mode: the checkpoint protocol maintains
+                        // a real redo_lsn and persist_graph_at_checkpoint
+                        // snapshots the graph write-buffer, so recycling
+                        // everything before current_lsn is backed by an
+                        // actual durable floor. UNCHANGED from before task #43.
+                        let redo_lsn = wal.current_lsn();
+                        match wal.recycle_aggressive(redo_lsn) {
+                            Ok(recycled) => {
+                                let pass_ms = pass_start.elapsed().as_millis() as u64;
+                                cumulative_ms += pass_ms;
+                                if recycled.segments_recycled > 0 {
+                                    tracing::debug!(
+                                        segments_recycled = recycled.segments_recycled,
+                                        bytes_reclaimed = recycled.bytes_reclaimed,
+                                        pass_ms,
+                                        "autovacuum: pass C (WAL recycle) freed segments"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "autovacuum: pass C (WAL recycle) failed"
                                 );
                             }
                         }
-                        Err(e) => {
+                    } else {
+                        // Task #43 (P1 data loss) fix: legacy (non-disk-offload)
+                        // mode has NO periodic checkpoint or plane snapshot —
+                        // save_graph_store only runs at graceful shutdown, and
+                        // the workspace/MQ/temporal registries have no
+                        // snapshot format at all (replay is WAL-only). Every
+                        // sealed segment may hold the SOLE durable copy of
+                        // that history, so recycle_aggressive's "everything
+                        // before current_lsn is safe" floor does not hold
+                        // here. Never trade data loss for disk space: skip
+                        // the recycle, warn (rate-limited), and count it.
+                        crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                            .fetch_add(1, Ordering::Relaxed);
+                        let should_warn = self
+                            .last_wal_recycle_warn_at
+                            .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(300));
+                        if should_warn {
                             tracing::warn!(
-                                error = %e,
-                                "autovacuum: pass C (WAL recycle) failed"
+                                wal_bytes = wal_stats.total_bytes,
+                                max_wal_bytes,
+                                "autovacuum: pass C (WAL recycle) SKIPPED — WAL exceeds \
+                                 --max-wal-size but this shard has no checkpoint floor \
+                                 to recycle against (legacy/non-disk-offload mode); \
+                                 recycling here would risk permanently losing graph/ \
+                                 workspace/MQ/temporal history that has no snapshot \
+                                 outside the WAL. Enable --disk-offload for bounded WAL \
+                                 growth, or perform a graceful shutdown (SIGTERM/SHUTDOWN, \
+                                 which persists the graph store) before the WAL grows \
+                                 much further."
                             );
+                            self.last_wal_recycle_warn_at = Some(now);
                         }
                     }
                 }
@@ -795,6 +853,127 @@ impl CompactionScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Count `*.wal` files under `wal_dir`.
+    fn count_wal_segments(wal_dir: &std::path::Path) -> usize {
+        std::fs::read_dir(wal_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Build a `WalWriterV3` with enough sealed (non-active) segments to
+    /// exceed `max_wal_bytes`, so Pass C's ceiling check fires.
+    fn wal_writer_over_ceiling(
+        wal_dir: &std::path::Path,
+    ) -> crate::persistence::wal_v3::segment::WalWriterV3 {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        let mut writer =
+            crate::persistence::wal_v3::segment::WalWriterV3::new(0, wal_dir, 512).unwrap();
+        for i in 0..80 {
+            writer.append(WalRecordType::Command, b"legacy-ws-t43 EARLY-MARKER-T43");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        assert!(
+            writer.current_segment_sequence() >= 3,
+            "test setup must produce several sealed segments"
+        );
+        writer
+    }
+
+    /// Task #43 (P1 data loss): in legacy (non-disk-offload) mode, Pass C
+    /// must NOT delete sealed WAL segments — there is no checkpoint/graph
+    /// snapshot floor backing `recycle_aggressive`'s "everything before
+    /// current_lsn is durable elsewhere" assumption.
+    #[test]
+    fn test_pass_c_legacy_mode_skips_recycle_and_counts_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = wal_writer_over_ceiling(&wal_dir);
+        let before = count_wal_segments(&wal_dir);
+
+        let before_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(Ordering::Relaxed);
+
+        let mut vector_store = crate::vector::store::VectorStore::new();
+        #[cfg(feature = "graph")]
+        let mut graph_store = crate::graph::store::GraphStore::new();
+        let mut daemon = AutovacuumDaemon::new(AutovacuumConfig::default());
+        daemon.run_tick(
+            &mut vector_store,
+            #[cfg(feature = "graph")]
+            &mut graph_store,
+            None,
+            Some(&mut writer),
+            256,   // max_wal_bytes: tiny, so the ceiling is already breached
+            false, // disk_offload_enabled: legacy mode — the fix under test
+            0,
+            0,
+            usize::MAX,
+            usize::MAX,
+            1.0,
+            false,
+        );
+
+        let after = count_wal_segments(&wal_dir);
+        assert_eq!(
+            after, before,
+            "legacy mode must not delete any WAL segment (task #43)"
+        );
+        let after_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(Ordering::Relaxed);
+        assert!(
+            after_blocked > before_blocked,
+            "legacy-mode skip must be observable via RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL"
+        );
+    }
+
+    /// Disk-offload mode is unchanged by task #43: Pass C still recycles
+    /// aggressively against `current_lsn()`, exactly as before this fix.
+    #[test]
+    fn test_pass_c_disk_offload_mode_recycles_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = wal_writer_over_ceiling(&wal_dir);
+        let before = count_wal_segments(&wal_dir);
+        assert!(before >= 3, "test setup should produce 3+ segments");
+
+        let mut vector_store = crate::vector::store::VectorStore::new();
+        #[cfg(feature = "graph")]
+        let mut graph_store = crate::graph::store::GraphStore::new();
+        let mut daemon = AutovacuumDaemon::new(AutovacuumConfig::default());
+        daemon.run_tick(
+            &mut vector_store,
+            #[cfg(feature = "graph")]
+            &mut graph_store,
+            None,
+            Some(&mut writer),
+            256,  // max_wal_bytes: tiny, so the ceiling is already breached
+            true, // disk_offload_enabled: checkpoint-backed mode — unchanged
+            0,
+            0,
+            usize::MAX,
+            usize::MAX,
+            1.0,
+            false,
+        );
+
+        let after = count_wal_segments(&wal_dir);
+        assert!(
+            after < before,
+            "disk-offload mode must still recycle sealed segments \
+             (before={before}, after={after}) — unchanged by task #43"
+        );
+    }
 
     #[test]
     fn test_latency_window_p95_empty() {

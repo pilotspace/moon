@@ -6,6 +6,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — autovacuum Pass C recycled the sole durable copy of graph/WS/MQ/temporal WAL history in legacy mode (task #43, P1)
+
+`AutovacuumDaemon::run_tick`'s Pass C (`src/shard/autovacuum.rs`) called
+`WalWriterV3::recycle_aggressive(redo_lsn = wal.current_lsn())` — the LSN
+*about to be assigned*, i.e. "everything sealed is durable elsewhere" —
+whenever total on-disk WAL bytes exceeded `--max-wal-size` (default
+256 MiB), **regardless of whether disk-offload was enabled**. That floor
+only holds in disk-offload mode, where the checkpoint protocol maintains a
+real `redo_lsn` and `persist_graph_at_checkpoint` snapshots the graph
+write-buffer before the floor advances. In legacy (non-disk-offload) mode
+there is no periodic plane snapshot at all: `save_graph_store` runs only at
+graceful shutdown, and the workspace/MQ/temporal registries have **no
+snapshot format whatsoever** — `replay_workspace_wal` / `replay_mq_wal` /
+`replay_temporal_wal` rebuild them purely by re-scanning the WAL. Once the
+ceiling was breached, Pass C deleted every sealed segment unconditionally,
+including segments holding the sole durable copy of that history; a kill-9
+afterwards lost it permanently, even though replay itself (task #42,
+PR #286) works correctly for whatever records survive.
+
+Fixed per the "never trade data loss for disk space" principle: `run_tick`
+now takes a `disk_offload_enabled` flag. When `true`, behavior is byte-for-
+byte unchanged (`recycle_aggressive` against `current_lsn()`, as before).
+When `false`, Pass C no longer recycles: it skips the delete, emits a
+rate-limited (5 min) `tracing::warn!`, and increments the new
+`reclamation_wal_recycle_blocked_no_checkpoint_total` INFO counter
+(`RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL`) so operators can see WAL
+growth is unbounded in this mode. A snapshot-then-floor design (option A)
+was considered and rejected for the workspace/MQ/temporal planes — they
+have no snapshot format to floor against, and inventing one was explicitly
+out of scope for this fix; only the graph plane has a callable snapshot
+(`persist_graph_at_checkpoint`), so a partial-A fix would still have left
+WS/MQ/temporal unprotected. Operators needing bounded WAL growth without
+this trade-off should enable `--disk-offload enable`.
+
+New integration test `tests/crash_recovery_wal_recycle_legacy.rs`
+(`t43_legacy_mode_pass_c_must_not_lose_ws_and_graph_history`, live kill -9 +
+restart against tiny `--wal-segment-size`/`--max-wal-size` to force several
+Pass C ticks within seconds) proves two things: (1) byte-level survival —
+after Pass C has had several chances to run, the earliest workspace AND
+graph WAL records are still present on disk; and (2) round-trip survival —
+after a real kill -9 + restart, `WS LIST` still returns the workspace
+(replay-only plane, no snapshot format, the exact risk called out above).
+Full `GRAPH.QUERY` reconstruction after restart is deliberately not
+asserted in legacy mode — independent probing found graph command replay
+from WAL v3 does not reconstruct the graph in that mode even with zero
+Pass C interference (default `--max-wal-size`), a separate, pre-existing
+gap unrelated to WAL recycling; assertion (1) above still proves task #43
+is fixed at the layer Pass C actually operates on. Disk-offload mode is
+unchanged, verified by the existing `crash_recovery_graph_durability.rs`
+G4/G5 suite (checkpoint-driven recycle path) passing unmodified.
+
 ### Fixed — cold-collection visibility: silent data loss on evicted Hash/List/Set/ZSet/Stream (task #41, P0)
 
 With disk-offload enabled (the default), the production eviction paths
