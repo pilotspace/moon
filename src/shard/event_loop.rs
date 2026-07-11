@@ -454,7 +454,21 @@ impl super::Shard {
         // Per-shard WAL append channel for local writes.
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
         let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
-        if appendonly_enabled || server_config.disk_offload_enabled() {
+        // INVARIANT: gate the sender wiring on `wal_writer.is_some()` — NOT on
+        // `appendonly_enabled || disk_offload_enabled()` — because that OR is
+        // broader than the condition that actually produced a writer above
+        // (`wal_shard_dir` requires `appendonly_enabled`; disk-offload alone,
+        // with `--appendonly no`, yields `wal_shard_dir == None` and hence
+        // `wal_writer == None`). Wiring a live sender while `wal_writer` is
+        // `None` would let `wal_append_rx.try_recv()` (the 1ms-tick drain,
+        // see `if let Some(ref mut wal) = wal_writer` below) silently discard
+        // every record instead of writing it — the channel accepts sends but
+        // has no writer to drain into. Leaving both fields `None` here
+        // instead degrades correctly: `ShardDatabases::wal_append` /
+        // `try_wal_append_required` and `mq_exec::wal_append_on_slice` all
+        // already treat a `None` sender as "persistence disabled, no
+        // durability requirement" (see their doc comments), matching reality.
+        if wal_writer.is_some() {
             // `ShardSlice::wal_append_tx` (used by the owner-shard MQ.* command
             // path in `mq_exec.rs::wal_append_on_slice`) is a SEPARATE field
             // from `ShardDatabases::wal_append_txs` (used by

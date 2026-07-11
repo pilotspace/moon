@@ -96,6 +96,46 @@ zero AOF durability, so `--appendonly yes`'s unconditional AOF-authority
 recovery wipes the Stream on every restart independent of this fix); that
 gap is left for follow-up.
 
+**CodeRabbit review follow-ups on the above (same PR):**
+- **Dead-channel sender wiring under `appendonly=no` + `disk-offload=on`.**
+  `event_loop.rs` wired `ShardSlice::wal_append_tx` /
+  `ShardDatabases::set_wal_append_tx` whenever
+  `appendonly_enabled || disk_offload_enabled()`, but `wal_writer` itself is
+  only ever created when `appendonly_enabled` is true (`wal_shard_dir`
+  requires it regardless of disk-offload) — so with disk-offload on and
+  AOF off, a live sender was wired to a channel with no writer behind it,
+  and the 1ms-tick drain silently discarded every record instead of the
+  `None`-sender no-op `wal_append`/`try_wal_append_required` are documented
+  to degrade to. Gated the wiring on `wal_writer.is_some()` instead.
+- **`replay_temporal_wal`'s legacy raw-`GraphTemporal` discriminator could
+  drop a real invalidation.** The un-framed-record fallback rejected a
+  payload whenever its first byte was `b'*'`, to distinguish it from a RESP
+  command payload — but that byte is the low byte of `entity_id`, so any
+  invalidation on an entity whose id happened to end in `0x2A` was silently
+  skipped on replay. Fixed both ends: `command::temporal::apply_invalidate`
+  now pre-frames its `GraphTemporal` WAL payload with `write_wal_v3_record`
+  (matching how MQ's `MqCreate`/`MqAck` are already pre-framed), so NEW
+  records replay unambiguously via the existing nested-Command unwrap
+  (CRC-validated, no byte-pattern guessing); the raw-legacy fallback (still
+  needed for WAL segments written before this fix) now runs only when the
+  nested unwrap finds nothing, gated by a new
+  `decode_graph_temporal_legacy_raw` sanity check (`is_node` byte must be
+  literally 0/1, both timestamps plausible) instead of the single
+  leading-byte guess. Added a red/green regression test reproducing the
+  exact `0x2A`-collision entity id, a round-trip test for the new
+  pre-framed producer format, and an adversarial test proving a RESP-shaped
+  25-byte payload is not misdecoded into a spurious invalidation.
+- **`temporal_invalidate_survives_kill9` only asserted absence.** The test
+  checked that the node was invisible at a far-future `VALID_AT` post-restart,
+  which would pass vacuously if `GRAPH.ADDNODE` replay had failed entirely
+  (no node at all is also "not visible"). Added a positive assertion that
+  the node is visible at a `VALID_AT` preceding its own invalidation,
+  proving the node itself actually survived the restart.
+- MQ.ACK's PEL/queue-key drop on replay is deliberately NOT addressed here —
+  deferred to the same follow-up as MQ's zero-AOF-durability gap above,
+  since PEL replay is only meaningful once MQ stream content itself survives
+  a restart.
+
 ### Fixed — Wave A adversarial-review fixes (task #34)
 
 Three defects found reviewing Wave A (plane replication) before merge, all

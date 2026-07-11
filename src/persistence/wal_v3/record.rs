@@ -313,6 +313,51 @@ pub fn decode_graph_temporal(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
     Some((entity_id, is_node, valid_to, system_from))
 }
 
+/// Upper plausibility bound for a `GraphTemporal` timestamp field (~year 5138
+/// in Unix ms). Real `valid_to`/`system_from` values are `capture_wall_ms()`
+/// wall-clock captures or explicit user-supplied future cutoffs (the crash
+/// test's `FAR_FUTURE_MS = 9_000_000_000_000`, ~year 2255, must stay well
+/// inside this ceiling). It exists purely to reject implausible bit patterns
+/// in [`decode_graph_temporal_legacy_raw`]'s sanity gate, not to validate
+/// real inputs.
+const GRAPH_TEMPORAL_PLAUSIBLE_TS_CEILING_MS: i64 = 100_000_000_000_000;
+
+/// Strict variant of [`decode_graph_temporal`] for the **unframed legacy raw**
+/// replay path only (`shared_databases::replay_temporal_wal`'s fallback for
+/// WAL segments written before the producer started pre-framing `GraphTemporal`
+/// records with [`write_wal_v3_record`]).
+///
+/// Pre-fix, `command::temporal::apply_invalidate` pushed the raw
+/// `encode_graph_temporal` bytes directly as a `Command` record's payload —
+/// indistinguishable from a length-25 RESP command payload by structure
+/// alone. The old discriminator (`payload[0] != b'*'`) was WRONG: it
+/// misclassified any legitimate record whose `entity_id`'s low byte was
+/// `0x2A` ('*') as a RESP command and silently dropped the invalidation.
+///
+/// This does not eliminate the ambiguity (a CRC-free 25-byte blob can always
+/// theoretically coincide with a real RESP payload), but narrows the
+/// false-accept window versus a single first-byte check: the payload must
+/// decode AND (a) `is_node` must be the literal `0` or `1` byte (never any
+/// other value `decode_graph_temporal` would silently accept as "true"), and
+/// (b) both timestamps must be non-negative and under
+/// [`GRAPH_TEMPORAL_PLAUSIBLE_TS_CEILING_MS`]. Returns `None` on any
+/// violation, exactly like a decode failure.
+pub fn decode_graph_temporal_legacy_raw(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
+    if payload.len() != 25 {
+        return None;
+    }
+    let (entity_id, is_node_bool, valid_to, system_from) = decode_graph_temporal(payload)?;
+    let is_node_byte = payload[8];
+    if is_node_byte != 0 && is_node_byte != 1 {
+        return None;
+    }
+    let plausible = |ts: i64| (0..=GRAPH_TEMPORAL_PLAUSIBLE_TS_CEILING_MS).contains(&ts);
+    if !plausible(valid_to) || !plausible(system_from) {
+        return None;
+    }
+    Some((entity_id, is_node_bool, valid_to, system_from))
+}
+
 /// Encode a [`WalRecordType::XactCommit`] payload for crash recovery.
 ///
 /// The header carries the logical db index the transaction ran in, so crash
@@ -564,6 +609,48 @@ mod tests {
     fn test_graph_temporal_malformed_returns_none() {
         assert!(decode_graph_temporal(b"").is_none());
         assert!(decode_graph_temporal(&[0; 24]).is_none()); // 24 < 25
+    }
+
+    // ── CodeRabbit review finding 2 (PR #286): decode_graph_temporal_legacy_raw ──
+
+    #[test]
+    fn test_legacy_raw_accepts_entity_id_with_0x2a_low_byte() {
+        // The exact collision that broke the old `payload[0] != b'*'`
+        // discriminator: entity_id's low byte is 0x2A ('*').
+        let entity_id: u64 = (1u64 << 32) | 0x2A;
+        let payload = encode_graph_temporal(entity_id, true, 1_700_000_000_123, 1_700_000_000_000);
+        assert_eq!(payload.first(), Some(&b'*'));
+        let (eid, is_node, valid_to, system_from) =
+            decode_graph_temporal_legacy_raw(&payload).expect("must decode despite 0x2A prefix");
+        assert_eq!(eid, entity_id);
+        assert!(is_node);
+        assert_eq!(valid_to, 1_700_000_000_123);
+        assert_eq!(system_from, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn test_legacy_raw_rejects_wrong_length() {
+        let payload = encode_graph_temporal(1, true, 1, 1);
+        let mut too_long = payload.clone();
+        too_long.push(0);
+        assert!(decode_graph_temporal_legacy_raw(&too_long).is_none());
+        assert!(decode_graph_temporal_legacy_raw(&payload[..24]).is_none());
+    }
+
+    #[test]
+    fn test_legacy_raw_rejects_invalid_is_node_byte() {
+        let mut payload = encode_graph_temporal(1, true, 1_700_000_000_000, 1_700_000_000_000);
+        payload[8] = 0xFF; // neither 0 nor 1
+        assert!(decode_graph_temporal_legacy_raw(&payload).is_none());
+    }
+
+    #[test]
+    fn test_legacy_raw_rejects_implausible_timestamps() {
+        let negative = encode_graph_temporal(1, true, -1, 1_700_000_000_000);
+        assert!(decode_graph_temporal_legacy_raw(&negative).is_none());
+
+        let too_far_future = encode_graph_temporal(1, true, i64::MAX, 1_700_000_000_000);
+        assert!(decode_graph_temporal_legacy_raw(&too_far_future).is_none());
     }
 
     #[test]

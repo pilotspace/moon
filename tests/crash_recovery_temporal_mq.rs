@@ -332,6 +332,18 @@ fn temporal_invalidate_survives_kill9() {
     // graph WAL v3 command replay) and TEMPORAL.INVALIDATE it (durable via
     // the GraphTemporal WAL record — the thing under test), then kill -9. ---
     let node_id: String;
+    // Captured strictly BEFORE TEMPORAL.INVALIDATE's server-side wall_ms (the
+    // client timestamps this before even sending the command, so it always
+    // precedes the server's own `capture_wall_ms()` reading). Used post-restart
+    // to positively assert the node exists pre-invalidation — CodeRabbit
+    // finding 3: the original test only asserted absence at a far-future
+    // VALID_AT, which would pass vacuously if GRAPH.ADDNODE replay failed
+    // entirely (no node at all is also "not visible").
+    let pre_invalidate_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_millis()
+        .to_string();
     {
         let (child, port) = spawn_moon(dir.path(), 1, extra);
         let _guard = ServerGuard(child);
@@ -400,6 +412,31 @@ fn temporal_invalidate_survives_kill9() {
         drop(wait_ready(port2));
 
         let mut c = Conn::open(port2);
+
+        // Positive assertion FIRST (CodeRabbit finding 3): the node must
+        // exist at a VALID_AT preceding its own invalidation. Without this,
+        // the absence check below would pass vacuously if GRAPH.ADDNODE
+        // replay had failed entirely — no node at all is also "not visible
+        // past valid_to." This pins down that the node itself really did
+        // survive the restart, not just that "alice" is absent for any reason.
+        let pre_invalidate_visible = c
+            .cmd_s(&[
+                "GRAPH.QUERY",
+                "tg",
+                "MATCH (n:Person) RETURN n.name",
+                "VALID_AT",
+                &pre_invalidate_ms,
+            ])
+            .flat();
+        assert!(
+            pre_invalidate_visible.contains("alice"),
+            "after restart, the node (id {node_id}) must be visible at a VALID_AT \
+             preceding its own invalidation (got: {pre_invalidate_visible}). If this \
+             fails, GRAPH.ADDNODE replay itself is broken (or the node never came \
+             back), which would make the far-future absence check below a false \
+             green."
+        );
+
         let after_restart = c
             .cmd_s(&[
                 "GRAPH.QUERY",
