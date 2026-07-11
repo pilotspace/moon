@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — consistency/durability defects caught by the R1 gates (task #35)
+
+Three pre-existing data-integrity bugs surfaced by the new load/kill-9 gates
+run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
+
+- **Replication: silent record drop for lagging replicas.** The per-replica
+  fan-out used `try_send` and *skipped* the record when the bounded channel
+  was full — under one pipelined burst a replica received ~2k of 40k keys,
+  stayed `master_link_status:up`, and diverged forever. A replica whose
+  channel overflows is now KICKED (shared `kicked` flag → drain loop closes
+  the socket) so it reconnects and resyncs from the backlog — Redis's
+  output-buffer-limit policy. Channel capacity raised 1024 → 16384 records
+  so bursts kick rarely. New e2e
+  `replica_converges_under_interleaved_multidb_load` locks in exact
+  post-load parity.
+- **Client `SELECT` commands leaked into the AOF and replication stream.**
+  SELECT is W-flagged (routing), so every handler persisted the literal
+  client SELECT while bare writes carried no db context — two interleaved
+  connections on different dbs corrupted BOTH planes' db attribution
+  (observed: all 40k keys recovered into db2 after kill-9). SELECT is now
+  connection-state only (`metadata::is_persisted_write`), never persisted or
+  replicated.
+- **AOF had no per-record db attribution.** The AOF writer now threads the
+  executing db through `AofMessage` and tracks the stream's current db,
+  prepending a `SELECT <db>` record exactly when it changes (Redis's
+  `aof_selected_db`), including through BGREWRITEAOF fold drains (context
+  resets per fresh incr segment; ambiguous drains use a force-emit
+  sentinel). New e2e `aof_multidb_kill9` (TopLevel + PerShard) proves
+  interleaved multi-db writes recover into the correct databases after
+  kill-9 on both runtimes.
+
 ### Added — R1: real WAIT/ACK plumbing (replica acknowledgements)
 
 - **`WAIT <numreplicas> <timeout>` now works on the production (monoio)

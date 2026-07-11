@@ -822,3 +822,149 @@ fn wait_returns_acked_replica_count() {
     let r = send_cmd(master_addr, "WAIT 2 300");
     assert_eq!(r.trim(), ":1", "WAIT 2 with one replica must return 1: {r}");
 }
+
+/// Task #35 (v0.7 consistency gate): interleaved multi-connection multi-db
+/// load must CONVERGE on the replica. Locks in two pre-existing defects the
+/// R1 gates caught:
+///
+/// 1. Client `SELECT` commands leaked into the replication stream as literal
+///    records (SELECT is W-flagged), desyncing the master's `stream_db`
+///    tracking — a db-0 write after another connection's SELECT 2 handshake
+///    applied into the replica's db 2.
+/// 2. `wal_append_and_fanout` / `ReplicaLiveFanout` silently DROPPED records
+///    when a replica's bounded fan-out channel filled under pipelined load —
+///    the replica stayed "up" but permanently diverged (observed 2k of 40k
+///    keys, link_status:up). The fix kicks the lagging replica so it
+///    reconnects and resyncs — divergence becomes a loud, self-healing
+///    resync, never silence.
+#[test]
+#[ignore]
+fn replica_converges_under_interleaved_multidb_load() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16738";
+    let replica_addr = "127.0.0.1:16739";
+
+    let _master = Killer(start_moon(16738, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+    let _replica = Killer(start_moon(16739, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16738");
+
+    // Prove the stream is up before loading.
+    send_cmd(master_addr, "SET warm 1");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "warm").as_deref() == Some("1")
+        }),
+        "live stream not flowing — load assertions would be meaningless"
+    );
+
+    // Two persistent connections: conn0 stays on db 0; conn2 SELECTs db 2 (a
+    // literal client SELECT — the record that used to poison the stream).
+    let mut conn0 = TcpStream::connect(master_addr).expect("conn0");
+    let mut conn2 = TcpStream::connect(master_addr).expect("conn2");
+    conn0
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    pipeline_burst(&mut conn2, &["SELECT 2".to_string()]);
+
+    // Interleaved pipelined bursts, large enough to overflow a bounded
+    // per-replica fan-out channel repeatedly.
+    const BATCH: usize = 2000;
+    const BATCHES: usize = 5;
+    for b in 0..BATCHES {
+        let cmds0: Vec<String> = (0..BATCH)
+            .map(|i| format!("SET k0:{} v{}", b * BATCH + i, b * BATCH + i))
+            .collect();
+        let cmds2: Vec<String> = (0..BATCH)
+            .map(|i| format!("SET k2:{} v{}", b * BATCH + i, b * BATCH + i))
+            .collect();
+        pipeline_burst(&mut conn0, &cmds0);
+        pipeline_burst(&mut conn2, &cmds2);
+    }
+    drop(conn0);
+    drop(conn2);
+
+    let total = (BATCH * BATCHES) as i64;
+    assert_eq!(dbsize(master_addr), total + 1, "master db0 load incomplete");
+
+    // Convergence: the replica may be kicked + resync mid-load; give it a
+    // generous settle window but require exact parity at the end.
+    let converged = wait_until(Duration::from_secs(60), || {
+        dbsize_in_db(replica_addr, 0) == total + 1 && dbsize_in_db(replica_addr, 2) == total
+    });
+    let (r0, r2) = (dbsize_in_db(replica_addr, 0), dbsize_in_db(replica_addr, 2));
+    assert!(
+        converged,
+        "replica diverged after interleaved multi-db load: db0={r0}/{} db2={r2}/{}",
+        total + 1,
+        total
+    );
+    // Spot checks: correct placement, no cross-db leaks.
+    assert_eq!(
+        get_in_db(replica_addr, 0, "k0:9999").as_deref(),
+        Some("v9999"),
+        "db0 tail key wrong"
+    );
+    assert_eq!(
+        get_in_db(replica_addr, 2, "k2:9999").as_deref(),
+        Some("v9999"),
+        "db2 tail key wrong"
+    );
+    assert_eq!(
+        get_in_db(replica_addr, 2, "k0:42"),
+        None,
+        "db0 key leaked into db2 (SELECT poisoning)"
+    );
+    assert_eq!(
+        get_in_db(replica_addr, 0, "k2:42"),
+        None,
+        "db2 key leaked into db0"
+    );
+}
+
+/// Write `cmds` as one pipelined burst on a persistent connection and read
+/// exactly one reply line per command (inline protocol; replies here are all
+/// +OK/+PONG-class single lines).
+fn pipeline_burst(stream: &mut TcpStream, cmds: &[String]) {
+    let mut payload = String::with_capacity(cmds.len() * 24);
+    for c in cmds {
+        payload.push_str(c);
+        payload.push_str("\r\n");
+    }
+    stream.write_all(payload.as_bytes()).expect("burst write");
+    stream.flush().ok();
+    let mut reader = BufReader::new(&*stream);
+    for i in 0..cmds.len() {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("burst reply");
+        assert!(
+            line.starts_with("+OK"),
+            "burst cmd {i} ({}) got: {line}",
+            cmds[i]
+        );
+    }
+}
+
+/// DBSIZE in a specific db over one connection (SELECT + DBSIZE).
+fn dbsize_in_db(addr: &str, db: usize) -> i64 {
+    let reply = send_seq(addr, &[&format!("SELECT {db}"), "DBSIZE"]);
+    reply
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(-1)
+}

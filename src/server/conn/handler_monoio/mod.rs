@@ -1291,7 +1291,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 || conn.tracking_state.enabled
                 || crate::replication::state::fanout_hint_active()
             {
-                metadata::is_write(cmd)
+                // `is_persisted_write`: SELECT is W-flagged but conn-state
+                // only — persisting the literal client SELECT poisons the
+                // stream db context for interleaved connections (task #35).
+                metadata::is_persisted_write(cmd)
             } else {
                 false
             };
@@ -1360,7 +1363,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 responses.push(response);
                                 continue;
                             };
-                            match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                            match pool
+                                .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
+                                .await
+                            {
                                 // Always: durability confirmed by ONE
                                 // fsync_barrier per batch (resolve_local_leg_barrier
                                 // before serialization) instead of an awaited
@@ -1443,7 +1449,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     responses.push(response);
                                     continue;
                                 };
-                                match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                match pool
+                                    .send_append_group(
+                                        ctx.shard_id,
+                                        lsn,
+                                        conn.selected_db,
+                                        serialized,
+                                    )
+                                    .await
+                                {
                                     // Same one-barrier-per-batch contract as MOVE.
                                     Ok(true) => local_leg_write_idxs.push(responses.len()),
                                     Ok(false) => {}
@@ -1747,7 +1761,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 )
                             };
                             if let Some(ref pool) = ctx.aof_pool {
-                                match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                match pool
+                                    .send_append_group(
+                                        ctx.shard_id,
+                                        lsn,
+                                        conn.selected_db,
+                                        serialized,
+                                    )
+                                    .await
+                                {
                                     Ok(true) => aof_barrier_pending = true,
                                     Ok(false) => {}
                                     Err(_) => {
@@ -1930,7 +1952,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
                 // Pre-compute AOF bytes before moving frame into Arc
-                let aof_bytes = if ctx.aof_pool.is_some() && metadata::is_write(cmd) {
+                // `is_persisted_write`: never AOF/replicate a literal client
+                // SELECT (task #35 — poisons the stream db context).
+                let aof_bytes = if ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) {
                     Some(aof::serialize_command(&dispatch_frame))
                 } else {
                     None

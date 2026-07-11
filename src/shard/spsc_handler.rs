@@ -101,7 +101,7 @@ pub(crate) fn drain_spsc_shared(
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
-    replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -368,7 +368,7 @@ pub(crate) fn handle_shard_message_shared(
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
-    replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -615,6 +615,7 @@ pub(crate) fn handle_shard_message_shared(
                                 crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                             if !wal_append_and_fanout(
                                 &serialized,
+                                db_idx,
                                 wal_writer,
                                 repl_backlog,
                                 replica_txs,
@@ -691,6 +692,7 @@ pub(crate) fn handle_shard_message_shared(
                                     crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -855,6 +857,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let serialized = aof::serialize_command(cmd_frame);
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -917,6 +920,7 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
+                                db_idx,
                                 wal_writer,
                                 repl_backlog,
                                 replica_txs,
@@ -1038,6 +1042,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let serialized = aof::serialize_command(cmd_frame);
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -1099,6 +1104,7 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
+                                db_idx,
                                 wal_writer,
                                 repl_backlog,
                                 replica_txs,
@@ -1262,6 +1268,7 @@ pub(crate) fn handle_shard_message_shared(
                         let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                         if !wal_append_and_fanout(
                             &serialized,
+                            db_idx,
                             wal_writer,
                             repl_backlog,
                             replica_txs,
@@ -1330,6 +1337,7 @@ pub(crate) fn handle_shard_message_shared(
                                     crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -1453,6 +1461,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let serialized = aof::serialize_command(cmd_frame);
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -1515,6 +1524,7 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
+                                db_idx,
                                 wal_writer,
                                 repl_backlog,
                                 replica_txs,
@@ -1637,6 +1647,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let serialized = aof::serialize_command(cmd_frame);
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
+                                    db_idx,
                                     wal_writer,
                                     repl_backlog,
                                     replica_txs,
@@ -1698,6 +1709,7 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
+                                db_idx,
                                 wal_writer,
                                 repl_backlog,
                                 replica_txs,
@@ -2303,6 +2315,10 @@ pub(crate) fn handle_shard_message_shared(
             let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
             let _ = wal_append_and_fanout(
                 &serialized,
+                // task #35: SWAPDB affects both `a` and `b` — no single db
+                // context applies; pass 0 (writer may emit a harmless
+                // redundant SELECT 0 if last_db was already non-zero).
+                0,
                 wal_writer,
                 repl_backlog,
                 replica_txs,
@@ -2483,6 +2499,7 @@ pub(crate) fn handle_shard_message_shared(
                 wrote = true;
                 let ok = wal_append_and_fanout(
                     entry_bytes,
+                    db_index,
                     wal_writer,
                     repl_backlog,
                     replica_txs,
@@ -2511,6 +2528,7 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::RegisterReplica {
             replica_id,
             tx,
+            kicked,
             backlog_capacity,
             registered,
             push_offset,
@@ -2534,7 +2552,7 @@ pub(crate) fn handle_shard_message_shared(
                 *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
             }
             drop(guard);
-            replica_txs.push((replica_id, tx));
+            replica_txs.push((replica_id, tx, kicked));
             // Reply with the offset at which live fan-out begins. For
             // same-thread self-queue registrations this is `push_offset`,
             // captured AT PUSH TIME: local writes advance the offset
@@ -2561,17 +2579,15 @@ pub(crate) fn handle_shard_message_shared(
             }
         }
         ShardMessage::UnregisterReplica { replica_id } => {
-            replica_txs.retain(|(id, _)| *id != replica_id);
+            replica_txs.retain(|(id, _, _)| *id != replica_id);
         }
         ShardMessage::ReplicaLiveFanout { bytes } => {
             // Live-delivery leg ONLY: backlog append + offset advance already
             // happened synchronously at write time on this same thread
             // (`record_local_write`) — doing either again here would double-
-            // count. Lagging replicas are skipped (try_send), same policy as
-            // `wal_append_and_fanout`'s fan-out leg.
-            for (_id, tx) in replica_txs.iter() {
-                let _ = tx.try_send(bytes.clone());
-            }
+            // count. A replica whose channel is FULL is KICKED (task #35):
+            // skipping the record would silently and permanently diverge it.
+            fanout_send_or_kick(replica_txs, &bytes);
         }
         ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
@@ -3365,11 +3381,44 @@ pub(crate) fn cow_intercept(
 #[inline]
 pub(crate) fn wal_fanout_has_work(
     wal_writer: &Option<WalWriterV3>,
-    replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
+    replica_txs: &[crate::shard::dispatch::ReplicaFanout],
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
 ) -> bool {
     (wal_kv_log && wal_writer.is_some()) || !replica_txs.is_empty() || aof_pool.is_some()
+}
+
+/// Deliver one replication record to every registered replica, KICKING any
+/// replica whose bounded channel is full (task #35).
+///
+/// The old policy — `try_send` and skip on `Full` — silently dropped records
+/// for a lagging replica, leaving a permanent gap in its stream while
+/// `master_link_status` stayed "up" (observed: 2k of 40k keys delivered under
+/// pipelined load, offsets diverged forever, WAIT correctly reported 0).
+/// A replica that cannot keep up must instead be disconnected so it retries
+/// PSYNC and resyncs from the backlog — Redis's output-buffer-limit policy.
+/// The kick is two-stage because the drain task and `ReplicaInfo.shard_txs`
+/// hold sender clones (dropping our entry alone cannot close the channel):
+/// set the shared `kicked` flag (the drain task polls it and closes the
+/// socket), then drop our entry so this shard stops queueing immediately.
+pub(crate) fn fanout_send_or_kick(
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    bytes: &bytes::Bytes,
+) {
+    replica_txs.retain(|(id, tx, kicked)| match tx.try_send(bytes.clone()) {
+        Ok(()) => true,
+        Err(flume::TrySendError::Full(_)) => {
+            kicked.store(true, std::sync::atomic::Ordering::Release);
+            tracing::warn!(
+                replica_id = id,
+                "replica live fan-out channel FULL — kicking replica to force a \
+                 resync (a skipped record would silently diverge it forever)"
+            );
+            false
+        }
+        // Drain task already gone; just stop queueing.
+        Err(flume::TrySendError::Disconnected(_)) => false,
+    });
 }
 
 /// Error frame substituted for a write's success frame when the command
@@ -3388,9 +3437,12 @@ pub(crate) const AOF_APPEND_LOST_ERR: &[u8] =
 /// per drain arm, not per command.
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
+    // task #35: db the command executed in — threaded into the AOF pool so
+    // the writer can inject a `SELECT <db>` record on a db-context change.
+    db: usize,
     wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
-    replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
@@ -3435,12 +3487,11 @@ pub(crate) fn wal_append_and_fanout(
     if let Some(offsets) = repl_state {
         offsets.increment_shard_offset(shard_id, data.len() as u64);
     }
-    // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)
+    // 4. Fan-out to replica sender tasks (non-blocking: a replica whose
+    //    channel is FULL is kicked to resync — see `fanout_send_or_kick`).
     if !replica_txs.is_empty() {
         let bytes = bytes::Bytes::copy_from_slice(data);
-        for (_id, tx) in replica_txs {
-            let _ = tx.try_send(bytes.clone());
-        }
+        fanout_send_or_kick(replica_txs, &bytes);
     }
     // 5. Per-shard AOF pool (FIX-W1-2): route to the owning shard's writer.
     // Bounded-blocking (`send_append_bounded_blocking`) because this function
@@ -3456,6 +3507,7 @@ pub(crate) fn wal_append_and_fanout(
         return pool.send_append_bounded_blocking(
             shard_id,
             0,
+            db,
             bytes::Bytes::copy_from_slice(data),
             aof_budget,
         );
@@ -3498,10 +3550,11 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"hello",
+            0,         // db
             &mut None, // no writer
             &backlog,
-            &[],   // no replicas
-            &None, // no repl_state
+            &mut vec![], // no replicas
+            &None,       // no repl_state
             0,
             None, // no aof_pool
             true, // wal_kv_log
@@ -3523,13 +3576,18 @@ mod wal_append_tests {
         let backlog: SharedBacklog =
             std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
         let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<bytes::Bytes>();
-        let replica_txs = vec![(1u64, tx)];
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = vec![(
+            1u64,
+            tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )];
 
         wal_append_and_fanout(
             b"hello",
+            0, // db
             &mut None,
             &backlog,
-            &replica_txs,
+            &mut replica_txs,
             &None,
             0,
             None, // no aof_pool
@@ -3565,9 +3623,10 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"world",
+            0,         // db
             &mut None, // no writer
             &backlog,
-            &[],         // no replicas — S3.5b bypass triggered without pool guard
+            &mut vec![], // no replicas — S3.5b bypass triggered without pool guard
             &None,       // no repl_state
             0,           // shard_id
             Some(&pool), // aof_pool provided — bypass must NOT fire
@@ -3629,13 +3688,14 @@ mod wal_append_tests {
         // Pre-fix this was `aof_pool` (Some), which caused the double-write.
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            0,         // db
             &mut None, // no writer
             &backlog,
-            &[],   // no replicas
-            &None, // no repl_state
-            0,     // shard_id
-            None,  // PipelineBatch fix: None prevents double-write
-            true,  // wal_kv_log
+            &mut vec![], // no replicas
+            &None,       // no repl_state
+            0,           // shard_id
+            None,        // PipelineBatch fix: None prevents double-write
+            true,        // wal_kv_log
             &mut std::time::Duration::from_millis(5),
         );
         assert!(
@@ -3654,9 +3714,10 @@ mod wal_append_tests {
         // cross-shard MSET/DEL/EXISTS commands).
         wal_append_and_fanout(
             b"*3\r\n$4\r\nMSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+            0, // db
             &mut None,
             &backlog,
-            &[],
+            &mut vec![],
             &None,
             0,
             Some(&pool), // MultiExecute: pool must receive this entry
@@ -3701,9 +3762,10 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             cmd,
+            0, // db
             &mut w3,
             &backlog,
-            &[],
+            &mut vec![],
             &None,
             0,
             Some(&pool),
@@ -3725,9 +3787,10 @@ mod wal_append_tests {
         // the record must land in the WAL as before.
         wal_append_and_fanout(
             cmd,
+            0, // db
             &mut w3,
             &backlog,
-            &[],
+            &mut vec![],
             &None,
             0,
             Some(&pool),

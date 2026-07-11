@@ -351,6 +351,11 @@ pub(crate) async fn persist_txn_aof(
     ctx: &crate::server::conn::core::ConnectionContext,
     aof_entries: Vec<Bytes>,
     repl_recorded: bool,
+    // task #35: the db the whole MULTI/EXEC body executed in (the
+    // originating connection's `selected_db` — every entry in the body ran
+    // against that one db, since SELECT itself is queued/executed like any
+    // other command inside the transaction).
+    db: usize,
 ) -> Result<(), ()> {
     if aof_entries.is_empty() {
         return Ok(());
@@ -369,7 +374,7 @@ pub(crate) async fn persist_txn_aof(
                 bytes.len(),
             )
         };
-        match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
+        match pool.send_append_group(ctx.shard_id, lsn, db, bytes).await {
             Ok(true) => barrier_pending = true,
             Ok(false) => {}
             Err(_) => return Err(()),

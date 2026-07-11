@@ -411,6 +411,17 @@ pub struct CdcSubscribePayload {
     pub from_lsn: u64,
 }
 
+/// One live replica fan-out endpoint held by a shard thread:
+/// `(replica_id, live channel sender, kicked flag)`.
+///
+/// `kicked` is the overflow disconnect signal — see
+/// [`ShardMessage::RegisterReplica::kicked`].
+pub type ReplicaFanout = (
+    u64,
+    channel::MpscSender<bytes::Bytes>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -455,12 +466,20 @@ pub enum ShardMessage {
     BlockCancel { wait_id: u64 },
     /// Register a connected replica's per-shard sender channel with this shard.
     /// Called once per shard per replica when a new replica connection is established.
-    /// The shard adds `tx` to its replica_txs list for WAL fan-out.
+    /// The shard adds `(id, tx, kicked)` to its replica_txs list for WAL fan-out.
     /// `backlog_capacity` (`--repl-backlog-size`) sizes the lazy backlog
     /// fallback-init so it can't diverge from the handshake-path allocation.
     RegisterReplica {
         replica_id: u64,
         tx: channel::MpscSender<bytes::Bytes>,
+        /// Set by the shard fan-out when this replica's bounded channel is
+        /// FULL: a record that cannot be queued would otherwise be silently
+        /// dropped, permanently diverging the replica while
+        /// `master_link_status` stays "up" (task #35 — observed 2k of 40k
+        /// keys delivered). The drain task polls the flag and disconnects,
+        /// converting silent divergence into a loud PSYNC resync (Redis
+        /// parity: output-buffer-limit disconnects).
+        kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
         backlog_capacity: usize,
         /// When set, the event loop replies with the shard's replication
         /// offset AT registration — the exact point where live fan-out to

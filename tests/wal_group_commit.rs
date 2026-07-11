@@ -34,6 +34,7 @@ use std::collections::VecDeque;
 fn append(data: &[u8]) -> AofMessage {
     AofMessage::Append {
         lsn: 0,
+        db: 0,
         bytes: Bytes::copy_from_slice(data),
     }
 }
@@ -43,6 +44,7 @@ fn append_sync(data: &[u8]) -> (AofMessage, OneshotReceiver<AofAck>) {
     (
         AofMessage::AppendSync {
             lsn: 0,
+            db: 0,
             bytes: Bytes::copy_from_slice(data),
             ack: tx,
         },

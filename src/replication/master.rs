@@ -441,6 +441,10 @@ async fn register_replica_with_shards(
             let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
                 replica_id,
                 tx,
+                // Legacy multi-shard drain loops do not poll the kick flag
+                // (superseded by the R2 redesign); overflow still stops
+                // queueing via the fan-out's retain.
+                kicked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 backlog_capacity,
                 // Fire-and-forget: the multi-shard register paths are superseded
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
@@ -535,6 +539,10 @@ async fn register_replica_with_shards(
             let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
                 replica_id,
                 tx,
+                // Legacy multi-shard drain loops do not poll the kick flag
+                // (superseded by the R2 redesign); overflow still stops
+                // queueing via the fan-out's retain.
+                kicked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 backlog_capacity,
                 // Fire-and-forget: the multi-shard register paths are superseded
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
@@ -843,6 +851,11 @@ struct InlineReplicaRegistration {
     tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
     rx: crate::runtime::channel::MpscReceiver<bytes::Bytes>,
     reg_rx: crate::runtime::channel::MpscReceiver<u64>,
+    /// Overflow disconnect signal shared with the shard fan-out — set when
+    /// this replica's channel filled and a record could not be queued
+    /// (task #35). The drain loop polls it and closes the socket so the
+    /// replica resyncs instead of silently diverging.
+    kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Push `RegisterReplica` onto shard 0's SPSC so the event loop captures the
@@ -860,8 +873,13 @@ fn push_register_replica_inline(
     static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
 
-    let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(1024);
+    // 16384 records (task #35): 1024 overflowed within one pipelined burst on
+    // the same host — every overflow now KICKS the replica into a resync, so
+    // headroom directly reduces resync churn. Records are Bytes handles;
+    // 16k × ~50 B typical ≈ under 1 MB queued worst-case per replica.
+    let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(16384);
     let (reg_tx, reg_rx) = crate::runtime::channel::mpsc_bounded::<u64>(1);
+    let kicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
     let backlog_capacity = repl_state
@@ -889,6 +907,7 @@ fn push_register_replica_inline(
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::RegisterReplica {
         replica_id,
         tx: tx.clone(),
+        kicked: kicked.clone(),
         backlog_capacity,
         registered: Some(reg_tx),
         push_offset: Some(push_offset),
@@ -898,6 +917,7 @@ fn push_register_replica_inline(
         tx,
         rx,
         reg_rx,
+        kicked,
     })
 }
 
@@ -919,6 +939,7 @@ async fn drain_replica_inline_single_shard(
         tx,
         rx,
         reg_rx: _,
+        kicked,
     } = reg;
 
     // Bookkeeping for WAIT/INFO.
@@ -951,15 +972,39 @@ async fn drain_replica_inline_single_shard(
         async move { ack_read_loop(rd, replica_id, repl_state).await }
     });
 
-    // Drain the channel and write to the stream until the replica disconnects.
-    while let Ok(data) = rx.recv_async().await {
-        let buf = data.to_vec();
-        let (wr, _) = wr_half.write_all(buf).await;
-        if wr.is_err() {
-            info!("Replica {} disconnected", replica_id);
-            break;
+    // Drain the channel and write to the stream until the replica
+    // disconnects — or until the shard fan-out KICKS this replica (task #35:
+    // its channel overflowed, so at least one record is already missing from
+    // the stream; continuing would deliver a silently-corrupt sequence). The
+    // kick cannot arrive as an in-band message (the trigger IS a full
+    // channel), so the recv races a coarse poll timer. `ReplicaInfo.shard_txs`
+    // and this task both hold sender clones, which is why channel closure
+    // can't signal this either.
+    loop {
+        monoio::select! {
+            recv = rx.recv_async() => {
+                let Ok(data) = recv else { break };
+                let buf = data.to_vec();
+                let (wr, _) = wr_half.write_all(buf).await;
+                if wr.is_err() {
+                    info!("Replica {} disconnected", replica_id);
+                    break;
+                }
+            }
+            _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if kicked.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::warn!(
+                        replica_id,
+                        "closing kicked replica connection (fan-out overflow) — \
+                         replica will reconnect and resync"
+                    );
+                    break;
+                }
+            }
         }
     }
+    // A kicked replica may still have queued records; they are stale (the
+    // stream already has a gap) — drop them with the channel.
     // Dropping the write half closes our outbound side; the reader task ends
     // on EOF/error when the peer closes (its socket dies with the write half
     // on a disconnect-driven exit, so it does not linger).
