@@ -183,14 +183,38 @@ pub fn export_graph_store(store: &mut GraphStore) -> Vec<u8> {
 /// (store is left in whatever partial state was reached — the caller aborts
 /// the sync and the replica retries with a fresh full resync).
 pub fn install_graph_store(store: &mut GraphStore, blob: &[u8]) -> Option<usize> {
-    let mut cur = Cursor { data: blob, pos: 0 };
-    if cur.u8()? != FORMAT_VERSION {
-        return None;
+    drop_all_local_graphs(store);
+    install_graphs_additive(store, blob)
+}
+
+/// R2 (task #20): install a MULTI-SHARD snapshot's graph blobs — one per
+/// master shard (`read_moon_aux_all` order). Authoritative replace happens
+/// ONCE, then every blob installs additively. Graph names are disjoint across
+/// blobs (each graph lives on exactly one master shard); a duplicate name is
+/// malformed input and fails the install (`None`).
+pub fn install_graph_store_many(store: &mut GraphStore, blobs: &[Vec<u8>]) -> Option<usize> {
+    drop_all_local_graphs(store);
+    let mut total = 0usize;
+    for blob in blobs {
+        total += install_graphs_additive(store, blob)?;
     }
-    // Authoritative replace: drop everything local first.
+    Some(total)
+}
+
+/// Authoritative replace leg shared by both install entry points.
+fn drop_all_local_graphs(store: &mut GraphStore) {
     let local: Vec<Bytes> = store.list_graphs().into_iter().cloned().collect();
     for name in local {
         let _ = store.drop_graph(&name);
+    }
+}
+
+/// Decode one export blob and create its graphs on top of whatever the store
+/// already holds. Callers handle the drop-local leg.
+fn install_graphs_additive(store: &mut GraphStore, blob: &[u8]) -> Option<usize> {
+    let mut cur = Cursor { data: blob, pos: 0 };
+    if cur.u8()? != FORMAT_VERSION {
+        return None;
     }
 
     let graph_count = cur.u32()? as usize;

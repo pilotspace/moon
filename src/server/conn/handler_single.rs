@@ -838,6 +838,10 @@ pub async fn handle_connection(
                                         }
                                         ReplicaofAction::PromoteToMaster => {
                                             use crate::replication::state::generate_repl_id;
+                                            // handler_single spawns no replica task itself, but
+                                            // bump the generation anyway so any task spawned by
+                                            // another handler path stops applying.
+                                            let _ = crate::replication::replica::bump_replica_task_epoch();
                                             if let Ok(mut rs_guard) = rs.write() {
                                                 rs_guard.repl_id2 = rs_guard.repl_id.clone();
                                                 rs_guard.repl_id = generate_repl_id();
@@ -856,6 +860,14 @@ pub async fn handle_connection(
                         if cmd.eq_ignore_ascii_case(b"REPLCONF") {
                             let resp = crate::command::connection::replconf(cmd_args);
                             responses.push(resp);
+                            continue;
+                        }
+
+                        // --- PSYNC (unsupported on tokio; clear error, R3/2A) ---
+                        if cmd.eq_ignore_ascii_case(b"PSYNC") {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR PSYNC requires runtime-monoio on the master (this build runs runtime-tokio)",
+                            )));
                             continue;
                         }
 

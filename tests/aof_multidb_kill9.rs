@@ -100,15 +100,36 @@ impl Conn {
         }
         reply.trim_end().to_string()
     }
+
+    /// Fallible variant for readiness polling: any I/O error (including a
+    /// RESET on a connection the kernel queued into the bootstrap listener's
+    /// backlog during moon's bootstrap→per-shard SO_REUSEPORT listener
+    /// handover — observed on the Linux VM, task #18 flake class) is a
+    /// "not ready yet", never a panic.
+    fn try_cmd(&mut self, line: &str) -> Option<String> {
+        self.reader
+            .get_mut()
+            .write_all(format!("{}\r\n", line).as_bytes())
+            .ok()?;
+        let mut reply = String::new();
+        self.reader.read_line(&mut reply).ok()?;
+        Some(reply.trim_end().to_string())
+    }
 }
 
 fn wait_ready(addr: &str) {
     for _ in 0..100 {
         if let Ok(stream) = TcpStream::connect(addr) {
-            drop(stream);
-            let mut c = Conn::connect(addr);
-            if c.cmd("PING") == "+PONG" {
-                return;
+            if stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .is_ok()
+            {
+                let mut c = Conn {
+                    reader: BufReader::new(stream),
+                };
+                if c.try_cmd("PING").as_deref() == Some("+PONG") {
+                    return;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(200));

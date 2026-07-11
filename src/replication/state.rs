@@ -163,8 +163,19 @@ impl ReplicationState {
 
     /// Increment the offset for the given shard by delta bytes.
     /// Also adds delta to master_repl_offset.
-    pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
-        let _ = self.issue_lsn(shard_id, delta);
+    ///
+    /// Returns the PER-SHARD offset after the advance — the record's
+    /// `end_offset` on the live-fanout wire, compared against each replica's
+    /// per-shard snapshot cut (`ReplicaFanout::cut`). Deliberately NOT the
+    /// master offset: `seed_master_offset` (AOF recovery) advances only the
+    /// master counter, so the two axes diverge and must never be mixed.
+    pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) -> u64 {
+        if shard_id >= self.shard_offsets.len() {
+            return 0;
+        }
+        let prev = self.shard_offsets[shard_id].fetch_add(delta, Ordering::Relaxed);
+        self.master_repl_offset.fetch_add(delta, Ordering::Relaxed);
+        prev + delta
     }
 
     /// Atomically issue an LSN for a write and advance per-shard +
@@ -259,10 +270,16 @@ impl OffsetHandle {
         self.master_repl_offset.fetch_add(delta, Ordering::Relaxed)
     }
 
-    /// See [`ReplicationState::increment_shard_offset`].
+    /// See [`ReplicationState::increment_shard_offset`] — returns the
+    /// per-shard offset after the advance (the record's fan-out `end_offset`).
     #[inline]
-    pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
-        let _ = self.issue_lsn(shard_id, delta);
+    pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) -> u64 {
+        if shard_id >= self.shard_offsets.len() {
+            return 0;
+        }
+        let prev = self.shard_offsets[shard_id].fetch_add(delta, Ordering::Relaxed);
+        self.master_repl_offset.fetch_add(delta, Ordering::Relaxed);
+        prev + delta
     }
 
     /// Current offset of one shard. Used by the `RegisterReplica` reply to
@@ -275,6 +292,15 @@ impl OffsetHandle {
             .get(shard_id)
             .map(|o| o.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Number of shards this handle tracks. R2 (task #20): `> 1` switches the
+    /// replica-stream serialization to per-record `SELECT` framing — N shard
+    /// threads feed ONE replica wire, so a shared "current db" context cannot
+    /// exist and every db-scoped record must carry its own.
+    #[inline]
+    pub fn num_shards(&self) -> usize {
+        self.shard_offsets.len()
     }
 }
 

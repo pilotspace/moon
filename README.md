@@ -325,7 +325,7 @@ GA exit criteria) and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md)
 **Recommended for production today**
 
 - **Single-node deployments** — Linux aarch64 (Tier 1) or x86_64 (Tier 2), `--shards N` master.
-- **Read replication** — `--shards 1` master with any `--shards N` replica topology (single-shard PSYNC2, wired since v0.1.10).
+- **Read replication** — any `--shards N` master with `--shards 1` replicas (PSYNC2; multi-shard masters send one merged RDB + merged live stream, wired in v0.7). `WAIT` reflects real replica ACKs.
 - **AI workloads** — vector, BM25, GraphRAG, semantic cache, hybrid retrieval. All in-core, all RDB/WAL durable, crash-recovery validated.
 - **Cache + feature store** — honest durability modes (`always`/`everysec`/`no`), forkless snapshots, tiered NVMe offload under `maxmemory`.
 - **Crash recovery** — 100% survived across 7 persistence configs and 5K-key SIGKILL workloads (RDB v2 + WAL v3 + multi-part AOF + cold tier).
@@ -333,7 +333,7 @@ GA exit criteria) and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md)
 **Not yet GA — avoid for production**
 
 - **Multi-node clustering** (16K-slot gossip, MOVED/ASK, failover) — protocol code exists but **PSYNC2 atomic slot migration is not soak-tested**. Scheduled for a v0.2.x follow-up.
-- **Multi-shard master PSYNC** — single-shard only today ([RFC](.planning/rfcs/multi-shard-replication-design.md)).
+- **Multi-shard replicas** — replicas run `--shards 1`; scale reads with more replicas, not replica shards.
 - **`CDC.SUBSCRIBE` push channel** and **zero-snapshot PITR (P3c)** — `CDC.READ` polling is ready; push/live-LSN are deferred.
 - **GPU vector acceleration** (`gpu-cuda`) — kernel scaffold only.
 - **Performance SLOs** in [`docs/PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) are `[provisional]` until the 24-h HDR-histogram rig validates them. Treat the benchmarks above as point-in-time measurements, not committed SLOs.

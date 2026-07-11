@@ -6,6 +6,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — R2: multi-shard master PSYNC (task #20, RFC 1B)
+
+A master running `--shards N` now serves full replication to a single-shard
+replica — previously PSYNC was rejected with `-ERR PSYNC across multiple
+shards is not yet supported`.
+
+- **Per-shard atomic snapshot legs.** A new `ShardMessage::PrepareReplicaSync`
+  fans out to every shard (own shard via the self queue, the rest over the
+  SPSC mesh). Each shard serializes its keyspace slice to an RDB *body*,
+  captures its replication offset, and registers the replica's live channel
+  in ONE synchronous stretch on its own thread — per shard, nothing can land
+  between "inside the snapshot" and "streamed live", so there is no backlog
+  catch-up leg and non-idempotent commands (INCR) can never double-apply.
+- **One merged Redis-format RDB.** The PSYNC task stitches the per-shard
+  bodies into a single valid RDB (`redis_rdb::write_rdb_merged`: header +
+  bodies + EOF/CRC64) and answers `+FULLRESYNC <replid> <Σ shard offsets>`
+  with one `$<len>` bulk — the replica's existing R0 loader needs no changes.
+  Index definitions ride once; graph content is sharded, so the snapshot
+  carries one `moon-graph-store` aux entry per shard and the replica imports
+  all of them (`install_graph_store_many`, `read_moon_aux_all`).
+- **Per-record SELECT framing on the merged wire.** N shard threads feed one
+  replica socket, so a shared "current db" context cannot exist: on
+  multi-shard masters every db-scoped record is fused with its own
+  `SELECT <db>` prefix (single channel send / backlog append pair / offset
+  advance) — no cross-shard interleave can split a SELECT from the write it
+  frames. Gated on the replica-attach hint; single-shard masters keep the
+  cheaper emit-on-change tracking.
+- **Partial resync degrades to full.** A replica's single scalar offset
+  cannot be mapped back onto N per-shard backlogs, so a multi-shard master
+  answers every PSYNC (any replid/offset) with `+FULLRESYNC`.
+- Overflow-kick (task #35), `REPLCONF ACK`, and `WAIT` all carry over: the
+  summed snapshot offset keeps `total_offset - base == bytes on wire`, so
+  WAIT/ACK math stays exact on multi-shard masters.
+- New e2e suite `tests/replication_multishard.rs`: 2/4/8-shard full resync +
+  live-stream convergence with INCR exactness, interleaved multi-db writers
+  with db-leak asserts, per-shard graph snapshot import, and the
+  partial→full degradation handshake.
+- Known limitation (unchanged from R1): master-side PSYNC requires
+  `runtime-monoio` (the default). A `runtime-tokio` master now answers PSYNC
+  with a clear `-ERR PSYNC requires runtime-monoio on the master` instead of
+  an unknown-command reply (RFC R3/2A). Multi-shard *replicas* remain
+  unsupported (`--shards 1`).
+- Known limitation: during snapshot preparation + transfer the live stream
+  buffers in the replica's 16,384-record channel. A very large keyspace
+  under sustained heavy write load can overflow it mid-attach — the replica
+  is then KICKED (loud) and retries the sync; it never diverges silently.
+  Attach such deployments during a write lull, or raise the buffer if this
+  becomes a practical constraint.
+- Docs refreshed for the new topology: `docs/guides/clustering.md` deployment
+  shape, `README.md` replication bullets, and `docs/PRODUCTION-CONTRACT.md`
+  rows REPL-MULTISHARD-01 + WAIT-01 flipped to ✅ with evidence.
+
+### Fixed — live-fanout exactly-once redesign + replica-task leak (task #20 follow-up)
+
+Attach-under-write stress testing of R2 surfaced three defects; all fixed
+before release (none shipped):
+
+- **`REPLICAOF` leaked the previous replica task — every re-attach stacked
+  one more live applier.** `REPLICAOF host port` spawned a fresh
+  `run_replica_task` without stopping the old one, and `REPLICAOF NO ONE`
+  only flipped the role state: the old task kept its master link open and
+  kept APPLYING the stream. After NO-ONE → re-attach cycles the replica ran
+  INCR counters ~25-35% ABOVE the master (reproduced at shards=1 AND
+  shards=4 — pre-existing, not an R2 defect). Replica tasks now carry a
+  process-global epoch ticket; a new `REPLICAOF` target or `NO ONE` bumps
+  the generation and superseded tasks exit before their next connect,
+  before loading a snapshot, and before applying any parsed chunk.
+- **Snapshot-vs-live exactly-once is now offset-cut based, not
+  FIFO-placement based.** Two adversarial-review rounds found opposite
+  failure modes for placement schemes (a queued self-shard snapshot leg
+  double-delivered local writes; an inline-captured one lost same-cycle
+  cross-shard writes — neither in the body nor live-sent, with the offset
+  advanced: permanent replica lag). Every fan-out entry now records
+  `cut = <shard offset at body capture>` and every live record carries its
+  per-shard `end_offset`; delivery requires `end_offset > cut`, making
+  correctness independent of where the registration lands in the drain
+  FIFO. All shards (including the PSYNC connection's own) use the same
+  `PrepareReplicaSync` arm.
+- **Same-key wire ordering.** Cross-shard (SPSC-dispatched) writes used to
+  send to replicas directly from the execute arm while local handler writes
+  deferred through the self queue — a later-offset write could reach the
+  wire before an earlier-offset write to the same key, replaying same-key
+  writes out of the master's order on the replica (found by analysis; not
+  reproduced in ~10 black-box runs). ALL live replica sends now flow
+  through the self-queue `ReplicaLiveFanout` arm, so per-shard wire order
+  equals offset order by construction.
+- New e2e regressions: `attach_under_write_no_double_apply` (4-shard +
+  single-shard control, 5× detach/re-attach under pipelined INCR load,
+  exact per-counter parity) and `same_key_write_order_parity` (12
+  connections APPEND-race the same 32 keys through both write paths;
+  replica strings must byte-equal the master).
+
 ### Fixed — consistency/durability defects caught by the R1 gates (task #35)
 
 Three pre-existing data-integrity bugs surfaced by the new load/kill-9 gates

@@ -464,6 +464,11 @@ pub(super) fn try_handle_replicaof(
                         });
                     }
                     let rs_clone = Arc::clone(rs);
+                    // Bump the task generation FIRST: any previously spawned
+                    // replica task (old REPLICAOF target) sees itself
+                    // superseded and exits instead of double-applying the
+                    // stream alongside the new task.
+                    let epoch = crate::replication::replica::bump_replica_task_epoch();
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
                         master_host: host,
                         master_port: port,
@@ -471,12 +476,17 @@ pub(super) fn try_handle_replicaof(
                         num_shards: ctx.num_shards,
                         persistence_dir: None,
                         listening_port: 0,
+                        epoch,
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
                     };
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
                 }
                 ReplicaofAction::PromoteToMaster => {
                     use crate::replication::state::generate_repl_id;
+                    // Kill the running replica task — flipping the role alone
+                    // left it streaming + applying forever (each NO ONE →
+                    // re-attach cycle stacked one more live applier).
+                    let _ = crate::replication::replica::bump_replica_task_epoch();
                     if let Ok(mut rs_guard) = rs.write() {
                         rs_guard.repl_id2 = rs_guard.repl_id.clone();
                         rs_guard.repl_id = generate_repl_id();
@@ -541,10 +551,9 @@ pub(super) fn try_handle_cdc_read(
 /// loop and returns the stream so the master replication driver can take over.
 ///
 /// Returns `None` for non-PSYNC commands.
-/// Returns `Some((..))` only when num_shards == 1 (the supported topology).
-/// For multi-shard topologies, pushes a clear error and returns `None`
-/// (consumed via `responses`); the caller treats it like any other command
-/// reply and continues — the replica will see the error and give up.
+/// Returns `Some((..))` for every accepted PSYNC — the accept loop routes the
+/// hijacked stream to the single-shard inline handler or, at num_shards > 1,
+/// to the R2 multi-shard handler (`handle_psync_inline_multi_shard`).
 pub(super) fn try_handle_psync(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -557,12 +566,6 @@ pub(super) fn try_handle_psync(
     if cmd_args.len() != 2 {
         responses.push(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'psync' command",
-        )));
-        return None;
-    }
-    if ctx.num_shards != 1 {
-        responses.push(Frame::Error(Bytes::from_static(
-            b"ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)",
         )));
         return None;
     }

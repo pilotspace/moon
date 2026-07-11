@@ -861,6 +861,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- PSYNC (unsupported on tokio; clear error, R3/2A) ---
+                    if dispatch::try_handle_psync_unsupported(cmd, &mut responses) {
+                        continue;
+                    }
+
                     // --- CDC.READ ---
                     if dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
                         continue;

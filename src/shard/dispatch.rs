@@ -411,16 +411,110 @@ pub struct CdcSubscribePayload {
     pub from_lsn: u64,
 }
 
-/// One live replica fan-out endpoint held by a shard thread:
-/// `(replica_id, live channel sender, kicked flag)`.
-///
-/// `kicked` is the overflow disconnect signal — see
-/// [`ShardMessage::RegisterReplica::kicked`].
-pub type ReplicaFanout = (
-    u64,
-    channel::MpscSender<bytes::Bytes>,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-);
+/// One live replica fan-out endpoint held by a shard thread.
+pub struct ReplicaFanout {
+    /// Master-side replica id (see [`ShardMessage::RegisterReplica`]).
+    pub replica_id: u64,
+    /// Live channel onto the replica's socket drain task.
+    pub tx: channel::MpscSender<bytes::Bytes>,
+    /// Overflow disconnect signal — see [`ShardMessage::RegisterReplica::kicked`].
+    pub kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Exactly-once cut line: this shard's replication offset at the moment
+    /// the replica's snapshot body was captured. A live record is delivered
+    /// iff its `end_offset > cut` — records at or below the cut are already
+    /// inside the snapshot body (their mutation and offset advance happened
+    /// before the capture), so sending them again would double-apply
+    /// non-idempotent commands on the replica. This makes correctness
+    /// independent of WHERE the registration lands relative to a record's
+    /// fan-out message in the drain FIFO.
+    pub cut: u64,
+}
+
+/// Payload of [`ShardMessage::RegisterReplica`].
+pub struct RegisterReplicaPayload {
+    pub replica_id: u64,
+    pub tx: channel::MpscSender<bytes::Bytes>,
+    /// Set by the shard fan-out when this replica's bounded channel is
+    /// FULL: a record that cannot be queued would otherwise be silently
+    /// dropped, permanently diverging the replica while
+    /// `master_link_status` stays "up" (task #35 — observed 2k of 40k
+    /// keys delivered). The drain task polls the flag and disconnects,
+    /// converting silent divergence into a loud PSYNC resync (Redis
+    /// parity: output-buffer-limit disconnects).
+    pub kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--repl-backlog-size`, sizes the lazy backlog fallback-init so it
+    /// can't diverge from the handshake-path allocation.
+    pub backlog_capacity: usize,
+    /// When set, the event loop replies with the shard's replication
+    /// offset AT registration — the exact point where live fan-out to
+    /// `tx` begins. The PSYNC task sends backlog catch-up bytes strictly
+    /// below this offset, closing the race where a write drained between
+    /// the catch-up read and registration reached neither leg (silent
+    /// replica gap). `None` = legacy fire-and-forget registration (the
+    /// multi-shard paths, redesigned in R2).
+    pub registered: Option<channel::MpscSender<u64>>,
+    /// Live-fanout start offset captured by the pusher AT PUSH TIME, on
+    /// the shard's own thread (same-thread self-queue pushes only; `None`
+    /// for the cross-shard legacy registrations, where the arm replies
+    /// with the offset at drain). Same-thread pushes MUST set this: local
+    /// writes advance the shard offset synchronously at write time
+    /// (`record_local_write`), so an offset read at DRAIN could include a
+    /// write whose `ReplicaLiveFanout` message is queued BEHIND this
+    /// registration — the catch-up range would cover it AND the fan-out
+    /// message would deliver it live: double-applied on the replica.
+    pub push_offset: Option<u64>,
+    /// PER-SHARD exactly-once cut for the fan-out entry
+    /// ([`ReplicaFanout::cut`]): live records are delivered iff their
+    /// per-shard `end_offset` exceeds this. `Some` = captured by the
+    /// pusher in the same synchronous stretch as its snapshot body
+    /// (single-shard inline path); `None` = the arm reads the shard
+    /// offset at drain time (legacy cross-shard registrations, where
+    /// no snapshot body was captured on this shard's thread).
+    /// NOTE: per-shard axis, NOT the master offset — `push_offset`
+    /// stays on the master axis for the catch-up reply.
+    pub cut: Option<u64>,
+}
+
+/// Payload of [`ShardMessage::PrepareReplicaSync`] (R2 multi-shard PSYNC).
+pub struct PrepareReplicaSyncPayload {
+    /// Master-side replica id — same id on every shard's fan-out entry.
+    pub replica_id: u64,
+    /// The replica's ONE live channel: every shard pushes its records here
+    /// and the PSYNC drain task pumps them onto the socket (merged wire).
+    pub tx: channel::MpscSender<bytes::Bytes>,
+    /// Shared overflow disconnect signal — any shard's fan-out overflow
+    /// kicks the replica into a resync (see `RegisterReplica::kicked`).
+    pub kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--repl-backlog-size`, for the lazy backlog fallback-init.
+    pub backlog_capacity: usize,
+    /// Reply channel (bounded 1). Cross-thread capable — remote shards send
+    /// their prepared leg back to the PSYNC connection task.
+    pub reply_tx: channel::MpscSender<PreparedShardSync>,
+}
+
+/// One shard's prepared full-resync leg — the reply to
+/// [`ShardMessage::PrepareReplicaSync`].
+pub struct PreparedShardSync {
+    /// RDB *body* (SELECTDB/RESIZEDB/entry sections only) of this shard's
+    /// keyspace slice — see `redis_rdb::write_rdb_body_refs`. The PSYNC task
+    /// stitches all shards' bodies into one valid RDB via
+    /// `redis_rdb::write_rdb_merged`.
+    pub rdb_body: Vec<u8>,
+    /// This shard's replication offset at capture. Live fan-out to the
+    /// replica begins exactly here (same synchronous stretch).
+    pub shard_offset: u64,
+    /// Vector index definitions (index_persist v5 sidecar bytes) — defs are
+    /// keyspace-global and identical on every shard; the stitcher uses shard
+    /// 0's copy. `None` when no vector indexes exist.
+    pub vector_defs: Option<Vec<u8>>,
+    /// Text index definitions; same convention as `vector_defs`.
+    pub text_defs: Option<Vec<u8>>,
+    /// This shard's graph-store snapshot blob. Graph CONTENT is sharded, so
+    /// the stitcher writes one `moon-graph-store` aux entry PER shard and the
+    /// replica imports all of them (`read_moon_aux_all`).
+    #[cfg(feature = "graph")]
+    pub graph_blob: Vec<u8>,
+}
 
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
@@ -466,43 +560,29 @@ pub enum ShardMessage {
     BlockCancel { wait_id: u64 },
     /// Register a connected replica's per-shard sender channel with this shard.
     /// Called once per shard per replica when a new replica connection is established.
-    /// The shard adds `(id, tx, kicked)` to its replica_txs list for WAL fan-out.
-    /// `backlog_capacity` (`--repl-backlog-size`) sizes the lazy backlog
-    /// fallback-init so it can't diverge from the handshake-path allocation.
-    RegisterReplica {
-        replica_id: u64,
-        tx: channel::MpscSender<bytes::Bytes>,
-        /// Set by the shard fan-out when this replica's bounded channel is
-        /// FULL: a record that cannot be queued would otherwise be silently
-        /// dropped, permanently diverging the replica while
-        /// `master_link_status` stays "up" (task #35 — observed 2k of 40k
-        /// keys delivered). The drain task polls the flag and disconnects,
-        /// converting silent divergence into a loud PSYNC resync (Redis
-        /// parity: output-buffer-limit disconnects).
-        kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        backlog_capacity: usize,
-        /// When set, the event loop replies with the shard's replication
-        /// offset AT registration — the exact point where live fan-out to
-        /// `tx` begins. The PSYNC task sends backlog catch-up bytes strictly
-        /// below this offset, closing the race where a write drained between
-        /// the catch-up read and registration reached neither leg (silent
-        /// replica gap). `None` = legacy fire-and-forget registration (the
-        /// multi-shard paths, redesigned in R2).
-        registered: Option<channel::MpscSender<u64>>,
-        /// Live-fanout start offset captured by the pusher AT PUSH TIME, on
-        /// the shard's own thread (same-thread self-queue pushes only; `None`
-        /// for the cross-shard legacy registrations, where the arm replies
-        /// with the offset at drain). Same-thread pushes MUST set this: local
-        /// writes advance the shard offset synchronously at write time
-        /// (`record_local_write`), so an offset read at DRAIN could include a
-        /// write whose `ReplicaLiveFanout` message is queued BEHIND this
-        /// registration — the catch-up range would cover it AND the fan-out
-        /// message would deliver it live: double-applied on the replica.
-        push_offset: Option<u64>,
-    },
+    /// The shard adds a [`ReplicaFanout`] entry to its replica_txs list for
+    /// WAL fan-out. Boxed: the payload (channels + three offset fields) is
+    /// past the enum's 64-byte cap.
+    RegisterReplica(Box<RegisterReplicaPayload>),
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
     UnregisterReplica { replica_id: u64 },
+    /// R2 (task #20): one shard's leg of a MULTI-SHARD full resync.
+    ///
+    /// The PSYNC connection task fans this to every shard (its own via the
+    /// self queue, the rest over the SPSC mesh). Each shard's arm runs the
+    /// whole leg in ONE synchronous stretch on its own thread — serialize its
+    /// keyspace slice to an RDB *body*, capture its shard replication offset,
+    /// and register `(replica_id, tx, kicked)` for live fan-out — so per
+    /// shard there is no window between "state captured" and "live stream
+    /// begins": every mutation is either inside the RDB body (offset already
+    /// counted below the captured offset) or delivered live. No backlog
+    /// catch-up leg exists on this path, and the `+FULLRESYNC` offset is the
+    /// sum of the per-shard captured offsets.
+    ///
+    /// Boxed: the payload carries channels + capacity fields well past the
+    /// enum's inline size budget.
+    PrepareReplicaSync(Box<PrepareReplicaSyncPayload>),
     /// Deliver an already-RECORDED local write to the live replica streams.
     ///
     /// The producing thread (`replication::record_local_write`) has ALREADY
@@ -513,7 +593,13 @@ pub enum ShardMessage {
     /// double-applying non-idempotent commands on the replica). This message
     /// carries ONLY the remaining leg: `try_send` to each registered
     /// replica's sender channel. Same-thread self-queue only.
-    ReplicaLiveFanout { bytes: bytes::Bytes },
+    ReplicaLiveFanout {
+        bytes: bytes::Bytes,
+        /// This shard's replication offset AFTER the record's advance —
+        /// compared against each [`ReplicaFanout::cut`] at delivery time.
+        /// `u64::MAX` when no offset handle exists (send unconditionally).
+        end_offset: u64,
+    },
     /// Register a CDC subscriber with this shard's fan-out registry (C3b-2).
     ///
     /// The connection handler creates a bounded channel, ships the sender

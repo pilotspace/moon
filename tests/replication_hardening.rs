@@ -4,7 +4,9 @@
 //! replica kill-restart, and replica promotion paths.
 //!
 //! Run: cargo test --test replication_hardening -- --ignored
-//! Requires: built moon binary at ./target/release/moon
+//! Requires: a built moon binary — set MOON_BIN, or default
+//! ./target/release/moon (⚠ on a shared macOS/Linux checkout the default may
+//! be the other platform's binary; always pin MOON_BIN, repo harness rule).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -12,9 +14,13 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+fn moon_bin() -> String {
+    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+}
+
 fn start_moon(port: u16, dir: &str, extra: &[&str]) -> Guard {
     Guard(
-        Command::new("./target/release/moon")
+        Command::new(moon_bin())
             .args(
                 [
                     &["--port", &port.to_string(), "--shards", "1", "--dir", dir][..],

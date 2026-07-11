@@ -460,8 +460,11 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
     // header) carry the FT index DEFINITIONS; standard RDB loaders skip them.
     let vec_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_VECTOR_DEFS);
     let text_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_TEXT_DEFS);
+    // R2 (task #20): a multi-shard master's merged snapshot carries one
+    // graph-store aux entry PER shard (graph content is sharded) — collect
+    // them all; a single-shard snapshot yields exactly one.
     #[cfg(feature = "graph")]
-    let graph_blob = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_GRAPH_STORE);
+    let graph_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_GRAPH_STORE);
     match crate::shard::slice::try_with_shard(|s| {
         for db in s.databases.iter_mut() {
             db.clear();
@@ -472,13 +475,19 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
         // (authoritative replace — an EMPTY blob drops replica-local graphs;
         // an ABSENT aux means a pre-graph-sync master, warn-and-keep).
         #[cfg(feature = "graph")]
-        match graph_blob.as_deref() {
-            Some(blob) => {
-                match crate::replication::graph_sync::install_graph_store(&mut s.graph_store, blob)
-                {
+        match &graph_blobs[..] {
+            blobs if !blobs.is_empty() => {
+                match crate::replication::graph_sync::install_graph_store_many(
+                    &mut s.graph_store,
+                    blobs,
+                ) {
                     Some(n) => {
                         if n > 0 {
-                            tracing::info!("replica snapshot: installed {} graph(s)", n);
+                            tracing::info!(
+                                "replica snapshot: installed {} graph(s) from {} shard blob(s)",
+                                n,
+                                blobs.len()
+                            );
                         }
                     }
                     None => {
@@ -488,7 +497,7 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
                     }
                 }
             }
-            None => {
+            _ => {
                 if s.graph_store.graph_count() > 0 {
                     tracing::warn!(
                         "replica snapshot carried no graph-store aux but {} local graph(s) \
