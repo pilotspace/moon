@@ -231,6 +231,13 @@ fn run_txn_case(shards: usize) {
     let mut conn2 = Conn::connect(&addr);
     assert_eq!(conn2.cmd("SELECT 2"), "+OK");
     let mem_t2_db2 = conn2.cmd("GET t2");
+    // PR #282 review: pin the baseline — a silently-failed `SET t2` would
+    // leave `$-1` in BOTH dbs and every recovery assertion would then pass
+    // vacuously.
+    assert!(
+        (mem_t2_db0 == "v2" && mem_t2_db2 == "$-1") || (mem_t2_db0 == "$-1" && mem_t2_db2 == "v2"),
+        "t2 must exist in exactly one database: db0={mem_t2_db0}, db2={mem_t2_db2}"
+    );
 
     std::thread::sleep(Duration::from_millis(1600));
     sigkill(&mut server);
