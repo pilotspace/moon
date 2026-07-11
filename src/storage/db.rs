@@ -2411,4 +2411,328 @@ mod tests {
         assert_eq!(db.now(), clock.secs());
         assert_eq!(db.now_ms(), clock.ms());
     }
+
+    // -----------------------------------------------------------------
+    // P0 cold-collection-visibility fix
+    // (.planning/reviews/storage-audit-2026-07-12-kv.md)
+    //
+    // Disk-offload spills Hash/List/Set/ZSet/Stream via
+    // `evict_one_async_spill` / `evict_batch_durable_no_aof` (production
+    // paths, `kv_serde::serialize_collection` handles every type), but the
+    // type-specific accessors used to consult only `self.data`, never the
+    // `ColdIndex` — so a spilled collection read as absent, and a write
+    // fabricated a brand-new EMPTY container that permanently shadowed
+    // (destroyed) the cold copy on the next `set`.
+    //
+    // These tests spill a collection directly via the same
+    // `spill_to_datafile` production helper the eviction paths use (mirrors
+    // the pattern in `tiered::cold_read`'s own tests), bypassing the
+    // eviction machinery itself (out of scope here) while exercising the
+    // exact on-disk format the accessors must decode.
+    // -----------------------------------------------------------------
+
+    use crate::persistence::manifest::ShardManifest;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::RedisValue as TestRedisValue;
+    use crate::storage::tiered::cold_index::ColdIndex;
+    use crate::storage::tiered::kv_spill::spill_to_datafile;
+
+    /// Build a `Database` with an active cold tier holding one spilled
+    /// collection at `key`. Mirrors `cold_read::tests::db_with_spilled_key`
+    /// but accepts an arbitrary `RedisValue` (collections, not just strings).
+    fn db_with_spilled_value(
+        shard_dir: &std::path::Path,
+        key: &[u8],
+        value: TestRedisValue,
+    ) -> Database {
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        let mut entry = Entry::new_string(Bytes::new()); // placeholder, overwritten below
+        entry.value = CompactValue::from_redis_value(value);
+
+        spill_to_datafile(
+            shard_dir,
+            900,
+            key,
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let mut db = Database::new();
+        db.cold_shard_dir = Some(shard_dir.to_path_buf());
+        db.cold_index = Some(cold_index);
+        db
+    }
+
+    #[test]
+    fn test_get_or_create_hash_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
+        fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+
+        // Precondition: nothing hot yet, key only exists cold.
+        assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
+
+        // Simulates HSET's get_or_create_hash call: must promote the real
+        // spilled fields, NOT fabricate an empty hash that would permanently
+        // shadow (destroy) the cold copy.
+        let map = db.get_or_create_hash(b"myhash").unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "must promote existing fields, not fabricate empty hash"
+        );
+        assert_eq!(map.get(b"color".as_slice()).unwrap(), b"red".as_slice());
+
+        // Promotion must also clear the cold index entry (no dual reference).
+        assert!(db.cold_index.as_ref().unwrap().lookup(b"myhash").is_none());
+        assert!(db.is_hot(b"myhash"));
+    }
+
+    #[test]
+    fn test_get_or_create_hash_merges_new_field_with_promoted_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(
+            Bytes::from_static(b"old_field"),
+            Bytes::from_static(b"old_value"),
+        );
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        // HSET h new_field new_value
+        {
+            let map = db.get_or_create_hash(b"h").unwrap();
+            map.insert(
+                Bytes::from_static(b"new_field"),
+                Bytes::from_static(b"new_value"),
+            );
+        }
+
+        let map = db.get_hash(b"h").unwrap().unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "old spilled field + new field must both be present"
+        );
+        assert_eq!(
+            map.get(b"old_field".as_slice()).unwrap(),
+            b"old_value".as_slice()
+        );
+        assert_eq!(
+            map.get(b"new_field".as_slice()).unwrap(),
+            b"new_value".as_slice()
+        );
+    }
+
+    #[test]
+    fn test_get_hash_ref_if_alive_sees_cold_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        let href = db
+            .get_hash_ref_if_alive(b"h", 0)
+            .unwrap()
+            .expect("must see cold hash");
+        assert_eq!(href.get_field(b"f").unwrap(), b"v".as_slice());
+        assert_eq!(href.len(), 1);
+
+        // Non-promoting: `&self` accessor must not have mutated hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "get_hash_ref_if_alive takes &self and must not promote"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"h").is_some(),
+            "cold index entry must remain untouched by a non-promoting read"
+        );
+    }
+
+    #[test]
+    fn test_get_or_create_list_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"a"));
+        list.push_back(Bytes::from_static(b"b"));
+        let mut db = db_with_spilled_value(tmp.path(), b"mylist", TestRedisValue::List(list));
+
+        let l = db.get_or_create_list(b"mylist").unwrap();
+        assert_eq!(
+            l.len(),
+            2,
+            "must promote existing elements, not fabricate empty list"
+        );
+        assert_eq!(l[0], Bytes::from_static(b"a"));
+    }
+
+    #[test]
+    fn test_get_list_ref_if_alive_sees_cold_list_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"x"));
+        let db = db_with_spilled_value(tmp.path(), b"l", TestRedisValue::List(list));
+
+        let lref = db
+            .get_list_ref_if_alive(b"l", 0)
+            .unwrap()
+            .expect("must see cold list");
+        assert_eq!(lref.len(), 1);
+        assert!(!db.is_hot(b"l"));
+    }
+
+    #[test]
+    fn test_get_or_create_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m1"));
+        set.insert(Bytes::from_static(b"m2"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+
+        let s = db.get_or_create_set(b"myset").unwrap();
+        assert_eq!(
+            s.len(),
+            2,
+            "must promote existing members, not fabricate empty set"
+        );
+        assert!(s.contains(b"m1".as_slice()));
+    }
+
+    #[test]
+    fn test_get_set_ref_if_alive_sees_cold_set_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m"));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+
+        let sref = db
+            .get_set_ref_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold set");
+        assert!(sref.contains(b"m"));
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_get_or_create_sorted_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(1.5), Bytes::from_static(b"alice"));
+        members.insert(Bytes::from_static(b"alice"), 1.5);
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myzset",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "must promote existing members, not fabricate empty zset"
+        );
+        assert_eq!(members.get(b"alice".as_slice()), Some(&1.5));
+    }
+
+    #[test]
+    fn test_get_sorted_set_ref_if_alive_sees_cold_zset_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(2.0), Bytes::from_static(b"bob"));
+        members.insert(Bytes::from_static(b"bob"), 2.0);
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"z",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let zref = db
+            .get_sorted_set_ref_if_alive(b"z", 0)
+            .unwrap()
+            .expect("must see cold zset");
+        assert_eq!(zref.score(b"bob"), Some(2.0));
+        assert!(!db.is_hot(b"z"));
+    }
+
+    #[test]
+    fn test_get_or_create_stream_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 1000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"field"), Bytes::from_static(b"value"))],
+        );
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"mystream",
+            TestRedisValue::Stream(Box::new(stream)),
+        );
+
+        let s = db.get_or_create_stream(b"mystream").unwrap();
+        assert_eq!(
+            s.length, 1,
+            "must promote existing entries, not fabricate empty stream"
+        );
+        assert_eq!(s.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_get_stream_if_alive_sees_cold_stream_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 2000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+        );
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Stream(Box::new(stream)));
+
+        let sref = db
+            .get_stream_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold stream");
+        assert_eq!(sref.length, 1);
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_exists_counts_cold_only_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        assert!(db.exists(b"h"), "cold-only key must count as existing");
+        // Cheap presence check must not have promoted the key into hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "EXISTS must not promote — cheap check only"
+        );
+
+        let now_ms = db.now_ms();
+        assert!(db.exists_if_alive(b"h", now_ms));
+        assert!(!db.is_hot(b"h"));
+    }
+
+    #[test]
+    fn test_exists_false_for_genuinely_missing_key() {
+        let mut db = Database::new();
+        db.cold_index = Some(ColdIndex::new());
+        assert!(!db.exists(b"nope"));
+        let now_ms = db.now_ms();
+        assert!(!db.exists_if_alive(b"nope", now_ms));
+    }
 }
