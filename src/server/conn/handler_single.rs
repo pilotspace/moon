@@ -1251,6 +1251,15 @@ pub async fn handle_connection(
                             } else {
                                 conn.in_multi = false;
                                 let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                                // PR #282 review: `execute_transaction` holds
+                                // ONE guard on the db selected at EXEC time —
+                                // every body write physically lands there,
+                                // even when a queued SELECT mutates
+                                // `conn.selected_db` mid-body. Capture the
+                                // guard's db NOW; attributing entries to the
+                                // post-EXEC `conn.selected_db` would mis-place
+                                // them on recovery.
+                                let txn_db = conn.selected_db;
                                 let (mut result, txn_aof_entries) = execute_transaction(
                                     &db,
                                     &conn.command_queue,
@@ -1388,14 +1397,15 @@ pub async fn handle_connection(
                                 // any command's fsync fails.
                                 let exec_resp_idx = responses.len();
                                 responses.push(result);
-                                // task #35: the whole txn body ran against
-                                // `conn.selected_db` (a SELECT queued inside MULTI
-                                // is not itself persisted, mirroring the top-level
-                                // dispatch path above).
+                                // task #35 + PR #282 review: the whole body
+                                // ran against the guard taken on `txn_db`
+                                // (captured before EXEC) — NOT the possibly
+                                // SELECT-mutated post-EXEC `conn.selected_db`.
+                                // A queued SELECT itself is never persisted.
                                 aof_entries.extend(
                                     txn_aof_entries
                                         .into_iter()
-                                        .map(|b| (exec_resp_idx, conn.selected_db, b)),
+                                        .map(|b| (exec_resp_idx, txn_db, b)),
                                 );
                             }
                             continue;

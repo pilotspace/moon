@@ -683,14 +683,9 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(
-                ctx,
-                aof_entries,
-                false,
-                conn.selected_db,
-            )
-            .await
-            .is_err()
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false)
+                .await
+                .is_err()
             {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and

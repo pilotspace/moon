@@ -161,8 +161,13 @@ pub(crate) fn execute_transaction(
             continue;
         }
 
-        // Check if this is a write command for AOF logging
-        let is_write = metadata::is_write(cmd);
+        // Check if this is a write command for AOF logging.
+        // `is_persisted_write` (PR #282 review): a SELECT queued inside MULTI
+        // must not be persisted as a literal record — it would shift the AOF
+        // stream's db context under every OTHER record (task #35). All body
+        // writes execute against the guard taken on the ENTRY db above, so
+        // the caller attributes every entry to that one db.
+        let is_write = metadata::is_persisted_write(cmd);
 
         // Serialize for AOF before dispatch
         let aof_bytes = if is_write {
@@ -209,11 +214,16 @@ pub(crate) fn execute_transaction_sharded(
     selected_db: usize,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
-) -> (Frame, Vec<Bytes>) {
+) -> (Frame, Vec<(usize, Bytes)>) {
     let db_count = shard_databases.db_count();
 
     let mut results = Vec::with_capacity(command_queue.len());
-    let mut aof_entries: Vec<Bytes> = Vec::new();
+    // Per-entry db (PR #282 review): this executor re-dispatches each body
+    // command against the CURRENT `selected`, so a SELECT queued inside MULTI
+    // really does redirect the commands after it — collapsing every entry to
+    // one db mis-attributes recovery and replication whenever the body
+    // switches dbs.
+    let mut aof_entries: Vec<(usize, Bytes)> = Vec::new();
     let mut selected = selected_db;
 
     for cmd_frame in command_queue {
@@ -240,13 +250,20 @@ pub(crate) fn execute_transaction_sharded(
         // MULTI/EXEC path logged nothing, so every transactional write was
         // silently lost on restart. Fully-qualified paths because `metadata`
         // is only `use`d under runtime-tokio but this fn compiles under both.
-        let aof_bytes = if crate::command::metadata::is_write(cmd) {
+        // `is_persisted_write` (PR #282 review): a queued literal SELECT is
+        // connection/txn state only — persisting it shifts the stream's db
+        // context under other records (task #35).
+        let aof_bytes = if crate::command::metadata::is_persisted_write(cmd) {
             let mut buf = bytes::BytesMut::new();
             crate::protocol::serialize::serialize(cmd_frame, &mut buf);
             Some(buf.freeze())
         } else {
             None
         };
+        // The db THIS command executes in — captured before dispatch (a
+        // queued SELECT mutates `selected` for the commands after it, never
+        // for itself, and no persisted write mutates it mid-dispatch).
+        let entry_db = selected;
 
         let result = crate::shard::slice::with_shard_db(selected, |db| {
             db.refresh_now_from_cache(cached_clock);
@@ -261,7 +278,7 @@ pub(crate) fn execute_transaction_sharded(
         // single-shard path — an errored write must not reach the AOF).
         if let Some(bytes) = aof_bytes {
             if !matches!(&response, Frame::Error(_)) {
-                aof_entries.push(bytes);
+                aof_entries.push((entry_db, bytes));
             }
         }
 
@@ -349,13 +366,12 @@ pub(crate) fn execute_transaction_sharded(
 /// master fanout is not wired; monoio is the production replication runtime).
 pub(crate) async fn persist_txn_aof(
     ctx: &crate::server::conn::core::ConnectionContext,
-    aof_entries: Vec<Bytes>,
+    // task #35 + PR #282 review: each entry carries the db THAT command
+    // executed in — a SELECT queued inside MULTI redirects the commands
+    // after it (sharded executor), so one collapsed db mis-attributes the
+    // body on recovery.
+    aof_entries: Vec<(usize, Bytes)>,
     repl_recorded: bool,
-    // task #35: the db the whole MULTI/EXEC body executed in (the
-    // originating connection's `selected_db` — every entry in the body ran
-    // against that one db, since SELECT itself is queued/executed like any
-    // other command inside the transaction).
-    db: usize,
 ) -> Result<(), ()> {
     if aof_entries.is_empty() {
         return Ok(());
@@ -364,7 +380,7 @@ pub(crate) async fn persist_txn_aof(
         return Ok(());
     };
     let mut barrier_pending = false;
-    for bytes in aof_entries {
+    for (db, bytes) in aof_entries {
         let lsn = if repl_recorded {
             0
         } else {

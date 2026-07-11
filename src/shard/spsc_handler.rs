@@ -2495,11 +2495,14 @@ pub(crate) fn handle_shard_message_shared(
             let mut wrote = false;
             let mut append_lost = false;
             let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-            for entry_bytes in &aof_entries {
+            // PR #282 review: each entry carries the db it EXECUTED in (a
+            // SELECT queued inside the body redirects the commands after it)
+            // — attribute per entry, not the body's entry db.
+            for (entry_db, entry_bytes) in &aof_entries {
                 wrote = true;
                 let ok = wal_append_and_fanout(
                     entry_bytes,
-                    db_index,
+                    *entry_db,
                     wal_writer,
                     repl_backlog,
                     replica_txs,

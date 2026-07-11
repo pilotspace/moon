@@ -765,8 +765,11 @@ pub(super) async fn try_handle_multi_exec(
                 // latency vector for cross-shard traffic sharing this thread.
                 // Each drain iteration is just a try_send per replica, so the
                 // burst is cheap; revisit only if EXEC bodies grow unbounded.
-                for bytes in &aof_entries {
-                    super::ft::record_local_write_db(ctx, conn.selected_db, bytes.clone());
+                // PR #282 review: per-entry db — a SELECT queued inside the
+                // body redirects the commands after it, so the replication
+                // stream must bind each record to ITS execution db.
+                for (entry_db, bytes) in &aof_entries {
+                    super::ft::record_local_write_db(ctx, *entry_db, bytes.clone());
                 }
             }
             // DURABILITY: append every successful write in the body to THIS
@@ -776,14 +779,9 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(
-                ctx,
-                aof_entries,
-                repl_active,
-                conn.selected_db,
-            )
-            .await
-            .is_err()
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, repl_active)
+                .await
+                .is_err()
             {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and
