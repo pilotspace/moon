@@ -19,7 +19,7 @@ Moon implements PSYNC2-compatible replication with per-shard WAL streaming and p
       stream from all shards; every record carries its own `SELECT` framing, so
       multi-db workloads replicate exactly. Requires the default `runtime-monoio`
       build — a `runtime-tokio` master answers PSYNC with
-      `-ERR PSYNC requires runtime-monoio on the master`.
+      `-ERR PSYNC requires runtime-monoio on the master (this build runs runtime-tokio)`.
     - **Replicas:** `--shards 1` each (scale reads by adding replicas, not
       replica shards). A multi-shard replica refuses to start replication.
     - **Partial resync:** supported on single-shard masters (backlog window);

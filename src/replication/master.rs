@@ -942,19 +942,34 @@ pub async fn handle_psync_inline_multi_shard(
     #[cfg(feature = "graph")]
     let mut graph_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_shards);
     for (shard, reply_rx) in reply_rxs {
-        let prepared = match reply_rx.recv_async().await {
-            Ok(p) => p,
-            Err(_) => {
-                unregister_replica_all_shards(
-                    replica_id,
-                    &dispatch_tx,
-                    &spsc_notifiers,
-                    self_shard_id,
-                    num_shards,
-                );
-                anyhow::bail!("shard {} dropped its PrepareReplicaSync reply", shard);
-            }
-        };
+        // Bounded wait (review): a wedged shard must not park this task —
+        // and its registrations — forever. 30s is far past any observed
+        // body-serialization time; on expiry the replica reconnects and
+        // retries the sync.
+        let prepared =
+            match monoio::time::timeout(std::time::Duration::from_secs(30), reply_rx.recv_async())
+                .await
+            {
+                Ok(Ok(p)) => p,
+                timeout_or_dropped => {
+                    unregister_replica_all_shards(
+                        replica_id,
+                        &dispatch_tx,
+                        &spsc_notifiers,
+                        self_shard_id,
+                        num_shards,
+                    );
+                    anyhow::bail!(
+                        "shard {} PrepareReplicaSync reply {} — aborting sync",
+                        shard,
+                        if timeout_or_dropped.is_err() {
+                            "timed out after 30s"
+                        } else {
+                            "dropped"
+                        }
+                    );
+                }
+            };
         snapshot_offset += prepared.shard_offset;
         // Index definitions are keyspace-global and identical on every shard —
         // keep the first non-empty copy.
@@ -995,14 +1010,31 @@ pub async fn handle_psync_inline_multi_shard(
         "multi-shard full resync prepared"
     );
 
-    let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);
-    let (wr, _) = stream.write_all(response.into_bytes()).await;
-    wr.map_err(|e| anyhow::anyhow!(e))?;
-    let header = format!("${}\r\n", rdb_buf.len());
-    let (wr, _) = stream.write_all(header.into_bytes()).await;
-    wr.map_err(|e| anyhow::anyhow!(e))?;
-    let (wr, _) = stream.write_all(rdb_buf).await;
-    wr.map_err(|e| anyhow::anyhow!(e))?;
+    // Socket-write failures (replica died mid-transfer) must ALSO unregister
+    // everywhere — otherwise the fan-out entries linger until each shard's
+    // next write passively prunes them (review).
+    let sent: anyhow::Result<()> = async {
+        let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);
+        let (wr, _) = stream.write_all(response.into_bytes()).await;
+        wr.map_err(|e| anyhow::anyhow!(e))?;
+        let header = format!("${}\r\n", rdb_buf.len());
+        let (wr, _) = stream.write_all(header.into_bytes()).await;
+        wr.map_err(|e| anyhow::anyhow!(e))?;
+        let (wr, _) = stream.write_all(rdb_buf).await;
+        wr.map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = sent {
+        unregister_replica_all_shards(
+            replica_id,
+            &dispatch_tx,
+            &spsc_notifiers,
+            self_shard_id,
+            num_shards,
+        );
+        return Err(e);
+    }
     // No backlog catch-up leg: each shard's registration IS its snapshot
     // point (same synchronous stretch), so live fan-out already covers every
     // byte past `snapshot_offset`.

@@ -48,6 +48,12 @@ shards is not yet supported`.
   with a clear `-ERR PSYNC requires runtime-monoio on the master` instead of
   an unknown-command reply (RFC R3/2A). Multi-shard *replicas* remain
   unsupported (`--shards 1`).
+- Known limitation: during snapshot preparation + transfer the live stream
+  buffers in the replica's 16,384-record channel. A very large keyspace
+  under sustained heavy write load can overflow it mid-attach — the replica
+  is then KICKED (loud) and retries the sync; it never diverges silently.
+  Attach such deployments during a write lull, or raise the buffer if this
+  becomes a practical constraint.
 - Docs refreshed for the new topology: `docs/guides/clustering.md` deployment
   shape, `README.md` replication bullets, and `docs/PRODUCTION-CONTRACT.md`
   rows REPL-MULTISHARD-01 + WAIT-01 flipped to ✅ with evidence.
