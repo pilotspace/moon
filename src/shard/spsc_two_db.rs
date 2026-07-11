@@ -100,6 +100,15 @@ pub(crate) fn try_two_db_intercept(
                 // the same eviction gate as any other write. Gate on the
                 // DESTINATION db (the one that grows) before copy_core.
                 if evict_active {
+                    // task #34 (Wave A): a plain-dropped victim here (cross-db
+                    // `COPY ... DB n` growing the destination past budget) is
+                    // NOT wired to `record_reason_del` yet — this function
+                    // deliberately does no WAL/AOF/replication I/O ("no
+                    // persistence here" per the module doc), and threading
+                    // those handles through for the comparatively rare
+                    // cross-db COPY path is left as a follow-up alongside the
+                    // other documented Wave-A gaps (db-quota eviction, Lua
+                    // effects). A no-op sink preserves pre-#34 behavior.
                     if let Err(oom) = crate::shard::spsc_handler::spsc_eviction_gate(
                         dst,
                         ca.dst_db,
@@ -109,6 +118,7 @@ pub(crate) fn try_two_db_intercept(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
+                        &mut |_| {},
                     ) {
                         return oom;
                     }

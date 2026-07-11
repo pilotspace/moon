@@ -24,7 +24,7 @@ use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
 };
 use crate::storage::tiered::spill_thread::SpillRequest;
 
@@ -46,6 +46,7 @@ use super::shared_databases::ShardDatabases;
 /// directly, bypassing the connection handlers' write path entirely — without
 /// this gate a scatter-gather write could grow a remote shard's memory past
 /// `maxmemory` without limit.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spsc_eviction_gate(
     db: &mut Database,
     db_idx: usize,
@@ -55,18 +56,42 @@ pub(super) fn spsc_eviction_gate(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // task #34 (Wave A): fires once per plain-dropped (non-spill) victim so
+    // the caller can emit a dual-plane DEL record. Callers build this from
+    // `record_reason_del` (event-loop-context flavor) — `drain_spsc_shared`
+    // already has the shard loop's pre-extracted `SharedBacklog`/
+    // `OffsetHandle`/`Vec<ReplicaFanout>` in scope for its own
+    // `wal_append_and_fanout` calls right next to each `spsc_eviction_gate`
+    // call site.
+    on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> Result<(), crate::protocol::Frame> {
     let rt = runtime_config.read();
     let budget = shard_databases.elastic_budget(shard_id);
     let global_result = if let Some(sender) = spill_sender {
         let mut fid = spill_file_id.get();
         let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
-        let res =
-            try_evict_if_needed_async_spill_budget(db, &rt, sender, dir, &mut fid, db_idx, budget);
+        // Task #34 review (defect 1 follow-through): this gate has no
+        // `ShardManifest` handle either (same reasoning as
+        // `run_write_eviction_gate`'s doc comment) — a cross-shard write
+        // past `maxmemory` under `--disk-offload enable` reliably takes the
+        // "no manifest reachable" plain-drop fallback. Previously called the
+        // non-reporting wrapper (hardcoded no-op sink), silently dropping
+        // `on_plain_drop` on the floor for this branch even though the
+        // caller already threads a real one for the sibling branch below.
+        let res = try_evict_if_needed_async_spill_budget_reporting(
+            db,
+            &rt,
+            sender,
+            dir,
+            &mut fid,
+            db_idx,
+            budget,
+            on_plain_drop,
+        );
         spill_file_id.set(fid);
         res
     } else {
-        try_evict_if_needed_budget(db, &rt, budget)
+        try_evict_if_needed_budget_reporting(db, &rt, budget, on_plain_drop)
     };
     global_result?;
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
@@ -663,6 +688,20 @@ pub(crate) fn handle_shard_message_shared(
                                     spill_sender,
                                     spill_file_id,
                                     disk_offload_dir,
+                                    // task #34 (Wave A): cross-shard write leg.
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            db_idx,
+                                            wal_writer,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                        );
+                                    },
                                 ) {
                                     oom_frame = Some(oom);
                                     return;
@@ -896,6 +935,20 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                // task #34 (Wave A): cross-shard write leg.
+                                &mut |key| {
+                                    crate::replication::reason_del::record_reason_del(
+                                        key,
+                                        db_idx,
+                                        wal_writer,
+                                        repl_backlog,
+                                        replica_txs,
+                                        repl_state,
+                                        shard_id,
+                                        aof_pool,
+                                        wal_kv_log,
+                                    );
+                                },
                             ) {
                                 results.push(oom);
                                 continue;
@@ -1081,6 +1134,20 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                // task #34 (Wave A): cross-shard write leg.
+                                &mut |key| {
+                                    crate::replication::reason_del::record_reason_del(
+                                        key,
+                                        db_idx,
+                                        wal_writer,
+                                        repl_backlog,
+                                        replica_txs,
+                                        repl_state,
+                                        shard_id,
+                                        aof_pool,
+                                        wal_kv_log,
+                                    );
+                                },
                             ) {
                                 results.push(oom);
                                 continue;
@@ -1309,6 +1376,20 @@ pub(crate) fn handle_shard_message_shared(
                                     spill_sender,
                                     spill_file_id,
                                     disk_offload_dir,
+                                    // task #34 (Wave A): cross-shard write leg.
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            db_idx,
+                                            wal_writer,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                        );
+                                    },
                                 ) {
                                     oom_frame = Some(oom);
                                     return;
@@ -1500,6 +1581,20 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                // task #34 (Wave A): cross-shard write leg.
+                                &mut |key| {
+                                    crate::replication::reason_del::record_reason_del(
+                                        key,
+                                        db_idx,
+                                        wal_writer,
+                                        repl_backlog,
+                                        replica_txs,
+                                        repl_state,
+                                        shard_id,
+                                        aof_pool,
+                                        wal_kv_log,
+                                    );
+                                },
                             ) {
                                 results.push(oom);
                                 continue;
@@ -1686,6 +1781,20 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                // task #34 (Wave A): cross-shard write leg.
+                                &mut |key| {
+                                    crate::replication::reason_del::record_reason_del(
+                                        key,
+                                        db_idx,
+                                        wal_writer,
+                                        repl_backlog,
+                                        replica_txs,
+                                        repl_state,
+                                        shard_id,
+                                        aof_pool,
+                                        wal_kv_log,
+                                    );
+                                },
                             ) {
                                 results.push(oom);
                                 continue;

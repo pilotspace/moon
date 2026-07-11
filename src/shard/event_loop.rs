@@ -1647,7 +1647,18 @@ impl super::Shard {
                 }
                 // Cooperative active expiry + MQ triggers
                 _ = expiry_interval.0.tick() => {
-                    timers::run_active_expiry(&shard_databases, shard_id);
+                    timers::run_active_expiry(
+                        &shard_databases, shard_id,
+                        &mut wal_writer, &repl_backlog, &mut replica_txs, &repl_offsets,
+                        aof_pool.as_ref(),
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
+                    );
                     // MQ trigger check: fire debounced triggers
                     timers::fire_pending_mq_triggers(
                         &shard_databases,
@@ -1670,6 +1681,15 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        &repl_backlog, &mut replica_txs, &repl_offsets,
+                        aof_pool.as_ref(),
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
                     );
 
                     // Reap idle io_uring connections (tokio+io_uring path).
@@ -2158,7 +2178,22 @@ impl super::Shard {
                 }
                 // expiry + eviction + MQ triggers: every 100ms (100 ticks)
                 if monoio_tick_counter % 100 == 0 {
-                    timers::run_active_expiry(&shard_databases, shard_id);
+                    timers::run_active_expiry(
+                        &shard_databases,
+                        shard_id,
+                        &mut wal_writer,
+                        &repl_backlog,
+                        &mut replica_txs,
+                        &repl_offsets,
+                        aof_pool.as_ref(),
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
+                    );
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
                         &mut shard_manifest,
@@ -2171,6 +2206,17 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        &repl_backlog,
+                        &mut replica_txs,
+                        &repl_offsets,
+                        aof_pool.as_ref(),
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
                     );
                     // MQ trigger check: fire debounced triggers
                     timers::fire_pending_mq_triggers(

@@ -6,6 +6,217 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Wave A adversarial-review fixes (task #34)
+
+Three defects found reviewing Wave A (plane replication) before merge, all
+fixed on top of the branch's part 1/2/3 work below.
+
+- **Non-string eviction victims under a `SpillContext` were dropped with no
+  cold copy AND no DEL record.** `storage::eviction::evict_one_with_spill`
+  snapshotted `is_plain_drop = spill.is_none()` BEFORE its spill body ran,
+  but that body only ever spills `RedisValueRef::String` values — a
+  Hash/List/Set/ZSet victim picked while a `SpillContext` was live took
+  neither branch of the `is_string` check (no bytes written anywhere) yet
+  still fell through to the unconditional `db.remove`, and because
+  `is_plain_drop` was already `false`, `on_plain_drop` never fired: a
+  genuine, silent, unreported data loss. Fixed by tracking whether THIS
+  victim was actually spilled (`spilled`, set only inside the branch that
+  performs the write) instead of snapshotting the precondition. Also
+  threaded the real `record_reason_del` sink into
+  `persistence_tick::handle_memory_pressure`'s "durable spill, manifest
+  reachable" branch, which previously passed a hardcoded no-op sink on the
+  (incorrect, for non-strings) assumption that this branch could never
+  plain-drop. New unit test:
+  `eviction::tests::sync_spill_non_string_victim_reports_plain_drop`.
+- **`record_reason_del`/`record_reason_del_conn`/`record_effect_write`
+  allocated a fully serialized RESP record BEFORE checking whether any
+  replica or AOF pool was even wired.** The single most common deployment
+  shape (standalone server, no replica ever attached, `--appendonly no`)
+  paid a `Bytes`/`Frame` allocation for every background-tick DEL or script
+  write effect, only to discard it a few instructions later inside
+  `wal_append_and_fanout`'s own no-op fast path. Fixed by hoisting the exact
+  same has-work predicate (`wal_fanout_has_work` for the shard-loop
+  context; a new `conn_has_work` — `fanout_hint_active() ||
+  aof_pool.is_some()` — for the connection context) to the top of all three
+  entry points, before any serialization. Behavior when there IS work is
+  byte-for-byte unchanged (same predicate, same downstream call). This is a
+  perf-only fix with no allocation-counting harness in this repo to red/
+  green against; verified instead by regression tests confirming both the
+  no-op path (`record_reason_del_noop_when_nothing_wired`) and the
+  has-work path still emits correctly
+  (`record_reason_del_still_emits_to_aof_when_wired`,
+  `conn_has_work_true_when_aof_pool_wired`).
+- **Lua's bystander-eviction gate was unwired from both durability planes.**
+  `scripting::bridge::LuaEvictionCtx::gate` — the OOM check run before every
+  `WRITE`-flagged `redis.call`/`redis.pcall` inside a script — called the
+  non-reporting `try_evict_if_needed_budget`/
+  `try_evict_if_needed_async_spill_budget`, which hardcode a no-op sink.
+  When a script's write pushed the shard over `maxmemory`, whatever
+  BYSTANDER key the policy sampled (never anything the script itself
+  touched) was plain-dropped with no AOF/replication record — invisible
+  eviction, same class of bug as every other Wave-A plain-drop site this
+  branch fixed elsewhere. New `eviction::try_evict_if_needed_async_spill_budget_reporting`
+  wrapper (mirroring the existing `try_evict_if_needed_budget_reporting`);
+  `gate` now threads a real sink through to `record_reason_del_conn` with
+  the gate's own `db_index`. Unit-level regression test (not a full
+  black-box EVAL+replica repro, to avoid a flaky multi-process harness for
+  a pure wiring check):
+  `scripting::bridge::tests::gate_reports_bystander_eviction_to_aof`.
+- **Same unwired-reporting bug at the two call sites ordinary writes
+  actually reach.** Black-box testing defect 1 (disk-offload enabled,
+  Hash victims, real replica) surfaced that the narrowly-described
+  `evict_one_with_spill`/`SpillContext` path above is effectively dead code
+  via any CLI configuration today — `spill_thread` and `shard_manifest` are
+  co-gated on the identical `disk_offload_enabled()` check, so the sync
+  `SpillContext::Some` branch that `persistence_tick` wires is never
+  actually constructed. The real reachable paths for an ordinary write
+  under `--disk-offload enable` are `server::conn::handler_monoio::
+  run_write_eviction_gate` (monoio) and `shard::spsc_handler::
+  spsc_eviction_gate` (cross-shard dispatch), and both had the identical
+  defect-3-class bug: their spill-sender branch called the non-reporting
+  `try_evict_if_needed_async_spill_budget` with a hardcoded no-op sink
+  (`spsc_eviction_gate` additionally had an already-plumbed
+  `on_plain_drop` parameter that this one branch silently discarded).
+  Fixed both to call `try_evict_if_needed_async_spill_budget_reporting`
+  with the real `record_reason_del_conn` sink, mirroring the sibling
+  no-spill-sender branch each function already had correct. New black-box
+  regression: `tests/replication_planes.rs`
+  `eviction_parity_hash_disk_offload_shards1`/`_shards4` (disk-offload
+  enabled, HSET-driven eviction, real replica attached). Note: full
+  dbsize equality is not asserted — the tick-driven memory-pressure
+  cascade's `evict_batch_durable_no_aof` batch spill is a real, correctly
+  *unreported* spill (durable cold copy + `cold_index` registration) for
+  non-string values too, so a residual share of evictions legitimately
+  never reach the replica. That cold copy is unreadable today for Hash/
+  List/Set/ZSet (`get_hash_ref_if_alive` and siblings never consult
+  `cold_index`, unlike the generic `Database::get()` path GET uses) — a
+  separate, pre-existing, out-of-scope gap — which is why the test gates
+  on a large-majority convergence ratio (0.70, matching this repo's own
+  `MERGE_RECALL_TOLERANCE`-style "good enough" convention) rather than
+  exact equality; before this fix the ratio was 0.0 (the replica retained
+  every hash key, full stop).
+
+**Known limitations (documented, not fixed here):**
+- `redis.pcall('SELECT', ...)` inside a script swallows the new
+  `SELECT`-rejection error into a Lua table instead of raising — the script
+  may continue running against the ORIGINAL db, silently, exactly as before
+  Wave A's `SELECT` lockout. Only `redis.call` fails loud. A real
+  multi-db-scripts feature (tracked as a follow-up) is the actual fix; until
+  then, avoid `redis.pcall('SELECT', ...)` in scripts.
+- Nondeterministic write commands issued inside a script (`SPOP`, `SRANDMEMBER`-
+  derived writes, etc.) replicate **verbatim** via `record_effect_write` (the
+  exact `cmd + args` the script invoked) and can diverge from the master on
+  a replica, exactly like any other verbatim-replicated nondeterministic
+  command in this codebase (pre-existing class, first exposed for Lua by
+  Wave A). A real fix requires replicating the script's *effects* in a
+  deterministic form, not the nondeterministic call itself — out of scope
+  for task #34.
+- `replication::state::fanout_hint_active()` is **sticky**: once ANY replica
+  has attached, it stays `true` for the rest of the process's lifetime (see
+  `FANOUT_HINT`, a one-way latch, not a live "is a replica currently
+  attached" flag). Consequence for operators: after the first-ever replica
+  attaches and later detaches, the monoio inline-SET fast path
+  (`server::conn::blocking::try_inline_dispatch`) stays permanently
+  disabled for that process — every subsequent `SET` falls back to the
+  generic dispatch path for the rest of the process's life, even with zero
+  replicas currently attached. A process restart is the only way back to
+  the fast path.
+
+### Added — Wave A part 1: `record_reason_del` dual-plane DEL emission (task #34)
+
+Master-side key removals for a reason OTHER than a client write command
+(active TTL expiry, `--maxmemory` eviction plain-drops) previously reached
+NEITHER the AOF plane nor the replication plane: the key vanished from the
+master's own keyspace, but an attached replica kept serving it forever, and
+a `kill -9` + restart against `--appendonly yes` resurrected it from the AOF
+replay (the AOF never recorded the DEL, only the original SET/write).
+
+- New `replication::reason_del::record_reason_del` (shard-event-loop
+  context, reuses `wal_append_and_fanout` — the same mechanism the
+  `ShardMessage::SwapDb` synthetic-command record already uses) and
+  `record_reason_del_conn` (connection-handler context, mirrors
+  `handler_monoio::ft::record_local_write_db`'s backlog/offset/fan-out
+  mechanics and adds the AOF leg that helper omits). Both emit a real
+  `DEL <key>` RESP record, respecting the fused-`SELECT` multi-db framing
+  every ordinary write already uses.
+- Wired into: active expiry's whole-key sweep (`expire_cycle`), background
+  eviction's plain-drop path (`timers::run_eviction`,
+  `persistence_tick::handle_memory_pressure`'s no-manifest fallback), the
+  inline fast-path SET eviction gate, the generic per-command write-eviction
+  gate, and the SPSC cross-shard write-eviction gate. Every call site is
+  restricted to `spill.is_none()` plain drops — a spilled/cold-tiered key is
+  NOT a delete and must never be reported here.
+- Fixed a related pre-existing gap found while wiring this: with
+  `--disk-offload disable`, `server::conn::blocking::try_inline_dispatch`
+  (the monoio inline SET fast path) fed the AOF but never the replication
+  backlog/fan-out at all — a plain `SET` on such a master silently never
+  reached an attached replica. `can_inline_writes` now also gates on
+  `!replication::state::fanout_hint_active()`, falling back to the generic
+  dispatch path (which replicates correctly) once any replica has ever
+  attached.
+- Known Wave-A-scoped gaps (documented, not silent): hash-field TTL reaps,
+  Lua `redis.call` write effects, per-db quota (`--db-maxmemory`) eviction,
+  and cross-db `COPY ... DB n` destination eviction do not yet emit —
+  tracked as follow-ups.
+
+### Added — Wave A part 2: Lua script write-effect replication + SELECT lockout (task #34)
+
+Continues part 1: a Lua script's `redis.call`/`redis.pcall` write effects
+previously reached NEITHER durability plane — `EVAL`/`EVALSHA` carry no
+`WRITE` command-metadata flag (by design, see below), so the generic
+per-command AOF/replication gate never saw them. A script's writes vanished
+on `kill -9` + restart against `--appendonly yes`, and an attached replica
+never observed them at all. `redis.call('SELECT', ...)` inside a script also
+silently corrupted state: dispatch's SELECT handler mutated only a local
+variable, so every subsequent write in the script kept landing in the
+ORIGINAL db while looking like it had switched.
+
+- `scripting::bridge::make_redis_call_fn` now records every successfully-
+  executed, `WRITE`-flagged inner command to both the AOF and replication
+  planes itself, immediately after each `redis.call`/`redis.pcall` returns
+  (not batched to script end) — a script that writes two keys and then
+  errors on a third still durably records the first two. New
+  `replication::reason_del::record_effect_write` (+ shared
+  `record_bytes_conn` core, refactored out of part 1's
+  `record_reason_del_conn`) does the emission: same fused-`SELECT`/backlog/
+  offset/fan-out mechanics as every other write path, recording the
+  verbatim `cmd + args` the script invoked.
+- `LuaEvictionCtx` (built once per shard at Lua-VM setup, already caching
+  the OOM eviction handles) now also carries `num_shards`/`repl_state`/
+  `aof_pool` for this emission — one addition at each of the 5 production
+  construction sites (4 in `shard::conn_accept`, 1 in
+  `server::conn::core::ConnectionContext::build_lua_eviction_ctx`, shared by
+  EVAL/EVALSHA and FCALL/FCALL_RO, which route through the identical
+  bridge closure).
+- `redis.call('SELECT', ...)` inside any script now fails loud with
+  `ERR SELECT inside scripts is not supported by moon yet` instead of
+  silently corrupting state — intercepted before dispatch, so no partial
+  write from the same call ever lands. A real multi-db-scripts feature is a
+  follow-up.
+- Deliberately did NOT flip `EVAL`/`EVALSHA` to `WRITE` in the command
+  metadata table — that would make the generic per-command AOF/replication
+  gate ALSO record the literal `EVAL <script> ...` invocation on top of the
+  effect records above, double-applying every write the script made (e.g.
+  an `INCR` landing as 2 instead of 1). Guarded by a new unit test
+  (`command::metadata::eval_evalsha_never_write_flagged`) and a black-box
+  regression test (`eval_incr_no_double_apply`). `FCALL` (unlike EVAL) IS
+  `WRITE`-flagged — mirrors upstream Redis Functions and only feeds ACL /
+  `READONLY`-replica gating, since `try_handle_functions` always consumes
+  FCALL before the generic AOF/replication block runs; it rides the same
+  single-emission bridge path.
+- Turns the 4 remaining RED tests in `tests/replication_planes.rs` green:
+  `eval_effects_parity_shards1`, `eval_effects_parity_shards4`,
+  `eval_writes_survive_restart`, `select_in_script_errors`. All 9 tests in
+  the suite (the 5 from part 1 plus the new `eval_incr_no_double_apply`)
+  pass.
+- Known gap, unchanged from today: a write-`EVAL` issued directly against a
+  read-only replica is not rejected (`try_enforce_readonly` only gates on
+  the `WRITE` metadata flag, which EVAL intentionally lacks) — tracked as a
+  follow-up; replicas never receive `EVAL` itself via replication (only the
+  effect records), so this cannot cause replication divergence, only local
+  replica-side corruption if a client is misdirected to write against a
+  replica directly.
+
 ### Fixed — test-harness port-flake sweep (task #18)
 
 33 integration suites that spawn a real `moon` process shared a copy-pasted

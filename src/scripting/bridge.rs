@@ -5,20 +5,48 @@
 //! 1. Each shard is single-threaded (no concurrent access)
 //! 2. The pointer is valid for the entire duration of script execution
 //! 3. The pointer is cleared immediately after script execution
+//!
+//! ## Write-effects replication (task #34 Wave A part 2)
+//!
+//! `EVAL`/`EVALSHA` deliberately carry no `WRITE` command-metadata flag (see
+//! `command::metadata::eval_evalsha_never_write_flagged`), so the generic
+//! per-command AOF/replication gate in `handler_monoio` never sees the
+//! literal `EVAL <script> ...` invocation. Instead, [`make_redis_call_fn`]
+//! itself records each successfully-executed, `WRITE`-flagged inner
+//! `redis.call`/`redis.pcall` to both durability planes as it happens (see
+//! [`LuaEvictionCtx::emit_effect`] / `replication::reason_del::
+//! record_effect_write`) — this is the ONLY emission path for a script's
+//! writes. Flipping EVAL/EVALSHA to `WRITE` would double-log every write a
+//! script makes (the generic gate would replay the raw EVAL a second time
+//! on top of the effect records already emitted here) — do not do that.
+//!
+//! `FCALL` (unlike EVAL/EVALSHA) IS `WRITE`-flagged, mirroring upstream
+//! Redis Functions (FCALL always requires write permission; FCALL_RO is the
+//! read-only variant) — but that flag only feeds ACL / `READONLY`-replica
+//! gating. `try_handle_functions` always consumes FCALL with `continue`
+//! before the generic per-command AOF/replication block runs, so FCALL
+//! rides the exact same single-emission bridge path as EVAL/EVALSHA.
+//!
+//! `redis.call('SELECT', ...)` is rejected with a loud script error rather
+//! than executed — see the intercept in [`make_redis_call_fn`] for why
+//! silently allowing it would corrupt state.
 
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use mlua::prelude::*;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
+use crate::replication::state::ReplicationState;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::engine::StorageEngine;
 use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
 };
 use crate::storage::tiered::spill_thread::SpillRequest;
 
@@ -52,6 +80,18 @@ struct LuaEvictionInner {
     spill_sender: Option<flume::Sender<SpillRequest>>,
     spill_file_id: Rc<Cell<u64>>,
     disk_offload_dir: Option<PathBuf>,
+    /// Wave A part 2 (task #34): handles for dual-plane (AOF + replication)
+    /// emission of a script's write effects. See
+    /// [`LuaEvictionCtx::emit_effect`]. Only read under `runtime-monoio`
+    /// (master-side PSYNC and the shard self-msg relay this rides on are
+    /// monoio-only) — kept unconditional in the struct so every call site
+    /// stays feature-uniform instead of growing a second constructor.
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    num_shards: usize,
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    aof_pool: Option<Arc<AofWriterPool>>,
 }
 
 impl LuaEvictionCtx {
@@ -64,6 +104,13 @@ impl LuaEvictionCtx {
     }
 
     /// Real gate, built from the shard's own handles at VM-setup time.
+    ///
+    /// `num_shards`/`repl_state`/`aof_pool` are the same handles
+    /// `ConnectionContext` carries — threaded through here so a script's
+    /// write effects (Wave A part 2) reach both durability planes exactly
+    /// like every other write path. They are stable for the shard's entire
+    /// lifetime, same as the pre-existing eviction handles this ctx already
+    /// caches once per shard.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_databases: Arc<ShardDatabases>,
@@ -72,6 +119,9 @@ impl LuaEvictionCtx {
         spill_sender: Option<flume::Sender<SpillRequest>>,
         spill_file_id: Rc<Cell<u64>>,
         disk_offload_dir: Option<PathBuf>,
+        num_shards: usize,
+        repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+        aof_pool: Option<Arc<AofWriterPool>>,
     ) -> Self {
         LuaEvictionCtx(Some(LuaEvictionInner {
             shard_databases,
@@ -80,6 +130,9 @@ impl LuaEvictionCtx {
             spill_sender,
             spill_file_id,
             disk_offload_dir,
+            num_shards,
+            repl_state,
+            aof_pool,
         }))
     }
 
@@ -89,6 +142,15 @@ impl LuaEvictionCtx {
     /// `CURRENT_DB` thread-local). Returns the standard OOM `Frame::Error`
     /// on failure; `Ok(())` if within budget, eviction succeeded, or
     /// `maxmemory` is unset.
+    ///
+    /// Task #34 review (defect 3): a script's write can push the shard over
+    /// `maxmemory` and force eviction of a BYSTANDER key — one this gate's
+    /// policy sampled, not necessarily anything the script itself touched.
+    /// Before this fix that plain-drop went through the non-reporting
+    /// eviction variants (a hardcoded no-op sink), so it never reached
+    /// `record_reason_del_conn` — an attached replica (or the AOF) never
+    /// learned the bystander key was gone. Wired to the exact same
+    /// dual-plane emission every other write-path eviction gate uses.
     fn gate(&self, db: &mut crate::storage::Database, db_index: usize) -> Result<(), Frame> {
         let Some(inner) = self.0.as_ref() else {
             return Ok(());
@@ -103,24 +165,83 @@ impl LuaEvictionCtx {
         }
         let rt = inner.runtime_config.read();
         let budget = inner.shard_databases.elastic_budget(inner.shard_id);
+        let mut on_plain_drop = |key: &[u8]| {
+            #[cfg(feature = "runtime-monoio")]
+            crate::replication::reason_del::record_reason_del_conn(
+                &inner.repl_state,
+                inner.shard_id,
+                inner.num_shards,
+                inner.aof_pool.as_ref(),
+                db_index,
+                key,
+            );
+            #[cfg(not(feature = "runtime-monoio"))]
+            {
+                let _ = key;
+            }
+        };
         let global_result = if let Some(sender) = &inner.spill_sender {
             let mut fid = inner.spill_file_id.get();
             let dir = inner
                 .disk_offload_dir
                 .as_deref()
                 .unwrap_or(std::path::Path::new("."));
-            let res = try_evict_if_needed_async_spill_budget(
-                db, &rt, sender, dir, &mut fid, db_index, budget,
+            let res = try_evict_if_needed_async_spill_budget_reporting(
+                db,
+                &rt,
+                sender,
+                dir,
+                &mut fid,
+                db_index,
+                budget,
+                &mut on_plain_drop,
             );
             inner.spill_file_id.set(fid);
             res
         } else {
-            try_evict_if_needed_budget(db, &rt, budget)
+            try_evict_if_needed_budget_reporting(db, &rt, budget, &mut on_plain_drop)
         };
         global_result?;
         // WS5b: per-db quota, additive and finer-grained than the
         // whole-instance maxmemory gate above. Zero-cost when unconfigured.
+        // NOT wired to `on_plain_drop` — pre-existing, documented gap (see
+        // `db_quota::check_db_maxmemory`'s own doc comment), out of scope
+        // for task #34.
         crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt)
+    }
+
+    /// Wave A part 2 (task #34): dual-plane (AOF + replication) emission of
+    /// one successfully-executed script write effect. Called from
+    /// `make_redis_call_fn` immediately after a W-flagged `redis.call`/
+    /// `redis.pcall` inner command returns a non-error `Frame` — so effects
+    /// emit as they happen (a script that writes two keys then errors on a
+    /// third still durably records the first two).
+    ///
+    /// `db_index` is the CONNECTION's selected db, unchanged for the whole
+    /// script now that `redis.call('SELECT', ...)` is rejected before
+    /// dispatch (see `make_redis_call_fn`) — there is exactly one db per
+    /// script execution.
+    ///
+    /// No-op for a disabled ctx (unit tests) and under `runtime-tokio`
+    /// (master-side PSYNC and the shard self-msg relay this rides on are
+    /// monoio-only — see `replication::reason_del::record_effect_write`).
+    fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame]) {
+        let Some(_inner) = self.0.as_ref() else {
+            return;
+        };
+        #[cfg(feature = "runtime-monoio")]
+        crate::replication::reason_del::record_effect_write(
+            &_inner.repl_state,
+            _inner.shard_id,
+            _inner.num_shards,
+            _inner.aof_pool.as_ref(),
+            db_index,
+            cmd_and_args,
+        );
+        #[cfg(not(feature = "runtime-monoio"))]
+        {
+            let _ = (db_index, cmd_and_args);
+        }
     }
 }
 
@@ -212,6 +333,21 @@ pub fn make_redis_call_fn(
             let mut db_idx = CURRENT_DB_IDX.with(|c| c.get());
             let db_count = CURRENT_DB_COUNT.with(|c| c.get());
 
+            // Wave A (task #34): `redis.call('SELECT', ...)` used to silently
+            // corrupt state — the generic dispatch SELECT handler mutates
+            // only the LOCAL `db_idx` below, but every write in this closure
+            // still lands on `db`, the ONE `Database` this script execution
+            // is pinned to (the `CURRENT_DB` thread-local is set once, by
+            // `set_script_db`, before the script starts). A script that
+            // called SELECT therefore kept writing the ORIGINAL db while
+            // looking like it had switched. Fail loud instead of corrupting
+            // a second db; a real multi-db-scripts feature is a follow-up.
+            if cmd_bytes.eq_ignore_ascii_case(b"SELECT") {
+                return Ok(Frame::Error(Bytes::from_static(
+                    b"ERR SELECT inside scripts is not supported by moon yet",
+                )));
+            }
+
             // Reject non-readonly commands in read-only mode (FCALL_RO / EVAL_RO)
             // Use positive allowlist (READONLY flag) instead of negative blocklist (!WRITE)
             // to also block PUBLISH and other side-effecting commands.
@@ -236,6 +372,18 @@ pub fn make_redis_call_fn(
             }
 
             let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
+
+            // Wave A part 2 (task #34): dual-plane (AOF + replication)
+            // emission of the effect, immediately after each successful
+            // write — not batched to script end, so a partially-failing
+            // script still durably records its completed writes. Skipped
+            // for FCALL_RO / EVAL_RO (`cmd_is_write` implies the read-only
+            // gate above already passed, so a write here only happens in a
+            // normal read-write script).
+            if cmd_is_write && !matches!(frame, Frame::Error(_)) {
+                eviction_ctx.emit_effect(db_idx, &frames);
+            }
+
             Ok(frame)
         })?;
 
@@ -251,4 +399,129 @@ pub fn make_redis_call_fn(
 
         crate::scripting::types::frame_to_lua_value(lua, &result)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RuntimeConfig;
+    use crate::shard::shared_databases::ShardDatabases;
+    use crate::storage::Database;
+
+    fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
+        RuntimeConfig {
+            maxmemory,
+            maxmemory_policy: policy.to_string(),
+            maxmemory_samples: 5,
+            db_maxmemory: Vec::new(),
+            lfu_log_factor: 10,
+            lfu_decay_time: 1,
+            save: None,
+            appendonly: "no".to_string(),
+            appendfsync: "everysec".to_string(),
+            aclfile: None,
+            dir: ".".to_string(),
+            requirepass: None,
+            protected_mode: "yes".to_string(),
+            acllog_max_len: 128,
+            client_pause_deadline_ms: 0,
+            client_pause_write_only: false,
+            lazyfree_threshold: 64,
+            maxclients: 10000,
+            timeout: 0,
+            tcp_keepalive: 300,
+            num_shards: 1,
+        }
+    }
+
+    /// Unit-level test of the gate wiring (defect 3, task #34 review): a
+    /// black-box EVAL repro (fill via normal SETs, EVAL a write that tips
+    /// the shard over `maxmemory`, assert an attached replica also loses the
+    /// bystander) is possible but adds a full Lua VM + replica harness for a
+    /// single wiring check — this pins the same fact directly against
+    /// `LuaEvictionCtx::gate`, which is what actually changed.
+    ///
+    /// RED (before the fix): `gate` called the non-reporting
+    /// `try_evict_if_needed_budget`/`try_evict_if_needed_async_spill_budget`,
+    /// which pass a hardcoded no-op sink all the way down — a bystander key
+    /// evicted here to make room for the script's write never reached
+    /// `record_reason_del_conn`, so it never reached the AOF pool (nor an
+    /// attached replica). GREEN (after): the gate now threads a real sink
+    /// through to `record_reason_del_conn`, and the AOF pool observes a
+    /// `DEL` for the evicted bystander key.
+    #[test]
+    #[cfg(feature = "runtime-monoio")]
+    fn gate_reports_bystander_eviction_to_aof() {
+        // Deliberately give the ctx a real `spill_sender` (`Some(..)`) so
+        // `gate`'s lock-free fast path (`spill_sender.is_none() && !
+        // maxmemory_is_set() && !db_maxmemory_any_set()`) is false by
+        // construction, regardless of `MAXMEMORY_GLOBAL`'s CURRENT value —
+        // that atomic is process-global and mutated by other tests running
+        // concurrently in this same `cargo test --lib` binary
+        // (`eviction::tests::maxmemory_publish_and_is_set_roundtrip`), so
+        // depending on its value here would be flaky under parallel test
+        // execution. `manifest` is always `None` at this call site (real
+        // production behavior, not a test shortcut — see
+        // `try_evict_if_needed_async_spill_budget_reporting`'s doc comment),
+        // and `config.appendonly == "no"` (the `make_config` default), so
+        // this deterministically takes the "no manifest reachable" plain-
+        // drop fallback inside `try_evict_if_needed_async_spill_with_total_budget_reporting`
+        // — the sender/shard_dir below are never actually touched by that
+        // branch, just required by the signature.
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(1, "allkeys-lru")));
+
+        let (tx, rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(64);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+
+        let (spill_tx, _spill_rx) =
+            flume::bounded::<crate::storage::tiered::spill_thread::SpillRequest>(4);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ctx = LuaEvictionCtx::new(
+            shard_databases,
+            runtime_config,
+            0,
+            Some(spill_tx),
+            Rc::new(Cell::new(1)),
+            Some(tmp.path().to_path_buf()),
+            1,    // num_shards
+            None, // repl_state
+            Some(pool),
+        );
+
+        let mut db = Database::new();
+        for i in 0..50 {
+            db.set_string(
+                Bytes::from(format!("bystander:{i}")),
+                Bytes::from(vec![0u8; 200]),
+            );
+        }
+        let before_len = db.len();
+        assert!(before_len > 0, "setup invariant: fixture must be non-empty");
+
+        // maxmemory=1 byte forces the allkeys-lru policy to evict bystander
+        // keys down toward empty on the very next gate check — none of them
+        // are anything a script wrote (this call simulates the check BEFORE
+        // the script's own write executes).
+        let result = ctx.gate(&mut db, 0);
+        assert!(result.is_ok(), "gate must succeed once the db is emptied");
+        assert!(
+            db.len() < before_len,
+            "setup invariant: gate must have evicted at least one bystander key"
+        );
+
+        let mut saw_del_for_bystander = false;
+        while let Ok(crate::persistence::aof::AofMessage::Append { bytes, .. }) = rx.try_recv() {
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("DEL") && text.contains("bystander:") {
+                saw_del_for_bystander = true;
+            }
+        }
+        assert!(
+            saw_del_for_bystander,
+            "bystander eviction inside the Lua gate must emit a DEL record to the AOF plane"
+        );
+    }
 }

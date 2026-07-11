@@ -180,6 +180,9 @@ impl ConnectionContext {
             self.spill_sender.clone(),
             self.spill_file_id.clone(),
             self.disk_offload_dir.clone(),
+            self.num_shards,
+            self.repl_state.clone(),
+            self.aof_pool.clone(),
         )
     }
 }
