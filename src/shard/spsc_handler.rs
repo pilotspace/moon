@@ -2528,14 +2528,16 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }
-        ShardMessage::RegisterReplica {
-            replica_id,
-            tx,
-            kicked,
-            backlog_capacity,
-            registered,
-            push_offset,
-        } => {
+        ShardMessage::RegisterReplica(payload) => {
+            let crate::shard::dispatch::RegisterReplicaPayload {
+                replica_id,
+                tx,
+                kicked,
+                backlog_capacity,
+                registered,
+                push_offset,
+                cut,
+            } = *payload;
             // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
             // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
             // ReplicationState — see ReplicationState::ensure_backlogs_allocated for the
@@ -2555,7 +2557,23 @@ pub(crate) fn handle_shard_message_shared(
                 *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
             }
             drop(guard);
-            replica_txs.push((replica_id, tx, kicked));
+            // Exactly-once cut (per-shard axis): pusher-captured when the
+            // registration rode with an inline snapshot capture, else the
+            // shard offset now — every record already fanned out (or whose
+            // fan-out message precedes this registration in the FIFO) is at
+            // or below it, so the filtered delivery can't double-send.
+            let entry_cut = cut.unwrap_or_else(|| {
+                repl_state
+                    .as_ref()
+                    .map(|h| h.shard_offset(shard_id))
+                    .unwrap_or(0)
+            });
+            replica_txs.push(crate::shard::dispatch::ReplicaFanout {
+                replica_id,
+                tx,
+                kicked,
+                cut: entry_cut,
+            });
             // Reply with the offset at which live fan-out begins. For
             // same-thread self-queue registrations this is `push_offset`,
             // captured AT PUSH TIME: local writes advance the offset
@@ -2582,7 +2600,7 @@ pub(crate) fn handle_shard_message_shared(
             }
         }
         ShardMessage::UnregisterReplica { replica_id } => {
-            replica_txs.retain(|(id, _, _)| *id != replica_id);
+            replica_txs.retain(|r| r.replica_id != replica_id);
         }
         ShardMessage::PrepareReplicaSync(payload) => {
             // R2 (task #20): this shard's leg of a multi-shard full resync.
@@ -2652,7 +2670,17 @@ pub(crate) fn handle_shard_message_shared(
                 .as_ref()
                 .map(|h| h.shard_offset(shard_id))
                 .unwrap_or(0);
-            replica_txs.push((replica_id, tx, kicked));
+            // `cut = shard_offset` is the exactly-once line: every mutation
+            // in the body captured above has already advanced the counter to
+            // at most this value, so its (possibly still-queued) fan-out
+            // message is filtered out at delivery; anything applied later
+            // carries a higher end_offset and is delivered live exactly once.
+            replica_txs.push(crate::shard::dispatch::ReplicaFanout {
+                replica_id,
+                tx,
+                kicked,
+                cut: shard_offset,
+            });
             tracing::debug!(
                 shard_id,
                 replica_id,
@@ -2673,7 +2701,7 @@ pub(crate) fn handle_shard_message_shared(
                 // The PSYNC task is gone (replica dropped mid-handshake) —
                 // undo the registration so this shard doesn't fan out to a
                 // channel nobody drains.
-                replica_txs.retain(|(id, _, _)| *id != replica_id);
+                replica_txs.retain(|r| r.replica_id != replica_id);
                 tracing::warn!(
                     shard_id,
                     replica_id,
@@ -2681,13 +2709,20 @@ pub(crate) fn handle_shard_message_shared(
                 );
             }
         }
-        ShardMessage::ReplicaLiveFanout { bytes } => {
+        ShardMessage::ReplicaLiveFanout { bytes, end_offset } => {
             // Live-delivery leg ONLY: backlog append + offset advance already
-            // happened synchronously at write time on this same thread
-            // (`record_local_write`) — doing either again here would double-
-            // count. A replica whose channel is FULL is KICKED (task #35):
-            // skipping the record would silently and permanently diverge it.
-            fanout_send_or_kick(replica_txs, &bytes);
+            // happened synchronously at the write's own execution point on
+            // this same thread (`record_local_write` for handler-local
+            // writes, `wal_append_and_fanout` for SPSC-dispatched ones) —
+            // doing either again here would double-count. ALL live replica
+            // sends flow through this single arm so the wire order per shard
+            // equals the self-queue FIFO order equals the offset order — a
+            // direct send from the execute path would let a LATER-offset
+            // cross-shard write overtake an earlier local write's queued
+            // fan-out message, reordering same-key writes on the replica.
+            // A replica whose channel is FULL is KICKED (task #35): skipping
+            // the record would silently and permanently diverge it.
+            fanout_send_or_kick(replica_txs, &bytes, end_offset);
         }
         ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
@@ -3504,20 +3539,29 @@ pub(crate) fn wal_fanout_has_work(
 pub(crate) fn fanout_send_or_kick(
     replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
     bytes: &bytes::Bytes,
+    end_offset: u64,
 ) {
-    replica_txs.retain(|(id, tx, kicked)| match tx.try_send(bytes.clone()) {
-        Ok(()) => true,
-        Err(flume::TrySendError::Full(_)) => {
-            kicked.store(true, std::sync::atomic::Ordering::Release);
-            tracing::warn!(
-                replica_id = id,
-                "replica live fan-out channel FULL — kicking replica to force a \
-                 resync (a skipped record would silently diverge it forever)"
-            );
-            false
+    replica_txs.retain(|r| {
+        // Exactly-once cut: a record at or below the replica's snapshot cut
+        // is already inside its FULLRESYNC body — delivering it live would
+        // double-apply non-idempotent commands (INCR/LPUSH) on the replica.
+        if end_offset <= r.cut {
+            return true;
         }
-        // Drain task already gone; just stop queueing.
-        Err(flume::TrySendError::Disconnected(_)) => false,
+        match r.tx.try_send(bytes.clone()) {
+            Ok(()) => true,
+            Err(flume::TrySendError::Full(_)) => {
+                r.kicked.store(true, std::sync::atomic::Ordering::Release);
+                tracing::warn!(
+                    replica_id = r.replica_id,
+                    "replica live fan-out channel FULL — kicking replica to force a \
+                     resync (a skipped record would silently diverge it forever)"
+                );
+                false
+            }
+            // Drain task already gone; just stop queueing.
+            Err(flume::TrySendError::Disconnected(_)) => false,
+        }
     });
 }
 
@@ -3603,12 +3647,30 @@ pub(crate) fn wal_append_and_fanout(
     // startup — the per-write advance no longer read-locks the RwLock.
     // The SELECT prefix counts too: offset accounting must equal the bytes
     // the replica receives, or WAIT/ACK math diverges.
-    if let Some(offsets) = repl_state {
+    let end_offset = if let Some(offsets) = repl_state {
         let prefix_len = select_prefix.as_ref().map_or(0, |p| p.len());
-        offsets.increment_shard_offset(shard_id, (prefix_len + data.len()) as u64);
-    }
-    // 4. Fan-out to replica sender tasks (non-blocking: a replica whose
-    //    channel is FULL is kicked to resync — see `fanout_send_or_kick`).
+        offsets.increment_shard_offset(shard_id, (prefix_len + data.len()) as u64)
+    } else {
+        // No offset handle — no cut accounting possible; deliver
+        // unconditionally (replicas can't exist without repl_state in
+        // practice, this keeps the degenerate path fail-open).
+        u64::MAX
+    };
+    // 4. Fan-out to replica sender tasks — DEFERRED through the self queue
+    //    (`ReplicaLiveFanout`), never sent directly from here. Two reasons
+    //    (R2 exactly-once redesign, task #20):
+    //    - Ordering: local handler writes already queue their delivery as
+    //      self-queue messages; a direct send here would put this (later-
+    //      offset) record on the wire BEFORE their (earlier-offset) queued
+    //      bytes — the replica would apply same-key writes out of the
+    //      master's order.
+    //    - Registration cut: a replica registration queued behind this
+    //      drain cycle (self-shard PSYNC leg) would miss a direct send
+    //      entirely — the record is past its snapshot body but not in
+    //      `replica_txs` yet: lost, with the offset advanced (permanent
+    //      replica lag). Deferring one cycle guarantees delivery lands
+    //      after the registration; the per-replica `cut` filter keeps it
+    //      exactly-once.
     if !replica_txs.is_empty() {
         let bytes = match &select_prefix {
             Some(prefix) => {
@@ -3619,7 +3681,10 @@ pub(crate) fn wal_append_and_fanout(
             }
             None => bytes::Bytes::copy_from_slice(data),
         };
-        fanout_send_or_kick(replica_txs, &bytes);
+        crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
+            bytes,
+            end_offset,
+        });
     }
     // 5. Per-shard AOF pool (FIX-W1-2): route to the owning shard's writer.
     // Bounded-blocking (`send_append_bounded_blocking`) because this function
@@ -3704,11 +3769,13 @@ mod wal_append_tests {
         let backlog: SharedBacklog =
             std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
         let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<bytes::Bytes>();
-        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = vec![(
-            1u64,
-            tx,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )];
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> =
+            vec![crate::shard::dispatch::ReplicaFanout {
+                replica_id: 1,
+                tx,
+                kicked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cut: 0,
+            }];
 
         wal_append_and_fanout(
             b"hello",

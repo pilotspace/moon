@@ -467,6 +467,220 @@ fn multishard_master_graph_snapshot_all_shards() {
     }
 }
 
+/// Adversarial-review P0 regression (attach-under-write race): a local write
+/// on the ACCEPTING shard that lands between the PSYNC task queueing its
+/// self-shard snapshot leg and the event loop draining it is visible to the
+/// snapshot body (mutation + offset already applied) while its live fan-out
+/// message sits BEHIND the snapshot leg in the same FIFO — so it was
+/// delivered twice (in the RDB and again live), double-applying INCR.
+///
+/// Hammer counters continuously WHILE the replica attaches; every counter
+/// must match the master exactly after convergence. Repeated attaches widen
+/// the race window.
+#[test]
+#[ignore]
+fn multishard_master_attach_under_write_no_double_apply() {
+    let shards = 4;
+    let (master_port, replica_port) = (17081, 17082);
+    let mdir = tempfile::tempdir().expect("mdir");
+    let master = start_moon_shards(master_port, mdir.path().to_str().unwrap(), shards);
+    let mut guard = Guard(vec![master]);
+    let m = format!("127.0.0.1:{}", master_port);
+    await_ready(&m);
+
+    const COUNTERS: usize = 64;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4 {
+        let m = m.clone();
+        let stop = stop.clone();
+        writers.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(&m).expect("connect");
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut buf = String::new();
+                for i in 0..COUNTERS / 4 {
+                    buf.push_str(&format!("INCR cnt:{}\r\n", w * (COUNTERS / 4) + i));
+                }
+                stream.write_all(buf.as_bytes()).unwrap();
+                stream.flush().ok();
+                for _ in 0..COUNTERS / 4 {
+                    read_one_reply(&mut reader);
+                }
+            }
+        }));
+    }
+
+    // Attach (and re-attach) replicas mid-load: each fresh attach runs the
+    // full multi-shard snapshot fan-out while writes race it.
+    let rdir = tempfile::tempdir().expect("rdir");
+    let replica = start_moon_shards(replica_port, rdir.path().to_str().unwrap(), 1);
+    guard.0.push(replica);
+    let r = format!("127.0.0.1:{}", replica_port);
+    await_ready(&r);
+    for _ in 0..5 {
+        assert!(send_cmd(&r, "REPLICAOF NO ONE").starts_with("+OK"));
+        thread::sleep(Duration::from_millis(50));
+        assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
+        assert!(
+            wait_until(Duration::from_secs(15), || send_cmd(&r, "INFO replication")
+                .contains("master_link_status:up")),
+            "replica link did not come up during attach-under-write"
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.join().expect("writer");
+    }
+
+    // Convergence, then exact per-counter parity. A double-applied INCR
+    // shows as replica > master for that counter.
+    let master_vals: Vec<i64> = (0..COUNTERS)
+        .map(|i| {
+            get_in_db(&m, 0, &format!("cnt:{}", i))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-1)
+        })
+        .collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            (0..COUNTERS).all(|i| {
+                get_in_db(&r, 0, &format!("cnt:{}", i)).and_then(|v| v.parse().ok())
+                    == Some(master_vals[i])
+            })
+        }),
+        "replica counters diverged after attach-under-write: {:?}",
+        (0..COUNTERS)
+            .filter_map(|i| {
+                let rv: i64 = get_in_db(&r, 0, &format!("cnt:{}", i))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(-2);
+                (rv != master_vals[i]).then_some((i, master_vals[i], rv))
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+/// R2 exactly-once redesign regression (D2, same-key wire ordering): before
+/// the unified fan-out, a cross-shard (SPSC-dispatched) write was sent to the
+/// replica DIRECTLY from the execute arm while a local handler write's
+/// delivery sat queued as a self-queue message — so a later-offset write
+/// could hit the wire before an earlier-offset write to the SAME key on the
+/// same shard. The replica applied them in arrival order and finished with
+/// the loser: permanent same-key divergence with byte-exact offsets (WAIT
+/// and DBSIZE both look healthy).
+///
+/// Four writers on distinct connections APPEND distinguishable tokens to the
+/// SAME key set while a replica is attached. APPEND is order-sensitive: ONE
+/// reordered pair anywhere in the stream leaves the strings permanently
+/// different ("..ab.." vs "..ba.."), so this catches even a single mid-stream
+/// swap — a SET-based last-write-wins check only sees a race on the very
+/// last pair. Replica must byte-equal the master on every key after quiesce.
+#[test]
+#[ignore]
+fn multishard_master_same_key_write_order_parity() {
+    let shards = 4;
+    let (master_port, replica_port) = (17091, 17092);
+    let mdir = tempfile::tempdir().expect("mdir");
+    let master = start_moon_shards(master_port, mdir.path().to_str().unwrap(), shards);
+    let mut guard = Guard(vec![master]);
+    let m = format!("127.0.0.1:{}", master_port);
+    await_ready(&m);
+
+    let rdir = tempfile::tempdir().expect("rdir");
+    let replica = start_moon_shards(replica_port, rdir.path().to_str().unwrap(), 1);
+    guard.0.push(replica);
+    let r = format!("127.0.0.1:{}", replica_port);
+    await_ready(&r);
+    assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
+    assert!(
+        wait_until(Duration::from_secs(15), || send_cmd(&r, "INFO replication")
+            .contains("master_link_status:up")),
+        "replica link did not come up during ordered-write load"
+    );
+
+    const KEYS: usize = 32;
+    const BURSTS: u64 = 400;
+    let mut writers = Vec::new();
+    // 12 connections: SO_REUSEPORT placement is kernel-hashed, so a handful
+    // of conns can all land on one shard — enough conns makes mixed
+    // local + SPSC traffic per key near-certain.
+    for w in 0..12 {
+        let m = m.clone();
+        writers.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(&m).expect("connect");
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            for seq in 0..BURSTS {
+                let mut buf = String::new();
+                // Every writer APPENDs to every key — same-key races between
+                // connections homed on different shards exercise both the
+                // local and the SPSC-dispatched write path on each shard.
+                for k in 0..KEYS {
+                    let tok = format!("w{}:{};", w, seq);
+                    buf.push_str(&format!(
+                        "*3\r\n$6\r\nAPPEND\r\n${}\r\nokey:{}\r\n${}\r\n{}\r\n",
+                        format!("okey:{}", k).len(),
+                        k,
+                        tok.len(),
+                        tok
+                    ));
+                }
+                stream.write_all(buf.as_bytes()).unwrap();
+                stream.flush().ok();
+                for _ in 0..KEYS {
+                    read_one_reply(&mut reader);
+                }
+            }
+        }));
+    }
+
+    for w in writers {
+        w.join().expect("writer");
+    }
+
+    let master_vals: Vec<String> = (0..KEYS)
+        .map(|k| get_in_db(&m, 0, &format!("okey:{}", k)).unwrap_or_default())
+        .collect();
+    assert!(
+        master_vals.iter().all(|v| !v.is_empty()),
+        "master lost keys?!"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            (0..KEYS).all(|k| {
+                get_in_db(&r, 0, &format!("okey:{}", k)).as_deref() == Some(&master_vals[k])
+            })
+        }),
+        "replica strings diverged (same-key write reorder): {:?}",
+        (0..KEYS)
+            .filter_map(|k| {
+                let rv = get_in_db(&r, 0, &format!("okey:{}", k)).unwrap_or_default();
+                (rv != master_vals[k]).then(|| {
+                    // Print the first divergent window, not multi-KB strings.
+                    let mv = &master_vals[k];
+                    let d = mv
+                        .bytes()
+                        .zip(rv.bytes())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(mv.len().min(rv.len()));
+                    let lo = d.saturating_sub(20);
+                    (
+                        k,
+                        mv.get(lo..(d + 20).min(mv.len())).unwrap_or("").to_string(),
+                        rv.get(lo..(d + 20).min(rv.len())).unwrap_or("").to_string(),
+                        mv.len(),
+                        rv.len(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A multi-shard master must answer ANY resumable PSYNC with +FULLRESYNC (a
 /// single total offset cannot be mapped back onto N per-shard backlogs), and
 /// the payload must be ONE merged RDB bulk.
@@ -525,4 +739,91 @@ fn multishard_master_partial_resync_degrades_to_full() {
     reader.read_exact(&mut magic).expect("rdb magic");
     assert_eq!(&magic, b"REDIS", "merged snapshot must be Redis-format RDB");
     assert!(len > 9, "suspiciously small RDB ({} bytes)", len);
+}
+/// CONTROL: same scenario, single-shard master (R0/R1 path untouched by R2).
+#[test]
+#[ignore]
+fn singleshard_master_attach_under_write_control() {
+    let shards = 1;
+    let (master_port, replica_port) = (17085, 17086);
+    let mdir = tempfile::tempdir().expect("mdir");
+    let master = start_moon_shards(master_port, mdir.path().to_str().unwrap(), shards);
+    let mut guard = Guard(vec![master]);
+    let m = format!("127.0.0.1:{}", master_port);
+    await_ready(&m);
+
+    const COUNTERS: usize = 64;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4 {
+        let m = m.clone();
+        let stop = stop.clone();
+        writers.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(&m).expect("connect");
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut buf = String::new();
+                for i in 0..COUNTERS / 4 {
+                    buf.push_str(&format!("INCR cnt:{}\r\n", w * (COUNTERS / 4) + i));
+                }
+                stream.write_all(buf.as_bytes()).unwrap();
+                stream.flush().ok();
+                for _ in 0..COUNTERS / 4 {
+                    read_one_reply(&mut reader);
+                }
+            }
+        }));
+    }
+
+    // Attach (and re-attach) replicas mid-load: each fresh attach runs the
+    // full multi-shard snapshot fan-out while writes race it.
+    let rdir = tempfile::tempdir().expect("rdir");
+    let replica = start_moon_shards(replica_port, rdir.path().to_str().unwrap(), 1);
+    guard.0.push(replica);
+    let r = format!("127.0.0.1:{}", replica_port);
+    await_ready(&r);
+    for _ in 0..5 {
+        assert!(send_cmd(&r, "REPLICAOF NO ONE").starts_with("+OK"));
+        thread::sleep(Duration::from_millis(50));
+        assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
+        assert!(
+            wait_until(Duration::from_secs(15), || send_cmd(&r, "INFO replication")
+                .contains("master_link_status:up")),
+            "replica link did not come up during attach-under-write"
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.join().expect("writer");
+    }
+
+    // Convergence, then exact per-counter parity. A double-applied INCR
+    // shows as replica > master for that counter.
+    let master_vals: Vec<i64> = (0..COUNTERS)
+        .map(|i| {
+            get_in_db(&m, 0, &format!("cnt:{}", i))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-1)
+        })
+        .collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            (0..COUNTERS).all(|i| {
+                get_in_db(&r, 0, &format!("cnt:{}", i)).and_then(|v| v.parse().ok())
+                    == Some(master_vals[i])
+            })
+        }),
+        "replica counters diverged after attach-under-write: {:?}",
+        (0..COUNTERS)
+            .filter_map(|i| {
+                let rv: i64 = get_in_db(&r, 0, &format!("cnt:{}", i))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(-2);
+                (rv != master_vals[i]).then_some((i, master_vals[i], rv))
+            })
+            .collect::<Vec<_>>()
+    );
 }

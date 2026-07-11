@@ -464,6 +464,11 @@ pub(super) fn try_handle_replicaof(
                         });
                     }
                     let rs_clone = Arc::clone(rs);
+                    // Bump the task generation FIRST: any previously spawned
+                    // replica task (old REPLICAOF target) sees itself
+                    // superseded and exits instead of double-applying the
+                    // stream alongside the new task.
+                    let epoch = crate::replication::replica::bump_replica_task_epoch();
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
                         master_host: host,
                         master_port: port,
@@ -471,12 +476,17 @@ pub(super) fn try_handle_replicaof(
                         num_shards: ctx.num_shards,
                         persistence_dir: None,
                         listening_port: 0,
+                        epoch,
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
                     };
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
                 }
                 ReplicaofAction::PromoteToMaster => {
                     use crate::replication::state::generate_repl_id;
+                    // Kill the running replica task — flipping the role alone
+                    // left it streaming + applying forever (each NO ONE →
+                    // re-attach cycle stacked one more live applier).
+                    let _ = crate::replication::replica::bump_replica_task_epoch();
                     if let Ok(mut rs_guard) = rs.write() {
                         rs_guard.repl_id2 = rs_guard.repl_id.clone();
                         rs_guard.repl_id = generate_repl_id();

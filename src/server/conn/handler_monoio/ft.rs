@@ -76,6 +76,10 @@ pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
 /// ⚠ Monoio shard threads only (pushes to `shard::self_msg`) — callers are
 /// all inside `handler_monoio`, which is `runtime-monoio`-gated.
 pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
+    // Per-shard offset AFTER this record — the fan-out arm compares it
+    // against each replica's snapshot cut (`ReplicaFanout::cut`) so a record
+    // already inside a FULLRESYNC body is never live-delivered again.
+    let mut end_offset = u64::MAX;
     if let Some(rs) = ctx.repl_state.as_ref() {
         if let Ok(g) = rs.read() {
             if let Some(slot) = g.per_shard_backlogs.get(ctx.shard_id) {
@@ -83,10 +87,13 @@ pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
                     backlog.append(&bytes);
                 }
             }
-            g.increment_shard_offset(ctx.shard_id, bytes.len() as u64);
+            end_offset = g.increment_shard_offset(ctx.shard_id, bytes.len() as u64);
         }
     }
-    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout { bytes });
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
+        bytes,
+        end_offset,
+    });
 }
 
 /// Db-aware variant of [`record_local_write`] (HIGH-2, task #22): prepends a

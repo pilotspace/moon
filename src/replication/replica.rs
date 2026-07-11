@@ -18,6 +18,35 @@ use tracing::{info, warn};
 use crate::replication::handshake::ReplicaHandshakeState;
 use crate::replication::state::{ReplicationRole, ReplicationState, save_replication_state};
 
+/// Process-global generation counter for replica tasks (attach-under-write
+/// P0, found while testing R2): `REPLICAOF host port` used to spawn a fresh
+/// `run_replica_task` WITHOUT stopping the previous one, and `REPLICAOF NO
+/// ONE` only flipped the role state — the old task kept its master link open
+/// and kept APPLYING the stream. After a NO-ONE → re-attach cycle, two (then
+/// three, ...) live tasks each applied every record: replica INCR counters
+/// ran ~25-35% ABOVE the master under write load (reproduced at shards=1 and
+/// shards=4 — pre-existing, not an R2 defect).
+///
+/// Every spawn bumps the epoch and hands the task its ticket; `REPLICAOF NO
+/// ONE` bumps it too. A task whose ticket no longer matches exits before its
+/// next connect, before applying a snapshot, and before applying any parsed
+/// chunk — a superseded task can never mutate the keyspace again (its parked
+/// socket read wakes on the next master byte or link close and hits the
+/// pre-apply check).
+static REPLICA_TASK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bump the generation (new REPLICAOF target, or NO ONE) and return the new
+/// ticket to hand to a freshly spawned task.
+pub fn bump_replica_task_epoch() -> u64 {
+    REPLICA_TASK_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// True when `epoch` is no longer the live generation — the owning task must
+/// stop without touching local state.
+fn superseded(epoch: u64) -> bool {
+    REPLICA_TASK_EPOCH.load(Ordering::Acquire) != epoch
+}
+
 /// Configuration for the replica outbound connection task.
 pub struct ReplicaTaskConfig {
     pub master_host: String,
@@ -26,6 +55,9 @@ pub struct ReplicaTaskConfig {
     pub num_shards: usize,
     pub persistence_dir: Option<String>,
     pub listening_port: u16,
+    /// Generation ticket from [`bump_replica_task_epoch`] — the task exits
+    /// as soon as a newer generation exists.
+    pub epoch: u64,
     /// Logical-db context of the replication stream, preserved ACROSS
     /// reconnects (HIGH-2, task #22): a `+CONTINUE` partial resync replays
     /// backlog bytes that only contain `SELECT` at db CHANGES — if the stream
@@ -63,6 +95,10 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     const MAX_BACKOFF_MS: u64 = 30_000;
 
     loop {
+        if superseded(cfg.epoch) {
+            info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
+            return;
+        }
         info!("Replica: connecting to master at {}", addr);
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
@@ -82,6 +118,12 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
                     addr, e, backoff_ms
                 );
             }
+        }
+
+        // A superseded task must not clobber the successor's handshake state.
+        if superseded(cfg.epoch) {
+            info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
+            return;
         }
 
         // Update handshake state to Disconnected in ReplicationState
@@ -220,6 +262,9 @@ async fn run_handshake_and_stream(
         // bulk and we load it into this thread's ShardSlice. `load_snapshot`
         // clears existing state first (full resync = authoritative). Multi-shard
         // replicas (merged-RDB load) are R2.
+        if superseded(cfg.epoch) {
+            anyhow::bail!("replica task superseded before snapshot load");
+        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
             match crate::replication::apply::load_snapshot(&rdb_bytes) {
@@ -323,6 +368,11 @@ async fn stream_commands_read_loop(
         if n == 0 {
             return Err(anyhow::anyhow!("Master closed connection"));
         }
+        // Superseded tasks must never apply another byte — checked after the
+        // parked read wakes, before any parse/apply.
+        if superseded(cfg.epoch) {
+            anyhow::bail!("replica task superseded — dropping stream unapplied");
+        }
 
         // Parse every complete RESP command in the buffer and apply it to the
         // local shard. The replication offset advances by CONSUMED bytes (whole
@@ -380,6 +430,10 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     const MAX_BACKOFF_MS: u64 = 30_000;
 
     loop {
+        if superseded(cfg.epoch) {
+            info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
+            return;
+        }
         info!("Replica: connecting to master at {}", addr);
         match monoio::net::TcpStream::connect(addr).await {
             Ok(stream) => {
@@ -399,6 +453,12 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
                     addr, e, backoff_ms
                 );
             }
+        }
+
+        // A superseded task must not clobber the successor's handshake state.
+        if superseded(cfg.epoch) {
+            info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
+            return;
         }
 
         if let Ok(mut rs) = cfg.repl_state.write() {
@@ -533,6 +593,9 @@ async fn run_handshake_and_stream(
         // R0 = single-shard: the master sends one diskless RDB bulk, loaded into
         // this thread's ShardSlice (clears existing state first — full resync is
         // authoritative). Multi-shard merged-RDB load is R2.
+        if superseded(cfg.epoch) {
+            anyhow::bail!("replica task superseded before snapshot load");
+        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
             match crate::replication::apply::load_snapshot(&rdb_bytes) {
@@ -644,6 +707,12 @@ async fn stream_commands_read_loop(
             return Err(anyhow::anyhow!("Master closed connection"));
         }
         buf.extend_from_slice(&tmp[..n]);
+
+        // Superseded tasks must never apply another byte — checked after the
+        // parked read wakes, before any parse/apply.
+        if superseded(cfg.epoch) {
+            anyhow::bail!("replica task superseded — dropping stream unapplied");
+        }
 
         // Parse every complete RESP command in the buffer and apply it to the
         // local shard. Offset advances by CONSUMED bytes (whole frames), never

@@ -838,6 +838,10 @@ pub async fn handle_connection(
                                         }
                                         ReplicaofAction::PromoteToMaster => {
                                             use crate::replication::state::generate_repl_id;
+                                            // handler_single spawns no replica task itself, but
+                                            // bump the generation anyway so any task spawned by
+                                            // another handler path stops applying.
+                                            let _ = crate::replication::replica::bump_replica_task_epoch();
                                             if let Ok(mut rs_guard) = rs.write() {
                                                 rs_guard.repl_id2 = rs_guard.repl_id.clone();
                                                 rs_guard.repl_id = generate_repl_id();

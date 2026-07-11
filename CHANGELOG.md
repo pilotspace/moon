@@ -52,6 +52,46 @@ shards is not yet supported`.
   shape, `README.md` replication bullets, and `docs/PRODUCTION-CONTRACT.md`
   rows REPL-MULTISHARD-01 + WAIT-01 flipped to ✅ with evidence.
 
+### Fixed — live-fanout exactly-once redesign + replica-task leak (task #20 follow-up)
+
+Attach-under-write stress testing of R2 surfaced three defects; all fixed
+before release (none shipped):
+
+- **`REPLICAOF` leaked the previous replica task — every re-attach stacked
+  one more live applier.** `REPLICAOF host port` spawned a fresh
+  `run_replica_task` without stopping the old one, and `REPLICAOF NO ONE`
+  only flipped the role state: the old task kept its master link open and
+  kept APPLYING the stream. After NO-ONE → re-attach cycles the replica ran
+  INCR counters ~25-35% ABOVE the master (reproduced at shards=1 AND
+  shards=4 — pre-existing, not an R2 defect). Replica tasks now carry a
+  process-global epoch ticket; a new `REPLICAOF` target or `NO ONE` bumps
+  the generation and superseded tasks exit before their next connect,
+  before loading a snapshot, and before applying any parsed chunk.
+- **Snapshot-vs-live exactly-once is now offset-cut based, not
+  FIFO-placement based.** Two adversarial-review rounds found opposite
+  failure modes for placement schemes (a queued self-shard snapshot leg
+  double-delivered local writes; an inline-captured one lost same-cycle
+  cross-shard writes — neither in the body nor live-sent, with the offset
+  advanced: permanent replica lag). Every fan-out entry now records
+  `cut = <shard offset at body capture>` and every live record carries its
+  per-shard `end_offset`; delivery requires `end_offset > cut`, making
+  correctness independent of where the registration lands in the drain
+  FIFO. All shards (including the PSYNC connection's own) use the same
+  `PrepareReplicaSync` arm.
+- **Same-key wire ordering.** Cross-shard (SPSC-dispatched) writes used to
+  send to replicas directly from the execute arm while local handler writes
+  deferred through the self queue — a later-offset write could reach the
+  wire before an earlier-offset write to the same key, replaying same-key
+  writes out of the master's order on the replica (found by analysis; not
+  reproduced in ~10 black-box runs). ALL live replica sends now flow
+  through the self-queue `ReplicaLiveFanout` arm, so per-shard wire order
+  equals offset order by construction.
+- New e2e regressions: `attach_under_write_no_double_apply` (4-shard +
+  single-shard control, 5× detach/re-attach under pipelined INCR load,
+  exact per-counter parity) and `same_key_write_order_parity` (12
+  connections APPEND-race the same 32 keys through both write paths;
+  replica strings must byte-equal the master).
+
 ### Fixed — consistency/durability defects caught by the R1 gates (task #35)
 
 Three pre-existing data-integrity bugs surfaced by the new load/kill-9 gates
