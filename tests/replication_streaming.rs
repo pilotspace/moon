@@ -688,3 +688,78 @@ fn replica_applies_multi_exec_bodies() {
         "MULTI/EXEC INCRs did not replicate exactly once (None=lost, 4=double-applied)"
     );
 }
+
+/// HIGH-2 (task #22 + #23): multi-db writes must land in the SAME logical db
+/// on the replica. The master prepends `SELECT <db>` to the stream whenever
+/// the writing connection's db differs from the stream's current db context;
+/// the replica-side drain already binds subsequent commands to it. Also
+/// exercises #23: reading db 2 on the replica requires SELECT on a replica
+/// connection (previously rejected with READONLY — SELECT is flagged W).
+#[test]
+#[ignore]
+fn replica_applies_multi_db_stream() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16734";
+    let replica_addr = "127.0.0.1:16735";
+
+    let _master = Killer(start_moon(16734, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+    let _replica = Killer(start_moon(16735, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16734");
+
+    // Prove the stream is up in db 0 first.
+    send_cmd(master_addr, "SET d0key d0val");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "d0key").as_deref() == Some("d0val")
+        }),
+        "db-0 live stream not flowing"
+    );
+
+    // #23: SELECT must be served by the read-only replica.
+    let sel = send_cmd(replica_addr, "SELECT 2");
+    assert!(
+        sel.starts_with("+OK"),
+        "SELECT on a read-only replica must succeed, got: {sel}"
+    );
+
+    // Write in db 2, then hop back to db 0 — the stream must carry both
+    // context switches.
+    let r = send_seq(master_addr, &["SELECT 2", "SET d2key d2val"]);
+    assert!(r.starts_with("+OK"), "master db-2 SET failed: {r}");
+    send_cmd(master_addr, "SET d0post after");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "d0post").as_deref() == Some("after")
+        }),
+        "post-hop db-0 sentinel never replicated"
+    );
+    assert_eq!(
+        get_in_db(replica_addr, 2, "d2key").as_deref(),
+        Some("d2val"),
+        "db-2 write did not land in db 2 on the replica"
+    );
+    assert_eq!(
+        get_in_db(replica_addr, 0, "d2key"),
+        None,
+        "db-2 write leaked into db 0 on the replica (SELECT not streamed)"
+    );
+    // The db-0 sentinel must not have leaked into db 2 either.
+    assert_eq!(
+        get_in_db(replica_addr, 2, "d0post"),
+        None,
+        "db-0 write leaked into db 2 on the replica"
+    );
+}

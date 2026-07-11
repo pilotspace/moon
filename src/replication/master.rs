@@ -670,7 +670,21 @@ pub async fn handle_psync_inline_single_shard(
             let snapshot_offset = {
                 let off = repl_state
                     .read()
-                    .map(|g| g.total_offset())
+                    .map(|g| {
+                        // HIGH-2 (task #22): reset the stream's db context in
+                        // the SAME synchronous stretch as the snapshot capture
+                        // — every byte at offset ≥ snapshot_offset then starts
+                        // from "db unknown", so the first post-snapshot write
+                        // re-emits `SELECT <db>` and this replica's drain
+                        // (which starts at db 0 after loading the RDB) can
+                        // never bind a write to the wrong db. Redis's
+                        // `slaveseldb = -1` idiom. Redundant re-SELECTs for
+                        // already-attached replicas are idempotent.
+                        if let Some(slot) = g.stream_db.first() {
+                            slot.store(-1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        g.total_offset()
+                    })
                     .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
                 // Shard 0 is this thread's shard — use the thread-local slice.
                 crate::shard::slice::with_shard(|s| {

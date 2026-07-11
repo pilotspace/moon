@@ -471,6 +471,7 @@ pub(super) fn try_handle_replicaof(
                         num_shards: ctx.num_shards,
                         persistence_dir: None,
                         listening_port: 0,
+                        stream_db: std::sync::atomic::AtomicUsize::new(0),
                     };
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
                 }
@@ -690,6 +691,13 @@ pub(super) fn try_enforce_readonly(
         return false;
     }
     if metadata::is_write(cmd) {
+        // SELECT is flagged W in the metadata table (it routes through the
+        // write dispatch paths) but only mutates CONNECTION state — Redis
+        // serves it on replicas, and a client cannot read a replica's
+        // non-zero dbs without it (task #23).
+        if cmd.eq_ignore_ascii_case(b"SELECT") {
+            return false;
+        }
         // GRAPH.QUERY is blanket-W in the metadata table because Cypher CAN
         // write; a read-only MATCH/RETURN must still be served by a replica.
         // Reuse the token-scan classifier the write dispatch path branches

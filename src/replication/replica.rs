@@ -26,6 +26,16 @@ pub struct ReplicaTaskConfig {
     pub num_shards: usize,
     pub persistence_dir: Option<String>,
     pub listening_port: u16,
+    /// Logical-db context of the replication stream, preserved ACROSS
+    /// reconnects (HIGH-2, task #22): a `+CONTINUE` partial resync replays
+    /// backlog bytes that only contain `SELECT` at db CHANGES — if the stream
+    /// was in db N when the link dropped, the resumed bytes carry no fresh
+    /// SELECT and a 0-reset drain would misapply them to db 0. Seeded into
+    /// `stream_commands`'s drain state on `+CONTINUE`; reset to 0 on
+    /// `+FULLRESYNC` (the master resets its own stream-db at snapshot capture,
+    /// so post-snapshot bytes always re-establish context). In-memory only: a
+    /// replica process restart starts at offset 0 → always FULLRESYNC.
+    pub stream_db: std::sync::atomic::AtomicUsize,
 }
 
 /// Entry point for the outbound replica task.
@@ -235,6 +245,10 @@ async fn run_handshake_and_stream(
                 *state = ReplicaHandshakeState::Streaming;
             }
         }
+        // FULLRESYNC resets the stream's db context: the master reset its own
+        // stream-db in the snapshot-capture stretch, so post-snapshot bytes
+        // always re-establish it with an explicit SELECT (task #22).
+        cfg.stream_db.store(0, Ordering::Relaxed);
         stream_commands(&mut stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
         // Partial resync: stream from current offset
@@ -258,7 +272,10 @@ async fn run_handshake_and_stream(
 #[cfg(feature = "runtime-tokio")]
 async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(65536);
-    let mut selected_db = 0usize;
+    // Seeded from the task-level slot (NOT 0): a +CONTINUE resume must keep
+    // the db context the stream was in when the link dropped — see
+    // `ReplicaTaskConfig::stream_db`.
+    let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
 
     loop {
         let n = stream.read_buf(&mut buf).await?;
@@ -284,6 +301,9 @@ async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> any
                     .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
             }
         }
+        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
+        // in the same logical db (HIGH-2, task #22).
+        cfg.stream_db.store(selected_db, Ordering::Relaxed);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"
@@ -496,6 +516,10 @@ async fn run_handshake_and_stream(
                 *state = ReplicaHandshakeState::Streaming;
             }
         }
+        // FULLRESYNC resets the stream's db context: the master reset its own
+        // stream-db in the snapshot-capture stretch, so post-snapshot bytes
+        // always re-establish it with an explicit SELECT (task #22).
+        cfg.stream_db.store(0, Ordering::Relaxed);
         stream_commands(&mut stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
         if let Ok(mut rs) = cfg.repl_state.write() {
@@ -520,7 +544,10 @@ async fn stream_commands(
     use monoio::io::AsyncReadRent;
 
     let mut buf = BytesMut::with_capacity(65536);
-    let mut selected_db = 0usize;
+    // Seeded from the task-level slot (NOT 0): a +CONTINUE resume must keep
+    // the db context the stream was in when the link dropped — see
+    // `ReplicaTaskConfig::stream_db`.
+    let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
 
     loop {
         let tmp = vec![0u8; 65536];
@@ -549,6 +576,9 @@ async fn stream_commands(
                     .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
             }
         }
+        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
+        // in the same logical db (HIGH-2, task #22).
+        cfg.stream_db.store(selected_db, Ordering::Relaxed);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"

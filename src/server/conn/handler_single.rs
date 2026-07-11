@@ -918,7 +918,11 @@ pub async fn handle_connection(
                                         && !crate::command::graph::is_cypher_write_query(cmd_args);
                                     #[cfg(not(feature = "graph"))]
                                     let graph_ro = false;
-                                    if metadata::is_write(cmd) && !graph_ro {
+                                    // SELECT is flagged W but only mutates
+                                    // CONNECTION state — serve it on replicas
+                                    // (task #23).
+                                    let conn_only = cmd.eq_ignore_ascii_case(b"SELECT");
+                                    if metadata::is_write(cmd) && !graph_ro && !conn_only {
                                         responses.push(Frame::Error(Bytes::from_static(
                                             b"READONLY You can't write against a read only replica.",
                                         )));

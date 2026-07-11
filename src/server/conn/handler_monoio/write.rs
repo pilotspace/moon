@@ -766,7 +766,7 @@ pub(super) async fn try_handle_multi_exec(
                 // Each drain iteration is just a try_send per replica, so the
                 // burst is cheap; revisit only if EXEC bodies grow unbounded.
                 for bytes in &aof_entries {
-                    super::ft::record_local_write(ctx, bytes.clone());
+                    super::ft::record_local_write_db(ctx, conn.selected_db, bytes.clone());
                 }
             }
             // DURABILITY: append every successful write in the body to THIS
@@ -1019,7 +1019,7 @@ pub(super) async fn try_handle_graph_command(
         // keeps mutation + replication record atomic w.r.t. the inline PSYNC
         // task's snapshot capture on this thread.
         for record in &wal_records {
-            super::ft::record_local_write(ctx, record.clone());
+            super::ft::record_local_write_db(ctx, conn.selected_db, record.clone());
         }
     }
     for record in wal_records {

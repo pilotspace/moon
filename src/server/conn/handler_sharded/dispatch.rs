@@ -288,6 +288,7 @@ pub(super) fn try_handle_replicaof(
                         num_shards: ctx.num_shards,
                         persistence_dir: None,
                         listening_port: 0,
+                        stream_db: std::sync::atomic::AtomicUsize::new(0),
                     };
                     tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
                 }
@@ -583,6 +584,11 @@ pub(super) fn try_enforce_readonly(
         return false;
     }
     if metadata::is_write(cmd) {
+        // SELECT is flagged W but only mutates CONNECTION state — Redis
+        // serves it on replicas (task #23, see handler_monoio::dispatch).
+        if cmd.eq_ignore_ascii_case(b"SELECT") {
+            return false;
+        }
         // GRAPH.QUERY is blanket-W (Cypher CAN write); serve read-only
         // MATCH/RETURN on replicas. The classifier never false-negatives
         // for a write query — see handler_monoio::dispatch.
