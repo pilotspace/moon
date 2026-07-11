@@ -24,7 +24,7 @@ use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget_reporting,
 };
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
@@ -96,7 +96,21 @@ fn run_write_eviction_gate(
         ctx.spill_file_id.set(fid);
         res
     } else {
-        try_evict_if_needed_budget(db, &rt, budget)
+        // task #34 (Wave A): plain-drop eviction on the generic per-command
+        // write path (the local-shard leg of any write when disk-offload is
+        // off/unwired) — emit a dual-plane DEL for every victim so an
+        // attached replica and the AOF replay converge with the master's
+        // own eviction decision.
+        try_evict_if_needed_budget_reporting(db, &rt, budget, &mut |key| {
+            crate::replication::reason_del::record_reason_del_conn(
+                &ctx.repl_state,
+                ctx.shard_id,
+                ctx.num_shards,
+                ctx.aof_pool.as_ref(),
+                sel_db,
+                key,
+            );
+        })
     };
     // WS6 fix (HIGH, adversarial review 2026-07-08): a command that can only
     // shrink memory (HDEL, SREM, LPOP, ...) must never be REJECTED by either
@@ -628,12 +642,31 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // CLIENT TRACKING invalidation hook, so ANY tracking client in
             // the process (not just this conn) forces writes through the
             // normal path. One relaxed atomic load; free when tracking is off.
+            //
+            // task #34 (Wave A) fix: `try_inline_dispatch`'s SET fast path
+            // (`server::conn::blocking`) does NOT feed the replication
+            // backlog/fan-out at all — only `record_local_write`/
+            // `record_local_write_db` (the generic dispatch path) do.
+            // Before this gate, a master with `--disk-offload disable` and
+            // an attached replica silently dropped every plain `SET` from
+            // the replication stream (verified: a lone `SET foo bar` never
+            // reached the replica). `!fanout_hint_active()` — the same
+            // cheap, never-cleared-once-true Relaxed load
+            // `handler_monoio::ft::replication_fanout_active` uses as its
+            // first gate — forces plain SET onto the generic dispatch path
+            // for the rest of the process once any replica has ever begun
+            // attaching, matching the existing `ctx.spill_sender.is_none()`
+            // precedent of "fall back to the full path when it must do more
+            // than this fast path knows how to do". GET inlining is
+            // unaffected (`is_get` in `try_inline_dispatch` doesn't check
+            // `can_inline_writes`).
             let can_inline_writes = conn.acl_skip_allowed()
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
                 && !crate::tracking::tracking_active()
                 && !is_replica
-                && ctx.spill_sender.is_none();
+                && ctx.spill_sender.is_none()
+                && !crate::replication::state::fanout_hint_active();
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,

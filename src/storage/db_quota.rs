@@ -240,7 +240,14 @@ pub fn check_db_maxmemory(
         let before = db.estimated_memory();
         // No disk-offload spill integration for db-quota eviction — see the
         // module doc's "Known limitation" note.
-        if !eviction::evict_one_with_spill(db, config, &policy, None) {
+        //
+        // task #34 (Wave A): db-quota plain-drops are NOT wired into
+        // `record_reason_del` yet (a no-op sink here matches pre-#34
+        // behavior exactly) — `--db-maxmemory` is a separate, narrower
+        // knob from the whole-instance `--maxmemory` gates Wave A covers;
+        // tracked as a follow-up alongside the other documented Wave-A gaps
+        // (hash-field TTL reaps, Lua script effects).
+        if !eviction::evict_one_with_spill(db, config, &policy, None, &mut |_| {}) {
             return Err(db_quota_error(db_index, budget));
         }
         let after = db.estimated_memory();

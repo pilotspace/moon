@@ -323,12 +323,31 @@ pub fn try_evict_if_needed_budget(
     config: &RuntimeConfig,
     budget_override: usize,
 ) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill_and_total_budget(
+    try_evict_if_needed_budget_reporting(db, config, budget_override, &mut |_| {})
+}
+
+/// Like [`try_evict_if_needed_budget`], but reports every plain-dropped
+/// (non-spill) victim key to `on_plain_drop` — task #34 (Wave A):
+/// connection-handler-context write-eviction gates (inline SET fast path,
+/// generic per-command write path, SPSC cross-shard write path) use this to
+/// emit a dual-plane DEL record for keys the caller's eviction just deleted
+/// with no cold-tier copy. Callers that don't care (Lua bridge, the tokio
+/// handlers, unit tests) keep calling [`try_evict_if_needed_budget`], which
+/// forwards here with a no-op sink — behavior-identical to before this
+/// parameter existed.
+pub fn try_evict_if_needed_budget_reporting(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    budget_override: usize,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
+) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total_budget_reporting(
         db,
         config,
         None,
         db.estimated_memory(),
         budget_override,
+        on_plain_drop,
     )
 }
 
@@ -371,9 +390,35 @@ pub fn try_evict_if_needed_with_spill_and_total(
 pub fn try_evict_if_needed_with_spill_and_total_budget(
     db: &mut Database,
     config: &RuntimeConfig,
+    spill: Option<&mut SpillContext<'_>>,
+    total_memory: usize,
+    budget_override: usize,
+) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total_budget_reporting(
+        db,
+        config,
+        spill,
+        total_memory,
+        budget_override,
+        &mut |_| {},
+    )
+}
+
+/// Like [`try_evict_if_needed_with_spill_and_total_budget`], but reports
+/// every plain-dropped (non-spill) victim key to `on_plain_drop` — task #34
+/// (Wave A): background-tick callers (active-expiry-adjacent eviction sweep,
+/// memory-pressure-cascade sync-spill fallback) use this to emit a
+/// dual-plane DEL record. `on_plain_drop` fires ONLY when `spill` was `None`
+/// for that victim — a spilled entry stays cold-readable, not deleted, so it
+/// must never be reported here (see `storage::eviction`'s spill-vs-plain-drop
+/// distinction, module docs of `replication::reason_del`).
+pub fn try_evict_if_needed_with_spill_and_total_budget_reporting(
+    db: &mut Database,
+    config: &RuntimeConfig,
     mut spill: Option<&mut SpillContext<'_>>,
     total_memory: usize,
     budget_override: usize,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
@@ -397,7 +442,7 @@ pub fn try_evict_if_needed_with_spill_and_total_budget(
             return Err(oom_error());
         }
         let before = db.estimated_memory();
-        if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut()) {
+        if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut(), on_plain_drop) {
             return Err(oom_error());
         }
         let after = db.estimated_memory();
@@ -599,6 +644,38 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
     budget_override: usize,
     manifest: Option<&mut ShardManifest>,
 ) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total_budget_reporting(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        total_memory,
+        db_index,
+        budget_override,
+        manifest,
+        &mut |_| {},
+    )
+}
+
+/// Like [`try_evict_if_needed_async_spill_with_total_budget`], but reports
+/// every plain-dropped (non-spill) victim key to `on_plain_drop` — task #34
+/// (Wave A). Only the `config.appendonly != "yes"` + no-manifest fallback
+/// branch below ever plain-drops; the durable-batch and async-spill branches
+/// never call `on_plain_drop` (both leave a cold-tier/AOF-recoverable copy).
+#[allow(clippy::too_many_arguments)]
+pub fn try_evict_if_needed_async_spill_with_total_budget_reporting(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    total_memory: usize,
+    db_index: usize,
+    budget_override: usize,
+    manifest: Option<&mut ShardManifest>,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
+) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
     }
@@ -631,7 +708,7 @@ pub fn try_evict_if_needed_async_spill_with_total_budget(
                     return Err(oom_error());
                 }
                 let before = db.estimated_memory();
-                if !evict_one_with_spill(db, config, &policy, None) {
+                if !evict_one_with_spill(db, config, &policy, None, on_plain_drop) {
                     return Err(oom_error());
                 }
                 let after = db.estimated_memory();
@@ -1005,7 +1082,13 @@ pub(crate) fn evict_one_with_spill(
     config: &RuntimeConfig,
     policy: &EvictionPolicy,
     spill: Option<&mut SpillContext<'_>>,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
+    // Captured before `spill` is consumed below — determines whether this
+    // victim (if any) is a true delete (no cold-tier copy, `on_plain_drop`
+    // fires) or a hot→cold tier transition (spill wrote a durable copy
+    // first; the key stays cold-readable, never reported).
+    let is_plain_drop = spill.is_none();
     // Find victim key using policy-specific sampling
     let victim = match policy {
         EvictionPolicy::NoEviction => None,
@@ -1059,6 +1142,9 @@ pub(crate) fn evict_one_with_spill(
 
     db.remove(key.as_bytes());
     crate::admin::metrics_setup::record_eviction();
+    if is_plain_drop {
+        on_plain_drop(key.as_bytes());
+    }
     true
 }
 

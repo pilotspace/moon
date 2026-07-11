@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Wave A part 1: `record_reason_del` dual-plane DEL emission (task #34)
+
+Master-side key removals for a reason OTHER than a client write command
+(active TTL expiry, `--maxmemory` eviction plain-drops) previously reached
+NEITHER the AOF plane nor the replication plane: the key vanished from the
+master's own keyspace, but an attached replica kept serving it forever, and
+a `kill -9` + restart against `--appendonly yes` resurrected it from the AOF
+replay (the AOF never recorded the DEL, only the original SET/write).
+
+- New `replication::reason_del::record_reason_del` (shard-event-loop
+  context, reuses `wal_append_and_fanout` — the same mechanism the
+  `ShardMessage::SwapDb` synthetic-command record already uses) and
+  `record_reason_del_conn` (connection-handler context, mirrors
+  `handler_monoio::ft::record_local_write_db`'s backlog/offset/fan-out
+  mechanics and adds the AOF leg that helper omits). Both emit a real
+  `DEL <key>` RESP record, respecting the fused-`SELECT` multi-db framing
+  every ordinary write already uses.
+- Wired into: active expiry's whole-key sweep (`expire_cycle`), background
+  eviction's plain-drop path (`timers::run_eviction`,
+  `persistence_tick::handle_memory_pressure`'s no-manifest fallback), the
+  inline fast-path SET eviction gate, the generic per-command write-eviction
+  gate, and the SPSC cross-shard write-eviction gate. Every call site is
+  restricted to `spill.is_none()` plain drops — a spilled/cold-tiered key is
+  NOT a delete and must never be reported here.
+- Fixed a related pre-existing gap found while wiring this: with
+  `--disk-offload disable`, `server::conn::blocking::try_inline_dispatch`
+  (the monoio inline SET fast path) fed the AOF but never the replication
+  backlog/fan-out at all — a plain `SET` on such a master silently never
+  reached an attached replica. `can_inline_writes` now also gates on
+  `!replication::state::fanout_hint_active()`, falling back to the generic
+  dispatch path (which replicates correctly) once any replica has ever
+  attached.
+- Known Wave-A-scoped gaps (documented, not silent): hash-field TTL reaps,
+  Lua `redis.call` write effects, per-db quota (`--db-maxmemory`) eviction,
+  and cross-db `COPY ... DB n` destination eviction do not yet emit —
+  tracked as follow-ups.
+
 ### Fixed — test-harness port-flake sweep (task #18)
 
 33 integration suites that spawn a real `moon` process shared a copy-pasted

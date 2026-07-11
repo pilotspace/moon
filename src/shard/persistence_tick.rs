@@ -295,6 +295,14 @@ pub(crate) fn run_eviction_tick(
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
+    // task #34 (Wave A): `record_reason_del` handles for plain-dropped
+    // eviction victims — threaded straight through to `timers::run_eviction`
+    // and `handle_memory_pressure`'s sync-spill-fallback branch.
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
 ) {
     if let Some(spill_t) = spill_thread {
         apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
@@ -375,9 +383,24 @@ pub(crate) fn run_eviction_tick(
             next_file_id,
             wal_v3_writer,
             spill_thread,
+            repl_backlog,
+            replica_txs,
+            repl_state,
+            aof_pool,
+            wal_kv_log,
         );
     } else {
-        super::timers::run_eviction(shard_databases, shard_id, runtime_config);
+        super::timers::run_eviction(
+            shard_databases,
+            shard_id,
+            runtime_config,
+            wal_v3_writer,
+            repl_backlog,
+            replica_txs,
+            repl_state,
+            aof_pool,
+            wal_kv_log,
+        );
     }
 
     // Sync file ID back to the shared Cell so connection handlers see it.
@@ -540,6 +563,7 @@ pub(crate) fn should_run_pressure_cascade(
 ///
 /// Called from eviction timer tick when `disk_offload_enabled` is true and
 /// `should_run_pressure_cascade()` returns true.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_memory_pressure(
     page_cache: &Option<PageCache>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
@@ -550,6 +574,12 @@ pub(crate) fn handle_memory_pressure(
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     spill_thread: Option<&crate::storage::tiered::spill_thread::SpillThread>,
+    // task #34 (Wave A): see `run_eviction_tick`.
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
 ) {
     // Step 1: PageCache eviction -- evict up to 16 cold frames per tick.
     // This is the cheapest operation: no disk I/O, just invalidates cached pages.
@@ -650,7 +680,7 @@ pub(crate) fn handle_memory_pressure(
                     let sender = spill_t.sender();
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
-                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget(
+                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget_reporting(
                                 db,
                                 &rt,
                                 &sender,
@@ -660,6 +690,25 @@ pub(crate) fn handle_memory_pressure(
                                 i,
                                 budget,
                                 shard_manifest.as_mut(),
+                                // task #34 (Wave A): only the no-manifest,
+                                // `--appendonly no` plain-drop fallback
+                                // inside this function ever calls this sink
+                                // (the async-spill and durable-batch
+                                // branches leave a cold/AOF-recoverable
+                                // copy and never invoke it).
+                                &mut |key| {
+                                    crate::replication::reason_del::record_reason_del(
+                                        key,
+                                        i,
+                                        wal_v3,
+                                        repl_backlog,
+                                        replica_txs,
+                                        repl_state,
+                                        shard_id,
+                                        aof_pool,
+                                        wal_kv_log,
+                                    );
+                                },
                             );
                         });
                     }
@@ -675,6 +724,10 @@ pub(crate) fn handle_memory_pressure(
                                     manifest,
                                     next_file_id,
                                 };
+                                // Durable spill (manifest reachable): the
+                                // victim stays cold-readable, never a plain
+                                // drop — must NOT emit (unchanged, no-op-sink
+                                // call).
                                 let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
                                     db,
                                     &rt,
@@ -683,8 +736,23 @@ pub(crate) fn handle_memory_pressure(
                                     budget,
                                 );
                             } else {
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                                // No manifest reachable: this IS the plain
+                                // -drop path (task #34, Wave A) — emit.
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
                                     db, &rt, None, total_mem, budget,
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            i,
+                                            wal_v3,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                        );
+                                    },
                                 );
                             }
                         });

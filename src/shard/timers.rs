@@ -14,11 +14,41 @@ use super::shared_databases::ShardDatabases;
 
 /// Run cooperative active expiry across all databases.
 /// Shard 0 also updates the RSS gauge (once per expiry cycle, ~100ms).
-pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id: usize) {
+///
+/// task #34 (Wave A): the `record_reason_del` handles are threaded through
+/// so every key the sweep actually removes gets a dual-plane (AOF +
+/// replication) `DEL` record — mirrors the `ShardMessage::SwapDb` synthetic
+/// -command pattern via `crate::replication::reason_del::record_reason_del`.
+/// Zero-cost when neither an AOF pool nor a replica/backlog is wired: the
+/// helper's own fast-path checks (`wal_fanout_has_work` inside
+/// `wal_append_and_fanout`) skip the serialization + fan-out entirely.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_active_expiry(
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    wal_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+) {
     let db_count = shard_databases.db_count();
     for i in 0..db_count {
         crate::shard::slice::with_shard_db(i, |db| {
-            crate::server::expiration::expire_cycle_direct(db);
+            crate::server::expiration::expire_cycle_direct(db, &mut |key| {
+                crate::replication::reason_del::record_reason_del(
+                    key,
+                    i,
+                    wal_writer,
+                    repl_backlog,
+                    replica_txs,
+                    repl_state,
+                    shard_id,
+                    aof_pool,
+                    wal_kv_log,
+                );
+            });
         });
     }
     // Update RSS gauge on shard 0 only, once per second (not every 100ms tick).
@@ -37,10 +67,22 @@ pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id:
 }
 
 /// Run background eviction if maxmemory (or a per-db quota) is configured.
+///
+/// task #34 (Wave A): plain-dropped victims (no disk-offload spill in this
+/// path — `--disk-offload disable`, or disk-offload's own budget cascade
+/// handles the spill-capable case elsewhere) get a dual-plane `DEL` record
+/// via the same `record_reason_del` handles `run_active_expiry` uses.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_eviction(
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
+    wal_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
 ) {
     let rt = runtime_config.read();
     if rt.maxmemory > 0 {
@@ -86,8 +128,21 @@ pub(crate) fn run_eviction(
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 let before = db.estimated_memory();
-                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
                     db, &rt, None, remaining, budget,
+                    &mut |key| {
+                        crate::replication::reason_del::record_reason_del(
+                            key,
+                            i,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                            aof_pool,
+                            wal_kv_log,
+                        );
+                    },
                 );
                 let freed = before.saturating_sub(db.estimated_memory());
                 remaining = remaining.saturating_sub(freed);
@@ -472,6 +527,28 @@ mod tests {
     use bytes::Bytes;
     use std::sync::atomic::Ordering;
 
+    /// No-replica/no-AOF `record_reason_del` handles for `run_eviction`
+    /// unit tests below — these tests exercise the eviction budget math
+    /// only, not task #34's dual-plane emission (covered end-to-end by
+    /// `tests/replication_planes.rs`).
+    struct NoOpReasonDelHandles {
+        wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+        repl_backlog: crate::replication::backlog::SharedBacklog,
+        replica_txs: Vec<crate::shard::dispatch::ReplicaFanout>,
+        repl_state: Option<crate::replication::state::OffsetHandle>,
+    }
+
+    impl NoOpReasonDelHandles {
+        fn new() -> Self {
+            Self {
+                wal_writer: None,
+                repl_backlog: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                replica_txs: Vec::new(),
+                repl_state: None,
+            }
+        }
+    }
+
     /// A3 review fix (CRITICAL, both adversarial reviews): the shard-wide
     /// vector term must gate an AGGREGATE check (Σ all dbs' KV + vector),
     /// not be re-added to every logical db's independent check. The per-db
@@ -518,7 +595,18 @@ mod tests {
         shared.store_memory_per_shard[0]
             .vector
             .store(700 * 1024, Ordering::Relaxed);
-        run_eviction(&shared, 0, &runtime_config);
+        let mut h = NoOpReasonDelHandles::new();
+        run_eviction(
+            &shared,
+            0,
+            &runtime_config,
+            &mut h.wal_writer,
+            &h.repl_backlog,
+            &mut h.replica_txs,
+            &h.repl_state,
+            None,
+            false,
+        );
 
         let len0 = crate::shard::slice::with_shard_db(0, |db| db.len());
         let len1 = crate::shard::slice::with_shard_db(1, |db| db.len());
@@ -569,7 +657,18 @@ mod tests {
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
 
         // KV alone (~tens of KB) is far under the 1 MiB budget: no eviction.
-        run_eviction(&shared, 0, &runtime_config);
+        let mut h = NoOpReasonDelHandles::new();
+        run_eviction(
+            &shared,
+            0,
+            &runtime_config,
+            &mut h.wal_writer,
+            &h.repl_backlog,
+            &mut h.replica_txs,
+            &h.repl_state,
+            None,
+            false,
+        );
         let before = crate::shard::slice::with_shard_db(0, |db| db.len());
         assert_eq!(before, 100, "KV under budget must not evict");
 
@@ -578,7 +677,17 @@ mod tests {
         shared.store_memory_per_shard[0]
             .vector
             .store(2 * 1024 * 1024, Ordering::Relaxed);
-        run_eviction(&shared, 0, &runtime_config);
+        run_eviction(
+            &shared,
+            0,
+            &runtime_config,
+            &mut h.wal_writer,
+            &h.repl_backlog,
+            &mut h.replica_txs,
+            &h.repl_state,
+            None,
+            false,
+        );
         let after = crate::shard::slice::with_shard_db(0, |db| db.len());
         assert!(
             after < before,

@@ -28,7 +28,12 @@ pub async fn run_active_expiration(db: SharedDatabases, shutdown: CancellationTo
             _ = interval.tick() => {
                 for lock in db.iter() {
                     let mut guard = lock.write();
-                    expire_cycle(&mut *guard);
+                    // task #34 (Wave A): tokio's active-expiry sweep does not
+                    // emit `record_reason_del` — master-side PSYNC is
+                    // monoio-only (CLAUDE.md), so a tokio-runtime process is
+                    // never a replication master; a no-op sink preserves
+                    // today's behavior exactly.
+                    expire_cycle(&mut guard, &mut |_| {});
                 }
             }
             _ = shutdown.cancelled() => {
@@ -43,7 +48,17 @@ pub async fn run_active_expiration(db: SharedDatabases, shutdown: CancellationTo
 ///
 /// Shards call this directly on their owned databases without going through
 /// the `SharedDatabases` wrapper (no Arc/RwLock needed in shared-nothing mode).
-pub fn expire_cycle_direct(db: &mut Database) {
+///
+/// `on_removed` fires once per whole-key removal from the probabilistic
+/// sweep (sweep 1) — task #34 (Wave A): the shard event loop's
+/// `run_active_expiry` uses this to emit a dual-plane `DEL` record for every
+/// key the sweep actually deletes, so an attached replica and the AOF replay
+/// both observe the master's own expiry decision instead of racing their own
+/// independent TTL sweeps. Hash-field TTL reaps (sweep 2) deliberately do
+/// NOT fire `on_removed` in Wave A — see the RFC's accepted-gap note
+/// (replicas run the identical reaper against the identical TTLs, a bounded
+/// divergence documented in CHANGELOG rather than wired up here).
+pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     // Fast path: if the DB-level flag latches "no expiring keys", skip the
     // O(N) `keys_with_expiry()` scan entirely. Discovered by flamegraph:
     // with 100K TTL-less keys, the per-tick scan was consuming ~26% of
@@ -53,7 +68,7 @@ pub fn expire_cycle_direct(db: &mut Database) {
     if !db.maybe_has_expiring_keys() {
         return;
     }
-    expire_cycle(db);
+    expire_cycle(db, on_removed);
 }
 
 /// Run one probabilistic expiration cycle on a single database.
@@ -71,7 +86,7 @@ pub fn expire_cycle_direct(db: &mut Database) {
 /// `maybe_has_expiring_keys` is cleared only when **both** sweeps return
 /// empty, so a database with hash-field TTLs but no whole-key TTLs is not
 /// incorrectly short-circuited on the next tick.
-fn expire_cycle(db: &mut Database) {
+fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     let start = Instant::now();
     let budget = Duration::from_millis(1);
     let mut rng = rand::rng();
@@ -90,6 +105,7 @@ fn expire_cycle(db: &mut Database) {
         for key in &sampled {
             if db.is_key_expired(key.as_bytes()) {
                 db.remove(key.as_bytes());
+                on_removed(key.as_bytes());
                 expired_count += 1;
             }
         }
@@ -158,7 +174,7 @@ mod tests {
             db.set(key, Entry::new_string(Bytes::from_static(b"v")));
         }
 
-        expire_cycle(&mut db);
+        expire_cycle(&mut db, &mut |_| {});
 
         // All expired keys should be removed
         for i in 0..10 {
@@ -190,7 +206,7 @@ mod tests {
         db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
         db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
 
-        expire_cycle(&mut db);
+        expire_cycle(&mut db, &mut |_| {});
 
         // Nothing should change
         assert_eq!(db.len(), 2);
@@ -199,7 +215,7 @@ mod tests {
     #[test]
     fn test_expire_cycle_empty_db() {
         let mut db = Database::new();
-        expire_cycle(&mut db);
+        expire_cycle(&mut db, &mut |_| {});
         assert_eq!(db.len(), 0);
     }
 
@@ -242,7 +258,7 @@ mod tests {
 
         // The hash key still exists; "f" is expired, "g" is live.
         assert_eq!(db.len(), 1);
-        expire_cycle(&mut db);
+        expire_cycle(&mut db, &mut |_| {});
 
         // Key must still exist (g is alive).
         assert_eq!(db.len(), 1);
@@ -257,7 +273,7 @@ mod tests {
         let mut db = Database::new();
         seed_hash_with_expired_field(&mut db, b"h", &[(b"f", b"v")], b"f");
 
-        expire_cycle(&mut db);
+        expire_cycle(&mut db, &mut |_| {});
 
         // Key must be entirely removed.
         assert_eq!(db.len(), 0);

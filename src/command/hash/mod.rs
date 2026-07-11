@@ -1093,7 +1093,7 @@ mod tests {
         let exp = db.now_ms() + 1_000;
         expire_field_at(&mut db, b"h", b"f", exp);
         db.set_cached_now_ms_for_test(exp + 1);
-        expire_cycle_direct(&mut db);
+        expire_cycle_direct(&mut db, &mut |_| {});
         assert_eq!(hget(&mut db, &make_args(&[b"h", b"f"])), Frame::Null);
         assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(1));
         assert_eq!(
@@ -1110,7 +1110,7 @@ mod tests {
         let exp = db.now_ms() + 1_000;
         expire_field_at(&mut db, b"h", b"f", exp);
         db.set_cached_now_ms_for_test(exp + 1);
-        expire_cycle_direct(&mut db);
+        expire_cycle_direct(&mut db, &mut |_| {});
         // After reaping the only TTL'd field, encoding must downgrade to plain Hash.
         // HEXPIRE XX on the surviving field must return -2 (no TTL).
         let r = hexpire(
@@ -1128,7 +1128,7 @@ mod tests {
         let exp = db.now_ms() + 1_000;
         expire_field_at(&mut db, b"h", b"f", exp);
         db.set_cached_now_ms_for_test(exp + 1);
-        expire_cycle_direct(&mut db);
+        expire_cycle_direct(&mut db, &mut |_| {});
         assert_eq!(
             hgetall(&mut db, &make_args(&[b"h"])),
             Frame::Array(framevec![])
