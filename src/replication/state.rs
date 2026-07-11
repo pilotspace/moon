@@ -45,6 +45,15 @@ pub struct ReplicationState {
     /// startup via [`set_backlog_capacity`](Self::set_backlog_capacity); never
     /// resizes already-allocated backlogs.
     pub backlog_capacity: usize,
+    /// Per-shard logical-db context of the replication byte stream (HIGH-2,
+    /// task #22): the db of the LAST data command recorded into the shard's
+    /// backlog, or `-1` = unknown. `record_local_write_db` prepends a
+    /// `SELECT <db>` record whenever the writing connection's db differs, so
+    /// a replica's drain binds each command to the master's db. Reset to `-1`
+    /// in the SAME synchronous stretch as every FULLRESYNC snapshot capture —
+    /// the first post-snapshot write then re-establishes the context for the
+    /// freshly-attached replica (Redis's `slaveseldb = -1` idiom).
+    pub stream_db: Vec<std::sync::atomic::AtomicI64>,
 }
 
 pub enum ReplicationRole {
@@ -81,6 +90,9 @@ impl ReplicationState {
                 .collect(),
             is_replica_mirror: Arc::new(AtomicBool::new(false)),
             backlog_capacity: DEFAULT_REPL_BACKLOG_SIZE,
+            stream_db: (0..num_shards)
+                .map(|_| std::sync::atomic::AtomicI64::new(-1))
+                .collect(),
         }
     }
 

@@ -1337,7 +1337,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
                             let lsn = if repl_active {
-                                ft::record_local_write(ctx, serialized.clone());
+                                ft::record_local_write_db(
+                                    ctx,
+                                    conn.selected_db,
+                                    serialized.clone(),
+                                );
                                 0
                             } else {
                                 aof::AofWriterPool::issue_append_lsn(
@@ -1416,7 +1420,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             if repl_active || ctx.aof_pool.is_some() {
                                 let serialized = aof::serialize_command(&frame);
                                 let lsn = if repl_active {
-                                    ft::record_local_write(ctx, serialized.clone());
+                                    ft::record_local_write_db(
+                                        ctx,
+                                        conn.selected_db,
+                                        serialized.clone(),
+                                    );
                                     0
                                 } else {
                                     aof::AofWriterPool::issue_append_lsn(
@@ -1719,7 +1727,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
                             let lsn = if repl_active {
-                                ft::record_local_write(ctx, serialized.clone());
+                                ft::record_local_write_db(
+                                    ctx,
+                                    conn.selected_db,
+                                    serialized.clone(),
+                                );
                                 0
                             } else {
                                 aof::AofWriterPool::issue_append_lsn(

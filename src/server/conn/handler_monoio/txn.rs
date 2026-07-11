@@ -355,6 +355,11 @@ pub(super) async fn try_handle_temporal_invalidate(
                                 entity_id,
                                 wall_ms,
                             );
+                            // Db-agnostic record (the replica routes it before
+                            // db resolution) — the primitive leaves the
+                            // stream's SELECT context untouched, which stays
+                            // truthful: this record neither needs nor changes
+                            // the db context.
                             super::ft::record_local_write(ctx, Bytes::from(record));
                         }
                         for record in wal_records {

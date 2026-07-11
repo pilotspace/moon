@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — multi-db replication: master streams `SELECT`, replicas serve it (HIGH-2)
+
+- **Writes outside db 0 landed in db 0 on the replica**: the replica-side
+  drain already understood in-stream `SELECT` context, but the master never
+  emitted it — every replicated command applied to the replica's db 0
+  regardless of the db it executed in on the master. `record_local_write_db`
+  now prepends a `SELECT <db>` record whenever the writing connection's db
+  differs from the stream's per-shard db context (`ReplicationState::
+  stream_db`); the context is reset in the same synchronous stretch as every
+  FULLRESYNC snapshot capture (Redis's `slaveseldb = -1` idiom), so a fresh
+  replica always sees an explicit context before its first non-0-db write.
+- **`+CONTINUE` keeps the db context across reconnects**: resumed backlog
+  bytes only carry `SELECT` at db CHANGES, so the replica now preserves its
+  drain-side db in `ReplicaTaskConfig::stream_db` across link drops (reset to
+  0 on FULLRESYNC). In-memory only — a replica process restart starts at
+  offset 0 and always full-resyncs.
+- **`SELECT` was rejected on read-only replicas** (task #23): flagged W in
+  the metadata table, so the READONLY guard blocked it — a client could
+  never read a replica's non-zero dbs. All three dispatch paths now serve
+  SELECT on replicas (connection-state only, Redis parity).
+
 ### Fixed — replication round-2 hardening: TEMPORAL.INVALIDATE, replay liveness, blob endpoint checks
 
 - **TEMPORAL.INVALIDATE never replicated** (round-2 finding B): the handler

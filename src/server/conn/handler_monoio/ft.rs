@@ -89,6 +89,52 @@ pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout { bytes });
 }
 
+/// Db-aware variant of [`record_local_write`] (HIGH-2, task #22): prepends a
+/// `SELECT <db>` record whenever the writing connection's logical db differs
+/// from the stream's current db context (`ReplicationState::stream_db`), so a
+/// replica's drain binds this command to the SAME db the master executed it
+/// in. Both records go through `record_local_write` — backlog append + offset
+/// advance stay synchronous with the mutation, and the SELECT is delivered in
+/// order ahead of the payload on the same self-queue.
+///
+/// GRAPH.\* / TEMPORAL.\* records are db-agnostic on the replica (routed
+/// before db resolution) but still use this variant: the uniform invariant is
+/// "stream db context == the writing connection's selected db", so a
+/// db-agnostic record can never silently strand a stale context for the next
+/// KV write.
+pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: Bytes) {
+    let needs_select = ctx.repl_state.as_ref().is_some_and(|rs| {
+        rs.read().is_ok_and(|g| {
+            g.stream_db.get(ctx.shard_id).is_some_and(|slot| {
+                if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
+                    slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            })
+        })
+    });
+    if needs_select {
+        record_local_write(ctx, Bytes::from(serialize_select(db)));
+    }
+    record_local_write(ctx, bytes);
+}
+
+/// RESP-serialize `SELECT <db>` for the replication stream.
+fn serialize_select(db: usize) -> Vec<u8> {
+    let mut n = itoa::Buffer::new();
+    let db_str = n.format(db);
+    let mut ln = itoa::Buffer::new();
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$");
+    buf.extend_from_slice(ln.format(db_str.len()).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(db_str.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf
+}
+
 /// Fail-loud marker for planes NOT yet wired into replication (round-2
 /// finding A): WS.* and MQ.* writes persist durably on the master but never
 /// reach a replica — deterministic record forms + replica apply arms are the
@@ -872,7 +918,7 @@ pub(super) async fn try_handle_ft_command(
             && replication_fanout_active(ctx)
         {
             let serialized = crate::persistence::aof::serialize_command(frame);
-            record_local_write(ctx, serialized);
+            record_local_write_db(ctx, conn.selected_db, serialized);
         }
         let mut response = response;
         if let Some(ws_id) = conn.workspace_id.as_ref() {
