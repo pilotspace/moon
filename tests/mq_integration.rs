@@ -42,6 +42,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         bind: "127.0.0.1".to_string(),
         port,
         tcp_backlog: 1024,
+        repl_backlog_size: 1024 * 1024,
         databases: 16,
         requirepass: None,
         db_maxmemory: Vec::new(),
