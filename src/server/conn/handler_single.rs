@@ -52,14 +52,15 @@ use crate::server::codec::RespCodec;
 ///   tests pass any `Sink<Frame>` mock.
 /// - `responses` — per-command response slots; fsync failures patch the
 ///   corresponding slot to `Frame::Error`.
-/// - `aof_entries` — `(resp_idx, bytes)`: bytes to fsync, slot to patch on failure.
+/// - `aof_entries` — `(resp_idx, db, bytes)`: bytes to fsync (executed in `db`),
+///   slot to patch on failure.
 /// - `pool` — AOF writer pool (caller must ensure Always policy).
 /// - `repl_state` — replication state for LSN issuance (`&None` in tests).
 /// - `change_counter` — auto-save dirty counter (`&None` if not configured).
 pub(crate) async fn flush_with_aof_ack<S>(
     sink: &mut S,
     mut responses: Vec<Frame>,
-    aof_entries: Vec<(usize, Bytes)>,
+    aof_entries: Vec<(usize, usize, Bytes)>,
     pool: &crate::persistence::aof::AofWriterPool,
     repl_state: &Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
     change_counter: &Option<Arc<AtomicU64>>,
@@ -73,10 +74,10 @@ where
     // resolve_local_leg_barrier. On barrier failure every enqueued write in
     // the batch is unconfirmed, so every joined slot is patched.
     let mut barrier_idxs: Vec<usize> = Vec::new();
-    for (resp_idx, bytes) in aof_entries {
+    for (resp_idx, db, bytes) in aof_entries {
         let lsn =
             crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
-        match pool.send_append_group(0, lsn, bytes).await {
+        match pool.send_append_group(0, lsn, db, bytes).await {
             Ok(true) => barrier_idxs.push(resp_idx),
             Ok(false) => {}
             Err(_) => {
@@ -427,10 +428,13 @@ pub async fn handle_connection(
                 // Phase 1: Handle connection-level intercepts, collect dispatchable frames
                 // Phase 2: Acquire ONE write lock, execute ALL dispatchable frames
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
-                // Each entry carries (resp_idx, bytes) so the Always-policy flush path
-                // can patch responses[resp_idx] with WRITEFAIL when fsync fails,
+                // Each entry carries (resp_idx, db, bytes) so the Always-policy flush
+                // path can patch responses[resp_idx] with WRITEFAIL when fsync fails,
                 // before any response is sent to the client (H1 fix — FIX-W1-1).
-                let mut aof_entries: Vec<(usize, Bytes)> = Vec::new();
+                // task #35: `db` is the connection's selected db at the moment this
+                // entry was recorded (only SELECT changes it, and SELECT itself is
+                // never persisted, so it is stable for every persisted entry).
+                let mut aof_entries: Vec<(usize, usize, Bytes)> = Vec::new();
                 let mut should_quit = false;
                 let mut break_outer = false;
 
@@ -776,7 +780,11 @@ pub async fn handle_connection(
                                                 );
                                             // Single-shard mode — shard_id = 0.
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
-                                            pool.try_send_append_durable(0, lsn, serialized)
+                                            // task #35: SWAPDB affects both `a` and
+                                            // `b` — no single db context applies;
+                                            // pass 0 (writer may emit a harmless
+                                            // redundant SELECT 0).
+                                            pool.try_send_append_durable(0, lsn, 0, serialized)
                                                 .await
                                                 .is_ok()
                                         } else {
@@ -1006,7 +1014,7 @@ pub async fn handle_connection(
                                         if !matches!(&response, Frame::Error(_)) {
                                             // Carry resp_idx so the Always-policy flush can
                                             // patch responses[resp_idx] on fsync failure.
-                                            aof_entries.push((resp_idx, bytes));
+                                            aof_entries.push((resp_idx, conn.selected_db, bytes));
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
@@ -1037,16 +1045,16 @@ pub async fn handle_connection(
                             // fire-and-forget (returns Ok immediately) so no latency
                             // penalty.
                             //
-                            // Note: aof_entries carries (resp_idx, bytes) from FIX-W1-1
-                            // — resp_idx is unused here because the all-or-nothing
-                            // failure mode discards the entire response buffer; future
-                            // per-slot patching could use it.
+                            // Note: aof_entries carries (resp_idx, db, bytes) from
+                            // FIX-W1-1 — resp_idx is unused here because the
+                            // all-or-nothing failure mode discards the entire response
+                            // buffer; future per-slot patching could use it.
                             let mut aof_write_failed = false;
                             let mut aof_barrier_needed = false;
-                            for (_resp_idx, bytes) in aof_entries.drain(..) {
+                            for (_resp_idx, entry_db, bytes) in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    match pool.send_append_group(0, lsn, bytes).await {
+                                    match pool.send_append_group(0, lsn, entry_db, bytes).await {
                                         Ok(true) => aof_barrier_needed = true,
                                         Ok(false) => {}
                                         Err(_) => aof_write_failed = true,
@@ -1243,6 +1251,15 @@ pub async fn handle_connection(
                             } else {
                                 conn.in_multi = false;
                                 let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                                // PR #282 review: `execute_transaction` holds
+                                // ONE guard on the db selected at EXEC time —
+                                // every body write physically lands there,
+                                // even when a queued SELECT mutates
+                                // `conn.selected_db` mid-body. Capture the
+                                // guard's db NOW; attributing entries to the
+                                // post-EXEC `conn.selected_db` would mis-place
+                                // them on recovery.
+                                let txn_db = conn.selected_db;
                                 let (mut result, txn_aof_entries) = execute_transaction(
                                     &db,
                                     &conn.command_queue,
@@ -1380,8 +1397,15 @@ pub async fn handle_connection(
                                 // any command's fsync fails.
                                 let exec_resp_idx = responses.len();
                                 responses.push(result);
+                                // task #35 + PR #282 review: the whole body
+                                // ran against the guard taken on `txn_db`
+                                // (captured before EXEC) — NOT the possibly
+                                // SELECT-mutated post-EXEC `conn.selected_db`.
+                                // A queued SELECT itself is never persisted.
                                 aof_entries.extend(
-                                    txn_aof_entries.into_iter().map(|b| (exec_resp_idx, b)),
+                                    txn_aof_entries
+                                        .into_iter()
+                                        .map(|b| (exec_resp_idx, txn_db, b)),
                                 );
                             }
                             continue;
@@ -1768,7 +1792,10 @@ pub async fn handle_connection(
                                             // everysec/no.
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                            match pool.send_append_group(0, lsn, bytes).await {
+                                            match pool
+                                                .send_append_group(0, lsn, conn.selected_db, bytes)
+                                                .await
+                                            {
                                                 Ok(true) => graph_barrier_needed = true,
                                                 Ok(false) => {}
                                                 Err(_) => graph_aof_failed = true,
@@ -1801,8 +1828,10 @@ pub async fn handle_connection(
 
                             let is_write = metadata::is_write(cmd);
 
-                            // Serialize for AOF before dispatch
-                            let aof_bytes = if is_write && aof_pool.is_some() {
+                            // Serialize for AOF before dispatch.
+                            // `is_persisted_write`: never AOF a literal client
+                            // SELECT (task #35 — poisons the stream db context).
+                            let aof_bytes = if metadata::is_persisted_write(cmd) && aof_pool.is_some() {
                                 let mut buf = BytesMut::new();
                                 crate::protocol::serialize::serialize(&frame, &mut buf);
                                 Some(buf.freeze())
@@ -2417,7 +2446,11 @@ pub async fn handle_connection(
                                     };
                                     if matches!(response, Frame::Integer(1)) {
                                         if let Some(bytes) = &aof_bytes {
-                                            aof_entries.push((resp_idx, bytes.clone()));
+                                            // task #35: MOVE persists against its
+                                            // SOURCE db (src_db == conn.selected_db;
+                                            // MOVE never changes the connection's
+                                            // selected db).
+                                            aof_entries.push((resp_idx, src_db, bytes.clone()));
                                         }
                                     }
                                     responses[resp_idx] = response;
@@ -2446,7 +2479,9 @@ pub async fn handle_connection(
                                         };
                                         if matches!(response, Frame::Integer(1)) {
                                             if let Some(bytes) = &aof_bytes {
-                                                aof_entries.push((resp_idx, bytes.clone()));
+                                                // task #35: COPY ... DB n persists
+                                                // against its SOURCE db, same as MOVE.
+                                                aof_entries.push((resp_idx, src_db, bytes.clone()));
                                             }
                                         }
                                         responses[resp_idx] = response;
@@ -2571,7 +2606,7 @@ pub async fn handle_connection(
                                         );
                                     }
                                     if let Some(bytes) = aof_bytes {
-                                        aof_entries.push((resp_idx, bytes.clone()));
+                                        aof_entries.push((resp_idx, conn.selected_db, bytes.clone()));
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed
@@ -2625,10 +2660,10 @@ pub async fn handle_connection(
                             break;
                         }
                     }
-                    for (_, bytes) in aof_entries {
+                    for (_, entry_db, bytes) in aof_entries {
                         if let Some(ref pool) = aof_pool {
                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                            let _ = pool.try_send_append_durable(0, lsn, bytes).await;
+                            let _ = pool.try_send_append_durable(0, lsn, entry_db, bytes).await;
                         }
                         if let Some(ref counter) = change_counter {
                             counter.fetch_add(1, Ordering::Relaxed);
@@ -2773,7 +2808,7 @@ mod tests {
         let start = Instant::now();
 
         let responses = vec![Frame::SimpleString(bytes::Bytes::from_static(b"OK"))];
-        let aof_entries = vec![(0usize, bytes::Bytes::from_static(b"SET k v\r\n"))];
+        let aof_entries = vec![(0usize, 0usize, bytes::Bytes::from_static(b"SET k v\r\n"))];
         let mut sink = RecordingSink::new();
 
         let broke = flush_with_aof_ack(

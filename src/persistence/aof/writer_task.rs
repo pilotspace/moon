@@ -181,6 +181,7 @@ mod poll_recv_tests {
         assert!(
             tx.try_send(AofMessage::Append {
                 lsn: 7,
+                db: 0,
                 bytes: bytes::Bytes::from_static(b"x"),
             })
             .is_ok()
@@ -202,6 +203,7 @@ mod poll_recv_tests {
             assert!(
                 tx.try_send(AofMessage::Append {
                     lsn: 1,
+                    db: 0,
                     bytes: bytes::Bytes::from_static(b"y"),
                 })
                 .is_ok()
@@ -396,6 +398,11 @@ pub async fn aof_writer_task(
     // state survives across iterations.
     #[cfg(feature = "runtime-tokio")]
     let mut idle_wait = IdleWait::new();
+    // task #35: AOF db-aware writer — see the monoio TopLevel loop above for
+    // the full rationale. Resets to 0 on every successful rewrite (fresh
+    // file: replay starts a segment at db 0).
+    #[cfg(feature = "runtime-tokio")]
+    let mut last_db: usize = 0;
 
     // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
     //
@@ -495,6 +502,12 @@ pub async fn aof_writer_task(
         // The bounded recv + end-of-loop proactive fsync below restore the
         // ~1s EverySec bound exactly like the PerShard writers.
         let mut idle_wait = IdleWait::new();
+        // task #35: AOF db-aware writer. Tracks the db the last-written
+        // record executed in; a non-empty record whose db differs gets a
+        // `SELECT <db>` record injected first (see `inject_select_records`).
+        // Resets to 0 whenever a NEW incr/base file becomes the append
+        // target (fresh manifest segment — replay starts each incr at db 0).
+        let mut last_db: usize = 0;
 
         loop {
             // Group commit: wait (bounded) for one message, then
@@ -536,6 +549,10 @@ pub async fn aof_writer_task(
                     AOF_GROUP_COMMIT_MAX_BATCH,
                     AOF_GROUP_COMMIT_MAX_BYTES,
                 );
+                // task #35: inject SELECT <db> records ahead of any db switch
+                // before committing — rides the same write path as any other
+                // record (raw bytes on this TopLevel format).
+                batch.data = inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
 
                 // -- commit the data batch (one fsync under Always; deadline under everysec) --
                 if !batch.data.is_empty() {
@@ -591,7 +608,7 @@ pub async fn aof_writer_task(
                                 error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
                             }
                         }
-                        match do_rewrite_single(&db, &mut manifest, &mut file, &rx) {
+                        match do_rewrite_single(&db, &mut manifest, &mut file, &rx, &mut last_db) {
                             Ok(()) => {
                                 write_error = false; // Reset on successful rewrite
                             }
@@ -617,6 +634,7 @@ pub async fn aof_writer_task(
                             &mut file,
                             &rx,
                             fold_channels.as_ref(),
+                            &mut last_db,
                         ) {
                             Ok(()) => {
                                 write_error = false;
@@ -721,6 +739,11 @@ pub async fn aof_writer_task(
                         AOF_GROUP_COMMIT_MAX_BATCH,
                         AOF_GROUP_COMMIT_MAX_BYTES,
                     );
+                    // task #35: inject SELECT <db> records ahead of any db
+                    // switch before committing (see the monoio TopLevel loop
+                    // above).
+                    batch.data =
+                        inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
 
                     // -- write the data batch inline (async), then ONE fsync --
                     if !batch.data.is_empty() {
@@ -803,7 +826,13 @@ pub async fn aof_writer_task(
                             match rewrite_aof(db, &aof_path).await {
                                 // Rewrite replaced the file with a clean one — the
                                 // torn-write latch resets (mirrors monoio TopLevel).
-                                Ok(()) => write_error = false,
+                                // task #35: fresh file — replay starts at db 0. On
+                                // Err the old file is untouched, so last_db stays
+                                // whatever it already was.
+                                Ok(()) => {
+                                    write_error = false;
+                                    last_db = 0;
+                                }
                                 Err(e) => error!("AOF rewrite failed: {}", e),
                             }
                             crate::command::persistence::AOF_REWRITE_IN_PROGRESS
@@ -851,6 +880,7 @@ pub async fn aof_writer_task(
                                 &rx,
                                 &mut sf,
                                 fold_channels.as_ref(),
+                                &mut last_db,
                             ) {
                                 // Fold rewrote aof_path clean — the latch resets.
                                 Ok(()) => write_error = false,
@@ -1062,6 +1092,9 @@ pub async fn per_shard_aof_writer_task(
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
+        // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
+        // near the top of this file for the full rationale.
+        let mut last_db: usize = 0;
         // (No `interval` here: the EverySec flush deadline is enforced by the
         // timeout-bounded recv in the loop below, which wakes at least every
         // `idle_wait.current()` (50ms floor, escalates to 1s while idle)
@@ -1130,6 +1163,12 @@ pub async fn per_shard_aof_writer_task(
                                 AOF_GROUP_COMMIT_MAX_BATCH,
                                 AOF_GROUP_COMMIT_MAX_BYTES,
                             );
+                            // task #35: inject SELECT <db> records on db-context
+                            // changes before this batch's framed writes go out.
+                            batch.data = inject_select_records(
+                                std::mem::take(&mut batch.data),
+                                &mut last_db,
+                            );
 
                             if !batch.data.is_empty() {
                                 if write_error {
@@ -1145,7 +1184,7 @@ pub async fn per_shard_aof_writer_task(
                                     let mut write_failed = false;
                                     for msg in &batch.data {
                                         let (lsn, data) = match msg {
-                                            AofMessage::Append { lsn, bytes }
+                                            AofMessage::Append { lsn, bytes, .. }
                                             | AofMessage::AppendSync { lsn, bytes, .. } => {
                                                 (*lsn, bytes)
                                             }
@@ -1284,7 +1323,7 @@ pub async fn per_shard_aof_writer_task(
                                         let mut sf = writer.into_inner().into_std().await;
                                         let res = do_rewrite_per_shard(
                                             shard_id, &shard_dbs, &mut sf, &rx, &coord,
-                                            &fold_producer, &fold_notifier,
+                                            &fold_producer, &fold_notifier, &mut last_db,
                                         );
                                         // `sf` is left on the committed generation by
                                         // the fold's internal barrier: NEW incr on
@@ -1443,6 +1482,9 @@ pub async fn per_shard_aof_writer_task(
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
+        // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
+        // near the top of this file for the full rationale.
+        let mut last_db: usize = 0;
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
         // the environment at writer task startup, every AppendSync ack resolves
         // as FsyncFailed instead of Synced. Read once before the loop so there
@@ -1506,6 +1548,9 @@ pub async fn per_shard_aof_writer_task(
                     AOF_GROUP_COMMIT_MAX_BATCH,
                     AOF_GROUP_COMMIT_MAX_BYTES,
                 );
+                // task #35: inject SELECT <db> records on db-context changes
+                // before this batch's framed writes go into batch_buf.
+                batch.data = inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
 
                 if !batch.data.is_empty() {
                     if write_error {
@@ -1524,7 +1569,7 @@ pub async fn per_shard_aof_writer_task(
                         batch_buf.clear();
                         for msg in &batch.data {
                             let (lsn, data) = match msg {
-                                AofMessage::Append { lsn, bytes }
+                                AofMessage::Append { lsn, bytes, .. }
                                 | AofMessage::AppendSync { lsn, bytes, .. } => (*lsn, bytes),
                                 _ => continue,
                             };
@@ -1622,6 +1667,7 @@ pub async fn per_shard_aof_writer_task(
                             &coord,
                             &fold_producer,
                             &fold_notifier,
+                            &mut last_db,
                         ) {
                             // The fold's ShardDoneGuard already marked the rewrite
                             // failed and decremented on this error exit (committing
@@ -1648,9 +1694,12 @@ pub async fn per_shard_aof_writer_task(
                         // Combined, the two fsyncs bound the post-fold EverySec window
                         // to ≤150ms — well within the test's 1500ms kill margin.
                         if !write_error {
-                            if let Ok(mut post_drain) =
-                                drain_pending_appends_framed(&rx, &mut file, usize::MAX)
-                            {
+                            if let Ok(mut post_drain) = drain_pending_appends_framed(
+                                &rx,
+                                &mut file,
+                                usize::MAX,
+                                &mut last_db,
+                            ) {
                                 if let Err(e) = sync_and_fulfill_drain(
                                     &mut post_drain,
                                     &mut file,

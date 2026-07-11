@@ -441,6 +441,10 @@ async fn register_replica_with_shards(
             let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
                 replica_id,
                 tx,
+                // Legacy multi-shard drain loops do not poll the kick flag
+                // (superseded by the R2 redesign); overflow still stops
+                // queueing via the fan-out's retain.
+                kicked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 backlog_capacity,
                 // Fire-and-forget: the multi-shard register paths are superseded
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
@@ -535,6 +539,10 @@ async fn register_replica_with_shards(
             let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
                 replica_id,
                 tx,
+                // Legacy multi-shard drain loops do not poll the kick flag
+                // (superseded by the R2 redesign); overflow still stops
+                // queueing via the fan-out's retain.
+                kicked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 backlog_capacity,
                 // Fire-and-forget: the multi-shard register paths are superseded
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
@@ -843,6 +851,11 @@ struct InlineReplicaRegistration {
     tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
     rx: crate::runtime::channel::MpscReceiver<bytes::Bytes>,
     reg_rx: crate::runtime::channel::MpscReceiver<u64>,
+    /// Overflow disconnect signal shared with the shard fan-out — set when
+    /// this replica's channel filled and a record could not be queued
+    /// (task #35). The drain loop polls it and closes the socket so the
+    /// replica resyncs instead of silently diverging.
+    kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Push `RegisterReplica` onto shard 0's SPSC so the event loop captures the
@@ -860,8 +873,13 @@ fn push_register_replica_inline(
     static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
 
-    let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(1024);
+    // 16384 records (task #35): 1024 overflowed within one pipelined burst on
+    // the same host — every overflow now KICKS the replica into a resync, so
+    // headroom directly reduces resync churn. Records are Bytes handles;
+    // 16k × ~50 B typical ≈ under 1 MB queued worst-case per replica.
+    let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(16384);
     let (reg_tx, reg_rx) = crate::runtime::channel::mpsc_bounded::<u64>(1);
+    let kicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // `--repl-backlog-size`, carried in RegisterReplica for the lazy fallback-init.
     let backlog_capacity = repl_state
@@ -889,6 +907,7 @@ fn push_register_replica_inline(
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::RegisterReplica {
         replica_id,
         tx: tx.clone(),
+        kicked: kicked.clone(),
         backlog_capacity,
         registered: Some(reg_tx),
         push_offset: Some(push_offset),
@@ -898,6 +917,7 @@ fn push_register_replica_inline(
         tx,
         rx,
         reg_rx,
+        kicked,
     })
 }
 
@@ -919,6 +939,7 @@ async fn drain_replica_inline_single_shard(
         tx,
         rx,
         reg_rx: _,
+        kicked,
     } = reg;
 
     // Bookkeeping for WAIT/INFO.
@@ -938,17 +959,57 @@ async fn drain_replica_inline_single_shard(
         rs.replicas.push(replica_info);
     }
 
-    // Drain the channel and write to the stream until the replica disconnects.
-    let stream = std::cell::RefCell::new(stream);
-    #[allow(clippy::await_holding_refcell_ref)]
-    while let Ok(data) = rx.recv_async().await {
-        let buf = data.to_vec();
-        let (wr, _) = stream.borrow_mut().write_all(buf).await;
-        if wr.is_err() {
-            info!("Replica {} disconnected", replica_id);
-            break;
+    // R1 (task #19): the hijacked PSYNC socket is full-duplex — the replica
+    // sends `REPLCONF ACK <offset>` back on it (1s cadence). Split the stream
+    // so a local reader task records ACKs into this replica's
+    // `ack_offsets`/`last_ack_time` (the data WAIT and INFO lag read) while
+    // the write loop below streams live fan-out bytes. Same-thread
+    // `monoio::spawn` — the task is !Send, which is fine here.
+    use monoio::io::Splitable as _;
+    let (rd, mut wr_half) = stream.into_split();
+    let ack_reader = monoio::spawn({
+        let repl_state = repl_state.clone();
+        async move { ack_read_loop(rd, replica_id, repl_state).await }
+    });
+
+    // Drain the channel and write to the stream until the replica
+    // disconnects — or until the shard fan-out KICKS this replica (task #35:
+    // its channel overflowed, so at least one record is already missing from
+    // the stream; continuing would deliver a silently-corrupt sequence). The
+    // kick cannot arrive as an in-band message (the trigger IS a full
+    // channel), so the recv races a coarse poll timer. `ReplicaInfo.shard_txs`
+    // and this task both hold sender clones, which is why channel closure
+    // can't signal this either.
+    loop {
+        monoio::select! {
+            recv = rx.recv_async() => {
+                let Ok(data) = recv else { break };
+                let buf = data.to_vec();
+                let (wr, _) = wr_half.write_all(buf).await;
+                if wr.is_err() {
+                    info!("Replica {} disconnected", replica_id);
+                    break;
+                }
+            }
+            _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if kicked.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::warn!(
+                        replica_id,
+                        "closing kicked replica connection (fan-out overflow) — \
+                         replica will reconnect and resync"
+                    );
+                    break;
+                }
+            }
         }
     }
+    // A kicked replica may still have queued records; they are stale (the
+    // stream already has a gap) — drop them with the channel.
+    // Dropping the write half closes our outbound side; the reader task ends
+    // on EOF/error when the peer closes (its socket dies with the write half
+    // on a disconnect-driven exit, so it does not linger).
+    drop(wr_half);
+    drop(ack_reader);
     // Remove from ReplicationState; the event loop will drop its replica_txs
     // entry on the next failed send via its own UnregisterReplica path.
     if let Ok(mut rs) = repl_state.write() {
@@ -959,6 +1020,107 @@ async fn drain_replica_inline_single_shard(
         replica_id,
     });
     Ok(())
+}
+
+/// Read `REPLCONF ACK <offset>` frames off the replica's half of the hijacked
+/// PSYNC socket and record them (R1, task #19). Runs as a same-thread task
+/// beside the write-drain loop in `drain_replica_inline_single_shard`; exits
+/// on EOF/read error. Anything other than a well-formed ACK is logged and
+/// skipped — a replica cannot corrupt master state through this path.
+#[cfg(feature = "runtime-monoio")]
+async fn ack_read_loop(
+    mut rd: monoio::net::tcp::TcpOwnedReadHalf,
+    replica_id: u64,
+    repl_state: Arc<RwLock<ReplicationState>>,
+) {
+    use monoio::io::AsyncReadRent;
+    use std::sync::atomic::Ordering;
+
+    let mut buf = bytes::BytesMut::with_capacity(4096);
+    loop {
+        let tmp = vec![0u8; 4096];
+        let (res, tmp) = rd.read(tmp).await;
+        let n = match res {
+            Ok(0) | Err(_) => return, // replica closed its send half
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        // Parse complete RESP frames directly — the shared replication
+        // drainer (`drain_replicated_commands`) deliberately DROPS REPLCONF
+        // as chatter, which is exactly the frame this loop exists to read.
+        let acks = match drain_ack_offsets(&mut buf) {
+            Ok(acks) => acks,
+            Err(()) => {
+                tracing::warn!(
+                    replica_id,
+                    "unparseable bytes on replica ACK channel — closing"
+                );
+                return;
+            }
+        };
+        for offset in acks {
+            if let Ok(rs) = repl_state.read() {
+                if let Some(info) = rs.replicas.iter().find(|r| r.id == replica_id) {
+                    // fetch_max: ACKs can only move forward — a reordered or
+                    // duplicate ACK never regresses the recorded offset.
+                    if let Some(slot) = info.ack_offsets.first() {
+                        slot.fetch_max(offset, Ordering::Relaxed);
+                    }
+                    info.last_ack_time.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Drain every complete RESP frame from `buf` and return the offsets of all
+/// well-formed `REPLCONF ACK <offset>` frames (R1). Non-ACK frames are
+/// skipped at debug level; a parse error returns `Err(())` — the unframed
+/// stream cannot be resynced, so the caller must drop the connection.
+#[cfg(feature = "runtime-monoio")]
+fn drain_ack_offsets(buf: &mut bytes::BytesMut) -> Result<Vec<u64>, ()> {
+    use crate::protocol::{Frame, ParseConfig, parse};
+
+    let config = ParseConfig::default();
+    let mut acks = Vec::new();
+    loop {
+        if buf.is_empty() {
+            return Ok(acks);
+        }
+        let frame = match parse::parse(buf, &config) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(acks), // partial trailing frame — wait for more
+            Err(_) => return Err(()),
+        };
+        let Frame::Array(items) = &frame else {
+            continue; // inline keepalive etc. — ignore
+        };
+        let bulk = |f: &Frame| -> Option<bytes::Bytes> {
+            match f {
+                Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
+                _ => None,
+            }
+        };
+        let is_ack = items.len() >= 3
+            && bulk(&items[0]).is_some_and(|c| c.eq_ignore_ascii_case(b"REPLCONF"))
+            && bulk(&items[1]).is_some_and(|s| s.eq_ignore_ascii_case(b"ACK"));
+        if !is_ack {
+            tracing::debug!("ignoring non-ACK frame on replica channel");
+            continue;
+        }
+        if let Some(offset) = bulk(&items[2])
+            .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.to_owned()))
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            acks.push(offset);
+        }
+    }
 }
 
 /// WAIT command: block until N replicas acknowledge >= target_offset, or timeout expires.

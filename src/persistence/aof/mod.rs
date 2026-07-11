@@ -159,7 +159,16 @@ pub enum AofMessage {
     /// `ReplicationState::issue_lsn(shard_id, bytes.len() as u64)` and pass
     /// the returned value. Sites with no replication state available pass 0
     /// (TopLevel ignores it; PerShard treats 0 as "no ordering hint").
-    Append { lsn: u64, bytes: Bytes },
+    ///
+    /// `db` is the database index the command EXECUTED in (task #35 — AOF
+    /// db-aware writer). The writer tracks a running `last_db` and, before
+    /// writing a non-empty record whose `db` differs, first writes a
+    /// `SELECT <db>` record (see [`serialize_select_record`]) so recovery
+    /// replays every record into the db it was actually written in — client
+    /// `SELECT` commands are connection-state only and are never persisted
+    /// (see `metadata::is_persisted_write`). A zero-length payload (the
+    /// `fsync_barrier` H1-BARRIER) never triggers or observes a db switch.
+    Append { lsn: u64, db: usize, bytes: Bytes },
     /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
     /// data-loss vector exposed by `appendfsync=always`).
     ///
@@ -180,6 +189,7 @@ pub enum AofMessage {
     /// `--unsafe-multishard-aof` gate.
     AppendSync {
         lsn: u64,
+        db: usize,
         bytes: Bytes,
         ack: crate::runtime::channel::OneshotSender<AofAck>,
     },
@@ -501,6 +511,75 @@ pub fn serialize_command(frame: &Frame) -> Bytes {
     let mut buf = BytesMut::with_capacity(64);
     serialize::serialize(frame, &mut buf);
     buf.freeze()
+}
+
+/// Serialized `SELECT <db>` RESP record for AOF db-context injection
+/// (task #35). Same wire form the replay engines already execute
+/// (`replay_incr_resp` / `replay_incr_framed` / `DispatchReplayEngine`).
+pub fn serialize_select_record(db: usize) -> Bytes {
+    let mut n = itoa::Buffer::new();
+    let d = n.format(db);
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$");
+    let mut l = itoa::Buffer::new();
+    buf.extend_from_slice(l.format(d.len()).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(d.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    Bytes::from(buf)
+}
+
+/// Returns `Some(serialize_select_record(db))` and advances `*last_db` when a
+/// non-barrier record's execution db differs from the writer's running
+/// context (task #35 db-aware writer). Returns `None` (no state change) for
+/// a zero-length barrier payload (`payload_is_empty` — `pool::fsync_barrier`
+/// writes no record and must never trigger nor observe a db switch) or when
+/// `db == *last_db`. Shared by every AOF write site — the batched writer
+/// loops (via [`inject_select_records`]) and the rewrite-fold per-message
+/// inline drains (`rewrite.rs`) alike — so the db-switch rule has exactly one
+/// definition.
+pub(crate) fn select_prefix_if_needed(
+    db: usize,
+    payload_is_empty: bool,
+    last_db: &mut usize,
+) -> Option<Bytes> {
+    if payload_is_empty || db == *last_db {
+        return None;
+    }
+    *last_db = db;
+    Some(serialize_select_record(db))
+}
+
+/// Insert a synthetic `SELECT <db>` [`AofMessage::Append`] (lsn=0) before
+/// every message in `data` whose db differs from the writer's running
+/// `last_db` context (task #35). Barriers (zero-length payload) never
+/// trigger nor observe a switch. `last_db` is updated in place so
+/// consecutive batches stay consistent across writer-loop iterations.
+///
+/// Used by all four batch-write writer loci (TopLevel/PerShard x
+/// monoio/tokio) immediately after `collect_group_commit_batch` returns —
+/// the injected message then rides the SAME write path as any other record
+/// (a framed `[u64 lsn=0][u32 len]` header for the PerShard loops, raw bytes
+/// for TopLevel), so no per-loop special-casing of the SELECT bytes is
+/// needed.
+pub(crate) fn inject_select_records(data: Vec<AofMessage>, last_db: &mut usize) -> Vec<AofMessage> {
+    let mut out = Vec::with_capacity(data.len());
+    for msg in data {
+        let (db, is_empty) = match &msg {
+            AofMessage::Append { db, bytes, .. } => (*db, bytes.is_empty()),
+            AofMessage::AppendSync { db, bytes, .. } => (*db, bytes.is_empty()),
+            _ => (0, true),
+        };
+        if let Some(select_bytes) = select_prefix_if_needed(db, is_empty, last_db) {
+            out.push(AofMessage::Append {
+                lsn: 0,
+                db,
+                bytes: select_bytes,
+            });
+        }
+        out.push(msg);
+    }
+    out
 }
 
 /// Whether legacy best-effort skip-and-resync on mid-stream AOF corruption is

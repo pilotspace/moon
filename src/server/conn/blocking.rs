@@ -1447,7 +1447,7 @@ pub(crate) fn try_inline_dispatch(
         // full. On loss, fail-loud: the SET is applied in memory, but the
         // client must see an error, not `+OK` (review finding, PR #211).
         let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-        if !pool.send_append_bounded_blocking(shard_id, lsn, frozen, &mut aof_budget) {
+        if !pool.send_append_bounded_blocking(shard_id, lsn, selected_db, frozen, &mut aof_budget) {
             write_buf.extend_from_slice(
                 b"-MOONERR AOF backpressure: write applied in memory but not queued \
                   for persistence\r\n",

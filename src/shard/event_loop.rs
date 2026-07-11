@@ -670,7 +670,7 @@ impl super::Shard {
             },
             None => std::sync::Arc::new(parking_lot::Mutex::new(None)),
         };
-        let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
         let repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>> = repl_state_ext;
         // QW3 (2026-06 review): lock-free offset handle cloned ONCE at shard
         // startup. The SPSC drain's per-write offset advance goes through this

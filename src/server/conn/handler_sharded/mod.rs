@@ -871,6 +871,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- WAIT (R1): blocks on replica ACKs; must run at the
+                    // connection layer (generic dispatch is synchronous) ---
+                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, &mut responses).await {
+                        continue;
+                    }
+
                     // --- READONLY enforcement ---
                     if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
                         continue;
@@ -1238,7 +1244,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     let is_write = if ctx.aof_pool.is_some() || conn.tracking_state.enabled { metadata::is_write(cmd) } else { false };
-                    let aof_bytes = if is_write && ctx.aof_pool.is_some() { Some(aof::serialize_command(&frame)) } else { None };
+                    // `is_persisted_write`: never AOF a literal client SELECT
+                    // (task #35 — poisons the stream db context).
+                    let aof_bytes = if is_write && ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) { Some(aof::serialize_command(&frame)) } else { None };
 
                     if is_local {
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
@@ -1285,7 +1293,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
                                         match pool
-                                            .send_append_group(ctx.shard_id, lsn, bytes.clone())
+                                            .send_append_group(
+                                                ctx.shard_id,
+                                                lsn,
+                                                conn.selected_db,
+                                                bytes.clone(),
+                                            )
                                             .await
                                         {
                                             // Always: one fsync_barrier per batch
@@ -1343,7 +1356,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         if let Some(ref pool) = ctx.aof_pool {
                                             let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
                                             match pool
-                                                .send_append_group(ctx.shard_id, lsn, bytes.clone())
+                                                .send_append_group(
+                                                    ctx.shard_id,
+                                                    lsn,
+                                                    conn.selected_db,
+                                                    bytes.clone(),
+                                                )
                                                 .await
                                             {
                                                 // Always: one fsync_barrier per batch
@@ -1694,7 +1712,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if !matches!(response, Frame::Error(_)) {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
+                                        match pool
+                                            .send_append_group(
+                                                ctx.shard_id,
+                                                lsn,
+                                                conn.selected_db,
+                                                bytes,
+                                            )
+                                            .await
+                                        {
                                             Ok(true) => aof_barrier_pending = true,
                                             Ok(false) => {}
                                             Err(_) => {

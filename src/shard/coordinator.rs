@@ -359,7 +359,7 @@ async fn run_on_owner_persist(
         let serialized = crate::persistence::aof::serialize_command(&Frame::Array(
             command_parts.to_vec().into(),
         ));
-        match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
             Err(()) => {
                 return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
@@ -401,6 +401,10 @@ async fn persist_local_leg(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
     my_shard: usize,
+    // task #35: the db this local leg executed in (`db_index` at every call
+    // site) — threaded into the AOF pool so the writer can inject a
+    // `SELECT <db>` record on a db-context change.
+    db: usize,
     serialized: Bytes,
 ) -> Result<bool, ()> {
     let Some(pool) = aof_pool else {
@@ -411,7 +415,7 @@ async fn persist_local_leg(
         my_shard,
         serialized.len(),
     );
-    match pool.send_append_group(my_shard, lsn, serialized).await {
+    match pool.send_append_group(my_shard, lsn, db, serialized).await {
         Ok(needs_barrier) => Ok(needs_barrier),
         Err(_) => Err(()),
     }
@@ -1207,7 +1211,7 @@ async fn coordinate_mset(
         // owned by my_shard — matching the local single-key write contract.
         if let Some(pairs) = groups.get(&my_shard) {
             let serialized = serialize_local_mset(pairs);
-            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1283,7 +1287,7 @@ async fn coordinate_mset(
     // write keys this shard doesn't own).
     if let Some(pairs) = groups.get(&my_shard) {
         let serialized = serialize_local_mset(pairs);
-        match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
             Err(()) => {
                 return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
@@ -1366,7 +1370,7 @@ async fn coordinate_msetnx(
         if matches!(resp, Frame::Integer(1)) {
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(command_parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1447,7 +1451,7 @@ async fn coordinate_multi_del_or_exists(
             parts.extend_from_slice(args);
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1480,7 +1484,9 @@ async fn coordinate_multi_del_or_exists(
                     parts.extend_from_slice(key_args);
                     let serialized =
                         crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-                    match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+                    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized)
+                        .await
+                    {
                         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                         Err(()) => {
                             return Frame::Error(Bytes::from_static(

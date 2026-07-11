@@ -251,11 +251,12 @@ impl AofWriterPool {
         &self,
         shard_id: usize,
         lsn: u64,
+        db: usize,
         bytes: Bytes,
     ) -> Result<(), AofAck> {
         match self.fsync_policy {
             FsyncPolicy::Always => {
-                let rx = self.try_send_append_sync(shard_id, lsn, bytes);
+                let rx = self.try_send_append_sync(shard_id, lsn, db, bytes);
                 // F2 (design-for-failure): bound the wait so a stalled disk
                 // can't park this connection forever. On elapse the write is
                 // failed — the entry may still land on disk later, but
@@ -277,7 +278,8 @@ impl AofWriterPool {
                 // enqueue (NOT fsync) under `fsync_timeout`, and a failed
                 // enqueue surfaces as Err so the client never gets a false
                 // success for a write the durability machinery never saw.
-                self.send_append_backpressure(shard_id, lsn, bytes).await
+                self.send_append_backpressure(shard_id, lsn, db, bytes)
+                    .await
             }
         }
     }
@@ -302,9 +304,11 @@ impl AofWriterPool {
         &self,
         shard_id: usize,
         lsn: u64,
+        db: usize,
         bytes: Bytes,
     ) -> Result<bool, AofAck> {
-        self.send_append_backpressure(shard_id, lsn, bytes).await?;
+        self.send_append_backpressure(shard_id, lsn, db, bytes)
+            .await?;
         Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
     }
 
@@ -348,7 +352,9 @@ impl AofWriterPool {
             FsyncPolicy::Always => {
                 // Enqueue a zero-length AppendSync. The writer will fsync all
                 // preceding Append messages (ordered channel) then ack Synced.
-                let rx = self.try_send_append_sync(shard_id, 0, Bytes::new());
+                // db=0: a zero-length barrier writes no record, so it can
+                // never trigger (or need) a SELECT injection.
+                let rx = self.try_send_append_sync(shard_id, 0, 0, Bytes::new());
                 // F2 bounded await — same semantics as try_send_append_durable.
                 match Self::await_ack(rx, self.fsync_timeout).await {
                     AckOutcome::Ack(AofAck::Synced) => Ok(()),
@@ -441,10 +447,10 @@ impl AofWriterPool {
     /// [`Self::send_append_bounded_blocking`] (sync contexts) or
     /// [`Self::try_send_append_durable`] (async contexts).
     #[inline]
-    pub fn try_send_append(&self, shard_id: usize, lsn: u64, bytes: Bytes) -> bool {
+    pub fn try_send_append(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
         match self
             .sender(shard_id)
-            .try_send(AofMessage::Append { lsn, bytes })
+            .try_send(AofMessage::Append { lsn, db, bytes })
         {
             Ok(()) => true,
             Err(e) => {
@@ -493,10 +499,11 @@ impl AofWriterPool {
         &self,
         shard_id: usize,
         lsn: u64,
+        db: usize,
         bytes: Bytes,
         budget: &mut Duration,
     ) -> bool {
-        let mut msg = AofMessage::Append { lsn, bytes };
+        let mut msg = AofMessage::Append { lsn, db, bytes };
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return true,
             Err(flume::TrySendError::Disconnected(_)) => {
@@ -561,9 +568,10 @@ impl AofWriterPool {
         &self,
         shard_id: usize,
         lsn: u64,
+        db: usize,
         bytes: Bytes,
     ) -> Result<(), AofAck> {
-        let mut msg = AofMessage::Append { lsn, bytes };
+        let mut msg = AofMessage::Append { lsn, db, bytes };
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return Ok(()),
             Err(flume::TrySendError::Disconnected(_)) => return Err(AofAck::WriteFailed),
@@ -640,11 +648,13 @@ impl AofWriterPool {
         &self,
         shard_id: usize,
         lsn: u64,
+        db: usize,
         bytes: Bytes,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
         match self.sender(shard_id).try_send(AofMessage::AppendSync {
             lsn,
+            db,
             bytes,
             ack: ack_tx,
         }) {
@@ -704,7 +714,7 @@ impl AofWriterPool {
     /// or replicated SCRIPT command has a place to land. Until that
     /// consumer exists, only test code emits ordered entries.
     #[inline]
-    pub fn try_send_append_ordered(&self, shard_id: usize, lsn: u64, bytes: Bytes) {
+    pub fn try_send_append_ordered(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) {
         debug_assert_eq!(
             lsn & ORDERED_LSN_FLAG,
             0,
@@ -714,6 +724,7 @@ impl AofWriterPool {
         let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
         let _ = self.sender(shard_id).try_send(AofMessage::Append {
             lsn: tagged_lsn,
+            db,
             bytes,
         });
     }
@@ -1032,6 +1043,7 @@ mod pool_tests {
         // on the reply. In this unit test there's no shard event loop consuming the
         // SPSC ring, so the fold will error out. The test verifies the abort path,
         // which is triggered by the fold guard's error handling.
+        let mut last_db: usize = 0;
         let _ = do_rewrite_per_shard(
             0,
             &shard_dbs,
@@ -1040,6 +1052,7 @@ mod pool_tests {
             &coord,
             &fold_producer,
             &fold_notifier,
+            &mut last_db,
         );
 
         // Abort kept the old generation committed and pruned the new-gen incr.
@@ -1152,9 +1165,9 @@ mod pool_tests {
         assert_eq!(pool.num_writers(), 1);
         assert_eq!(pool.layout(), AofLayout::TopLevel);
 
-        pool.try_send_append(0, 0, Bytes::from_static(b"a"));
-        pool.try_send_append(7, 0, Bytes::from_static(b"b"));
-        pool.try_send_append(42, 0, Bytes::from_static(b"c"));
+        pool.try_send_append(0, 0, 0, Bytes::from_static(b"a"));
+        pool.try_send_append(7, 0, 0, Bytes::from_static(b"b"));
+        pool.try_send_append(42, 0, 0, Bytes::from_static(b"c"));
 
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -1172,10 +1185,10 @@ mod pool_tests {
         assert_eq!(pool.num_writers(), 3);
         assert_eq!(pool.layout(), AofLayout::PerShard);
 
-        pool.try_send_append(0, 100, Bytes::from_static(b"shard0"));
-        pool.try_send_append(1, 200, Bytes::from_static(b"shard1a"));
-        pool.try_send_append(1, 300, Bytes::from_static(b"shard1b"));
-        pool.try_send_append(2, 400, Bytes::from_static(b"shard2"));
+        pool.try_send_append(0, 100, 0, Bytes::from_static(b"shard0"));
+        pool.try_send_append(1, 200, 0, Bytes::from_static(b"shard1a"));
+        pool.try_send_append(1, 300, 0, Bytes::from_static(b"shard1b"));
+        pool.try_send_append(2, 400, 0, Bytes::from_static(b"shard2"));
 
         let count = |rx: &channel::MpscReceiver<AofMessage>| -> usize {
             let mut n = 0;
@@ -1222,13 +1235,13 @@ mod pool_tests {
         let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        pool.try_send_append(0, 42, Bytes::from_static(b"set foo 1"));
-        pool.try_send_append(1, 43, Bytes::from_static(b"set bar 2"));
-        pool.try_send_append(0, 44, Bytes::from_static(b"del foo"));
+        pool.try_send_append(0, 42, 0, Bytes::from_static(b"set foo 1"));
+        pool.try_send_append(1, 43, 0, Bytes::from_static(b"set bar 2"));
+        pool.try_send_append(0, 44, 0, Bytes::from_static(b"del foo"));
 
         // Shard 0 should see (42, "set foo 1") then (44, "del foo").
         match rx0.try_recv() {
-            Ok(AofMessage::Append { lsn, bytes }) => {
+            Ok(AofMessage::Append { lsn, bytes, .. }) => {
                 assert_eq!(lsn, 42, "shard 0 first entry lsn");
                 assert_eq!(bytes.as_ref(), b"set foo 1");
             }
@@ -1238,7 +1251,7 @@ mod pool_tests {
             ),
         }
         match rx0.try_recv() {
-            Ok(AofMessage::Append { lsn, bytes }) => {
+            Ok(AofMessage::Append { lsn, bytes, .. }) => {
                 assert_eq!(lsn, 44, "shard 0 second entry lsn");
                 assert_eq!(bytes.as_ref(), b"del foo");
             }
@@ -1249,7 +1262,7 @@ mod pool_tests {
         }
         // Shard 1 should see (43, "set bar 2") only.
         match rx1.try_recv() {
-            Ok(AofMessage::Append { lsn, bytes }) => {
+            Ok(AofMessage::Append { lsn, bytes, .. }) => {
                 assert_eq!(lsn, 43, "shard 1 entry lsn");
                 assert_eq!(bytes.as_ref(), b"set bar 2");
             }
@@ -1268,12 +1281,14 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 99, Bytes::from_static(b"SET k v"));
+        let recv = pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"));
 
         // Drain the queue; the writer would normally do this. Capture the
         // ack sender, do the (mock) durable write, then ack Synced.
         let ack = match rx0.try_recv() {
-            Ok(AofMessage::AppendSync { lsn, bytes, ack }) => {
+            Ok(AofMessage::AppendSync {
+                lsn, bytes, ack, ..
+            }) => {
                 assert_eq!(lsn, 99, "lsn forwarded through the channel");
                 assert_eq!(bytes.as_ref(), b"SET k v", "bytes forwarded");
                 ack
@@ -1297,7 +1312,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 7, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"x"));
 
         // Drain the message but DROP the ack sender without sending.
         match rx0.try_recv() {
@@ -1317,7 +1332,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"));
         let ack = match rx0.try_recv() {
             Ok(AofMessage::AppendSync { ack, .. }) => ack,
             other => panic!("expected AppendSync, got {:?}", other.is_ok()),
@@ -1334,7 +1349,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"));
         let ack = match rx0.try_recv() {
             Ok(AofMessage::AppendSync { ack, .. }) => ack,
             other => panic!("expected AppendSync, got {:?}", other.is_ok()),
@@ -1357,14 +1372,16 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 99, Bytes::from_static(b"SET k v"));
+        let recv = pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"));
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut outcome = drain_pending_appends_framed(&rx0, &mut file, usize::MAX).unwrap();
+        let mut last_db: usize = 0;
+        let mut outcome =
+            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
 
         // CONTRACT: drained + parked, NOT yet acked.
         assert_eq!(outcome.drained, 1, "the AppendSync was drained");
@@ -1398,15 +1415,17 @@ mod pool_tests {
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
         // A real append followed by a barrier (empty payload).
-        pool.try_send_append(0, 5, Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"));
-        let barrier_recv = pool.try_send_append_sync(0, 0, Bytes::new());
+        pool.try_send_append(0, 5, 0, Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"));
+        let barrier_recv = pool.try_send_append_sync(0, 0, 0, Bytes::new());
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut outcome = drain_pending_appends_framed(&rx0, &mut file, usize::MAX).unwrap();
+        let mut last_db: usize = 0;
+        let mut outcome =
+            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
 
         assert_eq!(outcome.drained, 2, "both messages count toward drained");
         assert_eq!(outcome.pending_acks.len(), 1, "barrier ack parked");
@@ -1429,6 +1448,77 @@ mod pool_tests {
         );
     }
 
+    /// task #35 (C2 AOF db-aware writer): a db switch mid-stream must inject a
+    /// `SELECT <db>` record BEFORE the differing record — the writer is the
+    /// single consumer of a shard's AOF stream, so it (not the client's
+    /// SELECT, which is never persisted since C1) is what re-establishes
+    /// `aof_selected_db` for replay. Drives the REAL production drain
+    /// (`drain_pending_appends_framed`, one of the exact write loci this fix
+    /// touches) against a real temp file — not a mock — asserting the framed
+    /// on-disk bytes contain exactly `SELECT 2` before the db=2 record and
+    /// `SELECT 0` before the following db=0 record, with no redundant SELECT
+    /// around the two same-db (0) neighbors.
+    #[test]
+    fn drain_framed_injects_select_on_db_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incr = tmp.path().join("incr.aof");
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(8);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        // Append(db=0), Append(db=2), Append(db=0) — exactly the spec's
+        // red/green scenario.
+        pool.try_send_append(0, 1, 0, Bytes::from_static(b"AAAA"));
+        pool.try_send_append(0, 2, 2, Bytes::from_static(b"BBBB"));
+        pool.try_send_append(0, 3, 0, Bytes::from_static(b"CCCC"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr)
+            .unwrap();
+        let mut last_db: usize = 0;
+        let outcome =
+            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
+        assert_eq!(outcome.drained, 3, "all three real appends were drained");
+        assert_eq!(
+            last_db, 0,
+            "context tracker ends at the 3rd record's db (0)"
+        );
+
+        file.sync_data().unwrap();
+        let raw = std::fs::read(&incr).unwrap();
+
+        // Parse the PerShard incr framing `[u64 lsn LE][u32 len LE][len bytes]`
+        // — the same shape `replay_incr_framed` reads on restart. Local parser
+        // (not the sibling tokio-gated `parse_framed`) so this test runs under
+        // the default runtime-monoio build, not just runtime-tokio.
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0usize;
+        while i + 12 <= raw.len() {
+            let len = u32::from_le_bytes(raw[i + 8..i + 12].try_into().unwrap()) as usize;
+            assert!(i + 12 + len <= raw.len(), "no truncated tail expected here");
+            frames.push(raw[i + 12..i + 12 + len].to_vec());
+            i += 12 + len;
+        }
+
+        assert_eq!(
+            frames,
+            vec![
+                b"AAAA".to_vec(),
+                serialize_select_record(2).to_vec(),
+                b"BBBB".to_vec(),
+                serialize_select_record(0).to_vec(),
+                b"CCCC".to_vec(),
+            ],
+            "expected AAAA, SELECT 2, BBBB, SELECT 0, CCCC — got {:?}",
+            frames
+                .iter()
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Issue #140 failure path: if the rewrite-boundary fsync FAILS, a drained
     /// AppendSync must resolve `FsyncFailed`, never `Synced`. Exercises the
     /// non-framed `drain_pending_appends` — the DEFAULT `--shards 1` rewrite
@@ -1442,14 +1532,15 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 7, Bytes::from_static(b"SET a b"));
+        let recv = pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"SET a b"));
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut outcome = drain_pending_appends(&rx0, &mut file).unwrap();
+        let mut last_db: usize = 0;
+        let mut outcome = drain_pending_appends(&rx0, &mut file, &mut last_db).unwrap();
         assert_eq!(
             outcome.pending_acks.len(),
             1,
@@ -1486,7 +1577,7 @@ mod pool_tests {
 
         let start = Instant::now();
         let res = pool
-            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"))
             .await;
         let elapsed = start.elapsed();
 
@@ -1524,7 +1615,7 @@ mod pool_tests {
         });
 
         let res = pool
-            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"))
             .await;
         assert_eq!(res, Ok(()), "ack within the bound must succeed");
         drop(_rx1);
@@ -1584,16 +1675,19 @@ mod pool_tests {
         // 1: clean. 2: torn (header only). 3: must be suppressed by the latch.
         tx.try_send(AofMessage::Append {
             lsn: 1,
+            db: 0,
             bytes: Bytes::from_static(b"AAAA"),
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
             lsn: 2,
+            db: 0,
             bytes: Bytes::from_static(b"BBBB"),
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
             lsn: 3,
+            db: 0,
             bytes: Bytes::from_static(b"CCCC"),
         })
         .unwrap();
@@ -1603,6 +1697,7 @@ mod pool_tests {
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
         tx.try_send(AofMessage::AppendSync {
             lsn: 4,
+            db: 0,
             bytes: Bytes::from_static(b"DDDD"),
             ack: ack_tx,
         })
@@ -1685,7 +1780,7 @@ mod pool_tests {
 
         // The handler MUST await this BEFORE flushing responses to the client
         let result = pool
-            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
             .await;
         mock_writer.await.expect("mock writer completed");
 
@@ -1765,7 +1860,7 @@ mod pool_tests {
         let pool = AofWriterPool::top_level(tx0);
 
         let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
-        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"SET k v"));
+        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"SET k v"));
 
         // The channel was full — ChannelFull is returned immediately without
         // a writer round-trip.
@@ -1823,6 +1918,7 @@ mod pool_tests {
         let result = futures::executor::block_on(pool.try_send_append_durable(
             0,
             55,
+            0,
             Bytes::from_static(b"SWAPDB 0 1"),
         ));
 
@@ -1855,6 +1951,7 @@ mod pool_tests {
         let result = futures::executor::block_on(pool.try_send_append_durable(
             0,
             56,
+            0,
             Bytes::from_static(b"SWAPDB 0 1"),
         ));
 
@@ -1887,6 +1984,7 @@ mod pool_tests {
         let result = futures::executor::block_on(pool.send_append_group(
             0,
             77,
+            0,
             Bytes::from_static(b"MSET k v"),
         ));
 
@@ -1919,6 +2017,7 @@ mod pool_tests {
         let result = futures::executor::block_on(pool.send_append_group(
             0,
             78,
+            0,
             Bytes::from_static(b"MSET k v"),
         ));
         assert_eq!(
@@ -1941,6 +2040,7 @@ mod pool_tests {
         let result = futures::executor::block_on(pool.send_append_group(
             0,
             79,
+            0,
             Bytes::from_static(b"MSET k v"),
         ));
         assert!(
@@ -2069,6 +2169,7 @@ mod pool_tests {
         // Fill the only slot; keep _rx0 alive so the channel is Full, not Disconnected.
         tx0.try_send(AofMessage::Append {
             lsn: 0,
+            db: 0,
             bytes: Bytes::from_static(b"x"),
         })
         .unwrap();
@@ -2080,7 +2181,7 @@ mod pool_tests {
 
         let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
         let res = pool
-            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
             .await;
         assert_eq!(
             res,
@@ -2102,6 +2203,7 @@ mod pool_tests {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(1);
         tx0.try_send(AofMessage::Append {
             lsn: 0,
+            db: 0,
             bytes: Bytes::from_static(b"x"),
         })
         .unwrap();
@@ -2119,7 +2221,7 @@ mod pool_tests {
         });
 
         let res = pool
-            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
             .await;
         assert_eq!(
             res,
@@ -2142,6 +2244,7 @@ mod pool_tests {
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
         tx0.try_send(AofMessage::Append {
             lsn: 0,
+            db: 0,
             bytes: Bytes::from_static(b"x"),
         })
         .unwrap();
@@ -2155,7 +2258,7 @@ mod pool_tests {
         let start = std::time::Instant::now();
         let mut budget = Duration::from_millis(30);
         let ok =
-            pool.send_append_bounded_blocking(0, 7, Bytes::from_static(b"SET k v"), &mut budget);
+            pool.send_append_bounded_blocking(0, 7, 0, Bytes::from_static(b"SET k v"), &mut budget);
         assert!(!ok, "still-full channel after the bound must report loss");
         assert!(
             start.elapsed() >= Duration::from_millis(30),
@@ -2181,6 +2284,7 @@ mod pool_tests {
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
         tx0.try_send(AofMessage::Append {
             lsn: 0,
+            db: 0,
             bytes: Bytes::from_static(b"x"),
         })
         .unwrap();
@@ -2194,7 +2298,7 @@ mod pool_tests {
         let mut budget = Duration::ZERO; // batch already spent its bound
         let start = std::time::Instant::now();
         let ok =
-            pool.send_append_bounded_blocking(0, 8, Bytes::from_static(b"SET k v"), &mut budget);
+            pool.send_append_bounded_blocking(0, 8, 0, Bytes::from_static(b"SET k v"), &mut budget);
         assert!(!ok, "exhausted budget must report loss");
         assert!(
             start.elapsed() < Duration::from_millis(10),
@@ -2220,6 +2324,7 @@ mod pool_tests {
         assert!(pool.send_append_bounded_blocking(
             0,
             9,
+            0,
             Bytes::from_static(b"SET a 1"),
             &mut budget,
         ));

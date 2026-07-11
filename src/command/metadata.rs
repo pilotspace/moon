@@ -656,6 +656,20 @@ pub fn is_write(cmd: &[u8]) -> bool {
     lookup(cmd).is_some_and(|m| m.flags.contains(CommandFlags::WRITE))
 }
 
+/// Write commands that must be PERSISTED (AOF) and REPLICATED.
+///
+/// Excludes SELECT: it is W-flagged so it routes through the write dispatch
+/// paths, but it only mutates CONNECTION state. Persisting the literal client
+/// SELECT poisons the shared AOF/replication stream's db context for every
+/// OTHER connection interleaved with it — `conn A (db0): SET x` after
+/// `conn B: SELECT 2` replayed `x` into db 2 (task #35). Both planes prepend
+/// their own `SELECT <db>` records from per-stream db tracking instead
+/// (`ReplicationState::stream_db`, the AOF writer's `last_db`).
+#[inline]
+pub fn is_persisted_write(cmd: &[u8]) -> bool {
+    is_write(cmd) && !cmd.eq_ignore_ascii_case(b"SELECT")
+}
+
 /// Check if a command is read-only via the metadata registry.
 #[inline]
 pub fn is_read(cmd: &[u8]) -> bool {

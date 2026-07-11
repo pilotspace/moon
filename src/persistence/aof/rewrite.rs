@@ -349,11 +349,21 @@ pub(crate) fn sync_and_fulfill_drain(
 /// bound (C4-DRAIN-BOUND): draining more would consume post-snapshot appends
 /// that belong in the NEW incr, and those bytes would then be lost when
 /// `manifest.advance()` deletes the old incr at the end of the fold.
+///
+/// `db_ctx` is the writer's running db-attribution context for THIS incr file
+/// (task #35): the caller passes `&mut` the writer's `last_db` when draining
+/// into the file the live writer was already appending to (so the drain
+/// continues that stream's context), or a fresh `0` when draining into a
+/// brand-new incr (replay always starts a segment at db 0). A non-empty
+/// record whose db differs from `*db_ctx` gets a raw `SELECT <db>` record
+/// written first (same rule as the live writer loops); `*db_ctx` is updated
+/// in place so the caller can read back the final context after the drain.
 #[cfg(feature = "runtime-monoio")]
 pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
     max_drain: usize,
+    db_ctx: &mut usize,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
@@ -363,7 +373,14 @@ pub(crate) fn drain_pending_appends_bounded(
                 AofMessage::Append {
                     bytes: data,
                     lsn: _,
+                    db,
                 } => {
+                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                        file.write_all(&sel).map_err(|e| AofError::Io {
+                            path: PathBuf::from("<aof toplevel incr drain>"),
+                            source: e,
+                        })?;
+                    }
                     file.write_all(&data).map_err(|e| AofError::Io {
                         path: PathBuf::from("<aof toplevel incr drain>"),
                         source: e,
@@ -373,8 +390,15 @@ pub(crate) fn drain_pending_appends_bounded(
                 AofMessage::AppendSync {
                     bytes: data,
                     lsn: _,
+                    db,
                     ack,
                 } => {
+                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                        file.write_all(&sel).map_err(|e| AofError::Io {
+                            path: PathBuf::from("<aof toplevel incr drain>"),
+                            source: e,
+                        })?;
+                    }
                     file.write_all(&data).map_err(|e| AofError::Io {
                         path: PathBuf::from("<aof toplevel incr drain>"),
                         source: e,
@@ -402,8 +426,9 @@ pub(crate) fn drain_pending_appends_bounded(
 pub(crate) fn drain_pending_appends(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
+    db_ctx: &mut usize,
 ) -> Result<DrainOutcome, MoonError> {
-    drain_pending_appends_bounded(rx, file, usize::MAX)
+    drain_pending_appends_bounded(rx, file, usize::MAX, db_ctx)
 }
 
 /// [F6] Drain at most `max_drain` pending [`AofMessage::Append`] /
@@ -422,11 +447,17 @@ pub(crate) fn drain_pending_appends(
 /// This is the per-shard twin of [`drain_pending_appends`] (which writes the
 /// legacy TopLevel raw-RESP format). Correctness depends on the framing
 /// matching `replay_per_shard`'s reader.
+///
+/// `db_ctx` carries the writer's running db-attribution context exactly like
+/// [`drain_pending_appends_bounded`] (task #35) — see its doc for the
+/// caller contract. The synthetic `SELECT <db>` record is written framed
+/// (`lsn=0`), matching the live per-shard writer loops.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn drain_pending_appends_framed(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
     max_drain: usize,
+    db_ctx: &mut usize,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
@@ -440,7 +471,17 @@ pub(crate) fn drain_pending_appends_framed(
     while outcome.drained < max_drain {
         match rx.try_recv() {
             Ok(msg) => match msg {
-                AofMessage::Append { lsn, bytes: data } => {
+                AofMessage::Append {
+                    lsn,
+                    db,
+                    bytes: data,
+                } => {
+                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                        write_framed(file, 0, &sel).map_err(|e| AofError::Io {
+                            path: PathBuf::from("<aof per-shard incr drain>"),
+                            source: e,
+                        })?;
+                    }
                     write_framed(file, lsn, &data).map_err(|e| AofError::Io {
                         path: PathBuf::from("<aof per-shard incr drain>"),
                         source: e,
@@ -449,6 +490,7 @@ pub(crate) fn drain_pending_appends_framed(
                 }
                 AofMessage::AppendSync {
                     lsn,
+                    db,
                     bytes: data,
                     ack,
                 } => {
@@ -458,6 +500,12 @@ pub(crate) fn drain_pending_appends_framed(
                     // still counts toward `drained` (sender.len() counted it)
                     // and its ack still parks for the boundary fsync.
                     if !data.is_empty() {
+                        if let Some(sel) = select_prefix_if_needed(db, false, db_ctx) {
+                            write_framed(file, 0, &sel).map_err(|e| AofError::Io {
+                                path: PathBuf::from("<aof per-shard incr drain>"),
+                                source: e,
+                            })?;
+                        }
                         write_framed(file, lsn, &data).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof per-shard incr drain>"),
                             source: e,
@@ -560,6 +608,7 @@ pub(crate) fn do_rewrite_per_shard(
     coord: &PerShardRewriteCoord,
     fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
     fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
+    last_db: &mut usize,
 ) -> Result<(), MoonError> {
     use ringbuf::traits::Producer;
     // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
@@ -581,7 +630,10 @@ pub(crate) fn do_rewrite_per_shard(
     // Without this bound, under sustained high write load the drain loops forever
     // because the INCR producer keeps the channel perpetually non-empty.
     let pre_drain_bound = rx.len();
-    let mut pre_drain = drain_pending_appends_framed(rx, file, pre_drain_bound)?;
+    // task #35: pre/mid drain write into the OLD incr `file` — the SAME
+    // stream the live writer was appending to before the fold — so they
+    // continue the writer's running db context (`last_db`), not a fresh 0.
+    let mut pre_drain = drain_pending_appends_framed(rx, file, pre_drain_bound, last_db)?;
     sync_and_fulfill_drain(&mut pre_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase1 done: drained {} appends ({:.1}ms)",
@@ -692,7 +744,7 @@ pub(crate) fn do_rewrite_per_shard(
     // of pre-snapshot appends the shard reported before building its snapshot. This
     // prevents an infinite drain loop under sustained high write load where new
     // (post-snapshot) appends arrive faster than we can drain them.
-    let mut mid_drain = drain_pending_appends_framed(rx, file, pending_aof_count)?;
+    let mut mid_drain = drain_pending_appends_framed(rx, file, pending_aof_count, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase3 done: drained {} mid-appends ({:.1}ms total)",
@@ -723,6 +775,11 @@ pub(crate) fn do_rewrite_per_shard(
             path: new_incr,
             source: e,
         })?;
+    // task #35: save the OLD incr's final db context (in case phase 8 rolls
+    // back to it on abort) then reset for the fresh NEW incr — replay always
+    // starts a segment at db 0, so the writer's running context must match.
+    let old_incr_last_db = *last_db;
+    *last_db = 0;
 
     info!(
         "F6 per-shard rewrite: shard {} folded (drained {}+{} appends), new seq {}",
@@ -760,6 +817,9 @@ pub(crate) fn do_rewrite_per_shard(
                 path: committed_incr,
                 source: e,
             })?;
+        // task #35: rolled back onto the OLD (still-committed) incr — restore
+        // its db context instead of the fresh-incr 0 set above.
+        *last_db = old_incr_last_db;
         warn!(
             "F6 per-shard rewrite ABORTED: shard {} rolled its append file back to \
              committed seq {} (no restart needed)",
@@ -795,10 +855,12 @@ pub(crate) fn do_rewrite_single(
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
+    last_db: &mut usize,
 ) -> Result<(), MoonError> {
     // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
-    // resolve their parked AppendSync acks (issue #140).
-    let mut pre_drain = drain_pending_appends(rx, file)?;
+    // resolve their parked AppendSync acks (issue #140). task #35: continues
+    // the writer's running db context — this IS the writer's live `file`.
+    let mut pre_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
 
     // Phase 2: acquire write locks on every database in the shard.
@@ -809,7 +871,7 @@ pub(crate) fn do_rewrite_single(
 
     // Phase 3: drain any appends the handlers sent between phase 1 and phase 2,
     // fsync, then resolve their parked AppendSync acks (issue #140).
-    let mut mid_drain = drain_pending_appends(rx, file)?;
+    let mut mid_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
@@ -850,6 +912,8 @@ pub(crate) fn do_rewrite_single(
             path: new_incr,
             source: e,
         })?;
+    // task #35: fresh incr — replay always starts a segment at db 0.
+    *last_db = 0;
 
     info!(
         "AOF rewrite complete (single): drained {}+{} pre-snapshot appends, seq={}",
@@ -895,6 +959,7 @@ pub(crate) fn do_rewrite_sharded(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
+    last_db: &mut usize,
 ) -> Result<(), MoonError> {
     use ringbuf::traits::Producer;
 
@@ -916,7 +981,9 @@ pub(crate) fn do_rewrite_sharded(
     };
 
     // Phase 1: drain pre-rewrite queued appends into old incr (RAW RESP), fsync.
-    let mut pre_drain = drain_pending_appends(rx, file)?;
+    // task #35: continues the writer's running db context (this IS the
+    // writer's live `file`).
+    let mut pre_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
     info!(
         "TopLevel fold phase1 done: drained {} appends ({:.1}ms)",
@@ -993,7 +1060,7 @@ pub(crate) fn do_rewrite_sharded(
     // would be silently lost when `manifest.advance()` deletes the old incr file
     // at the end of phase 4.  This mirrors the identical bound used by
     // `drain_pending_appends_framed` in `do_rewrite_per_shard`.
-    let mut mid_drain = drain_pending_appends_bounded(rx, file, pending_aof_count)?;
+    let mut mid_drain = drain_pending_appends_bounded(rx, file, pending_aof_count, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
     info!(
         "TopLevel fold phase3 done: drained {} mid-appends ({:.1}ms)",
@@ -1019,6 +1086,8 @@ pub(crate) fn do_rewrite_sharded(
             path: new_incr,
             source: e,
         })?;
+    // task #35: fresh incr — replay always starts a segment at db 0.
+    *last_db = 0;
 
     info!(
         "TopLevel AOF rewrite complete: drained {}+{} appends, seq={}",
@@ -1111,6 +1180,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
+    last_db: &mut usize,
 ) -> Result<(), MoonError> {
     use ringbuf::traits::Producer;
     use std::io::Write as _;
@@ -1140,15 +1210,32 @@ pub(crate) fn rewrite_aof_sharded_sync(
         let mut pre_acks: Vec<crate::runtime::channel::OneshotSender<AofAck>> = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                AofMessage::Append { bytes: data, .. } => {
+                AofMessage::Append {
+                    db, bytes: data, ..
+                } => {
+                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                        old_file.write_all(&sel).map_err(|e| AofError::Io {
+                            path: aof_path.to_path_buf(),
+                            source: e,
+                        })?;
+                    }
                     old_file.write_all(&data).map_err(|e| AofError::Io {
                         path: aof_path.to_path_buf(),
                         source: e,
                     })?;
                 }
                 AofMessage::AppendSync {
-                    bytes: data, ack, ..
+                    db,
+                    bytes: data,
+                    ack,
+                    ..
                 } => {
+                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                        old_file.write_all(&sel).map_err(|e| AofError::Io {
+                            path: aof_path.to_path_buf(),
+                            source: e,
+                        })?;
+                    }
                     old_file.write_all(&data).map_err(|e| AofError::Io {
                         path: aof_path.to_path_buf(),
                         source: e,
@@ -1250,7 +1337,15 @@ pub(crate) fn rewrite_aof_sharded_sync(
         while drained < pending_aof_count {
             match rx.try_recv() {
                 Ok(msg) => match msg {
-                    AofMessage::Append { bytes: data, .. } => {
+                    AofMessage::Append {
+                        db, bytes: data, ..
+                    } => {
+                        if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                            old_file.write_all(&sel).map_err(|e| AofError::Io {
+                                path: aof_path.to_path_buf(),
+                                source: e,
+                            })?;
+                        }
                         old_file.write_all(&data).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1258,8 +1353,17 @@ pub(crate) fn rewrite_aof_sharded_sync(
                         drained += 1;
                     }
                     AofMessage::AppendSync {
-                        bytes: data, ack, ..
+                        db,
+                        bytes: data,
+                        ack,
+                        ..
                     } => {
+                        if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                            old_file.write_all(&sel).map_err(|e| AofError::Io {
+                                path: aof_path.to_path_buf(),
+                                source: e,
+                            })?;
+                        }
                         old_file.write_all(&data).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1323,6 +1427,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
             e
         ),
     })?;
+    // task #35: aof_path now points at a brand-new file (RDB base only) —
+    // replay always starts a segment at db 0.
+    *last_db = 0;
 
     info!(
         "rewrite_aof_sharded_sync (tokio) complete: {} bytes ({:.1}ms)",

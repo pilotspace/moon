@@ -765,8 +765,11 @@ pub(super) async fn try_handle_multi_exec(
                 // latency vector for cross-shard traffic sharing this thread.
                 // Each drain iteration is just a try_send per replica, so the
                 // burst is cheap; revisit only if EXEC bodies grow unbounded.
-                for bytes in &aof_entries {
-                    super::ft::record_local_write_db(ctx, conn.selected_db, bytes.clone());
+                // PR #282 review: per-entry db — a SELECT queued inside the
+                // body redirects the commands after it, so the replication
+                // stream must bind each record to ITS execution db.
+                for (entry_db, bytes) in &aof_entries {
+                    super::ft::record_local_write_db(ctx, *entry_db, bytes.clone());
                 }
             }
             // DURABILITY: append every successful write in the body to THIS

@@ -1206,7 +1206,7 @@ mod tests {
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
         // Raw lsn = 42; high bit must end up set on the receive side.
-        pool.try_send_append_ordered(0, 42, bytes::Bytes::from_static(b"x"));
+        pool.try_send_append_ordered(0, 42, 0, bytes::Bytes::from_static(b"x"));
         let msg = rx0.try_recv().expect("ordered append delivered");
         match msg {
             AofMessage::Append { lsn, .. } => {

@@ -668,6 +668,56 @@ pub(super) async fn try_handle_info(
     true
 }
 
+/// Handle WAIT (R1, task #19): block until N replicas acknowledge the current
+/// master offset or the timeout expires; reply with the acked count. Runs at
+/// the connection layer because it awaits — the generic dispatch path is
+/// synchronous (it used to hard-code `:0`). Returns `true` if consumed.
+pub(super) async fn try_handle_wait(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    ctx: &ConnectionContext,
+    responses: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"WAIT") {
+        return false;
+    }
+    let int_arg = |f: &Frame| -> Option<u64> {
+        match f {
+            Frame::BulkString(b) | Frame::SimpleString(b) => {
+                std::str::from_utf8(b).ok()?.trim().parse().ok()
+            }
+            Frame::Integer(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    };
+    let (Some(num_required), Some(timeout_ms)) = (
+        cmd_args.first().and_then(int_arg),
+        cmd_args.get(1).and_then(int_arg),
+    ) else {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'wait' command",
+        )));
+        return true;
+    };
+    // Redis: timeout 0 = block until satisfied. The poll loop is cooperative
+    // (10ms ticks), so an effectively-unbounded deadline cannot starve the
+    // shard thread — cap at one year rather than a literal infinity.
+    let timeout_ms = if timeout_ms == 0 {
+        31_536_000_000
+    } else {
+        timeout_ms
+    };
+    let count = match ctx.repl_state.as_ref() {
+        Some(rs) => {
+            crate::replication::master::wait_for_replicas(num_required as usize, timeout_ms, rs)
+                .await
+        }
+        None => 0,
+    };
+    responses.push(Frame::Integer(count as i64));
+    true
+}
+
 /// Handle READONLY enforcement: reject writes on replicas.
 /// Returns `true` if the command was blocked.
 ///

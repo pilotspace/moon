@@ -249,7 +249,7 @@ async fn run_handshake_and_stream(
         // stream-db in the snapshot-capture stretch, so post-snapshot bytes
         // always re-establish it with an explicit SELECT (task #22).
         cfg.stream_db.store(0, Ordering::Relaxed);
-        stream_commands(&mut stream, cfg).await?;
+        stream_commands(stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
         // Partial resync: stream from current offset
         if let Ok(mut rs) = cfg.repl_state.write() {
@@ -257,7 +257,7 @@ async fn run_handshake_and_stream(
                 *state = ReplicaHandshakeState::Streaming;
             }
         }
-        stream_commands(&mut stream, cfg).await?;
+        stream_commands(stream, cfg).await?;
     } else {
         anyhow::bail!("Unexpected PSYNC response: {:?}", response);
     }
@@ -270,7 +270,48 @@ async fn run_handshake_and_stream(
 /// Master sends RESP-encoded commands in the same format as the WAL (RESP Array frames).
 /// We parse each frame and route it to the correct shard via key_to_shard.
 #[cfg(feature = "runtime-tokio")]
-async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::Result<()> {
+async fn stream_commands(stream: TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    // R1 (task #19): the replica acknowledges its applied offset back to the
+    // master with `REPLCONF ACK <offset>` — the input WAIT needs to resolve.
+    // The socket is split so a dedicated 1s ticker task owns the write half
+    // (Redis's replicationCron cadence; also serves as an idle keepalive for
+    // master-side lag detection), while this loop keeps the read half.
+    let (mut stream, wr) = stream.into_split();
+    let ack_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ack_handle = tokio::spawn({
+        let stop = ack_stop.clone();
+        let repl_state = cfg.repl_state.clone();
+        let mut wr = wr;
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let offset = match repl_state.read() {
+                    Ok(rs) => rs.master_repl_offset.load(Ordering::Relaxed),
+                    Err(_) => break,
+                };
+                if wr.write_all(&encode_replconf_ack(offset)).await.is_err() {
+                    break; // socket dead — the read loop is exiting too
+                }
+            }
+        }
+    });
+    let result = stream_commands_read_loop(&mut stream, cfg).await;
+    ack_stop.store(true, Ordering::Relaxed);
+    ack_handle.abort();
+    result
+}
+
+/// The read/apply half of `stream_commands` (tokio).
+#[cfg(feature = "runtime-tokio")]
+async fn stream_commands_read_loop(
+    stream: &mut tokio::net::tcp::OwnedReadHalf,
+    cfg: &ReplicaTaskConfig,
+) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(65536);
     // Seeded from the task-level slot (NOT 0): a +CONTINUE resume must keep
     // the db context the stream was in when the link dropped — see
@@ -520,14 +561,14 @@ async fn run_handshake_and_stream(
         // stream-db in the snapshot-capture stretch, so post-snapshot bytes
         // always re-establish it with an explicit SELECT (task #22).
         cfg.stream_db.store(0, Ordering::Relaxed);
-        stream_commands(&mut stream, cfg).await?;
+        stream_commands(stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
         if let Ok(mut rs) = cfg.repl_state.write() {
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Streaming;
             }
         }
-        stream_commands(&mut stream, cfg).await?;
+        stream_commands(stream, cfg).await?;
     } else {
         anyhow::bail!("Unexpected PSYNC response: {:?}", response);
     }
@@ -538,7 +579,53 @@ async fn run_handshake_and_stream(
 /// Stream incoming WAL bytes from master under monoio using ownership read.
 #[cfg(feature = "runtime-monoio")]
 async fn stream_commands(
-    stream: &mut monoio::net::TcpStream,
+    stream: monoio::net::TcpStream,
+    cfg: &ReplicaTaskConfig,
+) -> anyhow::Result<()> {
+    // R1 (task #19): acknowledge the applied offset back to the master with
+    // `REPLCONF ACK <offset>` so WAIT resolves. Split the socket: a 1s ticker
+    // task owns the write half (Redis's replicationCron cadence + idle
+    // keepalive for lag detection); this loop keeps the read half. A
+    // timeout-wrapped read was rejected instead: cancelling an in-flight
+    // io_uring read whose CQE already completed DISCARDS those bytes —
+    // silent stream corruption.
+    use monoio::io::Splitable as _;
+    let (mut rd, wr) = stream.into_split();
+    let ack_stop = std::rc::Rc::new(std::cell::Cell::new(false));
+    let ack_handle = monoio::spawn({
+        let stop = ack_stop.clone();
+        let repl_state = cfg.repl_state.clone();
+        let mut wr = wr;
+        async move {
+            use monoio::io::AsyncWriteRentExt;
+            loop {
+                monoio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if stop.get() {
+                    break;
+                }
+                let offset = match repl_state.read() {
+                    Ok(rs) => rs.master_repl_offset.load(Ordering::Relaxed),
+                    Err(_) => break,
+                };
+                let (res, _) = wr.write_all(encode_replconf_ack(offset)).await;
+                if res.is_err() {
+                    break; // socket dead — the read loop is exiting too
+                }
+            }
+        }
+    });
+    let result = stream_commands_read_loop(&mut rd, cfg).await;
+    // Stop the ticker (checked each tick; the write half drops with the task,
+    // closing our side of the socket within ~1s of the read loop ending).
+    ack_stop.set(true);
+    drop(ack_handle);
+    result
+}
+
+/// The read/apply half of `stream_commands` (monoio).
+#[cfg(feature = "runtime-monoio")]
+async fn stream_commands_read_loop(
+    stream: &mut monoio::net::tcp::TcpOwnedReadHalf,
     cfg: &ReplicaTaskConfig,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncReadRent;
@@ -696,4 +783,18 @@ async fn read_rdb_bulk(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
+}
+
+/// RESP-serialize `REPLCONF ACK <offset>` for the replication link (R1).
+fn encode_replconf_ack(offset: u64) -> Vec<u8> {
+    let mut n = itoa::Buffer::new();
+    let off = n.format(offset);
+    let mut ln = itoa::Buffer::new();
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$");
+    buf.extend_from_slice(ln.format(off.len()).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(off.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf
 }
