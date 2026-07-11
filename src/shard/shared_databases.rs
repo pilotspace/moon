@@ -405,18 +405,30 @@ pub fn replay_workspace_wal(shared: &Arc<ShardDatabases>, persistence_dir: &std:
 ///
 /// Operates on `&mut [ShardSliceInit]` — called single-threaded at boot
 /// before shard threads are spawned. No locks needed.
+///
+/// WAL v3 segments for a shard live in `shard-{id}/wal-v3/` (matching
+/// `replay_workspace_wal` / `replay_graph_wal` / `recovery.rs`) — NOT
+/// directly under `shard-{id}/`, which `std::fs::read_dir` (non-recursive)
+/// would silently scan as empty. Every cross-thread `wal_append` blob is
+/// also re-wrapped as `WalRecordType::Command` by the shard event-loop
+/// drain (`event_loop.rs`), so `MqCreate`/`MqAck` records are nested inside
+/// a Command payload on disk; `handle_record` below is shared by both the
+/// direct-type arm (for any legacy/self-written records) and the
+/// Command-unwrap arm, mirroring `replay_workspace_wal`.
 pub fn replay_mq_wal(
     inits: &mut [crate::shard::slice::ShardSliceInit],
     persistence_dir: &std::path::Path,
 ) {
     use std::collections::HashMap;
 
-    use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
+    use crate::persistence::wal_v3::record::{WalRecord, WalRecordType, read_wal_v3_record};
     use crate::storage::stream::StreamId;
 
     for init in inits.iter_mut() {
         let shard_id = init.shard_id;
-        let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+        let wal_dir = persistence_dir
+            .join(format!("shard-{}", shard_id))
+            .join("wal-v3");
         if !wal_dir.exists() {
             continue;
         }
@@ -424,17 +436,34 @@ pub fn replay_mq_wal(
         let mut durable_configs: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut ack_count = 0u64;
 
-        let on_command = &mut |record: &WalRecord| match record.record_type {
+        let mut handle_record = |record_type: WalRecordType, payload: &[u8]| match record_type {
             WalRecordType::MqCreate => {
                 if let Some((queue_key, max_delivery_count)) =
-                    crate::mq::wal::decode_mq_create(&record.payload)
+                    crate::mq::wal::decode_mq_create(payload)
                 {
                     durable_configs.insert(queue_key, max_delivery_count);
                 }
             }
             WalRecordType::MqAck => {
-                if crate::mq::wal::decode_mq_ack(&record.payload).is_some() {
+                if crate::mq::wal::decode_mq_ack(payload).is_some() {
                     ack_count += 1;
+                }
+            }
+            _ => {}
+        };
+
+        let on_command = &mut |record: &WalRecord| match record.record_type {
+            WalRecordType::MqCreate | WalRecordType::MqAck => {
+                handle_record(record.record_type, &record.payload);
+            }
+            WalRecordType::Command => {
+                if let Some(inner) = read_wal_v3_record(&record.payload) {
+                    match inner.record_type {
+                        WalRecordType::MqCreate | WalRecordType::MqAck => {
+                            handle_record(inner.record_type, &inner.payload);
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -728,17 +757,31 @@ pub fn replay_graph_wal_v3(
 }
 
 /// Replay temporal WAL records into per-shard TemporalKvIndex and GraphStore.
+///
+/// WAL v3 segments for a shard live in `shard-{id}/wal-v3/` (matching
+/// `replay_workspace_wal` / `replay_graph_wal` / `recovery.rs`) — NOT
+/// directly under `shard-{id}/`, which `std::fs::read_dir` (non-recursive)
+/// would silently scan as empty. Every cross-thread `wal_append` blob is
+/// also re-wrapped as `WalRecordType::Command` by the shard event-loop
+/// drain (`event_loop.rs`), so `TemporalUpsert`/`GraphTemporal` records are
+/// nested inside a Command payload on disk; `handle_record` below is
+/// shared by both the direct-type arm (for any legacy/self-written
+/// records) and the Command-unwrap arm, mirroring `replay_workspace_wal`.
 pub fn replay_temporal_wal(
     inits: &mut [crate::shard::slice::ShardSliceInit],
     persistence_dir: &std::path::Path,
 ) {
     #[cfg(feature = "graph")]
     use crate::persistence::wal_v3::record::decode_graph_temporal;
-    use crate::persistence::wal_v3::record::{WalRecord, WalRecordType, decode_temporal_upsert};
+    use crate::persistence::wal_v3::record::{
+        WalRecord, WalRecordType, decode_temporal_upsert, read_wal_v3_record,
+    };
 
     for init in inits.iter_mut() {
         let shard_id = init.shard_id;
-        let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+        let wal_dir = persistence_dir
+            .join(format!("shard-{}", shard_id))
+            .join("wal-v3");
         if !wal_dir.exists() {
             continue;
         }
@@ -747,10 +790,10 @@ pub fn replay_temporal_wal(
         #[cfg(feature = "graph")]
         let mut graph_temporal_count = 0usize;
 
-        let on_command = &mut |record: &WalRecord| match record.record_type {
+        let mut handle_record = |record_type: WalRecordType, payload: &[u8]| match record_type {
             WalRecordType::TemporalUpsert => {
                 if let Some((key, valid_from, _system_from, value)) =
-                    decode_temporal_upsert(&record.payload)
+                    decode_temporal_upsert(payload)
                 {
                     let idx = init
                         .temporal_kv_index
@@ -766,7 +809,7 @@ pub fn replay_temporal_wal(
             #[cfg(feature = "graph")]
             WalRecordType::GraphTemporal => {
                 if let Some((entity_id, is_node, valid_to, _system_from)) =
-                    decode_graph_temporal(&record.payload)
+                    decode_graph_temporal(payload)
                 {
                     for named_graph in init.graph_store.iter_graphs_mut() {
                         let found = if is_node {
@@ -791,6 +834,78 @@ pub fn replay_temporal_wal(
                         if found {
                             graph_temporal_count += 1;
                             break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        };
+
+        let on_command = &mut |record: &WalRecord| match record.record_type {
+            WalRecordType::TemporalUpsert => {
+                handle_record(record.record_type, &record.payload);
+            }
+            #[cfg(feature = "graph")]
+            WalRecordType::GraphTemporal => {
+                handle_record(record.record_type, &record.payload);
+            }
+            WalRecordType::Command => {
+                // Try the documented nested-Command unwrap FIRST (the
+                // convention `replay_workspace_wal`/`replay_mq_wal` use, and
+                // the ONLY framing `command::temporal::apply_invalidate`
+                // produces since it started pre-framing GraphTemporal records
+                // with `write_wal_v3_record` — matching how MQ's
+                // `mq_exec.rs::handle_create`/`handle_ack` already pre-frame
+                // MqCreate/MqAck). `read_wal_v3_record` validates a CRC32C
+                // over the inner record, so a false-positive here requires a
+                // CRC collision, not a byte-pattern coincidence. Matching on
+                // the nested type (rather than a separate "did we handle it"
+                // bool) doubles as the dispatch to the legacy fallback below:
+                // the `_` arm covers BOTH "no valid nested record at all" and
+                // "a nested record of some other type" — either way, a
+                // pre-framed NEW TemporalUpsert/GraphTemporal record is
+                // already fully handled by the arms above and never reaches
+                // the fallback.
+                match read_wal_v3_record(&record.payload) {
+                    Some(inner) if inner.record_type == WalRecordType::TemporalUpsert => {
+                        handle_record(inner.record_type, &inner.payload);
+                    }
+                    #[cfg(feature = "graph")]
+                    Some(inner) if inner.record_type == WalRecordType::GraphTemporal => {
+                        handle_record(inner.record_type, &inner.payload);
+                    }
+                    _ => {
+                        // Legacy fallback for WAL segments written BEFORE
+                        // `apply_invalidate` pre-framed its record: those
+                        // pushed the RAW `encode_graph_temporal` bytes
+                        // directly as the Command payload (verified against
+                        // real on-disk bytes: exactly the 25-byte
+                        // `[entity_id:8][is_node:1][valid_to:8][system_from:8]`
+                        // layout, no nested record header/CRC).
+                        //
+                        // The old discriminator (`payload[0] != b'*'`, i.e.
+                        // "doesn't look like a RESP array") was WRONG: it
+                        // misread any legitimate record whose entity_id's low
+                        // byte was 0x2A ('*') as a RESP command and silently
+                        // dropped the invalidation.
+                        // `decode_graph_temporal_legacy_raw` replaces it with
+                        // decode-time sanity checks (is_node byte must be
+                        // literally 0/1, both timestamps must be plausible)
+                        // instead of a single leading-byte guess. This does
+                        // not fully eliminate the ambiguity — a CRC-free
+                        // 25-byte blob can in principle still coincide with a
+                        // real RESP payload that also passes the sanity gate
+                        // — but that residual window only affects WAL
+                        // segments written before this fix ships, and closes
+                        // as those segments recycle via normal WAL/checkpoint
+                        // rotation.
+                        #[cfg(feature = "graph")]
+                        if crate::persistence::wal_v3::record::decode_graph_temporal_legacy_raw(
+                            &record.payload,
+                        )
+                        .is_some()
+                        {
+                            handle_record(WalRecordType::GraphTemporal, &record.payload);
                         }
                     }
                 }
@@ -971,5 +1086,341 @@ mod tests {
         let unlimited = rt_config(0, 2);
         assert_eq!(shared2.recompute_elastic_budget(0, &unlimited), 0);
         assert_eq!(shared2.elastic_budget(0), 0);
+    }
+
+    // ── task #42 (P0 data loss): replay_mq_wal dir-join + nested-Command
+    // unwrap ─────────────────────────────────────────────────────────────
+    //
+    // Why this is a real-file, function-level test rather than a live
+    // spawned-server round trip (the `replay_workspace_wal`/`replay_temporal_wal`
+    // model in tests/shardslice_live.rs / tests/crash_recovery_temporal_mq.rs):
+    // proving `replay_mq_wal` end to end through a real server requires the
+    // underlying `Stream` to survive the restart at all. It does NOT, in ANY
+    // config that also produces the WAL v3 file this function reads:
+    //   - WAL v3 is only initialized when `appendonly_enabled` is true
+    //     (event_loop.rs's `wal_shard_dir` gate) — so proving this fix live
+    //     needs `--appendonly yes`.
+    //   - With `--appendonly yes`, `main.rs`'s multi-part AOF replay is
+    //     unconditionally authoritative: it `db.clear()`s every database and
+    //     rebuilds solely from the AOF manifest, for BOTH the single-shard and
+    //     PerShard (`--shards >= 2`) layouts (main.rs ~1246-1253, ~1307-1315).
+    //     MQ.CREATE/PUSH/POP never log to the AOF (`mq_exec.rs` bypasses
+    //     `cmd_dispatch` entirely — confirmed by spawning a real server,
+    //     BGSAVE-ing after MQ.CREATE, and finding `TYPE <queue>` => `none`
+    //     after a restart despite the `.rrdshard` snapshot having reported
+    //     "loaded 1 keys from snapshot"). So the Stream this function is
+    //     supposed to re-mark `durable` on is wiped before replay ever runs,
+    //     regardless of this fix. That gap is a separate, deeper MQ
+    //     persistence hole (MQ mutations have no AOF durability at all) —
+    //     out of scope for this task's minimal dir/unwrap fix, and NOT
+    //     something `--wal-kv-log` or any existing flag works around.
+    // This test instead proves the two named defects directly: write a REAL
+    // wal-v3 segment (via the same `WalWriterV3`/`write_wal_v3_record` calls
+    // `mq_exec.rs::handle_create`/`handle_ack` make, nested exactly as the
+    // shard event-loop drain leaves them on disk — verified byte-for-byte
+    // against a live-captured segment), seed a `Stream` shaped like a
+    // `.rrdshard`-restored one (`durable: false`, default `max_delivery_count`,
+    // a pending PEL entry), call `replay_mq_wal`, and assert the registry +
+    // stream + cursor are restored.
+    fn write_mq_wal_records(
+        dir: &std::path::Path,
+        shard_id: usize,
+        inner_records: &[(crate::persistence::wal_v3::record::WalRecordType, Vec<u8>)],
+    ) {
+        use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
+        use crate::persistence::wal_v3::segment::WalWriterV3;
+
+        let wal_dir = dir.join(format!("shard-{}", shard_id)).join("wal-v3");
+        let mut writer =
+            WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024).expect("create WalWriterV3");
+        for (rtype, payload) in inner_records {
+            let mut inner_buf = Vec::new();
+            write_wal_v3_record(&mut inner_buf, 0, *rtype, payload);
+            writer.append(WalRecordType::Command, &inner_buf);
+        }
+        writer.flush_sync().expect("flush wal segment");
+    }
+
+    #[test]
+    fn test_replay_mq_wal_restores_registry_and_rolls_back_cursor() {
+        use crate::mq::wal::{encode_mq_ack, encode_mq_create};
+        use crate::persistence::wal_v3::record::WalRecordType;
+        use crate::storage::stream::{PendingEntry, StreamId};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"orders".to_vec();
+        let group_name = bytes::Bytes::from_static(b"__mq_consumers");
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        {
+            let db = inits[0].databases.get_mut(0).expect("db 0");
+            let stream = db.get_or_create_stream(&queue_key).expect("create stream");
+            stream
+                .create_group(group_name.clone(), StreamId::ZERO)
+                .expect("create group");
+            assert!(
+                !stream.durable,
+                "sanity: a .rrdshard-restored stream starts non-durable \
+                 (rdb.rs's TYPE_STREAM body has no durable/max_delivery_count bytes)"
+            );
+            let group = stream.groups.get_mut(&group_name).expect("group");
+            // Simulate a crash mid-delivery: one message claimed but not yet
+            // acked survived (via the KV plane) in the PEL.
+            group.last_delivered_id = StreamId { ms: 100, seq: 5 };
+            group.pel.insert(
+                StreamId { ms: 100, seq: 5 },
+                PendingEntry {
+                    consumer: bytes::Bytes::from_static(b"__mq_default"),
+                    delivery_time: 0,
+                    delivery_count: 1,
+                },
+            );
+        }
+
+        // Real WAL v3 bytes, nested exactly as the shard event-loop drain
+        // produces them (bug (b): a naive `record.record_type` match never
+        // sees these, since the outer type is always Command).
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(&queue_key, 7)),
+                (WalRecordType::MqAck, encode_mq_ack(&queue_key, 100, 5)),
+            ],
+        );
+
+        // Written at `<dir>/shard-0/wal-v3/...` (bug (a): the pre-fix
+        // function scanned `<dir>/shard-0/` directly, a non-recursive
+        // `read_dir` over an otherwise-empty directory).
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let reg = inits[0]
+            .durable_queue_registry
+            .as_ref()
+            .expect("MqCreate record must populate durable_queue_registry");
+        let config = reg
+            .get(&queue_key)
+            .expect("queue must be registered after replay");
+        assert_eq!(config.max_delivery_count, 7);
+
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let stream = db
+            .get_stream_mut(&queue_key)
+            .expect("get_stream_mut")
+            .expect("stream must still exist");
+        assert!(
+            stream.durable,
+            "replay must restore durable=true from the MqCreate WAL record"
+        );
+        assert_eq!(stream.max_delivery_count, 7);
+
+        let group = stream.groups.get(&group_name).expect("group");
+        assert_eq!(
+            group.last_delivered_id,
+            StreamId { ms: 100, seq: 4 },
+            "cursor-rollback must rewind last_delivered_id to just before the \
+             sole PEL entry (ms=100,seq=5) so MQ.POP redelivers it"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop() {
+        // Regression guard for bug (a): files sitting directly under
+        // `shard-{id}/` (the pre-fix scan path) must NOT be picked up by the
+        // fixed function -- it must look under `shard-{id}/wal-v3/` only.
+        // A stray file at the old (wrong) location must not be misread as a
+        // WAL v3 segment (`replay_wal_v3_file` would reject it, but the
+        // directory must not even be scanned).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).expect("mkdir shard-0");
+        std::fs::write(shard_dir.join("000000000001.wal"), b"not a real segment")
+            .expect("write stray file");
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        replay_mq_wal(&mut inits, tmp.path());
+
+        assert!(
+            inits[0].durable_queue_registry.is_none(),
+            "no shard-0/wal-v3/ directory exists -- replay must be a no-op, \
+             not scan shard-0/ directly"
+        );
+    }
+
+    // ── CodeRabbit review finding 2 (PR #286): replay_temporal_wal's
+    // GraphTemporal legacy-raw-fallback discriminator ───────────────────────
+    //
+    // Pre-fix, the raw (unframed) GraphTemporal Command payload was
+    // discriminated from a RESP command payload by `payload[0] != b'*'` --
+    // WRONG whenever the entity_id's low byte happened to be 0x2A ('*'),
+    // which silently dropped the invalidation on replay. The fix:
+    // (a) `apply_invalidate` now pre-frames NEW records with
+    //     `write_wal_v3_record` (WalRecordType::GraphTemporal), so the
+    //     existing nested-Command unwrap recovers them unambiguously by
+    //     type tag + CRC -- no first-byte guessing needed.
+    // (b) the raw-legacy fallback (still needed for WAL segments written
+    //     before this fix) is gated by `decode_graph_temporal_legacy_raw`'s
+    //     decode-time sanity checks instead of the first-byte guess.
+
+    #[cfg(feature = "graph")]
+    fn write_temporal_wal_command(dir: &std::path::Path, shard_id: usize, command_payload: &[u8]) {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        use crate::persistence::wal_v3::segment::WalWriterV3;
+
+        let wal_dir = dir.join(format!("shard-{}", shard_id)).join("wal-v3");
+        let mut writer =
+            WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024).expect("create WalWriterV3");
+        writer.append(WalRecordType::Command, command_payload);
+        writer.flush_sync().expect("flush wal segment");
+    }
+
+    #[cfg(feature = "graph")]
+    fn seed_node(
+        inits: &mut [crate::shard::slice::ShardSliceInit],
+        graph_name: &[u8],
+        entity_id: u64,
+    ) {
+        let gs = &mut inits[0].graph_store;
+        gs.create_graph(bytes::Bytes::copy_from_slice(graph_name), 1000, 1)
+            .expect("create_graph");
+        let named = gs.get_graph_mut(graph_name).expect("graph exists");
+        named.write_buf.add_node_with_id(
+            entity_id,
+            smallvec::SmallVec::new(),
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    fn node_valid_to(
+        inits: &mut [crate::shard::slice::ShardSliceInit],
+        graph_name: &[u8],
+        entity_id: u64,
+    ) -> i64 {
+        let nk: crate::graph::types::NodeKey = slotmap::KeyData::from_ffi(entity_id).into();
+        let gs = &mut inits[0].graph_store;
+        let named = gs.get_graph_mut(graph_name).expect("graph exists");
+        named
+            .write_buf
+            .get_node_mut(nk)
+            .expect("node exists")
+            .valid_to
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_replay_temporal_wal_legacy_raw_0x2a_entity_low_byte_is_applied() {
+        // RED (pre-fix): entity_id's low byte is 0x2A ('*') -- the OLD
+        // `payload[0] != b'*'` discriminator misread this legitimate raw
+        // GraphTemporal record as a RESP command and skipped it, leaving
+        // valid_to stuck at the default i64::MAX.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graph_name = b"tg".as_slice();
+        let entity_id: u64 = (1u64 << 32) | 0x2A; // version=1 (odd/valid), index low byte = 0x2A
+        let valid_to: i64 = 1_700_000_000_123;
+        let system_from: i64 = 1_700_000_000_000;
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        seed_node(&mut inits, graph_name, entity_id);
+
+        let raw_payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+            entity_id,
+            true,
+            valid_to,
+            system_from,
+        );
+        assert_eq!(
+            raw_payload.first(),
+            Some(&b'*'),
+            "sanity: this entity_id must reproduce the reported 0x2A collision \
+             (test setup, not the assertion under test)"
+        );
+        write_temporal_wal_command(tmp.path(), 0, &raw_payload);
+
+        replay_temporal_wal(&mut inits, tmp.path());
+
+        assert_eq!(
+            node_valid_to(&mut inits, graph_name, entity_id),
+            valid_to,
+            "legacy raw GraphTemporal record must be applied even when its \
+             entity_id's low byte is 0x2A"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_replay_temporal_wal_framed_producer_record_roundtrips() {
+        // GREEN: a NEW record, framed the way `apply_invalidate` frames it
+        // post-fix (write_wal_v3_record(GraphTemporal) nested inside the
+        // outer Command the event-loop drain always wraps local writes in).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graph_name = b"tg2".as_slice();
+        let entity_id: u64 = (1u64 << 32) | 7;
+        let valid_to: i64 = 1_777_777_777_777;
+        let system_from: i64 = 1_777_777_777_000;
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        seed_node(&mut inits, graph_name, entity_id);
+
+        let inner_payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+            entity_id,
+            true,
+            valid_to,
+            system_from,
+        );
+        let mut framed = Vec::new();
+        crate::persistence::wal_v3::record::write_wal_v3_record(
+            &mut framed,
+            0,
+            crate::persistence::wal_v3::record::WalRecordType::GraphTemporal,
+            &inner_payload,
+        );
+        write_temporal_wal_command(tmp.path(), 0, &framed);
+
+        replay_temporal_wal(&mut inits, tmp.path());
+
+        assert_eq!(
+            node_valid_to(&mut inits, graph_name, entity_id),
+            valid_to,
+            "a pre-framed GraphTemporal record must replay via the nested-Command unwrap"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_replay_temporal_wal_rejects_resp_shaped_25_byte_payload() {
+        // Adversarial: a 25-byte payload that opens with a byte matching the
+        // old (now-removed) `b'*'` legacy discriminator, mimicking a RESP
+        // command payload, must NOT be misdecoded into a spurious
+        // invalidation. `is_node` (byte 8) is 0xFF -- neither 0 nor 1 --
+        // which `decode_graph_temporal_legacy_raw`'s sanity gate rejects
+        // regardless of the rest of the bytes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graph_name = b"tg3".as_slice();
+        let entity_id: u64 = (1u64 << 32) | 99;
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        seed_node(&mut inits, graph_name, entity_id);
+
+        let mut payload = vec![0u8; 25];
+        payload[0] = b'*';
+        payload[8] = 0xFF; // invalid is_node discriminant -- must be rejected
+        write_temporal_wal_command(tmp.path(), 0, &payload);
+
+        replay_temporal_wal(&mut inits, tmp.path());
+
+        assert_eq!(
+            node_valid_to(&mut inits, graph_name, entity_id),
+            i64::MAX,
+            "a RESP-shaped 25-byte payload with an invalid is_node byte must \
+             never be misdecoded into a spurious invalidation"
+        );
     }
 }
