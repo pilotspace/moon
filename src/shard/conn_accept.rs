@@ -192,6 +192,9 @@ pub(crate) fn spawn_tokio_connection(
                 spill_sender.clone(),
                 spill_file_id.clone(),
                 disk_offload_dir.clone(),
+                num_shards,
+                rs.clone(),
+                aof_pool.as_ref().map(Arc::clone),
             );
             *lua_opt = Some(
                 crate::scripting::setup_lua_vm(eviction_ctx).expect("Lua VM initialization failed"),
@@ -425,6 +428,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
                         spill_sender.clone(),
                         spill_file_id.clone(),
                         disk_offload_dir.clone(),
+                        num_shards,
+                        rs.clone(),
+                        aof_pool.as_ref().map(Arc::clone),
                     );
                     *lua_opt = Some(
                         crate::scripting::setup_lua_vm(eviction_ctx)
@@ -602,6 +608,9 @@ pub(crate) fn spawn_monoio_connection(
                         spill_tx.clone(),
                         spill_fid.clone(),
                         do_dir.clone(),
+                        num_shards,
+                        rs.clone(),
+                        aof_pool.as_ref().map(Arc::clone),
                     );
                     *lua_opt = Some(
                         crate::scripting::setup_lua_vm(eviction_ctx)
@@ -1007,6 +1016,9 @@ pub(crate) fn spawn_migrated_monoio_connection(
                         spill_sender.clone(),
                         spill_file_id.clone(),
                         disk_offload_dir.clone(),
+                        num_shards,
+                        rs.clone(),
+                        aof_pool.as_ref().map(Arc::clone),
                     );
                     *lua_opt = Some(
                         crate::scripting::setup_lua_vm(eviction_ctx)

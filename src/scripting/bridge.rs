@@ -5,16 +5,44 @@
 //! 1. Each shard is single-threaded (no concurrent access)
 //! 2. The pointer is valid for the entire duration of script execution
 //! 3. The pointer is cleared immediately after script execution
+//!
+//! ## Write-effects replication (task #34 Wave A part 2)
+//!
+//! `EVAL`/`EVALSHA` deliberately carry no `WRITE` command-metadata flag (see
+//! `command::metadata::eval_evalsha_never_write_flagged`), so the generic
+//! per-command AOF/replication gate in `handler_monoio` never sees the
+//! literal `EVAL <script> ...` invocation. Instead, [`make_redis_call_fn`]
+//! itself records each successfully-executed, `WRITE`-flagged inner
+//! `redis.call`/`redis.pcall` to both durability planes as it happens (see
+//! [`LuaEvictionCtx::emit_effect`] / `replication::reason_del::
+//! record_effect_write`) — this is the ONLY emission path for a script's
+//! writes. Flipping EVAL/EVALSHA to `WRITE` would double-log every write a
+//! script makes (the generic gate would replay the raw EVAL a second time
+//! on top of the effect records already emitted here) — do not do that.
+//!
+//! `FCALL` (unlike EVAL/EVALSHA) IS `WRITE`-flagged, mirroring upstream
+//! Redis Functions (FCALL always requires write permission; FCALL_RO is the
+//! read-only variant) — but that flag only feeds ACL / `READONLY`-replica
+//! gating. `try_handle_functions` always consumes FCALL with `continue`
+//! before the generic per-command AOF/replication block runs, so FCALL
+//! rides the exact same single-emission bridge path as EVAL/EVALSHA.
+//!
+//! `redis.call('SELECT', ...)` is rejected with a loud script error rather
+//! than executed — see the intercept in [`make_redis_call_fn`] for why
+//! silently allowing it would corrupt state.
 
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use mlua::prelude::*;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
+use crate::replication::state::ReplicationState;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::engine::StorageEngine;
 use crate::storage::eviction::{
@@ -52,6 +80,18 @@ struct LuaEvictionInner {
     spill_sender: Option<flume::Sender<SpillRequest>>,
     spill_file_id: Rc<Cell<u64>>,
     disk_offload_dir: Option<PathBuf>,
+    /// Wave A part 2 (task #34): handles for dual-plane (AOF + replication)
+    /// emission of a script's write effects. See
+    /// [`LuaEvictionCtx::emit_effect`]. Only read under `runtime-monoio`
+    /// (master-side PSYNC and the shard self-msg relay this rides on are
+    /// monoio-only) — kept unconditional in the struct so every call site
+    /// stays feature-uniform instead of growing a second constructor.
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    num_shards: usize,
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    aof_pool: Option<Arc<AofWriterPool>>,
 }
 
 impl LuaEvictionCtx {
@@ -64,6 +104,13 @@ impl LuaEvictionCtx {
     }
 
     /// Real gate, built from the shard's own handles at VM-setup time.
+    ///
+    /// `num_shards`/`repl_state`/`aof_pool` are the same handles
+    /// `ConnectionContext` carries — threaded through here so a script's
+    /// write effects (Wave A part 2) reach both durability planes exactly
+    /// like every other write path. They are stable for the shard's entire
+    /// lifetime, same as the pre-existing eviction handles this ctx already
+    /// caches once per shard.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_databases: Arc<ShardDatabases>,
@@ -72,6 +119,9 @@ impl LuaEvictionCtx {
         spill_sender: Option<flume::Sender<SpillRequest>>,
         spill_file_id: Rc<Cell<u64>>,
         disk_offload_dir: Option<PathBuf>,
+        num_shards: usize,
+        repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+        aof_pool: Option<Arc<AofWriterPool>>,
     ) -> Self {
         LuaEvictionCtx(Some(LuaEvictionInner {
             shard_databases,
@@ -80,6 +130,9 @@ impl LuaEvictionCtx {
             spill_sender,
             spill_file_id,
             disk_offload_dir,
+            num_shards,
+            repl_state,
+            aof_pool,
         }))
     }
 
@@ -121,6 +174,40 @@ impl LuaEvictionCtx {
         // WS5b: per-db quota, additive and finer-grained than the
         // whole-instance maxmemory gate above. Zero-cost when unconfigured.
         crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt)
+    }
+
+    /// Wave A part 2 (task #34): dual-plane (AOF + replication) emission of
+    /// one successfully-executed script write effect. Called from
+    /// `make_redis_call_fn` immediately after a W-flagged `redis.call`/
+    /// `redis.pcall` inner command returns a non-error `Frame` — so effects
+    /// emit as they happen (a script that writes two keys then errors on a
+    /// third still durably records the first two).
+    ///
+    /// `db_index` is the CONNECTION's selected db, unchanged for the whole
+    /// script now that `redis.call('SELECT', ...)` is rejected before
+    /// dispatch (see `make_redis_call_fn`) — there is exactly one db per
+    /// script execution.
+    ///
+    /// No-op for a disabled ctx (unit tests) and under `runtime-tokio`
+    /// (master-side PSYNC and the shard self-msg relay this rides on are
+    /// monoio-only — see `replication::reason_del::record_effect_write`).
+    fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame]) {
+        let Some(_inner) = self.0.as_ref() else {
+            return;
+        };
+        #[cfg(feature = "runtime-monoio")]
+        crate::replication::reason_del::record_effect_write(
+            &_inner.repl_state,
+            _inner.shard_id,
+            _inner.num_shards,
+            _inner.aof_pool.as_ref(),
+            db_index,
+            cmd_and_args,
+        );
+        #[cfg(not(feature = "runtime-monoio"))]
+        {
+            let _ = (db_index, cmd_and_args);
+        }
     }
 }
 
@@ -212,6 +299,21 @@ pub fn make_redis_call_fn(
             let mut db_idx = CURRENT_DB_IDX.with(|c| c.get());
             let db_count = CURRENT_DB_COUNT.with(|c| c.get());
 
+            // Wave A (task #34): `redis.call('SELECT', ...)` used to silently
+            // corrupt state — the generic dispatch SELECT handler mutates
+            // only the LOCAL `db_idx` below, but every write in this closure
+            // still lands on `db`, the ONE `Database` this script execution
+            // is pinned to (the `CURRENT_DB` thread-local is set once, by
+            // `set_script_db`, before the script starts). A script that
+            // called SELECT therefore kept writing the ORIGINAL db while
+            // looking like it had switched. Fail loud instead of corrupting
+            // a second db; a real multi-db-scripts feature is a follow-up.
+            if cmd_bytes.eq_ignore_ascii_case(b"SELECT") {
+                return Ok(Frame::Error(Bytes::from_static(
+                    b"ERR SELECT inside scripts is not supported by moon yet",
+                )));
+            }
+
             // Reject non-readonly commands in read-only mode (FCALL_RO / EVAL_RO)
             // Use positive allowlist (READONLY flag) instead of negative blocklist (!WRITE)
             // to also block PUBLISH and other side-effecting commands.
@@ -236,6 +338,18 @@ pub fn make_redis_call_fn(
             }
 
             let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
+
+            // Wave A part 2 (task #34): dual-plane (AOF + replication)
+            // emission of the effect, immediately after each successful
+            // write — not batched to script end, so a partially-failing
+            // script still durably records its completed writes. Skipped
+            // for FCALL_RO / EVAL_RO (`cmd_is_write` implies the read-only
+            // gate above already passed, so a write here only happens in a
+            // normal read-write script).
+            if cmd_is_write && !matches!(frame, Frame::Error(_)) {
+                eviction_ctx.emit_effect(db_idx, &frames);
+            }
+
             Ok(frame)
         })?;
 

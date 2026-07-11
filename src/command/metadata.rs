@@ -1015,6 +1015,34 @@ mod tests {
         }
     }
 
+    /// Wave A part 2 (task #34) double-apply guard: EVAL/EVALSHA must NEVER
+    /// gain the `WRITE` flag. `scripting::bridge::make_redis_call_fn` records
+    /// each successful inner `redis.call` write effect to the AOF/
+    /// replication planes itself (the ONLY emission for a script's writes —
+    /// there is no derived-from-metadata second emission). If EVAL/EVALSHA
+    /// were flagged `WRITE`, the generic per-command AOF/replication gate in
+    /// `handler_monoio::mod.rs` would ALSO record the literal `EVAL <script>
+    /// ...` command verbatim, and a replica replaying both the fused-effect
+    /// records AND the raw EVAL command would double-apply every write the
+    /// script made (e.g. an `INCR` landing as 2 instead of 1). FCALL is
+    /// deliberately excluded here: it IS `WRITE`-flagged (mirrors upstream
+    /// Redis Functions, where FCALL always requires write permission and
+    /// FCALL_RO is the read-only variant), but that flag only feeds ACL /
+    /// `READONLY`-replica gating — `try_handle_functions` always consumes
+    /// FCALL with `continue` before the generic per-command AOF/replication
+    /// block, so it never gets a second, redundant recording either.
+    #[test]
+    fn eval_evalsha_never_write_flagged() {
+        assert!(
+            !is_write(b"EVAL"),
+            "EVAL must not carry the WRITE flag — see scripting::bridge module docs"
+        );
+        assert!(
+            !is_write(b"EVALSHA"),
+            "EVALSHA must not carry the WRITE flag — see scripting::bridge module docs"
+        );
+    }
+
     /// Registry has a reasonable number of entries.
     #[test]
     fn command_count_reasonable() {

@@ -43,6 +43,64 @@ replay (the AOF never recorded the DEL, only the original SET/write).
   and cross-db `COPY ... DB n` destination eviction do not yet emit —
   tracked as follow-ups.
 
+### Added — Wave A part 2: Lua script write-effect replication + SELECT lockout (task #34)
+
+Continues part 1: a Lua script's `redis.call`/`redis.pcall` write effects
+previously reached NEITHER durability plane — `EVAL`/`EVALSHA` carry no
+`WRITE` command-metadata flag (by design, see below), so the generic
+per-command AOF/replication gate never saw them. A script's writes vanished
+on `kill -9` + restart against `--appendonly yes`, and an attached replica
+never observed them at all. `redis.call('SELECT', ...)` inside a script also
+silently corrupted state: dispatch's SELECT handler mutated only a local
+variable, so every subsequent write in the script kept landing in the
+ORIGINAL db while looking like it had switched.
+
+- `scripting::bridge::make_redis_call_fn` now records every successfully-
+  executed, `WRITE`-flagged inner command to both the AOF and replication
+  planes itself, immediately after each `redis.call`/`redis.pcall` returns
+  (not batched to script end) — a script that writes two keys and then
+  errors on a third still durably records the first two. New
+  `replication::reason_del::record_effect_write` (+ shared
+  `record_bytes_conn` core, refactored out of part 1's
+  `record_reason_del_conn`) does the emission: same fused-`SELECT`/backlog/
+  offset/fan-out mechanics as every other write path, recording the
+  verbatim `cmd + args` the script invoked.
+- `LuaEvictionCtx` (built once per shard at Lua-VM setup, already caching
+  the OOM eviction handles) now also carries `num_shards`/`repl_state`/
+  `aof_pool` for this emission — one addition at each of the 5 production
+  construction sites (4 in `shard::conn_accept`, 1 in
+  `server::conn::core::ConnectionContext::build_lua_eviction_ctx`, shared by
+  EVAL/EVALSHA and FCALL/FCALL_RO, which route through the identical
+  bridge closure).
+- `redis.call('SELECT', ...)` inside any script now fails loud with
+  `ERR SELECT inside scripts is not supported by moon yet` instead of
+  silently corrupting state — intercepted before dispatch, so no partial
+  write from the same call ever lands. A real multi-db-scripts feature is a
+  follow-up.
+- Deliberately did NOT flip `EVAL`/`EVALSHA` to `WRITE` in the command
+  metadata table — that would make the generic per-command AOF/replication
+  gate ALSO record the literal `EVAL <script> ...` invocation on top of the
+  effect records above, double-applying every write the script made (e.g.
+  an `INCR` landing as 2 instead of 1). Guarded by a new unit test
+  (`command::metadata::eval_evalsha_never_write_flagged`) and a black-box
+  regression test (`eval_incr_no_double_apply`). `FCALL` (unlike EVAL) IS
+  `WRITE`-flagged — mirrors upstream Redis Functions and only feeds ACL /
+  `READONLY`-replica gating, since `try_handle_functions` always consumes
+  FCALL before the generic AOF/replication block runs; it rides the same
+  single-emission bridge path.
+- Turns the 4 remaining RED tests in `tests/replication_planes.rs` green:
+  `eval_effects_parity_shards1`, `eval_effects_parity_shards4`,
+  `eval_writes_survive_restart`, `select_in_script_errors`. All 9 tests in
+  the suite (the 5 from part 1 plus the new `eval_incr_no_double_apply`)
+  pass.
+- Known gap, unchanged from today: a write-`EVAL` issued directly against a
+  read-only replica is not rejected (`try_enforce_readonly` only gates on
+  the `WRITE` metadata flag, which EVAL intentionally lacks) — tracked as a
+  follow-up; replicas never receive `EVAL` itself via replication (only the
+  effect records), so this cannot cause replication divergence, only local
+  replica-side corruption if a client is misdirected to write against a
+  replica directly.
+
 ### Fixed — test-harness port-flake sweep (task #18)
 
 33 integration suites that spawn a real `moon` process shared a copy-pasted

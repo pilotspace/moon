@@ -943,3 +943,77 @@ fn select_in_script_errors() {
         db1_val
     );
 }
+
+// ============================================================================
+// Scenario 7: eval_incr_no_double_apply — targeted double-apply regression
+// guard for Wave A part 2 (task #34). EVAL/EVALSHA deliberately carry no
+// WRITE command-metadata flag so the generic per-command AOF/replication
+// gate never records the literal `EVAL <script> ...` invocation; ONLY the
+// Lua bridge's own effect emission (`scripting::bridge::make_redis_call_fn`)
+// records the inner `redis.call('INCR', ...)`. If that invariant were ever
+// violated (e.g. someone flips EVAL to WRITE, or the bridge emission fired
+// twice per call), a single scripted INCR would land as 2 instead of 1 on
+// the master itself, on the replica, or both.
+// ============================================================================
+
+#[test]
+#[ignore]
+fn eval_incr_no_double_apply() {
+    let (master_port, replica_port) = (17381, 17382);
+    let mdir = tempfile::tempdir().expect("mdir");
+    let rdir = tempfile::tempdir().expect("rdir");
+    let master = start_moon(
+        master_port,
+        mdir.path().to_str().unwrap(),
+        1,
+        &["--appendonly", "no"],
+    );
+    let replica = start_moon(
+        replica_port,
+        rdir.path().to_str().unwrap(),
+        1,
+        &["--appendonly", "no"],
+    );
+    let mut guard = Guard(vec![master, replica]);
+    let m = format!("127.0.0.1:{}", master_port);
+    let r = format!("127.0.0.1:{}", replica_port);
+    await_ready(&m);
+    await_ready(&r);
+    assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
+    await_link_up(&r);
+
+    // A single EVAL wrapping a single INCR: if the effect were emitted more
+    // than once (or the raw EVAL were ALSO replayed on top of the effect),
+    // the counter would read 2 rather than 1.
+    let script = "return redis.call('INCR', KEYS[1])";
+    let reply = send_resp(&m, &["EVAL", script, "1", "noda:ctr"]);
+    assert_eq!(
+        reply.trim(),
+        ":1",
+        "setup: first EVAL INCR should return 1, got: {:?}",
+        reply
+    );
+
+    // FEATURE ASSERTION: the master's OWN value must be exactly 1 —
+    // `db.execute_command` inside the bridge runs the INCR exactly once;
+    // effect emission never re-executes it.
+    assert_eq!(
+        send_cmd(&m, "GET noda:ctr"),
+        "1",
+        "master applied the scripted INCR more than once"
+    );
+
+    // FEATURE ASSERTION: the replica must converge to the SAME value (1),
+    // not 2 — proves the effect record was emitted exactly once onto the
+    // replication plane, not once via bridge emission AND again via a
+    // (forbidden) generic write-path recording of the raw EVAL command.
+    assert!(
+        wait_until(Duration::from_secs(10), || send_cmd(&r, "GET noda:ctr")
+            == "1"),
+        "replica did not converge to the scripted INCR's value (double-apply \
+         would show 2): got {:?}",
+        send_cmd(&r, "GET noda:ctr")
+    );
+
+    guard.0.clear();
+}
