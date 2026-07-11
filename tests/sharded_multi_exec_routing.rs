@@ -17,18 +17,12 @@
 //! Skips gracefully when the moon binary is missing (MOON_BIN pin wins, then
 //! target/release, then target/debug).
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
@@ -56,13 +50,10 @@ impl Moon {
     }
 }
 
-/// Spawn moon at `--shards 4`. `durable` selects `appendonly yes` +
-/// `appendfsync always` (for the restart test) vs `appendonly no`.
-fn spawn_moon(port: u16, dir: &std::path::Path, durable: bool) -> Option<Moon> {
-    let bin = moon_binary()?;
+/// `durable` selects `appendonly yes` + `appendfsync always` (for the restart
+/// test) vs `appendonly no`. Always `--shards 4`.
+fn moon_args(dir: &std::path::Path, durable: bool) -> Vec<String> {
     let mut args: Vec<String> = vec![
-        "--port".into(),
-        port.to_string(),
         "--shards".into(),
         "4".into(),
         "--admin-port".into(),
@@ -78,13 +69,10 @@ fn spawn_moon(port: u16, dir: &std::path::Path, durable: bool) -> Option<Moon> {
     } else {
         args.extend(["--appendonly".into(), "no".into()]);
     }
-    let child = Command::new(&bin)
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let moon = Moon { child, port };
+    args
+}
+
+fn wait_moon_ready(moon: Moon) -> Option<Moon> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(mut c) = TcpStream::connect(("127.0.0.1", moon.port)) {
@@ -100,8 +88,38 @@ fn spawn_moon(port: u16, dir: &std::path::Path, durable: bool) -> Option<Moon> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
+    eprintln!("skipping: moon did not become ready on port {}", moon.port);
     None
+}
+
+/// First spawn of a server lifecycle — port chosen via `common::spawn_listening`.
+fn spawn_moon_first(dir: &std::path::Path, durable: bool) -> Option<Moon> {
+    let bin = moon_binary()?;
+    let args = moon_args(dir, durable);
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args(["--port".to_string(), port.to_string()])
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
+    wait_moon_ready(Moon { child, port })
+}
+
+/// Restart on the SAME port + dir on purpose (durability semantics). Per the
+/// port-flake-sweep hard rules, restart spawns keep the direct spawn path.
+fn spawn_moon_restart(port: u16, dir: &std::path::Path, durable: bool) -> Option<Moon> {
+    let bin = moon_binary()?;
+    let child = Command::new(&bin)
+        .args(["--port".to_string(), port.to_string()])
+        .args(moon_args(dir, durable))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    wait_moon_ready(Moon { child, port })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,14 +231,11 @@ impl Client {
 /// shards as owners across random accept placement.
 #[test]
 fn routed_hashtag_txn_succeeds_from_any_connection() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("moon-txn-route-{port}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
-    let Some(m) = spawn_moon(port, &dir, false) else {
-        let _ = std::fs::remove_dir_all(&dir);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(m) = spawn_moon_first(dir.path(), false) else {
         return;
     };
+    let port = m.port;
 
     for i in 0..40 {
         let ka = format!("user:{{{i}}}:a");
@@ -259,22 +274,18 @@ fn routed_hashtag_txn_succeeds_from_any_connection() {
     }
 
     m.kill9();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// INVARIANT 2: routed (Phase B) transactional writes survive kill-9 + restart —
 /// they must be persisted to the OWNER shard's AOF, not silently dropped.
 #[test]
 fn routed_hashtag_txn_survives_restart() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("moon-txn-route-dur-{port}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = tempfile::tempdir().expect("tempdir");
 
-    let Some(m1) = spawn_moon(port, &dir, true) else {
-        let _ = std::fs::remove_dir_all(&dir);
+    let Some(m1) = spawn_moon_first(dir.path(), true) else {
         return;
     };
+    let port = m1.port;
 
     // 12 distinct tags → spread across all 4 owner shards; fresh conn each time
     // so most bodies route cross-shard.
@@ -299,9 +310,8 @@ fn routed_hashtag_txn_survives_restart() {
 
     m1.kill9();
 
-    let Some(m2) = spawn_moon(port, &dir, true) else {
-        let _ = std::fs::remove_dir_all(&dir);
-        panic!("moon failed to restart from {dir:?}");
+    let Some(m2) = spawn_moon_restart(port, dir.path(), true) else {
+        panic!("moon failed to restart from {:?}", dir.path());
     };
     let mut r = Client::connect(port);
     let mut missing = Vec::new();
@@ -316,7 +326,6 @@ fn routed_hashtag_txn_survives_restart() {
         }
     }
     m2.kill9();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         missing.is_empty(),
         "routed MULTI/EXEC writes lost on restart (not persisted on owner shard): {missing:?}"
@@ -327,15 +336,11 @@ fn routed_hashtag_txn_survives_restart() {
 /// with CROSSSLOT — Phase B only routes single-owner-shard bodies.
 #[test]
 fn multi_shard_span_still_rejected() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("moon-txn-span-{port}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
-    let Some(m) = spawn_moon(port, &dir, false) else {
-        let _ = std::fs::remove_dir_all(&dir);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(m) = spawn_moon_first(dir.path(), false) else {
         return;
     };
-    let mut c = Client::connect(port);
+    let mut c = Client::connect(m.port);
     assert_eq!(c.cmd(&["MULTI"]), Reply::Simple("OK".into()));
     for i in 0..20 {
         // Distinct untagged keys → near-certain to span >1 of 4 shards.
@@ -350,5 +355,4 @@ fn multi_shard_span_still_rejected() {
         other => panic!("20-key span must be rejected, got: {other:?}"),
     }
     m.kill9();
-    let _ = std::fs::remove_dir_all(&dir);
 }

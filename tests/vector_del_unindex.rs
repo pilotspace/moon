@@ -17,6 +17,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -42,13 +44,6 @@ fn find_moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
 struct ServerGuard(Child);
 
 impl Drop for ServerGuard {
@@ -58,23 +53,25 @@ impl Drop for ServerGuard {
     }
 }
 
-fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-            "--appendonly",
-            "no",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon(dir: &std::path::Path, shards: u32) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +307,7 @@ fn assert_absent(keys: &[String], dead: &str, ctx: &str) {
 #[test]
 fn test_del_unindexes_vector_conn_local() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let _guard = spawn_moon(port, dir.path(), 1);
+    let (_guard, port) = spawn_moon(dir.path(), 1);
     let mut c = wait_ready(port);
 
     ft_create(&mut c);
@@ -330,8 +326,7 @@ fn test_del_unindexes_vector_conn_local() {
 #[test]
 fn test_unlink_unindexes_vector_conn_local() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let _guard = spawn_moon(port, dir.path(), 1);
+    let (_guard, port) = spawn_moon(dir.path(), 1);
     let mut c = wait_ready(port);
 
     ft_create(&mut c);
@@ -344,8 +339,7 @@ fn test_unlink_unindexes_vector_conn_local() {
 #[test]
 fn test_multi_exec_del_unindexes_vector() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let _guard = spawn_moon(port, dir.path(), 1);
+    let (_guard, port) = spawn_moon(dir.path(), 1);
     let mut c = wait_ready(port);
 
     ft_create(&mut c);
@@ -366,8 +360,7 @@ fn test_multi_exec_del_unindexes_vector() {
 #[test]
 fn test_pipelined_del_unindexes_vector_multishard() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let _guard = spawn_moon(port, dir.path(), 4);
+    let (_guard, port) = spawn_moon(dir.path(), 4);
     let mut c = wait_ready(port);
 
     ft_create(&mut c);

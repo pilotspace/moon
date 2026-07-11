@@ -21,6 +21,8 @@
 //!
 //! Run alone with: cargo test --test cross_shard_consistency_red
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -34,13 +36,6 @@ use moon::shard::dispatch::key_to_shard;
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
 }
 
 fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32) -> Child {
@@ -95,10 +90,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -267,9 +263,9 @@ fn keys_per_shard(prefix: &str, num_shards: usize) -> Vec<String> {
 
 #[test]
 fn cdg6a_bitop_cross_shard() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let ks = keys_per_shard("cdg6a:", SHARDS as usize);
@@ -346,9 +342,9 @@ fn cdg6a_bitop_cross_shard() {
 
 #[test]
 fn cdg6b_copy_cross_shard() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let ks = keys_per_shard("cdg6b:", SHARDS as usize);
@@ -427,9 +423,9 @@ fn cdg6c_graph_routing_connection_independent() {
         eprintln!("skip: graph feature compiled out (tokio CI feature set)");
         return;
     }
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c0 = Conn::open(port);
@@ -488,9 +484,9 @@ fn cdg6d_temporal_invalidate_cross_connection() {
         eprintln!("skip: graph feature compiled out (tokio CI feature set)");
         return;
     }
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c0 = Conn::open(port);
@@ -528,9 +524,9 @@ fn cdg6e_txn_abort_rolls_back_routed_graph_write() {
         eprintln!("skip: graph feature compiled out (tokio CI feature set)");
         return;
     }
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c0 = Conn::open(port);
@@ -583,9 +579,9 @@ fn cdg6e_txn_abort_rolls_back_routed_graph_write() {
 
 #[test]
 fn cdg6f_workspace_cross_connection() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c0 = Conn::open(port);
@@ -641,9 +637,9 @@ fn cdg6f_workspace_cross_connection() {
 
 #[test]
 fn cdg6g_mq_cross_connection() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c0 = Conn::open(port);

@@ -16,6 +16,8 @@
 #![cfg(unix)]
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
@@ -63,18 +65,6 @@ fn read_log(path: &std::path::Path) -> String {
         Ok(s) => s,
         Err(e) => format!("<unreadable: {e}>"),
     }
-}
-
-/// Pick an ephemeral port by binding :0 and releasing it.
-///
-/// Note: classic TOCTOU race — another process can grab the port between the
-/// `drop(l)` and the server's bind. Acceptable in test code: ephemeral-range
-/// collisions are rare, and a collision fails loudly in `wait_for_ready`.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
 }
 
 /// Outcome of polling for server readiness.
@@ -184,38 +174,32 @@ fn assert_sigterm_clean_exit_shards(
     extra_args: &[&str],
     conn: ConnAtSigterm,
 ) {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!(
-        "moon-sigterm-{}-{}-{}",
-        std::process::id(),
-        port,
-        label,
-    ));
+    let dir = std::env::temp_dir().join(format!("moon-sigterm-{}-{}", std::process::id(), label,));
     std::fs::create_dir_all(&dir).expect("mk tmpdir");
 
-    // Bind to locals so the &str slices in base_args are not temporaries.
-    let port_str = port.to_string();
     let dir_str = dir.to_string_lossy().into_owned();
     let shards_str = shards.to_string();
 
-    let mut base_args: Vec<&str> = vec![
-        "--port",
-        &port_str,
-        "--dir",
-        &dir_str,
-        "--appendonly",
-        "no",
-        "--shards",
-        &shards_str,
+    let mut base_args: Vec<String> = vec![
+        "--dir".into(),
+        dir_str,
+        "--appendonly".into(),
+        "no".into(),
+        "--shards".into(),
+        shards_str,
     ];
-    base_args.extend_from_slice(extra_args);
+    base_args.extend(extra_args.iter().map(|s| s.to_string()));
 
-    let mut child = Command::new(moon_binary())
-        .args(&base_args)
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
-        .spawn()
-        .expect("spawn moon");
+    let (mut child, port) = common::spawn_listening(|port| {
+        let mut args: Vec<String> = vec!["--port".into(), port.to_string()];
+        args.extend(base_args.iter().cloned());
+        Command::new(moon_binary())
+            .args(&args)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
 
     let pid = child.id();
 
@@ -293,7 +277,13 @@ fn sigterm_clean_exit_default() {
 /// signal 15), this test turns RED, and the regression is caught.
 #[test]
 fn sigterm_clean_exit_with_admin_port() {
-    let admin_port = free_port();
+    // Not the main server port `spawn_listening` binds/retries — an
+    // independent secondary listener the CLI needs to know about up front.
+    // `common::reserve_port` still dedups it against every other port this
+    // process has handed out (the intra-process half of the port-flake fix);
+    // it just can't defend against an external steal the way
+    // `spawn_listening`'s respawn-on-dead-child does for the primary port.
+    let admin_port = common::reserve_port();
     let admin_port_str = admin_port.to_string();
     assert_sigterm_clean_exit("admin", &["--admin-port", &admin_port_str]);
 }
@@ -336,31 +326,27 @@ fn sigterm_clean_exit_busy_poll() {
 /// are expected to die; the only assertion is that the SERVER exits cleanly.
 #[test]
 fn sigterm_clean_exit_under_write_storm() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!(
-        "moon-sigterm-{}-{}-storm",
-        std::process::id(),
-        port
-    ));
+    let dir = std::env::temp_dir().join(format!("moon-sigterm-{}-storm", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mk tmpdir");
-    let port_str = port.to_string();
     let dir_str = dir.to_string_lossy().into_owned();
 
-    let mut child = Command::new(moon_binary())
-        .args([
-            "--port",
-            &port_str,
-            "--dir",
-            &dir_str,
-            "--appendonly",
-            "yes",
-            "--shards",
-            "4",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
+    let (mut child, port) = common::spawn_listening(|port| {
+        Command::new(moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir_str,
+                "--appendonly",
+                "yes",
+                "--shards",
+                "4",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
     let pid = child.id();
 
     let deadline = ready_timeout();

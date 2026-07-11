@@ -10,6 +10,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -35,17 +37,6 @@ fn find_moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-        let p = l.local_addr().expect("local_addr").port();
-        drop(l);
-        if p >= 20000 {
-            return p;
-        }
-    }
-}
-
 /// Rooted under the repo's own volume, not system `$TMPDIR` (diskfull-guard
 /// trap — see gotcha_vm_diskfull_shared_volume in project memory).
 fn test_tmpdir() -> tempfile::TempDir {
@@ -66,23 +57,25 @@ impl Drop for ServerGuard {
     }
 }
 
-fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-            "--appendonly",
-            "no",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon(dir: &std::path::Path, shards: u32) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 fn connect(port: u16) -> TcpStream {
@@ -145,8 +138,7 @@ fn read_until_contains(stream: &mut TcpStream, buf: &mut Vec<u8>, needle: &[u8])
 
 fn run_burst(shards: u32) {
     let dir = test_tmpdir();
-    let port = free_port();
-    let _guard = spawn_moon(port, dir.path(), shards);
+    let (_guard, port) = spawn_moon(dir.path(), shards);
 
     // Subscriber
     let mut sub = connect(port);

@@ -19,6 +19,8 @@
 //! New-API compile-red tests (race2, counters) live in `spsc_wake_floor_red_api.rs`.
 //! Run this file alone with: cargo test --test spsc_wake_floor_red
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -32,20 +34,21 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
 /// Fresh `--dir` per server (CWD persistence-reload trap: an inherited
 /// appendonlydir would replay stale state into a throwaway test server).
-fn spawn_moon(port: u16, dir: &std::path::Path, extra: &[&str]) -> Child {
-    spawn_moon_with_shards(port, dir, 2, extra)
+fn spawn_moon(dir: &std::path::Path, extra: &[&str]) -> (Child, u16) {
+    spawn_moon_with_shards(dir, 2, extra)
 }
 
-fn spawn_moon_with_shards(port: u16, dir: &std::path::Path, shards: u32, extra: &[&str]) -> Child {
+fn spawn_moon_with_shards(dir: &std::path::Path, shards: u32, extra: &[&str]) -> (Child, u16) {
+    common::spawn_listening(|port| {
+        build_moon_command(port, dir, shards, extra)
+            .spawn()
+            .expect("spawn moon (CARGO_BIN_EXE_moon)")
+    })
+}
+
+fn build_moon_command(port: u16, dir: &std::path::Path, shards: u32, extra: &[&str]) -> Command {
     let mut args: Vec<String> = vec![
         "--port".into(),
         port.to_string(),
@@ -57,10 +60,18 @@ fn spawn_moon_with_shards(port: u16, dir: &std::path::Path, shards: u32, extra: 
     for e in extra {
         args.push((*e).into());
     }
-    Command::new(moon_binary())
-        .args(&args)
+    let mut cmd = Command::new(moon_binary());
+    cmd.args(&args)
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"));
+    cmd
+}
+
+/// Restart on the SAME port + dir on purpose (kill-9/restart durability
+/// semantics). Per the port-flake-sweep hard rules, restart spawns keep the
+/// direct (non-`spawn_listening`) path.
+fn spawn_moon_restart(port: u16, dir: &std::path::Path, extra: &[&str]) -> Child {
+    build_moon_command(port, dir, 2, extra)
         .spawn()
         .expect("spawn moon (CARGO_BIN_EXE_moon)")
 }
@@ -335,9 +346,9 @@ fn swf_a3_notify_token_survives_poll_drop() {
 
 #[test]
 fn swf1_notify_wakes_counter() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), &[]));
+    let (child, port) = spawn_moon(dir.path(), &[]);
+    let _guard = ServerGuard(child);
     let mut s = wait_ready(port);
 
     // 32 distinct keys on 2 shards: ~half route cross-shard from whichever
@@ -393,9 +404,9 @@ fn swf1_notify_wakes_counter() {
 fn swf2_burst_renotify() {
     const BURST: usize = 4096;
 
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), &[]));
+    let (child, port) = spawn_moon(dir.path(), &[]);
+    let _guard = ServerGuard(child);
     let mut s = wait_ready(port);
 
     // One pipelined write of BURST SETs (~half cross-shard) — pins burst
@@ -472,9 +483,9 @@ fn swf2b_drain_cap_renotifies_under_concurrency() {
     const CONNS: usize = 700;
     const TAGS: usize = 8; // hash tags t0..t7 — split across both shards w.h.p.
 
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), &[]));
+    let (child, port) = spawn_moon(dir.path(), &[]);
+    let _guard = ServerGuard(child);
     let mut s = wait_ready(port);
 
     let mut conns: Vec<TcpStream> = (0..CONNS)
@@ -539,9 +550,9 @@ fn swf2b_drain_cap_renotifies_under_concurrency() {
 ///   (b) WAL flush cadence holds -> a SET survives kill -9 + restart.
 #[test]
 fn swf3_cadence_pins() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut server = ServerGuard(spawn_moon(port, dir.path(), &["--appendonly", "yes"]));
+    let (child, port) = spawn_moon(dir.path(), &["--appendonly", "yes"]);
+    let mut server = ServerGuard(child);
     let mut s = wait_ready(port);
 
     // TTL key set BEFORE the traffic storm.
@@ -575,7 +586,11 @@ fn swf3_cadence_pins() {
     server.0.kill().expect("kill -9 server");
     let _ = server.0.wait();
 
-    let mut server2 = ServerGuard(spawn_moon(port, dir.path(), &["--appendonly", "yes"]));
+    let mut server2 = ServerGuard(spawn_moon_restart(
+        port,
+        dir.path(),
+        &["--appendonly", "yes"],
+    ));
     let mut s2 = wait_ready(port);
     let reply = resp_cmd(&mut s2, &[b"GET", b"swf3:durable"]);
     assert!(

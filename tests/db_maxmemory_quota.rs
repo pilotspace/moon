@@ -12,6 +12,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -29,17 +31,6 @@ fn find_moon_binary() -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-        let p = l.local_addr().expect("local_addr").port();
-        drop(l);
-        if p >= 20000 {
-            return p;
-        }
-    }
 }
 
 /// Fresh `--dir` under the OS temp dir (small, low-diskfull-risk, never the
@@ -70,33 +61,34 @@ impl Drop for ServerGuard {
 /// `<db>:<bytes>` tokens, one `--db-maxmemory` flag per entry) and
 /// `--maxmemory 0` (whole-instance cap unlimited, so only the db-quota gate
 /// is under test) and `--appendonly no` (raw write throughput, no WAL noise).
-fn spawn_moon_db_quota(port: u16, dir: &std::path::Path, db_entries: &[&str]) -> ServerGuard {
-    let mut cmd = Command::new(find_moon_binary());
-    cmd.args([
-        "--port",
-        &port.to_string(),
-        "--dir",
-        &dir.to_string_lossy(),
-        "--shards",
-        "1",
-        "--appendonly",
-        "no",
-        "--maxmemory",
-        "0",
-        "--maxmemory-policy",
-        "noeviction",
-        "--databases",
-        "16",
-    ]);
-    for entry in db_entries {
-        cmd.args(["--db-maxmemory", entry]);
-    }
-    let child = cmd
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_db_quota(dir: &std::path::Path, db_entries: &[&str]) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        let mut cmd = Command::new(find_moon_binary());
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            "1",
+            "--appendonly",
+            "no",
+            "--maxmemory",
+            "0",
+            "--maxmemory-policy",
+            "noeviction",
+            "--databases",
+            "16",
+        ]);
+        for entry in db_entries {
+            cmd.args(["--db-maxmemory", entry]);
+        }
+        cmd.stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 /// Same as `spawn_moon_db_quota` but additionally passes `--disk-offload
@@ -112,39 +104,36 @@ fn spawn_moon_db_quota(port: u16, dir: &std::path::Path, db_entries: &[&str]) ->
 /// it takes the separate, always-correctly-gated inline fast path in
 /// `blocking.rs`, which is exactly why the original quota test above (which
 /// only ever issues `SET`) did not catch this.
-fn spawn_moon_db_quota_no_spill(
-    port: u16,
-    dir: &std::path::Path,
-    db_entries: &[&str],
-) -> ServerGuard {
-    let mut cmd = Command::new(find_moon_binary());
-    cmd.args([
-        "--port",
-        &port.to_string(),
-        "--dir",
-        &dir.to_string_lossy(),
-        "--shards",
-        "1",
-        "--appendonly",
-        "no",
-        "--maxmemory",
-        "0",
-        "--maxmemory-policy",
-        "noeviction",
-        "--databases",
-        "16",
-        "--disk-offload",
-        "disable",
-    ]);
-    for entry in db_entries {
-        cmd.args(["--db-maxmemory", entry]);
-    }
-    let child = cmd
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_db_quota_no_spill(dir: &std::path::Path, db_entries: &[&str]) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        let mut cmd = Command::new(find_moon_binary());
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            "1",
+            "--appendonly",
+            "no",
+            "--maxmemory",
+            "0",
+            "--maxmemory-policy",
+            "noeviction",
+            "--databases",
+            "16",
+            "--disk-offload",
+            "disable",
+        ]);
+        for entry in db_entries {
+            cmd.args(["--db-maxmemory", entry]);
+        }
+        cmd.stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +282,8 @@ fn wait_ready(port: u16) -> Client {
 #[test]
 fn test_quota_rejects_writes_on_quota_d_db_only() {
     let dir = test_tmpdir();
-    let port = free_port();
     // db 1 gets a 4 KB quota; db 0 gets none (unlimited).
-    let _guard = spawn_moon_db_quota(port, dir.path(), &["1:4096"]);
+    let (_guard, port) = spawn_moon_db_quota(dir.path(), &["1:4096"]);
     let mut c = wait_ready(port);
 
     // db 0 (unconfigured): write a large amount of data — must never be
@@ -356,8 +344,7 @@ fn test_quota_rejects_writes_on_quota_d_db_only() {
 #[test]
 fn test_config_set_get_db_maxmemory_live() {
     let dir = test_tmpdir();
-    let port = free_port();
-    let _guard = spawn_moon_db_quota(port, dir.path(), &[]);
+    let (_guard, port) = spawn_moon_db_quota(dir.path(), &[]);
     let mut c = wait_ready(port);
 
     // Unconfigured at startup: CONFIG GET returns an empty value.
@@ -404,9 +391,8 @@ fn test_config_set_get_db_maxmemory_live() {
 #[test]
 fn test_quota_rejects_non_inline_writes_without_spill_sender() {
     let dir = test_tmpdir();
-    let port = free_port();
     // db 1 gets a tiny 4 KB quota; no disk-offload spill sender exists at all.
-    let _guard = spawn_moon_db_quota_no_spill(port, dir.path(), &["1:4096"]);
+    let (_guard, port) = spawn_moon_db_quota_no_spill(dir.path(), &["1:4096"]);
     let mut c = wait_ready(port);
 
     let sel = c.cmd(&[b"SELECT", b"1"]);
@@ -489,7 +475,10 @@ fn test_quota_rejects_non_inline_writes_without_spill_sender() {
 #[test]
 fn test_malformed_db_maxmemory_cli_refuses_to_start() {
     let dir = test_tmpdir();
-    let port = free_port();
+    // Deliberately expects startup to FAIL (malformed/out-of-range
+    // --db-maxmemory), so spawn_listening's accept-retry loop doesn't fit
+    // here — just reserve a dedup'd port.
+    let port = common::reserve_port();
     let mut cmd = Command::new(find_moon_binary());
     cmd.args([
         "--port",
@@ -529,7 +518,10 @@ fn test_malformed_db_maxmemory_cli_refuses_to_start() {
 #[test]
 fn test_out_of_range_db_maxmemory_cli_refuses_to_start() {
     let dir = test_tmpdir();
-    let port = free_port();
+    // Deliberately expects startup to FAIL (malformed/out-of-range
+    // --db-maxmemory), so spawn_listening's accept-retry loop doesn't fit
+    // here — just reserve a dedup'd port.
+    let port = common::reserve_port();
     let mut cmd = Command::new(find_moon_binary());
     cmd.args([
         "--port",

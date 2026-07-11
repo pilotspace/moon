@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — test-harness port-flake sweep (task #18)
+
+33 integration suites that spawn a real `moon` process shared a copy-pasted
+`free_port()` that binds `:0`, reads the port, and drops the listener before
+the server spawns. Two CI-observed failure modes shipped with that pattern:
+a **port TOCTOU** (between probe drop and moon's bind, a concurrent test's
+probe — or an outbound connection's ephemeral source port — takes the port,
+so moon exits with EADDRINUSE) and a **dead-server blind poll** (harnesses
+polled `connect()` for up to 30s without checking child liveness, reporting
+"server never accepted: Connection refused" while the real bind error sat
+unread in the server's stderr log).
+
+- New shared `tests/common/mod.rs`: `reserve_port()` (process-wide dedup set
+  over kernel-chosen probe ports) and `spawn_listening()` (spawns via a
+  caller closure, polls TCP accept **while watching `child.try_wait()`**,
+  and respawns on a fresh port the moment a child dies — external
+  ephemeral-port steals can't be prevented, only recovered from).
+- All 33 suites converted; protocol-level readiness (PING/AUTH) stays with
+  each suite. Kill-9/SIGTERM/restart tests keep their deliberate
+  same-port+same-dir restart legs untouched — only the first spawn of each
+  server lifecycle goes through `spawn_listening`. Expected-startup-failure
+  tests (CLI validation) keep direct spawns on `reserve_port()` ports.
+- Verified: all suites green plus a 10-rep stress running 14 port-hungry
+  suites concurrently (the CI contention pattern that produced the original
+  flakes).
+
 ### Added — R2: multi-shard master PSYNC (task #20, RFC 1B)
 
 A master running `--shards N` now serves full replication to a single-shard

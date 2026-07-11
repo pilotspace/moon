@@ -9,20 +9,11 @@
 
 #![cfg(feature = "console")]
 
-use std::net::TcpListener;
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Bind a throw-away listener to get a free port, then drop it. There is a
-/// TOCTOU window here but it's good enough for local/CI integration tests.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind for port probe")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
 
 /// RAII wrapper around a moon child process. `Drop` SIGKILLs the child and
 /// waits so the port is released before the next test runs.
@@ -53,25 +44,28 @@ fn spawn_moon(extra: &[&str]) -> Option<Moon> {
         );
         return None;
     }
-    let port = free_port();
-    let admin = free_port();
-    let mut args: Vec<String> = vec![
-        "--port".into(),
-        port.to_string(),
-        "--admin-port".into(),
-        admin.to_string(),
-        "--shards".into(),
-        "1".into(),
-    ];
-    for a in extra {
-        args.push((*a).to_string());
-    }
-    let child = Command::new(&bin)
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    // The plain client `--port` is never dialed by this suite (only the
+    // admin HTTP port is) — reserve it once, up front, so it doesn't
+    // collide with anything else in-process.
+    let port = common::reserve_port();
+    let extra_owned: Vec<String> = extra.iter().map(|a| (*a).to_string()).collect();
+    let (child, admin) = common::spawn_listening(|admin_port| {
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port.to_string(),
+            "--admin-port".into(),
+            admin_port.to_string(),
+            "--shards".into(),
+            "1".into(),
+        ];
+        args.extend(extra_owned.iter().cloned());
+        Command::new(&bin)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
     // Poll /healthz until the admin server accepts connections (max 8s).
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -203,8 +197,11 @@ fn hard02_wildcard_with_auth_rejected_at_startup() {
     if !bin.exists() {
         return;
     }
-    let port = free_port();
-    let admin = free_port();
+    // Deliberately expects startup to FAIL (wildcard CORS + auth is
+    // rejected before the server ever binds), so `spawn_listening`'s
+    // accept-retry loop doesn't fit here — just reserve two dedup'd ports.
+    let port = common::reserve_port();
+    let admin = common::reserve_port();
     let out = Command::new(&bin)
         .args([
             "--port",

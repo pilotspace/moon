@@ -25,6 +25,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -42,17 +44,6 @@ fn find_moon_binary() -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-        let p = l.local_addr().expect("local_addr").port();
-        drop(l);
-        if p >= 20000 {
-            return p;
-        }
-    }
 }
 
 /// Fresh `--dir` under the OS temp dir (never the shared `/Volumes/Games`
@@ -83,34 +74,37 @@ impl Drop for ServerGuard {
 /// Spawn moon with a small `--maxmemory` cap, `noeviction` policy, AOF and
 /// disk-offload both disabled (raw in-memory write path, no WAL/spill noise
 /// that could mask the accounting gap under test), single shard.
-fn spawn_moon_maxmemory(port: u16, dir: &std::path::Path, maxmemory_bytes: u64) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            "1",
-            "--appendonly",
-            "no",
-            "--maxmemory",
-            &maxmemory_bytes.to_string(),
-            "--maxmemory-policy",
-            "noeviction",
-            "--disk-offload",
-            "disable",
-            // Guard against the diskfull write-pause (`MOONERR diskfull`)
-            // firing mid-test on a nearly-full host volume and masking the
-            // OOM assertions under test with an unrelated error.
-            "--disk-free-min-pct",
-            "0",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_maxmemory(dir: &std::path::Path, maxmemory_bytes: u64) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                "1",
+                "--appendonly",
+                "no",
+                "--maxmemory",
+                &maxmemory_bytes.to_string(),
+                "--maxmemory-policy",
+                "noeviction",
+                "--disk-offload",
+                "disable",
+                // Guard against the diskfull write-pause (`MOONERR
+                // diskfull`) firing mid-test on a nearly-full host volume
+                // and masking the OOM assertions under test with an
+                // unrelated error.
+                "--disk-free-min-pct",
+                "0",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 /// Spawn moon with the GLOBAL `--maxmemory` gate disabled (0 = unlimited) and
@@ -119,37 +113,35 @@ fn spawn_moon_maxmemory(port: u16, dir: &std::path::Path, maxmemory_bytes: u64) 
 /// (`db_quota::check_db_maxmemory_for_command`) from the global gate
 /// (`eviction::try_evict_if_needed_budget`) so the shrink-only bypass is
 /// exercised on each independently.
-fn spawn_moon_db_maxmemory(
-    port: u16,
-    dir: &std::path::Path,
-    db_maxmemory_bytes: u64,
-) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            "1",
-            "--appendonly",
-            "no",
-            "--maxmemory",
-            "0",
-            "--maxmemory-policy",
-            "noeviction",
-            "--disk-offload",
-            "disable",
-            "--db-maxmemory",
-            &format!("0:{db_maxmemory_bytes}"),
-            "--disk-free-min-pct",
-            "0",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_db_maxmemory(dir: &std::path::Path, db_maxmemory_bytes: u64) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                "1",
+                "--appendonly",
+                "no",
+                "--maxmemory",
+                "0",
+                "--maxmemory-policy",
+                "noeviction",
+                "--disk-offload",
+                "disable",
+                "--db-maxmemory",
+                &format!("0:{db_maxmemory_bytes}"),
+                "--disk-free-min-pct",
+                "0",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -297,10 +289,9 @@ fn wait_ready(port: u16) -> Client {
 #[test]
 fn test_hset_growth_on_single_key_hits_maxmemory() {
     let dir = test_tmpdir();
-    let port = free_port();
     // 64 KB budget; ~1 KB fields -> should bite well within 200 fields even
     // accounting for the ~150-byte empty-container baseline charge.
-    let _guard = spawn_moon_maxmemory(port, dir.path(), 64 * 1024);
+    let (_guard, port) = spawn_moon_maxmemory(dir.path(), 64 * 1024);
     let mut c = wait_ready(port);
 
     let value = vec![b'v'; 1024];
@@ -335,8 +326,7 @@ fn test_hset_growth_on_single_key_hits_maxmemory() {
 #[test]
 fn test_lpush_growth_on_single_key_hits_maxmemory() {
     let dir = test_tmpdir();
-    let port = free_port();
-    let _guard = spawn_moon_maxmemory(port, dir.path(), 64 * 1024);
+    let (_guard, port) = spawn_moon_maxmemory(dir.path(), 64 * 1024);
     let mut c = wait_ready(port);
 
     let value = vec![b'v'; 1024];
@@ -373,13 +363,12 @@ fn test_lpush_growth_on_single_key_hits_maxmemory() {
 #[test]
 fn test_hdel_credits_memory_after_growth() {
     let dir = test_tmpdir();
-    let port = free_port();
     // Budget sized so growing ~100 KB of fields, deleting them all, then
     // writing another ~100 KB elsewhere fits ONLY if the deletes freed their
     // memory -- comfortably under the cap throughout (no OOM ever hit),
     // isolating credit-on-delete from the separate gate-classification gap
     // documented above.
-    let _guard = spawn_moon_maxmemory(port, dir.path(), 256 * 1024);
+    let (_guard, port) = spawn_moon_maxmemory(dir.path(), 256 * 1024);
     let mut c = wait_ready(port);
 
     let value = vec![b'v'; 1024];
@@ -444,9 +433,8 @@ fn test_hdel_credits_memory_after_growth() {
 #[test]
 fn test_hdel_self_recovery_past_maxmemory_boundary() {
     let dir = test_tmpdir();
-    let port = free_port();
     // Small budget so ~10 x 1 KB fields comfortably crosses it.
-    let _guard = spawn_moon_maxmemory(port, dir.path(), 4 * 1024);
+    let (_guard, port) = spawn_moon_maxmemory(dir.path(), 4 * 1024);
     let mut c = wait_ready(port);
 
     let value = vec![b'v'; 1024];
@@ -512,9 +500,8 @@ fn test_hdel_self_recovery_past_maxmemory_boundary() {
 #[test]
 fn test_hdel_self_recovery_past_db_maxmemory_boundary() {
     let dir = test_tmpdir();
-    let port = free_port();
     // Global --maxmemory is 0 (unlimited); only db 0's quota is small.
-    let _guard = spawn_moon_db_maxmemory(port, dir.path(), 4 * 1024);
+    let (_guard, port) = spawn_moon_db_maxmemory(dir.path(), 4 * 1024);
     let mut c = wait_ready(port);
 
     let value = vec![b'v'; 1024];

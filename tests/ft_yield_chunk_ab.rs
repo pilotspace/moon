@@ -12,6 +12,8 @@
 //! #[ignore] — spawns servers + loads 20k×384d vectors; run explicitly on the VM:
 //!   cargo test --test ft_yield_chunk_ab -- --ignored --nocapture
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -25,13 +27,6 @@ const REPS: usize = 3;
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
 }
 
 fn fresh_dir(tag: &str, port: u16) -> std::path::PathBuf {
@@ -225,9 +220,15 @@ impl Drop for Guard {
 
 /// Best-of-REPS QPS for one arm (fresh server per arm; best-of reduces VM jitter).
 fn measure_arm(chunk: Option<&str>, tag: &str) -> f64 {
-    let port = free_port();
-    let dir = fresh_dir(tag, port);
-    let _g = Guard(spawn(port, &dir, chunk));
+    // `fresh_dir` is keyed by (tag, port), so it's recomputed inside the
+    // closure on every attempt — spawn_listening may pick a different port
+    // on retry, and each attempt's directory is independent (never shared
+    // with a live server, so no remove_dir_all-out-from-under-it risk).
+    let (child, port) = common::spawn_listening(|port| {
+        let dir = fresh_dir(tag, port);
+        spawn(port, &dir, chunk)
+    });
+    let _g = Guard(child);
     let mut s = wait_ready(port);
     create_idx(&mut s);
     load_vectors(&mut s);

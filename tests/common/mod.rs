@@ -37,8 +37,7 @@ use std::time::{Duration, Instant};
 /// this alone does not stop *external* steals — pair it with
 /// [`spawn_listening`].
 pub fn reserve_port() -> u16 {
-    static HANDED_OUT: LazyLock<Mutex<HashSet<u16>>> =
-        LazyLock::new(|| Mutex::new(HashSet::new()));
+    static HANDED_OUT: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     loop {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 probe");
         let port = probe.local_addr().expect("probe local_addr").port();
