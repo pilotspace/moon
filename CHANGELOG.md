@@ -62,6 +62,40 @@ ZSet). Explicitly out of scope for this fix (unchanged):
 `recovery.rs` rehydration, replication, and the eviction gates' Wave A
 reporting sinks.
 
+### Fixed — TEMPORAL/MQ WAL v3 replay data loss on kill-9 (task #42)
+
+`TEMPORAL.INVALIDATE` and `MQ.CREATE`/`MQ.ACK` durable state was silently
+lost on every crash restart. `replay_mq_wal` / `replay_temporal_wal`
+(`src/shard/shared_databases.rs`) had two bugs: (a) they scanned
+`persistence_dir/shard-{id}/` instead of `.../shard-{id}/wal-v3/` —
+`std::fs::read_dir` is non-recursive, so every boot replayed zero records
+from an empty directory; (b) even with the directory fixed, they matched
+`record.record_type` directly, but every cross-thread `wal_append` blob is
+re-wrapped as `WalRecordType::Command` by the shard event-loop drain — the
+typed inner record (`MqCreate`/`MqAck`/`GraphTemporal`) is nested in the
+Command's payload and was never unwrapped (`replay_workspace_wal` was the
+only replay function that already did this). `GraphTemporal` records also
+turned out to be pushed as raw, un-framed bytes (not nested-record-framed)
+by `command::temporal::apply_invalidate`, requiring a direct-decode branch
+alongside the nested-unwrap for `replay_temporal_wal`.
+Also fixed a related dead-channel bug found while verifying the MQ path:
+`ShardSlice::wal_append_tx` (used by `mq_exec.rs`'s owner-shard MQ.CREATE /
+MQ.ACK path) was never assigned anywhere — `ShardDatabases::wal_append_txs`
+(a separate field, used by TEMPORAL/WS) was wired in `event_loop.rs`, but
+the per-slice field was not, so MQ.CREATE/MQ.ACK never reached the WAL v3
+writer at all regardless of the replay-side fix. Wired it in `event_loop.rs`
+alongside the existing `set_wal_append_tx` call.
+New crash-recovery integration test `tests/crash_recovery_temporal_mq.rs`
+(`temporal_invalidate_survives_kill9`, live kill -9 + restart against
+`GRAPH.QUERY ... VALID_AT`) and two white-box unit tests in
+`shared_databases.rs` (`test_replay_mq_wal_restores_registry_and_rolls_back_cursor`,
+`test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop`) proving the MQ replay
+fix directly against real WAL v3 bytes — a live MQ.CREATE round trip is
+architecturally blocked by a separate, deeper, out-of-scope gap (MQ has
+zero AOF durability, so `--appendonly yes`'s unconditional AOF-authority
+recovery wipes the Stream on every restart independent of this fix); that
+gap is left for follow-up.
+
 ### Fixed — Wave A adversarial-review fixes (task #34)
 
 Three defects found reviewing Wave A (plane replication) before merge, all

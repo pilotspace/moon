@@ -455,6 +455,17 @@ impl super::Shard {
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
         let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
         if appendonly_enabled || server_config.disk_offload_enabled() {
+            // `ShardSlice::wal_append_tx` (used by the owner-shard MQ.* command
+            // path in `mq_exec.rs::wal_append_on_slice`) is a SEPARATE field
+            // from `ShardDatabases::wal_append_txs` (used by
+            // `ShardDatabases::wal_append`, e.g. TEMPORAL.INVALIDATE) — both
+            // must carry a live sender for the SAME channel, or MQ.CREATE /
+            // MQ.ACK silently never reach the WAL at all (task #42: this was
+            // the field's only assignment site missing; `ShardSliceInit`
+            // always constructs it as `None` and nothing else ever set it).
+            crate::shard::slice::with_shard(|s| {
+                s.wal_append_tx = Some(wal_append_tx.clone());
+            });
             shard_databases.set_wal_append_tx(shard_id, wal_append_tx);
         }
 
