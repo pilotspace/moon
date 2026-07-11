@@ -928,9 +928,29 @@ pub(super) async fn try_handle_graph_command(
             txn.record_graph_undo(undo_op);
         }
     }
+    // v0.7 graph replication: the drained WAL records are the DETERMINISTIC,
+    // id-pinned form of this mutation (GRAPH.ADDNODE <g> <node_id> …, FNV-
+    // hashed u16 label/prop ids — `label_to_id` is stateless, so master and
+    // replica agree). Stream them verbatim to replicas, which replay them via
+    // `GraphReplayCollector` without re-allocating ids. `ReplicateVerbatim`
+    // carries the replication legs ONLY (backlog + offset + live fan-out) —
+    // the AOF copy is the local `wal_append` below, so nothing double-logs.
+    // Single-shard scope, matching the R0/R0.5 FT.* leg (multi-shard graph
+    // replication rides the R2 broadcast redesign).
+    let wal_records: Vec<bytes::Bytes> = wal_records.into_iter().map(bytes::Bytes::from).collect();
+    if !wal_records.is_empty() && ctx.num_shards == 1 && super::ft::replication_fanout_active(ctx) {
+        // Same-shard → self queue (`shard::self_msg`): the SPSC mesh has no
+        // self-loop, so this must NOT go through ctx.dispatch_tx. Pushing in
+        // the same synchronous stretch as the graph mutation keeps the record
+        // atomic w.r.t. the inline PSYNC task's snapshot capture.
+        for record in &wal_records {
+            crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
+                bytes: record.clone(),
+            });
+        }
+    }
     for record in wal_records {
-        ctx.shard_databases
-            .wal_append(ctx.shard_id, bytes::Bytes::from(record));
+        ctx.shard_databases.wal_append(ctx.shard_id, record);
     }
     let mut response = response;
     if let Some(ws_id) = conn.workspace_id.as_ref() {

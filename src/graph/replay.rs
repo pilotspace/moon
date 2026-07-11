@@ -515,6 +515,20 @@ impl GraphReplayCollector {
                         mg.ensure_node_id_floor(nm.external_id);
                     }
                 }
+                // Also seed from write-buffer-resident nodes (v0.7 graph
+                // replication): a replica replays streamed WAL records ONE AT
+                // A TIME, so an edge's endpoints usually landed in the write
+                // buffer during EARLIER replay calls, not this batch.
+                // external_id ↔ NodeKey is the same KeyData bijection used at
+                // insert (`add_node_with_id`), so membership here is the
+                // existence proof. No-op during restart recovery — the write
+                // buffer is empty until this replay populates it.
+                {
+                    use slotmap::Key;
+                    for (nk, _) in mg.iter_nodes() {
+                        node_map.entry(nk.data().as_ffi()).or_insert(nk);
+                    }
+                }
 
                 // Insert nodes.
                 // Precompute _key property ID for graph expansion mapping.

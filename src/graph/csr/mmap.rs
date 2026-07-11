@@ -385,6 +385,14 @@ impl MmapCsrSegment {
         })
     }
 
+    /// The complete serialized segment bytes (the mapped file IS the
+    /// `to_bytes()` encoding — `write_to_file` produced it). Used by the
+    /// replication snapshot export so a restart-loaded (mmap) segment can be
+    /// shipped to a replica with full fidelity.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self._mmap
+    }
+
     /// Node property blob (borrowed from mmap; empty for pre-v5 files).
     pub fn node_props_blob(&self) -> &[u8] {
         if self.node_props_len == 0 {

@@ -669,6 +669,7 @@ pub(super) fn try_handle_info(
 #[inline]
 pub(super) fn try_enforce_readonly(
     cmd: &[u8],
+    cmd_args: &[Frame],
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
@@ -679,6 +680,19 @@ pub(super) fn try_enforce_readonly(
         return false;
     }
     if metadata::is_write(cmd) {
+        // GRAPH.QUERY is blanket-W in the metadata table because Cypher CAN
+        // write; a read-only MATCH/RETURN must still be served by a replica.
+        // Reuse the token-scan classifier the write dispatch path branches
+        // on — it can false-POSITIVE (blocks a weird read) but never
+        // false-negative (lets a write through).
+        #[cfg(feature = "graph")]
+        if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+            && !crate::command::graph::is_cypher_write_query(cmd_args)
+        {
+            return false;
+        }
+        #[cfg(not(feature = "graph"))]
+        let _ = cmd_args;
         responses.push(Frame::Error(Bytes::from_static(
             b"READONLY You can't write against a read only replica.",
         )));

@@ -20,6 +20,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Fixed — single-shard live replication stream was DEAD (self-SPSC gap)
+
+- **The R0 live stream never actually flowed at `--shards 1`.** The SPSC mesh
+  is N·(N−1) with skip-self mapping, so a task on a shard's own thread had NO
+  producer to that shard: the inline PSYNC task's `RegisterReplica` failed
+  every attach ("shard 0 producer missing") and the replica fell into a 0.5s
+  reconnect/full-resync loop. Tests stayed green because each resync's RDB
+  carried the latest keyspace + FT defs — data crawled across via snapshot
+  polling, masking the dead stream. Fixed with a thread-local self-message
+  queue (`shard::self_msg`) drained by the event loop alongside its SPSC
+  consumers; PSYNC registration, FT.*/graph fan-out, and local-write fan-out
+  all route through it.
+- **Local (same-shard) writes now feed the replication plane.** Successful
+  local writes push their wire bytes as `ReplicateVerbatim` before any await
+  (mutation + record are one synchronous stretch, atomic w.r.t. snapshot
+  capture); the drained message does backlog + offset + replica fan-out
+  together, and the AOF leg no longer double-advances the offset (lsn = 0 when
+  fan-out owns the advance).
+- **Replication backlog now seeds at the current shard offset** on lazy
+  allocation (`ReplicationBacklog::new_at`) — an unseeded backlog made every
+  catch-up range read on a pre-written master fail as "evicted".
+- New process-global `fanout_hint_active()` (one Relaxed load, set on first
+  replica attach, never cleared) gates all fan-out serialization so
+  non-replicating servers pay nothing on the hot path.
+
+### Added — v0.7 graph-plane replication (live stream + snapshot backfill)
+
+- **Live leg:** graph mutations (GRAPH.* + Cypher writes) stream to replicas
+  as their deterministic, id-pinned WAL records (`GRAPH.ADDNODE <g> <id> …`;
+  label/prop ids are a stateless FNV hash, identical on both sides). The
+  replica applies them through the same `GraphReplayCollector` restart
+  recovery uses — no id re-allocation, no divergence. Replay's edge/SET
+  resolution now also seeds from write-buffer-resident nodes so one-record-at-
+  a-time streaming replay resolves endpoints applied by earlier records.
+- **Snapshot leg:** the FULLRESYNC RDB carries a `moon-graph-store` aux blob —
+  every graph's write buffer is frozen to CSR segments (the checkpoint's own
+  "freeze is the only serialization path" contract) and shipped as
+  `to_bytes()` encodings + id cursors; the replica installs them exactly like
+  restart recovery (`replication::graph_sync`). Mmap (restart-loaded) segments
+  export their mapped bytes verbatim.
+- **READONLY guard is now Cypher-aware:** a read-only `GRAPH.QUERY`
+  (MATCH/RETURN) is served by replicas; only write queries (CREATE/DELETE/
+  SET/MERGE tokens) are rejected. Previously the blanket `W` flag rejected all
+  GRAPH.QUERY on replicas.
+- New e2e `tests/replication_graph.rs`: live-stream parity (nodes, properties,
+  GRAPH.LIST) with a zero-reconnect stream-health assertion that would have
+  caught the masked dead stream, plus snapshot backfill + post-snapshot live
+  growth.
+
 ### Fixed — PSYNC attach races closed (adversarial-review findings on R0/R0.5)
 
 - **Registration-bounded catch-up:** the master now registers the replica with

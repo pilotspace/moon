@@ -524,7 +524,12 @@ impl CsrStorage {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             CsrStorage::Heap(s) => s.to_bytes(),
-            CsrStorage::Mmap(_) => Vec::new(), // Not applicable
+            // The mapped file is byte-identical to the `to_bytes()` encoding
+            // (`write_to_file` produced it), so a copy of the mapped region
+            // round-trips through `CsrSegment::from_bytes`. Post-load
+            // `mark_deleted` tombstones live in the in-memory validity
+            // overlay and are NOT captured — same fidelity as a restart.
+            CsrStorage::Mmap(s) => s.raw_bytes().to_vec(),
         }
     }
 
