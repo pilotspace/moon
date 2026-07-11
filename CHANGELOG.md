@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — CLIENT TRACKING dead on the monoio runtime (H-3 reorder regression)
+
+- Since the H-3 ACL reorder (#258), `CLIENT TRACKING ON|OFF` answered
+  `ERR unknown subcommand 'TRACKING'` on the monoio runtime (the production
+  default) at every shard count: `try_handle_client_admin` runs before
+  `try_handle_client_tracking` in the frame loop and its unknown-subcommand
+  fallback consumed TRACKING before the dedicated handler could see it.
+  RESP3 invalidation push was therefore entirely unavailable. Invisible to CI
+  because the test matrix exercises the tokio handler (`handler_sharded`),
+  whose intercept ordering differs.
+- `try_handle_client_admin` now falls through for TRACKING (both handlers are
+  post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
+  `client_tracking_invalidation` black-box tests on monoio.
+
 ### Fixed — `txn_kv_wiring` integration test port-collision flake
 
 - `start_txn_server` picked a port from a throwaway `bind(:0)` probe, dropped
