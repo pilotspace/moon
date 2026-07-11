@@ -124,8 +124,9 @@ fn replication_state_backlog_resident_bytes_lazy_init() {
         "uninitialized backlogs must report 0"
     );
 
-    // Allocate backlogs (simulates replica handshake).
-    state.ensure_backlogs_allocated(1024);
+    // Allocate backlogs (simulates replica handshake); capacity comes from
+    // state.backlog_capacity (--repl-backlog-size plumb).
+    state.ensure_backlogs_allocated();
 
     let after = state.backlog_resident_bytes();
     assert!(

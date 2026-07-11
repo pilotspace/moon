@@ -86,6 +86,14 @@ pub struct ServerConfig {
     #[arg(long = "tcp-backlog", default_value_t = 1024)]
     pub tcp_backlog: i32,
 
+    /// Replication backlog capacity in bytes per shard (raw bytes, like
+    /// --maxmemory). Bounds how far a disconnected replica can fall behind
+    /// and still partial-resync; older stream bytes are evicted and force a
+    /// full resync on reconnect. Matches Redis `repl-backlog-size`
+    /// (default 1 MiB).
+    #[arg(long = "repl-backlog-size", default_value_t = 1024 * 1024)]
+    pub repl_backlog_size: usize,
+
     /// Require clients to authenticate with this password
     #[arg(long)]
     pub requirepass: Option<String>,

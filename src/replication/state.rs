@@ -7,6 +7,13 @@ pub use crate::replication::handshake::ReplicaHandshakeState;
 
 use crate::replication::backlog::SharedBacklog;
 
+/// Default per-shard replication backlog capacity (1 MiB), Redis parity.
+pub const DEFAULT_REPL_BACKLOG_SIZE: usize = 1024 * 1024;
+/// Smallest accepted backlog capacity. Redis clamps `repl-backlog-size` to
+/// 16 KiB; the floor also protects `ServerConfig`'s derived `Default` (0)
+/// from allocating an evict-everything backlog.
+pub const MIN_REPL_BACKLOG_SIZE: usize = 16 * 1024;
+
 pub struct ReplicationState {
     pub role: ReplicationRole,
     /// Primary replication ID (40-char hex). Survives restarts -- persisted to disk.
@@ -33,6 +40,11 @@ pub struct ReplicationState {
     /// `try_enforce_readonly` can avoid taking the surrounding RwLock.
     /// Invariant: written by `set_role()` whenever `role` changes.
     pub is_replica_mirror: Arc<AtomicBool>,
+    /// Per-shard backlog capacity in bytes (`--repl-backlog-size`), the single
+    /// source of truth read by every allocation site and by INFO. Set once at
+    /// startup via [`set_backlog_capacity`](Self::set_backlog_capacity); never
+    /// resizes already-allocated backlogs.
+    pub backlog_capacity: usize,
 }
 
 pub enum ReplicationRole {
@@ -68,7 +80,16 @@ impl ReplicationState {
                 .map(|_| Arc::new(parking_lot::Mutex::new(None)))
                 .collect(),
             is_replica_mirror: Arc::new(AtomicBool::new(false)),
+            backlog_capacity: DEFAULT_REPL_BACKLOG_SIZE,
         }
+    }
+
+    /// Set the per-shard backlog capacity from config, clamped to
+    /// [`MIN_REPL_BACKLOG_SIZE`] (Redis clamps `repl-backlog-size` the same
+    /// way). Call before any replica handshake; it does not resize backlogs
+    /// that were already allocated.
+    pub fn set_backlog_capacity(&mut self, capacity: usize) {
+        self.backlog_capacity = capacity.max(MIN_REPL_BACKLOG_SIZE);
     }
 
     /// Set `role` and update the lock-free `is_replica_mirror` atomically.
@@ -87,13 +108,14 @@ impl ReplicationState {
     /// Allocate the per-shard backlog if not already allocated. Idempotent.
     /// Called when a replica handshake begins (REPLCONF or PSYNC arrival) so
     /// subsequent writes on the shard's event loop start being captured for
-    /// partial resync. Capacity defaults to 1 MiB per shard.
-    pub fn ensure_backlogs_allocated(&self, capacity: usize) {
+    /// partial resync. Capacity comes from `self.backlog_capacity`
+    /// (`--repl-backlog-size`, default 1 MiB per shard).
+    pub fn ensure_backlogs_allocated(&self) {
         for slot in &self.per_shard_backlogs {
             let mut guard = slot.lock();
             if guard.is_none() {
                 *guard = Some(crate::replication::backlog::ReplicationBacklog::new(
-                    capacity,
+                    self.backlog_capacity,
                 ));
             }
         }
@@ -215,6 +237,18 @@ impl OffsetHandle {
     #[inline]
     pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
         let _ = self.issue_lsn(shard_id, delta);
+    }
+
+    /// Current offset of one shard. Used by the `RegisterReplica` reply to
+    /// tell the PSYNC task exactly where live fan-out begins, so its backlog
+    /// catch-up read covers `[snapshot_offset, this)` with no gap and no
+    /// overlap.
+    #[inline]
+    pub fn shard_offset(&self, shard_id: usize) -> u64 {
+        self.shard_offsets
+            .get(shard_id)
+            .map(|o| o.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
@@ -359,6 +393,38 @@ mod tests {
         state.set_role(ReplicationRole::Master);
         assert!(!mirror.load(Ordering::Acquire));
         assert!(matches!(state.role, ReplicationRole::Master));
+    }
+
+    #[test]
+    fn test_backlog_capacity_default_and_clamp() {
+        let mut state = ReplicationState::new(1, generate_repl_id(), ZEROED_ID.to_string());
+        assert_eq!(state.backlog_capacity, DEFAULT_REPL_BACKLOG_SIZE);
+
+        // Configured capacity is honored…
+        state.set_backlog_capacity(64 * 1024);
+        assert_eq!(state.backlog_capacity, 64 * 1024);
+
+        // …but clamped to the Redis floor (also guards derived-Default 0).
+        state.set_backlog_capacity(1024);
+        assert_eq!(state.backlog_capacity, MIN_REPL_BACKLOG_SIZE);
+        state.set_backlog_capacity(0);
+        assert_eq!(state.backlog_capacity, MIN_REPL_BACKLOG_SIZE);
+    }
+
+    #[test]
+    fn test_ensure_backlogs_use_configured_capacity() {
+        let mut state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
+        state.set_backlog_capacity(MIN_REPL_BACKLOG_SIZE);
+        state.ensure_backlogs_allocated();
+        // Overflow one backlog past the configured capacity: eviction must
+        // kick in exactly at the configured size, proving the capacity plumb.
+        let slot = &state.per_shard_backlogs[0];
+        let mut guard = slot.lock();
+        let backlog = guard.as_mut().expect("allocated");
+        let data = vec![0xAAu8; MIN_REPL_BACKLOG_SIZE + 100];
+        backlog.append(&data);
+        assert_eq!(backlog.start_offset(), 100, "evicts past configured cap");
+        assert_eq!(backlog.end_offset(), (MIN_REPL_BACKLOG_SIZE + 100) as u64);
     }
 
     #[test]

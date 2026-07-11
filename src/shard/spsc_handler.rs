@@ -2472,20 +2472,59 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }
-        ShardMessage::RegisterReplica { replica_id, tx } => {
+        ShardMessage::RegisterReplica {
+            replica_id,
+            tx,
+            backlog_capacity,
+            registered,
+        } => {
             // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
             // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
             // ReplicationState — see ReplicationState::ensure_backlogs_allocated for the
-            // earlier allocation point triggered by REPLCONF.
+            // earlier allocation point triggered by REPLCONF. Capacity is carried
+            // in the message (from `--repl-backlog-size`) so this fallback can't
+            // silently diverge from the handshake-path allocation.
             let mut guard = repl_backlog.lock();
             if guard.is_none() {
-                *guard = Some(ReplicationBacklog::new(1024 * 1024));
+                *guard = Some(ReplicationBacklog::new(backlog_capacity));
             }
             drop(guard);
             replica_txs.push((replica_id, tx));
+            // Reply with the offset at which live fan-out begins. This runs
+            // synchronously between drains, so every fanout message queued
+            // BEFORE this registration has already advanced the offset, and
+            // every one after it will reach `tx` — the PSYNC task's catch-up
+            // read below this offset is therefore gap-free and overlap-free.
+            if let Some(reg_tx) = registered {
+                let offset = repl_state
+                    .as_ref()
+                    .map(|h| h.shard_offset(shard_id))
+                    .unwrap_or(0);
+                let _ = reg_tx.send(offset);
+            }
         }
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);
+        }
+        ShardMessage::ReplicateVerbatim { bytes } => {
+            // Replication legs only: backlog + offset + live replica fan-out.
+            // WAL writer / AOF pool are deliberately None — the commands routed
+            // here (FT.CREATE / FT.DROPINDEX / FT.CONFIG SET) are durable via
+            // the vector/text sidecars, and an AOF copy would double-apply on
+            // recovery. `wal_fanout_has_work` no-ops the whole call when no
+            // replica has ever attached.
+            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+            let _ = wal_append_and_fanout(
+                &bytes,
+                &mut None,
+                repl_backlog,
+                replica_txs,
+                repl_state,
+                shard_id,
+                None,
+                false,
+                &mut aof_budget,
+            );
         }
         ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,

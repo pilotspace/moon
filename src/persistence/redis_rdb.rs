@@ -432,7 +432,32 @@ pub fn write_rdb(databases: &[Database], buf: &mut Vec<u8>) {
 /// avoiding `Database: Clone` requirements. Used by PSYNC full-resync where
 /// databases are held behind `RwLockReadGuard`s and cannot be cloned or moved.
 pub fn write_rdb_refs(databases: &[&Database], buf: &mut Vec<u8>) {
+    write_rdb_refs_with_moon_aux(databases, &[], buf);
+}
+
+/// Moon replication aux key: FULLRESYNC snapshots carry the vector index
+/// DEFINITIONS (serialized `index_persist` v5 sidecar bytes) inside the RDB as
+/// a private AUX field, so defs arrive atomically with the keyspace snapshot
+/// and never perturb the replication offset math. Foreign RDB parsers (and
+/// older moons) skip unknown aux keys by design.
+pub const MOON_AUX_VECTOR_DEFS: &[u8] = b"moon-vector-defs";
+/// Moon replication aux key: text index definitions
+/// (`text::index_persist::serialize_text_index_metas` bytes). See
+/// [`MOON_AUX_VECTOR_DEFS`].
+pub const MOON_AUX_TEXT_DEFS: &[u8] = b"moon-text-defs";
+
+/// `write_rdb_refs` plus moon-private AUX fields written immediately after
+/// the standard header aux block (before any SELECTDB), which is what lets
+/// [`read_moon_aux`] find them with a bounded header walk.
+pub fn write_rdb_refs_with_moon_aux(
+    databases: &[&Database],
+    moon_aux: &[(&[u8], &[u8])],
+    buf: &mut Vec<u8>,
+) {
     write_rdb_header(buf);
+    for (key, value) in moon_aux {
+        write_aux(buf, key, value);
+    }
 
     let now_ms = current_time_ms();
 
@@ -486,6 +511,41 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Public API: read
 // ---------------------------------------------------------------------------
+
+/// Extract one moon-private AUX value from an RDB buffer produced by
+/// [`write_rdb_refs_with_moon_aux`].
+///
+/// Walks the header AUX block only — every aux field (standard + moon)
+/// precedes the first SELECTDB by construction, so the walk is bounded and
+/// never has to understand entry encodings. Returns `None` for a foreign or
+/// truncated buffer, an unknown key, or any parse hiccup — the RDB loader
+/// proper is where malformed data gets reported.
+pub fn read_moon_aux(data: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    // Version bytes are checked too (matching `load_rdb`): the fixed
+    // `set_position(9)` below is only valid for a 4-byte version field, and a
+    // foreign version would silently misalign the opcode walk.
+    if data.len() < 9 || &data[..5] != REDIS_RDB_MAGIC || &data[5..9] != REDIS_RDB_VERSION {
+        return None;
+    }
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(9); // magic + version
+    loop {
+        let mut opcode = [0u8; 1];
+        if cursor.read_exact(&mut opcode).is_err() {
+            return None;
+        }
+        if opcode[0] != RDB_OPCODE_AUX {
+            // First non-AUX opcode ends the header block — moon aux, if
+            // present, would have appeared by now.
+            return None;
+        }
+        let k = read_redis_string(&mut cursor).ok()?;
+        let v = read_redis_string(&mut cursor).ok()?;
+        if k == key {
+            return Some(v);
+        }
+    }
+}
 
 /// Load an RDB file in Redis format into the provided databases.
 ///
@@ -674,6 +734,53 @@ fn read_rdb_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moon_aux_round_trip_and_loader_skips_it() {
+        let db = Database::new();
+        let refs = [&db];
+        let mut buf = Vec::new();
+        write_rdb_refs_with_moon_aux(
+            &refs,
+            &[
+                (MOON_AUX_VECTOR_DEFS, b"vec-blob\x00\x01"),
+                (MOON_AUX_TEXT_DEFS, b"text-blob"),
+            ],
+            &mut buf,
+        );
+        assert_eq!(
+            read_moon_aux(&buf, MOON_AUX_VECTOR_DEFS).as_deref(),
+            Some(&b"vec-blob\x00\x01"[..])
+        );
+        assert_eq!(
+            read_moon_aux(&buf, MOON_AUX_TEXT_DEFS).as_deref(),
+            Some(&b"text-blob"[..])
+        );
+        assert_eq!(read_moon_aux(&buf, b"moon-unknown"), None);
+        // The standard loader must skip moon aux fields untouched.
+        let mut dbs = vec![Database::new()];
+        let loaded = load_rdb(&mut dbs, &buf).expect("aux-carrying RDB must load");
+        assert_eq!(loaded, 0);
+    }
+
+    #[test]
+    fn read_moon_aux_rejects_foreign_and_truncated_buffers() {
+        assert_eq!(read_moon_aux(b"", MOON_AUX_VECTOR_DEFS), None);
+        assert_eq!(read_moon_aux(b"REDIS", MOON_AUX_VECTOR_DEFS), None);
+        assert_eq!(read_moon_aux(b"NOTRDB0010....", MOON_AUX_VECTOR_DEFS), None);
+        // Plain RDB with no moon aux: header walk ends at first non-AUX opcode.
+        let db = Database::new();
+        let mut buf = Vec::new();
+        write_rdb_refs(&[&db], &mut buf);
+        assert_eq!(read_moon_aux(&buf, MOON_AUX_VECTOR_DEFS), None);
+        // Truncated mid-aux must not panic.
+        let db2 = Database::new();
+        let mut buf2 = Vec::new();
+        write_rdb_refs_with_moon_aux(&[&db2], &[(MOON_AUX_VECTOR_DEFS, b"blob")], &mut buf2);
+        for cut in 9..buf2.len().min(40) {
+            let _ = read_moon_aux(&buf2[..cut], MOON_AUX_VECTOR_DEFS);
+        }
+    }
 
     #[test]
     fn test_crc64_jones_polynomial() {

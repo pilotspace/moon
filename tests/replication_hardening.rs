@@ -12,19 +12,38 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-fn start_moon(port: u16, dir: &str, extra: &[&str]) -> std::process::Child {
-    Command::new("./target/release/moon")
-        .args(
-            [
-                &["--port", &port.to_string(), "--shards", "1", "--dir", dir][..],
-                extra,
-            ]
-            .concat(),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start moon")
+fn start_moon(port: u16, dir: &str, extra: &[&str]) -> Guard {
+    Guard(
+        Command::new("./target/release/moon")
+            .args(
+                [
+                    &["--port", &port.to_string(), "--shards", "1", "--dir", dir][..],
+                    extra,
+                ]
+                .concat(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to start moon"),
+    )
+}
+
+/// Kill-on-drop server guard.
+///
+/// Teardown is SIGKILL-based, NOT `SHUTDOWN NOSAVE`: moon has no working
+/// SHUTDOWN command on the production path (the dispatch arm is an error stub
+/// and the connection handlers never intercept it — see task #27), so a
+/// graceful-shutdown cleanup blocks `Child::wait` forever. Kill-on-drop also
+/// survives assert panics, so a failed test no longer leaks servers that hold
+/// ports and wedge later tests. (Repo harness rule: always kill -9 moon.)
+struct Guard(std::process::Child);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn send_cmd(addr: &str, cmd: &str) -> String {
@@ -102,7 +121,7 @@ mod tests {
         let master_dir = tempfile::tempdir().unwrap();
         let replica_dir = tempfile::tempdir().unwrap();
 
-        let mut master = start_moon(16600, master_dir.path().to_str().unwrap(), &[]);
+        let _master = start_moon(16600, master_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
 
         // Write initial data
@@ -127,27 +146,21 @@ mod tests {
         // Kill replica
         // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
         // SIGKILL is always valid. We check the return code for robustness.
-        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        let ret = unsafe { libc::kill(replica.0.id() as i32, libc::SIGKILL) };
         assert_eq!(ret, 0, "libc::kill failed");
-        let _ = replica.wait();
+        let _ = replica.0.wait();
 
         // Write more data while replica is down (within backlog)
         write_keys("127.0.0.1:16600", "new", 50);
 
         // Restart replica — should partial resync
-        let mut replica2 = start_moon(16601, replica_dir.path().to_str().unwrap(), &[]);
+        let _replica2 = start_moon(16601, replica_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
         send_cmd("127.0.0.1:16601", "REPLICAOF 127.0.0.1 16600");
         thread::sleep(Duration::from_secs(3));
 
         let final_size = dbsize("127.0.0.1:16601");
         let master_size = dbsize("127.0.0.1:16600");
-
-        // Cleanup
-        send_cmd("127.0.0.1:16600", "SHUTDOWN NOSAVE");
-        send_cmd("127.0.0.1:16601", "SHUTDOWN NOSAVE");
-        let _ = master.wait();
-        let _ = replica2.wait();
 
         assert_eq!(
             final_size, master_size,
@@ -163,7 +176,7 @@ mod tests {
         let master_dir = tempfile::tempdir().unwrap();
         let replica_dir = tempfile::tempdir().unwrap();
 
-        let mut master = start_moon(16610, master_dir.path().to_str().unwrap(), &[]);
+        let _master = start_moon(16610, master_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
 
         write_keys("127.0.0.1:16610", "kill_test", 200);
@@ -176,26 +189,21 @@ mod tests {
         // Kill replica with SIGKILL
         // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
         // SIGKILL is always valid. We check the return code for robustness.
-        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        let ret = unsafe { libc::kill(replica.0.id() as i32, libc::SIGKILL) };
         assert_eq!(ret, 0, "libc::kill failed");
-        let _ = replica.wait();
+        let _ = replica.0.wait();
 
         // Write more data
         write_keys("127.0.0.1:16610", "post_kill", 100);
 
         // Restart replica
-        let mut replica2 = start_moon(16611, replica_dir.path().to_str().unwrap(), &[]);
+        let _replica2 = start_moon(16611, replica_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
         send_cmd("127.0.0.1:16611", "REPLICAOF 127.0.0.1 16610");
         thread::sleep(Duration::from_secs(3));
 
         let master_size = dbsize("127.0.0.1:16610");
         let replica_size = dbsize("127.0.0.1:16611");
-
-        send_cmd("127.0.0.1:16610", "SHUTDOWN NOSAVE");
-        send_cmd("127.0.0.1:16611", "SHUTDOWN NOSAVE");
-        let _ = master.wait();
-        let _ = replica2.wait();
 
         assert_eq!(
             replica_size, master_size,
@@ -211,12 +219,12 @@ mod tests {
         let master_dir = tempfile::tempdir().unwrap();
         let replica_dir = tempfile::tempdir().unwrap();
 
-        let mut master = start_moon(16620, master_dir.path().to_str().unwrap(), &[]);
+        let _master = start_moon(16620, master_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
 
         write_keys("127.0.0.1:16620", "promo", 100);
 
-        let mut replica = start_moon(16621, replica_dir.path().to_str().unwrap(), &[]);
+        let _replica = start_moon(16621, replica_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
         send_cmd("127.0.0.1:16621", "REPLICAOF 127.0.0.1 16620");
         thread::sleep(Duration::from_secs(2));
@@ -236,11 +244,6 @@ mod tests {
             get_result.contains("promoted_value"),
             "Promoted replica should accept writes"
         );
-
-        send_cmd("127.0.0.1:16620", "SHUTDOWN NOSAVE");
-        send_cmd("127.0.0.1:16621", "SHUTDOWN NOSAVE");
-        let _ = master.wait();
-        let _ = replica.wait();
     }
 
     /// G17: Full resync when replica offset falls outside backlog window.
@@ -254,7 +257,7 @@ mod tests {
         let replica_dir = tempfile::tempdir().unwrap();
 
         // Start master with a tiny replication backlog (1KB)
-        let mut master = start_moon(
+        let _master = start_moon(
             16630,
             master_dir.path().to_str().unwrap(),
             &["--repl-backlog-size", "1024"],
@@ -280,27 +283,21 @@ mod tests {
         // Disconnect replica
         // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
         // SIGKILL is always valid. We check the return code for robustness.
-        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        let ret = unsafe { libc::kill(replica.0.id() as i32, libc::SIGKILL) };
         assert_eq!(ret, 0, "libc::kill failed");
-        let _ = replica.wait();
+        let _ = replica.0.wait();
 
         // Write enough to overflow the 1KB backlog
         write_keys("127.0.0.1:16630", "overflow", 500);
 
         // Reconnect replica — should trigger full resync
-        let mut replica2 = start_moon(16631, replica_dir.path().to_str().unwrap(), &[]);
+        let _replica2 = start_moon(16631, replica_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
         send_cmd("127.0.0.1:16631", "REPLICAOF 127.0.0.1 16630");
         thread::sleep(Duration::from_secs(4));
 
         let master_size = dbsize("127.0.0.1:16630");
         let replica_size = dbsize("127.0.0.1:16631");
-
-        // Cleanup
-        send_cmd("127.0.0.1:16630", "SHUTDOWN NOSAVE");
-        send_cmd("127.0.0.1:16631", "SHUTDOWN NOSAVE");
-        let _ = master.wait();
-        let _ = replica2.wait();
 
         assert_eq!(
             replica_size, master_size,
@@ -319,13 +316,13 @@ mod tests {
         let master_dir = tempfile::tempdir().unwrap();
         let replica_dir = tempfile::tempdir().unwrap();
 
-        let mut master = start_moon(16640, master_dir.path().to_str().unwrap(), &[]);
+        let _master = start_moon(16640, master_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
 
         // Initial data
         write_keys("127.0.0.1:16640", "partition", 100);
 
-        let mut replica = start_moon(16641, replica_dir.path().to_str().unwrap(), &[]);
+        let _replica = start_moon(16641, replica_dir.path().to_str().unwrap(), &[]);
         thread::sleep(Duration::from_millis(500));
         send_cmd("127.0.0.1:16641", "REPLICAOF 127.0.0.1 16640");
         thread::sleep(Duration::from_secs(2));
@@ -350,12 +347,6 @@ mod tests {
 
         let master_size = dbsize("127.0.0.1:16640");
         let replica_size = dbsize("127.0.0.1:16641");
-
-        // Cleanup
-        send_cmd("127.0.0.1:16640", "SHUTDOWN NOSAVE");
-        send_cmd("127.0.0.1:16641", "SHUTDOWN NOSAVE");
-        let _ = master.wait();
-        let _ = replica.wait();
 
         assert_eq!(
             replica_size, master_size,

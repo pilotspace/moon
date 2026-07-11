@@ -20,6 +20,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Fixed — PSYNC attach races closed (adversarial-review findings on R0/R0.5)
+
+- **Registration-bounded catch-up:** the master now registers the replica with
+  the event loop BEFORE reading backlog catch-up bytes, and the event loop
+  replies with the exact offset where live fan-out begins
+  (`RegisterReplica.registered` reply channel). Catch-up sends exactly
+  `[snapshot_offset, registration_offset)` — previously a write drained
+  between the catch-up read and registration reached neither the RDB, the
+  catch-up, nor the live stream: a silent, unlogged replica gap (worst for
+  FT.* def mutations, whose fanout always crosses the SPSC queue).
+- **Atomic snapshot capture:** the FULLRESYNC snapshot offset is read in the
+  same synchronous stretch as the RDB capture (no `.await` between), closing
+  the inverse race where a write landed inside the RDB *and* above the
+  advertised offset — double-applying non-idempotent commands (INCR) on the
+  replica.
+- **Backlog eviction during catch-up now aborts the sync loudly** (replica
+  retries a fresh full resync) instead of silently skipping the missing bytes.
+- A replica whose full resync carries NO index definitions (pre-R0.5 master
+  or def-serialization failure) now logs a warning when the authoritative
+  replace drops local indexes with no replacement.
+- New race-guard e2e `replica_attach_races_live_ft_create` (30 FT.CREATEs
+  racing a mid-stream attach, exact index-list parity required).
+- Hygiene: `read_moon_aux` validates RDB version bytes like `load_rdb`; the
+  FT.* fanout hook skips the serialize+SPSC round trip until a replica or
+  backlog exists.
+
+### Added — vector/text index-plane replication sync (v0.7 R0.5)
+
+- **Before this change a replica synchronized only the KV keyspace** — FT index
+  definitions never left the master (FT.CREATE/FT.DROPINDEX/FT.CONFIG are
+  handled at the connection layer and never reached the replication fanout),
+  and the replica's `apply` path ran generic dispatch only, skipping the
+  master's auto-index parity hooks. A replica answered `FT._LIST` with nothing
+  and `FT.SEARCH` with errors even while its hashes matched the master.
+- **Snapshot leg:** the FULLRESYNC RDB now carries the master's vector + text
+  index *definitions* as moon-private RDB AUX fields (opcode `0xFA`, keys
+  `moon-vector-defs` / `moon-text-defs`), reusing the sidecar codecs
+  (`serialize_index_metas_v5`, `serialize_text_index_metas`). Standard RDB
+  loaders skip AUX fields, so the snapshot stays Redis-tool-compatible. On
+  load the replica drops all local indexes (full resync = authoritative
+  replace), installs the master's definitions, and backfills them by
+  rescanning matching HASH keys — the same "restart semantics" rescan restart
+  recovery performs.
+- **Live leg:** successful FT.CREATE / FT.DROPINDEX / FT.CONFIG SET on the
+  master now fan out verbatim to the backlog + connected replicas via a new
+  `ShardMessage::ReplicateVerbatim` (offset-accounted like any replicated
+  write; durability remains the sidecar's job — no WAL/AOF leg). The replica
+  applies them through the same `ft_create`/`ft_dropindex`/`ft_config`
+  handlers, and runs the master's index-parity hooks after every applied KV
+  write (HSET auto-index, DEL/UNLINK tombstone, HDEL vector-field tombstone,
+  FLUSHDB/FLUSHALL content clear) so replica indexes track replica keyspace.
+- New black-box acceptance test (`replica_syncs_vector_index_defs_and_contents`)
+  covering snapshot defs + backfill, live HSET indexing, live DEL tombstoning,
+  live FT.CREATE streaming, and FLUSHALL clear-contents-keep-defs semantics.
+- **Scope:** single-shard master (matches R0); multi-shard FT.* replication
+  rides the R2 broadcast redesign. Graph-plane replication is a separate
+  v0.7 workstream.
+
+### Added — replica now applies the replication stream end-to-end (v0.7 R0)
+
+- **Foundational fix**: before this change a `REPLICAOF` replica completed the
+  PSYNC2 handshake but applied **nothing** — `run_handshake_and_stream`
+  discarded the FULLRESYNC RDB (logged "received … bytes" only) and
+  `stream_commands` did `buf.clear()` after advancing the offset. A freshly
+  attached replica reported `DBSIZE 0`. This went unnoticed because every
+  `replication_hardening.rs` test is `#[ignore]`d and never runs in CI.
+- The replica now (1) loads the full-resync RDB snapshot into its local shard
+  and (2) parses the live RESP command stream and applies each write, tracking
+  `SELECT`. Both runtime variants (monoio, tokio). Apply runs synchronously on
+  the shard thread via the thread-local `ShardSlice` (single-shard: every
+  command is local, no SPSC self-hop), bypassing the connection-layer read-only
+  guard as a replica must.
+- Also fixes a wire bug: the replica read the diskless full-resync RDB bulk as
+  `len + 2` bytes (assuming a trailing `\r\n` that diskless replication does not
+  send), stealing the first two bytes of the command stream and desyncing it.
+  Now reads exactly `len`. The replication offset advances by bytes *consumed*
+  by complete frames, not the raw socket read count.
+- `MOVE` and cross-db `COPY ... DB n` are applied through the same two-db core
+  helpers the master's handler-level intercept uses (generic dispatch cannot
+  apply them), so they replicate correctly. A replicated command that still
+  fails to apply is logged loudly rather than dropped silently.
+- New pure, unit-tested stream router (`replication::apply`) and a black-box
+  streaming acceptance test (`tests/replication_streaming.rs`, covering
+  snapshot + live SET/DEL/MOVE/COPY).
+- **Scope:** single-shard (`--shards 1`), logical **db 0**. A multi-shard
+  replica refuses to start replication loudly (rather than diverging silently).
+  Non-default-db writes are a known follow-up — the master's live fanout does
+  not yet stream `SELECT`, so `SELECT n; SET` replicates into db 0. Per-shard
+  WAIT/ACK and multi-shard PSYNC build on this in R1/R2.
+
+### Added — `--repl-backlog-size` (Redis `repl-backlog-size` parity)
+
+- New flag: per-shard replication backlog capacity in raw bytes (default
+  1 MiB, clamped to the 16 KiB Redis floor). Bounds how far a disconnected
+  replica may fall behind and still partial-resync. Previously the capacity
+  was hardcoded at three sites (handshake allocation ×2, SPSC lazy fallback)
+  and `replication_hardening::full_resync_outside_backlog` failed at spawn
+  with `unexpected argument` — the master process never started.
+  `ReplicationState.backlog_capacity` is now the single source of truth,
+  carried into `ShardMessage::RegisterReplica` for the fallback-init and
+  reported truthfully by `INFO replication` `repl_backlog_size`.
+
+### Fixed — `replication_hardening` harness could never complete
+
+- Test teardown used `SHUTDOWN NOSAVE` + `Child::wait()`, but SHUTDOWN is not
+  implemented on the production path (the dispatch arm is an error stub and no
+  connection handler intercepts it) — every test hung forever at cleanup and
+  a mid-test assert failure leaked live servers that wedged later tests'
+  ports. Teardown is now a kill-on-drop guard (panic-safe). Implementing a
+  real `SHUTDOWN [NOSAVE|SAVE]` is tracked separately.
+
 ### Fixed — `txn_kv_wiring` integration test port-collision flake
 
 - `start_txn_server` picked a port from a throwaway `bind(:0)` probe, dropped

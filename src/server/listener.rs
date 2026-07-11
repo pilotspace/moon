@@ -186,12 +186,14 @@ pub async fn run_with_shutdown(
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
         crate::replication::state::load_replication_state(std::path::Path::new(&config.dir));
-    let repl_state = Arc::new(RwLock::new(
-        crate::replication::state::ReplicationState::new(
+    let repl_state = {
+        let mut rs = crate::replication::state::ReplicationState::new(
             1, // non-sharded mode uses 1 shard
             repl_id, repl_id2,
-        ),
-    ));
+        );
+        rs.set_backlog_capacity(config.repl_backlog_size);
+        Arc::new(RwLock::new(rs))
+    };
 
     // Register repl_state globally for INFO command queries.
     crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
