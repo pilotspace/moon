@@ -156,7 +156,15 @@ impl NamedGraph {
     /// Re-materialize copy-up tombstones after a freeze drained them:
     /// copy the frozen row's data back into the write buffer, then re-delete
     /// it at its ORIGINAL deletion LSN (preserves MVCC time-travel).
-    fn restore_dead_shadows(&mut self, dead_shadows: &[(crate::graph::types::NodeKey, u64)]) {
+    ///
+    /// `pub(crate)` for the replication snapshot install
+    /// (`replication::graph_sync`): a replica receiving a graph blob must
+    /// re-materialize the master's copy-up tombstones the same way, or the
+    /// frozen rows they shadow resurrect on the replica.
+    pub(crate) fn restore_dead_shadows(
+        &mut self,
+        dead_shadows: &[(crate::graph::types::NodeKey, u64)],
+    ) {
         if dead_shadows.is_empty() {
             return;
         }

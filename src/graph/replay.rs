@@ -501,20 +501,54 @@ impl GraphReplayCollector {
                 };
                 let (mut mg, immutable) = take_memgraph(graph);
 
-                // Seed node_maps from immutable CSR segments so edges referencing
-                // CSR-resident nodes (loaded during recovery) can be resolved.
-                // Also raise the id-allocation floor past every frozen
-                // external_id so fresh post-replay inserts can never alias
-                // a frozen row.
-                let mut node_map: HashMap<u64, crate::graph::types::NodeKey> = HashMap::new();
+                // Raise the id-allocation floor past every frozen external_id
+                // so fresh post-replay inserts can never alias a frozen row.
+                // Per SEGMENT (header max), not per node: the floor is one
+                // monotonic counter, so the max subsumes every row's id — and
+                // a replica replays streamed WAL records ONE AT A TIME
+                // through this function, so a per-node pass here would cost
+                // O(total nodes) per record (adversarial-review P1-4).
                 for csr_seg in &immutable {
-                    for nm in csr_seg.node_meta() {
-                        let key_data = slotmap::KeyData::from_ffi(nm.external_id);
-                        let node_key = crate::graph::types::NodeKey::from(key_data);
-                        node_map.insert(nm.external_id, node_key);
-                        mg.ensure_node_id_floor(nm.external_id);
-                    }
+                    mg.ensure_node_id_floor(csr_seg.max_node_id());
                 }
+                // Node existence is resolved LAZILY, not via a pre-seeded
+                // map: external_id ↔ NodeKey is the same KeyData bijection
+                // used at insert (`add_node_with_id`), so probing the write
+                // buffer (O(1) hash — covers nodes landed by EARLIER streamed
+                // replay calls AND this batch's inserts) and the CSR segments
+                // (MPH lookup) IS the membership test the old map answered.
+                // The pre-seeded map re-scanned every write-buf node and
+                // every segment row on each call — O(N²) for an N-record
+                // stream.
+                let nk_of = |id: u64| -> crate::graph::types::NodeKey {
+                    crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(id))
+                };
+                // Presence: ANY record of this id — live write-buf node, dead
+                // tombstone/shadow, or frozen CSR row. AddNode dedup keys off
+                // presence: slotmap ids are never reused (version bits bump on
+                // slot reuse), so an AddNode for a present id can only be a
+                // full-history replay of the same node — re-inserting would
+                // shadow the existing identity.
+                let node_present = |mg: &MemGraph, nk: crate::graph::types::NodeKey| -> bool {
+                    mg.get_node(nk).is_some()
+                        || immutable.iter().any(|s| s.lookup_node(nk).is_some())
+                };
+                // Liveness: mutation targets (edge endpoints, SETPROP/SETLABEL,
+                // REMOVENODE) must be ALIVE. A write-buffer entry is
+                // authoritative — `deleted_lsn == MAX` ⇒ live; a tombstoned
+                // write-buf-only node or a copy-up dead shadow of a frozen row
+                // ⇒ dead (matching the old live-only `iter_nodes()` map —
+                // adversarial round-2 finding F: `get_node` alone returns dead
+                // entries too, and `set_node_property` has no aliveness guard,
+                // so a stray SETPROP would re-register a tombstoned node into
+                // the live property index). Only ids with NO write-buf entry
+                // fall back to the CSR rows.
+                let node_alive = |mg: &MemGraph, nk: crate::graph::types::NodeKey| -> bool {
+                    match mg.get_node(nk) {
+                        Some(n) => n.deleted_lsn == u64::MAX,
+                        None => immutable.iter().any(|s| s.lookup_node(nk).is_some()),
+                    }
+                };
 
                 // Insert nodes.
                 // Precompute _key property ID for graph expansion mapping.
@@ -539,18 +573,17 @@ impl GraphReplayCollector {
                         // the frozen row with a redundant mutable copy (P0:
                         // restart NodeKey aliasing). Keep the CSR-seeded
                         // identity and skip the insert.
-                        let nk = if let Some(&existing) = node_map.get(node_id) {
-                            existing
+                        let candidate = nk_of(*node_id);
+                        let nk = if node_present(&mg, candidate) {
+                            candidate
                         } else {
-                            let nk = mg.add_node_with_id(
+                            mg.add_node_with_id(
                                 *node_id,
                                 labels.clone(),
                                 properties.clone(),
                                 embedding.clone(),
                                 0,
-                            );
-                            node_map.insert(*node_id, nk);
-                            nk
+                            )
                         };
                         // Track _key properties for registration after memgraph is
                         // returned. Re-derived even for dedup-skipped (CSR-resident)
@@ -581,14 +614,14 @@ impl GraphReplayCollector {
                         ..
                     } = &self.commands[idx]
                     {
-                        let src_key = node_map.get(src_id).copied();
-                        let dst_key = node_map.get(dst_id).copied();
-                        if let (Some(src), Some(dst)) = (src_key, dst_key) {
-                            // Cross-tier aware: endpoints seeded from CSR
+                        let src = nk_of(*src_id);
+                        let dst = nk_of(*dst_id);
+                        if node_alive(&mg, src) && node_alive(&mg, dst) {
+                            // Cross-tier aware: endpoints frozen into CSR
                             // segments are non-resident in `mg` — a plain
                             // add_edge would silently drop the edge on
-                            // replay. node_map membership IS the existence
-                            // proof (replayed node or CSR row). The ORIGINAL
+                            // replay. `node_exists` (write buffer OR CSR row)
+                            // is the existence proof. The ORIGINAL
                             // logged edge id is preserved so client-cached
                             // edge handles (and later REMOVEEDGE records)
                             // resolve after restart.
@@ -630,13 +663,14 @@ impl GraphReplayCollector {
                             value,
                             ..
                         } => {
-                            let Some(nk) = node_map.get(entity_id).copied() else {
+                            let nk = nk_of(*entity_id);
+                            if !node_alive(&mg, nk) {
                                 tracing::warn!(
-                                    "WAL replay: SETPROP node_id={} not found in WAL or CSR",
+                                    "WAL replay: SETPROP node_id={} not found live in WAL or CSR",
                                     entity_id
                                 );
                                 continue;
-                            };
+                            }
                             // CSR-resident target (frozen before the SET was
                             // logged): copy the row up first, like live W2-2.
                             if mg.get_node(nk).is_none()
@@ -681,13 +715,14 @@ impl GraphReplayCollector {
                             }
                         }
                         GraphCommand::SetLabel { node_id, label, .. } => {
-                            let Some(nk) = node_map.get(node_id).copied() else {
+                            let nk = nk_of(*node_id);
+                            if !node_alive(&mg, nk) {
                                 tracing::warn!(
-                                    "WAL replay: SETLABEL node_id={} not found in WAL or CSR",
+                                    "WAL replay: SETLABEL node_id={} not found live in WAL or CSR",
                                     node_id
                                 );
                                 continue;
-                            };
+                            }
                             if mg.get_node(nk).is_none()
                                 && !crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
                             {
@@ -707,7 +742,8 @@ impl GraphReplayCollector {
                 // Remove nodes.
                 for &idx in &epoch.remove_node_indices {
                     if let GraphCommand::RemoveNode { node_id, .. } = &self.commands[idx] {
-                        if let Some(nk) = node_map.get(node_id).copied() {
+                        let nk = nk_of(*node_id);
+                        if node_alive(&mg, nk) {
                             if mg.remove_node(nk, 0) {
                                 *replayed += 1;
                             } else if mg.get_node(nk).is_none() {
@@ -1170,6 +1206,49 @@ mod tests {
         );
         assert!(node.labels.contains(&3), "original label kept");
         assert!(node.labels.contains(&5), "SETLABEL applied");
+    }
+
+    /// Adversarial round-2 finding F: a write-buffer-only node removed in an
+    /// EARLIER replay call (a streamed replica applies ONE record per call)
+    /// must NOT be resurrected by a later SETPROP for the same id —
+    /// `set_node_property` has no aliveness guard and would re-register the
+    /// tombstoned node into the live property index.
+    #[test]
+    fn test_streamed_replay_setprop_after_remove_does_not_resurrect() {
+        let n1 = (1u64 << 32) | 7;
+        let n1s = n1.to_string();
+        let mut store = GraphStore::new();
+
+        // Call 1 (streamed batch): create + addnode + removenode.
+        let mut c1 = GraphReplayCollector::new();
+        assert!(c1.collect_command(b"GRAPH.CREATE", &[b"g"]));
+        assert!(c1.collect_command(b"GRAPH.ADDNODE", &[b"g", n1s.as_bytes(), b"1", b"3", b"0"]));
+        assert!(c1.collect_command(b"GRAPH.REMOVENODE", &[b"g", n1s.as_bytes()]));
+        assert_eq!(c1.replay_into(&mut store), 3);
+
+        // Call 2 (a LATER streamed record): stray SETPROP for the dead id.
+        let mut c2 = GraphReplayCollector::new();
+        assert!(c2.collect_command(
+            b"GRAPH.SETPROP",
+            &[b"g", b"N", n1s.as_bytes(), b"9", b"i", b"1"]
+        ));
+        let replayed = c2.replay_into(&mut store);
+        assert_eq!(
+            replayed, 0,
+            "SETPROP on a dead node must skip, not resurrect"
+        );
+
+        let g = store.get_graph(b"g").expect("graph");
+        let nk = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(n1));
+        let node = g
+            .write_buf
+            .get_node(nk)
+            .expect("temporal tombstone entry is retained");
+        assert_ne!(node.deleted_lsn, u64::MAX, "node stays dead");
+        assert!(
+            node.properties.iter().all(|(k, _)| *k != 9),
+            "no property applied to a dead node"
+        );
     }
 
     /// W2-9 + W2-2: a SETPROP whose target froze before the crash must copy

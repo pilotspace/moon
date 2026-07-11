@@ -46,6 +46,16 @@ pub(super) async fn try_handle_ws_command(
         }
     };
 
+    // Round-2 finding A fail-loud: WS.CREATE/WS.DROP persist locally
+    // (WorkspaceCreate/Drop WAL records) but are NOT replicated in v0.7 —
+    // surface the divergence once instead of letting a replica silently miss
+    // the plane. (WS.CREATE is non-deterministic — fresh UUIDv7 per execution
+    // — so verbatim streaming would be wrong; task #34 tracks the id-pinned
+    // record form.)
+    if sub.eq_ignore_ascii_case(b"CREATE") || sub.eq_ignore_ascii_case(b"DROP") {
+        super::ft::warn_unreplicated_plane(ctx, cmd);
+    }
+
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_ws_create(cmd_args) {
             Ok(ws_name) => {
@@ -300,6 +310,13 @@ pub(super) async fn try_handle_mq_command(
             return true;
         }
     };
+
+    // Round-2 finding A fail-loud: MQ mutations persist locally (WAL via
+    // execute_mq_on_owner) but are NOT replicated in v0.7 — surface the
+    // divergence once instead of letting a replica silently miss the plane.
+    if !sub.eq_ignore_ascii_case(b"LEN") && !sub.eq_ignore_ascii_case(b"DLQLEN") {
+        super::ft::warn_unreplicated_plane(ctx, cmd);
+    }
 
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_mq_create(cmd_args) {
@@ -729,6 +746,29 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // v0.7 REPLICATION (adversarial-review P0-1): the txn body must
+            // reach replicas like any other successful local write. This was
+            // the ONE local write path that skipped the replication plane —
+            // `MULTI/SET/EXEC` at shards=1 committed on the master and never
+            // reached the replica (silent deterministic divergence). Record
+            // each body entry HERE, in the same synchronous stretch as the
+            // just-returned (fully synchronous) `execute_transaction_sharded`
+            // — atomic w.r.t. the inline PSYNC snapshot capture — and tell
+            // `persist_txn_aof` not to double-advance the offset (lsn = 0,
+            // same contract as the single-command legs).
+            let repl_active = super::ft::replication_fanout_active(ctx);
+            if repl_active {
+                // Round-2 finding G (throughput note): each entry pushes one
+                // ReplicaLiveFanout onto the self queue, and the drain
+                // preamble processes the whole burst before the shard's
+                // bounded SPSC consumers — a very large EXEC body is a tail-
+                // latency vector for cross-shard traffic sharing this thread.
+                // Each drain iteration is just a try_send per replica, so the
+                // burst is cheap; revisit only if EXEC bodies grow unbounded.
+                for bytes in &aof_entries {
+                    super::ft::record_local_write(ctx, bytes.clone());
+                }
+            }
             // DURABILITY: append every successful write in the body to THIS
             // shard's AOF via the same group-commit path as normal writes, then
             // issue ONE fsync barrier under appendfsync=always before acking.
@@ -736,7 +776,7 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries)
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, repl_active)
                 .await
                 .is_err()
             {
@@ -928,9 +968,27 @@ pub(super) async fn try_handle_graph_command(
             txn.record_graph_undo(undo_op);
         }
     }
+    // v0.7 graph replication: the drained WAL records are the DETERMINISTIC,
+    // id-pinned form of this mutation (GRAPH.ADDNODE <g> <node_id> …, FNV-
+    // hashed u16 label/prop ids — `label_to_id` is stateless, so master and
+    // replica agree). Record them verbatim in the replication plane
+    // (`record_local_write`: backlog + offset synchronously, live fan-out at
+    // the next drain), which replicas replay via `GraphReplayCollector`
+    // without re-allocating ids. Only the replication legs — the WAL copy is
+    // the local `wal_append` below, so nothing double-logs. Single-shard
+    // scope, matching the R0/R0.5 FT.* leg (multi-shard graph replication
+    // rides the R2 broadcast redesign).
+    let wal_records: Vec<bytes::Bytes> = wal_records.into_iter().map(bytes::Bytes::from).collect();
+    if !wal_records.is_empty() && ctx.num_shards == 1 && super::ft::replication_fanout_active(ctx) {
+        // Recording in the same synchronous stretch as the graph mutation
+        // keeps mutation + replication record atomic w.r.t. the inline PSYNC
+        // task's snapshot capture on this thread.
+        for record in &wal_records {
+            super::ft::record_local_write(ctx, record.clone());
+        }
+    }
     for record in wal_records {
-        ctx.shard_databases
-            .wal_append(ctx.shard_id, bytes::Bytes::from(record));
+        ctx.shard_databases.wal_append(ctx.shard_id, record);
     }
     let mut response = response;
     if let Some(ws_id) = conn.workspace_id.as_ref() {

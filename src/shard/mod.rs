@@ -23,6 +23,7 @@ pub mod scatter_aggregate;
 pub mod scatter_hybrid;
 /// MA1: write-stall on immutable segment backlog.
 pub mod segment_stall;
+pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
 pub mod spsc_handler;

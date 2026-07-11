@@ -899,7 +899,15 @@ pub async fn handle_connection(
                                     rs_guard.role,
                                     crate::replication::state::ReplicationRole::Replica { .. }
                                 ) {
-                                    if metadata::is_write(cmd) {
+                                    // GRAPH.QUERY is blanket-W (Cypher CAN
+                                    // write); serve read-only MATCH/RETURN on
+                                    // replicas — see handler_monoio::dispatch.
+                                    #[cfg(feature = "graph")]
+                                    let graph_ro = cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                                        && !crate::command::graph::is_cypher_write_query(cmd_args);
+                                    #[cfg(not(feature = "graph"))]
+                                    let graph_ro = false;
+                                    if metadata::is_write(cmd) && !graph_ro {
                                         responses.push(Frame::Error(Bytes::from_static(
                                             b"READONLY You can't write against a read only replica.",
                                         )));

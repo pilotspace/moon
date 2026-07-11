@@ -562,6 +562,7 @@ pub(super) async fn try_handle_swapdb(
 #[inline]
 pub(super) fn try_enforce_readonly(
     cmd: &[u8],
+    cmd_args: &[Frame],
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
@@ -572,6 +573,17 @@ pub(super) fn try_enforce_readonly(
         return false;
     }
     if metadata::is_write(cmd) {
+        // GRAPH.QUERY is blanket-W (Cypher CAN write); serve read-only
+        // MATCH/RETURN on replicas. The classifier never false-negatives
+        // for a write query — see handler_monoio::dispatch.
+        #[cfg(feature = "graph")]
+        if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+            && !crate::command::graph::is_cypher_write_query(cmd_args)
+        {
+            return false;
+        }
+        #[cfg(not(feature = "graph"))]
+        let _ = cmd_args;
         responses.push(Frame::Error(Bytes::from_static(
             b"READONLY You can't write against a read only replica.",
         )));

@@ -607,3 +607,84 @@ fn replica_attach_races_live_ft_create() {
         "replica lost FT.CREATE(s) during attach race.\nmaster:  {master_list}\nreplica: {replica_list}"
     );
 }
+
+/// REPL-STREAM-04 (adversarial-review P0-1 on the self-SPSC fix): MULTI/EXEC
+/// bodies must replicate.
+///
+/// The single-command local-write path records every successful write in the
+/// replication plane, but EXEC persisted its body through `persist_txn_aof`'s
+/// AOF-only leg: a `MULTI / SET / INCR / EXEC` on a `--shards 1` master with
+/// an attached replica committed durably on the master and NEVER reached the
+/// replica — no backlog bytes, no offset advance, no live fan-out. Silent,
+/// deterministic divergence for every application using transactions.
+#[test]
+#[ignore]
+fn replica_applies_multi_exec_bodies() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16730";
+    let replica_addr = "127.0.0.1:16731";
+
+    let _master = Killer(start_moon(16730, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+
+    let _replica = Killer(start_moon(16731, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+
+    send_cmd(replica_addr, &format!("REPLICAOF 127.0.0.1 {}", 16730));
+
+    // Prove the live stream is up with a plain single write first.
+    send_cmd(master_addr, "SET plain alive");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "plain").as_deref() == Some("alive")
+        }),
+        "single-command live stream not flowing — txn assertions would be meaningless"
+    );
+
+    // The transaction under test: a SET and two INCRs (INCR doubles as a
+    // double-apply canary — a re-delivered body would show ctr=4).
+    let exec_reply = send_seq(
+        master_addr,
+        &["MULTI", "SET t1 v1", "INCR ctr", "INCR ctr", "EXEC"],
+    );
+    assert!(
+        !exec_reply.contains("ERR"),
+        "EXEC failed on the master: {exec_reply}"
+    );
+    assert_eq!(
+        get(master_addr, "ctr").as_deref(),
+        Some("2"),
+        "master must see the txn's own effects"
+    );
+
+    // In-order stream sentinel: once this single post-txn write is visible,
+    // the txn body (streamed before it) must already have been applied.
+    send_cmd(master_addr, "SET txn_done 1");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "txn_done").as_deref() == Some("1")
+        }),
+        "post-txn sentinel never replicated"
+    );
+
+    assert_eq!(
+        get(replica_addr, "t1").as_deref(),
+        Some("v1"),
+        "MULTI/EXEC SET did not replicate"
+    );
+    assert_eq!(
+        get(replica_addr, "ctr").as_deref(),
+        Some("2"),
+        "MULTI/EXEC INCRs did not replicate exactly once (None=lost, 4=double-applied)"
+    );
+}

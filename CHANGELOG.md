@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — replication round-2 hardening: TEMPORAL.INVALIDATE, replay liveness, blob endpoint checks
+
+- **TEMPORAL.INVALIDATE never replicated** (round-2 finding B): the handler
+  drained the graph WAL — the same record mechanism GRAPH.\* replication
+  uses — but only fed the local WAL, never the replication plane; a replica
+  silently kept `valid_to = ∞` for entities the master had invalidated. The
+  master now streams a deterministic, wall-clock-pinned internal form
+  (`TEMPORAL.INVALIDATE-AT <graph> <N|E> <entity_id> <wall_ms>`, single-shard
+  scope like every replication leg) so master and replica agree on the exact
+  `valid_to`; the replica applies it through the same `apply_invalidate` the
+  master ran. New e2e REPL-GRAPH-03 proves temporal visibility converges
+  (red without the master leg, green with it).
+- **Streamed replay could resurrect a tombstoned node** (round-2 finding F,
+  regression from the P1-4 lazy-resolver rewrite): the lazy `node_exists`
+  accepted DEAD write-buffer entries (`get_node` does not filter
+  `deleted_lsn`), so a stray SETPROP for a node removed in an earlier
+  streamed replay call re-registered it into the live property index. Split
+  into `node_present` (AddNode dedup — any record of the id, matching the
+  never-reuse slotmap id contract) and `node_alive` (edge endpoints /
+  SETPROP / SETLABEL / REMOVENODE — write-buffer entry is authoritative,
+  live-only, matching the old pre-seeded map's `iter_nodes()` semantics).
+- **Graph snapshot install now rejects delta edges with unknown endpoints**
+  (round-2 finding E, defense-in-depth): `add_edge_across_tiers_with_id`'s
+  aliveness check only fires for resident endpoints — a corrupted blob
+  referencing a nonexistent node installed silently. The install loop now
+  verifies both endpoints against the just-installed segments and drops the
+  edge LOUD (`tracing::warn!`) otherwise.
+- **WS.\*/MQ.\* writes are NOT replicated in v0.7 — now fail-loud** (round-2
+  finding A, known limitation): WS.CREATE/WS.DROP and MQ mutations persist
+  durably on the master (WAL) but have no deterministic replication record
+  form yet (WS.CREATE mints a fresh UUIDv7 per execution — verbatim
+  streaming would diverge). A one-time `tracing::warn!` now fires when such
+  a write executes while a replica is attached, instead of silent divergence
+  discovered at failover. Full support (id-pinned record forms + replica
+  apply arms + snapshot coverage) is tracked as follow-up work, alongside
+  the pre-existing Lua-EVAL and expiry/eviction propagation gaps.
+
 ### Fixed — CLIENT TRACKING dead on the monoio runtime (H-3 reorder regression)
 
 - Since the H-3 ACL reorder (#258), `CLIENT TRACKING ON|OFF` answered
@@ -19,6 +56,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `try_handle_client_admin` now falls through for TRACKING (both handlers are
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
+
+### Fixed — replication exactly-once + txn/graph fidelity (adversarial-review P0/P1)
+
+- **MULTI/EXEC bodies never replicated at `--shards 1`** (P0-1): EXEC persisted
+  its body through `persist_txn_aof`'s AOF-only leg — the one local write path
+  that skipped the replication plane. A `MULTI/SET/EXEC` committed durably on
+  the master and never reached the replica: silent deterministic divergence
+  for every application using transactions. The txn body now records each
+  entry through the same `record_local_write` leg as single-command writes
+  (AOF `lsn = 0`, no double-advance). New e2e
+  `replica_applies_multi_exec_bodies` (INCR doubles as a double-apply canary).
+- **FULLRESYNC snapshot capture raced undrained local writes** (P0-2): the
+  original design queued backlog append + offset advance + live fan-out as ONE
+  deferred event-loop message, so a mutation could sit inside the RDB while
+  still below the advertised snapshot offset — re-delivered via backlog
+  catch-up and double-applied (INCR/LPUSH divergence). `record_local_write`
+  now appends the backlog bytes and advances the shard offset SYNCHRONOUSLY
+  at write time (atomic with the mutation w.r.t. the inline PSYNC capture);
+  only the live replica `try_send` is deferred (`ReplicaLiveFanout`).
+  `RegisterReplica` correspondingly carries a push-time offset so catch-up
+  and live delivery stay disjoint for every write/attach interleave.
+- **Graph snapshot lost soft state that lives outside CSR segments** (P1-5 +
+  two adjacent gaps): the CSR byte format has no validity section, `freeze()`
+  RETAINS cross-tier delta edges in the write buffer, and copy-up node
+  tombstones never freeze — the master recovers all three from its WAL on
+  restart, but a replica has no WAL, so it resurrected deleted edges/nodes
+  and silently lost every cross-tier edge. Blob format v2 ships a per-segment
+  deleted-edge sidecar, the retained delta edges (original edge ids), and the
+  dead-shadow list; install re-applies all three.
+- **Streamed graph replay was O(N²)** (P1-4): each replicated GRAPH.* record
+  re-scanned every write-buffer node and every segment row to pre-seed the
+  replay id map — unbounded replication lag on bulk graph loads. Node
+  existence is now resolved lazily (O(1) write-buf probe + MPH segment
+  lookup), and the id-allocation floor is raised per segment header max
+  instead of per row.
+- Also: FULLRESYNC graph export skips freezing untouched write buffers
+  (P1-6, repeated-resync latency), and the shard self-queue is drained
+  unbounded per cycle (P2-7 — entries are cheap try_sends; a cycle cap could
+  strand a replica's live bytes by a full tick).
+
+### Fixed — single-shard live replication stream was DEAD (self-SPSC gap)
+
+- **The R0 live stream never actually flowed at `--shards 1`.** The SPSC mesh
+  is N·(N−1) with skip-self mapping, so a task on a shard's own thread had NO
+  producer to that shard: the inline PSYNC task's `RegisterReplica` failed
+  every attach ("shard 0 producer missing") and the replica fell into a 0.5s
+  reconnect/full-resync loop. Tests stayed green because each resync's RDB
+  carried the latest keyspace + FT defs — data crawled across via snapshot
+  polling, masking the dead stream. Fixed with a thread-local self-message
+  queue (`shard::self_msg`) drained by the event loop alongside its SPSC
+  consumers; PSYNC registration, FT.*/graph fan-out, and local-write fan-out
+  all route through it.
+- **Local (same-shard) writes now feed the replication plane.** Successful
+  local writes push their wire bytes as `ReplicateVerbatim` before any await
+  (mutation + record are one synchronous stretch, atomic w.r.t. snapshot
+  capture); the drained message does backlog + offset + replica fan-out
+  together, and the AOF leg no longer double-advances the offset (lsn = 0 when
+  fan-out owns the advance).
+- **Replication backlog now seeds at the current shard offset** on lazy
+  allocation (`ReplicationBacklog::new_at`) — an unseeded backlog made every
+  catch-up range read on a pre-written master fail as "evicted".
+- New process-global `fanout_hint_active()` (one Relaxed load, set on first
+  replica attach, never cleared) gates all fan-out serialization so
+  non-replicating servers pay nothing on the hot path.
+
+### Added — v0.7 graph-plane replication (live stream + snapshot backfill)
+
+- **Live leg:** graph mutations (GRAPH.* + Cypher writes) stream to replicas
+  as their deterministic, id-pinned WAL records (`GRAPH.ADDNODE <g> <id> …`;
+  label/prop ids are a stateless FNV hash, identical on both sides). The
+  replica applies them through the same `GraphReplayCollector` restart
+  recovery uses — no id re-allocation, no divergence. Replay's edge/SET
+  resolution now also seeds from write-buffer-resident nodes so one-record-at-
+  a-time streaming replay resolves endpoints applied by earlier records.
+- **Snapshot leg:** the FULLRESYNC RDB carries a `moon-graph-store` aux blob —
+  every graph's write buffer is frozen to CSR segments (the checkpoint's own
+  "freeze is the only serialization path" contract) and shipped as
+  `to_bytes()` encodings + id cursors; the replica installs them exactly like
+  restart recovery (`replication::graph_sync`). Mmap (restart-loaded) segments
+  export their mapped bytes verbatim.
+- **READONLY guard is now Cypher-aware:** a read-only `GRAPH.QUERY`
+  (MATCH/RETURN) is served by replicas; only write queries (CREATE/DELETE/
+  SET/MERGE tokens) are rejected. Previously the blanket `W` flag rejected all
+  GRAPH.QUERY on replicas.
+- New e2e `tests/replication_graph.rs`: live-stream parity (nodes, properties,
+  GRAPH.LIST) with a zero-reconnect stream-health assertion that would have
+  caught the masked dead stream, plus snapshot backfill + post-snapshot live
+  growth.
 
 ### Fixed — PSYNC attach races closed (adversarial-review findings on R0/R0.5)
 

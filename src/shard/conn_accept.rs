@@ -757,7 +757,6 @@ pub(crate) fn spawn_monoio_connection(
                             _hijacked_psync = true;
                             let repl_state_clone = conn_ctx.repl_state.clone();
                             let shard_databases_clone = conn_ctx.shard_databases.clone();
-                            let dispatch_tx_clone = conn_ctx.dispatch_tx.clone();
                             let parsed_addr: std::net::SocketAddr = hp_peer
                                 .parse()
                                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -771,7 +770,6 @@ pub(crate) fn spawn_monoio_connection(
                                         stream,
                                         rs,
                                         shard_databases_clone,
-                                        dispatch_tx_clone,
                                         parsed_addr,
                                     ).await {
                                         tracing::warn!("PSYNC handler exited: {}", e);

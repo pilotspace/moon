@@ -445,6 +445,10 @@ pub const MOON_AUX_VECTOR_DEFS: &[u8] = b"moon-vector-defs";
 /// (`text::index_persist::serialize_text_index_metas` bytes). See
 /// [`MOON_AUX_VECTOR_DEFS`].
 pub const MOON_AUX_TEXT_DEFS: &[u8] = b"moon-text-defs";
+/// Moon replication aux key: whole graph-store snapshot
+/// (`replication::graph_sync::export_graph_store` blob — frozen CSR segment
+/// encodings + id cursors per graph). See [`MOON_AUX_VECTOR_DEFS`].
+pub const MOON_AUX_GRAPH_STORE: &[u8] = b"moon-graph-store";
 
 /// `write_rdb_refs` plus moon-private AUX fields written immediately after
 /// the standard header aux block (before any SELECTDB), which is what lets

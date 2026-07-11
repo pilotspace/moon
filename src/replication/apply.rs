@@ -184,6 +184,30 @@ pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
             return;
         }
 
+        // GRAPH.* mutations (v0.7 graph replication) arrive as the master's
+        // DETERMINISTIC WAL-record form: id-pinned (GRAPH.ADDNODE <g>
+        // <node_id> …) with FNV-hashed u16 label/prop-key ids — `label_to_id`
+        // is a stateless hash, so both sides resolve the same strings to the
+        // same ids. Generic `dispatch()` parses the USER syntax and would
+        // re-allocate ids; route through the WAL replay collector instead,
+        // exactly like restart recovery does.
+        #[cfg(feature = "graph")]
+        if crate::graph::replay::GraphReplayCollector::is_graph_command(cmd) {
+            apply_graph(s, cmd, args);
+            return;
+        }
+
+        // TEMPORAL.INVALIDATE arrives as the master's deterministic
+        // wall-clock-pinned form (`TEMPORAL.INVALIDATE-AT <graph> <N|E>
+        // <entity_id> <wall_ms>`, round-2 finding B) — apply with the SAME
+        // wall_ms the master used so `valid_to` matches exactly. Generic
+        // `dispatch()` does not know this internal record.
+        #[cfg(feature = "graph")]
+        if cmd.eq_ignore_ascii_case(b"TEMPORAL.INVALIDATE-AT") {
+            apply_temporal_invalidate(s, cmd, args);
+            return;
+        }
+
         // MOVE / cross-db COPY touch two databases at once and are intercepted
         // BEFORE generic dispatch on the master (see `spsc_two_db`). Generic
         // `dispatch()` cannot apply them — it returns an error for MOVE and
@@ -256,6 +280,81 @@ fn apply_ft(
         );
         Frame::Null
     }
+}
+
+/// Apply one replicated graph WAL record (v0.7 graph replication) into this
+/// shard's `GraphStore` through the same `GraphReplayCollector` restart
+/// recovery uses. Records arrive one at a time in stream order; the collector
+/// resolves edge/SET targets against nodes applied by EARLIER records via the
+/// write-buffer seeding in `replay_epoch_aware`.
+#[cfg(feature = "graph")]
+fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+    use crate::graph::replay::GraphReplayCollector;
+    let mut arg_bytes: Vec<&[u8]> = Vec::with_capacity(args.len());
+    for a in args {
+        match a {
+            Frame::BulkString(b) | Frame::SimpleString(b) => arg_bytes.push(b.as_ref()),
+            _ => {
+                tracing::warn!(
+                    "replica apply: non-bulk arg in graph record {} — skipped (graph diverges; \
+                     full resync required)",
+                    String::from_utf8_lossy(cmd)
+                );
+                return;
+            }
+        }
+    }
+    let mut collector = GraphReplayCollector::new();
+    if !collector.collect_command(cmd, &arg_bytes) {
+        tracing::warn!(
+            "replica apply: unparseable graph record {} — skipped (graph diverges; \
+             full resync required)",
+            String::from_utf8_lossy(cmd)
+        );
+        return;
+    }
+    if collector.replay_into(&mut s.graph_store) == 0 {
+        // Not always divergence (e.g. GRAPH.CREATE of an existing graph
+        // counts 0), but worth surfacing at debug for stream forensics.
+        tracing::debug!(
+            "replica apply: graph record {} replayed 0 mutations",
+            String::from_utf8_lossy(cmd)
+        );
+    }
+}
+
+/// Apply a replicated `TEMPORAL.INVALIDATE-AT` record: same mutation the
+/// master ran (`apply_invalidate`) with the master's pinned `wall_ms`. The
+/// drained `GraphTemporal` WAL payload is dropped, matching `apply_graph`'s
+/// no-local-persistence model (a restarted replica resyncs from the master;
+/// leaving it in `wal_pending` would leak into an unrelated later drain).
+#[cfg(feature = "graph")]
+fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+    let Some((graph_name, is_node, entity_id, wall_ms)) =
+        crate::command::temporal::parse_invalidate_at(args)
+    else {
+        tracing::warn!(
+            "replica apply: malformed {} record — skipped (graph diverges; \
+             full resync required)",
+            String::from_utf8_lossy(cmd)
+        );
+        return;
+    };
+    if let Err(e) = crate::command::temporal::apply_invalidate(
+        &mut s.graph_store,
+        entity_id,
+        is_node,
+        &graph_name,
+        wall_ms,
+    ) {
+        tracing::warn!(
+            "replica apply: TEMPORAL.INVALIDATE-AT entity_id={} failed: {} \
+             (graph diverges; full resync required)",
+            entity_id,
+            String::from_utf8_lossy(e)
+        );
+    }
+    let _ = s.graph_store.drain_wal();
 }
 
 /// Mirror of the master's connection-layer index-parity block
@@ -361,12 +460,45 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
     // header) carry the FT index DEFINITIONS; standard RDB loaders skip them.
     let vec_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_VECTOR_DEFS);
     let text_defs = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_TEXT_DEFS);
+    #[cfg(feature = "graph")]
+    let graph_blob = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_GRAPH_STORE);
     match crate::shard::slice::try_with_shard(|s| {
         for db in s.databases.iter_mut() {
             db.clear();
         }
         let loaded = redis_rdb::load_rdb(&mut s.databases, rdb)?;
         install_snapshot_index_defs(s, vec_defs.as_deref(), text_defs.as_deref());
+        // v0.7 graph replication: install the master's whole graph store
+        // (authoritative replace — an EMPTY blob drops replica-local graphs;
+        // an ABSENT aux means a pre-graph-sync master, warn-and-keep).
+        #[cfg(feature = "graph")]
+        match graph_blob.as_deref() {
+            Some(blob) => {
+                match crate::replication::graph_sync::install_graph_store(&mut s.graph_store, blob)
+                {
+                    Some(n) => {
+                        if n > 0 {
+                            tracing::info!("replica snapshot: installed {} graph(s)", n);
+                        }
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "replica snapshot: malformed graph-store aux blob"
+                        ));
+                    }
+                }
+            }
+            None => {
+                if s.graph_store.graph_count() > 0 {
+                    tracing::warn!(
+                        "replica snapshot carried no graph-store aux but {} local graph(s) \
+                         exist — master predates graph replication; keeping local graphs \
+                         (they may diverge)",
+                        s.graph_store.graph_count()
+                    );
+                }
+            }
+        }
         Ok(loaded)
     }) {
         Some(r) => r,

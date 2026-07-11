@@ -172,6 +172,31 @@ pub(crate) fn drain_spsc_shared(
     execute_batch.clear();
     other_messages.clear();
 
+    // Self-queue FIRST: same-shard tasks (inline PSYNC RegisterReplica,
+    // local-write ReplicaLiveFanout) cannot SPSC to their own shard — the
+    // mesh is N·(N−1) skip-self — so they enqueue on the thread-local self
+    // queue (`shard::self_msg`). All self messages are control-plane arms
+    // (never Execute-batch / SnapshotBegin types), so they route through
+    // `other_messages`. FIFO here is a correctness invariant: a write's
+    // ReplicaLiveFanout drained before RegisterReplica never live-sends to
+    // the not-yet-registered replica (it gets those bytes via backlog
+    // catch-up instead), one drained after fans to the freshly-registered
+    // replica — no gap, no double-delivery (see RegisterReplica.push_offset).
+    //
+    // Drained UNBOUNDED, on purpose: every arm is cheap (try_send loop /
+    // vec push), the queue refills only while this thread's own tasks run
+    // (bounded by one loop iteration's frame budget), and an entry left
+    // behind by a MAX_DRAIN_PER_CYCLE cut-off would delay a replica's live
+    // bytes by up to a full tick. The SPSC consumers below keep their
+    // per-cycle bound.
+    loop {
+        let Some(msg) = crate::shard::self_msg::pop() else {
+            break;
+        };
+        drained += 1;
+        other_messages.push(msg);
+    }
+
     let mut snapshot_seen = false;
     for consumer in consumers.iter_mut() {
         if snapshot_seen {
@@ -2477,6 +2502,7 @@ pub(crate) fn handle_shard_message_shared(
             tx,
             backlog_capacity,
             registered,
+            push_offset,
         } => {
             // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
             // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
@@ -2484,47 +2510,57 @@ pub(crate) fn handle_shard_message_shared(
             // earlier allocation point triggered by REPLCONF. Capacity is carried
             // in the message (from `--repl-backlog-size`) so this fallback can't
             // silently diverge from the handshake-path allocation.
+            crate::replication::state::mark_fanout_active();
             let mut guard = repl_backlog.lock();
             if guard.is_none() {
-                *guard = Some(ReplicationBacklog::new(backlog_capacity));
-            }
-            drop(guard);
-            replica_txs.push((replica_id, tx));
-            // Reply with the offset at which live fan-out begins. This runs
-            // synchronously between drains, so every fanout message queued
-            // BEFORE this registration has already advanced the offset, and
-            // every one after it will reach `tx` — the PSYNC task's catch-up
-            // read below this offset is therefore gap-free and overlap-free.
-            if let Some(reg_tx) = registered {
+                // Seed byte positions at the current shard offset so range
+                // math stays aligned with pre-attach `issue_lsn` advances —
+                // see `ReplicationBacklog::new_at`.
                 let offset = repl_state
                     .as_ref()
                     .map(|h| h.shard_offset(shard_id))
                     .unwrap_or(0);
+                *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
+            }
+            drop(guard);
+            replica_txs.push((replica_id, tx));
+            // Reply with the offset at which live fan-out begins. For
+            // same-thread self-queue registrations this is `push_offset`,
+            // captured AT PUSH TIME: local writes advance the offset
+            // synchronously at write time (`record_local_write`), so a write
+            // W that lands between the registration's push and this drain has
+            // already advanced the counter — an offset read HERE would cover
+            // W in the catch-up range while W's `ReplicaLiveFanout` message
+            // (queued behind this registration, drained after it) ALSO
+            // delivers it live: double-applied. With the push-time offset the
+            // ledger is exact either way W interleaves: W before the push →
+            // below `reg_offset`, delivered via catch-up, its fan-out message
+            // drains before `tx` is registered (no live copy); W after the
+            // push → at/above `reg_offset`, excluded from catch-up, delivered
+            // live. Cross-shard legacy registrations (`None`, R2 redesign)
+            // keep the drain-time read.
+            if let Some(reg_tx) = registered {
+                let offset = push_offset.unwrap_or_else(|| {
+                    repl_state
+                        .as_ref()
+                        .map(|h| h.shard_offset(shard_id))
+                        .unwrap_or(0)
+                });
                 let _ = reg_tx.send(offset);
             }
         }
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);
         }
-        ShardMessage::ReplicateVerbatim { bytes } => {
-            // Replication legs only: backlog + offset + live replica fan-out.
-            // WAL writer / AOF pool are deliberately None — the commands routed
-            // here (FT.CREATE / FT.DROPINDEX / FT.CONFIG SET) are durable via
-            // the vector/text sidecars, and an AOF copy would double-apply on
-            // recovery. `wal_fanout_has_work` no-ops the whole call when no
-            // replica has ever attached.
-            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-            let _ = wal_append_and_fanout(
-                &bytes,
-                &mut None,
-                repl_backlog,
-                replica_txs,
-                repl_state,
-                shard_id,
-                None,
-                false,
-                &mut aof_budget,
-            );
+        ShardMessage::ReplicaLiveFanout { bytes } => {
+            // Live-delivery leg ONLY: backlog append + offset advance already
+            // happened synchronously at write time on this same thread
+            // (`record_local_write`) — doing either again here would double-
+            // count. Lagging replicas are skipped (try_send), same policy as
+            // `wal_append_and_fanout`'s fan-out leg.
+            for (_id, tx) in replica_txs.iter() {
+                let _ = tx.try_send(bytes.clone());
+            }
         }
         ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,

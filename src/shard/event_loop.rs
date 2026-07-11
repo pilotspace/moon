@@ -766,6 +766,11 @@ impl super::Shard {
         let spsc_notify_local = spsc_notify;
         #[cfg(feature = "runtime-monoio")]
         let _ = &spsc_notify_local;
+        // Same-shard self-message queue (shard::self_msg): register this
+        // shard's drain Notify so a push from a sibling task on this thread
+        // (inline PSYNC registration, replication fan-out) wakes the drain
+        // arm immediately instead of waiting for the next periodic tick.
+        crate::shard::self_msg::register_drain_notify(spsc_notify_local.clone());
 
         // tokio drains through the select! arms below and mutates the Vec
         // directly; monoio re-wraps it in Rc<RefCell<>> for the spin probe.

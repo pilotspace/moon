@@ -872,7 +872,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- READONLY enforcement ---
-                    if dispatch::try_enforce_readonly(cmd, ctx, &mut responses) {
+                    if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
                         continue;
                     }
 

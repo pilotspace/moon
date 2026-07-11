@@ -83,6 +83,70 @@ pub fn validate_invalidate(args: &[Frame]) -> Result<(u64, bool, Bytes), Frame> 
     Ok((entity_id, is_node, graph_name))
 }
 
+/// Serialize the deterministic, wall-clock-pinned replication form of
+/// TEMPORAL.INVALIDATE (v0.7 graph replication, adversarial round-2 finding
+/// B): `TEMPORAL.INVALIDATE-AT <graph> <N|E> <entity_id> <wall_ms>`.
+///
+/// The user command captures `wall_ms` at execution time, so streaming it
+/// verbatim would let master and replica disagree on `valid_to`; and the
+/// drained `GraphTemporal` WAL record is a binary wal_v3 payload the RESP
+/// replication link cannot carry. This internal RESP form pins the master's
+/// wall clock; the replica applies it via `apply_invalidate` with the SAME
+/// `wall_ms` (see `replication::apply`).
+#[cfg(feature = "graph")]
+pub fn serialize_invalidate_at(
+    graph_name: &[u8],
+    is_node: bool,
+    entity_id: u64,
+    wall_ms: i64,
+) -> Vec<u8> {
+    fn write_bulk(buf: &mut Vec<u8>, data: &[u8]) {
+        let mut n = itoa::Buffer::new();
+        buf.push(b'$');
+        buf.extend_from_slice(n.format(data.len()).as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(data);
+        buf.extend_from_slice(b"\r\n");
+    }
+    let mut id_buf = itoa::Buffer::new();
+    let mut ms_buf = itoa::Buffer::new();
+    let mut buf = Vec::with_capacity(96 + graph_name.len());
+    buf.extend_from_slice(b"*5\r\n");
+    write_bulk(&mut buf, b"TEMPORAL.INVALIDATE-AT");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, if is_node { b"N" } else { b"E" });
+    write_bulk(&mut buf, id_buf.format(entity_id).as_bytes());
+    write_bulk(&mut buf, ms_buf.format(wall_ms).as_bytes());
+    buf
+}
+
+/// Parse the argument list of a replicated `TEMPORAL.INVALIDATE-AT` record
+/// (inverse of [`serialize_invalidate_at`], minus the command name).
+/// Returns `(graph_name, is_node, entity_id, wall_ms)` or `None` on any
+/// malformed field — the replica warns and skips rather than diverging
+/// silently on garbage.
+#[cfg(feature = "graph")]
+pub fn parse_invalidate_at(args: &[Frame]) -> Option<(Bytes, bool, u64, i64)> {
+    if args.len() != 4 {
+        return None;
+    }
+    let bulk = |f: &Frame| -> Option<Bytes> {
+        match f {
+            Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
+            _ => None,
+        }
+    };
+    let graph_name = bulk(&args[0])?;
+    let is_node = match bulk(&args[1])?.as_ref() {
+        b"N" => true,
+        b"E" => false,
+        _ => return None,
+    };
+    let entity_id: u64 = std::str::from_utf8(&bulk(&args[2])?).ok()?.parse().ok()?;
+    let wall_ms: i64 = std::str::from_utf8(&bulk(&args[3])?).ok()?.parse().ok()?;
+    Some((graph_name, is_node, entity_id, wall_ms))
+}
+
 /// Apply a TEMPORAL.INVALIDATE mutation to a graph store.
 ///
 /// Sets `valid_to = wall_ms` on the entity and pushes the WAL payload into
