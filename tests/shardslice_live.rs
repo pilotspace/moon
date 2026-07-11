@@ -25,6 +25,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -51,21 +53,11 @@ fn find_moon_binary() -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Port allocation — bind-to-0 trick, freed before server binds.
-// ---------------------------------------------------------------------------
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
-// ---------------------------------------------------------------------------
 // Server spawn helpers
 // ---------------------------------------------------------------------------
 
-/// Spawn a moon server.
+/// Spawn a moon server via `common::spawn_listening` (dead-child/lost-bind-race
+/// respawn on a fresh port).
 ///
 /// stdout + stderr are written to log files under `dir` so callers can
 /// inspect the captured output for log-line assertions.
@@ -75,31 +67,33 @@ fn free_port() -> u16 {
 ///
 /// ALWAYS wrap the returned `Child` in a `ServerGuard` immediately so that
 /// test failures do not leak the process.
-fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32, extra: &[&str]) -> Child {
-    let mut args: Vec<String> = vec![
-        "--port".into(),
-        port.to_string(),
-        "--dir".into(),
-        dir.to_string_lossy().into_owned(),
-        "--shards".into(),
-        shards.to_string(),
-    ];
-    for &e in extra {
-        args.push(e.into());
-    }
-    Command::new(find_moon_binary())
-        .args(&args)
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
-        .env("RUST_LOG", "moon=info")
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to spawn moon binary at '{}': {e}. Build with \
-                 `cargo build [--release]` or set MOON_BIN.",
-                find_moon_binary().display()
-            )
-        })
+fn spawn_moon(dir: &std::path::Path, shards: u32, extra: &[&str]) -> (Child, u16) {
+    common::spawn_listening(|port| {
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port.to_string(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "--shards".into(),
+            shards.to_string(),
+        ];
+        for &e in extra {
+            args.push(e.into());
+        }
+        Command::new(find_moon_binary())
+            .args(&args)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
+            .env("RUST_LOG", "moon=info")
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to spawn moon binary at '{}': {e}. Build with \
+                     `cargo build [--release]` or set MOON_BIN.",
+                    find_moon_binary().display()
+                )
+            })
+    })
 }
 
 /// RAII guard: kills the server process when dropped.
@@ -419,16 +413,11 @@ fn aof_manifest_seq(dir: &std::path::Path) -> u64 {
 #[test]
 fn test_ssm1_slice_live_at_startup() {
     const SHARDS: u32 = 4;
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Use --appendonly no so the test is not slowed by WAL replay.
-    let _guard = ServerGuard(spawn_moon(
-        port,
-        dir.path(),
-        SHARDS,
-        &["--appendonly", "no"],
-    ));
+    let (child, port) = spawn_moon(dir.path(), SHARDS, &["--appendonly", "no"]);
+    let _guard = ServerGuard(child);
 
     // Wait for the server to accept connections (all 4 shards have started
     // and the first accept loop iteration has run).
@@ -523,16 +512,11 @@ fn test_ssm1_slice_live_at_startup() {
 #[test]
 fn test_ssm3_ws_global_registry() {
     const SHARDS: u32 = 4;
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
 
     // --- Create workspace, verify from 12 connections ---
-    let _guard = ServerGuard(spawn_moon(
-        port,
-        dir.path(),
-        SHARDS,
-        &["--appendonly", "yes"],
-    ));
+    let (child, port) = spawn_moon(dir.path(), SHARDS, &["--appendonly", "yes"]);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     // Create workspace from connection A.
@@ -609,13 +593,8 @@ fn test_ssm3_ws_registry_survives_restart() {
 
     // --- Round 1: create the workspace with WAL enabled ---
     {
-        let port = free_port();
-        let _guard = ServerGuard(spawn_moon(
-            port,
-            dir.path(),
-            SHARDS,
-            &["--appendonly", "yes"],
-        ));
+        let (child, port) = spawn_moon(dir.path(), SHARDS, &["--appendonly", "yes"]);
+        let _guard = ServerGuard(child);
         drop(wait_ready(port));
 
         let mut ca = Conn::open(port);
@@ -635,13 +614,8 @@ fn test_ssm3_ws_registry_survives_restart() {
 
     // --- Round 2: restart on the SAME dir; the workspace must be replayed ---
     {
-        let port2 = free_port();
-        let _guard2 = ServerGuard(spawn_moon(
-            port2,
-            dir.path(),
-            SHARDS,
-            &["--appendonly", "yes"],
-        ));
+        let (child2, port2) = spawn_moon(dir.path(), SHARDS, &["--appendonly", "yes"]);
+        let _guard2 = ServerGuard(child2);
         drop(wait_ready(port2));
 
         let mut c = Conn::open(port2);
@@ -688,13 +662,13 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
     let mut flags: Vec<&str> = vec!["--appendonly", "yes", "--appendfsync", "everysec"];
     flags.extend_from_slice(extra);
 
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
     let recorded_count: i64;
 
     // --- Round 1: write data, trigger rewrite under concurrent writes ---
     {
-        let _guard = ServerGuard(spawn_moon(port, dir.path(), shards, &flags));
+        let (child, port) = spawn_moon(dir.path(), shards, &flags);
+        let _guard = ServerGuard(child);
         drop(wait_ready(port));
 
         // Pipeline 2000 SET operations.
@@ -819,8 +793,8 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
 
     // --- Round 2: restart on the SAME dir, assert durability ---
     {
-        let port2 = free_port();
-        let _guard2 = ServerGuard(spawn_moon(port2, dir.path(), shards, &flags));
+        let (child2, port2) = spawn_moon(dir.path(), shards, &flags);
+        let _guard2 = ServerGuard(child2);
         drop(wait_ready(port2));
 
         let mut c = Conn::open(port2);
@@ -884,9 +858,9 @@ fn test_ssm4a_fold_4shard_experimental() {
 
 #[test]
 fn test_reject_uninitialized_shard_no_wire_panic() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), 4, &["--appendonly", "no"]));
+    let (child, port) = spawn_moon(dir.path(), 4, &["--appendonly", "no"]);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     // --- Send a burst of junk-but-parseable commands ---

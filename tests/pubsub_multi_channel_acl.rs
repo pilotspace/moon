@@ -12,15 +12,12 @@
 //! moon binary is missing (MOON_BIN pin wins, then target/release, then
 //! target/debug).
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().unwrap().port()
-}
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
@@ -52,28 +49,29 @@ impl Drop for Moon {
 
 fn spawn_moon(shards: &str) -> Option<Moon> {
     let bin = moon_binary()?;
-    let port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-pubsub-acl-{port}"));
+    let tmp_dir = std::env::temp_dir().join(format!("moon-pubsub-acl-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
-    let child = Command::new(&bin)
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            shards,
-            "--admin-port",
-            "0",
-            "--appendonly",
-            "no",
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-            tmp_dir.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                shards,
+                "--admin-port",
+                "0",
+                "--appendonly",
+                "no",
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+                tmp_dir.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
     let moon = Moon {
         child,
         port,

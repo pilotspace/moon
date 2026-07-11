@@ -25,6 +25,8 @@
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -34,32 +36,24 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-/// Pick an ephemeral port by binding :0 and releasing it. Good enough for a
-/// short-lived test; the server rebinds immediately.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
-fn spawn_moon(port: u16, dir: &std::path::Path, extra: &[&str]) -> Child {
-    let mut args: Vec<String> = vec![
-        "--port".into(),
-        port.to_string(),
-        "--dir".into(),
-        dir.to_string_lossy().into_owned(),
-    ];
-    for e in extra {
-        args.push((*e).into());
-    }
-    Command::new(moon_binary())
-        .args(&args)
-        // Pipe to a log file so a CI failure has a diagnostic (never Stdio::null()).
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
-        .spawn()
-        .expect("spawn moon (CARGO_BIN_EXE_moon)")
+fn spawn_moon(dir: &std::path::Path, extra: &[&str]) -> (Child, u16) {
+    let extra_owned: Vec<String> = extra.iter().map(|e| (*e).to_string()).collect();
+    common::spawn_listening(|port| {
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port.to_string(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        args.extend(extra_owned.iter().cloned());
+        Command::new(moon_binary())
+            .args(&args)
+            // Pipe to a log file so a CI failure has a diagnostic (never Stdio::null()).
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
+            .spawn()
+            .expect("spawn moon (CARGO_BIN_EXE_moon)")
+    })
 }
 
 /// Connect + inline PING, return true iff we read `+PONG` within `deadline`.
@@ -111,16 +105,11 @@ fn safe_shards() -> usize {
 }
 
 fn run_serves(label: &str, extra: &[&str]) {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!(
-        "moon-serve-smoke-{}-{}-{}",
-        std::process::id(),
-        port,
-        label,
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("moon-serve-smoke-{}-{}", std::process::id(), label,));
     std::fs::create_dir_all(dir.join("off")).expect("mk dir");
 
-    let mut child = spawn_moon(port, &dir, extra);
+    let (mut child, port) = spawn_moon(&dir, extra);
     // Hard deadline: a healthy server answers within ~1s; the hang never answers.
     let ok = ping_ok(port, Duration::from_secs(15));
 

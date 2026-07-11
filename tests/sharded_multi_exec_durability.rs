@@ -22,18 +22,12 @@
 //! Skips gracefully when the moon binary is missing (MOON_BIN pin wins, then
 //! target/release, then target/debug).
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
@@ -64,30 +58,28 @@ impl Moon {
     }
 }
 
-fn spawn_moon_persistent(port: u16, dir: &std::path::Path) -> Option<Moon> {
-    let bin = moon_binary()?;
-    let child = Command::new(&bin)
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            "1",
-            "--admin-port",
-            "0",
-            "--appendonly",
-            "yes",
-            "--appendfsync",
-            "always",
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-            dir.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let moon = Moon { child, port };
+/// Common `--dir`-relative arg tail shared by the first spawn and the restart.
+fn persistent_args(dir: &std::path::Path) -> Vec<String> {
+    vec![
+        "--shards".into(),
+        "1".into(),
+        "--admin-port".into(),
+        "0".into(),
+        "--appendonly".into(),
+        "yes".into(),
+        "--appendfsync".into(),
+        "always".into(),
+        "--disk-free-min-pct".into(),
+        "0".into(),
+        "--dir".into(),
+        dir.to_str().unwrap().into(),
+    ]
+}
+
+/// Poll for PING readiness (protocol-level; `spawn_listening`/the direct
+/// restart spawn only guarantee TCP accept). Unchanged from the pre-sweep
+/// version beyond taking an already-constructed `Moon`.
+fn wait_moon_ready(moon: Moon) -> Option<Moon> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(mut c) = TcpStream::connect(("127.0.0.1", moon.port)) {
@@ -103,8 +95,42 @@ fn spawn_moon_persistent(port: u16, dir: &std::path::Path) -> Option<Moon> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
+    eprintln!("skipping: moon did not become ready on port {}", moon.port);
     None
+}
+
+/// First spawn of a server lifecycle: goes through `common::spawn_listening`
+/// so a lost bind-port race (or a dead child) is retried on a fresh port
+/// instead of blind-polling a corpse.
+fn spawn_moon_persistent_first(dir: &std::path::Path) -> Option<Moon> {
+    let bin = moon_binary()?;
+    let args = persistent_args(dir);
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args(["--port".to_string(), port.to_string()])
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
+    wait_moon_ready(Moon { child, port })
+}
+
+/// Restart on the SAME port + SAME dir on purpose (durability semantics: the
+/// whole point is proving data survives a kill -9 + restart against the
+/// identical persistence location). Per the port-flake-sweep hard rules,
+/// restart spawns keep the direct (non-`spawn_listening`) path.
+fn spawn_moon_persistent_restart(port: u16, dir: &std::path::Path) -> Option<Moon> {
+    let bin = moon_binary()?;
+    let child = Command::new(&bin)
+        .args(["--port".to_string(), port.to_string()])
+        .args(persistent_args(dir))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    wait_moon_ready(Moon { child, port })
 }
 
 /// One parsed RESP2 reply — only the shapes these tests need.
@@ -216,15 +242,12 @@ impl Client {
 /// key vanished on restart while the plain control key survived.
 #[test]
 fn multi_exec_write_survives_restart() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("moon-txn-dur-{port}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = tempfile::tempdir().expect("tempdir");
 
-    let Some(m1) = spawn_moon_persistent(port, &dir) else {
-        let _ = std::fs::remove_dir_all(&dir);
+    let Some(m1) = spawn_moon_persistent_first(dir.path()) else {
         return;
     };
+    let port = m1.port;
 
     {
         let mut c = Client::connect(port);
@@ -262,9 +285,8 @@ fn multi_exec_write_survives_restart() {
     // body on disk, so recovery must replay it.
     m1.kill9();
 
-    let Some(m2) = spawn_moon_persistent(port, &dir) else {
-        let _ = std::fs::remove_dir_all(&dir);
-        panic!("moon failed to restart from {dir:?}");
+    let Some(m2) = spawn_moon_persistent_restart(port, dir.path()) else {
+        panic!("moon failed to restart from {:?}", dir.path());
     };
 
     let mut r = Client::connect(port);
@@ -272,7 +294,6 @@ fn multi_exec_write_survives_restart() {
     let txn = r.cmd(&["GET", "txn:key"]);
     let counter = r.cmd(&["GET", "txn:counter"]);
     m2.kill9();
-    let _ = std::fs::remove_dir_all(&dir);
 
     // Control must survive (it always did).
     assert_eq!(

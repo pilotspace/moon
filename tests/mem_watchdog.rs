@@ -23,6 +23,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -44,19 +46,6 @@ fn find_moon_binary() -> std::path::PathBuf {
     // Windows (the old target/{release,debug}/moon probing found nothing on
     // Windows and could pick a stale release binary).
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-/// Ports below 20000 collide with other services in CI/dev; pick a free one
-/// above that floor instead of a fixed low port.
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-        let p = l.local_addr().expect("local_addr").port();
-        drop(l);
-        if p >= 20000 {
-            return p;
-        }
-    }
 }
 
 /// `tempfile::tempdir()` defaults to `$TMPDIR`, which on macOS lives on the
@@ -90,36 +79,36 @@ impl Drop for ServerGuard {
 /// `None`, leave untouched — falling back to real limit detection) the RSS
 /// watchdog.
 fn spawn_moon_mem(
-    port: u16,
     dir: &std::path::Path,
     mem_full_pct: u8,
     limit_bytes_override: Option<u64>,
-) -> ServerGuard {
-    let mut cmd = Command::new(find_moon_binary());
-    cmd.args([
-        "--port",
-        &port.to_string(),
-        "--dir",
-        &dir.to_string_lossy(),
-        "--shards",
-        "1",
-        "--appendonly",
-        "no",
-        "--mem-full-pct",
-        &mem_full_pct.to_string(),
-    ]);
-    if let Some(limit) = limit_bytes_override {
-        cmd.env("MOON_MEM_LIMIT_BYTES", limit.to_string());
-    } else {
-        // Ensure no ambient override leaks in from the test runner's shell.
-        cmd.env_remove("MOON_MEM_LIMIT_BYTES");
-    }
-    let child = cmd
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        let mut cmd = Command::new(find_moon_binary());
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            "1",
+            "--appendonly",
+            "no",
+            "--mem-full-pct",
+            &mem_full_pct.to_string(),
+        ]);
+        if let Some(limit) = limit_bytes_override {
+            cmd.env("MOON_MEM_LIMIT_BYTES", limit.to_string());
+        } else {
+            // Ensure no ambient override leaks in from the test runner's shell.
+            cmd.env_remove("MOON_MEM_LIMIT_BYTES");
+        }
+        cmd.stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -279,12 +268,11 @@ fn wait_ready(port: u16) -> Client {
 #[test]
 fn test_case_a_tiny_limit_engages_memfull_on_first_write() {
     let dir = test_tmpdir();
-    let port = free_port();
     // 1 MB "limit" is far below any real moon process's startup RSS — the
     // watchdog's very first poll (inside init_global) must already compute
     // rss% far past 50%.
     const TINY_LIMIT_BYTES: u64 = 1_000_000;
-    let _guard = spawn_moon_mem(port, dir.path(), 50, Some(TINY_LIMIT_BYTES));
+    let (_guard, port) = spawn_moon_mem(dir.path(), 50, Some(TINY_LIMIT_BYTES));
     let mut c = wait_ready(port);
 
     let r = c.cmd(&[b"SET", b"k1", b"v1"]);
@@ -307,9 +295,8 @@ fn test_case_a_tiny_limit_engages_memfull_on_first_write() {
 #[test]
 fn test_case_b_get_not_blocked_while_memfull_engaged() {
     let dir = test_tmpdir();
-    let port = free_port();
     const TINY_LIMIT_BYTES: u64 = 1_000_000;
-    let _guard = spawn_moon_mem(port, dir.path(), 50, Some(TINY_LIMIT_BYTES));
+    let (_guard, port) = spawn_moon_mem(dir.path(), 50, Some(TINY_LIMIT_BYTES));
     let mut c = wait_ready(port);
 
     // Confirm the guard is actually engaged (setup assertion).
@@ -340,8 +327,7 @@ fn test_case_b_get_not_blocked_while_memfull_engaged() {
 #[test]
 fn test_case_c_control_no_override_set_succeeds() {
     let dir = test_tmpdir();
-    let port = free_port();
-    let _guard = spawn_moon_mem(port, dir.path(), 95, None);
+    let (_guard, port) = spawn_moon_mem(dir.path(), 95, None);
     let mut c = wait_ready(port);
 
     let r = c.cmd(&[b"SET", b"k3", b"v3"]);
@@ -360,9 +346,8 @@ fn test_case_c_control_no_override_set_succeeds() {
 #[test]
 fn test_case_d_mem_full_pct_zero_disables_guard() {
     let dir = test_tmpdir();
-    let port = free_port();
     const TINY_LIMIT_BYTES: u64 = 1_000_000;
-    let _guard = spawn_moon_mem(port, dir.path(), 0, Some(TINY_LIMIT_BYTES));
+    let (_guard, port) = spawn_moon_mem(dir.path(), 0, Some(TINY_LIMIT_BYTES));
     let mut c = wait_ready(port);
 
     let r = c.cmd(&[b"SET", b"k4", b"v4"]);

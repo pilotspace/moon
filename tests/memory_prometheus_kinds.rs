@@ -8,18 +8,13 @@
 //! Run with:
 //!   cargo test --release --test memory_prometheus_kinds -- --nocapture
 
+mod common;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Allocate an OS-assigned TCP port, drop the listener, return the number.
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().unwrap().port()
-}
 
 fn redis_cli_available() -> bool {
     Command::new("redis-cli")
@@ -64,29 +59,30 @@ fn spawn_moon() -> Option<Moon> {
         );
         return None;
     }
-    let port = free_port();
-    let admin_port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-test-prom-{port}"));
+    let admin_port = common::reserve_port();
+    let tmp_dir = std::env::temp_dir().join(format!("moon-test-prom-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
-    let child = Command::new(&bin)
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            "1",
-            "--admin-port",
-            &admin_port.to_string(),
-            "--appendonly",
-            "no",
-            "--dir",
-            tmp_dir.to_str().unwrap(),
-            "--disk-offload",
-            "disable",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                "1",
+                "--admin-port",
+                &admin_port.to_string(),
+                "--appendonly",
+                "no",
+                "--dir",
+                tmp_dir.to_str().unwrap(),
+                "--disk-offload",
+                "disable",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
     let moon = Moon {
         child,
         port,

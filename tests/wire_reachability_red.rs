@@ -21,6 +21,8 @@
 //!
 //! Run alone with: cargo test --test wire_reachability_red
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -34,33 +36,28 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
 /// Fresh `--dir` per server (CWD persistence-reload trap: an inherited
 /// appendonlydir would replay stale state into a throwaway test server).
-fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32, extra: &[&str]) -> Child {
-    let mut args: Vec<String> = vec![
-        "--port".into(),
-        port.to_string(),
-        "--dir".into(),
-        dir.to_string_lossy().into_owned(),
-        "--shards".into(),
-        shards.to_string(),
-    ];
-    for e in extra {
-        args.push((*e).into());
-    }
-    Command::new(moon_binary())
-        .args(&args)
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon (CARGO_BIN_EXE_moon)")
+fn spawn_moon(dir: &std::path::Path, shards: u32, extra: &[&str]) -> (Child, u16) {
+    common::spawn_listening(|port| {
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port.to_string(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "--shards".into(),
+            shards.to_string(),
+        ];
+        for e in extra {
+            args.push((*e).into());
+        }
+        Command::new(moon_binary())
+            .args(&args)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon (CARGO_BIN_EXE_moon)")
+    })
 }
 
 struct ServerGuard(Child);
@@ -265,9 +262,9 @@ impl Conn {
 /// only "unknown command" (or a dead connection) is a violation.
 #[test]
 fn cdg1_registry_sweep_no_unknowns() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), 1, &["--appendonly", "no"]));
+    let (child, port) = spawn_moon(dir.path(), 1, &["--appendonly", "no"]);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     // Backlogged by user decision (contract v2, 2026-06-11 "Fix 26, backlog the
@@ -343,9 +340,9 @@ fn cdg1_registry_sweep_no_unknowns() {
 
 #[test]
 fn cdg2_twenty_commands_answer_correctly() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), 2, &["--appendonly", "no"]));
+    let (child, port) = spawn_moon(dir.path(), 2, &["--appendonly", "no"]);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
     let mut c = Conn::new(connect(port, Duration::from_secs(10)));
 
@@ -648,9 +645,9 @@ fn aof_quiesce(dir: &std::path::Path, expect_nonzero: bool) -> u64 {
 
 #[test]
 fn cdg3_read_arms_are_pure_reads() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), 1, &["--appendonly", "yes"]));
+    let (child, port) = spawn_moon(dir.path(), 1, &["--appendonly", "yes"]);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
     let mut c = Conn::new(connect(port, Duration::from_secs(10)));
 

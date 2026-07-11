@@ -24,6 +24,8 @@
 #![cfg(all(unix, target_os = "linux", feature = "runtime-monoio"))]
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -33,13 +35,6 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
 struct ServerGuard(Child);
 
 impl Drop for ServerGuard {
@@ -47,6 +42,31 @@ impl Drop for ServerGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Spawn moon with `--io-busy-poll-us <poll_us>` on `shards` shards and wait
+/// until it ACCEPTS a connection (see `common::spawn_listening`).
+fn spawn_moon(dir: &std::path::Path, shards: u32, poll_us: &str) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+                "--io-busy-poll-us",
+                poll_us,
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 fn wait_for_ready(port: u16, deadline: Duration) -> bool {
@@ -90,25 +110,7 @@ fn cpu_seconds(pid: u32) -> f64 {
 #[test]
 fn busy_poll_idle_server_does_not_burn_cpu() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let child = Command::new(moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.path().to_string_lossy(),
-            "--shards",
-            "4",
-            "--appendonly",
-            "no",
-            "--io-busy-poll-us",
-            "200",
-        ])
-        .stdout(std::fs::File::create(dir.path().join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.path().join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    let guard = ServerGuard(child);
+    let (guard, port) = spawn_moon(dir.path(), 4, "200");
     let pid = guard.0.id();
 
     assert!(
@@ -138,25 +140,7 @@ fn busy_poll_idle_server_does_not_burn_cpu() {
 #[test]
 fn busy_poll_recovers_after_idle() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let child = Command::new(moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.path().to_string_lossy(),
-            "--shards",
-            "2",
-            "--appendonly",
-            "no",
-            "--io-busy-poll-us",
-            "40",
-        ])
-        .stdout(std::fs::File::create(dir.path().join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.path().join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    let guard = ServerGuard(child);
+    let (guard, port) = spawn_moon(dir.path(), 2, "40");
 
     assert!(
         wait_for_ready(port, Duration::from_secs(15)),

@@ -28,6 +28,8 @@
 //! Run:  cargo test --test ft_search_yield_red --features graph -- --test-threads=1
 #![cfg(feature = "graph")]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -39,13 +41,6 @@ use std::time::{Duration, Instant};
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
 }
 
 /// Fresh unique `--dir` per server (CWD persistence-reload trap: an inherited
@@ -82,6 +77,18 @@ fn spawn_single_shard(port: u16, dir: &std::path::Path) -> Child {
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
         .spawn()
         .expect("spawn moon (CARGO_BIN_EXE_moon)")
+}
+
+/// Reserve a port, spawn a single-shard server into its own fresh `--dir`
+/// (keyed by port — recomputed inside the closure on every attempt, since
+/// `spawn_listening` may pick a different port on retry), and wait for it to
+/// ACCEPT (see `common::spawn_listening`).
+fn spawn_test_server() -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        let dir = fresh_dir(port);
+        spawn_single_shard(port, &dir)
+    });
+    (ServerGuard(child), port)
 }
 
 fn connect(port: u16, deadline: Duration) -> TcpStream {
@@ -310,9 +317,7 @@ impl Drop for ServerGuard {
 
 #[test]
 fn m1_heavy_search_yields_cooperatively() {
-    let port = free_port();
-    let dir = fresh_dir(port);
-    let guard = ServerGuard(spawn_single_shard(port, &dir));
+    let (guard, port) = spawn_test_server();
     let mut s = wait_ready(port);
 
     create_idx(&mut s);
@@ -354,9 +359,7 @@ fn m1_heavy_search_yields_cooperatively() {
 #[test]
 #[ignore = "wall-clock co-located latency — jitter-sensitive; run on a quiesced VM at verify"]
 fn m1b_colocated_ping_progress_during_search() {
-    let port = free_port();
-    let dir = fresh_dir(port);
-    let guard = ServerGuard(spawn_single_shard(port, &dir));
+    let (guard, port) = spawn_test_server();
     let mut setup = wait_ready(port);
     create_idx(&mut setup);
     for i in 0..2000u32 {
@@ -405,9 +408,7 @@ fn m1b_colocated_ping_progress_during_search() {
 
 #[test]
 fn m2_topk_known_neighbors_keys_resolved() {
-    let port = free_port();
-    let dir = fresh_dir(port);
-    let guard = ServerGuard(spawn_single_shard(port, &dir));
+    let (guard, port) = spawn_test_server();
     let mut s = wait_ready(port);
 
     create_idx(&mut s);
@@ -442,9 +443,7 @@ fn m2_topk_known_neighbors_keys_resolved() {
 
 #[test]
 fn m3_write_visible_and_consistent() {
-    let port = free_port();
-    let dir = fresh_dir(port);
-    let guard = ServerGuard(spawn_single_shard(port, &dir));
+    let (guard, port) = spawn_test_server();
     let mut s = wait_ready(port);
 
     create_idx(&mut s);
@@ -475,9 +474,7 @@ fn m3_write_visible_and_consistent() {
 
 #[test]
 fn m4_ft_basic_correctness_smoke() {
-    let port = free_port();
-    let dir = fresh_dir(port);
-    let guard = ServerGuard(spawn_single_shard(port, &dir));
+    let (guard, port) = spawn_test_server();
     let mut s = wait_ready(port);
 
     create_idx(&mut s);

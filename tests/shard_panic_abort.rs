@@ -13,6 +13,8 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -20,13 +22,6 @@ use std::time::{Duration, Instant};
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
 }
 
 struct ServerGuard(Child);
@@ -63,22 +58,23 @@ fn wait_for_ready(port: u16, deadline: Duration) -> bool {
 
 fn assert_panic_aborts_process(shards: u32, label: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let child = Command::new(moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.path().to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-            "--appendonly",
-            "no",
-        ])
-        .stdout(std::fs::File::create(dir.path().join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.path().join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.path().to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+            ])
+            .stdout(std::fs::File::create(dir.path().join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.path().join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
     let mut guard = ServerGuard(child);
 
     assert!(

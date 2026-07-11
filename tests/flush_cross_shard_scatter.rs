@@ -11,15 +11,11 @@
 //! Run with:
 //!   cargo test --release --test flush_cross_shard_scatter
 
-use std::net::TcpListener;
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().unwrap().port()
-}
 
 fn redis_cli_available() -> bool {
     Command::new("redis-cli")
@@ -67,26 +63,29 @@ fn spawn_moon_4shard() -> Option<Moon> {
         );
         return None;
     }
-    let port = free_port();
+    let (child, port) = common::spawn_listening(|port| {
+        let tmp_dir = std::env::temp_dir().join(format!("moon-flush-scatter-{port}"));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                "4",
+                "--admin-port",
+                "0",
+                "--appendonly",
+                "no",
+                "--dir",
+                tmp_dir.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
+    // Same directory formula the closure used for the winning attempt.
     let tmp_dir = std::env::temp_dir().join(format!("moon-flush-scatter-{port}"));
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let child = Command::new(&bin)
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            "4",
-            "--admin-port",
-            "0",
-            "--appendonly",
-            "no",
-            "--dir",
-            tmp_dir.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
     let moon = Moon {
         child,
         port,

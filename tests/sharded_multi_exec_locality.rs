@@ -18,18 +18,12 @@
 //! Never "EXEC says OK but the data isn't there." Skips gracefully when the
 //! moon binary is missing (MOON_BIN pin wins, then target/release, then debug).
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
@@ -48,45 +42,47 @@ fn moon_binary() -> Option<std::path::PathBuf> {
 struct Moon {
     child: Child,
     port: u16,
-    tmp_dir: std::path::PathBuf,
+    // Kept alive for the process lifetime; removed on Drop.
+    _tmp_dir: tempfile::TempDir,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
 fn spawn_moon(shards: &str) -> Option<Moon> {
     let bin = moon_binary()?;
-    let port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-txn-loc-{port}"));
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let child = Command::new(&bin)
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            shards,
-            "--admin-port",
-            "0",
-            "--appendonly",
-            "no",
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-            tmp_dir.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let dir_str = tmp_dir.path().to_str().unwrap().to_string();
+    let shards = shards.to_string();
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &shards,
+                "--admin-port",
+                "0",
+                "--appendonly",
+                "no",
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+                &dir_str,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
     let moon = Moon {
         child,
         port,
-        tmp_dir,
+        _tmp_dir: tmp_dir,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -103,7 +99,7 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
+    eprintln!("skipping: moon did not become ready on port {}", moon.port);
     None
 }
 

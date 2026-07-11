@@ -11,13 +11,14 @@
 //! Run: cargo test --test txn_kv_wiring --no-default-features --features runtime-tokio,jemalloc -- --test-threads=1
 #![cfg(feature = "runtime-tokio")]
 
+mod common;
+
 use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
 use moon::server::listener;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
-use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
 // Test server infrastructure
@@ -34,14 +35,19 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
     // between dropping the probe and `run_sharded` rebinding the port, a
     // parallel test (in this or another test binary) can win the same freed
     // ephemeral port — a TOCTOU race that used to leave callers holding a dead
-    // port after a blind 200ms sleep. Two defenses: `reserve_unique_port`
-    // guarantees no two tests in THIS binary are ever handed the same recycled
-    // port, and an active connect+PING readiness probe (which also fixes the
-    // separate slow-CI-startup flake the fixed sleep had) lets us retry the
-    // whole start on a fresh port when the bind is lost to another process.
+    // port after a blind 200ms sleep. Two defenses: `common::reserve_port`
+    // guarantees no two tests in THIS PROCESS (across every test binary that
+    // links `tests/common`, not just this file) are ever handed the same
+    // recycled port, and an active connect+PING readiness probe (which also
+    // fixes the separate slow-CI-startup flake the fixed sleep had) lets us
+    // retry the whole start on a fresh port when the bind is lost to another
+    // process. `run_sharded` binds the port in-process (not via
+    // `std::process::Command`), so `common::spawn_listening`'s
+    // respawn-a-`Child` mechanism doesn't apply here — this is the
+    // `common::reserve_port()`-only half of the shared harness.
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 1..=MAX_ATTEMPTS {
-        let port = reserve_unique_port().await;
+        let port = common::reserve_port();
         let token = CancellationToken::new();
 
         let config = ServerConfig {
@@ -287,25 +293,6 @@ fn spawn_txn_server_thread(config: ServerConfig, num_shards: usize, cancel: Canc
             let _ = handle.join();
         }
     });
-}
-
-/// Reserve an OS-assigned ephemeral port that no other test in THIS binary has
-/// already been handed. A throwaway probe listener discovers a free port; a
-/// process-global set rejects any port the OS recycled from a just-finished
-/// sibling test — the intra-binary half of the bind-drop-rebind TOCTOU race,
-/// which no amount of readiness-polling can otherwise disambiguate (the
-/// sibling's live server would answer PING on the very port we lost).
-async fn reserve_unique_port() -> u16 {
-    static HANDED_OUT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    loop {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        if HANDED_OUT.lock().unwrap().insert(port) {
-            return port;
-        }
-    }
 }
 
 /// Poll until the server accepts a TCP connection and answers PING, or
@@ -925,28 +912,36 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    /// Spawn the moon binary with stdout+stderr redirected to a log file in
-    /// `tmp_dir`. Returns a `ChildGuard` that owns the child + the log path.
-    /// `label` distinguishes phase-1 from phase-2 in diagnostic output.
+    /// Spawn the moon binary (via `common::spawn_listening`, so a lost
+    /// bind-port race or a dead child retries on a fresh port instead of
+    /// blind-polling a corpse) with stdout+stderr redirected to a log file in
+    /// `tmp_dir`. `args` must NOT include `--port` — the port is chosen here.
+    /// Returns a `ChildGuard` that owns the child + the log path, plus the
+    /// port it ended up listening on. `label` distinguishes phase-1 from
+    /// phase-2 in diagnostic output.
     fn spawn(
         binary: &std::path::Path,
         args: &[&str],
         tmp_dir: &std::path::Path,
         label: &'static str,
-    ) -> Self {
+    ) -> (Self, u16) {
         let log = tmp_dir.join(format!("moon-{label}.log"));
-        let log_file = std::fs::File::create(&log)
-            .unwrap_or_else(|e| panic!("create {label} log file at {log:?}: {e}"));
-        let err_file = log_file
-            .try_clone()
-            .unwrap_or_else(|e| panic!("clone {label} log file handle: {e}"));
-        let child = std::process::Command::new(binary)
-            .args(args)
-            .stdout(std::process::Stdio::from(log_file))
-            .stderr(std::process::Stdio::from(err_file))
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn moon server ({label}): {e}"));
-        Self { child, log, label }
+        let (child, port) = common::spawn_listening(|port| {
+            let log_file = std::fs::File::create(&log)
+                .unwrap_or_else(|e| panic!("create {label} log file at {log:?}: {e}"));
+            let err_file = log_file
+                .try_clone()
+                .unwrap_or_else(|e| panic!("clone {label} log file handle: {e}"));
+            let mut full_args: Vec<String> = vec!["--port".into(), port.to_string()];
+            full_args.extend(args.iter().map(|s| s.to_string()));
+            std::process::Command::new(binary)
+                .args(&full_args)
+                .stdout(std::process::Stdio::from(log_file))
+                .stderr(std::process::Stdio::from(err_file))
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn moon server ({label}): {e}"))
+        });
+        (Self { child, log, label }, port)
     }
 
     /// Dump the captured server log to test stderr, prefixed with the label.
@@ -1077,13 +1072,6 @@ fn connect_redis_with_retry(client: &redis::Client, child: &mut ChildGuard) -> r
     }
 }
 
-/// Bind a free OS port, drop the listener, and return the port number.
-fn free_port() -> u16 {
-    // SAFETY: bind + drop releases the port; the server will re-bind it.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    listener.local_addr().unwrap().port()
-}
-
 /// ACID-06 + ACID-11: Committed TXN KV state survives a server kill and restart.
 ///
 /// This test spawns the Moon binary as a child process (not the in-process harness),
@@ -1117,21 +1105,10 @@ async fn test_txn_commit_wal_crash_recovery() {
     let _tmp_guard = DirGuard(tmp_dir.clone());
 
     // ---- Phase 1: start server, commit a TXN ----
-    let port1 = free_port();
-    let port1_s = port1.to_string();
     let tmp_dir_s = tmp_dir.to_str().unwrap().to_string();
-    let mut child1 = ChildGuard::spawn(
+    let (mut child1, port1) = ChildGuard::spawn(
         &binary,
-        &[
-            "--port",
-            &port1_s,
-            "--shards",
-            "1",
-            "--dir",
-            &tmp_dir_s,
-            "--appendonly",
-            "yes",
-        ],
+        &["--shards", "1", "--dir", &tmp_dir_s, "--appendonly", "yes"],
         &tmp_dir,
         "phase-1",
     );
@@ -1229,20 +1206,12 @@ async fn test_txn_commit_wal_crash_recovery() {
     drop(child1); // ChildGuard calls kill() + wait()
 
     // ---- Phase 2: restart server from same persistence dir, verify replay ----
-    let port2 = free_port();
-    let port2_s = port2.to_string();
-    let mut child2 = ChildGuard::spawn(
+    // A fresh port (not port1) is fine here — this restart only needs the
+    // SAME `--dir`, not the same port, so it goes through the normal
+    // `spawn_listening`-backed path like phase 1.
+    let (mut child2, port2) = ChildGuard::spawn(
         &binary,
-        &[
-            "--port",
-            &port2_s,
-            "--shards",
-            "1",
-            "--dir",
-            &tmp_dir_s,
-            "--appendonly",
-            "yes",
-        ],
+        &["--shards", "1", "--dir", &tmp_dir_s, "--appendonly", "yes"],
         &tmp_dir,
         "phase-2",
     );

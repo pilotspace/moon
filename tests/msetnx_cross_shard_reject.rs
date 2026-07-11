@@ -13,6 +13,8 @@
 //!
 //! Run alone with: cargo test --test msetnx_cross_shard_reject
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -28,27 +30,22 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
-
-fn spawn_moon(port: u16, dir: &std::path::Path, shards: u32) -> Child {
-    Command::new(moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon (CARGO_BIN_EXE_moon)")
+fn spawn_moon(dir: &std::path::Path, shards: u32) -> (Child, u16) {
+    common::spawn_listening(|port| {
+        Command::new(moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon (CARGO_BIN_EXE_moon)")
+    })
 }
 
 struct ServerGuard(Child);
@@ -235,9 +232,9 @@ const SHARDS: u32 = 4;
 
 #[test]
 fn msetnx_cross_shard_rejected_no_partial_write() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = spawn_moon(dir.path(), SHARDS);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     // Two keys that PROVABLY land on different shards.
@@ -278,9 +275,9 @@ fn msetnx_cross_shard_rejected_no_partial_write() {
 
 #[test]
 fn msetnx_colocated_is_atomic() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard = ServerGuard(spawn_moon(port, dir.path(), SHARDS));
+    let (child, port) = spawn_moon(dir.path(), SHARDS);
+    let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
     let mut c = Conn::open(port);

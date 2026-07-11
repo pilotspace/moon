@@ -29,6 +29,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -50,19 +52,6 @@ fn find_moon_binary() -> std::path::PathBuf {
     // Windows (the old target/{release,debug}/moon probing found nothing on
     // Windows and could pick a stale release binary).
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-/// Ports below 20000 collide with other services in CI/dev; pick a free one
-/// above that floor instead of a fixed low port.
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-        let p = l.local_addr().expect("local_addr").port();
-        drop(l);
-        if p >= 20000 {
-            return p;
-        }
-    }
 }
 
 /// `tempfile::tempdir()` defaults to `$TMPDIR`, which on macOS lives on the
@@ -94,32 +83,29 @@ impl Drop for ServerGuard {
 
 /// Spawn moon with a tiny `--maxmemory` + `noeviction` policy so writes OOM
 /// deterministically once the budget is exceeded.
-fn spawn_moon_oom(
-    port: u16,
-    dir: &std::path::Path,
-    shards: u32,
-    maxmemory_bytes: u64,
-) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-            "--appendonly",
-            "no",
-            "--maxmemory",
-            &maxmemory_bytes.to_string(),
-            "--maxmemory-policy",
-            "noeviction",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_oom(dir: &std::path::Path, shards: u32, maxmemory_bytes: u64) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+                "--maxmemory",
+                &maxmemory_bytes.to_string(),
+                "--maxmemory-policy",
+                "noeviction",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,9 +315,8 @@ fn blob(size: usize, fill: u8) -> Vec<u8> {
 #[test]
 fn test_case_a_direct_set_control_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 1, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     let value = blob(64 * 1024, b'a'); // 64KB per key
@@ -376,9 +361,8 @@ fn test_case_a_direct_set_control_oom() {
 #[test]
 fn test_case_b_cross_shard_pipeline_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB whole-instance cap
-    let mut guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 4, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 3000;
@@ -437,9 +421,8 @@ fn test_case_b_cross_shard_pipeline_oom() {
 #[test]
 fn test_case_c_lua_redis_call_write_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 1, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // 2000 * 8KB = ~16MB attempted vs a 2MB cap — comfortably oversubscribed.
@@ -474,9 +457,8 @@ fn test_case_c_lua_redis_call_write_oom() {
 #[test]
 fn test_case_d_readonly_eval_not_blocked_at_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 1, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // Drive the instance past its cap first (reuses case A's control setup).
@@ -541,9 +523,8 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
 #[test]
 fn test_case_e_cross_db_copy_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB whole-instance cap
-    let mut guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 4, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 300;
@@ -676,49 +657,50 @@ fn test_case_e_cross_db_copy_oom() {
 // not just the pre-existing local/inline fast path.
 // ---------------------------------------------------------------------------
 
-fn spawn_moon_no_maxmemory(port: u16, dir: &std::path::Path, shards: u32) -> ServerGuard {
-    let child = Command::new(find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--shards",
-            &shards.to_string(),
-            "--appendonly",
-            "no",
-            // Disk offload defaults to `enable`, which gives every shard's
-            // SPSC drain a `spill_sender.is_some() == true` regardless of
-            // maxmemory — that ORs into `evict_active` and would mask
-            // whether the CONFIG SET call site actually published the
-            // atomic under test. Disable it so `evict_active` here is driven
-            // solely by `maxmemory_is_set()`.
-            "--disk-offload",
-            "disable",
-            // Explicit `0`, NOT omitted: omitting --maxmemory triggers the
-            // config auto-guardrail (config.rs ~1044-1101), which caps
-            // maxmemory at a nonzero fraction of detected system RAM — that
-            // nonzero value would make the STARTUP publish_maxmemory call
-            // (main.rs) publish `maxmemory_is_set() == true` immediately,
-            // making phase 2's OOM assertion pass regardless of whether the
-            // CONFIG SET call site publishes anything at all. `0` is the
-            // explicit, Redis-compatible "unlimited" escape hatch — it
-            // starts the atomic definitively unset.
-            "--maxmemory",
-            "0",
-        ])
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon");
-    ServerGuard(child)
+fn spawn_moon_no_maxmemory(dir: &std::path::Path, shards: u32) -> (ServerGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+                // Disk offload defaults to `enable`, which gives every shard's
+                // SPSC drain a `spill_sender.is_some() == true` regardless of
+                // maxmemory — that ORs into `evict_active` and would mask
+                // whether the CONFIG SET call site actually published the
+                // atomic under test. Disable it so `evict_active` here is driven
+                // solely by `maxmemory_is_set()`.
+                "--disk-offload",
+                "disable",
+                // Explicit `0`, NOT omitted: omitting --maxmemory triggers the
+                // config auto-guardrail (config.rs ~1044-1101), which caps
+                // maxmemory at a nonzero fraction of detected system RAM — that
+                // nonzero value would make the STARTUP publish_maxmemory call
+                // (main.rs) publish `maxmemory_is_set() == true` immediately,
+                // making phase 2's OOM assertion pass regardless of whether the
+                // CONFIG SET call site publishes anything at all. `0` is the
+                // explicit, Redis-compatible "unlimited" escape hatch — it
+                // starts the atomic definitively unset.
+                "--maxmemory",
+                "0",
+            ])
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon")
+    });
+    (ServerGuard(child), port)
 }
 
 #[test]
 fn test_case_f_config_set_maxmemory_publishes_atomic() {
     let dir = test_tmpdir();
-    let port = free_port();
-    let mut guard = spawn_moon_no_maxmemory(port, dir.path(), 4);
+    let (mut guard, port) = spawn_moon_no_maxmemory(dir.path(), 4);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     const N: usize = 3000;
@@ -836,9 +818,8 @@ fn test_case_f_config_set_maxmemory_publishes_atomic() {
 #[test]
 fn test_case_g_fcall_internal_write_oom() {
     let dir = test_tmpdir();
-    let port = free_port();
     const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
-    let mut guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let (mut guard, port) = spawn_moon_oom(dir.path(), 1, MAXMEMORY);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     // Registered functions are called with zero Lua args (`call_function` in
@@ -890,10 +871,9 @@ fn test_case_g_fcall_internal_write_oom() {
 #[test]
 fn test_case_h_fcall_no_maxmemory_succeeds() {
     let dir = test_tmpdir();
-    let port = free_port();
     // Reuse spawn_moon_no_maxmemory (Gap C's case F helper) so this
     // genuinely has no cap — spawn_moon_oom always sets one.
-    let mut guard = spawn_moon_no_maxmemory(port, dir.path(), 1);
+    let (mut guard, port) = spawn_moon_no_maxmemory(dir.path(), 1);
     let mut c = wait_ready(&mut guard, dir.path(), port);
 
     let lib_body: &[u8] = b"#!lua name=oklib\n\

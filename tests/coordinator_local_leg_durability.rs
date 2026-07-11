@@ -34,6 +34,8 @@
 //!
 //! Run alone with: cargo test --test coordinator_local_leg_durability
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
@@ -52,13 +54,6 @@ const GROUP_SIZE: usize = 3;
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
 }
 
 /// Spawn moon with per-shard AOF enabled (`--appendonly yes`). `everysec` +
@@ -338,9 +333,13 @@ fn assert_all_survive_restart(
 
 #[test]
 fn mset_colocated_local_leg_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -389,9 +388,13 @@ fn mset_colocated_local_leg_persists_across_restart() {
 
 #[test]
 fn mset_scatter_local_slice_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -488,9 +491,13 @@ fn assert_state_after_restart(
 
 #[test]
 fn del_scatter_local_leg_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -547,9 +554,13 @@ fn del_scatter_local_leg_persists_across_restart() {
 
 #[test]
 fn unlink_colocated_fastpath_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -604,9 +615,13 @@ fn unlink_colocated_fastpath_persists_across_restart() {
 
 #[test]
 fn bitop_dest_local_leg_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -671,9 +686,13 @@ fn bitop_dest_local_leg_persists_across_restart() {
 
 #[test]
 fn copy_dst_local_leg_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);
@@ -722,9 +741,13 @@ fn copy_dst_local_leg_persists_across_restart() {
 
 #[test]
 fn msetnx_colocated_local_leg_persists_across_restart() {
-    let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
-    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    // Only the FIRST spawn of this server's lifecycle goes through
+    // spawn_listening; the post-SIGKILL restart below reuses the SAME port
+    // via a direct spawn_moon_aof call (port continuity is part of the
+    // test's semantics — see assert_all_survive_restart /
+    // assert_state_after_restart).
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
     wait_ready(port);
 
     let tags = tags_per_shard(SHARDS as usize);

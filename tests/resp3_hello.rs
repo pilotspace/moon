@@ -10,8 +10,10 @@
 //! the binary was built with (monoio by default, tokio under
 //! `--features runtime-tokio`).
 
+mod common;
+
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -23,14 +25,6 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// Grab a free port by binding to :0 and dropping the listener.
-fn free_port() -> u16 {
-    #[allow(clippy::unwrap_used)] // test-only: loopback bind cannot reasonably fail
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    #[allow(clippy::unwrap_used)] // test-only
-    listener.local_addr().unwrap().port()
 }
 
 /// Connect with retries until the server accepts and answers PING.
@@ -98,22 +92,28 @@ fn roundtrip(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
     reply
 }
 
+/// Spawn moon on a self-chosen port (see `common::spawn_listening`) and
+/// return the guard + the live port.
+fn spawn_moon(dir_s: &str) -> (ChildGuard, u16) {
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(env!("CARGO_BIN_EXE_moon"))
+            .args(["--port", &port.to_string(), "--shards", "2", "--dir", dir_s])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon server")
+    });
+    (ChildGuard(child), port)
+}
+
 #[test]
 fn hello_negotiation_switches_wire_protocol() {
     #[allow(clippy::unwrap_used)] // test-only
     let tmp_dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let port_s = port.to_string();
     #[allow(clippy::unwrap_used)] // test-only
     let dir_s = tmp_dir.path().to_str().unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_moon"))
-        .args(["--port", &port_s, "--shards", "2", "--dir", dir_s])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn moon server");
-    let _guard = ChildGuard(child);
+    let (_guard, port) = spawn_moon(dir_s);
 
     // ── RESP3: HELLO 3 must reply with a map frame ('%') and switch the codec ──
     {

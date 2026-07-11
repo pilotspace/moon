@@ -27,17 +27,13 @@
 //! Run with:
 //!   MOON_BIN=/path/to/moon cargo test --release --test vector_db_isolation
 
-use std::net::TcpListener;
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use redis::{Client, Connection};
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().unwrap().port()
-}
 
 fn release_binary() -> std::path::PathBuf {
     // MOON_BIN pin wins (VM-local / worktree-local target dirs); fall back
@@ -98,6 +94,48 @@ fn wait_ready(port: u16) -> bool {
     false
 }
 
+/// First spawn of a lifecycle against a caller-provided `tmp_dir`: port
+/// chosen via `common::spawn_listening` (retries on a fresh port if the bind
+/// race is lost / the child dies before accepting).
+fn spawn_moon_first(tmp_dir: &std::path::Path, shards: usize) -> Option<Moon> {
+    let bin = release_binary();
+    let dir_s = tmp_dir.to_str().unwrap().to_string();
+    let shards_s = shards.to_string();
+    let (child, port) = common::spawn_listening(|port| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &shards_s,
+                "--admin-port",
+                "0",
+                "--appendonly",
+                "no",
+                "--dir",
+                &dir_s,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    });
+    let moon = Moon {
+        child,
+        port,
+        tmp_dir: tmp_dir.to_path_buf(),
+    };
+    if wait_ready(moon.port) {
+        Some(moon)
+    } else {
+        eprintln!(
+            "skipping: moon did not respond to PING within 10s on port {}",
+            moon.port
+        );
+        None
+    }
+}
+
 /// Spawn moon fresh (new tmp dir, new port). `shards` lets callers exercise
 /// both single-shard and multi-shard dispatch paths (CLAUDE.md's "three
 /// dispatch path" gotcha means single-shard vs multi-shard is a REAL branch,
@@ -109,12 +147,18 @@ fn spawn_moon(shards: usize, tag: &str) -> Option<Moon> {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-db-isolation-{tag}-{port}"));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("moon-db-isolation-{tag}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
-    spawn_moon_at(&tmp_dir, port, shards)
+    spawn_moon_first(&tmp_dir, shards)
 }
 
+/// Restart on a caller-chosen, already-freed port + dir — used ONLY by
+/// same-port restart tests (`restart_round_trip_preserves_db_binding`).
+/// Per the port-flake-sweep hard rules, a deliberate same-port restart keeps
+/// the direct (non-`spawn_listening`) spawn path: reusing the exact port is
+/// part of the test's semantics, not something `spawn_listening` (which picks
+/// its own port) should be involved in.
 fn spawn_moon_at(tmp_dir: &std::path::Path, port: u16, shards: usize) -> Option<Moon> {
     let bin = release_binary();
     let child = Command::new(&bin)
@@ -336,17 +380,18 @@ fn restart_round_trip_preserves_db_binding() {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-db-isolation-restart-{port}"));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("moon-db-isolation-restart-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
 
-    let mut moon = match spawn_moon_at(&tmp_dir, port, 1) {
+    let mut moon = match spawn_moon_first(&tmp_dir, 1) {
         Some(m) => m,
         None => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return;
         }
     };
+    let port = moon.port;
 
     {
         let mut c1 = moon.conn(1);
@@ -364,9 +409,9 @@ fn restart_round_trip_preserves_db_binding() {
 
     moon.kill_keep_dir();
     // Re-bind on the SAME port + SAME dir — proves this is a true restart,
-    // not a fresh server (free_port() would risk a different port winning
-    // a race; reuse the already-freed one directly since we just killed
-    // the owning process).
+    // not a fresh server (going through `spawn_listening`/a freshly reserved
+    // port would risk a different port winning; reuse the one the first
+    // spawn already bound, now free since we just killed its owner).
     let restarted = spawn_moon_at(&tmp_dir, port, 1);
     let Some(moon2) = restarted else {
         eprintln!("skipping: restart did not come back up on port {port}");
