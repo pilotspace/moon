@@ -11,6 +11,7 @@ pub mod graph_write;
 pub use graph_read::{
     graph_explain, graph_hybrid, graph_info, graph_list, graph_neighbors, graph_profile,
     graph_query, graph_query_or_write, graph_query_write, graph_ro_query, graph_vsearch,
+    merge_graph_list_responses,
 };
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
@@ -223,6 +224,35 @@ mod tests {
             .map(|p| Frame::BulkString(Bytes::from(p.to_vec())))
             .collect();
         Frame::Array(FrameVec::from_vec(frames))
+    }
+
+    #[test]
+    fn merge_graph_list_unions_sorts_dedups_and_skips_errors() {
+        let mk = |names: &[&[u8]]| {
+            let frames: Vec<Frame> = names
+                .iter()
+                .map(|n| Frame::BulkString(Bytes::from(n.to_vec())))
+                .collect();
+            Frame::Array(FrameVec::from_vec(frames))
+        };
+        let local = mk(&[b"g2", b"g1"]);
+        let remotes = vec![
+            mk(&[b"g3", b"g1"]),                           // g1 duplicated across shards
+            Frame::Error(Bytes::from_static(b"ERR boom")), // skipped
+            mk(&[]),
+        ];
+        let merged = merge_graph_list_responses(local, &remotes);
+        let Frame::Array(items) = merged else {
+            panic!("expected array");
+        };
+        let names: Vec<&[u8]> = items
+            .iter()
+            .map(|f| match f {
+                Frame::BulkString(b) => b.as_ref(),
+                _ => panic!("expected bulk string"),
+            })
+            .collect();
+        assert_eq!(names, vec![&b"g1"[..], &b"g2"[..], &b"g3"[..]]);
     }
 
     /// Decode `[headers, rows, stats]` from a GRAPH.QUERY response into rows of cells.

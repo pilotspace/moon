@@ -1779,6 +1779,51 @@ pub async fn coordinate_dbsize(
     Frame::Integer(total)
 }
 
+/// Gather per-db `(keys, expires)` across ALL shards for `INFO # Keyspace`.
+///
+/// Element-wise sum of each shard's per-db counter vector (a key lives on
+/// exactly one shard, so sums never double-count). Returns the local-only
+/// vector at `num_shards == 1` without touching the SPSC mesh. A dead remote
+/// reply channel degrades to the partial sum (INFO is diagnostics — prefer
+/// an under-count over an error frame).
+pub async fn coordinate_keyspace_info(
+    my_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Vec<(u64, u64)> {
+    let mut totals: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
+        s.databases
+            .iter()
+            .map(|db| (db.len() as u64, db.expires_count() as u64))
+            .collect()
+    });
+    if num_shards <= 1 {
+        return totals;
+    }
+    let mut receivers = Vec::with_capacity(num_shards - 1);
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::KeyspaceStats { reply_tx };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
+    }
+    for rx in receivers {
+        if let Ok(stats) = recv_reply_bounded(rx).await {
+            for (i, (k, e)) in stats.into_iter().enumerate() {
+                if let Some(t) = totals.get_mut(i) {
+                    t.0 += k;
+                    t.1 += e;
+                }
+            }
+        }
+    }
+    totals
+}
+
 /// Coordinate HOTKEYS across all shards: merge per-shard top-K sketches.
 ///
 /// Each key lives on exactly one shard, so the merge never has to sum

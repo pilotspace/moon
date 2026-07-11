@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovered at failover. Full support (id-pinned record forms + replica
   apply arms + snapshot coverage) is tracked as follow-up work, alongside
   the pre-existing Lua-EVAL and expiry/eviction propagation gaps.
+### Fixed — listing parity: `INFO # Keyspace` all dbs × all shards, `GRAPH.LIST` all shards
+
+- `INFO`'s `# Keyspace` section always printed a single `db0:` line holding
+  the SELECTED db's LOCAL-shard key count — `SELECT 2; SET k v; INFO`
+  reported the db-2 count as db0, every other db was invisible, and at
+  `--shards N` the other shards' keys were uncounted. It now lists every
+  NON-EMPTY logical db (Redis semantics) with `(keys, expires)` summed
+  across all shards via a new `KeyspaceStats` scatter (O(#dbs) counter
+  reads per shard, no key iteration). All three dispatch paths
+  (monoio / tokio sharded / single).
+- `GRAPH.LIST` at `--shards N` listed only the connection shard's graphs
+  (~1/N of them, since a graph lives on the shard that owns its name). It
+  now scatters to every shard and returns the sorted, deduplicated union.
 
 ### Fixed — CLIENT TRACKING dead on the monoio runtime (H-3 reorder regression)
 

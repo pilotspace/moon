@@ -759,8 +759,43 @@ pub(super) async fn try_handle_graph_command(
     // thread-local once ShardSlice is initialized, so non-owner commands MUST
     // hop via ShardMessage::GraphCommand — the shard-side handler dispatches
     // on its own store and drains graph WAL records locally.
-    // GRAPH.LIST has no name argument and stays connection-local (it reports
-    // this shard's graphs only — recorded as a v3 observe delta).
+    // GRAPH.LIST has no name argument: scatter to EVERY shard and union the
+    // names (a local-only answer listed roughly 1/N of the graphs).
+    if ctx.num_shards > 1 && cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
+        let mut receivers = Vec::with_capacity(ctx.num_shards - 1);
+        for target in 0..ctx.num_shards {
+            if target == ctx.shard_id {
+                continue;
+            }
+            let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+            let msg = crate::shard::dispatch::ShardMessage::GraphCommand {
+                command: std::sync::Arc::new(frame.clone()),
+                reply_tx,
+            };
+            let _ = crate::shard::coordinator::spsc_send(
+                &ctx.dispatch_tx,
+                ctx.shard_id,
+                target,
+                msg,
+                &ctx.spsc_notifiers,
+            )
+            .await;
+            receivers.push(reply_rx);
+        }
+        let mut remotes = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            if let Ok(f) = crate::shard::coordinator::recv_reply_bounded(rx).await {
+                remotes.push(f);
+            }
+        }
+        let local = crate::shard::slice::with_shard(|s| {
+            crate::command::graph::dispatch_graph_read(&s.graph_store, cmd, cmd_args, None)
+        });
+        responses.push(crate::command::graph::merge_graph_list_responses(
+            local, &remotes,
+        ));
+        return true;
+    }
     if ctx.num_shards > 1 && !cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
         if let Some(name) = cmd_args.first().and_then(extract_bytes) {
             let owner = crate::shard::dispatch::graph_to_shard(&name, ctx.num_shards);

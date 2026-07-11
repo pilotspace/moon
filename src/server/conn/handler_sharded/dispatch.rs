@@ -308,7 +308,7 @@ pub(super) fn try_handle_replicaof(
 }
 
 /// Handle INFO command. Returns `true` if consumed.
-pub(super) fn try_handle_info(
+pub(super) async fn try_handle_info(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &ConnectionState,
@@ -318,9 +318,19 @@ pub(super) fn try_handle_info(
     if !cmd.eq_ignore_ascii_case(b"INFO") {
         return false;
     }
+    // # Keyspace parity: per-db (keys, expires) summed across ALL shards —
+    // previously the section reported the selected db's LOCAL count as db0
+    // (other dbs invisible, other shards uncounted).
+    let keyspace = crate::shard::coordinator::coordinate_keyspace_info(
+        ctx.shard_id,
+        ctx.num_shards,
+        &ctx.dispatch_tx,
+        &ctx.spsc_notifiers,
+    )
+    .await;
     // ShardSlice path: access the local shard's database via thread-local.
     let mut response_text = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-        let resp_frame = conn_cmd::info_readonly(db, cmd_args);
+        let resp_frame = conn_cmd::info_with_keyspace(db, cmd_args, &keyspace);
         match resp_frame {
             Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
             _ => String::new(),

@@ -520,6 +520,32 @@ pub fn graph_list(store: &GraphStore) -> Frame {
     Frame::Array(frames.into())
 }
 
+/// Merge the local shard's GRAPH.LIST reply with the other shards' replies
+/// (multi-shard scatter — a graph lives on the shard that owns its name, so
+/// a local-only answer listed roughly 1/N of the graphs). Union of names,
+/// sorted for a stable client-visible order. Error frames from remote shards
+/// are skipped (prefer a partial listing over failing the whole command).
+pub fn merge_graph_list_responses(local: Frame, remotes: &[Frame]) -> Frame {
+    let mut names: Vec<bytes::Bytes> = Vec::new();
+    let mut collect = |frame: &Frame| {
+        if let Frame::Array(items) = frame {
+            for item in items.iter() {
+                if let Frame::BulkString(name) = item {
+                    names.push(name.clone());
+                }
+            }
+        }
+    };
+    collect(&local);
+    for r in remotes {
+        collect(r);
+    }
+    names.sort_unstable();
+    names.dedup();
+    let frames: Vec<Frame> = names.into_iter().map(Frame::BulkString).collect();
+    Frame::Array(frames.into())
+}
+
 // ---------------------------------------------------------------------------
 // GRAPH.QUERY, GRAPH.RO_QUERY, GRAPH.EXPLAIN
 // ---------------------------------------------------------------------------

@@ -514,6 +514,13 @@ pub enum ShardMessage {
         count: usize,
         reply_tx: channel::OneshotSender<Vec<bytes::Bytes>>,
     },
+    /// Per-db `(keys, expires)` counters for ALL logical dbs on this shard —
+    /// the `INFO # Keyspace` scatter (Redis lists every non-empty db; a
+    /// local-only or db0-only answer under-reports, same class as the
+    /// FT.INFO `num_docs` scatter). Reply vector is indexed by db number.
+    KeyspaceStats {
+        reply_tx: channel::OneshotSender<Vec<(u64, u64)>>,
+    },
     /// Notify shard of slot ownership changes (no-op placeholder for future per-shard caching).
     SlotOwnershipUpdate {
         add_slots: Vec<u16>,
