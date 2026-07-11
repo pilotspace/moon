@@ -139,6 +139,9 @@ impl Drop for ServerGuard {
 #[cfg(unix)]
 fn sigkill(child: &mut Child) {
     let pid = child.id() as i32;
+    // SAFETY: `pid` is the live child's own process id (owned `Child`, not yet
+    // waited), so the SIGKILL targets exactly the server this guard spawned;
+    // `libc::kill` has no memory-safety preconditions beyond a valid signal.
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
