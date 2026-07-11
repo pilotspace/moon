@@ -136,6 +136,14 @@ pub static RECL_AUTOVACUUM_SEGMENTS_COMPACTED_TOTAL: AtomicU64 = AtomicU64::new(
 /// TODO(P10→Wave2): wire from autovacuum scheduler.
 pub static RECL_AUTOVACUUM_THROTTLED_DUE_TO_LOAD: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of Pass C (WAL recycle) ticks that found the WAL over
+/// `--max-wal-size` but declined to recycle because no checkpoint/graph
+/// snapshot protocol backs this WAL (legacy, non-disk-offload mode —
+/// task #43, P1 data loss fix). Non-zero means the operator should either
+/// enable `--disk-offload enable` or expect unbounded WAL growth past the
+/// configured ceiling; it never means data was lost.
+pub static RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Graph plan-cache hit count (cumulative). Used to compute hit_ratio.
 /// TODO(P10→Wave2): wire from PlanCache::get() on hit path.
 pub static RECL_PLAN_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -191,9 +199,11 @@ pub fn write_reclamation_section(buf: &mut String) {
     let _ = write!(
         buf,
         "reclamation_wal_bytes:{}\r\n\
-         reclamation_wal_segments:{}\r\n",
+         reclamation_wal_segments:{}\r\n\
+         reclamation_wal_recycle_blocked_no_checkpoint_total:{}\r\n",
         RECL_WAL_BYTES.load(Ordering::Relaxed),
-        RECL_WAL_SEGMENTS.load(Ordering::Relaxed)
+        RECL_WAL_SEGMENTS.load(Ordering::Relaxed),
+        RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed)
     );
 
     // -- Write stall: OR of disk-pressure (MA12), segment-backlog (MA1), and
