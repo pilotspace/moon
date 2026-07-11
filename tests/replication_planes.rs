@@ -365,8 +365,6 @@ fn run_eviction_parity(shards: usize) {
             i
         );
     }
-
-    guard.0.clear();
 }
 
 #[test]
@@ -569,8 +567,6 @@ fn run_eviction_parity_hash_disk_offload(shards: usize) {
         spot_check_fraction * 100.0,
         MIN_CONVERGED_FRACTION * 100.0
     );
-
-    guard.0.clear();
 }
 
 #[test]
@@ -831,8 +827,6 @@ fn run_eval_effects_parity(shards: usize) {
             missing_sets, missing_incrs
         );
     }
-
-    guard.0.clear();
 }
 
 #[test]
@@ -1118,8 +1112,6 @@ fn expiry_del_propagates() {
         baseline_offset,
         after_offset
     );
-
-    guard.0.clear();
 }
 
 // ============================================================================
@@ -1250,6 +1242,4 @@ fn eval_incr_no_double_apply() {
          would show 2): got {:?}",
         send_cmd(&r, "GET noda:ctr")
     );
-
-    guard.0.clear();
 }
