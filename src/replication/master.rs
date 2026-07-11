@@ -938,17 +938,33 @@ async fn drain_replica_inline_single_shard(
         rs.replicas.push(replica_info);
     }
 
+    // R1 (task #19): the hijacked PSYNC socket is full-duplex — the replica
+    // sends `REPLCONF ACK <offset>` back on it (1s cadence). Split the stream
+    // so a local reader task records ACKs into this replica's
+    // `ack_offsets`/`last_ack_time` (the data WAIT and INFO lag read) while
+    // the write loop below streams live fan-out bytes. Same-thread
+    // `monoio::spawn` — the task is !Send, which is fine here.
+    use monoio::io::Splitable as _;
+    let (rd, mut wr_half) = stream.into_split();
+    let ack_reader = monoio::spawn({
+        let repl_state = repl_state.clone();
+        async move { ack_read_loop(rd, replica_id, repl_state).await }
+    });
+
     // Drain the channel and write to the stream until the replica disconnects.
-    let stream = std::cell::RefCell::new(stream);
-    #[allow(clippy::await_holding_refcell_ref)]
     while let Ok(data) = rx.recv_async().await {
         let buf = data.to_vec();
-        let (wr, _) = stream.borrow_mut().write_all(buf).await;
+        let (wr, _) = wr_half.write_all(buf).await;
         if wr.is_err() {
             info!("Replica {} disconnected", replica_id);
             break;
         }
     }
+    // Dropping the write half closes our outbound side; the reader task ends
+    // on EOF/error when the peer closes (its socket dies with the write half
+    // on a disconnect-driven exit, so it does not linger).
+    drop(wr_half);
+    drop(ack_reader);
     // Remove from ReplicationState; the event loop will drop its replica_txs
     // entry on the next failed send via its own UnregisterReplica path.
     if let Ok(mut rs) = repl_state.write() {
@@ -959,6 +975,107 @@ async fn drain_replica_inline_single_shard(
         replica_id,
     });
     Ok(())
+}
+
+/// Read `REPLCONF ACK <offset>` frames off the replica's half of the hijacked
+/// PSYNC socket and record them (R1, task #19). Runs as a same-thread task
+/// beside the write-drain loop in `drain_replica_inline_single_shard`; exits
+/// on EOF/read error. Anything other than a well-formed ACK is logged and
+/// skipped — a replica cannot corrupt master state through this path.
+#[cfg(feature = "runtime-monoio")]
+async fn ack_read_loop(
+    mut rd: monoio::net::tcp::TcpOwnedReadHalf,
+    replica_id: u64,
+    repl_state: Arc<RwLock<ReplicationState>>,
+) {
+    use monoio::io::AsyncReadRent;
+    use std::sync::atomic::Ordering;
+
+    let mut buf = bytes::BytesMut::with_capacity(4096);
+    loop {
+        let tmp = vec![0u8; 4096];
+        let (res, tmp) = rd.read(tmp).await;
+        let n = match res {
+            Ok(0) | Err(_) => return, // replica closed its send half
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        // Parse complete RESP frames directly — the shared replication
+        // drainer (`drain_replicated_commands`) deliberately DROPS REPLCONF
+        // as chatter, which is exactly the frame this loop exists to read.
+        let acks = match drain_ack_offsets(&mut buf) {
+            Ok(acks) => acks,
+            Err(()) => {
+                tracing::warn!(
+                    replica_id,
+                    "unparseable bytes on replica ACK channel — closing"
+                );
+                return;
+            }
+        };
+        for offset in acks {
+            if let Ok(rs) = repl_state.read() {
+                if let Some(info) = rs.replicas.iter().find(|r| r.id == replica_id) {
+                    // fetch_max: ACKs can only move forward — a reordered or
+                    // duplicate ACK never regresses the recorded offset.
+                    if let Some(slot) = info.ack_offsets.first() {
+                        slot.fetch_max(offset, Ordering::Relaxed);
+                    }
+                    info.last_ack_time.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Drain every complete RESP frame from `buf` and return the offsets of all
+/// well-formed `REPLCONF ACK <offset>` frames (R1). Non-ACK frames are
+/// skipped at debug level; a parse error returns `Err(())` — the unframed
+/// stream cannot be resynced, so the caller must drop the connection.
+#[cfg(feature = "runtime-monoio")]
+fn drain_ack_offsets(buf: &mut bytes::BytesMut) -> Result<Vec<u64>, ()> {
+    use crate::protocol::{Frame, ParseConfig, parse};
+
+    let config = ParseConfig::default();
+    let mut acks = Vec::new();
+    loop {
+        if buf.is_empty() {
+            return Ok(acks);
+        }
+        let frame = match parse::parse(buf, &config) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(acks), // partial trailing frame — wait for more
+            Err(_) => return Err(()),
+        };
+        let Frame::Array(items) = &frame else {
+            continue; // inline keepalive etc. — ignore
+        };
+        let bulk = |f: &Frame| -> Option<bytes::Bytes> {
+            match f {
+                Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
+                _ => None,
+            }
+        };
+        let is_ack = items.len() >= 3
+            && bulk(&items[0]).is_some_and(|c| c.eq_ignore_ascii_case(b"REPLCONF"))
+            && bulk(&items[1]).is_some_and(|s| s.eq_ignore_ascii_case(b"ACK"));
+        if !is_ack {
+            tracing::debug!("ignoring non-ACK frame on replica channel");
+            continue;
+        }
+        if let Some(offset) = bulk(&items[2])
+            .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.to_owned()))
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            acks.push(offset);
+        }
+    }
 }
 
 /// WAIT command: block until N replicas acknowledge >= target_offset, or timeout expires.

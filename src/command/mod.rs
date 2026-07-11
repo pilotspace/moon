@@ -1470,10 +1470,11 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (4, b'w') => {
-            // WAIT: no replication — always 0 (mirrors handler_single.rs:833).
-            // WAIT is in extract_primary_key's keyless table, so it routes
-            // locally: this arm fires on the local read path only, never the
-            // cross-shard fast path.
+            // WAIT fallback: the REAL implementation is the connection-layer
+            // `try_handle_wait` intercept (R1 — it awaits replica ACKs, which
+            // this synchronous dispatch cannot). This arm only answers when a
+            // path lacks that intercept (no repl_state configured): 0 is then
+            // truthful — no replicas can be attached.
             if cmd.eq_ignore_ascii_case(b"WAIT") {
                 return resp(Frame::Integer(0));
             }

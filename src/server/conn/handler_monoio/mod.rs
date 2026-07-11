@@ -907,6 +907,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
+            // WAIT blocks on replica ACKs (R1) — must run at the connection
+            // layer; generic dispatch is synchronous and used to answer :0.
+            if cmd_len == 4 && dispatch::try_handle_wait(cmd, cmd_args, ctx, &mut responses).await {
+                continue;
+            }
             if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }

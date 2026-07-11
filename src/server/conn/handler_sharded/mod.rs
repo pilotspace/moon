@@ -871,6 +871,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- WAIT (R1): blocks on replica ACKs; must run at the
+                    // connection layer (generic dispatch is synchronous) ---
+                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, &mut responses).await {
+                        continue;
+                    }
+
                     // --- READONLY enforcement ---
                     if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
                         continue;

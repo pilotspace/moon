@@ -763,3 +763,62 @@ fn replica_applies_multi_db_stream() {
         "db-0 write leaked into db 2 on the replica"
     );
 }
+
+/// R1 (task #19): real WAIT/ACK plumbing. The replica sends
+/// `REPLCONF ACK <offset>` on the replication link (after each applied batch
+/// + a 1s idle tick); the master reads them off the hijacked PSYNC socket and
+/// records them per replica; `WAIT <n> <ms>` blocks until n replicas
+/// acknowledge the master's current offset. Previously WAIT returned 0
+/// unconditionally on the monoio runtime and no ACK was ever sent or read.
+#[test]
+#[ignore]
+fn wait_returns_acked_replica_count() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let master_addr = "127.0.0.1:16736";
+    let replica_addr = "127.0.0.1:16737";
+
+    let _master = Killer(start_moon(16736, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+
+    // No replicas attached: WAIT 1 with a short timeout must return 0 fast.
+    let r = send_cmd(master_addr, "WAIT 1 200");
+    assert_eq!(r.trim(), ":0", "WAIT with no replicas must return 0: {r}");
+
+    let _replica = Killer(start_moon(16737, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    send_cmd(replica_addr, &format!("REPLICAOF 127.0.0.1 {}", 16736));
+
+    // Prove the stream is live.
+    send_cmd(master_addr, "SET w1 v1");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            get(replica_addr, "w1").as_deref() == Some("v1")
+        }),
+        "live stream not flowing — WAIT assertions would be meaningless"
+    );
+
+    // Write, then WAIT for 1 replica to acknowledge everything so far. The
+    // ACK cadence is drain-driven + a 1s idle tick, so a 3s budget is ample.
+    send_cmd(master_addr, "SET w2 v2");
+    let r = send_cmd(master_addr, "WAIT 1 3000");
+    assert_eq!(
+        r.trim(),
+        ":1",
+        "WAIT must observe the replica's ACK of the current offset: {r}"
+    );
+
+    // Asking for MORE replicas than exist must time out and report the real
+    // acked count (1), not hang or claim 2.
+    let r = send_cmd(master_addr, "WAIT 2 300");
+    assert_eq!(r.trim(), ":1", "WAIT 2 with one replica must return 1: {r}");
+}

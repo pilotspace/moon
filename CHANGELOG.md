@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — R1: real WAIT/ACK plumbing (replica acknowledgements)
+
+- **`WAIT <numreplicas> <timeout>` now works on the production (monoio)
+  runtime.** It previously answered `:0` unconditionally from the synchronous
+  dispatch table; a new connection-layer intercept awaits
+  `wait_for_replicas` (10ms poll, early exit; `timeout 0` = block until
+  satisfied, capped at one year). Wired on the tokio sharded path too.
+- **Replicas acknowledge their applied offset**: a dedicated 1s ticker task
+  owns the write half of the (split) replication socket and sends
+  `REPLCONF ACK <offset>` — Redis's replicationCron cadence, doubling as an
+  idle keepalive for master-side lag detection. A timeout-wrapped read was
+  rejected: cancelling an in-flight io_uring read whose completion already
+  landed DISCARDS those bytes (silent stream corruption).
+- **The master reads ACKs off the hijacked PSYNC socket**: the inline drain
+  loop splits the stream; a same-thread reader task parses
+  `REPLCONF ACK <offset>` frames (dedicated parser — the shared replication
+  drainer deliberately drops REPLCONF as chatter) and records them into the
+  replica's `ack_offsets`/`last_ack_time` via `fetch_max` (reordered or
+  duplicate ACKs can never regress the recorded offset).
+- New e2e `wait_returns_acked_replica_count`: WAIT with no replicas → 0
+  fast; WAIT 1 after a write → 1 within the ACK cadence; WAIT 2 with one
+  replica → times out reporting 1 (RED before this change).
+
 ### Fixed — multi-db replication: master streams `SELECT`, replicas serve it (HIGH-2)
 
 - **Writes outside db 0 landed in db 0 on the replica**: the replica-side
