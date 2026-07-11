@@ -32,7 +32,12 @@ fn is_replicated_ft_def_mutation(cmd: &[u8], cmd_args: &[Frame]) -> bool {
 /// snapshot is captured, so an FT.* mutation racing a first-ever attach still
 /// fans out). Gates the serialize+SPSC round trip so servers that never
 /// replicate pay nothing — mirrors `wal_fanout_has_work` on the KV path.
-fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
+pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
+    // Cheap first gate: one Relaxed load; false until the first replica ever
+    // begins attaching (REPLCONF/PSYNC → ensure_backlogs_allocated).
+    if !crate::replication::state::fanout_hint_active() {
+        return false;
+    }
     ctx.repl_state.as_ref().is_some_and(|rs| {
         rs.read().is_ok_and(|g| {
             !g.replicas.is_empty()
@@ -806,19 +811,13 @@ pub(super) async fn try_handle_ft_command(
             && is_replicated_ft_def_mutation(cmd, cmd_args)
             && replication_fanout_active(ctx)
         {
-            use ringbuf::traits::Producer;
+            // Same-shard → self queue: the SPSC mesh has no self-loop (the
+            // producer Vec is EMPTY at shards=1), so this must NOT go through
+            // ctx.dispatch_tx — see `shard::self_msg`.
             let serialized = crate::persistence::aof::serialize_command(frame);
-            let mut producers = ctx.dispatch_tx.borrow_mut();
-            if let Some(prod) = producers.get_mut(0) {
-                let msg =
-                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim { bytes: serialized };
-                if prod.try_push(msg).is_err() {
-                    tracing::warn!(
-                        "replication: SPSC full, {} not fanned to replicas (replicas must full-resync)",
-                        String::from_utf8_lossy(cmd)
-                    );
-                }
-            }
+            crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
+                bytes: serialized,
+            });
         }
         let mut response = response;
         if let Some(ws_id) = conn.workspace_id.as_ref() {

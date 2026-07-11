@@ -172,6 +172,23 @@ pub(crate) fn drain_spsc_shared(
     execute_batch.clear();
     other_messages.clear();
 
+    // Self-queue FIRST: same-shard tasks (inline PSYNC RegisterReplica,
+    // FT.*/graph/local-write ReplicateVerbatim) cannot SPSC to their own
+    // shard — the mesh is N·(N−1) skip-self — so they enqueue on the
+    // thread-local self queue (`shard::self_msg`). All self messages are
+    // control-plane arms (never Execute-batch / SnapshotBegin types), so
+    // they route through `other_messages`. FIFO here is a correctness
+    // invariant: a write's ReplicateVerbatim drained before RegisterReplica
+    // lands in the backlog below the registration offset, one drained after
+    // fans to the freshly-registered replica — no gap, no double-delivery.
+    while drained < MAX_DRAIN_PER_CYCLE {
+        let Some(msg) = crate::shard::self_msg::pop() else {
+            break;
+        };
+        drained += 1;
+        other_messages.push(msg);
+    }
+
     let mut snapshot_seen = false;
     for consumer in consumers.iter_mut() {
         if snapshot_seen {
@@ -2484,9 +2501,17 @@ pub(crate) fn handle_shard_message_shared(
             // earlier allocation point triggered by REPLCONF. Capacity is carried
             // in the message (from `--repl-backlog-size`) so this fallback can't
             // silently diverge from the handshake-path allocation.
+            crate::replication::state::mark_fanout_active();
             let mut guard = repl_backlog.lock();
             if guard.is_none() {
-                *guard = Some(ReplicationBacklog::new(backlog_capacity));
+                // Seed byte positions at the current shard offset so range
+                // math stays aligned with pre-attach `issue_lsn` advances —
+                // see `ReplicationBacklog::new_at`.
+                let offset = repl_state
+                    .as_ref()
+                    .map(|h| h.shard_offset(shard_id))
+                    .unwrap_or(0);
+                *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
             }
             drop(guard);
             replica_txs.push((replica_id, tx));

@@ -906,7 +906,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if dispatch::try_enforce_readonly(cmd, ctx, &mut responses) {
+            if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
             // MA12: Disk full enforcement
@@ -1278,8 +1278,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
 
-            // Pre-classify write commands for AOF + tracking
-            let is_write = if ctx.aof_pool.is_some() || conn.tracking_state.enabled {
+            // Pre-classify write commands for AOF + tracking + replication
+            // fan-out (the fanout hint is one Relaxed load, false until the
+            // first replica ever begins attaching).
+            let is_write = if ctx.aof_pool.is_some()
+                || conn.tracking_state.enabled
+                || crate::replication::state::fanout_hint_active()
+            {
                 metadata::is_write(cmd)
             } else {
                 false
@@ -1324,13 +1329,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // awaits the writer's fsync ack before responding to
                     // the client.
                     if matches!(response, Frame::Integer(1)) {
-                        if let Some(ref pool) = ctx.aof_pool {
+                        // v0.7 local-leg live replication — same contract as
+                        // the main write leg: push before any await, AOF leg
+                        // does not double-advance the offset (lsn = 0).
+                        let repl_active = ft::replication_fanout_active(ctx);
+                        if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
-                            let lsn = aof::AofWriterPool::issue_append_lsn(
-                                &ctx.repl_state,
-                                ctx.shard_id,
-                                serialized.len(),
-                            );
+                            let lsn = if repl_active {
+                                crate::shard::self_msg::push(
+                                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
+                                        bytes: serialized.clone(),
+                                    },
+                                );
+                                0
+                            } else {
+                                aof::AofWriterPool::issue_append_lsn(
+                                    &ctx.repl_state,
+                                    ctx.shard_id,
+                                    serialized.len(),
+                                )
+                            };
+                            let Some(ref pool) = ctx.aof_pool else {
+                                responses.push(response);
+                                continue;
+                            };
                             match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
                                 // Always: durability confirmed by ONE
                                 // fsync_barrier per batch (resolve_local_leg_barrier
@@ -1389,13 +1411,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                         // H1: durable path awaits fsync under appendfsync=always.
                         if matches!(response, Frame::Integer(1)) {
-                            if let Some(ref pool) = ctx.aof_pool {
+                            // v0.7 local-leg live replication — same contract
+                            // as the main write leg (push before await; AOF
+                            // leg does not double-advance, lsn = 0).
+                            let repl_active = ft::replication_fanout_active(ctx);
+                            if repl_active || ctx.aof_pool.is_some() {
                                 let serialized = aof::serialize_command(&frame);
-                                let lsn = aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    ctx.shard_id,
-                                    serialized.len(),
-                                );
+                                let lsn = if repl_active {
+                                    crate::shard::self_msg::push(
+                                        crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
+                                            bytes: serialized.clone(),
+                                        },
+                                    );
+                                    0
+                                } else {
+                                    aof::AofWriterPool::issue_append_lsn(
+                                        &ctx.repl_state,
+                                        ctx.shard_id,
+                                        serialized.len(),
+                                    )
+                                };
+                                let Some(ref pool) = ctx.aof_pool else {
+                                    responses.push(response);
+                                    continue;
+                                };
                                 match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
                                     // Same one-barrier-per-batch contract as MOVE.
                                     Ok(true) => local_leg_write_idxs.push(responses.len()),
@@ -1671,20 +1710,43 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // measured 8x deficit vs Redis at P16).
                     let mut aof_barrier_pending = false;
                     if !matches!(response, Frame::Error(_)) && is_write {
-                        if let Some(ref pool) = ctx.aof_pool {
+                        // v0.7 local-leg live replication: push the wire bytes
+                        // onto the self queue (`shard::self_msg`) BEFORE any
+                        // await, so the memory mutation and its replication
+                        // record are one synchronous stretch — atomic w.r.t.
+                        // the inline PSYNC task's snapshot capture on this
+                        // thread. The drained ReplicateVerbatim does backlog +
+                        // offset + replica fan-out together, so the AOF leg
+                        // below must NOT also advance the offset (lsn = 0;
+                        // per-shard order is append order, same contract as
+                        // wal_append_and_fanout's cross-shard legs).
+                        let repl_active = ft::replication_fanout_active(ctx);
+                        if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
-                            let lsn = aof::AofWriterPool::issue_append_lsn(
-                                &ctx.repl_state,
-                                ctx.shard_id,
-                                serialized.len(),
-                            );
-                            match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
-                                Ok(true) => aof_barrier_pending = true,
-                                Ok(false) => {}
-                                Err(_) => {
-                                    response =
-                                        Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR));
-                                    aof_failed = true;
+                            let lsn = if repl_active {
+                                crate::shard::self_msg::push(
+                                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
+                                        bytes: serialized.clone(),
+                                    },
+                                );
+                                0
+                            } else {
+                                aof::AofWriterPool::issue_append_lsn(
+                                    &ctx.repl_state,
+                                    ctx.shard_id,
+                                    serialized.len(),
+                                )
+                            };
+                            if let Some(ref pool) = ctx.aof_pool {
+                                match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                    Ok(true) => aof_barrier_pending = true,
+                                    Ok(false) => {}
+                                    Err(_) => {
+                                        response = Frame::Error(bytes::Bytes::from_static(
+                                            aof::AOF_FSYNC_ERR,
+                                        ));
+                                        aof_failed = true;
+                                    }
                                 }
                             }
                         }

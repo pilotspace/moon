@@ -602,7 +602,6 @@ pub async fn handle_psync_inline_single_shard(
     mut stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
     _shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
-    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
     replica_addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
@@ -685,6 +684,13 @@ pub async fn handle_psync_inline_single_shard(
                             ))
                         }
                     };
+                    // v0.7 graph replication: whole-graph-store snapshot
+                    // (frozen CSR segments + id cursors). ALWAYS written when
+                    // the graph feature is on — an empty blob (0 graphs) tells
+                    // the replica the master authoritatively has none.
+                    #[cfg(feature = "graph")]
+                    let graph_blob =
+                        crate::replication::graph_sync::export_graph_store(&mut s.graph_store);
                     let mut moon_aux: Vec<(&[u8], &[u8])> = Vec::new();
                     if let Some(ref v) = vec_defs {
                         moon_aux
@@ -693,6 +699,11 @@ pub async fn handle_psync_inline_single_shard(
                     if let Some(ref t) = text_defs {
                         moon_aux.push((crate::persistence::redis_rdb::MOON_AUX_TEXT_DEFS, &t[..]));
                     }
+                    #[cfg(feature = "graph")]
+                    moon_aux.push((
+                        crate::persistence::redis_rdb::MOON_AUX_GRAPH_STORE,
+                        &graph_blob[..],
+                    ));
                     crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
                         &refs,
                         &moon_aux,
@@ -720,7 +731,7 @@ pub async fn handle_psync_inline_single_shard(
             // replica channel. Reading the backlog BEFORE registering (the
             // old order) left a window where a write drained in between
             // reached neither leg — a silent, unlogged replica gap.
-            let reg = push_register_replica_inline(&repl_state, &dispatch_tx)?;
+            let reg = push_register_replica_inline(&repl_state)?;
             let reg_offset = reg
                 .reg_rx
                 .recv_async()
@@ -728,8 +739,7 @@ pub async fn handle_psync_inline_single_shard(
                 .map_err(|_| anyhow::anyhow!("event loop dropped registration reply"))?;
             send_backlog_range(&mut stream, &backlog_slot, snapshot_offset, reg_offset).await?;
 
-            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state, dispatch_tx)
-                .await?;
+            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state).await?;
         }
         PsyncDecision::PartialResync { from_offset } => {
             let response = format!("+CONTINUE {}\r\n", repl_id);
@@ -737,7 +747,7 @@ pub async fn handle_psync_inline_single_shard(
             wr.map_err(|e| anyhow::anyhow!(e))?;
 
             // Same register-then-catch-up ordering as the FullResync arm.
-            let reg = push_register_replica_inline(&repl_state, &dispatch_tx)?;
+            let reg = push_register_replica_inline(&repl_state)?;
             let reg_offset = reg
                 .reg_rx
                 .recv_async()
@@ -745,8 +755,7 @@ pub async fn handle_psync_inline_single_shard(
                 .map_err(|_| anyhow::anyhow!("event loop dropped registration reply"))?;
             send_backlog_range(&mut stream, &backlog_slot, from_offset, reg_offset).await?;
 
-            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state, dispatch_tx)
-                .await?;
+            drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state).await?;
         }
     }
     Ok(())
@@ -815,9 +824,7 @@ struct InlineReplicaRegistration {
 #[cfg(feature = "runtime-monoio")]
 fn push_register_replica_inline(
     repl_state: &Arc<RwLock<ReplicationState>>,
-    dispatch_tx: &Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
 ) -> anyhow::Result<InlineReplicaRegistration> {
-    use ringbuf::traits::Producer;
     use std::sync::atomic::Ordering;
 
     static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -831,20 +838,16 @@ fn push_register_replica_inline(
         .read()
         .map(|g| g.backlog_capacity)
         .unwrap_or(crate::replication::state::DEFAULT_REPL_BACKLOG_SIZE);
-    let mut prods = dispatch_tx.borrow_mut();
-    if let Some(prod) = prods.get_mut(0) {
-        let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
-            replica_id,
-            tx: tx.clone(),
-            backlog_capacity,
-            registered: Some(reg_tx),
-        };
-        if prod.try_push(msg).is_err() {
-            anyhow::bail!("failed to push RegisterReplica onto shard 0 SPSC");
-        }
-    } else {
-        anyhow::bail!("shard 0 producer missing");
-    }
+    // The inline PSYNC task runs ON the owning shard's thread; the SPSC mesh
+    // has no self-loop (N·(N−1) skip-self — at shards=1 the producer Vec is
+    // EMPTY), so registration goes through the thread-local self queue the
+    // event loop drains alongside its SPSC consumers.
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::RegisterReplica {
+        replica_id,
+        tx: tx.clone(),
+        backlog_capacity,
+        registered: Some(reg_tx),
+    });
     Ok(InlineReplicaRegistration {
         replica_id,
         tx,
@@ -863,10 +866,8 @@ async fn drain_replica_inline_single_shard(
     addr: std::net::SocketAddr,
     stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
-    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
-    use ringbuf::traits::Producer;
 
     let InlineReplicaRegistration {
         replica_id,
@@ -908,13 +909,10 @@ async fn drain_replica_inline_single_shard(
     if let Ok(mut rs) = repl_state.write() {
         rs.replicas.retain(|r| r.id != replica_id);
     }
-    {
-        let mut prods = dispatch_tx.borrow_mut();
-        if let Some(prod) = prods.get_mut(0) {
-            let _ = prod
-                .try_push(crate::shard::dispatch::ShardMessage::UnregisterReplica { replica_id });
-        }
-    }
+    // Same-thread → self queue (no self-SPSC exists; see push_register_replica_inline).
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::UnregisterReplica {
+        replica_id,
+    });
     Ok(())
 }
 

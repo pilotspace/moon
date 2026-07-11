@@ -111,11 +111,25 @@ impl ReplicationState {
     /// partial resync. Capacity comes from `self.backlog_capacity`
     /// (`--repl-backlog-size`, default 1 MiB per shard).
     pub fn ensure_backlogs_allocated(&self) {
-        for slot in &self.per_shard_backlogs {
+        // Hint FIRST: any write racing this allocation that still sees the
+        // hint as false advances the offset without a backlog append, and the
+        // seed below (reading the offset AFTER that advance) re-aligns. At
+        // shards=1 both run on the same shard thread, so there is no race at
+        // all. (Multi-shard masters ride the R2 redesign.)
+        mark_fanout_active();
+        for (shard_id, slot) in self.per_shard_backlogs.iter().enumerate() {
             let mut guard = slot.lock();
             if guard.is_none() {
-                *guard = Some(crate::replication::backlog::ReplicationBacklog::new(
+                // Seed byte positions at the CURRENT shard offset — see
+                // `ReplicationBacklog::new_at`.
+                let offset = self
+                    .shard_offsets
+                    .get(shard_id)
+                    .map(|o| o.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                *guard = Some(crate::replication::backlog::ReplicationBacklog::new_at(
                     self.backlog_capacity,
+                    offset,
                 ));
             }
         }
@@ -274,6 +288,29 @@ pub fn save_replication_state(
     std::fs::write(&tmp, format!("{}\n{}\n", repl_id, repl_id2))?;
     std::fs::rename(&tmp, &dst)?;
     Ok(())
+}
+
+/// Process-global "a replica has (ever) attached" hint.
+///
+/// Write hot paths gate their replication-fanout serialization on this ONE
+/// Relaxed load instead of taking `repl_state.read()` per command (the same
+/// S3.5a rationale that gave READONLY its `is_replica_mirror` AtomicBool).
+/// Set by `ensure_backlogs_allocated` (REPLCONF/PSYNC arrival) and never
+/// cleared — once a replica has attached, the master keeps feeding the
+/// backlog so partial resync stays possible, exactly like Redis.
+static FANOUT_HINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the fanout hint (idempotent). See [`FANOUT_HINT`].
+#[inline]
+pub fn mark_fanout_active() {
+    FANOUT_HINT.store(true, Ordering::Relaxed);
+}
+
+/// Cheap hot-path predicate: has any replica ever begun attaching?
+/// False ⇒ skip replication serialization/fan-out entirely.
+#[inline]
+pub fn fanout_hint_active() -> bool {
+    FANOUT_HINT.load(Ordering::Relaxed)
 }
 
 /// Load replication IDs from {dir}/replication.state.

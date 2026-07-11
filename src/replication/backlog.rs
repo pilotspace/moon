@@ -22,11 +22,23 @@ pub struct ReplicationBacklog {
 
 impl ReplicationBacklog {
     pub fn new(capacity: usize) -> Self {
+        Self::new_at(capacity, 0)
+    }
+
+    /// Allocate a backlog whose byte positions begin at `offset`.
+    ///
+    /// The backlog is LAZILY allocated on the first replica attach, but the
+    /// shard offset counter may already be far past zero (local writes advance
+    /// it via `issue_lsn` even with no replica). Seeding start/end to the
+    /// current shard offset keeps `bytes_from`/`contains_offset` range math
+    /// aligned with the counter — an unseeded backlog made every catch-up
+    /// read on a pre-written master fail as "evicted".
+    pub fn new_at(capacity: usize, offset: u64) -> Self {
         ReplicationBacklog {
             buf: std::collections::VecDeque::with_capacity(capacity),
             capacity,
-            start_offset: 0,
-            end_offset: 0,
+            start_offset: offset,
+            end_offset: offset,
         }
     }
 
