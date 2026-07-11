@@ -859,6 +859,14 @@ pub async fn handle_connection(
                             continue;
                         }
 
+                        // --- PSYNC (unsupported on tokio; clear error, R3/2A) ---
+                        if cmd.eq_ignore_ascii_case(b"PSYNC") {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR PSYNC requires runtime-monoio on the master (this build runs runtime-tokio)",
+                            )));
+                            continue;
+                        }
+
                         // --- WAIT ---
                         if cmd.eq_ignore_ascii_case(b"WAIT") {
                             // WAIT numreplicas timeout

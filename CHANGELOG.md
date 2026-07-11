@@ -44,8 +44,13 @@ shards is not yet supported`.
   with db-leak asserts, per-shard graph snapshot import, and the
   partial→full degradation handshake.
 - Known limitation (unchanged from R1): master-side PSYNC requires
-  `runtime-monoio` (the default); the tokio build has no master-side PSYNC
-  intercept. Multi-shard *replicas* remain unsupported (`--shards 1`).
+  `runtime-monoio` (the default). A `runtime-tokio` master now answers PSYNC
+  with a clear `-ERR PSYNC requires runtime-monoio on the master` instead of
+  an unknown-command reply (RFC R3/2A). Multi-shard *replicas* remain
+  unsupported (`--shards 1`).
+- Docs refreshed for the new topology: `docs/guides/clustering.md` deployment
+  shape, `README.md` replication bullets, and `docs/PRODUCTION-CONTRACT.md`
+  rows REPL-MULTISHARD-01 + WAIT-01 flipped to ✅ with evidence.
 
 ### Fixed — consistency/durability defects caught by the R1 gates (task #35)
 

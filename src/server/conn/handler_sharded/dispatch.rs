@@ -713,3 +713,16 @@ pub(super) fn try_handle_replconf(
     responses.push(crate::command::connection::replconf(cmd_args));
     true
 }
+
+/// RFC v0.2-R3 (2A): master-side PSYNC is monoio-only — the tokio runtime has
+/// no connection-hijack path. Answer with a clear error instead of the
+/// generic unknown-command reply so an attaching replica's log says WHY.
+pub(super) fn try_handle_psync_unsupported(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"PSYNC") {
+        return false;
+    }
+    responses.push(Frame::Error(bytes::Bytes::from_static(
+        b"ERR PSYNC requires runtime-monoio on the master (this build runs runtime-tokio)",
+    )));
+    true
+}

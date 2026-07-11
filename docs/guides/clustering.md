@@ -11,21 +11,27 @@ Moon supports Redis-compatible replication and cluster mode for high availabilit
 
 Moon implements PSYNC2-compatible replication with per-shard WAL streaming and partial resync support.
 
-!!! warning
-    **v0.1.x limitation — master must run `--shards 1`.**
+!!! info
+    **Supported deployment shape (v0.7):**
 
-    PSYNC on a multi-shard master (`--shards N` where N > 1) currently returns `-ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)`. The master's N shard-local databases cannot yet be serialized into a single consistent RDB stream for a replica to consume.
+    - **Master:** any `--shards N` (multi-core writer). Multi-shard masters serve
+      a full resync as ONE merged Redis-format RDB followed by the merged live
+      stream from all shards; every record carries its own `SELECT` framing, so
+      multi-db workloads replicate exactly. Requires the default `runtime-monoio`
+      build — a `runtime-tokio` master answers PSYNC with
+      `-ERR PSYNC requires runtime-monoio on the master`.
+    - **Replicas:** `--shards 1` each (scale reads by adding replicas, not
+      replica shards). A multi-shard replica refuses to start replication.
+    - **Partial resync:** supported on single-shard masters (backlog window);
+      a multi-shard master answers every reconnect with a full resync (a single
+      scalar offset cannot be mapped back onto N per-shard backlogs).
 
-    **Supported deployment shape for v0.1.x:**
-    - **Master:** `--shards 1` (single-core writer, ~1–1.5 M ops/s ceiling)
-    - **Replicas:** any `--shards N` (multi-core read scaling is unaffected)
-
-    **Multi-shard master replication is scheduled for v0.2** (see `.planning/rfcs/multi-shard-replication-design.md`). If you need a multi-core master today, run without replication; if you need replication, accept the single-shard master ceiling.
-
-    **Observability caveats (v0.1.x):**
-    - `WAIT` returns 0 until the master parses `REPLCONF ACK <offset>` (v0.2 scope).
+    **Observability:**
+    - `WAIT N timeout` reflects real replica ACKs (1s `REPLCONF ACK` cadence).
+    - `master_link_status` in `INFO replication` reflects the handshake state — use it to detect a failed REPLICAOF.
     - `CLIENT LIST TYPE replica` has no predicate yet; returns all clients.
-    - `master_link_status` in `INFO replication` correctly reflects the handshake state — use it to detect a failed REPLICAOF.
+    - WS.\*/MQ.\* planes are **not replicated yet** (the master logs one warning
+      when a replica is attached); vector/text/graph planes replicate fully.
 
 ### Set up a replica
 
