@@ -470,19 +470,31 @@ pub enum ShardMessage {
         /// replica gap). `None` = legacy fire-and-forget registration (the
         /// multi-shard paths, redesigned in R2).
         registered: Option<channel::MpscSender<u64>>,
+        /// Live-fanout start offset captured by the pusher AT PUSH TIME, on
+        /// the shard's own thread (same-thread self-queue pushes only; `None`
+        /// for the cross-shard legacy registrations, where the arm replies
+        /// with the offset at drain). Same-thread pushes MUST set this: local
+        /// writes advance the shard offset synchronously at write time
+        /// (`record_local_write`), so an offset read at DRAIN could include a
+        /// write whose `ReplicaLiveFanout` message is queued BEHIND this
+        /// registration — the catch-up range would cover it AND the fan-out
+        /// message would deliver it live: double-applied on the replica.
+        push_offset: Option<u64>,
     },
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
     UnregisterReplica { replica_id: u64 },
-    /// Fan a pre-serialized RESP command verbatim into the replication plane
-    /// (backlog + live replica streams + offset) WITHOUT touching WAL/AOF.
+    /// Deliver an already-RECORDED local write to the live replica streams.
     ///
-    /// For connection-layer commands that never cross the SPSC write path but
-    /// must replicate — FT.CREATE / FT.DROPINDEX / FT.CONFIG SET (v0.7 R0.5):
-    /// their durability is the vector/text sidecar, not the AOF, so only the
-    /// replication legs of `wal_append_and_fanout` apply. No-ops when no
-    /// replica has ever attached (no backlog, no replica_txs).
-    ReplicateVerbatim { bytes: bytes::Bytes },
+    /// The producing thread (`replication::record_local_write`) has ALREADY
+    /// appended `bytes` to the shard backlog and advanced the shard offset,
+    /// synchronously with the keyspace mutation — so the inline PSYNC task's
+    /// snapshot capture can never observe a mutation whose offset is still
+    /// uncounted (that skew re-delivered the write via backlog catch-up,
+    /// double-applying non-idempotent commands on the replica). This message
+    /// carries ONLY the remaining leg: `try_send` to each registered
+    /// replica's sender channel. Same-thread self-queue only.
+    ReplicaLiveFanout { bytes: bytes::Bytes },
     /// Register a CDC subscriber with this shard's fan-out registry (C3b-2).
     ///
     /// The connection handler creates a bounded channel, ships the sender

@@ -20,6 +20,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-ACL, so the H-3 deniability guarantee is unchanged). Re-greens all 5
   `client_tracking_invalidation` black-box tests on monoio.
 
+### Fixed — replication exactly-once + txn/graph fidelity (adversarial-review P0/P1)
+
+- **MULTI/EXEC bodies never replicated at `--shards 1`** (P0-1): EXEC persisted
+  its body through `persist_txn_aof`'s AOF-only leg — the one local write path
+  that skipped the replication plane. A `MULTI/SET/EXEC` committed durably on
+  the master and never reached the replica: silent deterministic divergence
+  for every application using transactions. The txn body now records each
+  entry through the same `record_local_write` leg as single-command writes
+  (AOF `lsn = 0`, no double-advance). New e2e
+  `replica_applies_multi_exec_bodies` (INCR doubles as a double-apply canary).
+- **FULLRESYNC snapshot capture raced undrained local writes** (P0-2): the
+  original design queued backlog append + offset advance + live fan-out as ONE
+  deferred event-loop message, so a mutation could sit inside the RDB while
+  still below the advertised snapshot offset — re-delivered via backlog
+  catch-up and double-applied (INCR/LPUSH divergence). `record_local_write`
+  now appends the backlog bytes and advances the shard offset SYNCHRONOUSLY
+  at write time (atomic with the mutation w.r.t. the inline PSYNC capture);
+  only the live replica `try_send` is deferred (`ReplicaLiveFanout`).
+  `RegisterReplica` correspondingly carries a push-time offset so catch-up
+  and live delivery stay disjoint for every write/attach interleave.
+- **Graph snapshot lost soft state that lives outside CSR segments** (P1-5 +
+  two adjacent gaps): the CSR byte format has no validity section, `freeze()`
+  RETAINS cross-tier delta edges in the write buffer, and copy-up node
+  tombstones never freeze — the master recovers all three from its WAL on
+  restart, but a replica has no WAL, so it resurrected deleted edges/nodes
+  and silently lost every cross-tier edge. Blob format v2 ships a per-segment
+  deleted-edge sidecar, the retained delta edges (original edge ids), and the
+  dead-shadow list; install re-applies all three.
+- **Streamed graph replay was O(N²)** (P1-4): each replicated GRAPH.* record
+  re-scanned every write-buffer node and every segment row to pre-seed the
+  replay id map — unbounded replication lag on bulk graph loads. Node
+  existence is now resolved lazily (O(1) write-buf probe + MPH segment
+  lookup), and the id-allocation floor is raised per segment header max
+  instead of per row.
+- Also: FULLRESYNC graph export skips freezing untouched write buffers
+  (P1-6, repeated-resync latency), and the shard self-queue is drained
+  unbounded per cycle (P2-7 — entries are cheap try_sends; a cycle cap could
+  strand a replica's live bytes by a full tick).
+
 ### Fixed — single-shard live replication stream was DEAD (self-SPSC gap)
 
 - **The R0 live stream never actually flowed at `--shards 1`.** The SPSC mesh

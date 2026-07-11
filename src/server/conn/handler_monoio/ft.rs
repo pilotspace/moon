@@ -48,6 +48,47 @@ pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
     })
 }
 
+/// Record one successfully-executed local write in the replication plane.
+///
+/// The backlog append AND the shard-offset advance happen HERE, synchronously,
+/// in the same no-await stretch as the keyspace mutation itself. This is the
+/// linchpin of snapshot consistency: the inline PSYNC task reads
+/// `total_offset()` in the same synchronous block as its RDB capture, so with
+/// a synchronous advance a mutation baked into the RDB always has its offset
+/// counted — the backlog catch-up range `[snapshot_offset, reg_offset)` can
+/// never re-deliver it (double-applying INCR/LPUSH on the replica). The
+/// previous design deferred backlog+offset to the event-loop drain of a
+/// queued message, which opened exactly that window.
+///
+/// Only the live replica `try_send` is deferred (`ReplicaLiveFanout` on the
+/// self queue): the replica sender list lives in the event loop's local
+/// state. Exactly-once holds for every interleave with a registering replica
+/// because `RegisterReplica.push_offset` is also captured at push time — a
+/// write W and a registration R queued in either order agree on whether W is
+/// below `reg_offset` (delivered via catch-up, fan-out message drains before
+/// R registers) or at/above it (delivered live, catch-up excludes it).
+///
+/// A backlog slot that is `None` skips the byte append but still advances the
+/// offset — mirroring `wal_append_and_fanout`: the offset counter is the
+/// source of truth, and a later lazy allocation seeds the backlog at the
+/// current counter (`ReplicationBacklog::new_at`).
+///
+/// ⚠ Monoio shard threads only (pushes to `shard::self_msg`) — callers are
+/// all inside `handler_monoio`, which is `runtime-monoio`-gated.
+pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
+    if let Some(rs) = ctx.repl_state.as_ref() {
+        if let Ok(g) = rs.read() {
+            if let Some(slot) = g.per_shard_backlogs.get(ctx.shard_id) {
+                if let Some(backlog) = slot.lock().as_mut() {
+                    backlog.append(&bytes);
+                }
+            }
+            g.increment_shard_offset(ctx.shard_id, bytes.len() as u64);
+        }
+    }
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout { bytes });
+}
+
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.
@@ -802,22 +843,17 @@ pub(super) async fn try_handle_ft_command(
         });
         // v0.7 R0.5: index-DEFINITION mutations must reach replicas. FT.*
         // executes here at the connection layer (never crosses the SPSC write
-        // path), so on success fan the ORIGINAL command bytes into the
-        // replication plane via ReplicateVerbatim — exact parity, no
-        // reconstruction. Single-shard only (multi-shard FT.* replication
-        // rides the R2 broadcast redesign). The replica applies it through
-        // the same ft_create/ft_dropindex/ft_config handlers.
+        // path), so on success record the ORIGINAL command bytes in the
+        // replication plane — exact parity, no reconstruction. Single-shard
+        // only (multi-shard FT.* replication rides the R2 broadcast
+        // redesign). The replica applies it through the same
+        // ft_create/ft_dropindex/ft_config handlers.
         if !matches!(response, Frame::Error(_))
             && is_replicated_ft_def_mutation(cmd, cmd_args)
             && replication_fanout_active(ctx)
         {
-            // Same-shard → self queue: the SPSC mesh has no self-loop (the
-            // producer Vec is EMPTY at shards=1), so this must NOT go through
-            // ctx.dispatch_tx — see `shard::self_msg`.
             let serialized = crate::persistence::aof::serialize_command(frame);
-            crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
-                bytes: serialized,
-            });
+            record_local_write(ctx, serialized);
         }
         let mut response = response;
         if let Some(ws_id) = conn.workspace_id.as_ref() {

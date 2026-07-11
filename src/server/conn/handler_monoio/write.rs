@@ -729,6 +729,22 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // v0.7 REPLICATION (adversarial-review P0-1): the txn body must
+            // reach replicas like any other successful local write. This was
+            // the ONE local write path that skipped the replication plane —
+            // `MULTI/SET/EXEC` at shards=1 committed on the master and never
+            // reached the replica (silent deterministic divergence). Record
+            // each body entry HERE, in the same synchronous stretch as the
+            // just-returned (fully synchronous) `execute_transaction_sharded`
+            // — atomic w.r.t. the inline PSYNC snapshot capture — and tell
+            // `persist_txn_aof` not to double-advance the offset (lsn = 0,
+            // same contract as the single-command legs).
+            let repl_active = super::ft::replication_fanout_active(ctx);
+            if repl_active {
+                for bytes in &aof_entries {
+                    super::ft::record_local_write(ctx, bytes.clone());
+                }
+            }
             // DURABILITY: append every successful write in the body to THIS
             // shard's AOF via the same group-commit path as normal writes, then
             // issue ONE fsync barrier under appendfsync=always before acking.
@@ -736,7 +752,7 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries)
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, repl_active)
                 .await
                 .is_err()
             {
@@ -931,22 +947,20 @@ pub(super) async fn try_handle_graph_command(
     // v0.7 graph replication: the drained WAL records are the DETERMINISTIC,
     // id-pinned form of this mutation (GRAPH.ADDNODE <g> <node_id> …, FNV-
     // hashed u16 label/prop ids — `label_to_id` is stateless, so master and
-    // replica agree). Stream them verbatim to replicas, which replay them via
-    // `GraphReplayCollector` without re-allocating ids. `ReplicateVerbatim`
-    // carries the replication legs ONLY (backlog + offset + live fan-out) —
-    // the AOF copy is the local `wal_append` below, so nothing double-logs.
-    // Single-shard scope, matching the R0/R0.5 FT.* leg (multi-shard graph
-    // replication rides the R2 broadcast redesign).
+    // replica agree). Record them verbatim in the replication plane
+    // (`record_local_write`: backlog + offset synchronously, live fan-out at
+    // the next drain), which replicas replay via `GraphReplayCollector`
+    // without re-allocating ids. Only the replication legs — the WAL copy is
+    // the local `wal_append` below, so nothing double-logs. Single-shard
+    // scope, matching the R0/R0.5 FT.* leg (multi-shard graph replication
+    // rides the R2 broadcast redesign).
     let wal_records: Vec<bytes::Bytes> = wal_records.into_iter().map(bytes::Bytes::from).collect();
     if !wal_records.is_empty() && ctx.num_shards == 1 && super::ft::replication_fanout_active(ctx) {
-        // Same-shard → self queue (`shard::self_msg`): the SPSC mesh has no
-        // self-loop, so this must NOT go through ctx.dispatch_tx. Pushing in
-        // the same synchronous stretch as the graph mutation keeps the record
-        // atomic w.r.t. the inline PSYNC task's snapshot capture.
+        // Recording in the same synchronous stretch as the graph mutation
+        // keeps mutation + replication record atomic w.r.t. the inline PSYNC
+        // task's snapshot capture on this thread.
         for record in &wal_records {
-            crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
-                bytes: record.clone(),
-            });
+            super::ft::record_local_write(ctx, record.clone());
         }
     }
     for record in wal_records {

@@ -11,8 +11,17 @@
 //!      attach failed with "shard 0 producer missing" and the replica fell
 //!      into a 0.5s reconnect/full-resync loop that MASKED the dead live
 //!      stream (each resync's RDB carried the latest keyspace + FT defs);
-//!   2. the FT.* index-definition `ReplicateVerbatim` fan-out (ft.rs);
-//!   3. the graph WAL-record `ReplicateVerbatim` fan-out (write.rs).
+//!   2. the FT.* index-definition replication fan-out (ft.rs);
+//!   3. the graph WAL-record replication fan-out (write.rs).
+//!
+//! Replication messages carried here are DELIVERY-ONLY (`ReplicaLiveFanout`):
+//! the backlog append and shard-offset advance happen synchronously at write
+//! time in `record_local_write`, atomic with the mutation w.r.t. the inline
+//! PSYNC task's snapshot capture. Deferring the offset advance to the drain
+//! (the original design) let a mutation sit inside a FULLRESYNC RDB while
+//! still below the advertised snapshot offset — re-delivered via backlog
+//! catch-up, double-applying non-idempotent commands (adversarial-review
+//! P0-2). `RegisterReplica.push_offset` is the matching pusher-side capture.
 //!
 //! One shard per OS thread (monoio thread-per-core), so a `thread_local!`
 //! queue IS the per-shard self-channel — same pattern as `shard::slice`.

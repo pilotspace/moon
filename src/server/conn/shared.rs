@@ -340,9 +340,17 @@ pub(crate) fn execute_transaction_sharded(
 /// `AOF_FSYNC_ERR` instead of acking a durability it can't guarantee. A no-op
 /// (returns `Ok`) when AOF is disabled (`aof_pool` is `None`) or the body wrote
 /// nothing.
+///
+/// `repl_recorded`: the caller already recorded every entry in the
+/// replication plane (`record_local_write`, monoio local-leg fanout), which
+/// advanced the shard offset — this AOF leg must then NOT advance it again
+/// (lsn = 0; per-shard order is append order, same contract as the
+/// single-command write legs). The tokio handler passes `false` (tokio-side
+/// master fanout is not wired; monoio is the production replication runtime).
 pub(crate) async fn persist_txn_aof(
     ctx: &crate::server::conn::core::ConnectionContext,
     aof_entries: Vec<Bytes>,
+    repl_recorded: bool,
 ) -> Result<(), ()> {
     if aof_entries.is_empty() {
         return Ok(());
@@ -352,11 +360,15 @@ pub(crate) async fn persist_txn_aof(
     };
     let mut barrier_pending = false;
     for bytes in aof_entries {
-        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
-            &ctx.repl_state,
-            ctx.shard_id,
-            bytes.len(),
-        );
+        let lsn = if repl_recorded {
+            0
+        } else {
+            crate::persistence::aof::AofWriterPool::issue_append_lsn(
+                &ctx.repl_state,
+                ctx.shard_id,
+                bytes.len(),
+            )
+        };
         match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
             Ok(true) => barrier_pending = true,
             Ok(false) => {}

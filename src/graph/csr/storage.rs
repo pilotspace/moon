@@ -211,6 +211,17 @@ impl CsrStorage {
         }
     }
 
+    /// Largest frozen external node id (header field). O(1) — lets recovery
+    /// and streamed replay raise the id-allocation floor per SEGMENT instead
+    /// of per node (`ensure_node_id_floor` keeps a single monotonic counter,
+    /// so the max subsumes every row's id).
+    pub fn max_node_id(&self) -> u64 {
+        match self {
+            CsrStorage::Heap(s) => s.header.max_node_id,
+            CsrStorage::Mmap(s) => s.header.max_node_id,
+        }
+    }
+
     /// Access the validity bitmap.
     pub fn validity(&self) -> &RoaringBitmap {
         match self {
@@ -521,14 +532,19 @@ impl CsrStorage {
     }
 
     /// Serialize to bytes (only meaningful for Heap variant).
+    ///
+    /// ⚠ Post-load `mark_deleted` tombstones live in the in-memory validity
+    /// overlay and are NOT captured for EITHER variant — the byte format has
+    /// no validity section (`to_bytes` writes `validity_bitmap_offset = 0`).
+    /// Consumers that need deletion fidelity across the wire must ship the
+    /// overlay separately (`replication::graph_sync` writes a deleted-edge
+    /// sidecar per segment and re-applies it on install).
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             CsrStorage::Heap(s) => s.to_bytes(),
             // The mapped file is byte-identical to the `to_bytes()` encoding
             // (`write_to_file` produced it), so a copy of the mapped region
-            // round-trips through `CsrSegment::from_bytes`. Post-load
-            // `mark_deleted` tombstones live in the in-memory validity
-            // overlay and are NOT captured — same fidelity as a restart.
+            // round-trips through `CsrSegment::from_bytes`.
             CsrStorage::Mmap(s) => s.raw_bytes().to_vec(),
         }
     }

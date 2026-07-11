@@ -446,6 +446,9 @@ async fn register_replica_with_shards(
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
                 // protocol is wired on the single-shard inline path only.
                 registered: None,
+                // Cross-shard registration: the target shard's offset is
+                // owned by its own thread — the arm reads it at drain.
+                push_offset: None,
             };
             let _ = prod.try_push(msg);
         }
@@ -537,6 +540,9 @@ async fn register_replica_with_shards(
                 // by the R2 PrepareReplicaSync redesign; the offset-reply catch-up
                 // protocol is wired on the single-shard inline path only.
                 registered: None,
+                // Cross-shard registration: the target shard's offset is
+                // owned by its own thread — the arm reads it at drain.
+                push_offset: None,
             };
             let _ = prod.try_push(msg);
         }
@@ -645,6 +651,16 @@ pub async fn handle_psync_inline_single_shard(
             // (before the FULLRESYNC line was written) let a write land both
             // inside the RDB AND above snapshot_offset — re-delivered via
             // catch-up, double-applying non-idempotent commands (INCR).
+            //
+            // This atomicity argument additionally requires that every local
+            // write advances the offset IN its own synchronous stretch —
+            // `record_local_write` appends the backlog bytes and moves the
+            // counter at write time (only the live replica try_send is
+            // deferred to the event-loop drain). If the advance were deferred
+            // too (the pre-review design queued backlog+offset+fanout as one
+            // message), a mutation already visible to this RDB capture could
+            // still be BELOW `total_offset()` here, land in the catch-up
+            // range, and double-apply — adversarial-review P0-2.
             //
             // The RDB is generated inline by reading all databases on shard 0.
             // Hold read guards across the synchronous write to avoid any
@@ -842,11 +858,26 @@ fn push_register_replica_inline(
     // has no self-loop (N·(N−1) skip-self — at shards=1 the producer Vec is
     // EMPTY), so registration goes through the thread-local self queue the
     // event loop drains alongside its SPSC consumers.
+    //
+    // The live-fanout start offset is captured HERE, at push time — NOT at
+    // drain time. Local writes advance the shard offset synchronously at
+    // write time (`record_local_write`), so a write that lands between this
+    // push and the drain has already moved the counter; a drain-time read
+    // would put it below `reg_offset` (delivered via backlog catch-up) while
+    // its `ReplicaLiveFanout` message — queued BEHIND this registration —
+    // also delivers it live: double-applied on the replica. The push-time
+    // offset keeps catch-up and live delivery disjoint for every interleave
+    // (see `RegisterReplica::push_offset`).
+    let push_offset = repl_state
+        .read()
+        .map(|g| g.total_offset())
+        .map_err(|_| anyhow::anyhow!("replication state lock poisoned"))?;
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::RegisterReplica {
         replica_id,
         tx: tx.clone(),
         backlog_capacity,
         registered: Some(reg_tx),
+        push_offset: Some(push_offset),
     });
     Ok(InlineReplicaRegistration {
         replica_id,

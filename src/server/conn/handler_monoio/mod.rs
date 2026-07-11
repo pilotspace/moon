@@ -1330,17 +1330,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // the client.
                     if matches!(response, Frame::Integer(1)) {
                         // v0.7 local-leg live replication — same contract as
-                        // the main write leg: push before any await, AOF leg
-                        // does not double-advance the offset (lsn = 0).
+                        // the main write leg: record (backlog+offset, sync)
+                        // before any await, AOF leg does not double-advance
+                        // the offset (lsn = 0).
                         let repl_active = ft::replication_fanout_active(ctx);
                         if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
                             let lsn = if repl_active {
-                                crate::shard::self_msg::push(
-                                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
-                                        bytes: serialized.clone(),
-                                    },
-                                );
+                                ft::record_local_write(ctx, serialized.clone());
                                 0
                             } else {
                                 aof::AofWriterPool::issue_append_lsn(
@@ -1412,17 +1409,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // H1: durable path awaits fsync under appendfsync=always.
                         if matches!(response, Frame::Integer(1)) {
                             // v0.7 local-leg live replication — same contract
-                            // as the main write leg (push before await; AOF
-                            // leg does not double-advance, lsn = 0).
+                            // as the main write leg (record backlog+offset
+                            // synchronously before await; AOF leg does not
+                            // double-advance, lsn = 0).
                             let repl_active = ft::replication_fanout_active(ctx);
                             if repl_active || ctx.aof_pool.is_some() {
                                 let serialized = aof::serialize_command(&frame);
                                 let lsn = if repl_active {
-                                    crate::shard::self_msg::push(
-                                        crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
-                                            bytes: serialized.clone(),
-                                        },
-                                    );
+                                    ft::record_local_write(ctx, serialized.clone());
                                     0
                                 } else {
                                     aof::AofWriterPool::issue_append_lsn(
@@ -1710,25 +1704,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // measured 8x deficit vs Redis at P16).
                     let mut aof_barrier_pending = false;
                     if !matches!(response, Frame::Error(_)) && is_write {
-                        // v0.7 local-leg live replication: push the wire bytes
-                        // onto the self queue (`shard::self_msg`) BEFORE any
-                        // await, so the memory mutation and its replication
-                        // record are one synchronous stretch — atomic w.r.t.
-                        // the inline PSYNC task's snapshot capture on this
-                        // thread. The drained ReplicateVerbatim does backlog +
-                        // offset + replica fan-out together, so the AOF leg
-                        // below must NOT also advance the offset (lsn = 0;
-                        // per-shard order is append order, same contract as
-                        // wal_append_and_fanout's cross-shard legs).
+                        // v0.7 local-leg live replication: record the wire
+                        // bytes BEFORE any await — `record_local_write` does
+                        // the backlog append + offset advance synchronously
+                        // (mutation and replication record are one no-await
+                        // stretch, atomic w.r.t. the inline PSYNC task's
+                        // snapshot capture on this thread) and defers only
+                        // the live replica try_send to the event-loop drain.
+                        // The AOF leg below must NOT also advance the offset
+                        // (lsn = 0; per-shard order is append order, same
+                        // contract as wal_append_and_fanout's cross-shard
+                        // legs).
                         let repl_active = ft::replication_fanout_active(ctx);
                         if repl_active || ctx.aof_pool.is_some() {
                             let serialized = aof::serialize_command(&frame);
                             let lsn = if repl_active {
-                                crate::shard::self_msg::push(
-                                    crate::shard::dispatch::ShardMessage::ReplicateVerbatim {
-                                        bytes: serialized.clone(),
-                                    },
-                                );
+                                ft::record_local_write(ctx, serialized.clone());
                                 0
                             } else {
                                 aof::AofWriterPool::issue_append_lsn(
