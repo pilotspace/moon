@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use super::bptree::BPTree;
 use super::intset::Intset;
 use super::listpack::Listpack;
+use super::stream::Stream as StreamData;
 
 // ---------------------------------------------------------------------------
 // Read-only Ref enums for immutable access to compact and full encodings
@@ -26,6 +27,22 @@ pub enum HashRef<'a> {
     WithTtl {
         fields: &'a HashMap<Bytes, Bytes>,
         ttls: &'a HashMap<Bytes, u64>,
+        now_ms: u64,
+        min_expiry_ms: u64,
+    },
+    /// A value read fresh from the cold tier with no backing hot `Entry` to
+    /// borrow from (P0 cold-collection-visibility fix, 2026-07-12).
+    ///
+    /// `get_hash_ref_if_alive` takes `&self` because some callers (the
+    /// RwLock-shared-read dispatch path) hold only a shared read guard and
+    /// cannot promote a cold hit into hot RAM. Rather than report the key
+    /// absent (silent data loss to the caller), the value is decoded fresh
+    /// from disk on every such access and carried here by value.
+    Owned(HashMap<Bytes, Bytes>),
+    /// Owned counterpart of `WithTtl` for a cold `HashWithTtl` read.
+    OwnedWithTtl {
+        fields: HashMap<Bytes, Bytes>,
+        ttls: HashMap<Bytes, u64>,
         now_ms: u64,
         min_expiry_ms: u64,
     },
@@ -65,6 +82,23 @@ impl<'a> HashRef<'a> {
                     fields.get(field).cloned()
                 }
             }
+            HashRef::Owned(map) => map.get(field).cloned(),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => {
+                if *now_ms < *min_expiry_ms {
+                    return fields.get(field).cloned();
+                }
+                let expired = ttls.get(field).is_some_and(|&t| t <= *now_ms);
+                if expired {
+                    None
+                } else {
+                    fields.get(field).cloned()
+                }
+            }
         }
     }
 
@@ -87,6 +121,21 @@ impl<'a> HashRef<'a> {
                     return fields.len();
                 }
                 // Slow path: at least one field may have expired; scan all.
+                fields
+                    .keys()
+                    .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                    .count()
+            }
+            HashRef::Owned(map) => map.len(),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => {
+                if *now_ms < *min_expiry_ms {
+                    return fields.len();
+                }
                 fields
                     .keys()
                     .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
@@ -120,6 +169,22 @@ impl<'a> HashRef<'a> {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             }
+            HashRef::Owned(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => {
+                if *now_ms < *min_expiry_ms {
+                    return fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                }
+                fields
+                    .iter()
+                    .filter(|(f, _)| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }
         }
     }
 }
@@ -128,6 +193,9 @@ impl<'a> HashRef<'a> {
 pub enum ListRef<'a> {
     Deque(&'a VecDeque<Bytes>),
     Listpack(&'a Listpack),
+    /// Owned counterpart for a value decoded fresh from the cold tier — see
+    /// `HashRef::Owned` for the rationale (P0 cold-collection-visibility fix).
+    Owned(VecDeque<Bytes>),
 }
 
 impl<'a> ListRef<'a> {
@@ -136,6 +204,7 @@ impl<'a> ListRef<'a> {
         match self {
             ListRef::Deque(d) => d.len(),
             ListRef::Listpack(lp) => lp.len(),
+            ListRef::Owned(d) => d.len(),
         }
     }
 
@@ -144,6 +213,7 @@ impl<'a> ListRef<'a> {
         match self {
             ListRef::Deque(d) => d.get(index).cloned(),
             ListRef::Listpack(lp) => lp.get_at(index).map(|e| e.to_bytes()),
+            ListRef::Owned(d) => d.get(index).cloned(),
         }
     }
 
@@ -154,6 +224,7 @@ impl<'a> ListRef<'a> {
             ListRef::Listpack(lp) => (start..=end)
                 .filter_map(|i| lp.get_at(i).map(|e| e.to_bytes()))
                 .collect(),
+            ListRef::Owned(d) => (start..=end).filter_map(|i| d.get(i).cloned()).collect(),
         }
     }
 
@@ -162,6 +233,7 @@ impl<'a> ListRef<'a> {
         match self {
             ListRef::Deque(d) => d.iter().cloned().collect(),
             ListRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            ListRef::Owned(d) => d.iter().cloned().collect(),
         }
     }
 }
@@ -171,6 +243,9 @@ pub enum SetRef<'a> {
     Hash(&'a HashSet<Bytes>),
     Listpack(&'a Listpack),
     Intset(&'a Intset),
+    /// Owned counterpart for a value decoded fresh from the cold tier — see
+    /// `HashRef::Owned` for the rationale (P0 cold-collection-visibility fix).
+    Owned(HashSet<Bytes>),
 }
 
 impl<'a> SetRef<'a> {
@@ -180,6 +255,7 @@ impl<'a> SetRef<'a> {
             SetRef::Hash(s) => s.len(),
             SetRef::Listpack(lp) => lp.len(),
             SetRef::Intset(is) => is.len(),
+            SetRef::Owned(s) => s.len(),
         }
     }
 
@@ -196,6 +272,7 @@ impl<'a> SetRef<'a> {
                 }
                 false
             }
+            SetRef::Owned(s) => s.contains(member),
         }
     }
 
@@ -205,6 +282,7 @@ impl<'a> SetRef<'a> {
             SetRef::Hash(s) => s.iter().cloned().collect(),
             SetRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
             SetRef::Intset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
+            SetRef::Owned(s) => s.iter().cloned().collect(),
         }
     }
 
@@ -214,6 +292,7 @@ impl<'a> SetRef<'a> {
             SetRef::Hash(s) => (*s).clone(),
             SetRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
             SetRef::Intset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
+            SetRef::Owned(s) => s.clone(),
         }
     }
 }
@@ -230,6 +309,15 @@ pub enum SortedSetRef<'a> {
         members: &'a HashMap<Bytes, f64>,
         scores: &'a BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
     },
+    /// Owned counterpart of `BPTree` for a value decoded fresh from the cold
+    /// tier — see `HashRef::Owned` for the rationale (P0
+    /// cold-collection-visibility fix). `members_map`/`bptree` return `None`
+    /// for this variant (same as `Listpack`); callers already fall back to
+    /// the generic `score`/`entries_sorted` methods in that case.
+    Owned {
+        tree: BPTree,
+        members: HashMap<Bytes, f64>,
+    },
 }
 
 impl<'a> SortedSetRef<'a> {
@@ -239,6 +327,7 @@ impl<'a> SortedSetRef<'a> {
             SortedSetRef::BPTree { members, .. } => members.len(),
             SortedSetRef::Listpack(lp) => lp.len() / 2,
             SortedSetRef::Legacy { members, .. } => members.len(),
+            SortedSetRef::Owned { members, .. } => members.len(),
         }
     }
 
@@ -260,6 +349,7 @@ impl<'a> SortedSetRef<'a> {
                 None
             }
             SortedSetRef::Legacy { members, .. } => members.get(member).copied(),
+            SortedSetRef::Owned { members, .. } => members.get(member).copied(),
         }
     }
 
@@ -292,6 +382,10 @@ impl<'a> SortedSetRef<'a> {
             SortedSetRef::Legacy { scores, .. } => {
                 scores.keys().map(|(s, m)| (m.clone(), s.0)).collect()
             }
+            SortedSetRef::Owned { tree, .. } => tree
+                .iter()
+                .map(|(score, member)| (member.clone(), score.0))
+                .collect(),
         }
     }
 
@@ -302,6 +396,7 @@ impl<'a> SortedSetRef<'a> {
             SortedSetRef::BPTree { members, .. } => Some(members),
             SortedSetRef::Legacy { members, .. } => Some(members),
             SortedSetRef::Listpack(_) => None,
+            SortedSetRef::Owned { .. } => None,
         }
     }
 
@@ -310,6 +405,28 @@ impl<'a> SortedSetRef<'a> {
         match self {
             SortedSetRef::BPTree { tree, .. } => Some(tree),
             _ => None,
+        }
+    }
+}
+
+/// Read-only reference to a stream: either borrowed from a hot `Entry`, or
+/// owned after a fresh cold-tier decode (P0 cold-collection-visibility fix,
+/// 2026-07-12 — see `HashRef::Owned` for the general rationale).
+///
+/// `Deref`s to `&StreamData` so existing call sites (`stream.length`,
+/// `stream.entries.range(..)`, etc.) work unchanged for both variants.
+pub enum StreamRef<'a> {
+    Borrowed(&'a StreamData),
+    Owned(Box<StreamData>),
+}
+
+impl<'a> std::ops::Deref for StreamRef<'a> {
+    type Target = StreamData;
+
+    fn deref(&self) -> &StreamData {
+        match self {
+            StreamRef::Borrowed(s) => s,
+            StreamRef::Owned(s) => s,
         }
     }
 }

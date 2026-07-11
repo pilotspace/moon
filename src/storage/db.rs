@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef};
+pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 
 use super::bptree::BPTree;
 use super::compact_key::CompactKey;
@@ -865,45 +865,125 @@ impl Database {
                 None
             }
             KeyState::Absent => {
-                use crate::storage::tiered::cold_read::ColdReadOutcome;
-                // Cold fallback: read from disk DataFile via cold_read helper.
-                // Extract owned result first to drop immutable borrows before mutation.
-                let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
-                    self.cold_index.as_ref().map(|ci| {
-                        crate::storage::tiered::cold_read::cold_read_through_outcome(
-                            ci, shard_dir, key, now_ms,
-                        )
-                    })
-                });
-                match cold_result {
-                    Some(ColdReadOutcome::Hit(redis_value, ttl_ms)) => {
-                        let key_bytes = Bytes::copy_from_slice(key);
-                        // Build an entry from the RedisValue (works for strings and collections)
-                        let mut entry = Entry::new_string(Bytes::new()); // placeholder
-                        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
-                            redis_value,
-                        );
-                        if let Some(ttl) = ttl_ms {
-                            entry.set_expires_at_ms(self.base_timestamp, ttl);
-                        }
-                        self.set(key_bytes, entry);
-                        if let Some(ref mut ci) = self.cold_index {
-                            ci.remove(key);
-                        }
-                        self.data.get(key)
-                    }
-                    Some(ColdReadOutcome::Expired) => {
-                        // Expired on disk: reclaim the index entry now, or it leaks
-                        // (the orphan sweep only checks hot-shadowing, never TTL).
-                        if let Some(ref mut ci) = self.cold_index {
-                            ci.remove(key);
-                        }
-                        None
-                    }
-                    Some(ColdReadOutcome::Miss) | None => None,
-                }
+                // Cold fallback: promote from disk into hot RAM if spilled
+                // there by eviction, then re-probe. `promote_cold_if_present`
+                // also owns reclaiming a stale (TTL-expired) cold-index entry.
+                self.promote_cold_if_present(key, now_ms);
+                self.data.get(key)
             }
         }
+    }
+
+    /// If `key` is missing from hot RAM but present in the cold tier
+    /// (spilled there by eviction), read it from disk and promote it into
+    /// hot RAM, removing the cold-index entry — this is the cold-fallback
+    /// branch [`Self::get`] has always used, factored out so every mutable
+    /// accessor can share it.
+    ///
+    /// Returns `true` if `key` is present in hot RAM after this call returns
+    /// (either because it already was, or because promotion just happened).
+    /// Returns `false` for a genuine miss (absent from both tiers), or when
+    /// the cold entry's TTL had already passed — the stale index entry is
+    /// reclaimed as a byproduct in that case, same as the expired-hot branch
+    /// above.
+    ///
+    /// Cheap on the common case callers actually care about (key already
+    /// hot): a single `contains_key` probe short-circuits before ever
+    /// touching the cold tier. Only a genuine miss pays for the `ColdIndex`
+    /// lookup + a blocking disk `pread`.
+    ///
+    /// P0 fix (`.planning/reviews/storage-audit-2026-07-12-kv.md`):
+    /// `get_or_create_hash`/`_list`/`_set`/`_sorted_set`/`_stream` (and their
+    /// compact-encoding siblings `get_or_create_hash_listpack`,
+    /// `get_or_create_list_listpack`, `get_or_create_intset`) used to skip
+    /// straight to fabricating a brand-new EMPTY container whenever
+    /// `self.data` missed the key — even when the real value was sitting
+    /// right there in the cold tier. The fabricated container then got
+    /// written back over the cold copy on the next `set`/mutation,
+    /// permanently destroying it. Calling this method first closes that gap.
+    pub fn promote_cold_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
+        if self.data.contains_key(key) {
+            return true;
+        }
+        use crate::storage::tiered::cold_read::ColdReadOutcome;
+        // Extract an owned result first to drop immutable borrows of
+        // `self.cold_index` / `self.cold_shard_dir` before the mutation below.
+        let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
+            self.cold_index.as_ref().map(|ci| {
+                crate::storage::tiered::cold_read::cold_read_through_outcome(
+                    ci, shard_dir, key, now_ms,
+                )
+            })
+        });
+        match cold_result {
+            Some(ColdReadOutcome::Hit(redis_value, ttl_ms)) => {
+                let key_bytes = Bytes::copy_from_slice(key);
+                // Build an entry from the RedisValue (works for strings and collections).
+                let mut entry = Entry::new_string(Bytes::new()); // placeholder
+                entry.value =
+                    crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+                if let Some(ttl) = ttl_ms {
+                    entry.set_expires_at_ms(self.base_timestamp, ttl);
+                }
+                self.set(key_bytes, entry);
+                if let Some(ref mut ci) = self.cold_index {
+                    ci.remove(key);
+                }
+                true
+            }
+            Some(ColdReadOutcome::Expired) => {
+                // Expired on disk: reclaim the index entry now, or it leaks
+                // (the orphan sweep only checks hot-shadowing, never TTL).
+                if let Some(ref mut ci) = self.cold_index {
+                    ci.remove(key);
+                }
+                false
+            }
+            Some(ColdReadOutcome::Miss) | None => false,
+        }
+    }
+
+    /// Cheap (no disk I/O, no promotion) check for whether `key` is present
+    /// in the cold tier and not yet TTL-expired.
+    ///
+    /// Used by `EXISTS`: a spilled key logically exists even though it has
+    /// no in-RAM `Entry`, but `EXISTS` doesn't need the *value* — paying for
+    /// a disk read (or, worse, promoting the key into RAM) just to answer a
+    /// boolean would be wasteful. A single `HashMap` probe against the
+    /// in-RAM `ColdIndex` (which caches `ttl_ms` at insert time, see
+    /// [`crate::storage::tiered::cold_index::ColdLocation::ttl_ms`]) is
+    /// enough. Does not reclaim an expired entry (that needs `&mut self`
+    /// and disk access to do safely) — the proactive sweep and the
+    /// promoting paths handle reclamation.
+    #[inline]
+    fn cold_contains_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        let Some(ci) = self.cold_index.as_ref() else {
+            return false;
+        };
+        match ci.lookup(key) {
+            Some(loc) => loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl),
+            None => false,
+        }
+    }
+
+    /// Non-promoting cold read-through for the `&self` "*_ref_if_alive"
+    /// accessors: decodes a spilled value from disk WITHOUT touching hot RAM
+    /// or the cold index. Thin wrapper over [`Self::get_cold_value`] using
+    /// this `Database`'s own cached clock semantics is left to the caller
+    /// (they already have `now_ms` in hand); kept as a private alias so the
+    /// call sites below read as "cold read" rather than repeating the
+    /// `cold_shard_dir`/`cold_index` plumbing.
+    ///
+    /// These accessors back BOTH the exclusive-dispatch path (`&mut
+    /// Database`, which downgrades to `&self` for the call) AND the
+    /// RwLock-shared-read dispatch path (`&Database` only — see
+    /// `dispatch_read` / `*_readonly` command handlers). The latter cannot
+    /// mutate `self` to promote a cold hit into hot RAM, so the safe fix is
+    /// "decode it from disk every time it's cold" rather than "silently
+    /// report the key absent" (same P0 as [`Self::promote_cold_if_present`]).
+    #[inline]
+    fn cold_read_only(&self, key: &[u8], now_ms: u64) -> Option<RedisValue> {
+        self.get_cold_value(key, now_ms)
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.
@@ -1094,19 +1174,23 @@ impl Database {
 
     /// Check if a key exists, performing lazy expiration.
     /// Optimized: single lookup via get instead of check_expired + contains_key.
+    ///
+    /// A cold-only key (spilled by eviction, no in-RAM `Entry`) still counts
+    /// as existing — checked via the cheap in-RAM [`Self::cold_contains_alive`]
+    /// (no disk I/O, no promotion; P0 cold-collection-visibility fix).
     #[allow(clippy::unwrap_used)] // remove() after get() returned Some — key guaranteed present
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
-            None => false,
+            None => self.cold_contains_alive(key, now_ms),
             Some(entry) => {
                 if entry.is_expired_at(base_ts, now_ms) {
                     let removed = self.data.remove(key).unwrap();
                     self.used_memory = self
                         .used_memory
                         .saturating_sub(entry_overhead(key, &removed));
-                    false
+                    self.cold_contains_alive(key, now_ms)
                 } else {
                     true
                 }
@@ -1253,10 +1337,17 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_hash();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: a hash may have been spilled to the cold tier by
+            // eviction. Promote it back to hot RAM before fabricating an
+            // empty container, or HSET on an evicted hash would silently
+            // destroy the cold copy (see `Self::promote_cold_if_present`).
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_hash();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = match self.data.get_mut(key) {
             Some(e) => e,
@@ -1297,6 +1388,11 @@ impl Database {
 
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encoding to full HashMap if found.
+    ///
+    /// Promotes a cold-spilled hash back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`, so
+    /// unlike the enum-based `get_hash_ref_if_alive` it can promote directly
+    /// instead of decoding a throwaway copy on every call.
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
@@ -1305,6 +1401,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         // Upgrade compact encoding if present
         if let Some(entry) = self.data.get_mut(key) {
@@ -1339,10 +1438,15 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_list();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled list before fabricating an empty
+            // one (see `Self::promote_cold_if_present`).
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_list();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         // Upgrade compact listpack to full VecDeque if needed
@@ -1358,6 +1462,9 @@ impl Database {
 
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encoding to full VecDeque if found.
+    ///
+    /// Promotes a cold-spilled list back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
@@ -1366,6 +1473,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         // Upgrade compact encoding if present
         if let Some(entry) = self.data.get_mut(key) {
@@ -1395,10 +1505,15 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_set();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled set before fabricating an empty
+            // one (see `Self::promote_cold_if_present`).
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_set();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         // Upgrade compact encodings to full HashSet
@@ -1421,6 +1536,9 @@ impl Database {
 
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encodings to full HashSet if found.
+    ///
+    /// Promotes a cold-spilled set back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
@@ -1429,6 +1547,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         // Upgrade compact encodings if present
         if let Some(entry) = self.data.get_mut(key) {
@@ -1467,10 +1588,19 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_set_intset();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled set before fabricating an empty
+            // intset — a promoted value always decodes as `RedisValue::Set`
+            // (cold storage never persists the intset compact encoding), so
+            // it naturally falls into the `Ok(None)` "not an intset, caller
+            // should use get_or_create_set" arm below, which already routes
+            // callers (e.g. SADD) to `get_or_create_set` — no fabrication.
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_set_intset();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -1516,10 +1646,19 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_hash_listpack();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled hash before fabricating an
+            // empty listpack — a promoted value always decodes as
+            // `RedisValue::Hash` (cold storage never persists the listpack
+            // compact encoding), so it naturally falls into the `Ok(None)`
+            // "not a listpack, fall through" arm below, which already routes
+            // callers (e.g. HSET) to `get_or_create_hash` — no fabrication.
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_hash_listpack();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -1567,10 +1706,19 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_list_listpack();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled list before fabricating an
+            // empty listpack — a promoted value always decodes as
+            // `RedisValue::List` (cold storage never persists the listpack
+            // compact encoding), so it naturally falls into the `Ok(None)`
+            // "not a listpack, fall through" arm below, which already routes
+            // callers (e.g. LPUSH) to `get_or_create_list` — no fabrication.
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_list_listpack();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -1616,10 +1764,15 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_sorted_set_bptree();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled sorted set before fabricating
+            // an empty one (see `Self::promote_cold_if_present`).
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_sorted_set_bptree();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
         let entry = self.data.get_mut(key).unwrap();
@@ -1642,6 +1795,9 @@ impl Database {
     }
 
     /// Get a sorted set entry (read-only). Returns None if key missing, Err if wrong type.
+    ///
+    /// Promotes a cold-spilled sorted set back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     #[allow(clippy::unwrap_used)] // get_mut() after confirmed existence; legacy BTreeMap upgrade is infallible
     pub fn get_sorted_set(
         &mut self,
@@ -1653,6 +1809,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
         if let Some(entry) = self.data.get(key) {
@@ -1798,12 +1957,17 @@ impl Database {
     }
 
     /// Read-only existence check: returns false if expired.
+    ///
+    /// Also counts a cold-only key (spilled by eviction) as existing — see
+    /// [`Self::cold_contains_alive`] (P0 cold-collection-visibility fix).
+    /// Used by the RwLock-shared-read `EXISTS` dispatch path, which cannot
+    /// mutate `self` to promote.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
         let base_ts = self.base_timestamp;
-        self.data
-            .get(key)
-            .map(|e| !e.is_expired_at(base_ts, now_ms))
-            .unwrap_or(false)
+        match self.data.get(key) {
+            Some(e) if !e.is_expired_at(base_ts, now_ms) => true,
+            _ => self.cold_contains_alive(key, now_ms),
+        }
     }
 
     /// Read-only hash access. Returns None if key missing or expired, Err if wrong type.
@@ -1894,16 +2058,25 @@ impl Database {
     /// `HashWithTtl` (HashMap with per-field TTL sidecar).  For `HashWithTtl`
     /// returns a `HashRef::WithTtl` that filters expired fields on every
     /// field-level operation without mutating the database (lazy expiry).
+    ///
+    /// Takes `&self` because this backs BOTH the exclusive-dispatch path
+    /// (`&mut Database`, reborrowed) AND the RwLock-shared-read dispatch
+    /// path (`&Database` only — `hget_readonly`/`hgetall_readonly`/etc.).
+    /// The latter cannot promote a cold hit into hot RAM, so a hot miss
+    /// falls back to a non-promoting cold read-through returning
+    /// `HashRef::Owned`/`OwnedWithTtl` (P0 cold-collection-visibility fix) —
+    /// the fast path (key present hot) still costs exactly one probe.
     pub fn get_hash_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<HashRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(base_ts, now_ms) {
+                return Ok(None);
+            }
+            return match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(HashRef::Map(map))),
                 RedisValueRef::HashListpack(lp) => Ok(Some(HashRef::Listpack(lp))),
                 RedisValueRef::HashWithTtl {
@@ -1917,58 +2090,98 @@ impl Database {
                     min_expiry_ms,
                 })),
                 _ => Err(Self::wrongtype_error()),
-            },
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(RedisValue::Hash(map)) => Ok(Some(HashRef::Owned(map))),
+            Some(RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms,
+            }) => Ok(Some(HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            })),
+            Some(_) => Err(Self::wrongtype_error()),
+            None => Ok(None),
         }
     }
 
     /// Read-only list access via ListRef enum. Handles both VecDeque and Listpack.
+    ///
+    /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
+    /// tier without promoting on a hot miss (P0 cold-collection-visibility
+    /// fix).
     pub fn get_list_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(base_ts, now_ms) {
+                return Ok(None);
+            }
+            return match entry.value.as_redis_value() {
                 RedisValueRef::List(list) => Ok(Some(ListRef::Deque(list))),
                 RedisValueRef::ListListpack(lp) => Ok(Some(ListRef::Listpack(lp))),
                 _ => Err(Self::wrongtype_error()),
-            },
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(RedisValue::List(list)) => Ok(Some(ListRef::Owned(list))),
+            Some(_) => Err(Self::wrongtype_error()),
+            None => Ok(None),
         }
     }
 
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
+    ///
+    /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
+    /// tier without promoting on a hot miss (P0 cold-collection-visibility
+    /// fix).
     pub fn get_set_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SetRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(base_ts, now_ms) {
+                return Ok(None);
+            }
+            return match entry.value.as_redis_value() {
                 RedisValueRef::Set(set) => Ok(Some(SetRef::Hash(set))),
                 RedisValueRef::SetListpack(lp) => Ok(Some(SetRef::Listpack(lp))),
                 RedisValueRef::SetIntset(is) => Ok(Some(SetRef::Intset(is))),
                 _ => Err(Self::wrongtype_error()),
-            },
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(RedisValue::Set(set)) => Ok(Some(SetRef::Owned(set))),
+            Some(_) => Err(Self::wrongtype_error()),
+            None => Ok(None),
         }
     }
 
     /// Read-only sorted set access via SortedSetRef enum. Handles BPTree, Listpack, and Legacy.
+    ///
+    /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
+    /// tier without promoting on a hot miss (P0 cold-collection-visibility
+    /// fix).
     pub fn get_sorted_set_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SortedSetRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(base_ts, now_ms) {
+                return Ok(None);
+            }
+            return match entry.value.as_redis_value() {
                 RedisValueRef::SortedSetBPTree { tree, members } => {
                     Ok(Some(SortedSetRef::BPTree { tree, members }))
                 }
@@ -1977,7 +2190,14 @@ impl Database {
                     Ok(Some(SortedSetRef::Legacy { members, scores }))
                 }
                 _ => Err(Self::wrongtype_error()),
-            },
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(RedisValue::SortedSetBPTree { tree, members }) => {
+                Ok(Some(SortedSetRef::Owned { tree, members }))
+            }
+            Some(_) => Err(Self::wrongtype_error()),
+            None => Ok(None),
         }
     }
 
@@ -2075,10 +2295,15 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_stream();
-            let k = CompactKey::from(key);
-            self.used_memory += entry_overhead(key, &entry);
-            self.data.insert(k, entry);
+            // P0 fix: promote a cold-spilled stream before fabricating an
+            // empty one (see `Self::promote_cold_if_present`).
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let entry = Entry::new_stream();
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
         }
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -2092,24 +2317,41 @@ impl Database {
     /// Checks expiry using `now_ms` but does NOT remove the expired key or
     /// touch LRU (mirrors `get_if_alive` semantics).  Returns `Ok(None)` for
     /// missing or expired keys, `Err(WRONGTYPE)` for non-stream keys.
+    ///
+    /// Returns `StreamRef` rather than `&StreamData`: this backs both the
+    /// exclusive-dispatch path and the RwLock-shared-read dispatch path
+    /// (`&Database` only, cannot promote). A hot miss falls back to a
+    /// non-promoting cold read-through returning `StreamRef::Owned` (P0
+    /// cold-collection-visibility fix) — `StreamRef` derefs to `&StreamData`
+    /// so existing call sites (`stream.length`, `stream.range(..)`, ...) are
+    /// unaffected. The fast path (key present hot) still costs one probe.
     pub fn get_stream_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
-    ) -> Result<Option<&StreamData>, Frame> {
+    ) -> Result<Option<StreamRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Stream(s) => Ok(Some(s)),
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(base_ts, now_ms) {
+                return Ok(None);
+            }
+            return match entry.value.as_redis_value() {
+                RedisValueRef::Stream(s) => Ok(Some(StreamRef::Borrowed(s))),
                 _ => Err(Self::wrongtype_error()),
-            },
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(RedisValue::Stream(s)) => Ok(Some(StreamRef::Owned(s))),
+            Some(_) => Err(Self::wrongtype_error()),
+            None => Ok(None),
         }
     }
 
     /// Get a read-only reference to a stream. Returns Ok(None) if key doesn't exist.
     /// Returns WRONGTYPE error if key holds another type.
+    ///
+    /// Promotes a cold-spilled stream back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream(&mut self, key: &[u8]) -> Result<Option<&StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -2117,6 +2359,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         match self.data.get(key) {
             None => Ok(None),
@@ -2128,6 +2373,9 @@ impl Database {
     }
 
     /// Get a mutable reference to an existing stream. Returns Ok(None) if key doesn't exist.
+    ///
+    /// Promotes a cold-spilled stream back to hot RAM on miss (P0
+    /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -2135,6 +2383,9 @@ impl Database {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
+        }
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
         }
         match self.data.get_mut(key) {
             None => Ok(None),
@@ -2410,5 +2661,329 @@ mod tests {
         // cached_now should match clock
         assert_eq!(db.now(), clock.secs());
         assert_eq!(db.now_ms(), clock.ms());
+    }
+
+    // -----------------------------------------------------------------
+    // P0 cold-collection-visibility fix
+    // (.planning/reviews/storage-audit-2026-07-12-kv.md)
+    //
+    // Disk-offload spills Hash/List/Set/ZSet/Stream via
+    // `evict_one_async_spill` / `evict_batch_durable_no_aof` (production
+    // paths, `kv_serde::serialize_collection` handles every type), but the
+    // type-specific accessors used to consult only `self.data`, never the
+    // `ColdIndex` — so a spilled collection read as absent, and a write
+    // fabricated a brand-new EMPTY container that permanently shadowed
+    // (destroyed) the cold copy on the next `set`.
+    //
+    // These tests spill a collection directly via the same
+    // `spill_to_datafile` production helper the eviction paths use (mirrors
+    // the pattern in `tiered::cold_read`'s own tests), bypassing the
+    // eviction machinery itself (out of scope here) while exercising the
+    // exact on-disk format the accessors must decode.
+    // -----------------------------------------------------------------
+
+    use crate::persistence::manifest::ShardManifest;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::RedisValue as TestRedisValue;
+    use crate::storage::tiered::cold_index::ColdIndex;
+    use crate::storage::tiered::kv_spill::spill_to_datafile;
+
+    /// Build a `Database` with an active cold tier holding one spilled
+    /// collection at `key`. Mirrors `cold_read::tests::db_with_spilled_key`
+    /// but accepts an arbitrary `RedisValue` (collections, not just strings).
+    fn db_with_spilled_value(
+        shard_dir: &std::path::Path,
+        key: &[u8],
+        value: TestRedisValue,
+    ) -> Database {
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        let mut entry = Entry::new_string(Bytes::new()); // placeholder, overwritten below
+        entry.value = CompactValue::from_redis_value(value);
+
+        spill_to_datafile(
+            shard_dir,
+            900,
+            key,
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let mut db = Database::new();
+        db.cold_shard_dir = Some(shard_dir.to_path_buf());
+        db.cold_index = Some(cold_index);
+        db
+    }
+
+    #[test]
+    fn test_get_or_create_hash_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
+        fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+
+        // Precondition: nothing hot yet, key only exists cold.
+        assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
+
+        // Simulates HSET's get_or_create_hash call: must promote the real
+        // spilled fields, NOT fabricate an empty hash that would permanently
+        // shadow (destroy) the cold copy.
+        let map = db.get_or_create_hash(b"myhash").unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "must promote existing fields, not fabricate empty hash"
+        );
+        assert_eq!(map.get(b"color".as_slice()).unwrap(), b"red".as_slice());
+
+        // Promotion must also clear the cold index entry (no dual reference).
+        assert!(db.cold_index.as_ref().unwrap().lookup(b"myhash").is_none());
+        assert!(db.is_hot(b"myhash"));
+    }
+
+    #[test]
+    fn test_get_or_create_hash_merges_new_field_with_promoted_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(
+            Bytes::from_static(b"old_field"),
+            Bytes::from_static(b"old_value"),
+        );
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        // HSET h new_field new_value
+        {
+            let map = db.get_or_create_hash(b"h").unwrap();
+            map.insert(
+                Bytes::from_static(b"new_field"),
+                Bytes::from_static(b"new_value"),
+            );
+        }
+
+        let map = db.get_hash(b"h").unwrap().unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "old spilled field + new field must both be present"
+        );
+        assert_eq!(
+            map.get(b"old_field".as_slice()).unwrap(),
+            b"old_value".as_slice()
+        );
+        assert_eq!(
+            map.get(b"new_field".as_slice()).unwrap(),
+            b"new_value".as_slice()
+        );
+    }
+
+    #[test]
+    fn test_get_hash_ref_if_alive_sees_cold_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        let href = db
+            .get_hash_ref_if_alive(b"h", 0)
+            .unwrap()
+            .expect("must see cold hash");
+        assert_eq!(href.get_field(b"f").unwrap(), b"v".as_slice());
+        assert_eq!(href.len(), 1);
+
+        // Non-promoting: `&self` accessor must not have mutated hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "get_hash_ref_if_alive takes &self and must not promote"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"h").is_some(),
+            "cold index entry must remain untouched by a non-promoting read"
+        );
+    }
+
+    #[test]
+    fn test_get_or_create_list_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"a"));
+        list.push_back(Bytes::from_static(b"b"));
+        let mut db = db_with_spilled_value(tmp.path(), b"mylist", TestRedisValue::List(list));
+
+        let l = db.get_or_create_list(b"mylist").unwrap();
+        assert_eq!(
+            l.len(),
+            2,
+            "must promote existing elements, not fabricate empty list"
+        );
+        assert_eq!(l[0], Bytes::from_static(b"a"));
+    }
+
+    #[test]
+    fn test_get_list_ref_if_alive_sees_cold_list_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"x"));
+        let db = db_with_spilled_value(tmp.path(), b"l", TestRedisValue::List(list));
+
+        let lref = db
+            .get_list_ref_if_alive(b"l", 0)
+            .unwrap()
+            .expect("must see cold list");
+        assert_eq!(lref.len(), 1);
+        assert!(!db.is_hot(b"l"));
+    }
+
+    #[test]
+    fn test_get_or_create_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m1"));
+        set.insert(Bytes::from_static(b"m2"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+
+        let s = db.get_or_create_set(b"myset").unwrap();
+        assert_eq!(
+            s.len(),
+            2,
+            "must promote existing members, not fabricate empty set"
+        );
+        assert!(s.contains(b"m1".as_slice()));
+    }
+
+    #[test]
+    fn test_get_set_ref_if_alive_sees_cold_set_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m"));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+
+        let sref = db
+            .get_set_ref_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold set");
+        assert!(sref.contains(b"m"));
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_get_or_create_sorted_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(1.5), Bytes::from_static(b"alice"));
+        members.insert(Bytes::from_static(b"alice"), 1.5);
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myzset",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "must promote existing members, not fabricate empty zset"
+        );
+        assert_eq!(members.get(b"alice".as_slice()), Some(&1.5));
+    }
+
+    #[test]
+    fn test_get_sorted_set_ref_if_alive_sees_cold_zset_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(2.0), Bytes::from_static(b"bob"));
+        members.insert(Bytes::from_static(b"bob"), 2.0);
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"z",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let zref = db
+            .get_sorted_set_ref_if_alive(b"z", 0)
+            .unwrap()
+            .expect("must see cold zset");
+        assert_eq!(zref.score(b"bob"), Some(2.0));
+        assert!(!db.is_hot(b"z"));
+    }
+
+    #[test]
+    fn test_get_or_create_stream_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 1000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"field"), Bytes::from_static(b"value"))],
+        );
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"mystream",
+            TestRedisValue::Stream(Box::new(stream)),
+        );
+
+        let s = db.get_or_create_stream(b"mystream").unwrap();
+        assert_eq!(
+            s.length, 1,
+            "must promote existing entries, not fabricate empty stream"
+        );
+        assert_eq!(s.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_get_stream_if_alive_sees_cold_stream_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 2000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+        );
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Stream(Box::new(stream)));
+
+        let sref = db
+            .get_stream_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold stream");
+        assert_eq!(sref.length, 1);
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_exists_counts_cold_only_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        assert!(db.exists(b"h"), "cold-only key must count as existing");
+        // Cheap presence check must not have promoted the key into hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "EXISTS must not promote — cheap check only"
+        );
+
+        let now_ms = db.now_ms();
+        assert!(db.exists_if_alive(b"h", now_ms));
+        assert!(!db.is_hot(b"h"));
+    }
+
+    #[test]
+    fn test_exists_false_for_genuinely_missing_key() {
+        let mut db = Database::new();
+        db.cold_index = Some(ColdIndex::new());
+        assert!(!db.exists(b"nope"));
+        let now_ms = db.now_ms();
+        assert!(!db.exists_if_alive(b"nope", now_ms));
     }
 }

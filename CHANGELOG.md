@@ -6,6 +6,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — cold-collection visibility: silent data loss on evicted Hash/List/Set/ZSet/Stream (task #41, P0)
+
+With disk-offload enabled (the default), the production eviction paths
+(`evict_one_async_spill`, `evict_batch_durable_no_aof` in
+`storage/eviction.rs`) spill Hash/List/Set/ZSet/Stream values to the cold
+tier via `kv_serde::serialize_collection` — but the type-specific accessors
+never consulted the cold index before this fix. Consequences: `HGET`/
+`HGETALL`/`LRANGE`/`SMEMBERS`/`ZRANGE`/`EXISTS` reported the key absent
+after eviction even though it was durably spilled, and `HSET`/`LPUSH`/
+`SADD`/`ZADD` silently fabricated a **new empty container**, permanently
+shadowing (destroying) the cold copy on the next flush — a genuine,
+silent user-data-loss bug for any collection key subject to eviction.
+
+Fixed with a single promote-if-cold hook rather than rewriting every
+accessor:
+
+- `Database::promote_cold_if_present` — on a hot miss, does one
+  `ColdIndex` lookup; on a hit it decodes the cold value, installs it hot,
+  and removes the cold-index entry (single owning copy, no dual
+  reference). All 8 `get_or_create_*`/`get_*` mutable accessors
+  (`get_or_create_hash[_listpack]`, `get_or_create_list[_listpack]`,
+  `get_or_create_set`/`get_or_create_intset`, `get_or_create_sorted_set`,
+  `get_or_create_stream`, `get_hash`, `get_list`, `get_set`,
+  `get_sorted_set`, `get_stream[_mut]`) now call this hook before falling
+  through to their existing "fabricate new" path — so HSET/LPUSH/SADD/ZADD/
+  XADD merge into the promoted collection instead of shadowing it.
+- The four `&self`-typed "`*_ref_if_alive`" shared-read accessors
+  (`get_hash_ref_if_alive`, `get_list_ref_if_alive`, `get_set_ref_if_alive`,
+  `get_sorted_set_ref_if_alive`, `get_stream_if_alive`) cannot promote
+  (they're also called from the `_readonly` dispatch path holding only a
+  shared `&Database`), so they instead do a **non-promoting** cold
+  read-through: new `Owned`/`Borrowed` variants on `HashRef`/`ListRef`/
+  `SetRef`/`SortedSetRef` (and a new `StreamRef<'a>` `Deref` wrapper
+  replacing the old `&StreamData` return type) let a cold hit return a
+  freshly-decoded owned value without a backing hot entry, at the cost of
+  exactly one extra branch + one `ColdIndex` lookup on a hot miss. Hot-hit
+  cost is unchanged (single probe, same as before).
+- `exists`/`exists_if_alive` now fall back to a cheap
+  `cold_contains_alive` check (ColdIndex presence + TTL only, no disk I/O,
+  no promotion) instead of unconditionally returning `false` on a hot
+  miss.
+- `zrank_readonly`/`zrevrank_readonly` (`command/sorted_set/sorted_set_read.rs`)
+  updated to route the new `SortedSetRef::Owned` variant through the same
+  O(n) fallback as the existing `Listpack` variant (previously any
+  unmatched variant silently fell into a `Frame::Null` wildcard arm —
+  would have reported a promoted member as not-ranked).
+
+New tests: 13 unit tests in `storage::db::tests` (spill-then-promote for
+all 5 collection types + `EXISTS`-without-promoting) plus a new black-box
+suite `tests/cold_collection_visibility.rs` (real server,
+`--disk-offload enable`, sampled-LRU-driven eviction, asserts `EXISTS`,
+read-after-evict, and write-merges-with-promoted-data for Hash/List/Set/
+ZSet). Explicitly out of scope for this fix (unchanged):
+`recovery.rs` rehydration, replication, and the eviction gates' Wave A
+reporting sinks.
+
 ### Fixed — Wave A adversarial-review fixes (task #34)
 
 Three defects found reviewing Wave A (plane replication) before merge, all

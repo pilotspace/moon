@@ -673,8 +673,14 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                         None => Frame::Null,
                     }
                 }
-                (SortedSetRef::Listpack(_), Some(score)) => {
-                    // For listpack, compute rank from sorted entries
+                // Listpack has no O(log n) rank structure; Owned (P0
+                // cold-collection-visibility fix: a value decoded fresh from
+                // the cold tier, see `SortedSetRef::Owned`) carries its own
+                // `BPTree` but `members_map`/`bptree` deliberately return
+                // `None` for it (same as Listpack) — both fall back to the
+                // same O(n) rank-from-sorted-entries computation.
+                (SortedSetRef::Listpack(_), Some(score))
+                | (SortedSetRef::Owned { .. }, Some(score)) => {
                     let entries = zref.entries_sorted();
                     let target_score = OrderedFloat(score);
                     let target_member = Bytes::copy_from_slice(member);
@@ -715,7 +721,11 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                     None => Frame::Null,
                 }
             }
-            (SortedSetRef::Listpack(_), Some(score)) => {
+            // See the matching comment in `zrank_readonly`: Owned (P0
+            // cold-collection-visibility fix) falls back to the same
+            // generic path as Listpack.
+            (SortedSetRef::Listpack(_), Some(score))
+            | (SortedSetRef::Owned { .. }, Some(score)) => {
                 let entries = zref.entries_sorted();
                 let target_score = OrderedFloat(score);
                 let target_member = Bytes::copy_from_slice(member);
