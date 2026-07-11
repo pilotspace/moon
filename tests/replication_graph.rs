@@ -293,3 +293,86 @@ fn replica_backfills_graph_from_snapshot() {
     });
     assert!(grew, "post-snapshot live node did not replicate");
 }
+
+/// REPL-GRAPH-03 (adversarial round-2 finding B): TEMPORAL.INVALIDATE mutates
+/// graph state (`valid_to`) and must reach the replica — streamed as the
+/// deterministic wall-clock-pinned `TEMPORAL.INVALIDATE-AT` form so master
+/// and replica agree on the exact `valid_to`. Observable only through an
+/// explicit `VALID_AT` filter: far-future is inside the default
+/// `valid_to = i64::MAX` before invalidation and outside `valid_to = now`
+/// after it.
+#[test]
+#[ignore]
+fn replica_applies_temporal_invalidate() {
+    // ~ year 2255 in Unix ms: beyond "now", far short of i64::MAX.
+    const FAR_FUTURE_MS: &str = "9000000000000";
+
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let master_addr = "127.0.0.1:16660";
+    let replica_addr = "127.0.0.1:16661";
+
+    let _master = Killer(start_moon(16660, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+    let _replica = Killer(start_moon(16661, replica_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16660").starts_with("+OK"),
+        "REPLICAOF failed"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(send_cmd(master_addr, "GRAPH.CREATE tg").contains("OK"));
+    let reply = send_resp(
+        master_addr,
+        &["GRAPH.ADDNODE", "tg", "Person", "name", "alice"],
+    );
+    assert!(reply.starts_with(':'), "ADDNODE must return an id: {reply}");
+    let node_id = reply.trim_start_matches(':').trim().to_string();
+
+    let visible_query = [
+        "GRAPH.QUERY",
+        "tg",
+        "MATCH (n:Person) RETURN n.name",
+        "VALID_AT",
+        FAR_FUTURE_MS,
+    ];
+    assert!(
+        wait_until(Duration::from_secs(10), || send_resp(
+            replica_addr,
+            &visible_query
+        )
+        .contains("alice")),
+        "node never became visible on the replica before invalidation"
+    );
+
+    let inv = send_resp(
+        master_addr,
+        &["TEMPORAL.INVALIDATE", &node_id, "NODE", "tg"],
+    );
+    assert!(inv.starts_with("+OK"), "TEMPORAL.INVALIDATE failed: {inv}");
+    // Master-side sanity: invalidation is observable at VALID_AT far-future.
+    assert!(
+        !send_resp(master_addr, &visible_query).contains("alice"),
+        "master itself still shows the node past its valid_to"
+    );
+
+    // The replica must converge to the same temporal visibility.
+    assert!(
+        wait_until(Duration::from_secs(10), || !send_resp(
+            replica_addr,
+            &visible_query
+        )
+        .contains("alice")),
+        "TEMPORAL.INVALIDATE never applied on the replica (valid_to diverged): {}",
+        send_resp(replica_addr, &visible_query)
+    );
+}

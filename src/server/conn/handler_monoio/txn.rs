@@ -339,6 +339,24 @@ pub(super) async fn try_handle_temporal_invalidate(
                 });
                 match result {
                     Ok(()) => {
+                        // v0.7 graph replication (round-2 finding B):
+                        // TEMPORAL.INVALIDATE mutates graph state (valid_to)
+                        // — stream the deterministic wall-clock-pinned form.
+                        // The drained GraphTemporal record is a binary wal_v3
+                        // payload the RESP replication link can't carry, and
+                        // replaying the USER command would re-capture wall_ms
+                        // on the replica (valid_to divergence). Same single-
+                        // shard scope + synchronous-stretch contract as the
+                        // GRAPH.* leg in write.rs.
+                        if ctx.num_shards == 1 && super::ft::replication_fanout_active(ctx) {
+                            let record = crate::command::temporal::serialize_invalidate_at(
+                                &graph_name,
+                                is_node,
+                                entity_id,
+                                wall_ms,
+                            );
+                            super::ft::record_local_write(ctx, Bytes::from(record));
+                        }
                         for record in wal_records {
                             ctx.shard_databases
                                 .wal_append(ctx.shard_id, Bytes::from(record));

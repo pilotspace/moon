@@ -46,6 +46,16 @@ pub(super) async fn try_handle_ws_command(
         }
     };
 
+    // Round-2 finding A fail-loud: WS.CREATE/WS.DROP persist locally
+    // (WorkspaceCreate/Drop WAL records) but are NOT replicated in v0.7 —
+    // surface the divergence once instead of letting a replica silently miss
+    // the plane. (WS.CREATE is non-deterministic — fresh UUIDv7 per execution
+    // — so verbatim streaming would be wrong; task #34 tracks the id-pinned
+    // record form.)
+    if sub.eq_ignore_ascii_case(b"CREATE") || sub.eq_ignore_ascii_case(b"DROP") {
+        super::ft::warn_unreplicated_plane(ctx, cmd);
+    }
+
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_ws_create(cmd_args) {
             Ok(ws_name) => {
@@ -300,6 +310,13 @@ pub(super) async fn try_handle_mq_command(
             return true;
         }
     };
+
+    // Round-2 finding A fail-loud: MQ mutations persist locally (WAL via
+    // execute_mq_on_owner) but are NOT replicated in v0.7 — surface the
+    // divergence once instead of letting a replica silently miss the plane.
+    if !sub.eq_ignore_ascii_case(b"LEN") && !sub.eq_ignore_ascii_case(b"DLQLEN") {
+        super::ft::warn_unreplicated_plane(ctx, cmd);
+    }
 
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_mq_create(cmd_args) {
@@ -741,6 +758,13 @@ pub(super) async fn try_handle_multi_exec(
             // same contract as the single-command legs).
             let repl_active = super::ft::replication_fanout_active(ctx);
             if repl_active {
+                // Round-2 finding G (throughput note): each entry pushes one
+                // ReplicaLiveFanout onto the self queue, and the drain
+                // preamble processes the whole burst before the shard's
+                // bounded SPSC consumers — a very large EXEC body is a tail-
+                // latency vector for cross-shard traffic sharing this thread.
+                // Each drain iteration is just a try_send per replica, so the
+                // burst is cheap; revisit only if EXEC bodies grow unbounded.
                 for bytes in &aof_entries {
                     super::ft::record_local_write(ctx, bytes.clone());
                 }

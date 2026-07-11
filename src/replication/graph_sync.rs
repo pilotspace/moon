@@ -276,9 +276,34 @@ pub fn install_graph_store(store: &mut GraphStore, blob: &[u8]) -> Option<usize>
         });
         // Cross-tier delta edges re-enter the write buffer under their
         // ORIGINAL edge ids (later streamed REMOVEEDGE records must resolve).
+        let installed = graph.segments.load();
         for (ek, src, dst, edge_type, created_lsn, weight, props) in delta_edges {
             let src_key: crate::graph::types::NodeKey = slotmap::KeyData::from_ffi(src).into();
             let dst_key: crate::graph::types::NodeKey = slotmap::KeyData::from_ffi(dst).into();
+            // Round-2 finding E: `add_edge_across_tiers_with_id`'s aliveness
+            // check only fires for RESIDENT endpoints, and the write buffer is
+            // empty at this point — a corrupted blob referencing a nonexistent
+            // node would otherwise install silently. Fail loud instead: a
+            // correctly-behaving master only exports delta edges whose
+            // endpoints are frozen into the segments shipped in this blob.
+            let endpoint_known = |nk: crate::graph::types::NodeKey| {
+                graph.write_buf.get_node(nk).is_some()
+                    || installed
+                        .immutable
+                        .iter()
+                        .any(|s| s.lookup_node(nk).is_some())
+            };
+            if !endpoint_known(src_key) || !endpoint_known(dst_key) {
+                tracing::warn!(
+                    graph = %String::from_utf8_lossy(&name),
+                    edge = ek,
+                    src,
+                    dst,
+                    "replica graph sync: delta edge references node(s) absent from \
+                     installed segments — dropped (blob corrupt or master bug)"
+                );
+                continue;
+            }
             if graph
                 .write_buf
                 .add_edge_across_tiers_with_id(

@@ -197,6 +197,17 @@ pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
             return;
         }
 
+        // TEMPORAL.INVALIDATE arrives as the master's deterministic
+        // wall-clock-pinned form (`TEMPORAL.INVALIDATE-AT <graph> <N|E>
+        // <entity_id> <wall_ms>`, round-2 finding B) — apply with the SAME
+        // wall_ms the master used so `valid_to` matches exactly. Generic
+        // `dispatch()` does not know this internal record.
+        #[cfg(feature = "graph")]
+        if cmd.eq_ignore_ascii_case(b"TEMPORAL.INVALIDATE-AT") {
+            apply_temporal_invalidate(s, cmd, args);
+            return;
+        }
+
         // MOVE / cross-db COPY touch two databases at once and are intercepted
         // BEFORE generic dispatch on the master (see `spsc_two_db`). Generic
         // `dispatch()` cannot apply them — it returns an error for MOVE and
@@ -310,6 +321,40 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
             String::from_utf8_lossy(cmd)
         );
     }
+}
+
+/// Apply a replicated `TEMPORAL.INVALIDATE-AT` record: same mutation the
+/// master ran (`apply_invalidate`) with the master's pinned `wall_ms`. The
+/// drained `GraphTemporal` WAL payload is dropped, matching `apply_graph`'s
+/// no-local-persistence model (a restarted replica resyncs from the master;
+/// leaving it in `wal_pending` would leak into an unrelated later drain).
+#[cfg(feature = "graph")]
+fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+    let Some((graph_name, is_node, entity_id, wall_ms)) =
+        crate::command::temporal::parse_invalidate_at(args)
+    else {
+        tracing::warn!(
+            "replica apply: malformed {} record — skipped (graph diverges; \
+             full resync required)",
+            String::from_utf8_lossy(cmd)
+        );
+        return;
+    };
+    if let Err(e) = crate::command::temporal::apply_invalidate(
+        &mut s.graph_store,
+        entity_id,
+        is_node,
+        &graph_name,
+        wall_ms,
+    ) {
+        tracing::warn!(
+            "replica apply: TEMPORAL.INVALIDATE-AT entity_id={} failed: {} \
+             (graph diverges; full resync required)",
+            entity_id,
+            String::from_utf8_lossy(e)
+        );
+    }
+    let _ = s.graph_store.drain_wal();
 }
 
 /// Mirror of the master's connection-layer index-parity block

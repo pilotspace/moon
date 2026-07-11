@@ -89,6 +89,25 @@ pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout { bytes });
 }
 
+/// Fail-loud marker for planes NOT yet wired into replication (round-2
+/// finding A): WS.* and MQ.* writes persist durably on the master but never
+/// reach a replica — deterministic record forms + replica apply arms are the
+/// task-#34 follow-up. Warn ONCE per process so operators running replicas
+/// learn about the divergence at write time instead of at failover. No-op
+/// (one Relaxed load) when no replica has ever attached.
+pub(super) fn warn_unreplicated_plane(ctx: &ConnectionContext, cmd: &[u8]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if replication_fanout_active(ctx) && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            command = %String::from_utf8_lossy(cmd),
+            "replication: WS.*/MQ.* writes are NOT replicated in v0.7 — a \
+             replica will not see this plane (known limitation, further \
+             occurrences not logged)"
+        );
+    }
+}
+
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.

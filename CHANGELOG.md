@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — replication round-2 hardening: TEMPORAL.INVALIDATE, replay liveness, blob endpoint checks
+
+- **TEMPORAL.INVALIDATE never replicated** (round-2 finding B): the handler
+  drained the graph WAL — the same record mechanism GRAPH.\* replication
+  uses — but only fed the local WAL, never the replication plane; a replica
+  silently kept `valid_to = ∞` for entities the master had invalidated. The
+  master now streams a deterministic, wall-clock-pinned internal form
+  (`TEMPORAL.INVALIDATE-AT <graph> <N|E> <entity_id> <wall_ms>`, single-shard
+  scope like every replication leg) so master and replica agree on the exact
+  `valid_to`; the replica applies it through the same `apply_invalidate` the
+  master ran. New e2e REPL-GRAPH-03 proves temporal visibility converges
+  (red without the master leg, green with it).
+- **Streamed replay could resurrect a tombstoned node** (round-2 finding F,
+  regression from the P1-4 lazy-resolver rewrite): the lazy `node_exists`
+  accepted DEAD write-buffer entries (`get_node` does not filter
+  `deleted_lsn`), so a stray SETPROP for a node removed in an earlier
+  streamed replay call re-registered it into the live property index. Split
+  into `node_present` (AddNode dedup — any record of the id, matching the
+  never-reuse slotmap id contract) and `node_alive` (edge endpoints /
+  SETPROP / SETLABEL / REMOVENODE — write-buffer entry is authoritative,
+  live-only, matching the old pre-seeded map's `iter_nodes()` semantics).
+- **Graph snapshot install now rejects delta edges with unknown endpoints**
+  (round-2 finding E, defense-in-depth): `add_edge_across_tiers_with_id`'s
+  aliveness check only fires for resident endpoints — a corrupted blob
+  referencing a nonexistent node installed silently. The install loop now
+  verifies both endpoints against the just-installed segments and drops the
+  edge LOUD (`tracing::warn!`) otherwise.
+- **WS.\*/MQ.\* writes are NOT replicated in v0.7 — now fail-loud** (round-2
+  finding A, known limitation): WS.CREATE/WS.DROP and MQ mutations persist
+  durably on the master (WAL) but have no deterministic replication record
+  form yet (WS.CREATE mints a fresh UUIDv7 per execution — verbatim
+  streaming would diverge). A one-time `tracing::warn!` now fires when such
+  a write executes while a replica is attached, instead of silent divergence
+  discovered at failover. Full support (id-pinned record forms + replica
+  apply arms + snapshot coverage) is tracked as follow-up work, alongside
+  the pre-existing Lua-EVAL and expiry/eviction propagation gaps.
+
 ### Fixed — CLIENT TRACKING dead on the monoio runtime (H-3 reorder regression)
 
 - Since the H-3 ACL reorder (#258), `CLIENT TRACKING ON|OFF` answered
