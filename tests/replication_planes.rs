@@ -1058,11 +1058,20 @@ fn expiry_del_propagates() {
     assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
     await_link_up(&r);
 
+    // TTL long enough that the whole setup phase (pipeline + replica catch-up
+    // + baseline-offset capture) settles comfortably BEFORE the first key can
+    // expire on either side — a 200ms TTL raced the replica's catch-up under
+    // load (observed ~1-in-4 on a busy host: keys expired before dbsize(&r)
+    // ever reached N, failing the setup invariant, not the feature).
     const N: usize = 50;
-    let cmds: Vec<String> = (0..N).map(|i| format!("SET xk:{} v PX 200", i)).collect();
+    const TTL_MS: u64 = 3000;
+    let cmds: Vec<String> = (0..N)
+        .map(|i| format!("SET xk:{} v PX {}", i, TTL_MS))
+        .collect();
+    let setup_start = std::time::Instant::now();
     pipeline(&m, &cmds);
     assert!(
-        wait_until(Duration::from_secs(5), || dbsize(&r) == N as i64),
+        wait_until(Duration::from_secs(2), || dbsize(&r) == N as i64),
         "setup invariant broken: replica did not receive the {} SETs before expiry",
         N
     );
@@ -1070,15 +1079,21 @@ fn expiry_del_propagates() {
 
     // Baseline offset AFTER the SETs have settled (excludes SET/PEXPIRE
     // writes themselves — only the subsequent active-expiry DELs, if any,
-    // should move the needle from here).
+    // should move the needle from here). Must itself land before any TTL
+    // fires, or a DEL could slip under the baseline.
     let baseline_offset = master_repl_offset(&m);
+    assert!(
+        setup_start.elapsed() < Duration::from_millis(TTL_MS),
+        "setup took {:?}, longer than the {}ms TTL — baseline offset is unusable",
+        setup_start.elapsed(),
+        TTL_MS
+    );
 
-    // Let the 200ms TTLs expire (master active-expiry sweep runs at 100ms
-    // cadence, comfortably inside this 2s window either way).
-    thread::sleep(Duration::from_secs(2));
+    // Let the TTLs expire (master active-expiry sweep runs at 100ms cadence).
+    thread::sleep(Duration::from_millis(TTL_MS));
 
     assert!(
-        wait_until(Duration::from_secs(5), || dbsize(&m) == 0),
+        wait_until(Duration::from_secs(10), || dbsize(&m) == 0),
         "master did not actively expire all keys: dbsize={}",
         dbsize(&m)
     );
