@@ -92,6 +92,23 @@ pub(crate) fn record_reason_del(
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     wal_kv_log: bool,
 ) {
+    // Task #34 review (defect 2): hoist the exact same no-work gate
+    // `wal_append_and_fanout` checks internally to BEFORE `serialize_del`
+    // allocates the RESP record. Previously every background-tick removal
+    // (active expiry, eviction plain-drop) paid a `Bytes` allocation +
+    // `Frame`/`framevec` build even on a standalone server with no WAL, no
+    // replica, and no AOF pool wired — the single most common deployment
+    // shape. Behavior when there IS work is unchanged: the same predicate
+    // runs again inside `wal_append_and_fanout` (cheap, no allocation) and
+    // gates nothing differently.
+    if !crate::shard::spsc_handler::wal_fanout_has_work(
+        wal_writer,
+        replica_txs,
+        aof_pool,
+        wal_kv_log,
+    ) {
+        return;
+    }
     let serialized = serialize_del(key);
     // Fire-and-forget-on-loss like every other background-tick record (the
     // client that originally SET the key is long gone; there is no response
@@ -129,6 +146,11 @@ pub(crate) fn record_reason_del_conn(
     db: usize,
     key: &[u8],
 ) {
+    // Task #34 review (defect 2): see `conn_has_work` doc comment. Skip the
+    // `serialize_del` allocation entirely when neither leg has any work.
+    if !conn_has_work(aof_pool) {
+        return;
+    }
     record_bytes_conn(
         repl_state,
         shard_id,
@@ -162,9 +184,33 @@ pub(crate) fn record_effect_write(
     db: usize,
     cmd_and_args: &[Frame],
 ) {
+    // Task #34 review (defect 2): see `conn_has_work` doc comment. Skip the
+    // `Frame::Array`/`cmd_and_args.to_vec()`/`serialize_command` allocations
+    // entirely when neither leg has any work — a script's write effects on a
+    // standalone, AOF-off server previously paid a full record build for
+    // every single inner command, discarded immediately after.
+    if !conn_has_work(aof_pool) {
+        return;
+    }
     let frame = Frame::Array(crate::protocol::FrameVec::from_vec(cmd_and_args.to_vec()));
     let serialized = serialize_command(&frame);
     record_bytes_conn(repl_state, shard_id, num_shards, aof_pool, db, serialized);
+}
+
+/// Cheap pre-check (task #34 review, defect 2): `true` iff either
+/// connection-context emission leg — replication (gated on the sticky
+/// `fanout_hint_active` Relaxed load) or AOF (gated on `aof_pool` being
+/// wired) — has any work to do. Hoisted to the top of every
+/// connection-context entry point ([`record_reason_del_conn`],
+/// [`record_effect_write`]) so the common "no replica ever attached AND no
+/// AOF pool wired" case costs one atomic load + one `Option` check, never a
+/// `Bytes`/`Frame` allocation. Mirrors the exact pair of checks
+/// `record_bytes_conn` already runs per-leg — this is not a new decision,
+/// only an earlier exit for the case where NEITHER leg would do anything.
+#[cfg(feature = "runtime-monoio")]
+#[inline]
+fn conn_has_work(aof_pool: Option<&std::sync::Arc<AofWriterPool>>) -> bool {
+    crate::replication::state::fanout_hint_active() || aof_pool.is_some()
 }
 
 /// Shared connection-context emission core: replication leg (gated on the
@@ -259,4 +305,96 @@ fn push_record(
         bytes,
         end_offset,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GREEN (defect 2 regression guard): with no WAL writer, no replica
+    /// fan-out targets, no `repl_state`, and no AOF pool, `record_reason_del`
+    /// must be a true no-op — in particular it must never even reach
+    /// `serialize_del`/`wal_append_and_fanout`'s internals. We can't assert
+    /// "zero allocations" without an allocation-counting harness (none exists
+    /// in this repo), so this pins the OBSERVABLE half of the contract: the
+    /// shared backlog is untouched (stays `None`) and the call returns
+    /// without panicking off the event-loop thread it would normally run on.
+    #[test]
+    fn record_reason_del_noop_when_nothing_wired() {
+        let repl_backlog: crate::replication::backlog::SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
+        let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
+
+        record_reason_del(
+            b"gone",
+            0,
+            &mut wal_writer,
+            &repl_backlog,
+            &mut replica_txs,
+            &None,
+            0,
+            None,
+            false,
+        );
+
+        assert!(
+            repl_backlog.lock().is_none(),
+            "no-work gate must early-return before touching the backlog"
+        );
+    }
+
+    /// GREEN (defect 2 regression guard, has-work path): hoisting the gate
+    /// must not break emission when there IS work. With an AOF pool wired
+    /// (the "work" leg `wal_fanout_has_work` checks), the DEL record must
+    /// still reach the writer channel exactly as before the hoist.
+    #[test]
+    fn record_reason_del_still_emits_to_aof_when_wired() {
+        let (tx, rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(16);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+
+        let repl_backlog: crate::replication::backlog::SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
+        let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
+
+        record_reason_del(
+            b"gone",
+            0,
+            &mut wal_writer,
+            &repl_backlog,
+            &mut replica_txs,
+            &None,
+            0,
+            Some(&pool),
+            false,
+        );
+
+        match rx.try_recv() {
+            Ok(crate::persistence::aof::AofMessage::Append { bytes, .. }) => {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    text.contains("DEL") && text.contains("gone"),
+                    "expected a serialized DEL record, got {text:?}"
+                );
+            }
+            Ok(_) => panic!("expected an AofMessage::Append record"),
+            Err(e) => panic!("expected a queued AOF record, got recv error: {e:?}"),
+        }
+    }
+
+    /// `conn_has_work` (defect 2's connection-context gate): an AOF pool
+    /// being wired must ALONE be sufficient to report work, independent of
+    /// the sticky process-global `fanout_hint_active` flag (which this test
+    /// binary otherwise never sets — see `replication::state`'s doc comment
+    /// on `FANOUT_HINT`).
+    #[cfg(feature = "runtime-monoio")]
+    #[test]
+    fn conn_has_work_true_when_aof_pool_wired() {
+        let (tx, _rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(16);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+        assert!(conn_has_work(Some(&pool)));
+    }
 }

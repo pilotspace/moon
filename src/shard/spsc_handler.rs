@@ -24,7 +24,7 @@ use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget_reporting,
+    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
 };
 use crate::storage::tiered::spill_thread::SpillRequest;
 
@@ -70,8 +70,24 @@ pub(super) fn spsc_eviction_gate(
     let global_result = if let Some(sender) = spill_sender {
         let mut fid = spill_file_id.get();
         let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
-        let res =
-            try_evict_if_needed_async_spill_budget(db, &rt, sender, dir, &mut fid, db_idx, budget);
+        // Task #34 review (defect 1 follow-through): this gate has no
+        // `ShardManifest` handle either (same reasoning as
+        // `run_write_eviction_gate`'s doc comment) — a cross-shard write
+        // past `maxmemory` under `--disk-offload enable` reliably takes the
+        // "no manifest reachable" plain-drop fallback. Previously called the
+        // non-reporting wrapper (hardcoded no-op sink), silently dropping
+        // `on_plain_drop` on the floor for this branch even though the
+        // caller already threads a real one for the sibling branch below.
+        let res = try_evict_if_needed_async_spill_budget_reporting(
+            db,
+            &rt,
+            sender,
+            dir,
+            &mut fid,
+            db_idx,
+            budget,
+            on_plain_drop,
+        );
         spill_file_id.set(fid);
         res
     } else {

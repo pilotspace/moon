@@ -724,16 +724,36 @@ pub(crate) fn handle_memory_pressure(
                                     manifest,
                                     next_file_id,
                                 };
-                                // Durable spill (manifest reachable): the
-                                // victim stays cold-readable, never a plain
-                                // drop — must NOT emit (unchanged, no-op-sink
-                                // call).
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                                // Durable spill (manifest reachable): a
+                                // STRING victim stays cold-readable, never a
+                                // plain drop. But `evict_one_with_spill`'s
+                                // spill body is string-only (task #34 review,
+                                // defect 1) — a Hash/List/Set/ZSet victim
+                                // picked here is a genuine plain-drop with no
+                                // cold copy anywhere, and must still reach
+                                // `record_reason_del`. Thread the real
+                                // reporting sink (previously a hardcoded
+                                // no-op here, which silently swallowed those
+                                // emissions).
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
                                     db,
                                     &rt,
                                     Some(&mut ctx),
                                     total_mem,
                                     budget,
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            i,
+                                            wal_v3,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                        );
+                                    },
                                 );
                             } else {
                                 // No manifest reachable: this IS the plain

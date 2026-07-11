@@ -587,7 +587,40 @@ pub fn try_evict_if_needed_async_spill_budget(
     db_index: usize,
     budget_override: usize,
 ) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_with_total_budget(
+    try_evict_if_needed_async_spill_budget_reporting(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        db_index,
+        budget_override,
+        &mut |_| {},
+    )
+}
+
+/// Like [`try_evict_if_needed_async_spill_budget`], but reports every
+/// plain-dropped (non-spill) victim key to `on_plain_drop` — task #34 review
+/// (defect 3): wires the Lua bystander-eviction gate
+/// (`scripting::bridge::LuaEvictionCtx::gate`) to the same dual-plane DEL
+/// emission every other write-path eviction call site already has. No
+/// `ShardManifest` is ever available to this call site (the Lua ctx only
+/// caches a `spill_sender`), so `manifest` is always `None` here — meaning a
+/// non-string victim (or ANY victim under `--appendonly no`) reliably takes
+/// the "no manifest reachable" plain-drop fallback inside
+/// `try_evict_if_needed_async_spill_with_total_budget_reporting`, not the
+/// durable-batch branch. Only that fallback ever calls `on_plain_drop`.
+pub fn try_evict_if_needed_async_spill_budget_reporting(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    db_index: usize,
+    budget_override: usize,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
+) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total_budget_reporting(
         db,
         config,
         sender,
@@ -597,6 +630,7 @@ pub fn try_evict_if_needed_async_spill_budget(
         db_index,
         budget_override,
         None,
+        on_plain_drop,
     )
 }
 
@@ -1084,11 +1118,6 @@ pub(crate) fn evict_one_with_spill(
     spill: Option<&mut SpillContext<'_>>,
     on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
-    // Captured before `spill` is consumed below — determines whether this
-    // victim (if any) is a true delete (no cold-tier copy, `on_plain_drop`
-    // fires) or a hot→cold tier transition (spill wrote a durable copy
-    // first; the key stays cold-readable, never reported).
-    let is_plain_drop = spill.is_none();
     // Find victim key using policy-specific sampling
     let victim = match policy {
         EvictionPolicy::NoEviction => None,
@@ -1110,7 +1139,19 @@ pub(crate) fn evict_one_with_spill(
         None => return false,
     };
 
-    // Spill to disk before removing, if context provided
+    // Spill to disk before removing, if context provided. `spilled` tracks
+    // whether a durable cold copy was ACTUALLY written for this specific
+    // victim -- not merely whether a `SpillContext` was passed in. Task #34
+    // review (defect 1): the previous `is_plain_drop = spill.is_none()`
+    // snapshot, taken before this block ran, mis-classified any non-string
+    // victim (Hash/List/Set/ZSet/Stream) under a live `SpillContext` as
+    // "spilled" even though the `is_string` gate below never touches them --
+    // they fell through to the unconditional `db.remove` with no cold copy
+    // AND no plain-drop report: silent data loss with no AOF/replication DEL
+    // record. Tying the flag to the branch that actually performs the write
+    // makes the two cases (no `SpillContext` vs. a `SpillContext` that
+    // couldn't spill this value type) equivalent by construction.
+    let mut spilled = false;
     if let Some(ctx) = spill {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             // Only spill string entries (collection types not yet supported)
@@ -1136,13 +1177,14 @@ pub(crate) fn evict_one_with_spill(
                     return false;
                 }
                 *ctx.next_file_id += 1;
+                spilled = true;
             }
         }
     }
 
     db.remove(key.as_bytes());
     crate::admin::metrics_setup::record_eviction();
-    if is_plain_drop {
+    if !spilled {
         on_plain_drop(key.as_bytes());
     }
     true
@@ -2174,6 +2216,68 @@ mod tests {
             "hot value must be retained when the sync spill fails (no silent drop)"
         );
         assert!(db.data().get(&b"spill_key"[..]).is_some());
+    }
+
+    /// RED (defect 1, task #34 review): `evict_one_with_spill`'s spill body
+    /// only durably spills `RedisValueRef::String` entries (see the
+    /// `is_string` gate). A Hash (or List/Set/ZSet) victim picked while a
+    /// `SpillContext` IS present therefore takes neither branch of the
+    /// `if is_string` check — no bytes are ever written to `shard_dir` — yet
+    /// falls through to the unconditional `db.remove` a few lines later. The
+    /// bug: `is_plain_drop` was snapshotted from `spill.is_none()` BEFORE
+    /// this happened, so it reads `false` (a `SpillContext` was passed) and
+    /// `on_plain_drop` never fires even though nothing durable exists for
+    /// this key anywhere. This must be a reported plain-drop, indistinguishable
+    /// from `spill: None`, because the outcome (no cold copy, no AOF/repl
+    /// record) is identical.
+    #[test]
+    fn sync_spill_non_string_victim_reports_plain_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        // Hash victim: get_or_create_hash + a field write, matching how HSET
+        // populates a real hash entry (mirrors src/storage/db.rs's own test
+        // fixture pattern).
+        {
+            let h = db.get_or_create_hash(b"hash_key").unwrap();
+            h.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        }
+        assert_eq!(db.len(), 1);
+
+        let config = make_config(1, "allkeys-lru"); // over-budget by construction
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+        };
+
+        let mut reported: Vec<Vec<u8>> = Vec::new();
+        let evicted = evict_one_with_spill(
+            &mut db,
+            &config,
+            &EvictionPolicy::AllKeysLru,
+            Some(&mut ctx),
+            &mut |key| reported.push(key.to_vec()),
+        );
+
+        assert!(evicted, "the hash victim must still be evicted from RAM");
+        assert_eq!(db.len(), 0);
+        assert!(
+            !shard_dir.join("data").exists(),
+            "setup invariant: a Hash entry must never actually be spilled \
+             to disk today (spill body is string-only)"
+        );
+        assert_eq!(
+            reported,
+            vec![b"hash_key".to_vec()],
+            "a Hash victim that was NOT actually spilled must be reported to \
+             on_plain_drop (no cold copy exists anywhere for it) -- silent \
+             data loss otherwise, with no AOF/replication DEL record"
+        );
     }
 
     #[test]

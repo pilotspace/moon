@@ -24,7 +24,7 @@ use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget_reporting,
+    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
 };
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
@@ -76,6 +76,20 @@ pub enum MonoioHandlerResult {
 /// Reads the runtime config, fetches this shard's elastic budget (GAP-1),
 /// and runs the spill-aware evictor when disk offload is wired, the plain
 /// budget evictor otherwise. Returns the evictor's OOM frame verbatim.
+///
+/// Task #34 review (defect 1 follow-through): this gate has no
+/// `ShardManifest` handle (only the tick-driven memory-pressure cascade in
+/// `persistence_tick.rs` does), so under `--disk-offload enable` the
+/// spill-sender branch below reliably takes the "no manifest reachable"
+/// plain-drop fallback inside
+/// `try_evict_if_needed_async_spill_with_total_budget_reporting` for EVERY
+/// write past `maxmemory` — this is, empirically, the actual eviction path a
+/// live server hits on ordinary writes (HSET, SET, ...) under disk-offload,
+/// not the sync `SpillContext` path. It previously called the non-reporting
+/// wrapper (hardcoded no-op sink), so those plain-drops never reached
+/// `record_reason_del_conn` — silently unreported eviction under the single
+/// most common disk-offload deployment shape. Now wired to the same sink the
+/// no-spill-sender branch below already uses.
 #[cfg(feature = "runtime-monoio")]
 fn run_write_eviction_gate(
     ctx: &super::core::ConnectionContext,
@@ -91,8 +105,25 @@ fn run_write_eviction_gate(
             .disk_offload_dir
             .as_deref()
             .unwrap_or(std::path::Path::new("."));
-        let res =
-            try_evict_if_needed_async_spill_budget(db, &rt, sender, dir, &mut fid, sel_db, budget);
+        let res = try_evict_if_needed_async_spill_budget_reporting(
+            db,
+            &rt,
+            sender,
+            dir,
+            &mut fid,
+            sel_db,
+            budget,
+            &mut |key| {
+                crate::replication::reason_del::record_reason_del_conn(
+                    &ctx.repl_state,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    ctx.aof_pool.as_ref(),
+                    sel_db,
+                    key,
+                );
+            },
+        );
         ctx.spill_file_id.set(fid);
         res
     } else {

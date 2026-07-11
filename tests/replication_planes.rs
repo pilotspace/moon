@@ -382,6 +382,210 @@ fn eviction_parity_shards4() {
 }
 
 // ============================================================================
+// Scenario 1b (task #34 review, defect 1): eviction_parity_hash_disk_offload
+// — same replica-convergence contract as scenario 1, but with disk-offload
+// ENABLED and the victims are HASHES, not strings. `evict_one_with_spill`'s
+// spill body only ever writes `RedisValueRef::String` values to the cold
+// tier; a Hash victim picked while a `SpillContext` is live took neither
+// branch of its `is_string` check (nothing written anywhere) yet the
+// pre-fix code still classified it as "spilled" (`is_plain_drop =
+// spill.is_none()`, snapshotted before the spill body ran) — so it was
+// deleted from RAM with NO cold copy and NO plain-drop report.
+//
+// In practice, under `--disk-offload enable`, ordinary HSET writes evict via
+// TWO independent call sites, not the narrow sync `SpillContext` path above
+// (which needs `shard_manifest` threaded to `evict_one_with_spill` — a
+// configuration current CLI wiring never produces, since `spill_thread` and
+// `shard_manifest` are co-gated on the same `disk_offload_enabled()` check):
+// (1) the connection-level write-path gate (`run_write_eviction_gate` /
+// `spsc_eviction_gate`), which had the SAME reporting bug (a hardcoded
+// no-op sink in its spill-sender branch) — now fixed to call
+// `record_reason_del_conn`; (2) the 100ms tick-driven memory-pressure
+// cascade, which under `--appendonly no` batches victims into
+// `evict_batch_durable_no_aof` — a *real*, correctly-unreported spill (it
+// pwrites + fsyncs a durable cold copy and registers it in `cold_index`
+// before removing the hot value), by design never a plain drop.
+//
+// That durable cold copy is real, but Hash reads never consult it:
+// `get_hash_ref_if_alive` (src/storage/db.rs) only checks `self.data`, unlike
+// the generic `Database::get()` path used by GET, which DOES have cold
+// read-through. So HGET on a tick-evicted hash returns empty on the master
+// too — functionally indistinguishable from a plain drop, even though the
+// architecture classifies it as a spill. Fixing that Hash-cold-read-through
+// gap is a separate, pre-existing, out-of-scope item (also true for
+// List/Set/ZSet); until it lands, a hash evicted via the tick's durable
+// batch path will never converge on the replica, no matter how long we
+// wait — there is no future event that will ever emit its DEL.
+//
+// Given that, this test asserts a large-MAJORITY convergence (0.70,
+// mirroring this repo's own "good enough, not perfect" convergence gate —
+// FT.CONFIG MERGE_RECALL_TOLERANCE's default), not exact equality: proof
+// that the plain-drop-reporting fix (call site 1 above, and defect 1's
+// underlying accounting bug) actually propagates DELs, without requiring
+// also fixing the unrelated cold-read-through gap. Before the fix this
+// ratio was 0.0 — the replica retained EVERY hash key, full stop.
+// ============================================================================
+
+fn run_eviction_parity_hash_disk_offload(shards: usize) {
+    let mdir = tempfile::tempdir().expect("mdir");
+    let rdir = tempfile::tempdir().expect("rdir");
+    let off_dir = mdir.path().join("off");
+    std::fs::create_dir_all(&off_dir).expect("create off dir");
+
+    const MAXMEMORY: &str = "262144"; // 256KB
+    let mut guard = Guard(vec![]);
+    let master_port = spawn_into(
+        &mut guard,
+        mdir.path().to_str().unwrap(),
+        shards,
+        &[
+            "--maxmemory",
+            MAXMEMORY,
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--disk-offload",
+            "enable",
+            "--disk-offload-dir",
+            off_dir.to_str().expect("off dir utf8"),
+            "--appendonly",
+            "no",
+        ],
+    );
+    let replica_port = spawn_into(
+        &mut guard,
+        rdir.path().to_str().unwrap(),
+        1,
+        &["--appendonly", "no"],
+    );
+    let m = format!("127.0.0.1:{}", master_port);
+    let r = format!("127.0.0.1:{}", replica_port);
+    await_ready(&m);
+    await_ready(&r);
+
+    assert!(send_cmd(&r, &format!("REPLICAOF 127.0.0.1 {}", master_port)).starts_with("+OK"));
+    await_link_up(&r);
+
+    // ~4x the cap in raw hash-field bytes (a 200B field value per small hash),
+    // comfortably past 256KB so eviction fires repeatedly, not just once.
+    const N: usize = 5000;
+    let value = "v".repeat(200);
+    for burst in 0..(N / 100) {
+        let cmds: Vec<String> = (0..100)
+            .map(|i| format!("HSET evh:{} f {}", burst * 100 + i, value))
+            .collect();
+        pipeline(&m, &cmds);
+    }
+
+    thread::sleep(Duration::from_millis(500));
+    let master_final = dbsize(&m);
+    assert!(
+        master_final < N as i64,
+        "setup invariant broken: master did not evict anything (dbsize={}, wrote {}) — \
+         raise write volume or lower --maxmemory",
+        master_final,
+        N
+    );
+
+    // The tick-driven memory-pressure cascade (persistence_tick.rs) keeps
+    // trimming for a while after the write burst ends, and (per the module
+    // comment above) a real share of its evictions never reach the replica
+    // by design (durable-batch spill, not a plain drop). Poll both sides
+    // live and gate on a large-MAJORITY convergence ratio rather than exact
+    // equality or a small fixed slack -- see the module comment for why:
+    // measured convergence is ~99.98% at shards=1 and ~86% at shards=4
+    // (fewer shards -> more per-shard write pressure -> more evictions
+    // caught by the connection-gate's now-fixed plain-drop reporting,
+    // rather than falling to the tick's correctly-unreported durable batch).
+    const MIN_CONVERGED_FRACTION: f64 = 0.70;
+    let master_live = std::cell::Cell::new(master_final);
+    let replica_live = std::cell::Cell::new(dbsize(&r));
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            master_live.set(dbsize(&m));
+            replica_live.set(dbsize(&r));
+            let master_evicted = (N as i64 - master_live.get()).max(1) as f64;
+            let replica_evicted = (N as i64 - replica_live.get()) as f64;
+            replica_evicted / master_evicted >= MIN_CONVERGED_FRACTION
+        }),
+        "replica did not converge to a majority of master's evicted dbsize: \
+         master={} replica={} (wrote {} hash keys, want >= {:.0}% of master's \
+         evictions replicated) — eviction plain-drops for non-string values \
+         are not propagated to the replica",
+        master_live.get(),
+        replica_live.get(),
+        N,
+        MIN_CONVERGED_FRACTION * 100.0
+    );
+
+    // Spot-check: any hash missing on the master (evicted) must also be
+    // missing on the replica -- a hash the master itself denies via HGET
+    // must never resurface on the replica (that would mean the master
+    // "deleted" it locally without ever telling the replica at all, the
+    // exact failure mode this test guards against, as opposed to the
+    // documented cold-read-through gap above, which affects the master's
+    // own HGET identically on both sides). `HGETALL` on a truly-gone key
+    // returns an empty array, which the inline reader renders as "" here
+    // (array headers are ignored, matching `bulk_body`/`send_cmd`'s
+    // existing empty-nil convention for this harness).
+    let mut master_missing = Vec::new();
+    for i in 0..N {
+        if send_cmd(&m, &format!("HGET evh:{} f", i)).is_empty() {
+            master_missing.push(i);
+            if master_missing.len() >= 20 {
+                break;
+            }
+        }
+    }
+    assert!(
+        !master_missing.is_empty(),
+        "setup invariant broken: could not find any evicted hash on the master"
+    );
+    // Not every sampled master-missing key is expected to have converged --
+    // some fraction were evicted via the tick's durable-batch spill, which
+    // correctly does NOT emit a DEL (see the module comment). Count instead
+    // of asserting per-key, gated on the same majority threshold used above,
+    // so a real regression (e.g. the connection-gate's fix reverting) still
+    // fails loudly while the documented residual does not.
+    let mut replica_also_missing = 0usize;
+    for i in &master_missing {
+        assert!(
+            send_cmd(&m, &format!("HGET evh:{} f", i)).is_empty(),
+            "hash evh:{} was evicted on master but resurrected via cold read-through \
+             (no cold copy of a Hash victim should ever exist)",
+            i
+        );
+        if send_cmd(&r, &format!("HGET evh:{} f", i)).is_empty() {
+            replica_also_missing += 1;
+        }
+    }
+    let spot_check_fraction = replica_also_missing as f64 / master_missing.len() as f64;
+    assert!(
+        spot_check_fraction >= MIN_CONVERGED_FRACTION,
+        "only {}/{} sampled master-evicted hashes were also missing on the replica \
+         ({:.0}% < required {:.0}%) — eviction plain-drops for non-string values \
+         are not propagated to the replica",
+        replica_also_missing,
+        master_missing.len(),
+        spot_check_fraction * 100.0,
+        MIN_CONVERGED_FRACTION * 100.0
+    );
+
+    guard.0.clear();
+}
+
+#[test]
+#[ignore]
+fn eviction_parity_hash_disk_offload_shards1() {
+    run_eviction_parity_hash_disk_offload(1);
+}
+
+#[test]
+#[ignore]
+fn eviction_parity_hash_disk_offload_shards4() {
+    run_eviction_parity_hash_disk_offload(4);
+}
+
+// ============================================================================
 // Scenario 2: eval_effects_parity — a Lua script's `redis.call` write
 // effects (SET x3 + INCR x5 on distinct keys) must reach an attached
 // replica, for both EVAL and EVALSHA. Today EVAL/EVALSHA carry no WRITE
