@@ -26,6 +26,8 @@
 //! `tests/replication_multishard.rs` — belt and suspenders against the
 //! diskfull guard (`/Volumes/Games` itself hovers near the 5% floor).
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -236,6 +238,22 @@ impl Drop for Guard {
     }
 }
 
+/// Spawn moon on a dynamically reserved port via `common::spawn_listening`
+/// (TOCTOU-safe, dead-child respawn) and push the child into `guard`
+/// IMMEDIATELY — before any panic-able readiness wait can leak it. A leaked
+/// server on a fixed port is poison here: moon binds with SO_REUSEPORT, so
+/// a stale process silently SHARES the port with the next run's server and
+/// splits its connections (observed on the Linux VM: three masters on one
+/// port after two failed runs). Returns the live port.
+///
+/// Restart legs (same port + same dir on purpose) keep direct `start_moon`
+/// calls — push those into the guard immediately too.
+fn spawn_into(guard: &mut Guard, dir: &str, shards: usize, extra: &[&str]) -> u16 {
+    let (child, port) = common::spawn_listening(|port| start_moon(port, dir, shards, extra));
+    guard.0.push(child);
+    port
+}
+
 /// SAFETY: `pid` is a live child PID we spawned ourselves; SIGKILL is always
 /// a valid signal to send. Mirrors `tests/replication_hardening.rs`.
 fn sigkill(child: &mut Child) {
@@ -253,15 +271,16 @@ fn sigkill(child: &mut Child) {
 // itself has since evicted.
 // ============================================================================
 
-fn run_eviction_parity(shards: usize, master_port: u16, replica_port: u16) {
+fn run_eviction_parity(shards: usize) {
     let mdir = tempfile::tempdir().expect("mdir");
     let rdir = tempfile::tempdir().expect("rdir");
     // Small whole-instance cap + allkeys-lru: writes past the cap force
     // plain-drop eviction of older keys. `--disk-offload disable` per the
     // Wave A eviction-emission scope (plain-drops only, no spill/cold tier).
     const MAXMEMORY: &str = "262144"; // 256KB
-    let master = start_moon(
-        master_port,
+    let mut guard = Guard(vec![]);
+    let master_port = spawn_into(
+        &mut guard,
         mdir.path().to_str().unwrap(),
         shards,
         &[
@@ -275,13 +294,12 @@ fn run_eviction_parity(shards: usize, master_port: u16, replica_port: u16) {
             "no",
         ],
     );
-    let replica = start_moon(
-        replica_port,
+    let replica_port = spawn_into(
+        &mut guard,
         rdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let mut guard = Guard(vec![master, replica]);
     let m = format!("127.0.0.1:{}", master_port);
     let r = format!("127.0.0.1:{}", replica_port);
     await_ready(&m);
@@ -354,13 +372,13 @@ fn run_eviction_parity(shards: usize, master_port: u16, replica_port: u16) {
 #[test]
 #[ignore]
 fn eviction_parity_shards1() {
-    run_eviction_parity(1, 17301, 17302);
+    run_eviction_parity(1);
 }
 
 #[test]
 #[ignore]
 fn eviction_parity_shards4() {
-    run_eviction_parity(4, 17311, 17312);
+    run_eviction_parity(4);
 }
 
 // ============================================================================
@@ -473,22 +491,22 @@ fn evalsha_find_shard_and_run(
     );
 }
 
-fn run_eval_effects_parity(shards: usize, master_port: u16, replica_port: u16) {
+fn run_eval_effects_parity(shards: usize) {
     let mdir = tempfile::tempdir().expect("mdir");
     let rdir = tempfile::tempdir().expect("rdir");
-    let master = start_moon(
-        master_port,
+    let mut guard = Guard(vec![]);
+    let master_port = spawn_into(
+        &mut guard,
         mdir.path().to_str().unwrap(),
         shards,
         &["--appendonly", "no"],
     );
-    let replica = start_moon(
-        replica_port,
+    let replica_port = spawn_into(
+        &mut guard,
         rdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let mut guard = Guard(vec![master, replica]);
     let m = format!("127.0.0.1:{}", master_port);
     let r = format!("127.0.0.1:{}", replica_port);
     await_ready(&m);
@@ -616,13 +634,13 @@ fn run_eval_effects_parity(shards: usize, master_port: u16, replica_port: u16) {
 #[test]
 #[ignore]
 fn eval_effects_parity_shards1() {
-    run_eval_effects_parity(1, 17321, 17322);
+    run_eval_effects_parity(1);
 }
 
 #[test]
 #[ignore]
 fn eval_effects_parity_shards4() {
-    run_eval_effects_parity(4, 17331, 17332);
+    run_eval_effects_parity(4);
 }
 
 // ============================================================================
@@ -636,10 +654,10 @@ fn eval_effects_parity_shards4() {
 #[test]
 #[ignore]
 fn eval_writes_survive_restart() {
-    let (port,) = (17341,);
     let dir = tempfile::tempdir().expect("dir");
-    let mut master = start_moon(
-        port,
+    let mut guard = Guard(vec![]);
+    let port = spawn_into(
+        &mut guard,
         dir.path().to_str().unwrap(),
         1,
         &["--appendonly", "yes"],
@@ -674,15 +692,16 @@ fn eval_writes_survive_restart() {
     // Give the AOF writer a moment to flush/fsync before the kill (WAL/AOF
     // group-commit cadence; not testing the fsync timing itself here).
     thread::sleep(Duration::from_millis(500));
-    sigkill(&mut master);
+    sigkill(&mut guard.0[0]);
 
-    let master2 = start_moon(
+    // Restart leg: SAME port + dir on purpose (AOF replay continuity) —
+    // direct start_moon, pushed into the guard immediately.
+    guard.0.push(start_moon(
         port,
         dir.path().to_str().unwrap(),
         1,
         &["--appendonly", "yes"],
-    );
-    let _guard = Guard(vec![master2]);
+    ));
     await_ready(&m);
 
     // FEATURE ASSERTION: EVAL-written keys must exist after restart.
@@ -707,11 +726,11 @@ fn eval_writes_survive_restart() {
 #[test]
 #[ignore]
 fn evicted_keys_stay_dead_after_restart() {
-    let (port,) = (17351,);
     let dir = tempfile::tempdir().expect("dir");
     const MAXMEMORY: &str = "262144"; // 256KB
-    let mut master = start_moon(
-        port,
+    let mut guard = Guard(vec![]);
+    let port = spawn_into(
+        &mut guard,
         dir.path().to_str().unwrap(),
         1,
         &[
@@ -756,9 +775,11 @@ fn evicted_keys_stay_dead_after_restart() {
     );
 
     thread::sleep(Duration::from_millis(500));
-    sigkill(&mut master);
+    sigkill(&mut guard.0[0]);
 
-    let master2 = start_moon(
+    // Restart leg: SAME port + dir on purpose (AOF replay continuity) —
+    // direct start_moon, pushed into the guard immediately.
+    guard.0.push(start_moon(
         port,
         dir.path().to_str().unwrap(),
         1,
@@ -772,8 +793,7 @@ fn evicted_keys_stay_dead_after_restart() {
             "--disk-offload",
             "disable",
         ],
-    );
-    let _guard = Guard(vec![master2]);
+    ));
     await_ready(&m);
 
     // FEATURE ASSERTION: the evicted key must still be gone.
@@ -812,22 +832,21 @@ fn evicted_keys_stay_dead_after_restart() {
 #[test]
 #[ignore]
 fn expiry_del_propagates() {
-    let (master_port, replica_port) = (17361, 17362);
     let mdir = tempfile::tempdir().expect("mdir");
     let rdir = tempfile::tempdir().expect("rdir");
-    let master = start_moon(
-        master_port,
+    let mut guard = Guard(vec![]);
+    let master_port = spawn_into(
+        &mut guard,
         mdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let replica = start_moon(
-        replica_port,
+    let replica_port = spawn_into(
+        &mut guard,
         rdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let mut guard = Guard(vec![master, replica]);
     let m = format!("127.0.0.1:{}", master_port);
     let r = format!("127.0.0.1:{}", replica_port);
     await_ready(&m);
@@ -896,15 +915,14 @@ fn expiry_del_propagates() {
 #[test]
 #[ignore]
 fn select_in_script_errors() {
-    let (port,) = (17371,);
     let dir = tempfile::tempdir().expect("dir");
-    let master = start_moon(
-        port,
+    let mut guard = Guard(vec![]);
+    let port = spawn_into(
+        &mut guard,
         dir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let _guard = Guard(vec![master]);
     let m = format!("127.0.0.1:{}", port);
     await_ready(&m);
 
@@ -959,22 +977,21 @@ fn select_in_script_errors() {
 #[test]
 #[ignore]
 fn eval_incr_no_double_apply() {
-    let (master_port, replica_port) = (17381, 17382);
     let mdir = tempfile::tempdir().expect("mdir");
     let rdir = tempfile::tempdir().expect("rdir");
-    let master = start_moon(
-        master_port,
+    let mut guard = Guard(vec![]);
+    let master_port = spawn_into(
+        &mut guard,
         mdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let replica = start_moon(
-        replica_port,
+    let replica_port = spawn_into(
+        &mut guard,
         rdir.path().to_str().unwrap(),
         1,
         &["--appendonly", "no"],
     );
-    let mut guard = Guard(vec![master, replica]);
     let m = format!("127.0.0.1:{}", master_port);
     let r = format!("127.0.0.1:{}", replica_port);
     await_ready(&m);
