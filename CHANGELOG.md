@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — R2: multi-shard master PSYNC (task #20, RFC 1B)
+
+A master running `--shards N` now serves full replication to a single-shard
+replica — previously PSYNC was rejected with `-ERR PSYNC across multiple
+shards is not yet supported`.
+
+- **Per-shard atomic snapshot legs.** A new `ShardMessage::PrepareReplicaSync`
+  fans out to every shard (own shard via the self queue, the rest over the
+  SPSC mesh). Each shard serializes its keyspace slice to an RDB *body*,
+  captures its replication offset, and registers the replica's live channel
+  in ONE synchronous stretch on its own thread — per shard, nothing can land
+  between "inside the snapshot" and "streamed live", so there is no backlog
+  catch-up leg and non-idempotent commands (INCR) can never double-apply.
+- **One merged Redis-format RDB.** The PSYNC task stitches the per-shard
+  bodies into a single valid RDB (`redis_rdb::write_rdb_merged`: header +
+  bodies + EOF/CRC64) and answers `+FULLRESYNC <replid> <Σ shard offsets>`
+  with one `$<len>` bulk — the replica's existing R0 loader needs no changes.
+  Index definitions ride once; graph content is sharded, so the snapshot
+  carries one `moon-graph-store` aux entry per shard and the replica imports
+  all of them (`install_graph_store_many`, `read_moon_aux_all`).
+- **Per-record SELECT framing on the merged wire.** N shard threads feed one
+  replica socket, so a shared "current db" context cannot exist: on
+  multi-shard masters every db-scoped record is fused with its own
+  `SELECT <db>` prefix (single channel send / backlog append pair / offset
+  advance) — no cross-shard interleave can split a SELECT from the write it
+  frames. Gated on the replica-attach hint; single-shard masters keep the
+  cheaper emit-on-change tracking.
+- **Partial resync degrades to full.** A replica's single scalar offset
+  cannot be mapped back onto N per-shard backlogs, so a multi-shard master
+  answers every PSYNC (any replid/offset) with `+FULLRESYNC`.
+- Overflow-kick (task #35), `REPLCONF ACK`, and `WAIT` all carry over: the
+  summed snapshot offset keeps `total_offset - base == bytes on wire`, so
+  WAIT/ACK math stays exact on multi-shard masters.
+- New e2e suite `tests/replication_multishard.rs`: 2/4/8-shard full resync +
+  live-stream convergence with INCR exactness, interleaved multi-db writers
+  with db-leak asserts, per-shard graph snapshot import, and the
+  partial→full degradation handshake.
+- Known limitation (unchanged from R1): master-side PSYNC requires
+  `runtime-monoio` (the default); the tokio build has no master-side PSYNC
+  intercept. Multi-shard *replicas* remain unsupported (`--shards 1`).
+
 ### Fixed — consistency/durability defects caught by the R1 gates (task #35)
 
 Three pre-existing data-integrity bugs surfaced by the new load/kill-9 gates

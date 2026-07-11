@@ -799,6 +799,199 @@ pub async fn handle_psync_inline_single_shard(
     Ok(())
 }
 
+/// R2 (task #20): multi-shard master full resync — RFC 1B.
+///
+/// Every multi-shard PSYNC is answered with a FULL resync: the replica's
+/// single scalar offset cannot be mapped back onto N per-shard backlogs, so
+/// `+CONTINUE` is never offered (the client's requested replid/offset are
+/// accepted but ignored). Flow:
+///
+///   1. Fan a [`ShardMessage::PrepareReplicaSync`] to every shard — its own
+///      via the self queue (the SPSC mesh has no self-loop), the rest over
+///      `dispatch_tx` + notifier. Each shard's arm snapshots its keyspace
+///      slice to an RDB *body*, captures its shard offset, and registers the
+///      replica's live channel — all in ONE synchronous stretch, so per shard
+///      nothing can land between "in the snapshot" and "streamed live".
+///   2. Stitch the bodies into ONE Redis-format RDB (`write_rdb_merged`) —
+///      index definitions once, one graph blob PER shard — and send
+///      `+FULLRESYNC <replid> <Σ shard offsets>` + the `$<len>` bulk. A
+///      single-shard replica loads it through the unchanged R0 path.
+///   3. Drain the merged live channel onto the socket (same drain + ACK
+///      reader + overflow-kick loop as the single-shard path).
+///
+/// The summed offset is consistent even though shards capture at different
+/// times: each shard's live records begin exactly at its own captured offset,
+/// so bytes-on-wire past the FULLRESYNC base always equal
+/// `total_offset() - base` — which keeps WAIT/ACK math exact.
+#[cfg(feature = "runtime-monoio")]
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_psync_inline_multi_shard(
+    mut stream: monoio::net::TcpStream,
+    repl_state: Arc<RwLock<ReplicationState>>,
+    replica_addr: std::net::SocketAddr,
+    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
+    spsc_notifiers: Vec<std::sync::Arc<crate::runtime::channel::Notify>>,
+    self_shard_id: usize,
+    num_shards: usize,
+) -> anyhow::Result<()> {
+    use monoio::io::AsyncWriteRentExt;
+    use ringbuf::traits::Producer;
+
+    let (repl_id, backlog_capacity) = {
+        let rs = repl_state
+            .read()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        (rs.repl_id.clone(), rs.backlog_capacity)
+    };
+
+    let replica_id = next_replica_id();
+    // One merged live channel: every shard's fan-out entry holds a clone of
+    // `tx`; the drain loop below pumps `rx` onto the socket. Capacity choice
+    // matches the single-shard path (task #35) — shared across all shards.
+    let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(16384);
+    let kicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Fan out PrepareReplicaSync; replies are bounded(1) channels usable
+    // across threads.
+    let mut reply_rxs = Vec::with_capacity(num_shards);
+    for shard in 0..num_shards {
+        let (reply_tx, reply_rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::shard::dispatch::PreparedShardSync>(1);
+        let mut msg = crate::shard::dispatch::ShardMessage::PrepareReplicaSync(Box::new(
+            crate::shard::dispatch::PrepareReplicaSyncPayload {
+                replica_id,
+                tx: tx.clone(),
+                kicked: kicked.clone(),
+                backlog_capacity,
+                reply_tx,
+            },
+        ));
+        if shard == self_shard_id {
+            crate::shard::self_msg::push(msg);
+        } else {
+            let idx = crate::shard::mesh::ChannelMesh::target_index(self_shard_id, shard);
+            // The SPSC ring can be transiently full under load — bounded retry,
+            // then abort loudly (the replica reconnects and retries the sync).
+            let mut attempts = 0u32;
+            loop {
+                let res = { dispatch_tx.borrow_mut()[idx].try_push(msg) };
+                match res {
+                    Ok(()) => {
+                        spsc_notifiers[shard].notify_one();
+                        break;
+                    }
+                    Err(back) => {
+                        msg = back;
+                        attempts += 1;
+                        if attempts > 5_000 {
+                            anyhow::bail!(
+                                "shard {} SPSC full for >5s during PSYNC fan-out; aborting sync",
+                                shard
+                            );
+                        }
+                        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        }
+        reply_rxs.push((shard, reply_rx));
+    }
+
+    // Collect every shard's leg. A dropped reply means that shard could not
+    // prepare (or we raced shutdown) — abort; already-registered shards clean
+    // up passively when `rx` drops (their next fan-out send sees Disconnected).
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(num_shards);
+    let mut snapshot_offset: u64 = 0;
+    let mut vector_defs: Option<Vec<u8>> = None;
+    let mut text_defs: Option<Vec<u8>> = None;
+    #[cfg(feature = "graph")]
+    let mut graph_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_shards);
+    for (shard, reply_rx) in reply_rxs {
+        let prepared = reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| anyhow::anyhow!("shard {} dropped its PrepareReplicaSync reply", shard))?;
+        snapshot_offset += prepared.shard_offset;
+        // Index definitions are keyspace-global and identical on every shard —
+        // keep the first non-empty copy.
+        if vector_defs.is_none() {
+            vector_defs = prepared.vector_defs;
+        }
+        if text_defs.is_none() {
+            text_defs = prepared.text_defs;
+        }
+        #[cfg(feature = "graph")]
+        graph_blobs.push(prepared.graph_blob);
+        bodies.push(prepared.rdb_body);
+    }
+
+    // Stitch ONE valid Redis-format RDB. Graph content is sharded: one aux
+    // entry per shard, imported in order by the replica (`read_moon_aux_all`).
+    let mut moon_aux: Vec<(&[u8], &[u8])> = Vec::new();
+    if let Some(v) = &vector_defs {
+        moon_aux.push((crate::persistence::redis_rdb::MOON_AUX_VECTOR_DEFS, &v[..]));
+    }
+    if let Some(t) = &text_defs {
+        moon_aux.push((crate::persistence::redis_rdb::MOON_AUX_TEXT_DEFS, &t[..]));
+    }
+    #[cfg(feature = "graph")]
+    for blob in &graph_blobs {
+        moon_aux.push((
+            crate::persistence::redis_rdb::MOON_AUX_GRAPH_STORE,
+            &blob[..],
+        ));
+    }
+    let mut rdb_buf: Vec<u8> = Vec::new();
+    crate::persistence::redis_rdb::write_rdb_merged(&moon_aux, &bodies, &mut rdb_buf);
+    info!(
+        replica_id,
+        num_shards,
+        snapshot_offset,
+        rdb_bytes = rdb_buf.len(),
+        "multi-shard full resync prepared"
+    );
+
+    let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);
+    let (wr, _) = stream.write_all(response.into_bytes()).await;
+    wr.map_err(|e| anyhow::anyhow!(e))?;
+    let header = format!("${}\r\n", rdb_buf.len());
+    let (wr, _) = stream.write_all(header.into_bytes()).await;
+    wr.map_err(|e| anyhow::anyhow!(e))?;
+    let (wr, _) = stream.write_all(rdb_buf).await;
+    wr.map_err(|e| anyhow::anyhow!(e))?;
+    // No backlog catch-up leg: each shard's registration IS its snapshot
+    // point (same synchronous stretch), so live fan-out already covers every
+    // byte past `snapshot_offset`.
+
+    let reg = InlineReplicaRegistration {
+        replica_id,
+        tx,
+        rx,
+        // The multi-shard path has no registration-offset reply channel —
+        // offsets arrived in the PrepareReplicaSync replies.
+        reg_rx: crate::runtime::channel::mpsc_bounded::<u64>(1).1,
+        kicked,
+    };
+    let drain_result =
+        drain_replica_inline_single_shard(reg, replica_addr, stream, repl_state).await;
+    // Best-effort explicit unregister on the REMOTE shards (the drain already
+    // self-queued UnregisterReplica for this shard). A full ring is fine —
+    // dropping `rx` above already flipped every sender to Disconnected, which
+    // the next fan-out send prunes.
+    for shard in 0..num_shards {
+        if shard == self_shard_id {
+            continue;
+        }
+        let idx = crate::shard::mesh::ChannelMesh::target_index(self_shard_id, shard);
+        let pushed = dispatch_tx.borrow_mut()[idx]
+            .try_push(crate::shard::dispatch::ShardMessage::UnregisterReplica { replica_id });
+        if pushed.is_ok() {
+            spsc_notifiers[shard].notify_one();
+        }
+    }
+    drain_result
+}
+
 /// Send backlog bytes `[from, to)` to the replica, or fail LOUDLY if the
 /// backlog can no longer serve that range (evicted mid-sync). Aborting drops
 /// the connection so the replica retries with a fresh full resync — strictly
@@ -865,13 +1058,17 @@ struct InlineReplicaRegistration {
 /// fan-out begins, which the caller uses to bound its backlog catch-up read
 /// (see `handle_psync_inline_single_shard`).
 #[cfg(feature = "runtime-monoio")]
+fn next_replica_id() -> u64 {
+    use std::sync::atomic::Ordering;
+    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(feature = "runtime-monoio")]
 fn push_register_replica_inline(
     repl_state: &Arc<RwLock<ReplicationState>>,
 ) -> anyhow::Result<InlineReplicaRegistration> {
-    use std::sync::atomic::Ordering;
-
-    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
+    let replica_id = next_replica_id();
 
     // 16384 records (task #35): 1024 overflowed within one pipelined burst on
     // the same host — every overflow now KICKS the replica into a resync, so

@@ -103,6 +103,28 @@ pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
 /// db-agnostic record can never silently strand a stale context for the next
 /// KV write.
 pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: Bytes) {
+    // R2 (task #20): multi-shard masters merge N shard streams onto one
+    // replica wire, so the per-shard `stream_db` context tracking below is
+    // meaningless there — another shard may have moved the wire's db context
+    // between any two of this shard's records. Instead EVERY db-scoped record
+    // is framed with its own `SELECT <db>` prefix, fused into ONE record so
+    // no cross-shard interleave can split them. Gated on the fanout hint: a
+    // multi-shard master that never had a replica attach pays nothing, and
+    // the hint flips (process-global, then re-asserted by each shard's
+    // `PrepareReplicaSync` arm BEFORE that shard's snapshot offset is
+    // captured) before any of this shard's records can reach a wire.
+    if ctx.num_shards > 1 {
+        if crate::replication::state::fanout_hint_active() {
+            let select = serialize_select(db);
+            let mut combined = Vec::with_capacity(select.len() + bytes.len());
+            combined.extend_from_slice(&select);
+            combined.extend_from_slice(&bytes);
+            record_local_write(ctx, Bytes::from(combined));
+        } else {
+            record_local_write(ctx, bytes);
+        }
+        return;
+    }
     let needs_select = ctx.repl_state.as_ref().is_some_and(|rs| {
         rs.read().is_ok_and(|g| {
             g.stream_db.get(ctx.shard_id).is_some_and(|slot| {

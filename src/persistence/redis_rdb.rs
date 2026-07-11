@@ -462,7 +462,17 @@ pub fn write_rdb_refs_with_moon_aux(
     for (key, value) in moon_aux {
         write_aux(buf, key, value);
     }
+    write_rdb_body_refs(databases, buf);
+    write_rdb_footer(buf);
+}
 
+/// Body-only writer: per-DB SELECTDB/RESIZEDB sections and entries — NO
+/// header, aux, EOF, or CRC. Building block for [`write_rdb_merged`]: a
+/// multi-shard master has each shard serialize its own keyspace slice with
+/// this, then stitches the bodies into ONE valid RDB. Repeated SELECTDB
+/// opcodes for the same db index (one per shard) are valid RDB — loaders
+/// treat SELECTDB as "switch current db" and accumulate entries.
+pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
     let now_ms = current_time_ms();
 
     for (db_idx, db) in databases.iter().enumerate() {
@@ -486,7 +496,7 @@ pub fn write_rdb_refs_with_moon_aux(
         buf.push(RDB_OPCODE_SELECTDB);
         write_length(buf, db_idx as u64);
 
-        // RESIZEDB
+        // RESIZEDB (per-shard slice size — a presize hint only, safe to repeat)
         buf.push(RDB_OPCODE_RESIZEDB);
         write_length(buf, live.len() as u64);
         write_length(buf, expires_count as u64);
@@ -495,7 +505,21 @@ pub fn write_rdb_refs_with_moon_aux(
             write_rdb_entry(buf, key.as_bytes(), entry, base_ts);
         }
     }
+}
 
+/// Assemble ONE valid Redis-format RDB from pre-serialized per-shard bodies
+/// (each produced by [`write_rdb_body_refs`]): header + moon aux fields +
+/// concatenated bodies + EOF/CRC footer. The multi-shard PSYNC full resync
+/// (R2, task #20) sends this as a single `$<len>` bulk so a single-shard
+/// replica loads it with the unchanged R0 path.
+pub fn write_rdb_merged(moon_aux: &[(&[u8], &[u8])], bodies: &[Vec<u8>], buf: &mut Vec<u8>) {
+    write_rdb_header(buf);
+    for (key, value) in moon_aux {
+        write_aux(buf, key, value);
+    }
+    for body in bodies {
+        buf.extend_from_slice(body);
+    }
     write_rdb_footer(buf);
 }
 
@@ -547,6 +571,39 @@ pub fn read_moon_aux(data: &[u8], key: &[u8]) -> Option<Vec<u8>> {
         let v = read_redis_string(&mut cursor).ok()?;
         if k == key {
             return Some(v);
+        }
+    }
+}
+
+/// Like [`read_moon_aux`] but collects EVERY occurrence of `key` in the
+/// header aux block, in write order. A merged multi-shard snapshot
+/// ([`write_rdb_merged`]) carries one `moon-graph-store` aux entry PER shard —
+/// graph content is sharded, so the replica must import all of them, not just
+/// the first. Returns an empty Vec for foreign/truncated buffers or when the
+/// key never appears.
+pub fn read_moon_aux_all(data: &[u8], key: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if data.len() < 9 || &data[..5] != REDIS_RDB_MAGIC || &data[5..9] != REDIS_RDB_VERSION {
+        return out;
+    }
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(9); // magic + version
+    loop {
+        let mut opcode = [0u8; 1];
+        if cursor.read_exact(&mut opcode).is_err() {
+            return out;
+        }
+        if opcode[0] != RDB_OPCODE_AUX {
+            return out;
+        }
+        let Ok(k) = read_redis_string(&mut cursor) else {
+            return out;
+        };
+        let Ok(v) = read_redis_string(&mut cursor) else {
+            return out;
+        };
+        if k == key {
+            out.push(v);
         }
     }
 }
@@ -765,6 +822,74 @@ mod tests {
         let mut dbs = vec![Database::new()];
         let loaded = load_rdb(&mut dbs, &buf).expect("aux-carrying RDB must load");
         assert_eq!(loaded, 0);
+    }
+
+    /// R2 (task #20): a merged multi-shard snapshot — per-shard bodies with
+    /// REPEATED SELECTDB sections for the same db — must load as one keyspace,
+    /// and repeated graph aux entries must all be readable in write order.
+    #[test]
+    fn merged_multishard_rdb_round_trip() {
+        // "Shard 0": keys in db0 and db2. "Shard 1": different keys, same dbs.
+        let mk = |pairs: &[(usize, &str, &str)]| {
+            let mut dbs = vec![Database::new(), Database::new(), Database::new()];
+            for (db_idx, k, v) in pairs {
+                dbs[*db_idx].set(
+                    Bytes::copy_from_slice(k.as_bytes()),
+                    Entry::new_string(Bytes::copy_from_slice(v.as_bytes())),
+                );
+            }
+            dbs
+        };
+        let shard0 = mk(&[(0, "a", "1"), (2, "c", "3")]);
+        let shard1 = mk(&[(0, "b", "2"), (2, "d", "4")]);
+
+        let mut body0 = Vec::new();
+        write_rdb_body_refs(&shard0.iter().collect::<Vec<_>>(), &mut body0);
+        let mut body1 = Vec::new();
+        write_rdb_body_refs(&shard1.iter().collect::<Vec<_>>(), &mut body1);
+
+        let mut merged = Vec::new();
+        write_rdb_merged(
+            &[
+                (MOON_AUX_VECTOR_DEFS, b"vec-defs"),
+                (MOON_AUX_GRAPH_STORE, b"graph-shard-0"),
+                (MOON_AUX_GRAPH_STORE, b"graph-shard-1"),
+            ],
+            &[body0, body1],
+            &mut merged,
+        );
+
+        // Single-occurrence reader still finds the first entry of each key.
+        assert_eq!(
+            read_moon_aux(&merged, MOON_AUX_VECTOR_DEFS).as_deref(),
+            Some(&b"vec-defs"[..])
+        );
+        // All-occurrences reader returns every shard's graph blob in order.
+        assert_eq!(
+            read_moon_aux_all(&merged, MOON_AUX_GRAPH_STORE),
+            vec![b"graph-shard-0".to_vec(), b"graph-shard-1".to_vec()]
+        );
+        assert!(read_moon_aux_all(&merged, b"moon-unknown").is_empty());
+
+        // The merged blob is ONE valid RDB (magic/version/CRC) whose repeated
+        // SELECTDB sections accumulate into a single keyspace.
+        let mut loaded = vec![Database::new(), Database::new(), Database::new()];
+        let n = load_rdb(&mut loaded, &merged).expect("merged RDB must load");
+        assert_eq!(n, 4);
+        let get = |db: &Database, k: &str| {
+            db.data()
+                .iter()
+                .find(|(key, _)| key.as_bytes() == k.as_bytes())
+                .map(|(_, e)| match e.as_redis_value() {
+                    RedisValueRef::String(s) => s.to_vec(),
+                    _ => panic!("expected string"),
+                })
+        };
+        assert_eq!(get(&loaded[0], "a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get(&loaded[0], "b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(get(&loaded[2], "c").as_deref(), Some(&b"3"[..]));
+        assert_eq!(get(&loaded[2], "d").as_deref(), Some(&b"4"[..]));
+        assert!(get(&loaded[1], "a").is_none());
     }
 
     #[test]

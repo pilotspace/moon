@@ -541,10 +541,9 @@ pub(super) fn try_handle_cdc_read(
 /// loop and returns the stream so the master replication driver can take over.
 ///
 /// Returns `None` for non-PSYNC commands.
-/// Returns `Some((..))` only when num_shards == 1 (the supported topology).
-/// For multi-shard topologies, pushes a clear error and returns `None`
-/// (consumed via `responses`); the caller treats it like any other command
-/// reply and continues — the replica will see the error and give up.
+/// Returns `Some((..))` for every accepted PSYNC — the accept loop routes the
+/// hijacked stream to the single-shard inline handler or, at num_shards > 1,
+/// to the R2 multi-shard handler (`handle_psync_inline_multi_shard`).
 pub(super) fn try_handle_psync(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -557,12 +556,6 @@ pub(super) fn try_handle_psync(
     if cmd_args.len() != 2 {
         responses.push(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'psync' command",
-        )));
-        return None;
-    }
-    if ctx.num_shards != 1 {
-        responses.push(Frame::Error(Bytes::from_static(
-            b"ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)",
         )));
         return None;
     }

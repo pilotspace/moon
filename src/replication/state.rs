@@ -276,6 +276,15 @@ impl OffsetHandle {
             .map(|o| o.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
+
+    /// Number of shards this handle tracks. R2 (task #20): `> 1` switches the
+    /// replica-stream serialization to per-record `SELECT` framing — N shard
+    /// threads feed ONE replica wire, so a shared "current db" context cannot
+    /// exist and every db-scoped record must carry its own.
+    #[inline]
+    pub fn num_shards(&self) -> usize {
+        self.shard_offsets.len()
+    }
 }
 
 const ZEROED_ID: &str = "0000000000000000000000000000000000000000";

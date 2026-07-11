@@ -422,6 +422,47 @@ pub type ReplicaFanout = (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
 );
 
+/// Payload of [`ShardMessage::PrepareReplicaSync`] (R2 multi-shard PSYNC).
+pub struct PrepareReplicaSyncPayload {
+    /// Master-side replica id — same id on every shard's fan-out entry.
+    pub replica_id: u64,
+    /// The replica's ONE live channel: every shard pushes its records here
+    /// and the PSYNC drain task pumps them onto the socket (merged wire).
+    pub tx: channel::MpscSender<bytes::Bytes>,
+    /// Shared overflow disconnect signal — any shard's fan-out overflow
+    /// kicks the replica into a resync (see `RegisterReplica::kicked`).
+    pub kicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--repl-backlog-size`, for the lazy backlog fallback-init.
+    pub backlog_capacity: usize,
+    /// Reply channel (bounded 1). Cross-thread capable — remote shards send
+    /// their prepared leg back to the PSYNC connection task.
+    pub reply_tx: channel::MpscSender<PreparedShardSync>,
+}
+
+/// One shard's prepared full-resync leg — the reply to
+/// [`ShardMessage::PrepareReplicaSync`].
+pub struct PreparedShardSync {
+    /// RDB *body* (SELECTDB/RESIZEDB/entry sections only) of this shard's
+    /// keyspace slice — see `redis_rdb::write_rdb_body_refs`. The PSYNC task
+    /// stitches all shards' bodies into one valid RDB via
+    /// `redis_rdb::write_rdb_merged`.
+    pub rdb_body: Vec<u8>,
+    /// This shard's replication offset at capture. Live fan-out to the
+    /// replica begins exactly here (same synchronous stretch).
+    pub shard_offset: u64,
+    /// Vector index definitions (index_persist v5 sidecar bytes) — defs are
+    /// keyspace-global and identical on every shard; the stitcher uses shard
+    /// 0's copy. `None` when no vector indexes exist.
+    pub vector_defs: Option<Vec<u8>>,
+    /// Text index definitions; same convention as `vector_defs`.
+    pub text_defs: Option<Vec<u8>>,
+    /// This shard's graph-store snapshot blob. Graph CONTENT is sharded, so
+    /// the stitcher writes one `moon-graph-store` aux entry PER shard and the
+    /// replica imports all of them (`read_moon_aux_all`).
+    #[cfg(feature = "graph")]
+    pub graph_blob: Vec<u8>,
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -503,6 +544,22 @@ pub enum ShardMessage {
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
     UnregisterReplica { replica_id: u64 },
+    /// R2 (task #20): one shard's leg of a MULTI-SHARD full resync.
+    ///
+    /// The PSYNC connection task fans this to every shard (its own via the
+    /// self queue, the rest over the SPSC mesh). Each shard's arm runs the
+    /// whole leg in ONE synchronous stretch on its own thread — serialize its
+    /// keyspace slice to an RDB *body*, capture its shard replication offset,
+    /// and register `(replica_id, tx, kicked)` for live fan-out — so per
+    /// shard there is no window between "state captured" and "live stream
+    /// begins": every mutation is either inside the RDB body (offset already
+    /// counted below the captured offset) or delivered live. No backlog
+    /// catch-up leg exists on this path, and the `+FULLRESYNC` offset is the
+    /// sum of the per-shard captured offsets.
+    ///
+    /// Boxed: the payload carries channels + capacity fields well past the
+    /// enum's inline size budget.
+    PrepareReplicaSync(Box<PrepareReplicaSyncPayload>),
     /// Deliver an already-RECORDED local write to the live replica streams.
     ///
     /// The producing thread (`replication::record_local_write`) has ALREADY

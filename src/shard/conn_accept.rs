@@ -757,6 +757,12 @@ pub(crate) fn spawn_monoio_connection(
                             _hijacked_psync = true;
                             let repl_state_clone = conn_ctx.repl_state.clone();
                             let shard_databases_clone = conn_ctx.shard_databases.clone();
+                            // R2 (task #20): the multi-shard handler fans
+                            // PrepareReplicaSync over the SPSC mesh.
+                            let psync_num_shards = conn_ctx.num_shards;
+                            let psync_dispatch_tx = conn_ctx.dispatch_tx.clone();
+                            let psync_notifiers = conn_ctx.spsc_notifiers.clone();
+                            let psync_shard_id = conn_ctx.shard_id;
                             let parsed_addr: std::net::SocketAddr = hp_peer
                                 .parse()
                                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -764,14 +770,27 @@ pub(crate) fn spawn_monoio_connection(
                             let client_offset_v = *client_offset;
                             monoio::spawn(async move {
                                 if let Some(rs) = repl_state_clone {
-                                    if let Err(e) = crate::replication::master::handle_psync_inline_single_shard(
-                                        &client_repl_id_owned,
-                                        client_offset_v,
-                                        stream,
-                                        rs,
-                                        shard_databases_clone,
-                                        parsed_addr,
-                                    ).await {
+                                    let res = if psync_num_shards > 1 {
+                                        crate::replication::master::handle_psync_inline_multi_shard(
+                                            stream,
+                                            rs,
+                                            parsed_addr,
+                                            psync_dispatch_tx,
+                                            psync_notifiers,
+                                            psync_shard_id,
+                                            psync_num_shards,
+                                        ).await
+                                    } else {
+                                        crate::replication::master::handle_psync_inline_single_shard(
+                                            &client_repl_id_owned,
+                                            client_offset_v,
+                                            stream,
+                                            rs,
+                                            shard_databases_clone,
+                                            parsed_addr,
+                                        ).await
+                                    };
+                                    if let Err(e) = res {
                                         tracing::warn!("PSYNC handler exited: {}", e);
                                     }
                                 } else {
