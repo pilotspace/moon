@@ -115,6 +115,13 @@ on the stage-2a MQ WAL effect records (PR #291):
   entries, `last_id`, consumer groups (PEL + per-consumer pending), the
   `durable` flag, and `max_delivery_count`. Without this fix, MQ FULLRESYNC
   backfill would silently lose every durable queue's message content.
+  **Operator note — upgrade masters and replicas together** if any durable
+  Streams exist: a pre-fix replica syncing from a fixed master hard-fails
+  FULLRESYNC on the new `RDB_TYPE_STREAM_MOON` tag (and retries on its
+  reconnect loop until upgraded), while a fixed replica syncing from a
+  pre-fix master absorbs the old placeholder as a corrupted string value —
+  both inherent to fixing a wire-format bug, neither loses data already
+  durable in the master's WAL.
 - Two new `cargo-fuzz` targets: `mq_registry_blob` (the new
   `install_mq_registry_many` decoder) and `redis_rdb_load` (the FULLRESYNC
   RDB loader as a whole, including the new Stream type tag) — wired into
