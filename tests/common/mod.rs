@@ -167,21 +167,8 @@ pub fn find_moon_binary() -> PathBuf {
 
 /// SIGKILL a spawned child and reap it (never SIGTERM — SIGTERM +
 /// SO_REUSEPORT is a documented hang, see CLAUDE.md / the harness-speed
-/// gotcha ledger).
-#[cfg(unix)]
-pub fn sigkill(child: &mut Child) {
-    let pid = child.id() as i32;
-    // SAFETY: `pid` is the live child's own process id (owned `Child`, not
-    // yet waited on by this call), so the SIGKILL targets exactly the
-    // process the caller spawned; `libc::kill` has no memory-safety
-    // preconditions beyond passing a valid signal number.
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
+/// gotcha ledger). `Child::kill()` is documented to send SIGKILL on Unix,
+/// so no raw `libc::kill` (and no `unsafe`, no cfg split) is needed.
 pub fn sigkill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();

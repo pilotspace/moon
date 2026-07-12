@@ -878,9 +878,15 @@ pub fn concurrent_burst_no_corruption(cfg: &Config) {
              not-found) after a mid-burst kill",
             cfg.label
         );
+        // XLEN on a never-durable queue replies Int(0), so no benign
+        // not-found error strings need allowlisting — any error reply at
+        // all is an unexpected MQ-plane failure. (The previous
+        // `as_int_or_zero(..) >= 0` form was vacuous: it mapped error
+        // replies to 0 and could never fail.)
+        let mq_reply = c2.cmd_s(&["XLEN", &mq_queue_name(&tag)]);
         assert!(
-            as_int_or_zero(&c2.cmd_s(&["XLEN", &mq_queue_name(&tag)])) >= 0,
-            "cell {}: MQ plane must not error after a mid-burst kill",
+            !is_unexpected_plane_error(&mq_reply, &[]),
+            "cell {}: MQ plane must not error after a mid-burst kill (got {mq_reply:?})",
             cfg.label
         );
         drop(guard2);
@@ -910,13 +916,6 @@ fn is_unexpected_plane_error(r: &crate::resp::Resp, allowed_exact: &[&str]) -> b
                 .any(|needle| lower == needle.to_lowercase())
         }
         _ => false,
-    }
-}
-
-fn as_int_or_zero(r: &crate::resp::Resp) -> i64 {
-    match r {
-        crate::resp::Resp::Int(i) => *i,
-        _ => 0,
     }
 }
 
