@@ -411,28 +411,376 @@ pub fn replay_workspace_wal(shared: &Arc<ShardDatabases>, persistence_dir: &std:
     }
 }
 
-/// Replay MQ WAL records to restore DurableQueueRegistry and apply cursor-rollback.
+/// Fixed consumer-group / consumer names used by every MQ.POP (mirrors
+/// `src/shard/mq_exec.rs`'s hardcoded constants — MQ.* never exposes custom
+/// group/consumer names, unlike the generic XREADGROUP API).
+const MQ_GROUP_NAME: &[u8] = b"__mq_consumers";
+const MQ_CONSUMER_NAME: &[u8] = b"__mq_default";
+
+/// Replay-time counters for `replay_mq_wal`, logged once per shard.
+#[derive(Default)]
+struct MqReplayStats {
+    create: u64,
+    push: u64,
+    pop: u64,
+    ack: u64,
+    trigger: u64,
+    skipped: u64,
+}
+
+impl MqReplayStats {
+    fn total(&self) -> u64 {
+        self.create + self.push + self.pop + self.ack + self.trigger
+    }
+}
+
+/// Log a skip-and-warn for a malformed or unsupported-version MQ WAL record.
+/// Never aborts the replay scan — one bad record just doesn't get applied.
+fn warn_skip_mq_record(shard_id: usize, kind: &str, payload: &[u8], stats: &mut MqReplayStats) {
+    stats.skipped += 1;
+    match crate::mq::wal::peek_version(payload) {
+        Some(v) if v > crate::mq::wal::MQ_WAL_VERSION => {
+            tracing::warn!(
+                "Shard {}: {} WAL record has unsupported version {} (this build \
+                 supports {}) — skipping, replay continues",
+                shard_id,
+                kind,
+                v,
+                crate::mq::wal::MQ_WAL_VERSION,
+            );
+        }
+        _ => {
+            tracing::warn!(
+                "Shard {}: {} WAL record is malformed — skipping, replay continues",
+                shard_id,
+                kind,
+            );
+        }
+    }
+}
+
+/// Apply a single decoded MqCreate record: registers the shard-level durable
+/// queue config AND (re)creates the stream in the record's OWN db (fixes the
+/// pre-K2 db-0 hardcode — MqCreate now carries `db_index`).
+fn apply_mq_create(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    db_index: usize,
+    key: &[u8],
+    max_delivery_count: u32,
+) {
+    let key_bytes = bytes::Bytes::copy_from_slice(key);
+    let reg = init
+        .durable_queue_registry
+        .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
+    reg.insert(
+        key_bytes.clone(),
+        crate::mq::DurableStreamConfig::new(key_bytes, max_delivery_count),
+    );
+
+    if let Some(db) = init.databases.get_mut(db_index) {
+        if let Ok(stream) = db.get_or_create_stream(key) {
+            stream.durable = true;
+            stream.max_delivery_count = max_delivery_count;
+            let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
+            // Idempotent: `create_group` errs BUSYGROUP if already created by
+            // an earlier replayed record (or a surviving RDB/rrdshard load);
+            // that's expected and fine, nothing else to do.
+            let _ = stream.create_group(group_name, crate::storage::stream::StreamId::ZERO);
+        }
+    }
+}
+
+/// Apply a single decoded MqPush record: re-inserts the entry at its
+/// ORIGINAL assigned id. Idempotent — replaying the same id twice (e.g. a
+/// stream that already had this entry via a surviving RDB/rrdshard load) is
+/// a harmless no-op rather than double-counting `length`.
+fn apply_mq_push(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    db_index: usize,
+    key: &[u8],
+    id: crate::storage::stream::StreamId,
+    fields: Vec<(bytes::Bytes, bytes::Bytes)>,
+) {
+    if let Some(db) = init.databases.get_mut(db_index) {
+        if let Ok(stream) = db.get_or_create_stream(key) {
+            if !stream.entries.contains_key(&id) {
+                stream.add(id, fields);
+            }
+        }
+    }
+}
+
+/// Apply a single decoded MqPop record: rebuilds the consumer group's PEL
+/// entries for every claimed id, restores `last_delivered_id`, and replays
+/// any DLQ routing (removing the source id from the PEL and re-pushing it
+/// into the sibling DLQ stream at its ORIGINAL assigned id). Field content
+/// for DLQ pushes is looked up from the main stream's `entries` map, which
+/// by this point already reflects every MqPush record replayed so far
+/// (records are applied strictly in WAL order).
+fn apply_mq_pop(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    db_index: usize,
+    key: &[u8],
+    last_delivered: crate::storage::stream::StreamId,
+    claimed: Vec<(crate::storage::stream::StreamId, u64)>,
+    dlq: Vec<(
+        crate::storage::stream::StreamId,
+        crate::storage::stream::StreamId,
+    )>,
+) {
+    use crate::storage::stream::{Consumer, PendingEntry};
+
+    let Some(db) = init.databases.get_mut(db_index) else {
+        return;
+    };
+
+    let dlq_pushes: Vec<(
+        crate::storage::stream::StreamId,
+        Vec<(bytes::Bytes, bytes::Bytes)>,
+    )> = match db.get_stream_mut(key) {
+        Ok(Some(stream)) => {
+            // Look up DLQ field content FIRST (reads of `stream.entries`)
+            // before taking a mutable borrow of `stream.groups` below —
+            // keeps the borrow shape unambiguous rather than relying on
+            // interleaved disjoint-field access.
+            let dlq_fields: Vec<Vec<(bytes::Bytes, bytes::Bytes)>> = dlq
+                .iter()
+                .map(|(src_id, _)| stream.entries.get(src_id).cloned().unwrap_or_default())
+                .collect();
+
+            let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
+            let consumer_name = bytes::Bytes::from_static(MQ_CONSUMER_NAME);
+            if !stream.groups.contains_key(group_name.as_ref()) {
+                // Should already exist from MqCreate replay; defensively
+                // create it so a truncated/out-of-order WAL can't panic.
+                let _ =
+                    stream.create_group(group_name.clone(), crate::storage::stream::StreamId::ZERO);
+            }
+
+            match stream.groups.get_mut(group_name.as_ref()) {
+                Some(group) => {
+                    for (id, delivery_count) in &claimed {
+                        group.pel.insert(
+                            *id,
+                            PendingEntry {
+                                consumer: consumer_name.clone(),
+                                delivery_time: 0,
+                                delivery_count: *delivery_count,
+                            },
+                        );
+                        let consumer =
+                            group
+                                .consumers
+                                .entry(consumer_name.clone())
+                                .or_insert_with(|| Consumer {
+                                    name: consumer_name.clone(),
+                                    pending: std::collections::BTreeMap::new(),
+                                    seen_time: 0,
+                                });
+                        consumer.pending.insert(*id, ());
+                    }
+                    group.last_delivered_id = last_delivered;
+
+                    let mut collected = Vec::with_capacity(dlq.len());
+                    for ((src_id, dlq_id), fields) in dlq.iter().zip(dlq_fields) {
+                        group.pel.remove(src_id);
+                        if let Some(c) = group.consumers.get_mut(consumer_name.as_ref()) {
+                            c.pending.remove(src_id);
+                        }
+                        collected.push((*dlq_id, fields));
+                    }
+                    collected
+                }
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    if !dlq_pushes.is_empty() {
+        let mut dlq_key = Vec::with_capacity(key.len() + 8);
+        dlq_key.extend_from_slice(key);
+        dlq_key.extend_from_slice(b"::mq:dlq");
+        if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
+            for (dlq_id, fields) in dlq_pushes {
+                if !dlq_stream.entries.contains_key(&dlq_id) {
+                    dlq_stream.add(dlq_id, fields);
+                }
+            }
+        }
+    }
+}
+
+/// Apply a single decoded MqAck record BY ID (not count) — the task #34 fix
+/// for the old cursor-rollback-by-count heuristic. `Stream::xack` is
+/// idempotent (no-ops if the id isn't in the PEL), so replaying the same ack
+/// twice or acking an id that was never actually pending is harmless.
+fn apply_mq_ack(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    db_index: usize,
+    key: &[u8],
+    id: crate::storage::stream::StreamId,
+) {
+    if let Some(db) = init.databases.get_mut(db_index) {
+        if let Ok(Some(stream)) = db.get_stream_mut(key) {
+            let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
+            let _ = stream.xack(&group_name, &[id]);
+        }
+    }
+}
+
+/// Apply a single decoded MqTrigger record: registers the trigger as opaque
+/// data. Registration is durable/replayed but NEVER fired during replay —
+/// firing only happens from live `MQ.PUSH` debounce arming
+/// (`src/shard/timers.rs::fire_pending_mq_triggers`).
+fn apply_mq_trigger(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    trig_key: Vec<u8>,
+    queue_key: Vec<u8>,
+    callback_cmd: Vec<u8>,
+    debounce_ms: u64,
+) {
+    let entry = crate::mq::TriggerEntry {
+        queue_key: bytes::Bytes::from(queue_key),
+        callback_cmd: bytes::Bytes::from(callback_cmd),
+        debounce_ms,
+        last_fire_ms: 0,
+        pending_fire_ms: 0,
+    };
+    let reg = init
+        .trigger_registry
+        .get_or_insert_with(|| Box::new(crate::mq::TriggerRegistry::new()));
+    reg.register(bytes::Bytes::from(trig_key), entry);
+}
+
+/// Decode + dispatch one MQ WAL record to its `apply_mq_*` handler,
+/// skip-and-warn on any decode failure (malformed payload OR an
+/// unsupported/future version byte).
+fn apply_mq_wal_record(
+    init: &mut crate::shard::slice::ShardSliceInit,
+    shard_id: usize,
+    record_type: crate::persistence::wal_v3::record::WalRecordType,
+    payload: &[u8],
+    stats: &mut MqReplayStats,
+) {
+    use crate::persistence::wal_v3::record::WalRecordType;
+    use crate::storage::stream::StreamId;
+
+    match record_type {
+        WalRecordType::MqCreate => match crate::mq::wal::decode_mq_create(payload) {
+            Some((db_index, key, mdc)) => {
+                apply_mq_create(init, db_index as usize, &key, mdc);
+                stats.create += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqCreate", payload, stats),
+        },
+        WalRecordType::MqPush => match crate::mq::wal::decode_mq_push(payload) {
+            Some((db_index, key, ms, seq, fields)) => {
+                apply_mq_push(init, db_index as usize, &key, StreamId { ms, seq }, fields);
+                stats.push += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqPush", payload, stats),
+        },
+        WalRecordType::MqPop => match crate::mq::wal::decode_mq_pop(payload) {
+            Some((db_index, key, last_delivered, claimed, dlq)) => {
+                let claimed: Vec<(StreamId, u64)> = claimed
+                    .into_iter()
+                    .map(|(ms, seq, dc)| (StreamId { ms, seq }, dc))
+                    .collect();
+                let dlq: Vec<(StreamId, StreamId)> = dlq
+                    .into_iter()
+                    .map(|(src_ms, src_seq, dlq_ms, dlq_seq)| {
+                        (
+                            StreamId {
+                                ms: src_ms,
+                                seq: src_seq,
+                            },
+                            StreamId {
+                                ms: dlq_ms,
+                                seq: dlq_seq,
+                            },
+                        )
+                    })
+                    .collect();
+                apply_mq_pop(
+                    init,
+                    db_index as usize,
+                    &key,
+                    StreamId {
+                        ms: last_delivered.0,
+                        seq: last_delivered.1,
+                    },
+                    claimed,
+                    dlq,
+                );
+                stats.pop += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqPop", payload, stats),
+        },
+        WalRecordType::MqAck => match crate::mq::wal::decode_mq_ack(payload) {
+            Some((db_index, key, ms, seq)) => {
+                apply_mq_ack(init, db_index as usize, &key, StreamId { ms, seq });
+                stats.ack += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqAck", payload, stats),
+        },
+        WalRecordType::MqTrigger => match crate::mq::wal::decode_mq_trigger(payload) {
+            Some((trig_key, queue_key, callback_cmd, debounce_ms)) => {
+                apply_mq_trigger(init, trig_key, queue_key, callback_cmd, debounce_ms);
+                stats.trigger += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqTrigger", payload, stats),
+        },
+        _ => {}
+    }
+}
+
+/// Replay MQ WAL records to restore full durable-queue state: registry
+/// config, stream content, consumer-group PEL/cursor, DLQ routing, and
+/// trigger registrations (task #34 / Wave B stage 2a).
 ///
 /// Operates on `&mut [ShardSliceInit]` — called single-threaded at boot
 /// before shard threads are spawned. No locks needed.
 ///
+/// # Ordering requirement
+///
+/// MUST run AFTER any AOF-authority `db.clear()` wipe. `main.rs` calls this
+/// near the end of the boot sequence, well after the AOF-authority
+/// wipe-then-replay block — see `tests::test_replay_mq_wal_survives_prior_db_clear`
+/// for a direct regression proof, and
+/// `tests/crash_recovery_mq_effects.rs::mq_effect_records_survive_kill9` for
+/// the live kill-9 round trip. MQ.* commands are intercepted before the
+/// generic AOF-logging dispatch path, so under `--appendonly yes` the wipe
+/// discards every durable Stream unconditionally; only this replay's own
+/// effect-record log rebuilds it.
+///
+/// # Ordering WITHIN the log
+///
+/// Records are applied ONE AT A TIME, in WAL order (LSN order, preserved by
+/// `replay_wal_v3_file`'s sequential per-file scan + the caller's
+/// lexicographically sorted file list) — NOT collected into a map and
+/// bulk-applied at the end. PEL membership and the consumer group's
+/// `last_delivered_id` are only correct if interleaved MqPush/MqPop/MqAck
+/// records are replayed in their original relative order (e.g. a POP that
+/// claims ids 1-3, an ACK of id 1, then a LATER POP that claims ids 4-5 must
+/// leave the PEL at `{2, 3, 4, 5}` with `last_delivered_id = 5` — batching
+/// "all pops then all acks" would get this wrong whenever an id is
+/// claimed-then-acked-then-a-later-pop-claims-more).
+///
+/// # WAL v3 framing
+///
 /// WAL v3 segments for a shard live in `shard-{id}/wal-v3/` (matching
 /// `replay_workspace_wal` / `replay_graph_wal` / `recovery.rs`) — NOT
 /// directly under `shard-{id}/`, which `std::fs::read_dir` (non-recursive)
-/// would silently scan as empty. Every cross-thread `wal_append` blob is
-/// also re-wrapped as `WalRecordType::Command` by the shard event-loop
-/// drain (`event_loop.rs`), so `MqCreate`/`MqAck` records are nested inside
-/// a Command payload on disk; `handle_record` below is shared by both the
-/// direct-type arm (for any legacy/self-written records) and the
-/// Command-unwrap arm, mirroring `replay_workspace_wal`.
+/// would silently scan as empty (task #42). Every cross-thread `wal_append`
+/// blob SHOULD arrive with its real type directly post-K1a (no `Command`
+/// wrapper) — the nested-unwrap arm below is defensive-only, covering any
+/// stray pre-K1a segment still on disk.
 pub fn replay_mq_wal(
     inits: &mut [crate::shard::slice::ShardSliceInit],
     persistence_dir: &std::path::Path,
 ) {
-    use std::collections::HashMap;
-
     use crate::persistence::wal_v3::record::{WalRecord, WalRecordType, read_wal_v3_record};
-    use crate::storage::stream::StreamId;
 
     for init in inits.iter_mut() {
         let shard_id = init.shard_id;
@@ -443,120 +791,66 @@ pub fn replay_mq_wal(
             continue;
         }
 
-        let mut durable_configs: HashMap<Vec<u8>, u32> = HashMap::new();
-        let mut ack_count = 0u64;
+        let mut stats = MqReplayStats::default();
 
-        let mut handle_record = |record_type: WalRecordType, payload: &[u8]| match record_type {
-            WalRecordType::MqCreate => {
-                if let Some((queue_key, max_delivery_count)) =
-                    crate::mq::wal::decode_mq_create(payload)
-                {
-                    durable_configs.insert(queue_key, max_delivery_count);
+        {
+            let mut handle_record = |record_type: WalRecordType, payload: &[u8]| {
+                apply_mq_wal_record(init, shard_id, record_type, payload, &mut stats);
+            };
+
+            let on_command = &mut |record: &WalRecord| match record.record_type {
+                WalRecordType::MqCreate
+                | WalRecordType::MqAck
+                | WalRecordType::MqPush
+                | WalRecordType::MqPop
+                | WalRecordType::MqTrigger => {
+                    handle_record(record.record_type, &record.payload);
                 }
-            }
-            WalRecordType::MqAck => {
-                if crate::mq::wal::decode_mq_ack(payload).is_some() {
-                    ack_count += 1;
-                }
-            }
-            _ => {}
-        };
-
-        let on_command = &mut |record: &WalRecord| match record.record_type {
-            WalRecordType::MqCreate | WalRecordType::MqAck => {
-                handle_record(record.record_type, &record.payload);
-            }
-            WalRecordType::Command => {
-                if let Some(inner) = read_wal_v3_record(&record.payload) {
-                    match inner.record_type {
-                        WalRecordType::MqCreate | WalRecordType::MqAck => {
-                            handle_record(inner.record_type, &inner.payload);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        };
-        let on_fpi = &mut |_: &WalRecord| {};
-
-        if let Ok(entries) = std::fs::read_dir(&wal_dir) {
-            let mut wal_files: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
-                .map(|e| e.path())
-                .collect();
-            wal_files.sort();
-
-            for wal_file in &wal_files {
-                let _ = crate::persistence::wal_v3::replay::replay_wal_v3_file(
-                    wal_file, 0, on_command, on_fpi,
-                );
-            }
-        }
-
-        if !durable_configs.is_empty() {
-            let reg = init
-                .durable_queue_registry
-                .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
-            for (queue_key_bytes, max_delivery_count) in &durable_configs {
-                let key = bytes::Bytes::copy_from_slice(queue_key_bytes);
-                let config = crate::mq::DurableStreamConfig::new(key.clone(), *max_delivery_count);
-                reg.insert(key, config);
-            }
-        }
-
-        // Cursor-rollback for each durable queue using db 0.
-        for (queue_key_bytes, max_dc) in &durable_configs {
-            let key_bytes = bytes::Bytes::copy_from_slice(queue_key_bytes);
-            // db 0 is the first database in the slice.
-            if let Some(db) = init.databases.get_mut(0) {
-                if let Ok(Some(stream)) = db.get_stream_mut(&key_bytes) {
-                    stream.durable = true;
-                    stream.max_delivery_count = *max_dc;
-
-                    let group_name = bytes::Bytes::from_static(b"__mq_consumers");
-                    if let Some(group) = stream.groups.get_mut(&group_name) {
-                        if let Some((min_pel_id, _)) = group.pel.iter().next() {
-                            let rollback_target = if min_pel_id.seq > 0 {
-                                StreamId {
-                                    ms: min_pel_id.ms,
-                                    seq: min_pel_id.seq - 1,
-                                }
-                            } else if min_pel_id.ms > 0 {
-                                StreamId {
-                                    ms: min_pel_id.ms - 1,
-                                    seq: u64::MAX,
-                                }
-                            } else {
-                                StreamId::ZERO
-                            };
-
-                            tracing::info!(
-                                "Shard {}: MQ cursor-rollback for queue {:?}: \
-                                 last_delivered_id {}-{} -> {}-{} (PEL size: {})",
-                                shard_id,
-                                String::from_utf8_lossy(queue_key_bytes),
-                                group.last_delivered_id.ms,
-                                group.last_delivered_id.seq,
-                                rollback_target.ms,
-                                rollback_target.seq,
-                                group.pel.len(),
-                            );
-
-                            group.last_delivered_id = rollback_target;
+                WalRecordType::Command => {
+                    if let Some(inner) = read_wal_v3_record(&record.payload) {
+                        match inner.record_type {
+                            WalRecordType::MqCreate
+                            | WalRecordType::MqAck
+                            | WalRecordType::MqPush
+                            | WalRecordType::MqPop
+                            | WalRecordType::MqTrigger => {
+                                handle_record(inner.record_type, &inner.payload);
+                            }
+                            _ => {}
                         }
                     }
                 }
+                _ => {}
+            };
+            let on_fpi = &mut |_: &WalRecord| {};
+
+            if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+                let mut wal_files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
+                    .map(|e| e.path())
+                    .collect();
+                wal_files.sort();
+
+                for wal_file in &wal_files {
+                    let _ = crate::persistence::wal_v3::replay::replay_wal_v3_file(
+                        wal_file, 0, on_command, on_fpi,
+                    );
+                }
             }
         }
 
-        if !durable_configs.is_empty() {
+        if stats.total() > 0 || stats.skipped > 0 {
             tracing::info!(
-                "Shard {}: replayed {} MQ queue configs, {} ack records",
+                "Shard {}: replayed MQ WAL — {} create, {} push, {} pop, {} ack, \
+                 {} trigger record(s), {} skipped (malformed/unsupported version)",
                 shard_id,
-                durable_configs.len(),
-                ack_count,
+                stats.create,
+                stats.push,
+                stats.pop,
+                stats.ack,
+                stats.trigger,
+                stats.skipped,
             );
         }
     }
@@ -1151,86 +1445,324 @@ mod tests {
         writer.flush_sync().expect("flush wal segment");
     }
 
+    // ── Wave B stage 2a (task #34): full-lifecycle effect-record replay ────
+    //
+    // Supersedes the old `test_replay_mq_wal_restores_registry_and_rolls_back_cursor`,
+    // which asserted the PRE-task-#34 "blind cursor-rollback by PEL-count"
+    // heuristic (roll back to just before the min PEL id, regardless of
+    // which ids were actually acked). That heuristic is gone: MqAck now
+    // replays BY ID via `Stream::xack`, and MqPush/MqPop give replay the
+    // actual content + claim/DLQ outcomes needed to reconstruct state
+    // exactly, without depending on whatever partial content a `.rrdshard`
+    // snapshot happened to preserve.
+
     #[test]
-    fn test_replay_mq_wal_restores_registry_and_rolls_back_cursor() {
-        use crate::mq::wal::{encode_mq_ack, encode_mq_create};
+    fn test_replay_mq_wal_restores_full_lifecycle_by_id() {
+        use crate::mq::wal::{encode_mq_ack, encode_mq_create, encode_mq_pop, encode_mq_push};
         use crate::persistence::wal_v3::record::WalRecordType;
-        use crate::storage::stream::{PendingEntry, StreamId};
+        use crate::storage::stream::StreamId;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue_key = b"orders".to_vec();
         let group_name = bytes::Bytes::from_static(b"__mq_consumers");
 
+        // Simulate the AOF-authority wipe: db starts completely empty (no
+        // .rrdshard content survived — matches `--appendonly yes` reality).
         let dbs = vec![vec![Database::new()]];
         let (_shared, mut inits) = ShardDatabases::new(dbs);
-        {
-            let db = inits[0].databases.get_mut(0).expect("db 0");
-            let stream = db.get_or_create_stream(&queue_key).expect("create stream");
-            stream
-                .create_group(group_name.clone(), StreamId::ZERO)
-                .expect("create group");
-            assert!(
-                !stream.durable,
-                "sanity: a .rrdshard-restored stream starts non-durable \
-                 (rdb.rs's TYPE_STREAM body has no durable/max_delivery_count bytes)"
-            );
-            let group = stream.groups.get_mut(&group_name).expect("group");
-            // Simulate a crash mid-delivery: one message claimed but not yet
-            // acked survived (via the KV plane) in the PEL.
-            group.last_delivered_id = StreamId { ms: 100, seq: 5 };
-            group.pel.insert(
-                StreamId { ms: 100, seq: 5 },
-                PendingEntry {
-                    consumer: bytes::Bytes::from_static(b"__mq_default"),
-                    delivery_time: 0,
-                    delivery_count: 1,
-                },
-            );
-        }
 
-        // Real WAL v3 bytes, nested exactly as the shard event-loop drain
-        // produces them (bug (b): a naive `record.record_type` match never
-        // sees these, since the outer type is always Command).
+        let f = |v: &[u8]| {
+            (
+                bytes::Bytes::from_static(b"seq"),
+                bytes::Bytes::copy_from_slice(v),
+            )
+        };
         write_mq_wal_records(
             tmp.path(),
             0,
             &[
-                (WalRecordType::MqCreate, encode_mq_create(&queue_key, 7)),
-                (WalRecordType::MqAck, encode_mq_ack(&queue_key, 100, 5)),
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 5)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 0, &[f(b"1")]),
+                ),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 1, &[f(b"2")]),
+                ),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 2, &[f(b"3")]),
+                ),
+                // POP claims ids (1,0) and (1,1) with delivery_count=1;
+                // resulting last_delivered_id = (1,1); no DLQ routing.
+                (
+                    WalRecordType::MqPop,
+                    encode_mq_pop(0, &queue_key, (1, 1), &[(1, 0, 1), (1, 1, 1)], &[]),
+                ),
+                // ACK only (1,0) — (1,1) must remain pending.
+                (WalRecordType::MqAck, encode_mq_ack(0, &queue_key, 1, 0)),
             ],
         );
 
-        // Written at `<dir>/shard-0/wal-v3/...` (bug (a): the pre-fix
-        // function scanned `<dir>/shard-0/` directly, a non-recursive
-        // `read_dir` over an otherwise-empty directory).
         replay_mq_wal(&mut inits, tmp.path());
 
         let reg = inits[0]
             .durable_queue_registry
             .as_ref()
             .expect("MqCreate record must populate durable_queue_registry");
-        let config = reg
-            .get(&queue_key)
-            .expect("queue must be registered after replay");
-        assert_eq!(config.max_delivery_count, 7);
+        assert_eq!(
+            reg.get(&queue_key).expect("registered").max_delivery_count,
+            5
+        );
 
         let db = inits[0].databases.get_mut(0).expect("db 0");
         let stream = db
             .get_stream_mut(&queue_key)
             .expect("get_stream_mut")
-            .expect("stream must still exist");
-        assert!(
-            stream.durable,
-            "replay must restore durable=true from the MqCreate WAL record"
+            .expect("stream must exist — rebuilt entirely from the WAL");
+        assert!(stream.durable, "MqCreate replay must restore durable=true");
+        assert_eq!(stream.max_delivery_count, 5);
+        assert_eq!(
+            stream.entries.len(),
+            3,
+            "all 3 MqPush records must rebuild stream content from nothing"
         );
-        assert_eq!(stream.max_delivery_count, 7);
+        assert_eq!(
+            stream.entries.get(&StreamId { ms: 1, seq: 2 }),
+            Some(&vec![f(b"3")]),
+            "field content must match exactly, including the never-popped 3rd entry"
+        );
 
         let group = stream.groups.get(&group_name).expect("group");
         assert_eq!(
             group.last_delivered_id,
-            StreamId { ms: 100, seq: 4 },
-            "cursor-rollback must rewind last_delivered_id to just before the \
-             sole PEL entry (ms=100,seq=5) so MQ.POP redelivers it"
+            StreamId { ms: 1, seq: 1 },
+            "cursor must land exactly where the MqPop record said, not a \
+             count-derived heuristic"
+        );
+        assert_eq!(
+            group.pel.keys().collect::<Vec<_>>(),
+            vec![&StreamId { ms: 1, seq: 1 }],
+            "only the un-acked id (1,1) may remain pending -- ack-by-id must \
+             NOT roll back (1,0) too"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_dlq_routing_restored() {
+        use crate::mq::wal::{encode_mq_create, encode_mq_pop, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"dlqtestq".to_vec();
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        let f = |v: &[u8]| {
+            (
+                bytes::Bytes::from_static(b"f"),
+                bytes::Bytes::copy_from_slice(v),
+            )
+        };
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 1)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 0, &[f(b"a")]),
+                ),
+                // MAXDELIVERY 1: the claim immediately routes to DLQ,
+                // assigned id (2,0) in the sibling DLQ stream.
+                (
+                    WalRecordType::MqPop,
+                    encode_mq_pop(0, &queue_key, (1, 0), &[(1, 0, 1)], &[(1, 0, 2, 0)]),
+                ),
+            ],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let mut dlq_key = queue_key.clone();
+        dlq_key.extend_from_slice(b"::mq:dlq");
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let dlq_stream = db
+            .get_stream_mut(&dlq_key)
+            .expect("get_stream_mut")
+            .expect("DLQ stream must exist after replay");
+        assert_eq!(dlq_stream.entries.len(), 1);
+        assert_eq!(
+            dlq_stream
+                .entries
+                .get(&crate::storage::stream::StreamId { ms: 2, seq: 0 }),
+            Some(&vec![f(b"a")]),
+            "DLQ entry must land at its ORIGINAL assigned id with original fields"
+        );
+
+        let main_stream = db
+            .get_stream_mut(&queue_key)
+            .expect("get_stream_mut")
+            .expect("main stream must exist");
+        let group = main_stream
+            .groups
+            .get(bytes::Bytes::from_static(b"__mq_consumers").as_ref())
+            .expect("group");
+        assert!(
+            group.pel.is_empty(),
+            "DLQ-routed entry must NOT remain pending in the main PEL"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_trigger_registered() {
+        use crate::mq::wal::encode_mq_trigger;
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[(
+                WalRecordType::MqTrigger,
+                encode_mq_trigger(b"trigq", b"trigq", b"FIRED", 200),
+            )],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let reg = inits[0]
+            .trigger_registry
+            .as_ref()
+            .expect("MqTrigger record must populate trigger_registry");
+        let entry = reg.get(b"trigq").expect("trigger must be registered");
+        assert_eq!(entry.queue_key.as_ref(), b"trigq");
+        assert_eq!(entry.callback_cmd.as_ref(), b"FIRED");
+        assert_eq!(entry.debounce_ms, 200);
+        assert_eq!(
+            entry.pending_fire_ms, 0,
+            "replay must never arm a pending fire -- only live MQ.PUSH does"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_survives_prior_db_clear() {
+        // Direct regression proof for the ordering requirement documented on
+        // `replay_mq_wal`: it must be safe to call AFTER an AOF-authority
+        // `db.clear()` wipe (main.rs's ordering), because that's exactly the
+        // scenario `--appendonly yes` produces in production. Simulates the
+        // wipe explicitly rather than depending on main.rs's call order.
+        use crate::mq::wal::{encode_mq_create, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"survives".to_vec();
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        // Pre-populate as if content existed before the "crash" (e.g. from
+        // an earlier boot in the same process) — then wipe it exactly like
+        // main.rs's AOF-authority path does.
+        {
+            let db = inits[0].databases.get_mut(0).expect("db 0");
+            let _ = db.get_or_create_stream(&queue_key);
+            db.clear();
+            assert!(
+                db.get_stream_mut(&queue_key).unwrap().is_none(),
+                "sanity: db.clear() must actually wipe the stream"
+            );
+        }
+
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 3)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        1,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"v"),
+                        )],
+                    ),
+                ),
+            ],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let stream = db
+            .get_stream_mut(&queue_key)
+            .expect("get_stream_mut")
+            .expect(
+                "RED: replay_mq_wal must rebuild the stream from its own \
+                 effect-record log even after an earlier db.clear() wipe",
+            );
+        assert!(stream.durable);
+        assert_eq!(stream.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_replay_mq_wal_unknown_version_skipped_not_fatal() {
+        // A corrupted/future-version MqCreate record must be skipped (not
+        // panic, not abort the rest of the scan) — the well-formed MqPush
+        // record right after it must still apply.
+        use crate::mq::wal::encode_mq_push;
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"q".to_vec();
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        let mut bogus_create = crate::mq::wal::encode_mq_create(0, &queue_key, 1);
+        bogus_create[0] = 200; // unsupported future version
+
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, bogus_create),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        1,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"v"),
+                        )],
+                    ),
+                ),
+            ],
+        );
+
+        // Must not panic.
+        replay_mq_wal(&mut inits, tmp.path());
+
+        assert!(
+            inits[0].durable_queue_registry.is_none(),
+            "the malformed MqCreate must be skipped, not applied"
+        );
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        assert_eq!(
+            db.get_or_create_stream(&queue_key).unwrap().entries.len(),
+            1,
+            "a well-formed record after a skipped malformed one must still apply"
         );
     }
 

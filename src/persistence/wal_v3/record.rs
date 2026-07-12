@@ -70,10 +70,30 @@ pub enum WalRecordType {
     WorkspaceCreate = 0x60,
     /// Workspace deletion record.
     WorkspaceDrop = 0x61,
-    /// MQ queue creation record.
+    /// MQ queue creation record. Wave B stage 2a bumped the payload to a
+    /// versioned form (leading version byte + db index) — see
+    /// `crate::mq::wal::encode_mq_create`. The discriminant is unchanged
+    /// (precedent: the 0x51->0x53 XactCommit format freeze), pre-K2 payloads
+    /// are simply no longer decodable and are skipped-with-warn like any
+    /// other malformed record.
     MqCreate = 0x70,
-    /// MQ message acknowledge record (used for cursor-rollback).
+    /// MQ message acknowledge record, applied by id (not count) at replay.
+    /// Payload versioned + db-index-carrying as of Wave B stage 2a, same
+    /// discriminant-preserved bump as `MqCreate`.
     MqAck = 0x71,
+    /// MQ message push record (Wave B stage 2a). Captures the ASSIGNED
+    /// message id + field/value pairs so replay can rebuild stream content
+    /// deterministically without depending on wall-clock id generation.
+    MqPush = 0x72,
+    /// MQ message pop/claim record (Wave B stage 2a). Captures claimed ids
+    /// (with resulting delivery_count), the consumer group's resulting
+    /// `last_delivered_id`, and any DLQ routing decisions (source id ->
+    /// assigned DLQ id) taken by that pop.
+    MqPop = 0x73,
+    /// MQ trigger registration record (Wave B stage 2a). Registration is
+    /// durable/replayed as opaque data; the callback is never fired during
+    /// replay (only live `MQ.PUSH` debounce arming fires it).
+    MqTrigger = 0x74,
 }
 
 impl WalRecordType {
@@ -101,6 +121,9 @@ impl WalRecordType {
             0x61 => Some(Self::WorkspaceDrop),
             0x70 => Some(Self::MqCreate),
             0x71 => Some(Self::MqAck),
+            0x72 => Some(Self::MqPush),
+            0x73 => Some(Self::MqPop),
+            0x74 => Some(Self::MqTrigger),
             _ => None,
         }
     }
@@ -500,6 +523,9 @@ mod tests {
         assert_eq!(WalRecordType::WorkspaceDrop as u8, 0x61);
         assert_eq!(WalRecordType::MqCreate as u8, 0x70);
         assert_eq!(WalRecordType::MqAck as u8, 0x71);
+        assert_eq!(WalRecordType::MqPush as u8, 0x72);
+        assert_eq!(WalRecordType::MqPop as u8, 0x73);
+        assert_eq!(WalRecordType::MqTrigger as u8, 0x74);
 
         // from_u8 roundtrips
         for &v in &[

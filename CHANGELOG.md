@@ -15,6 +15,75 @@ linked repo-root files (`BENCHMARK.md`, `RELEASES.md`,
 the GitHub Pages deploy had failed on every main push since 2026-07-08.
 Converted the 5 links to absolute GitHub blob URLs; strict build verified
 clean locally. Docs-only.
+### Fixed — MQ effect records now survive kill-9 (Wave B stage 2a, task #34)
+
+`MQ.CREATE/PUSH/POP/ACK/TRIGGER` intercept before the generic AOF-logging
+dispatch path (they route via `execute_mq_on_owner` in
+`src/shard/mq_exec.rs`), so under `--appendonly yes` the AOF-authority
+recovery (`db.clear()` on every shard, rebuild solely from the AOF manifest)
+silently discarded every durable `Stream`, consumer-group PEL, DLQ routing
+decision, and trigger registration on every restart — regardless of whether
+`replay_mq_wal` itself was correct. Two additional pre-existing defects in
+`replay_mq_wal` made it dangerous even when reached: `MqAck` records were
+applied by COUNT (rolling the whole PEL back to a snapshot cursor) instead
+of by ID, and every MQ payload hardcoded db index 0.
+
+Fixed by giving each MQ mutation its own versioned WAL v3 effect record,
+emitted at the owner-shard execution site: `MqPush` (0x72), `MqPop` (0x73),
+and `MqTrigger` (0x74) are new discriminants; `MqCreate` (0x70) and `MqAck`
+(0x71) keep their existing discriminants but move to a versioned,
+db-index-carrying payload (precedent: the `XactCommit` 0x51→0x53 format
+freeze — WAL v3 segments are short-lived with no cross-version contract).
+Every decoder in the new `src/mq/wal.rs` module returns `None` on a
+malformed OR unsupported-version payload; `replay_mq_wal` skip-and-warns
+(`tracing::warn!`) rather than aborting the scan. `MqPop` now carries the
+full claim set (id + delivery_count per claimed message) plus any DLQ
+routing decisions (source id → assigned DLQ id), so replay reconstructs the
+consumer group's PEL and `last_delivered_id` exactly instead of guessing.
+`MqAck` now applies via `Stream::xack` by id — idempotent, and immune to
+the old count-based rollback bug. `MQ.PUBLISH`'s TXN materialization hop
+also emits `MqPush` records, at both the self-fold and foreign-shard legs,
+on both the monoio and tokio connection handlers.
+
+Trigger registrations are durable/replayed as opaque data — replay never
+*fires* a trigger; only a live `MQ.PUSH`'s debounce arming does
+(`src/shard/timers.rs::fire_pending_mq_triggers`).
+
+New RED/GREEN kill-9 crash test: `tests/crash_recovery_mq_effects.rs`
+(`--ignored`, needs a built binary) exercises the full lifecycle —
+CREATE → PUSH×5 → POP(3) → ACK(2 of 3) → a second CREATE/PUSH/POP pair that
+forces immediate DLQ routing → a TRIGGER registration — kill -9, restart on
+the same `--dir`, and asserts stream content, delivery cursor, PEL-by-id,
+DLQ routing, and trigger re-arming all survive. New fuzz target
+`mq_wal_record` covers the five new op-blob decoders (`fuzz/fuzz_targets/`,
+registered in both `fuzz-pr` and `fuzz-nightly` CI matrices).
+
+Measured WAL footprint (release, single shard): CREATE + 5×PUSH + POP(3)
+= 7 records, 576 bytes on disk including the 64-byte segment header —
+~68 bytes per small PUSH (48-byte payload + 20-byte framing/CRC), ~132
+bytes for a 3-claim POP.
+
+**WAL recycle plane guard (adversarial-review fix):** `recycle_aggressive`
+and `recycle_segments_before` now refuse to delete any sealed segment
+holding workspace/MQ/temporal records — those planes have no snapshot
+format in ANY mode, so the WAL is their sole durable copy and no caller's
+LSN floor (autovacuum Pass C in disk-offload mode, the checkpoint
+protocol, admin `VACUUM`) makes such a segment safe. Previously,
+disk-offload deployments under `--max-wal-size` pressure would silently
+and permanently lose MQ/WS/temporal history during normal operation, no
+crash required. Kept segments are counted in
+`reclamation_wal_recycle_blocked_no_checkpoint_total` and warned
+(rate-limited); WAL size may exceed `--max-wal-size` for plane-heavy
+workloads until plane checkpointing lands (storage-kernel M3). The
+guard fails closed: unreadable/torn/unknown-type segments are kept.
+
+Known limitation (pre-existing, now tracked): durable MQ streams deleted
+via generic `DEL`/`UNLINK`/`FLUSHALL`/`FLUSHDB` are resurrected — now with
+full content — by MQ WAL replay after a restart; there is no MQ tombstone
+record yet (same bug class as the fixed vector/KV cold-plane resurrection;
+follow-up task filed).
+
+Out of scope (stage 2b+): replication emission/apply for the MQ plane.
 
 ### Changed — WAL v3 `wal_append` channel now preserves the caller's REAL record type end-to-end (K1a, storage-kernel M1 stage 1)
 

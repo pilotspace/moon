@@ -1,7 +1,7 @@
 //! `# Reclamation` INFO section — observability foundation for Wave-1 production
 //! reclamation hardening (P10, v0.1.13).
 //!
-//! All 29 fields are plumbed here. Wave-2 agents fill in real values by
+//! All 30 fields are plumbed here. Wave-2 agents fill in real values by
 //! incrementing the public atomics exported from this module. Until then, every
 //! field that lacks a real source emits `0` or `-1` as a sentinel, with a
 //! `// TODO(P10→Wave2):` comment marking the wire point.
@@ -144,6 +144,14 @@ pub static RECL_AUTOVACUUM_THROTTLED_DUE_TO_LOAD: AtomicU64 = AtomicU64::new(0);
 /// configured ceiling; it never means data was lost.
 pub static RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of plane WAL records (MQ/WS/temporal) DROPPED because the
+/// shard's `wal_append` channel was full at enqueue time (capacity 4096,
+/// drained every 1ms by the same shard thread — blocking there would deadlock
+/// the drain, so `try_send` is structural). Non-zero means an already-applied
+/// in-memory mutation is MISSING from crash recovery: a real durability gap.
+/// Alert on any increase. See `mq_exec::wal_append_on_slice`.
+pub static RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Graph plan-cache hit count (cumulative). Used to compute hit_ratio.
 /// TODO(P10→Wave2): wire from PlanCache::get() on hit path.
 pub static RECL_PLAN_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -167,7 +175,7 @@ pub static RECL_DELETE_PENDING_VISIBLE_LSN: AtomicI64 = AtomicI64::new(-1);
 
 /// Append the `# Reclamation` INFO section to `buf`.
 ///
-/// Reads all 29 fields from the module-level atomics above using `Relaxed`
+/// Reads all 30 fields from the module-level atomics above using `Relaxed`
 /// ordering — same pattern as `crate::vector::metrics`. No allocation beyond
 /// the caller's pre-sized `String`.
 ///
@@ -200,10 +208,12 @@ pub fn write_reclamation_section(buf: &mut String) {
         buf,
         "reclamation_wal_bytes:{}\r\n\
          reclamation_wal_segments:{}\r\n\
-         reclamation_wal_recycle_blocked_no_checkpoint_total:{}\r\n",
+         reclamation_wal_recycle_blocked_no_checkpoint_total:{}\r\n\
+         reclamation_wal_append_channel_dropped_total:{}\r\n",
         RECL_WAL_BYTES.load(Ordering::Relaxed),
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed),
-        RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed)
+        RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed),
+        RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
 
     // -- Write stall: OR of disk-pressure (MA12), segment-backlog (MA1), and
@@ -373,9 +383,9 @@ pub fn write_reclamation_section(buf: &mut String) {
 mod tests {
     use super::*;
 
-    /// All 29 required field keys must appear in the reclamation section output.
+    /// All 30 required field keys must appear in the reclamation section output.
     ///
-    /// RED: fails until `write_reclamation_section` emits all 29 fields.
+    /// RED: fails until `write_reclamation_section` emits all 30 fields.
     #[test]
     fn info_reclamation_contains_all_required_fields() {
         let mut buf = String::with_capacity(2048);
@@ -413,6 +423,7 @@ mod tests {
             "reclamation_plan_cache_hit_ratio:",
             "reclamation_plan_cache_evictions_total:",
             "reclamation_delete_pending_visible_lsn:",
+            "reclamation_wal_append_channel_dropped_total:",
         ];
 
         for field in required_fields {

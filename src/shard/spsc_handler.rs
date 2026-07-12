@@ -2505,16 +2505,37 @@ pub(crate) fn handle_shard_message_shared(
             // TXN.COMMIT MQ-intent materialize: fold deferred MQ.PUBLISH messages
             // onto the owner shard. Mirrors txn.rs:160–167 exactly:
             //   for intent in intents: get_stream_mut → durable-check → add.
-            crate::shard::slice::with_shard_db(db_index, |db| {
+            // Wave B stage 2a: also emits one MqPush WAL record per applied
+            // intent (durability plane only — this is the FOREIGN-shard leg
+            // of MQ.PUBLISH materialization; the self-shard leg is handled
+            // directly in txn.rs). Payloads are collected inside the
+            // closure (encoding is a pure function call) and emitted after
+            // it returns.
+            let payloads: Vec<Vec<u8>> = crate::shard::slice::with_shard_db(db_index, |db| {
+                let mut payloads = Vec::with_capacity(intents.len());
                 for intent in &intents {
                     if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
                         if stream.durable {
                             let msg_id = stream.next_auto_id();
+                            payloads.push(crate::mq::wal::encode_mq_push(
+                                db_index as u32,
+                                &intent.queue_key,
+                                msg_id.ms,
+                                msg_id.seq,
+                                &intent.fields,
+                            ));
                             stream.add(msg_id, intent.fields.clone());
                         }
                     }
                 }
+                payloads
             });
+            for payload in payloads {
+                crate::shard::mq_exec::wal_append_on_slice(
+                    crate::persistence::wal_v3::record::WalRecordType::MqPush,
+                    bytes::Bytes::from(payload),
+                );
+            }
             // Ignore send failure: receiver dropped means the TXN coordinator
             // has already given up (e.g. client disconnect mid-commit).
             let _ = reply_tx.send(());

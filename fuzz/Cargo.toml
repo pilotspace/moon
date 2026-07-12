@@ -83,3 +83,8 @@ members = ["."]
 name = "graph_props_record"
 path = "fuzz_targets/graph_props_record.rs"
 doc = false
+
+[[bin]]
+name = "mq_wal_record"
+path = "fuzz_targets/mq_wal_record.rs"
+doc = false

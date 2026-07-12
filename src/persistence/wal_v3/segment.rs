@@ -101,6 +101,77 @@ pub struct RecycleStats {
     pub segments_recycled: usize,
     /// Total bytes freed from disk.
     pub bytes_reclaimed: u64,
+    /// LSN-eligible segments KEPT because they hold sole-copy plane history
+    /// (see [`segment_holds_plane_history`]). Callers surface this via the
+    /// `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` counter.
+    pub segments_blocked_plane: usize,
+}
+
+/// Return `true` when the sealed segment at `path` contains at least one
+/// record whose ONLY durable copy is the WAL itself.
+///
+/// The workspace / MQ / temporal planes have no snapshot or checkpoint
+/// format in ANY mode (their replay is WAL-only — see task #43 and the
+/// Wave B stage 2a review): the disk-offload checkpoint covers KV pages and
+/// the graph store, nothing else. A segment holding such a record must
+/// never be recycled regardless of the caller's LSN floor, or that history
+/// is permanently lost on the next restart. `GraphTemporal` is included
+/// conservatively: autovacuum's recycle floor (`current_lsn`) is not tied
+/// to a completed graph checkpoint.
+///
+/// Fail-closed contract: an unreadable file, a non-v3 header, an unknown
+/// record-type byte (a future plane type this build predates), or a
+/// malformed/torn record tail all return `true` (keep the segment). A
+/// crash-torn tail can only occur in the previously-active segment of an
+/// earlier process generation — blocking that one segment is bounded and
+/// beats guessing. A `record_len == 0` tail is normal zero-padding → end
+/// of records.
+fn segment_holds_plane_history(path: &Path) -> bool {
+    use super::record::WalRecordType;
+
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+    if data.len() < WAL_V3_HEADER_SIZE || &data[..6] != WAL_V3_MAGIC || data[6] != WAL_V3_VERSION {
+        return true;
+    }
+    let mut offset = WAL_V3_HEADER_SIZE;
+    while offset + 4 <= data.len() {
+        let record_len = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        if record_len == 0 {
+            return false; // zero-padded tail — clean end of records
+        }
+        // Minimum framing: len(4) + header(12) + crc(4).
+        if record_len < 20 || offset + record_len > data.len() {
+            return true; // torn/malformed sealed tail — fail closed
+        }
+        let plane = match WalRecordType::from_u8(data[offset + 12]) {
+            Some(
+                WalRecordType::TemporalUpsert
+                | WalRecordType::GraphTemporal
+                | WalRecordType::WorkspaceCreate
+                | WalRecordType::WorkspaceDrop
+                | WalRecordType::MqCreate
+                | WalRecordType::MqAck
+                | WalRecordType::MqPush
+                | WalRecordType::MqPop
+                | WalRecordType::MqTrigger,
+            ) => true,
+            Some(_) => false,
+            None => return true, // unknown (future) type — fail closed
+        };
+        if plane {
+            return true;
+        }
+        offset += record_len;
+    }
+    false
 }
 
 /// WAL v3 writer with segmented files, per-record LSN, and batched fsync.
@@ -496,6 +567,7 @@ impl WalWriterV3 {
 
         let mut segments_recycled = 0usize;
         let mut bytes_reclaimed = 0u64;
+        let mut segments_blocked_plane = 0usize;
 
         for i in 0..all_segments.len() {
             let seg = &all_segments[i];
@@ -508,6 +580,14 @@ impl WalWriterV3 {
             // next segment's base_lsn (which equals this segment's end LSN).
             let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
             if next_base == 0 || next_base > redo_lsn {
+                continue;
+            }
+            // Plane guard: WS/MQ/temporal records have no snapshot in any
+            // mode — the WAL is their sole durable copy, so no LSN floor
+            // makes this segment safe to delete. See
+            // `segment_holds_plane_history` for the fail-closed contract.
+            if segment_holds_plane_history(&seg.path) {
+                segments_blocked_plane += 1;
                 continue;
             }
             // Aggressive: skip the min_wal_bytes floor check.
@@ -533,6 +613,7 @@ impl WalWriterV3 {
         Ok(RecycleStats {
             segments_recycled,
             bytes_reclaimed,
+            segments_blocked_plane,
         })
     }
 
@@ -696,6 +777,16 @@ impl WalWriterV3 {
             // (which equals this segment's end LSN) is <= redo_lsn.
             let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
             if next_base == 0 || next_base > redo_lsn {
+                continue;
+            }
+            // Plane guard: the checkpoint floor covers KV pages + graph
+            // only — WS/MQ/temporal history has no snapshot in any mode.
+            // See `segment_holds_plane_history` (fail-closed).
+            if segment_holds_plane_history(&seg.path) {
+                tracing::debug!(
+                    "WAL recycle: keeping segment {:?} — holds sole-copy plane history",
+                    seg.path
+                );
                 continue;
             }
             // Check min_wal_bytes floor: stop if removing this segment would
@@ -1150,6 +1241,84 @@ mod tests {
         // Total count should have decreased.
         let after = count_wals();
         assert_eq!(after, before - recycled);
+    }
+
+    /// Adversarial-review P0 (Wave B stage 2a): a sealed segment holding
+    /// plane records (WS/MQ/temporal — sole durable copy, no snapshot format
+    /// in ANY mode) must survive `recycle_aggressive`, no matter the LSN
+    /// floor the caller passes. Pure-KV segments must still be recycled.
+    #[test]
+    fn test_recycle_aggressive_keeps_plane_history_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        // First record = an MqPush plane record → lands in segment 1.
+        writer.append(WalRecordType::MqPush, b"\x01mq-plane-payload");
+        // Then enough KV commands to seal several pure-Command segments.
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        let active_seq = writer.current_segment_sequence();
+        assert!(active_seq >= 4, "need several sealed segments");
+
+        let stats = writer.recycle_aggressive(writer.current_lsn()).unwrap();
+
+        // Segment 1 (holds the MqPush record) must survive.
+        let plane_path = WalSegment::segment_path(&wal_dir, 1);
+        assert!(
+            plane_path.exists(),
+            "segment holding sole-copy MQ plane history must never be recycled"
+        );
+        assert!(
+            stats.segments_blocked_plane >= 1,
+            "blocked plane segment must be observable in RecycleStats"
+        );
+        // Pure-Command sealed segments must still be recycled (the guard
+        // must not turn into a blanket recycle freeze).
+        assert!(
+            stats.segments_recycled >= 1,
+            "pure-KV sealed segments must still be recycled"
+        );
+        let seg2_path = WalSegment::segment_path(&wal_dir, 2);
+        assert!(
+            !seg2_path.exists(),
+            "pure-Command segment 2 should have been recycled"
+        );
+    }
+
+    /// Same guard for the checkpoint-path recycler: `recycle_segments_before`
+    /// must skip plane-history segments too (it is called with a real
+    /// checkpoint floor, but the checkpoint covers KV pages + graph only —
+    /// planes have no snapshot).
+    #[test]
+    fn test_recycle_segments_before_keeps_plane_history_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        writer.append(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+
+        let recycled = writer.recycle_segments_before(u64::MAX).unwrap();
+        assert!(recycled >= 1, "pure-KV segments must still be recycled");
+        let plane_path = WalSegment::segment_path(&wal_dir, 1);
+        assert!(
+            plane_path.exists(),
+            "segment holding sole-copy WS plane history must never be recycled"
+        );
     }
 
     #[test]

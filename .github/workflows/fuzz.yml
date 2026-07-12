@@ -35,6 +35,7 @@ jobs:
           - csr_from_bytes
           - graph_props_record
           - fts_query_parse
+          - mq_wal_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -86,6 +87,7 @@ jobs:
           - csr_from_bytes
           - graph_props_record
           - fts_query_parse
+          - mq_wal_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

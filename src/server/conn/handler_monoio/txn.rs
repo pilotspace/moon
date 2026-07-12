@@ -137,17 +137,42 @@ pub(super) async fn try_handle_txn_commit(
                     let mut mq_lost: Option<(usize, usize)> = None; // (shard, intents)
                     for (owner, intents) in by_shard {
                         if owner == ctx.shard_id {
-                            // Self: apply locally via slice.
-                            crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
-                                for intent in &intents {
-                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                        if stream.durable {
-                                            let msg_id = stream.next_auto_id();
-                                            stream.add(msg_id, intent.fields.clone());
+                            // Self: apply locally via slice. Collect WAL
+                            // payloads inside the closure (encoding is a pure
+                            // function call, not a nested `with_shard*` call)
+                            // and emit them AFTER the closure returns — each
+                            // MqPush record captures the ASSIGNED id so
+                            // replay is outcome-deterministic (Wave B stage
+                            // 2a: MQ.PUBLISH materialization durability).
+                            let db_index = conn.selected_db;
+                            let payloads: Vec<Vec<u8>> =
+                                crate::shard::slice::with_shard_db(db_index, |db| {
+                                    let mut payloads = Vec::with_capacity(intents.len());
+                                    for intent in &intents {
+                                        if let Ok(Some(stream)) =
+                                            db.get_stream_mut(&intent.queue_key)
+                                        {
+                                            if stream.durable {
+                                                let msg_id = stream.next_auto_id();
+                                                payloads.push(crate::mq::wal::encode_mq_push(
+                                                    db_index as u32,
+                                                    &intent.queue_key,
+                                                    msg_id.ms,
+                                                    msg_id.seq,
+                                                    &intent.fields,
+                                                ));
+                                                stream.add(msg_id, intent.fields.clone());
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                    payloads
+                                });
+                            for payload in payloads {
+                                crate::shard::mq_exec::wal_append_on_slice(
+                                    crate::persistence::wal_v3::record::WalRecordType::MqPush,
+                                    Bytes::from(payload),
+                                );
+                            }
                         } else {
                             // Foreign: send MqTxnMaterialize hop and await ack.
                             let intent_count = intents.len();

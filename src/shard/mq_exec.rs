@@ -188,17 +188,39 @@ fn derive_trig_key(key_prefix: &Bytes, raw_queue_key: &Bytes) -> Bytes {
 /// pre-framing); the event-loop drain calls `wal.append(record_type, &payload)`
 /// directly.
 ///
-/// Mirrors `ShardDatabases::wal_append` semantics — `try_send` failures are
-/// ignored (the channel is bounded; under extreme backpressure the record is
-/// dropped, same as the existing lock-path).
+/// Failure policy (CodeRabbit PR #291): `try_send` is structurally required
+/// here — every caller runs ON the shard thread, which is also the channel's
+/// sole consumer (the 1ms-tick drain in `event_loop.rs`), so blocking on a
+/// full channel would deadlock the drain that empties it. Overflow therefore
+/// needs >4096 records enqueued within a single tick. When it DOES happen
+/// the mutation has already been applied and cannot be unwound mid-commit,
+/// so the record loss is made LOUD instead of silent: `tracing::error!` +
+/// the `RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL` INFO counter, giving
+/// operators a durability-gap signal to alert on.
+///
+/// `pub(crate)`: also called from `src/server/conn/handler_monoio/txn.rs` and
+/// `src/server/conn/handler_sharded/txn.rs` (MQ.PUBLISH self-fold) and
+/// `src/shard/spsc_handler.rs` (`MqTxnMaterialize` foreign-leg fold) to emit
+/// `MqPush` records at TXN materialization time (Wave B stage 2a).
 #[inline]
-fn wal_append_on_slice(
+pub(crate) fn wal_append_on_slice(
     record_type: crate::persistence::wal_v3::record::WalRecordType,
     payload: bytes::Bytes,
 ) {
     crate::shard::slice::with_shard(|s| {
         if let Some(ref tx) = s.wal_append_tx {
-            let _ = tx.try_send((record_type, payload));
+            if tx.try_send((record_type, payload)).is_err() {
+                crate::command::info_reclamation::RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    ?record_type,
+                    "WAL append channel rejected a plane record AFTER the \
+                     in-memory mutation was applied — this record will be \
+                     MISSING from crash recovery. The channel is drained by \
+                     this same shard thread every 1ms (capacity 4096), so \
+                     this indicates a pathological single-tick burst."
+                );
+            }
         }
     });
 }
@@ -243,8 +265,11 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
     // WAL: MqCreate record on the owner shard. K1a: send the unframed payload
     // tagged with its real type — the event-loop drain does the single framing.
+    // Wave B stage 2a: payload now carries `db_index` so replay recreates the
+    // stream in the SAME db it was created in (fixes the db-0 hardcode).
     {
-        let payload = crate::mq::wal::encode_mq_create(&eff_key, max_delivery_count);
+        let payload =
+            crate::mq::wal::encode_mq_create(db_index as u32, &eff_key, max_delivery_count);
         wal_append_on_slice(
             crate::persistence::wal_v3::record::WalRecordType::MqCreate,
             Bytes::from(payload),
@@ -267,8 +292,12 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     let eff_key = effective_key(key_prefix, &raw_key);
     let trig_key = derive_trig_key(key_prefix, &raw_key);
 
-    // Push into the stream.
-    type PushResult = Result<Option<StreamId>, Frame>;
+    // Push into the stream. The WAL payload is built INSIDE the closure
+    // (before `fields` is moved into `stream.add`) — it captures the
+    // ASSIGNED id, not the request, so replay is outcome-deterministic.
+    // Encoding here is a pure function call, not a nested `with_shard*`
+    // call, so it doesn't violate the non-reentrancy contract.
+    type PushResult = Result<Option<(StreamId, Vec<u8>)>, Frame>;
     let push_result: PushResult =
         crate::shard::slice::with_shard_db(db_index, |db| match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
@@ -276,8 +305,15 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                     Ok(None)
                 } else {
                     let msg_id = stream.next_auto_id();
+                    let payload = crate::mq::wal::encode_mq_push(
+                        db_index as u32,
+                        &eff_key,
+                        msg_id.ms,
+                        msg_id.seq,
+                        &fields,
+                    );
                     let msg_id = stream.add(msg_id, fields);
-                    Ok(Some(msg_id))
+                    Ok(Some((msg_id, payload)))
                 }
             }
             Ok(None) => Ok(None),
@@ -285,7 +321,14 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
         });
 
     match push_result {
-        Ok(Some(msg_id)) => {
+        Ok(Some((msg_id, payload))) => {
+            // WAL: MqPush record on the owner shard (Wave B stage 2a) —
+            // durability plane only; no replication emission here (stage 2b).
+            wal_append_on_slice(
+                crate::persistence::wal_v3::record::WalRecordType::MqPush,
+                Bytes::from(payload),
+            );
+
             // Debounce trigger: set pending_fire_ms if not already armed.
             let now_ms = current_time_ms();
             crate::shard::slice::with_shard(|s| {
@@ -316,6 +359,11 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 /// MQ.POP — owner claims messages, routing max-delivery entries to the DLQ.
 ///
 /// Mirrors handler_sharded/write.rs MQ POP arm (lock-path `else` branch).
+/// Emits an `MqPop` WAL record capturing the full outcome (claimed ids +
+/// resulting delivery_count, the group's resulting `last_delivered_id`, and
+/// any DLQ routing decisions) so replay can reproduce it deterministically
+/// without recomputing "which entries would this claim" against
+/// possibly-different post-crash state.
 fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     let (raw_key, count) = match validate_mq_pop(args) {
         Ok(v) => v,
@@ -325,99 +373,145 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     let group_name = Bytes::from_static(b"__mq_consumers");
     let consumer_name = Bytes::from_static(b"__mq_default");
 
-    // All POP logic runs in a single with_shard_db closure to avoid re-entrancy.
-    crate::shard::slice::with_shard_db(db_index, |db| {
-        // Step 1: read max_delivery_count.
-        let mdc = match db.get_stream_mut(&eff_key) {
-            Ok(Some(stream)) => {
-                if !stream.durable {
-                    return Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE));
+    // All POP logic runs in a single with_shard_db closure to avoid
+    // re-entrancy. Returns `(reply, wal_payload)`; `wal_payload` is `None`
+    // on any error/early-exit path (nothing claimed, nothing to record).
+    let (reply, wal_payload): (Frame, Option<Vec<u8>>) =
+        crate::shard::slice::with_shard_db(db_index, |db| -> (Frame, Option<Vec<u8>>) {
+            // Step 1: read max_delivery_count.
+            let mdc = match db.get_stream_mut(&eff_key) {
+                Ok(Some(stream)) => {
+                    if !stream.durable {
+                        return (Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)), None);
+                    }
+                    stream.max_delivery_count
                 }
-                stream.max_delivery_count
-            }
-            Ok(None) => return Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)),
-            Err(e) => return e,
-        };
-
-        let request_count = count + (mdc as usize);
-
-        // Step 2: read_group_new to claim entries.
-        let stream = match db.get_stream_mut(&eff_key) {
-            Ok(Some(s)) => s,
-            _ => return Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)),
-        };
-        let claimed =
-            match stream.read_group_new(&group_name, &consumer_name, Some(request_count), false) {
-                Ok(entries) => entries,
-                Err(_) => return Frame::Array(vec![].into()),
+                Ok(None) => return (Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)), None),
+                Err(e) => return (e, None),
             };
 
-        // Step 3: partition claimed into good entries and DLQ entries.
-        let mut results: Vec<(StreamId, Vec<(Bytes, Bytes)>)> =
-            Vec::with_capacity(count.min(claimed.len()));
-        let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
-        let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
+            let request_count = count + (mdc as usize);
 
-        for (id, fields) in &claimed {
-            let delivery_count = stream
+            // Step 2: read_group_new to claim entries.
+            let stream = match db.get_stream_mut(&eff_key) {
+                Ok(Some(s)) => s,
+                _ => return (Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)), None),
+            };
+            let claimed = match stream.read_group_new(
+                &group_name,
+                &consumer_name,
+                Some(request_count),
+                false,
+            ) {
+                Ok(entries) => entries,
+                Err(_) => return (Frame::Array(vec![].into()), None),
+            };
+            if claimed.is_empty() {
+                return (Frame::Array(vec![].into()), None);
+            }
+
+            // Step 3: partition claimed into good entries and DLQ entries.
+            let mut results: Vec<(StreamId, Vec<(Bytes, Bytes)>)> =
+                Vec::with_capacity(count.min(claimed.len()));
+            let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
+            let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
+            // Every claimed id, with its delivery_count at claim time —
+            // recorded for the WAL regardless of DLQ routing (mirrors what
+            // read_group_new just inserted into the PEL).
+            let mut claimed_for_wal: Vec<crate::mq::wal::ClaimedEntry> =
+                Vec::with_capacity(claimed.len());
+
+            for (id, fields) in &claimed {
+                let delivery_count = stream
+                    .groups
+                    .get(group_name.as_ref())
+                    .and_then(|g| g.pel.get(id))
+                    .map(|pe| pe.delivery_count)
+                    .unwrap_or(1);
+                claimed_for_wal.push((id.ms, id.seq, delivery_count));
+                if mdc > 0 && delivery_count >= mdc as u64 {
+                    dlq_entries.push((*id, fields.clone()));
+                    dlq_ack_ids.push(*id);
+                } else if results.len() < count {
+                    results.push((*id, fields.clone()));
+                }
+            }
+
+            // Step 4: ACK DLQ entries from the main stream PEL.
+            if !dlq_ack_ids.is_empty() {
+                let _ = stream.xack(&group_name, &dlq_ack_ids);
+            }
+
+            let last_delivered_id = stream
                 .groups
                 .get(group_name.as_ref())
-                .and_then(|g| g.pel.get(id))
-                .map(|pe| pe.delivery_count)
-                .unwrap_or(1);
-            if mdc > 0 && delivery_count >= mdc as u64 {
-                dlq_entries.push((*id, fields.clone()));
-                dlq_ack_ids.push(*id);
-            } else if results.len() < count {
-                results.push((*id, fields.clone()));
-            }
-        }
+                .map(|g| g.last_delivered_id)
+                .unwrap_or(StreamId::ZERO);
 
-        // Step 4: ACK DLQ entries from the main stream PEL.
-        if !dlq_ack_ids.is_empty() {
-            let _ = stream.xack(&group_name, &dlq_ack_ids);
-        }
-
-        // Step 5: append DLQ entries to the sibling DLQ stream.
-        if !dlq_entries.is_empty() {
-            let dlq_key = {
-                let mut buf = Vec::with_capacity(eff_key.len() + 8);
-                buf.extend_from_slice(&eff_key);
-                buf.extend_from_slice(b"::mq:dlq");
-                Bytes::from(buf)
-            };
-            if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
-                for (_id, fields) in dlq_entries {
-                    let dlq_id = dlq_stream.next_auto_id();
-                    dlq_stream.add(dlq_id, fields);
+            // Step 5: append DLQ entries to the sibling DLQ stream, capturing
+            // the ASSIGNED dlq-stream id for each (outcome-deterministic —
+            // replay must reproduce the exact id, not regenerate one from
+            // its own wall clock).
+            let mut dlq_for_wal: Vec<crate::mq::wal::DlqRouting> =
+                Vec::with_capacity(dlq_entries.len());
+            if !dlq_entries.is_empty() {
+                let dlq_key = {
+                    let mut buf = Vec::with_capacity(eff_key.len() + 8);
+                    buf.extend_from_slice(&eff_key);
+                    buf.extend_from_slice(b"::mq:dlq");
+                    Bytes::from(buf)
+                };
+                if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
+                    for (src_id, fields) in dlq_entries {
+                        let dlq_id = dlq_stream.next_auto_id();
+                        dlq_stream.add(dlq_id, fields);
+                        dlq_for_wal.push((src_id.ms, src_id.seq, dlq_id.ms, dlq_id.seq));
+                    }
                 }
             }
-        }
 
-        // Step 6: build response frames.
-        let result_frames: Vec<Frame> = results
-            .iter()
-            .map(|(id, fields)| {
-                let mut entry_frames = Vec::with_capacity(2);
-                let mut ms_buf = itoa::Buffer::new();
-                let mut seq_buf = itoa::Buffer::new();
-                let ms_str = ms_buf.format(id.ms);
-                let seq_str = seq_buf.format(id.seq);
-                let mut id_bytes = Vec::with_capacity(ms_str.len() + 1 + seq_str.len());
-                id_bytes.extend_from_slice(ms_str.as_bytes());
-                id_bytes.push(b'-');
-                id_bytes.extend_from_slice(seq_str.as_bytes());
-                entry_frames.push(Frame::BulkString(Bytes::from(id_bytes)));
-                let field_frames: Vec<Frame> = fields
-                    .iter()
-                    .flat_map(|(f, v)| [Frame::BulkString(f.clone()), Frame::BulkString(v.clone())])
-                    .collect();
-                entry_frames.push(Frame::Array(field_frames.into()));
-                Frame::Array(entry_frames.into())
-            })
-            .collect();
-        Frame::Array(result_frames.into())
-    })
+            let wal_payload = crate::mq::wal::encode_mq_pop(
+                db_index as u32,
+                &eff_key,
+                (last_delivered_id.ms, last_delivered_id.seq),
+                &claimed_for_wal,
+                &dlq_for_wal,
+            );
+
+            // Step 6: build response frames.
+            let result_frames: Vec<Frame> = results
+                .iter()
+                .map(|(id, fields)| {
+                    let mut entry_frames = Vec::with_capacity(2);
+                    let mut ms_buf = itoa::Buffer::new();
+                    let mut seq_buf = itoa::Buffer::new();
+                    let ms_str = ms_buf.format(id.ms);
+                    let seq_str = seq_buf.format(id.seq);
+                    let mut id_bytes = Vec::with_capacity(ms_str.len() + 1 + seq_str.len());
+                    id_bytes.extend_from_slice(ms_str.as_bytes());
+                    id_bytes.push(b'-');
+                    id_bytes.extend_from_slice(seq_str.as_bytes());
+                    entry_frames.push(Frame::BulkString(Bytes::from(id_bytes)));
+                    let field_frames: Vec<Frame> = fields
+                        .iter()
+                        .flat_map(|(f, v)| {
+                            [Frame::BulkString(f.clone()), Frame::BulkString(v.clone())]
+                        })
+                        .collect();
+                    entry_frames.push(Frame::Array(field_frames.into()));
+                    Frame::Array(entry_frames.into())
+                })
+                .collect();
+            (Frame::Array(result_frames.into()), Some(wal_payload))
+        });
+
+    if let Some(payload) = wal_payload {
+        wal_append_on_slice(
+            crate::persistence::wal_v3::record::WalRecordType::MqPop,
+            Bytes::from(payload),
+        );
+    }
+    reply
 }
 
 /// MQ.ACK — owner acknowledges one or more message IDs.
@@ -450,8 +544,12 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     match ack_result {
         Some(acked_count) => {
             // Emit one WAL record per acked message id (unframed, real type).
+            // Replay applies MqAck BY ID via `Stream::xack` — idempotent even
+            // if a request id was never actually in the PEL (matches this
+            // aggregate-count live path, which can't distinguish per-id
+            // success without changing `Stream::xack`'s return type).
             for (ms, seq) in &msg_ids {
-                let payload = crate::mq::wal::encode_mq_ack(&eff_key, *ms, *seq);
+                let payload = crate::mq::wal::encode_mq_ack(db_index as u32, &eff_key, *ms, *seq);
                 wal_append_on_slice(
                     crate::persistence::wal_v3::record::WalRecordType::MqAck,
                     Bytes::from(payload),
@@ -498,6 +596,12 @@ fn handle_trigger(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame 
     let eff_key = effective_key(key_prefix, &raw_key);
     let trig_key = derive_trig_key(key_prefix, &raw_key);
 
+    // WAL: MqTrigger record (Wave B stage 2a) — registration is durable/
+    // replayed as opaque data, never fired during replay. Built before the
+    // registry insert consumes `eff_key`/`callback_cmd`/`trig_key`.
+    let payload =
+        crate::mq::wal::encode_mq_trigger(&trig_key, &eff_key, &callback_cmd, debounce_ms);
+
     let entry = crate::mq::TriggerEntry {
         queue_key: eff_key,
         callback_cmd,
@@ -513,8 +617,14 @@ fn handle_trigger(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame 
         reg.register(trig_key, entry);
     });
 
-    // `db_index` is unused for TRIGGER (registry only) but kept in the
-    // signature for API uniformity. Suppress the unused-variable warning.
+    wal_append_on_slice(
+        crate::persistence::wal_v3::record::WalRecordType::MqTrigger,
+        Bytes::from(payload),
+    );
+
+    // `db_index` is unused for TRIGGER (registry is shard-level, not
+    // per-db) but kept in the signature for API uniformity. Suppress the
+    // unused-variable warning.
     let _ = db_index;
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
