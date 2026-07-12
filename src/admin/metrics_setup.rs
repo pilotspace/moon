@@ -239,18 +239,22 @@ pub fn init_metrics(
     }
 }
 
-/// Prime all 7 `moon_memory_bytes{kind=...}` series with `0.0` so they
+/// Prime every `moon_memory_bytes{kind=...}` series with `0.0` so they
 /// appear in `/metrics` output from the first scrape, even when subsystems
 /// are feature-gated off or not yet initialized.
 ///
 /// NOTE: This scrape path intentionally does NOT call `mallctl("epoch")`.
 /// See the documented jemalloc leak at the `get_rss_bytes()` doc-comment
 /// (~1 MB / 20 s growth). `allocator_overhead` is computed as
-/// `max(0, RSS − sum(other 6))` — the same formula MEMORY DOCTOR uses.
+/// `max(0, RSS − sum(other kinds))` — the same formula MEMORY DOCTOR uses.
 fn prime_moon_memory_bytes() {
     for kind in [
         "dashtable",
         "hnsw",
+        // K4 (kernel-m2-brief-2026-07-12 stage 2): text (FTS) resident
+        // bytes -- previously hard-coded 0 at the publish site, so this
+        // series existed nowhere until now.
+        "text",
         "csr",
         "wal",
         "sealed",
@@ -1390,6 +1394,9 @@ fn update_moon_memory_bytes() {
     let mut dashtable: usize = 0;
     let mut hnsw: usize = 0;
     let sealed: usize = 0; // combined into hnsw from vector atomic (C5)
+    // K4 (kernel-m2-brief-2026-07-12 stage 2): text (FTS) resident bytes,
+    // previously hard-coded 0 at the publish site.
+    let mut text: usize = 0;
     let mut csr: usize = 0;
     let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
     let mut backlog: usize = 0;
@@ -1400,10 +1407,11 @@ fn update_moon_memory_bytes() {
         // C5 / M4: `read_memory_sum()` replaces per-shard `read_db(…)` locks.
         dashtable = shard_dbs.read_memory_sum();
 
-        // Store memory: sum published per-shard vector/graph atomics.
+        // Store memory: sum published per-shard vector/text/graph atomics.
         // Values are refreshed by each shard's 100ms tick (publish_store_memory).
         for mem in shard_dbs.store_memory_per_shard.iter() {
             hnsw += mem.vector.load(Ordering::Relaxed);
+            text += mem.text.load(Ordering::Relaxed);
             // graph is cfg-gated at publish time; the atomic is always present.
             csr += mem.graph.load(Ordering::Relaxed);
             // C4 (wave-5 hygiene): Lua script-cache byte estimate.
@@ -1418,11 +1426,12 @@ fn update_moon_memory_bytes() {
         }
     }
 
-    let other_sum = dashtable + hnsw + csr + wal + sealed + backlog + lua;
+    let other_sum = dashtable + hnsw + text + csr + wal + sealed + backlog + lua;
     let alloc_overhead = rss.saturating_sub(other_sum);
 
     gauge!("moon_memory_bytes", "kind" => "dashtable").set(dashtable as f64);
     gauge!("moon_memory_bytes", "kind" => "hnsw").set(hnsw as f64);
+    gauge!("moon_memory_bytes", "kind" => "text").set(text as f64);
     gauge!("moon_memory_bytes", "kind" => "csr").set(csr as f64);
     gauge!("moon_memory_bytes", "kind" => "wal").set(wal as f64);
     gauge!("moon_memory_bytes", "kind" => "sealed").set(sealed as f64);
