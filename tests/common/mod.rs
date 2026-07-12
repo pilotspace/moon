@@ -209,4 +209,17 @@ pub fn wait_for_port_down(port: u16) {
             }
         }
     }
+    // No silent-pass verification helpers in a tripwire codebase (review
+    // round 3, P2): a caller that proceeds to bind the SAME port after this
+    // returns without the port actually being down races the dying
+    // process's socket teardown, which can manifest as a flaky bind failure
+    // or — worse — a same-port respawn silently talking to the wrong
+    // (still-dying) process. Loop exhaustion after 120 iterations (~18s
+    // worst case) is not a benign timeout here; it means the port never
+    // went down and every caller's assumption is false.
+    panic!(
+        "wait_for_port_down: port {port} never stopped accepting connections \
+         after 120 poll iterations (~18s) — the old process may still be \
+         alive, or SO_REUSEPORT is masking a listener that never exited"
+    );
 }

@@ -15,8 +15,11 @@ const TXN_GRAPH_LEG_RED_REASON: &str = "cross-store TXN graph leg not durable, t
      and confirmed deterministic 3x consecutive at both shards=1 and \
      shards=4 after the task #52 hardening pass (own crash cycle per \
      round, --checkpoint-timeout 3600, kill immediately post-sync-wait). \
-     Minimal repro in scenarios::txn_isolated's doc comment. P1 finding \
-     for kernel M3 — tracked separately, not this stage's job to fix.";
+     Minimal repro in scenarios::txn_isolated_committed's doc comment. \
+     P1 finding for kernel M3 — tracked separately, not this stage's job to \
+     fix. Gates ONLY the committed-transaction half (review round 3, P1): \
+     the atomicity half (`cross_plane_*_txn_isolated_atomicity`) is a \
+     genuinely different, unrelated, GREEN claim and runs ungated.";
 
 /// NEW finding (kernel M3, not a harness artifact — see
 /// `scenarios::mixed_mid_checkpoint`'s doc for the full analysis): some
@@ -77,11 +80,21 @@ fn cross_plane_prod_s1_mq_isolated() {
 
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
-fn cross_plane_prod_s1_txn_isolated() {
+fn cross_plane_prod_s1_txn_isolated_committed() {
     if !harness::red_guard(TXN_GRAPH_LEG_RED_REASON) {
         return;
     }
-    scenarios::txn_isolated(&Config::PROD_S1);
+    scenarios::txn_isolated_committed(&Config::PROD_S1);
+}
+
+/// Ungated (review round 3, P1) — atomicity is unrelated to task #52's
+/// graph-leg-durability finding and is GREEN here; see
+/// `scenarios::txn_isolated_atomicity`'s doc for why it must not share the
+/// committed half's `red_guard`.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s1_txn_isolated_atomicity() {
+    scenarios::txn_isolated_atomicity(&Config::PROD_S1);
 }
 
 #[test]
@@ -143,11 +156,19 @@ fn cross_plane_prod_s4_mq_isolated() {
 
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
-fn cross_plane_prod_s4_txn_isolated() {
+fn cross_plane_prod_s4_txn_isolated_committed() {
     if !harness::red_guard(TXN_GRAPH_LEG_RED_REASON) {
         return;
     }
-    scenarios::txn_isolated(&Config::PROD_S4);
+    scenarios::txn_isolated_committed(&Config::PROD_S4);
+}
+
+/// Ungated (review round 3, P1) — see
+/// `cross_plane_prod_s1_txn_isolated_atomicity`'s doc.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s4_txn_isolated_atomicity() {
+    scenarios::txn_isolated_atomicity(&Config::PROD_S4);
 }
 
 #[test]

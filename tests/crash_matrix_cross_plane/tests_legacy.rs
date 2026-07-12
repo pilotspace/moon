@@ -1,17 +1,18 @@
 //! Legacy cells (`--disk-offload disable`), shards=1 only per the brief
 //! ("legacy mode has no cross-shard novelty for this suite's purpose").
 //!
-//! 4 cells here are RED, all one root cause: PR #288's own changelog states
+//! 5 cells here are RED, all one root cause: PR #288's own changelog states
 //! graph command replay from WAL v3 does not reconstruct the graph in
 //! legacy mode even with zero Pass C interference — a pre-existing gap
 //! unrelated to WAL recycling, deliberately not asserted by
 //! `tests/crash_recovery_wal_recycle_legacy.rs` for the same reason. This
 //! suite DOES assert it (the shared `scenarios::graph_isolated` /
-//! `mixed_synced` / `mixed_mid_pass_c` / `txn_isolated` bodies make no
-//! exceptions), so each surfaces the same "ERR graph not found" —
-//! `harness::red_guard` skips them by default (set `MOON_CRASH_MATRIX_RED=1`
-//! to reproduce); see that function's doc for why a plain `#[ignore = "RED:
-//! ..."]` annotation does NOT achieve this (`--ignored` runs ignored tests).
+//! `mixed_synced` / `mixed_mid_pass_c` / `txn_isolated_committed` /
+//! `txn_isolated_atomicity` bodies make no exceptions), so each surfaces the
+//! same "ERR graph not found" — `harness::red_guard` skips them by default
+//! (set `MOON_CRASH_MATRIX_RED=1` to reproduce); see that function's doc for
+//! why a plain `#[ignore = "RED: ..."]` annotation does NOT achieve this
+//! (`--ignored` runs ignored tests).
 
 use crate::harness::{self, Config};
 use crate::scenarios;
@@ -57,16 +58,30 @@ fn cross_plane_legacy_yes_s1_mq_isolated() {
 
 // One root cause (legacy-mode graph WAL replay never reconstructs the
 // graph — same gap as `cross_plane_legacy_yes_s1_graph_isolated`) surfaces
-// in the 3 cells below too: each hits the same "ERR graph not found" the
-// isolated graph scenario does.
+// in the 4 cells below too: each hits the same "ERR graph not found" the
+// isolated graph scenario does. This includes BOTH txn_isolated halves
+// (review round 3, P1 restructuring, task #52) — unlike prod_s1/prod_s4,
+// the atomicity half is NOT independently green here: `graph_create` itself
+// never survives a restart in legacy mode, so the atomicity scenario's
+// graph-leg assertion panics on "ERR graph not found" before it can ever
+// evaluate the atomicity claim. Confirmed on the VM, not assumed.
 
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
-fn cross_plane_legacy_yes_s1_txn_isolated() {
+fn cross_plane_legacy_yes_s1_txn_isolated_committed() {
     if !harness::red_guard(LEGACY_GRAPH_RED_REASON) {
         return;
     }
-    scenarios::txn_isolated(&Config::LEGACY_YES_S1);
+    scenarios::txn_isolated_committed(&Config::LEGACY_YES_S1);
+}
+
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_legacy_yes_s1_txn_isolated_atomicity() {
+    if !harness::red_guard(LEGACY_GRAPH_RED_REASON) {
+        return;
+    }
+    scenarios::txn_isolated_atomicity(&Config::LEGACY_YES_S1);
 }
 
 #[test]

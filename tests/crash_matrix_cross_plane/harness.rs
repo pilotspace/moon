@@ -403,6 +403,41 @@ pub fn wait_for_control_file_change(dir: &Path, before: &Option<Vec<u8>>, timeou
     }
 }
 
+/// Recursively count `heap-*.mpf` cold-tier data files anywhere under
+/// `dir` (kv_spill's on-disk format, `src/storage/tiered/kv_spill.rs` —
+/// `<disk-offload-dir>/shard-<n>/data/heap-<file_id>.mpf`;
+/// `effective_disk_offload_dir` falls back to `--dir` when
+/// `--disk-offload-dir` is not set, which is this harness's default, so a
+/// plain recursive walk from the test's unique dir finds them without
+/// needing to know the exact shard layout). A hard precondition for
+/// every disk-offload scenario: without any heap files on disk, filler
+/// pressure never forced a spill and the scenario silently degenerates to
+/// ordinary AOF-replay coverage (already proven by `kv_isolated`) — proven
+/// empirically in review round 3 (task #52 P0) against a too-small filler.
+/// Pattern: `crash_recovery_cold_del_resurrection.rs::count_heap_files`.
+pub fn count_heap_mpf_files(dir: &Path) -> usize {
+    fn walk(p: &Path, acc: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, acc);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("heap-") && n.ends_with(".mpf"))
+            {
+                *acc += 1;
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(dir, &mut acc);
+    acc
+}
+
 /// Gate for RED cells (kernel M3 brief, coordinator review round 3): the
 /// suite's own execution convention is `cargo test ... --ignored` (every
 /// test needs a built release binary, so ALL of them carry `#[ignore]`) —

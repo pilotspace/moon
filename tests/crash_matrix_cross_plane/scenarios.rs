@@ -71,15 +71,41 @@ pub fn kv_isolated(cfg: &Config) {
 
 /// KV spilled: filler pushes the probe keys to the cold tier before they are
 /// deleted-and-resynced; only meaningful when disk-offload is enabled.
+///
+/// Filler sizing mirrors `crash_recovery_cold_del_resurrection.rs` exactly
+/// (`MAXMEMORY_BYTES` = 8 MiB, `FILLER_COUNT` × `FILLER_VALUE_LEN` =
+/// 16,000×600B ≈ 9.6 MiB, `SETTLE_AFTER_FILLER` = 8s) rather than an
+/// independently-invented ratio. `--maxmemory` is divided evenly across
+/// shards (`RuntimeConfig::maxmemory_per_shard`, `src/config.rs`), so at
+/// `shards=1` the whole 8 MiB cap lives on one shard (trivially exceeded by
+/// unscoped filler) and at `shards=4` each shard's ~2 MiB cap is exceeded by
+/// the filler's average ~2.4 MiB/shard scatter — the SAME total-byte ratio
+/// the reference suite already validated forces a spill at its own
+/// `SHARDS=4` config, so no per-shard-count filler scaling is needed on top
+/// of matching the reference's absolute numbers. A prior 3000×512B filler
+/// (~1.5 MiB) against a 4 MiB cap never came close to the 0.85× spill
+/// threshold at either shard count — confirmed on the VM via
+/// `reclamation_cold_segments:0` and zero `heap-*.mpf` files — and the cell
+/// silently degenerated to ordinary AOF-replay coverage (already proven by
+/// `kv_isolated`), a real false-GREEN (review round 3, task #52 P0). The
+/// `count_heap_mpf_files` precondition assert below is the hard backstop:
+/// any future load-parameter regression now fails LOUD instead of vacuously
+/// passing.
 pub fn kv_spilled_isolated(cfg: &Config) {
     assert!(
         cfg.disk_offload,
         "kv_spilled_isolated requires disk-offload enable"
     );
+    const MAXMEMORY_BYTES: u64 = 8 * 1024 * 1024;
+    const FILLER_COUNT: u64 = 16_000;
+    const FILLER_VALUE_LEN: usize = 600;
+    const SETTLE_AFTER_FILLER: u64 = 8;
+
     let dir = harness::unique_dir(&format!("kvspill-{}", cfg.label));
+    let maxmemory_s = MAXMEMORY_BYTES.to_string();
     let extra = [
         "--maxmemory",
-        "4194304",
+        maxmemory_s.as_str(),
         "--maxmemory-policy",
         "allkeys-lru",
     ];
@@ -96,8 +122,20 @@ pub fn kv_spilled_isolated(cfg: &Config) {
         probes.push((key, val));
     }
     // Push probes to the cold tier.
-    kv_spill_filler(&mut c, "kvspillfiller", 3000, 512);
-    std::thread::sleep(Duration::from_secs(3));
+    kv_spill_filler(&mut c, "kvspillfiller", FILLER_COUNT, FILLER_VALUE_LEN);
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_FILLER));
+
+    // Hard precondition (review round 3, task #52 P0): without any
+    // heap-*.mpf files on disk, filler pressure never forced a spill and
+    // this scenario has no power — it would silently degenerate to
+    // ordinary AOF-replay coverage, already proven by `kv_isolated`.
+    let heap_files = harness::count_heap_mpf_files(&dir);
+    assert!(
+        heap_files > 0,
+        "cell {}: precondition failed: no heap-*.mpf files — filler did not \
+         force a spill",
+        cfg.label
+    );
 
     let marker = "XPLANE-KVSPILL-MARKER".to_string();
     kv_set(&mut c, &format!("{{{tag}}}:marker"), &marker);
@@ -192,6 +230,24 @@ pub fn graph_isolated(cfg: &Config) {
         "cell {}: TEMPORAL.INVALIDATE (GraphTemporal) must survive kill-9 — \
          node 0 must NOT be visible at a far-future VALID_AT after restart, \
          got {visible_far_future:?}",
+        cfg.label
+    );
+    // Positive control (review round 3, P2): without this, the negative
+    // check above would PASS vacuously if VALID_AT plumbing itself were
+    // broken and always returned empty regardless of invalidation state.
+    // Node 1 was never invalidated or deleted, so it MUST still be visible
+    // at the same far-future VALID_AT.
+    let node1_visible_far_future = graph_query_ids_valid_at(
+        &mut c2,
+        &name,
+        "MATCH (n:N {id: 1}) RETURN n.id",
+        "9000000000000",
+    );
+    assert_eq!(
+        node1_visible_far_future,
+        std::collections::BTreeSet::from([1]),
+        "cell {}: VALID_AT positive control — node 1 (never invalidated) \
+         must be visible at a far-future VALID_AT",
         cfg.label
     );
     drop(guard2);
@@ -354,16 +410,30 @@ pub fn mq_isolated(cfg: &Config) {
     drop(guard2);
 }
 
-/// Cross-store TXN: (1) a committed transaction spanning KV+graph must
-/// survive kill-9 exactly like a non-transactional write (extends
-/// `sharded_multi_exec_durability.rs`'s single-plane proof cross-plane);
-/// (2) a transaction queued but killed BEFORE it commits must apply NOTHING
-/// (atomicity — this is the "kill mid cross-store TXN" kill point). Each
-/// half runs its OWN spawn/crash/restart cycle (task #52 review round:
+/// Cross-store TXN, split into two independently-gated functions (review
+/// round 3, P1: the two halves have UNRELATED root causes and must not
+/// share one `red_guard` — see each function's own doc):
+///
+/// - [`txn_isolated_committed`]: a committed transaction spanning
+///   KV+graph must survive kill-9 exactly like a non-transactional write
+///   (extends `sharded_multi_exec_durability.rs`'s single-plane proof
+///   cross-plane). RED on `prod_s1`/`prod_s4` — task #52.
+/// - [`txn_isolated_atomicity`]: a transaction queued but killed BEFORE it
+///   commits must apply NOTHING (atomicity — the "kill mid cross-store TXN"
+///   kill point). GREEN on `prod_s1`/`prod_s4` (unrelated to task #52) —
+///   gating it behind the SAME `red_guard` as the committed-exec half would
+///   skip a working, unrelated regression tripwire by default. Still RED on
+///   `legacy_yes_s1` (same pre-existing legacy-graph-WAL-replay gap as
+///   every other legacy graph cell — `GRAPH.CREATE` itself never
+///   reconstructs there, so any post-restart `GRAPH.QUERY` errors "graph
+///   not found" regardless of transaction semantics; empirically confirmed,
+///   not assumed — see `tests_legacy.rs`).
+///
+/// Each half runs its OWN spawn/crash/restart cycle (task #52 review round:
 /// interleaving them in one server lifetime inserted extra round-trips —
-/// queuing round (2)'s transaction — between round (1)'s durability
-/// sync-wait and the kill, an avoidable timing confound for a RED-cell
-/// repro that needs to be deterministic).
+/// queuing the atomicity round's transaction — between the committed-exec
+/// round's durability sync-wait and the kill, an avoidable timing confound
+/// for a RED-cell repro that needs to be deterministic).
 ///
 /// REAL RED FINDING (kernel M3, task #52 — reviewed and confirmed NOT a
 /// harness artifact): on `prod_s1`/`prod_s4` (checkpoint-backed,
@@ -406,18 +476,10 @@ pub fn mq_isolated(cfg: &Config) {
 /// GET k               -> v                (KV leg survives)
 /// GRAPH.QUERY g "MATCH (n:Label {id: 1}) RETURN n.id"  -> empty (graph leg lost)
 /// ```
-pub fn txn_isolated(cfg: &Config) {
-    txn_isolated_committed_exec(cfg);
-    txn_isolated_queued_uncommitted(cfg);
-}
-
-/// Round (1): a committed cross-store transaction (KV+graph) must survive
-/// kill-9. Own spawn/crash/restart cycle — see [`txn_isolated`]'s doc for
-/// why.
-fn txn_isolated_committed_exec(cfg: &Config) {
+pub fn txn_isolated_committed(cfg: &Config) {
     let dir = harness::unique_dir(&format!("txniso-committed-{}", cfg.label));
-    // Long checkpoint-timeout: see [`txn_isolated`]'s "Determinism
-    // conditions" doc — rules out a periodic checkpoint as the rescuer.
+    // Long checkpoint-timeout: see this function's own "Determinism
+    // conditions" doc above — rules out a periodic checkpoint as the rescuer.
     let extra = ["--checkpoint-timeout", "3600"];
     let (guard, port) = harness::spawn_moon_on(&dir, cfg, &extra);
     let mut c = Conn::open(port);
@@ -475,15 +537,44 @@ fn txn_isolated_committed_exec(cfg: &Config) {
     drop(guard2);
 }
 
-/// Round (2): a transaction queued but killed BEFORE it commits must apply
-/// NOTHING (atomicity). Own spawn/crash/restart cycle, fully independent of
-/// round (1) — see [`txn_isolated`]'s doc for why.
-fn txn_isolated_queued_uncommitted(cfg: &Config) {
+/// A transaction queued but killed BEFORE it commits must apply NOTHING
+/// (atomicity — the "kill mid cross-store TXN" kill point). Own
+/// spawn/crash/restart cycle, fully independent of
+/// [`txn_isolated_committed`] — see that function's doc for why.
+///
+/// Deliberately NOT gated behind the task #52 `red_guard` on
+/// `prod_s1`/`prod_s4` (review round 3, P1): this is a genuinely different
+/// claim from the committed half (nothing was ever queued to durably apply,
+/// vs. a committed transaction losing a leg) and is GREEN there — gating it
+/// behind the same reason as the committed half would skip a working,
+/// unrelated regression tripwire by default. IS gated on `legacy_yes_s1`
+/// via `LEGACY_GRAPH_RED_REASON` (see `tests_legacy.rs`): `graph_create`
+/// itself never survives a restart in legacy mode (the same pre-existing
+/// WAL-v3-replay gap every other legacy graph cell hits), so the graph-leg
+/// assertion below panics on "ERR graph not found" rather than evaluating
+/// the atomicity claim at all — confirmed on the VM, not assumed.
+///
+/// The initial `GRAPH.CREATE` MUST sync-wait before the MULTI is queued and
+/// the kill fires (an earlier draft of this function skipped that wait,
+/// treating "kill as close to queued as possible" as license to skip ALL
+/// sync-waiting — that was wrong): without it, the graph's own existence
+/// races the same WAL flush tick as everything else, so a post-restart
+/// `GRAPH.QUERY` can error "ERR graph not found" for a reason that has
+/// NOTHING to do with the atomicity claim under test, on every config
+/// (confirmed on the VM — the earlier unwaited version failed identically
+/// on `prod_s1`/`prod_s4`/`legacy_yes_s1` alike, which was the tell that it
+/// was a harness bug, not a finding). Waiting for `GRAPH.CREATE` does not
+/// weaken the kill point: the transaction itself is still queued and killed
+/// with zero settle time.
+pub fn txn_isolated_atomicity(cfg: &Config) {
     let dir = harness::unique_dir(&format!("txniso-queued-{}", cfg.label));
     let (guard, port) = harness::spawn_moon_on(&dir, cfg, &[]);
     let mut c = Conn::open(port);
     let graph = graph_name("txnisoq");
     graph_create(&mut c, &graph);
+    if !cfg.no_durability_contract() {
+        harness::wait_for_wal_v3_bytes_any_shard(&dir, cfg.shards, graph.as_bytes());
+    }
 
     let queued_key = "{txnisoq}:queued-uncommitted";
     c.pipeline_s(&[
@@ -491,8 +582,9 @@ fn txn_isolated_queued_uncommitted(cfg: &Config) {
         vec!["SET", queued_key, "must-not-persist"],
         vec!["GRAPH.ADDNODE", &graph, "TxnN", "id", "2"],
     ]);
-    // Deliberately never committed, no wait — kill as close to "queued" as
-    // possible.
+    // Deliberately never committed, no wait for the transaction itself —
+    // kill as close to "queued" as possible (only the PRECEDING
+    // GRAPH.CREATE is sync-waited, see above).
     harness::crash(guard, port);
 
     let (guard2, port2) = harness::spawn_moon_on(&dir, cfg, &[]);
@@ -752,7 +844,7 @@ pub fn concurrent_burst_no_corruption(cfg: &Config) {
                     &graph_name(&tag),
                     "MATCH (n:BurstN) RETURN count(n)"
                 ]),
-                &["graph not found"],
+                &["ERR graph not found"],
             ),
             "cell {}: graph plane must not error (beyond ordinary \
              not-found) after a mid-burst kill",
@@ -765,10 +857,22 @@ pub fn concurrent_burst_no_corruption(cfg: &Config) {
         // probe. `FT.INFO` needs no query vector and answers cleanly with
         // just "Unknown Index name" when the index was never durable —
         // exactly the same benign-not-found shape as the graph/MQ checks.
+        // Exact strings (`src/command/vector_search/ft_info.rs`,
+        // `ft_aggregate.rs`/`hybrid.rs`/`ft_search/dispatch.rs`), not bare
+        // substrings (review round 3, P2): a substring match on "unknown
+        // index" would ALSO classify a hypothetical future corruption
+        // message like "unknown index format" as benign — every not-found
+        // error this engine emits is a short, fixed, exact literal (never a
+        // longer message with a variable/diagnostic suffix), so exact
+        // equality is strictly correct here and closes that door.
         assert!(
             !is_unexpected_plane_error(
                 &c2.cmd_s(&["FT.INFO", &vec_index_name(&tag)]),
-                &["unknown index", "no such index"],
+                &[
+                    "ERR unknown index",
+                    "Unknown Index name",
+                    "ERR no such index"
+                ],
             ),
             "cell {}: vector plane must not error (beyond ordinary \
              not-found) after a mid-burst kill",
@@ -783,17 +887,27 @@ pub fn concurrent_burst_no_corruption(cfg: &Config) {
     }
 }
 
-/// True if `r` is an error reply whose text does NOT match any of the
-/// benign `allowed_substrings` (case-insensitive) — i.e. a genuine,
-/// unexpected plane error rather than an ordinary "this schema object was
-/// never durable before the kill" not-found response.
-fn is_unexpected_plane_error(r: &crate::resp::Resp, allowed_substrings: &[&str]) -> bool {
+/// True if `r` is an error reply whose text does NOT EXACTLY match (modulo
+/// case/whitespace) any of the benign `allowed_exact` messages — i.e. a
+/// genuine, unexpected plane error rather than an ordinary "this schema
+/// object was never durable before the kill" not-found response.
+///
+/// Exact matching, not `.contains()` (review round 3, P2): every not-found
+/// error this engine emits (`"ERR graph not found"`, `"ERR unknown
+/// index"`, `"Unknown Index name"`, `"ERR no such index"`) is a short,
+/// fixed, literal `Frame::Error` with no variable suffix — confirmed via a
+/// full-repo grep, not assumed. A substring check would ALSO classify a
+/// hypothetical future corruption message like `"unknown index format"` as
+/// benign purely because it happens to start with the same words; exact
+/// equality closes that door without weakening today's coverage (every
+/// caller's allowlist already contains the exact real strings).
+fn is_unexpected_plane_error(r: &crate::resp::Resp, allowed_exact: &[&str]) -> bool {
     match r {
         crate::resp::Resp::Error(msg) => {
-            let lower = msg.to_lowercase();
-            !allowed_substrings
+            let lower = msg.trim().to_lowercase();
+            !allowed_exact
                 .iter()
-                .any(|needle| lower.contains(&needle.to_lowercase()))
+                .any(|needle| lower == needle.to_lowercase())
         }
         _ => false,
     }

@@ -268,6 +268,21 @@ pub fn assert_mixed_truth_recovered(c: &mut Conn, truth: &MixedTruth) {
 /// disconnect-shaped panic in some unrelated LATER test. Any panic message
 /// that doesn't match the known-benign substrings is forwarded to the
 /// previous hook unchanged, so real bugs stay visible.
+///
+/// REQUIRES `--test-threads=1` (this suite's documented invocation — see
+/// the crate-root module doc): `std::panic::set_hook`/`take_hook` are
+/// PROCESS-GLOBAL, not per-thread. If two `#[test]` functions ran
+/// concurrently and both installed/dropped this guard around overlapping
+/// windows, the `take_hook`/`set_hook` pairs could interleave and clobber
+/// each other's `prev` chain. This does NOT corrupt test *results* — a
+/// panic still unwinds and fails its own test regardless of which hook
+/// happened to print it — it only garbles WHICH hook prints a given panic
+/// message, i.e. stderr readability, not correctness. Still worth avoiding:
+/// this suite already requires `--test-threads=1` for an unrelated reason
+/// (every cell spawns/kills real server processes bound to dynamically
+/// reserved ports; concurrent cells competing for OS resources is its own
+/// source of flakiness), so this guard's global-hook sharing is inert in
+/// practice, not accidentally safe.
 type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send;
 
 pub struct BenignDisconnectPanicFilter {

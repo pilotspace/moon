@@ -34,13 +34,27 @@ pub fn kv_del(c: &mut Conn, key: &str) {
 /// Fill `count` filler keys under a DIFFERENT (untagged) prefix, each
 /// `value_len` bytes, to push shard memory past the disk-offload spill
 /// threshold — forces the tagged probe keys written earlier to evict to the
-/// cold tier. Pattern: `tests/crash_recovery_cold_del_resurrection.rs`,
-/// scaled down (this suite needs many cells to run quickly, not a
-/// high-fidelity spill proof — that already has its own dedicated suite).
+/// cold tier. Pattern: `tests/crash_recovery_cold_del_resurrection.rs`'s
+/// `write_filler` — pipelined (one `pipeline_s` batch per chunk, not one
+/// round trip per key) so 16,000+ filler writes complete in a couple of
+/// seconds rather than minutes; caller MUST verify the spill actually
+/// happened via a hard precondition (`harness::count_heap_mpf_files`) rather
+/// than assuming byte-count math alone forced it — see review round 3 (task
+/// #52 P0): a prior 3000×512B filler against a 4 MiB cap silently never
+/// spilled at all and the cell degenerated to plain AOF-replay coverage.
 pub fn kv_spill_filler(c: &mut Conn, prefix: &str, count: u64, value_len: usize) {
     let value = "f".repeat(value_len);
-    for i in 0..count {
-        c.cmd_s(&["SET", &format!("{prefix}:filler:{i}"), &value]);
+    const BATCH: u64 = 2000;
+    let mut i = 0u64;
+    while i < count {
+        let end = (i + BATCH).min(count);
+        let keys: Vec<String> = (i..end).map(|n| format!("{prefix}:filler:{n}")).collect();
+        let cmds: Vec<Vec<&str>> = keys
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), value.as_str()])
+            .collect();
+        c.pipeline_s(&cmds);
+        i = end;
     }
 }
 
