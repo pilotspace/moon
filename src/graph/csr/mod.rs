@@ -615,10 +615,19 @@ impl CsrSegment {
         buf
     }
 
-    /// Write CSR segment bytes to a file.
+    /// Write CSR segment bytes to a file, atomically (K3: temp + fsync +
+    /// rename + dir-fsync via `atomic_write_durable`).
+    ///
+    /// Before this fix the segment was written with a bare `fs::write`: no
+    /// fsync at all, and the final path was overwritten in place rather
+    /// than replaced by rename -- a crash mid-write left a torn segment
+    /// directly at the path a manifest may already reference, and even a
+    /// clean run gave the OS no durability guarantee. See
+    /// `test_write_to_file_concurrent_rewrite_never_exposes_torn_segment`.
     pub fn write_to_file(&self, path: &Path) -> Result<(), CsrError> {
         let bytes = self.to_bytes();
-        std::fs::write(path, &bytes).map_err(|e| CsrError::IoError(e.to_string()))
+        crate::persistence::atomic::atomic_write_durable(path, &bytes)
+            .map_err(|e| CsrError::IoError(e.to_string()))
     }
 
     /// Reconstruct a CsrSegment from serialized bytes (as produced by `to_bytes()`).
@@ -1276,6 +1285,72 @@ mod tests {
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 55);
+    }
+
+    /// K3 (kernel-m2-brief-2026-07-12.md): `write_to_file` must go through
+    /// the shared `atomic_write_durable` primitive (temp + fsync + rename +
+    /// dir-fsync), not a bare `std::fs::write`. A bare write is not an
+    /// atomic replace — a concurrent reader can observe the file mid-write,
+    /// and a crash mid-write leaves a torn segment directly at the final
+    /// path (the pre-fix behavior this test pins against). Proven here via
+    /// a concurrent writer alternating between two differently-sized,
+    /// differently-LSN'd segments at the same path: a reader must NEVER see
+    /// anything other than one of the two complete, checksum-valid
+    /// segments (or "not found" / mid-rename transients), never a
+    /// corrupt/truncated read.
+    #[test]
+    fn test_write_to_file_concurrent_rewrite_never_exposes_torn_segment() {
+        fn build_medium_graph() -> FrozenMemGraph {
+            let mut g = crate::graph::memgraph::MemGraph::new(500);
+            let mut nodes = Vec::new();
+            for i in 0..200u16 {
+                nodes.push(g.add_node(smallvec![i % 32], smallvec![], None, 1));
+            }
+            for i in 0..199 {
+                g.add_edge(nodes[i], nodes[i + 1], 1, 1.0, None, 2)
+                    .expect("ok");
+            }
+            g.freeze().expect("freeze ok")
+        }
+
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("seg_torn.csr");
+
+        let seg_small = CsrSegment::from_frozen(build_small_graph(), 1).expect("csr ok");
+        let seg_medium = CsrSegment::from_frozen(build_medium_graph(), 2).expect("csr ok");
+        assert_ne!(
+            seg_small.to_bytes().len(),
+            seg_medium.to_bytes().len(),
+            "fixtures must differ in encoded length to maximize torn-read detectability"
+        );
+
+        seg_small.write_to_file(&path).expect("seed write ok");
+
+        let path_w = path.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..150 {
+                let seg = if i % 2 == 0 { &seg_small } else { &seg_medium };
+                seg.write_to_file(&path_w).expect("write ok");
+            }
+        });
+
+        for _ in 0..1500 {
+            match CsrSegment::from_file(&path) {
+                Ok(restored) => {
+                    assert!(
+                        restored.created_lsn == 1 || restored.created_lsn == 2,
+                        "read a segment with an unexpected lsn {} -- likely a torn write \
+                         that happened to parse",
+                        restored.created_lsn
+                    );
+                }
+                Err(CsrError::IoError(_)) => {
+                    // Not found / transient during rename -- acceptable.
+                }
+                Err(other) => panic!("torn/corrupt read of seg_torn.csr: {other:?}"),
+            }
+        }
+        writer.join().expect("writer thread panicked");
     }
 
     #[test]
