@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
 
+use crate::persistence::wal_v3::record::WalRecordType;
 use crate::storage::Database;
 use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
 use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
@@ -44,11 +45,15 @@ pub struct ShardStoreMemory {
 /// - `workspace_registry`: single process-global registry (C3 / M3).
 /// - `store_memory_per_shard`: published store-memory atomics (C5 / M4).
 pub struct ShardDatabases {
-    /// Per-shard WAL append channel sender. Connection handlers send serialized
-    /// write commands here; the event loop drains into WAL v3 on the 1ms tick.
-    /// OnceLock: set once at event-loop startup (before connections are
-    /// accepted), then every hot-path read is lock-free.
-    wal_append_txs: Vec<std::sync::OnceLock<crate::runtime::channel::MpscSender<bytes::Bytes>>>,
+    /// Per-shard WAL append channel sender. Connection handlers send
+    /// `(WalRecordType, payload)` pairs here — the caller's REAL record type,
+    /// unframed — and the event loop drains into WAL v3 on the 1ms tick via
+    /// `wal.append(record_type, &payload)` (K1a: no more nested-Command
+    /// re-wrapping). OnceLock: set once at event-loop startup (before
+    /// connections are accepted), then every hot-path read is lock-free.
+    wal_append_txs: Vec<
+        std::sync::OnceLock<crate::runtime::channel::MpscSender<(WalRecordType, bytes::Bytes)>>,
+    >,
     /// Process-global WorkspaceRegistry (C3 / M3).
     ///
     /// Workspaces are control-plane objects looked up by every connection
@@ -141,7 +146,7 @@ impl ShardDatabases {
     pub fn set_wal_append_tx(
         &self,
         shard_id: usize,
-        tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
+        tx: crate::runtime::channel::MpscSender<(WalRecordType, bytes::Bytes)>,
     ) {
         if self.wal_append_txs[shard_id].set(tx).is_err() {
             tracing::warn!(
@@ -151,15 +156,15 @@ impl ShardDatabases {
         }
     }
 
-    /// Send serialized command bytes to the WAL append channel for a shard.
-    ///
-    /// Called by connection handlers for local write commands. The event loop
-    /// drains this channel on the 1ms tick into WAL v3.
+    /// Send a WAL record to the append channel for a shard, tagged with its
+    /// REAL `record_type` (K1a). The event loop's 1ms-tick drain calls
+    /// `wal.append(record_type, &data)` directly — no nested-Command
+    /// re-framing, so replay sees the record's true outer type.
     /// No-op when persistence is disabled.
     #[inline]
-    pub fn wal_append(&self, shard_id: usize, data: bytes::Bytes) {
+    pub fn wal_append(&self, shard_id: usize, record_type: WalRecordType, data: bytes::Bytes) {
         if let Some(tx) = self.wal_append_txs[shard_id].get() {
-            let _ = tx.try_send(data);
+            let _ = tx.try_send((record_type, data));
         }
     }
 
@@ -171,9 +176,14 @@ impl ShardDatabases {
     /// record's durability (e.g. SWAPDB has no command-level rollback).
     #[inline]
     #[must_use = "callers must check the result and skip the mutation on WAL failure"]
-    pub fn try_wal_append_required(&self, shard_id: usize, data: bytes::Bytes) -> bool {
+    pub fn try_wal_append_required(
+        &self,
+        shard_id: usize,
+        record_type: WalRecordType,
+        data: bytes::Bytes,
+    ) -> bool {
         match self.wal_append_txs[shard_id].get() {
-            Some(tx) => tx.try_send(data).is_ok(),
+            Some(tx) => tx.try_send((record_type, data)).is_ok(),
             None => true, // persistence disabled — no durability requirement
         }
     }
@@ -319,12 +329,12 @@ pub fn replay_workspace_wal(shared: &Arc<ShardDatabases>, persistence_dir: &std:
 
         let mut handle_record = |record_type: WalRecordType, payload: &[u8]| match record_type {
             WalRecordType::WorkspaceCreate => {
-                if let Some((ws_bytes, name)) = decode_workspace_create(payload) {
+                if let Some((ws_bytes, name, created_at)) = decode_workspace_create(payload) {
                     let ws_id = WorkspaceId::from_bytes(ws_bytes);
                     let meta = WorkspaceMetadata {
                         id: ws_id,
                         name: bytes::Bytes::from(name),
-                        created_at: 0,
+                        created_at,
                     };
                     let mut guard = shared.workspace_registry.lock();
                     let reg = guard.get_or_insert_with(|| Box::new(WorkspaceRegistry::new()));

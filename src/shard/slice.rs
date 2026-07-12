@@ -35,6 +35,7 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "graph")]
 use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
+use crate::persistence::wal_v3::record::WalRecordType;
 use crate::runtime::channel::MpscSender;
 use crate::shard::shared_databases::ShardStoreMemory;
 use crate::storage::Database;
@@ -89,7 +90,13 @@ pub struct ShardSlice {
     /// until the first `MQ.TRIGGER` call on this shard.
     pub trigger_registry: Option<Box<TriggerRegistry>>,
     /// WAL append channel sender. `None` when persistence is disabled.
-    pub wal_append_tx: Option<MpscSender<bytes::Bytes>>,
+    ///
+    /// Carries the producer's REAL `WalRecordType` alongside the unframed
+    /// payload bytes — the event-loop drain calls `wal.append(record_type,
+    /// &payload)` directly instead of re-wrapping everything as `Command`
+    /// (the K1a structural fix; see `storage-audit-2026-07-12-wal.md` §
+    /// "Preserve WalRecordType through the wal_append channel").
+    pub wal_append_tx: Option<MpscSender<(WalRecordType, bytes::Bytes)>>,
     /// Per-shard estimated memory counter. Published atomically so that
     /// cross-shard readers (maxmemory eviction, metrics) can sum without locks.
     ///
@@ -130,7 +137,7 @@ pub struct ShardSliceInit {
     pub temporal_kv_index: Option<Box<TemporalKvIndex>>,
     pub durable_queue_registry: Option<Box<DurableQueueRegistry>>,
     pub trigger_registry: Option<Box<TriggerRegistry>>,
-    pub wal_append_tx: Option<MpscSender<bytes::Bytes>>,
+    pub wal_append_tx: Option<MpscSender<(WalRecordType, bytes::Bytes)>>,
     /// A clone of `ShardDatabases::memory_per_shard[shard_id]`. The master
     /// `Arc<AtomicUsize>` lives in `ShardDatabases`; this is a second owner.
     pub estimated_memory: Arc<AtomicUsize>,

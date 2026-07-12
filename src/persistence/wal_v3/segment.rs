@@ -876,6 +876,56 @@ mod tests {
         assert_eq!(count, 10);
     }
 
+    /// K1a RED/GREEN: a WS.CREATE record sent through the SAME
+    /// `(WalRecordType, Bytes)` typed channel + drain pattern the shard event
+    /// loop uses (`event_loop.rs`'s `wal_append_rx.try_recv()` loop) must land
+    /// on disk with its REAL outer type (`WorkspaceCreate`) — not re-wrapped
+    /// as `WalRecordType::Command`, the nested-Command workaround this task
+    /// retires. Before K1a the channel only carried `Bytes` and the drain
+    /// forced `WalRecordType::Command` unconditionally
+    /// (`wal.append(WalRecordType::Command, &data)`), so this assertion would
+    /// have failed (`record.record_type == Command`, not `WorkspaceCreate`)
+    /// and the payload the RESP-parser tried to read would have been the
+    /// WorkspaceCreate bytes themselves — not even valid RESP.
+    #[test]
+    fn test_typed_channel_preserves_workspace_create_outer_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        // Producer side: exactly what handler_monoio/write.rs's WS.CREATE arm
+        // does post-K1a — build the UNFRAMED payload and send it with its
+        // real type over the typed channel. No `write_wal_v3_record`
+        // pre-framing.
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded::<(WalRecordType, bytes::Bytes)>(4096);
+        let ws_id = [7u8; 16];
+        let payload =
+            crate::workspace::wal::encode_workspace_create(&ws_id, b"acme", 1_752_000_000_000);
+        tx.try_send((WalRecordType::WorkspaceCreate, bytes::Bytes::from(payload)))
+            .unwrap();
+
+        // Drain side: the exact loop body from `event_loop.rs`'s 1ms tick.
+        while let Ok((record_type, data)) = rx.try_recv() {
+            writer.append(record_type, &data);
+        }
+        writer.flush_sync().unwrap();
+
+        // Read back the raw segment bytes and parse the FIRST (only) record.
+        let data = fs::read(WalSegment::segment_path(&wal_dir, 1)).unwrap();
+        let record = read_wal_v3_record(&data[WAL_V3_HEADER_SIZE..]).expect("record parses");
+        assert_eq!(
+            record.record_type,
+            WalRecordType::WorkspaceCreate,
+            "K1a: outer type must be the producer's REAL type, not re-wrapped Command"
+        );
+        // And the payload decodes directly — no nested-Command unwrap needed.
+        let (decoded_id, decoded_name, created_at) =
+            crate::workspace::wal::decode_workspace_create(&record.payload).unwrap();
+        assert_eq!(decoded_id, ws_id);
+        assert_eq!(decoded_name, b"acme");
+        assert_eq!(created_at, 1_752_000_000_000);
+    }
+
     #[test]
     fn test_wait_durable_zero_and_already_durable_are_noops() {
         let tmp = tempfile::tempdir().unwrap();

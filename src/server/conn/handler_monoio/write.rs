@@ -76,20 +76,21 @@ pub(super) async fn try_handle_ws_command(
                     });
                     reg.insert(ws_id, meta);
                 }
-                // WAL: WorkspaceCreate record. The registry is global, so its
-                // WAL stream is pinned to shard 0 — one stream gives replay a
-                // total order over Create/Drop regardless of which connection
-                // issued them.
-                let payload =
-                    crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &ws_name);
-                let mut wal_buf = Vec::new();
-                crate::persistence::wal_v3::record::write_wal_v3_record(
-                    &mut wal_buf,
+                // WAL: WorkspaceCreate record (unframed, real type — K1a). The
+                // registry is global, so its WAL stream is pinned to shard 0 —
+                // one stream gives replay a total order over Create/Drop
+                // regardless of which connection issued them. K1b: the payload
+                // carries `created_at` so it survives a restart.
+                let payload = crate::workspace::wal::encode_workspace_create(
+                    ws_id.as_bytes(),
+                    &ws_name,
+                    created_at,
+                );
+                ctx.shard_databases.wal_append(
                     0,
                     crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
-                    &payload,
+                    Bytes::from(payload),
                 );
-                ctx.shard_databases.wal_append(0, Bytes::from(wal_buf));
                 responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
             }
             Err(e) => responses.push(e),
@@ -110,17 +111,14 @@ pub(super) async fn try_handle_ws_command(
                             }
                         };
                         if removed {
-                            // WAL: WorkspaceDrop record
+                            // WAL: WorkspaceDrop record (unframed, real type — K1a).
                             let payload =
                                 crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
-                            let mut wal_buf = Vec::new();
-                            crate::persistence::wal_v3::record::write_wal_v3_record(
-                                &mut wal_buf,
+                            ctx.shard_databases.wal_append(
                                 0,
                                 crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
-                                &payload,
+                                Bytes::from(payload),
                             );
-                            ctx.shard_databases.wal_append(0, Bytes::from(wal_buf));
                             // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
                             // Owner-route the cleanup via WsDropCleanup hop. The {wsid} hash
                             // tag co-locates every workspace key on ONE shard.
@@ -1026,7 +1024,11 @@ pub(super) async fn try_handle_graph_command(
         }
     }
     for record in wal_records {
-        ctx.shard_databases.wal_append(ctx.shard_id, record);
+        ctx.shard_databases.wal_append(
+            ctx.shard_id,
+            crate::persistence::wal_v3::record::WalRecordType::Command,
+            record,
+        );
     }
     let mut response = response;
     if let Some(ws_id) = conn.workspace_id.as_ref() {

@@ -2808,7 +2808,11 @@ pub async fn coordinate_swapdb(
             Frame::BulkString(Bytes::copy_from_slice(b_buf.format(b).as_bytes())),
         ]);
         let serialized = crate::persistence::aof::serialize_command(&wal_frame);
-        if !shard_databases.try_wal_append_required(my_shard, serialized) {
+        if !shard_databases.try_wal_append_required(
+            my_shard,
+            crate::persistence::wal_v3::record::WalRecordType::Command,
+            serialized,
+        ) {
             return Frame::Error(bytes::Bytes::from_static(
                 b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
             ));

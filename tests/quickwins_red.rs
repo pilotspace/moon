@@ -211,6 +211,7 @@ fn qw5_backlog_append_golden() {
 
 #[test]
 fn qw2_try_wal_append_required_false_on_full() {
+    use moon::persistence::wal_v3::record::WalRecordType;
     use moon::shard::shared_databases::ShardDatabases;
     use moon::storage::db::Database;
 
@@ -218,27 +219,27 @@ fn qw2_try_wal_append_required_false_on_full() {
 
     // Persistence disabled -> no durability requirement -> true.
     assert!(
-        dbs.try_wal_append_required(0, Bytes::from_static(b"x")),
+        dbs.try_wal_append_required(0, WalRecordType::Command, Bytes::from_static(b"x")),
         "no WAL configured: append must report success (no durability requirement)"
     );
 
     // Bounded(1) channel, never drained: first append fills it, second must
     // be refused — the caller-visible gate that prevents un-journaled mutation
     // (Reject: durability_contract_broken).
-    let (tx, _rx) = moon::runtime::channel::mpsc_bounded::<Bytes>(1);
+    let (tx, _rx) = moon::runtime::channel::mpsc_bounded::<(WalRecordType, Bytes)>(1);
     dbs.set_wal_append_tx(0, tx);
 
     assert!(
-        dbs.try_wal_append_required(0, Bytes::from_static(b"a")),
+        dbs.try_wal_append_required(0, WalRecordType::Command, Bytes::from_static(b"a")),
         "first append fits the bounded(1) channel"
     );
     assert!(
-        !dbs.try_wal_append_required(0, Bytes::from_static(b"b")),
+        !dbs.try_wal_append_required(0, WalRecordType::Command, Bytes::from_static(b"b")),
         "full WAL channel must report false so the caller skips the mutation"
     );
 
     // Fire-and-forget variant must not panic on a full channel.
-    dbs.wal_append(0, Bytes::from_static(b"c"));
+    dbs.wal_append(0, WalRecordType::Command, Bytes::from_static(b"c"));
 }
 
 // ---------------------------------------------------------------------------

@@ -153,7 +153,18 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
                     &graph_name,
                     wall_ms,
                 ) {
-                    Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+                    // `dispatch_graph_command` only returns a `Frame` (its ~90
+                    // test call sites and the two real cross-shard callers in
+                    // `spsc_handler.rs` all assume that), so the GraphTemporal
+                    // payload can't ride the return value. Stash it in the
+                    // dedicated `temporal_wal_pending` side-channel — distinct
+                    // from `wal_pending` (always `Command`-typed RESP bytes) —
+                    // for the caller to `.take()` and send through the typed
+                    // `wal_append` channel right after this call returns.
+                    Ok(payload) => {
+                        store.temporal_wal_pending = Some(payload);
+                        Frame::SimpleString(Bytes::from_static(b"OK"))
+                    }
                     Err(e) => Frame::Error(Bytes::from_static(e)),
                 }
             }

@@ -87,9 +87,12 @@ pub(super) async fn try_handle_txn_commit(
                     return true;
                 }
 
-                // Write XactCommit WAL record with committed KV state.
-                // Both the forward-image read and the record header use the
-                // txn's BEGIN-time db so commit and replay agree on the db.
+                // Write XactCommit WAL record with committed KV state
+                // (unframed, real type — K1a). The record's LSN is now
+                // assigned by the WAL writer itself at drain time — the old
+                // pre-framing passed `txn_id` into `write_wal_v3_record`'s
+                // `lsn` parameter, mislabeling the transaction id as the WAL
+                // LSN in the (nested, now-deleted) inner frame.
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
                     let payload = crate::shard::slice::with_shard_db(txn.db_index, |db| {
@@ -100,15 +103,11 @@ pub(super) async fn try_handle_txn_commit(
                             db,
                         )
                     });
-                    let mut wal_buf = Vec::new();
-                    crate::persistence::wal_v3::record::write_wal_v3_record(
-                        &mut wal_buf,
-                        txn_id,
+                    ctx.shard_databases.wal_append(
+                        ctx.shard_id,
                         crate::persistence::wal_v3::record::WalRecordType::XactCommit,
-                        &payload,
+                        bytes::Bytes::from(payload),
                     );
-                    ctx.shard_databases
-                        .wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
                 }
 
                 // Release KV write intents and drain HNSW queue via thread-local slice.
@@ -321,24 +320,24 @@ pub(super) async fn try_handle_temporal_invalidate(
                 let wall_ms = capture_wall_ms();
                 // Unconditional slice path: apply temporal invalidation via
                 // ShardSlice::graph_store directly (no lock).
-                let (result, wal_records) = crate::shard::slice::with_shard(|s| {
-                    let gs = &mut s.graph_store;
-                    let r = crate::command::temporal::apply_invalidate(
-                        gs,
+                //
+                // K1a: `apply_invalidate` returns the unframed `GraphTemporal`
+                // payload directly instead of pre-framing it with
+                // `write_wal_v3_record` and stashing it in `gs.wal_pending`
+                // (which is otherwise always `Command`-typed RESP bytes) —
+                // the typed `wal_append` channel below carries the real type,
+                // so no `drain_wal()` call is needed for this record.
+                let result = crate::shard::slice::with_shard(|s| {
+                    crate::command::temporal::apply_invalidate(
+                        &mut s.graph_store,
                         entity_id,
                         is_node,
                         &graph_name,
                         wall_ms,
-                    );
-                    let recs = if r.is_ok() {
-                        gs.drain_wal()
-                    } else {
-                        Vec::new()
-                    };
-                    (r, recs)
+                    )
                 });
                 match result {
-                    Ok(()) => {
+                    Ok(payload) => {
                         // v0.7 graph replication (round-2 finding B):
                         // TEMPORAL.INVALIDATE mutates graph state (valid_to)
                         // — stream the deterministic wall-clock-pinned form.
@@ -362,10 +361,11 @@ pub(super) async fn try_handle_temporal_invalidate(
                             // the db context.
                             super::ft::record_local_write(ctx, Bytes::from(record));
                         }
-                        for record in wal_records {
-                            ctx.shard_databases
-                                .wal_append(ctx.shard_id, Bytes::from(record));
-                        }
+                        ctx.shard_databases.wal_append(
+                            ctx.shard_id,
+                            crate::persistence::wal_v3::record::WalRecordType::GraphTemporal,
+                            Bytes::from(payload),
+                        );
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                     }
                     Err(err) => responses.push(Frame::Error(Bytes::from_static(err))),

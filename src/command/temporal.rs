@@ -149,11 +149,27 @@ pub fn parse_invalidate_at(args: &[Frame]) -> Option<(Bytes, bool, u64, i64)> {
 
 /// Apply a TEMPORAL.INVALIDATE mutation to a graph store.
 ///
-/// Sets `valid_to = wall_ms` on the entity and pushes the WAL payload into
-/// `gs.wal_pending`. The CALLER drains the WAL and appends on its own shard —
-/// this keeps the function usable from both the connection-local path and the
+/// Sets `valid_to = wall_ms` on the entity and returns the UNFRAMED
+/// `GraphTemporal` WAL payload (`encode_graph_temporal` bytes, no
+/// `write_wal_v3_record` wrapping). The CALLER sends it through the typed
+/// `wal_append` channel tagged `WalRecordType::GraphTemporal` — this keeps
+/// the function usable from both the connection-local path and the
 /// shard-side `ShardMessage::GraphCommand` handler (multi-shard routing sends
-/// the command to the shard that owns the graph name).
+/// the command to the shard that owns the graph name; that caller instead
+/// stashes the payload in `gs.temporal_wal_pending` since it can only return
+/// a `Frame`, see `command::graph::dispatch_graph_command`).
+///
+/// K1a: earlier versions of this function pre-framed the payload with
+/// `write_wal_v3_record(WalRecordType::GraphTemporal)` and pushed it into
+/// `gs.wal_pending` (which is otherwise always `Command`-typed RESP bytes)
+/// because the cross-thread `wal_append` channel used to force EVERY record
+/// to an outer `WalRecordType::Command`, and nesting was the only way replay
+/// could recover the real type. Now that the channel carries the real type
+/// end-to-end, returning the raw payload directly is both simpler and
+/// removes the double-framing overhead. Replay still tolerates the OLD
+/// nested-Command form for segments written before this fix — see
+/// `ShardDatabases::replay_temporal_wal`'s nested-Command-unwrap arm and its
+/// legacy-raw-fallback for segments from even before THAT fix.
 #[cfg(feature = "graph")]
 pub fn apply_invalidate(
     gs: &mut crate::graph::store::GraphStore,
@@ -161,7 +177,7 @@ pub fn apply_invalidate(
     is_node: bool,
     graph_name: &Bytes,
     wall_ms: i64,
-) -> Result<(), &'static [u8]> {
+) -> Result<Vec<u8>, &'static [u8]> {
     let Some(named_graph) = gs.get_graph_mut(graph_name) else {
         return Err(ERR_GRAPH_NOT_FOUND);
     };
@@ -185,31 +201,13 @@ pub fn apply_invalidate(
     if !mutated {
         return Err(ERR_ENTITY_NOT_FOUND);
     }
-    // Pre-frame with `write_wal_v3_record` (WalRecordType::GraphTemporal)
-    // exactly like the MQ producers (`mq_exec.rs::handle_create`/`handle_ack`)
-    // do for MqCreate/MqAck -- the shard event-loop drain re-wraps whatever
-    // arrives on `wal_append_tx` as an OUTER `WalRecordType::Command` record,
-    // so pre-framing here is what lets `replay_temporal_wal`'s nested-Command
-    // unwrap (`read_wal_v3_record`) recover this record UNAMBIGUOUSLY by
-    // type tag + CRC, instead of guessing from the raw byte layout. Before
-    // this fix the raw (un-framed) 25-byte payload was pushed directly,
-    // which forced replay to discriminate it from a RESP command payload by
-    // a `payload[0] != b'*'` heuristic on the entity_id's low byte -- WRONG
-    // for any entity_id whose low byte happened to be 0x2A, silently
-    // dropping the invalidation on replay (see `replay_temporal_wal`'s
-    // legacy-raw-fallback comment for the mixed-segment compatibility path
-    // this leaves in place for WAL segments written before this fix).
-    let inner_payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+    // K1a: return the UNFRAMED payload — no `write_wal_v3_record` pre-framing
+    // and no `gs.wal_pending` push. The typed `wal_append` channel carries
+    // `WalRecordType::GraphTemporal` end-to-end now, so the caller can send
+    // this straight through without a second nested WAL frame.
+    let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
         entity_id, is_node, wall_ms, wall_ms,
     );
-    let mut framed = Vec::with_capacity(20 + inner_payload.len());
-    crate::persistence::wal_v3::record::write_wal_v3_record(
-        &mut framed,
-        0,
-        crate::persistence::wal_v3::record::WalRecordType::GraphTemporal,
-        &inner_payload,
-    );
-    gs.wal_pending.push(framed);
     // Task #32: TEMPORAL.INVALIDATE mutates valid_to on write_buf directly,
     // changing what a subsequent read sees -- invalidate the graph's cached
     // query results. Re-fetch rather than reuse `named_graph` above: the
@@ -217,7 +215,7 @@ pub fn apply_invalidate(
     if let Some(named_graph) = gs.get_graph_mut(graph_name) {
         named_graph.touch();
     }
-    Ok(())
+    Ok(payload)
 }
 
 /// Capture the current wall-clock time as i64 Unix milliseconds.

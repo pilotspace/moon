@@ -6,6 +6,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — WAL v3 `wal_append` channel now preserves the caller's REAL record type end-to-end (K1a, storage-kernel M1 stage 1)
+
+`ShardDatabases::wal_append` / `try_wal_append_required` and
+`mq_exec::wal_append_on_slice` took a plain `Bytes` payload; the shard
+event-loop's 1ms-tick drain (`event_loop.rs`, two sites) unconditionally
+re-wrapped every message as an outer `WalRecordType::Command` record. Every
+non-Command producer (`XactCommit`, `WorkspaceCreate`/`WorkspaceDrop`,
+`MqCreate`/`MqAck`, `GraphTemporal`) worked around this by pre-framing its
+own record with `write_wal_v3_record` and sending the ALREADY-FRAMED bytes
+through — a second, nested WAL frame inside the outer `Command` frame,
+recovered on replay via a bespoke `read_wal_v3_record`-on-payload unwrap per
+record type. One nested-framing call (`handler_monoio/txn.rs` /
+`handler_sharded/txn.rs` XactCommit) additionally passed the transaction's
+`txn_id` into the inner frame's `lsn` field, mislabeling it.
+
+Fixed structurally: the channel item is now `(WalRecordType, Bytes)` — the
+producer's real type plus the UNFRAMED payload — threaded through
+`ShardSlice::wal_append_tx` / `ShardDatabases::wal_append_txs` end-to-end.
+The drain calls `wal.append(record_type, &payload)` directly, so the WAL
+writer assigns the real LSN and does the single framing. Every producer's
+pre-framing (`write_wal_v3_record` call) was deleted:
+`handler_monoio`/`handler_sharded` `write.rs` (WS.CREATE/DROP) and `txn.rs`
+(XactCommit — the `txn_id`-as-`lsn` mislabel is gone with it),
+`shard/uring_handler.rs`'s WS batch path, `shard/mq_exec.rs` (MqCreate/MqAck),
+and `command::temporal::apply_invalidate` (GraphTemporal — PR #286 had just
+added this record's pre-framing; it is deleted in favor of the typed
+channel, and the function now RETURNS the raw payload instead of pushing it
+into `GraphStore::wal_pending`, which stays exclusively `Command`-typed RESP
+bytes). The one caller that cannot change its `Frame`-only return signature
+without a ~90-call-site test ripple (`command::graph::dispatch_graph_command`,
+the cross-shard `GraphCommand` entry point) stashes the returned payload in
+a new `GraphStore::temporal_wal_pending` side-channel instead, which its two
+real callers (`shard/spsc_handler.rs`) `.take()` right after dispatch.
+
+Replay is **fully backward compatible, no format bump**: every existing
+direct-type match arm (`replay_workspace_wal`, `replay_mq_wal`,
+`replay_temporal_wal` in `shared_databases.rs`) already had a nested-Command
+unwrap fallback (added when the records were still nested) plus, for
+`GraphTemporal`, a legacy-raw fallback for even older un-nested records —
+both are UNTOUCHED, so segments written before this fix keep replaying
+exactly as before. New records simply hit the direct-type arm for the first
+time instead of falling through the unwrap.
+
+`persistence::recovery.rs` Phase 4's `on_command` closure had no
+`XactCommit` arm at all (silent `_ => {}`) — now reachable for the first
+time because the outer type used to always be `Command`. Decision: an
+EXPLICIT documented no-op (counts toward `commands_replayed`, never
+dispatches). The forward-image KV payload (`encode_xact_commit_payload`) is
+redundant in every reachable config — the transaction's individual SET/DEL
+ops already ride either this same Phase-4 WAL replay as ordinary `Command`
+records (`--wal-kv-log` on) or the AOF, the KV recovery authority in every
+config (Phase 4b falls back to it whenever `kv_commands_replayed == 0`).
+Decoding it would be a no-op at best and risks double-applying a
+non-idempotent op at worst — the same overlap risk the adjacent Phase 4b
+comment already flags. `wal_v3::replay::replay_wal_v3_dir_commands` (the
+legacy last-resort-fallback path, used only when no AOF exists) already had
+a correct `replay_xact_commit` call for the real outer type — untouched,
+and now reachable for the first time too since it stops receiving records
+nested inside `Command`.
+
+### Fixed — WS.CREATE's `created_at` was silently dropped by the WAL, restored as 0 after every restart (K1b, storage-kernel M1 stage 1)
+
+`encode_workspace_create`/`decode_workspace_create` (`src/workspace/wal.rs`)
+only ever serialized `[ws_id][name_len][name]` — the `created_at` computed
+at WS.CREATE time never reached the payload, so `replay_workspace_wal`
+(`shared_databases.rs`) had no choice but to hardcode `created_at: 0` on
+every restart, silently losing the real creation time. Fixed with a
+versioned, backward-compatible layout: new records append a trailing
+`created_at_ms: i64 LE`; the decoder accepts BOTH the old
+(`20 + name_len`-byte) and new (`20 + name_len + 8`-byte) lengths, returning
+`created_at = 0` for old records (matching prior restart behavior exactly —
+no format bump, mixed-segment compatible). All three producers
+(`handler_monoio`/`handler_sharded` `write.rs`, `shard/uring_handler.rs`'s
+batch path) now pass the already-computed `created_at` through; the replay
+decoder threads the real value into `WorkspaceMetadata` instead of the
+hardcoded `0`.
+
 ### Fixed — autovacuum Pass C recycled the sole durable copy of graph/WS/MQ/temporal WAL history in legacy mode (task #43, P1)
 
 `AutovacuumDaemon::run_tick`'s Pass C (`src/shard/autovacuum.rs`) called

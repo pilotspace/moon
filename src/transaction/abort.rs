@@ -151,7 +151,11 @@ pub fn abort_cross_store_txn(
             // replay observes the rollback in the same ordering the live
             // write path would have produced.
             for record in wal_records {
-                shard_databases.wal_append(shard_id, Bytes::from(record));
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::Command,
+                    Bytes::from(record),
+                );
             }
         }
     }
