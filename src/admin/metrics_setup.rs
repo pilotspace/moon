@@ -259,6 +259,11 @@ fn prime_moon_memory_bytes() {
         "wal",
         "sealed",
         "replication_backlog",
+        // Pre-existing gap fixed alongside the "text" addition above:
+        // `update_moon_memory_bytes` has emitted this kind since C4
+        // (wave-5 hygiene), but it was never primed, so it silently
+        // didn't appear in `/metrics` until the first 15s update tick.
+        "lua_scripts",
         "allocator_overhead",
     ] {
         gauge!("moon_memory_bytes", "kind" => kind).set(0.0);
