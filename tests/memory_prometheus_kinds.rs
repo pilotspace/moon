@@ -26,7 +26,17 @@ fn redis_cli_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the release binary to spawn. Honors `MOON_BIN` when set so a
+/// pinned, freshly-built ELF binary can be supplied explicitly -- required
+/// inside the OrbStack Linux VM, where the shared checkout's
+/// `target/release/moon` may be a macOS Mach-O binary that gets silently
+/// host-proxied back to the Mac (the port never binds VM-side, producing a
+/// 30s accept timeout with no obvious cause). See
+/// `gotcha_orbstack_macho_binary_trap`.
 fn release_binary() -> std::path::PathBuf {
+    if let Ok(bin) = std::env::var("MOON_BIN") {
+        return std::path::PathBuf::from(bin);
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
 }
 
