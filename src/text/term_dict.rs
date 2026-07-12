@@ -63,4 +63,45 @@ impl TermDictionary {
     pub fn next_id(&self) -> u32 {
         self.next_id
     }
+
+    /// Approximate resident bytes: term string length + the `u32` id value
+    /// plus a fixed per-entry `HashMap` bucket-overhead constant (K4
+    /// accounting spine). Not exact -- `hashbrown`'s SwissTable control-byte
+    /// layout is an implementation detail -- but monotonic and consistent
+    /// with `Database`'s own `entry_overhead` approximation (WS6) and
+    /// `graph::index::PropertyIndex::resident_bytes`'s `serialized_size()`
+    /// convention. O(vocabulary size); called from the shard's 100ms tick,
+    /// the same cadence `GraphStore::resident_bytes` already accepts for its
+    /// own O(segment_count) walk.
+    pub fn resident_bytes(&self) -> usize {
+        const MAP_ENTRY_OVERHEAD: usize = 48;
+        self.terms
+            .keys()
+            .map(|term| term.len() + std::mem::size_of::<u32>() + MAP_ENTRY_OVERHEAD)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_bytes_zero_when_empty() {
+        let dict = TermDictionary::new();
+        assert_eq!(dict.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn resident_bytes_grows_with_inserts() {
+        let mut dict = TermDictionary::new();
+        let before = dict.resident_bytes();
+        dict.get_or_insert("hello");
+        dict.get_or_insert("world");
+        assert!(dict.resident_bytes() > before);
+        // Re-inserting an existing term must not double-count.
+        let after_dup = dict.resident_bytes();
+        dict.get_or_insert("hello");
+        assert_eq!(dict.resident_bytes(), after_dup);
+    }
 }
