@@ -1274,6 +1274,134 @@ impl TextIndex {
             .sum()
     }
 
+    /// Approximate total resident bytes owned by this index: posting lists,
+    /// term dictionaries (BM25 path), FST sidecars (fuzzy/prefix expansion),
+    /// per-document bookkeeping maps (field lengths, key<->doc_id, MVCC
+    /// LSNs), and TAG/NUMERIC secondary indexes.
+    ///
+    /// K4 accounting spine (kernel-m2-brief-2026-07-12 stage 2): the sole
+    /// contributor to `TextStore::resident_bytes()`, which is folded into
+    /// the shard's `store_memory.text` atomic (elastic memory budget
+    /// used-term + MEMORY DOCTOR / Prometheus surfacing) -- previously
+    /// hard-coded 0.
+    ///
+    /// Excluded as negligible/bounded, not doc-scaling: `AnalyzerPipeline`
+    /// (one stemmer + stop-word set per field, built once at FT.CREATE),
+    /// `FieldStats` (two scalars per field), `BM25Config` / `text_fields` /
+    /// `key_prefixes` / `name` (schema metadata, O(field count)). Every
+    /// `HashMap`/`BTreeMap` entry cost below uses the same fixed-overhead
+    /// approximation as `TermDictionary::resident_bytes` and
+    /// `graph::index::PropertyIndex::resident_bytes`'s `serialized_size()`
+    /// convention -- a monotonic signal for the budget, not exact RSS.
+    pub fn resident_bytes(&self) -> usize {
+        const MAP_ENTRY_OVERHEAD: usize = 48;
+
+        let postings: usize = self
+            .field_postings
+            .iter()
+            .map(PostingStore::estimated_bytes)
+            .sum();
+        let term_dicts: usize = self
+            .field_term_dicts
+            .iter()
+            .map(TermDictionary::resident_bytes)
+            .sum();
+
+        #[cfg(feature = "text-index")]
+        let fst: usize = self
+            .fst_maps
+            .iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| m.as_fst().size())
+            .sum();
+        #[cfg(not(feature = "text-index"))]
+        let fst: usize = 0;
+
+        let doc_field_lengths: usize = self
+            .doc_field_lengths
+            .values()
+            .map(|v| {
+                std::mem::size_of::<u32>()
+                    + v.len() * std::mem::size_of::<u32>()
+                    + MAP_ENTRY_OVERHEAD
+            })
+            .sum();
+        let key_hash_to_doc_id = self.key_hash_to_doc_id.len()
+            * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + MAP_ENTRY_OVERHEAD);
+        let doc_id_to_key: usize = self
+            .doc_id_to_key
+            .values()
+            .map(|k| std::mem::size_of::<u32>() + k.len() + MAP_ENTRY_OVERHEAD)
+            .sum();
+        let lsn_maps = (self.doc_id_to_insert_lsn.len() + self.doc_id_to_delete_lsn.len())
+            * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD);
+
+        #[cfg(feature = "text-index")]
+        let tag: usize = self
+            .tag_indexes
+            .iter()
+            .map(|(field, inner)| {
+                field.len()
+                    + MAP_ENTRY_OVERHEAD
+                    + inner
+                        .iter()
+                        .map(|(v, bm)| v.len() + bm.serialized_size() + MAP_ENTRY_OVERHEAD)
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .doc_tag_entries
+                .values()
+                .map(|entries| {
+                    std::mem::size_of::<u32>()
+                        + MAP_ENTRY_OVERHEAD
+                        + entries
+                            .iter()
+                            .map(|(a, b)| a.len() + b.len() + 32)
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        #[cfg(not(feature = "text-index"))]
+        let tag: usize = 0;
+
+        #[cfg(feature = "text-index")]
+        let numeric: usize = self
+            .numeric_indexes
+            .iter()
+            .map(|(field, tree)| {
+                field.len()
+                    + MAP_ENTRY_OVERHEAD
+                    + tree
+                        .values()
+                        .map(|bm| {
+                            std::mem::size_of::<f64>() + bm.serialized_size() + MAP_ENTRY_OVERHEAD
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .doc_numeric_entries
+                .values()
+                .map(|entries| {
+                    std::mem::size_of::<u32>()
+                        + MAP_ENTRY_OVERHEAD
+                        + entries.iter().map(|(a, _)| a.len() + 16).sum::<usize>()
+                })
+                .sum::<usize>();
+        #[cfg(not(feature = "text-index"))]
+        let numeric: usize = 0;
+
+        postings
+            + term_dicts
+            + fst
+            + doc_field_lengths
+            + key_hash_to_doc_id
+            + doc_id_to_key
+            + lsn_maps
+            + tag
+            + numeric
+    }
+
     /// Hard-delete a document identified by `doc_id` from all inverted indexes.
     ///
     /// Removes:
@@ -1483,6 +1611,16 @@ impl TextStore {
                 tracing::warn!("Failed to save text index metadata: {}", e);
             }
         }
+    }
+
+    /// Approximate total resident bytes across every text index on this
+    /// shard (K4 accounting spine). Sum of `TextIndex::resident_bytes()`;
+    /// see that method's doc comment for what is counted/excluded. `0` for
+    /// an empty store -- called from the shard's 100ms tick and published
+    /// into `store_memory.text`, which previously never left its
+    /// hard-coded-0 initial value.
+    pub fn resident_bytes(&self) -> usize {
+        self.indexes.values().map(TextIndex::resident_bytes).sum()
     }
 
     /// Collect schema-only metadata from all text indexes for persistence.
@@ -2267,6 +2405,53 @@ mod tests {
         );
         assert!(idx.is_doc_visible_at(0, 77));
         assert!(!idx.is_doc_visible_at(0, 76));
+    }
+
+    // ── K4 accounting spine: TextIndex/TextStore resident_bytes ──────────
+
+    #[test]
+    fn resident_bytes_zero_for_empty_index() {
+        let idx = make_index_with_docs(&[]);
+        assert_eq!(idx.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn resident_bytes_grows_with_indexed_docs() {
+        let empty = make_index_with_docs(&[]);
+        let indexed = make_index_with_docs(&[
+            ("doc:1", "the quick brown fox jumps over the lazy dog"),
+            ("doc:2", "a completely different sentence about cats"),
+        ]);
+        assert!(
+            indexed.resident_bytes() > empty.resident_bytes(),
+            "indexed docs must grow resident_bytes: empty={} indexed={}",
+            empty.resident_bytes(),
+            indexed.resident_bytes()
+        );
+    }
+
+    /// RED-first (K4 stage 2 contract): an empty `TextStore` must report 0,
+    /// and creating an index + indexing documents must strictly grow the
+    /// store-level total -- the aggregate the elastic memory budget's
+    /// used-term (`ShardStoreMemory::text`) now sees.
+    #[test]
+    fn text_store_resident_bytes_grows_after_indexing() {
+        let mut store = TextStore::new();
+        assert_eq!(store.resident_bytes(), 0, "empty store reports 0");
+
+        let idx = make_index_with_docs(&[
+            ("doc:1", "the quick brown fox jumps over the lazy dog"),
+            ("doc:2", "a completely different sentence about cats"),
+            ("doc:3", "yet another document with distinct vocabulary"),
+        ]);
+        store
+            .create_index(Bytes::from_static(b"test_idx"), idx)
+            .expect("create_index");
+
+        assert!(
+            store.resident_bytes() > 0,
+            "store with an indexed document must report > 0"
+        );
     }
 }
 
