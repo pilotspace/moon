@@ -102,41 +102,80 @@ pub struct RecycleStats {
     /// Total bytes freed from disk.
     pub bytes_reclaimed: u64,
     /// LSN-eligible segments KEPT because they hold sole-copy plane history
-    /// (see [`segment_holds_plane_history`]). Callers surface this via the
+    /// (see [`segment_plane_scan`]). Callers surface this via the
     /// `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` counter.
     pub segments_blocked_plane: usize,
 }
 
-/// Return `true` when the sealed segment at `path` contains at least one
+/// Content-scan result for a sealed segment's plane-record classification.
+///
+/// `blocks_recycle` is `true` when the sealed segment contains at least one
 /// record whose ONLY durable copy is the WAL itself.
 ///
-/// The workspace / MQ / temporal planes have no snapshot or checkpoint
-/// format in ANY mode (their replay is WAL-only — see task #43 and the
-/// Wave B stage 2a review): the disk-offload checkpoint covers KV pages and
-/// the graph store, nothing else. A segment holding such a record must
-/// never be recycled regardless of the caller's LSN floor, or that history
-/// is permanently lost on the next restart. `GraphTemporal` is included
-/// conservatively: autovacuum's recycle floor (`current_lsn`) is not tied
-/// to a completed graph checkpoint.
+/// The workspace / MQ / temporal-upsert planes have no snapshot or
+/// checkpoint format in ANY mode (their replay is WAL-only — see task #43
+/// and the Wave B stage 2a review): the disk-offload checkpoint covers KV
+/// pages and the graph store, nothing else. A segment holding such a record
+/// must never be recycled regardless of the caller's LSN floor, or that
+/// history is permanently lost on the next restart.
+///
+/// `GraphTemporal` is deliberately NOT in that set (kernel M3 K2, brief
+/// §1.3): `TEMPORAL.INVALIDATE` mutates `node.valid_to`/`edge.valid_to`
+/// directly on the graph's mutable write buffer
+/// (`src/command/temporal.rs::apply_invalidate`), the exact tier
+/// `persist_graph_at_checkpoint`'s `freeze_and_compact` flushes to CSR —
+/// `valid_to` is carried into the frozen `NodeMeta`/`EdgeMeta`
+/// (`src/graph/compaction.rs`). Graph's `snapshot_lsn` floor already
+/// structurally covers `GraphTemporal` mutations; treating it the same as
+/// WS/MQ (which have NO floor at all, ever) was over-conservative — it
+/// blocked recycling a segment forever purely because it once carried a
+/// `TEMPORAL.INVALIDATE`, even after the graph engine had durably
+/// checkpointed well past it. K2 formalizes `graph_floor_lsn` as an
+/// explicit, checked value (replacing the implicit begin()-vs-Finalize
+/// ordering this guard used to compensate for), so callers now gate on
+/// `min(kv_floor, graph_floor)` BEFORE reaching this content scan —
+/// `GraphTemporal` segments recycle once that floor covers them, same as
+/// any other graph record.
 ///
 /// Fail-closed contract: an unreadable file, a non-v3 header, an unknown
 /// record-type byte (a future plane type this build predates), or a
-/// malformed/torn record tail all return `true` (keep the segment). A
-/// crash-torn tail can only occur in the previously-active segment of an
-/// earlier process generation — blocking that one segment is bounded and
-/// beats guessing. A `record_len == 0` tail is normal zero-padding → end
-/// of records.
-fn segment_holds_plane_history(path: &Path) -> bool {
+/// malformed/torn record tail all set `blocks_recycle = true` (keep the
+/// segment). A crash-torn tail can only occur in the previously-active
+/// segment of an earlier process generation — blocking that one segment is
+/// bounded and beats guessing. A `record_len == 0` tail is normal
+/// zero-padding → end of records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SegmentPlaneScan {
+    /// WS/MQ/`TemporalUpsert` present (or unreadable/torn/future-typed) —
+    /// this segment must never be recycled by an LSN floor alone.
+    blocks_recycle: bool,
+    /// At least one `GraphTemporal` record is present. Never gates
+    /// recycling by itself (that's `graph_floor_lsn`'s job, K2) — surfaced
+    /// only so callers can observe the guard-shrink take effect via
+    /// `RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL`.
+    has_graph_temporal: bool,
+}
+
+/// Single-pass content scan backing both the recycle-gating boolean
+/// (`blocks_recycle`) and the K2 `GraphTemporal` observability
+/// counter, so recyclers never need to read a sealed segment file twice.
+fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
     use super::record::WalRecordType;
+
+    const BLOCKED: SegmentPlaneScan = SegmentPlaneScan {
+        blocks_recycle: true,
+        has_graph_temporal: false,
+    };
 
     let data = match fs::read(path) {
         Ok(d) => d,
-        Err(_) => return true,
+        Err(_) => return BLOCKED,
     };
     if data.len() < WAL_V3_HEADER_SIZE || &data[..6] != WAL_V3_MAGIC || data[6] != WAL_V3_VERSION {
-        return true;
+        return BLOCKED;
     }
     let mut offset = WAL_V3_HEADER_SIZE;
+    let mut has_graph_temporal = false;
     while offset + 4 <= data.len() {
         let record_len = u32::from_le_bytes([
             data[offset],
@@ -145,16 +184,19 @@ fn segment_holds_plane_history(path: &Path) -> bool {
             data[offset + 3],
         ]) as usize;
         if record_len == 0 {
-            return false; // zero-padded tail — clean end of records
+            // zero-padded tail — clean end of records
+            return SegmentPlaneScan {
+                blocks_recycle: false,
+                has_graph_temporal,
+            };
         }
         // Minimum framing: len(4) + header(12) + crc(4).
         if record_len < 20 || offset + record_len > data.len() {
-            return true; // torn/malformed sealed tail — fail closed
+            return BLOCKED; // torn/malformed sealed tail — fail closed
         }
-        let plane = match WalRecordType::from_u8(data[offset + 12]) {
+        match WalRecordType::from_u8(data[offset + 12]) {
             Some(
                 WalRecordType::TemporalUpsert
-                | WalRecordType::GraphTemporal
                 | WalRecordType::WorkspaceCreate
                 | WalRecordType::WorkspaceDrop
                 | WalRecordType::MqCreate
@@ -162,16 +204,17 @@ fn segment_holds_plane_history(path: &Path) -> bool {
                 | WalRecordType::MqPush
                 | WalRecordType::MqPop
                 | WalRecordType::MqTrigger,
-            ) => true,
-            Some(_) => false,
-            None => return true, // unknown (future) type — fail closed
-        };
-        if plane {
-            return true;
+            ) => return BLOCKED,
+            Some(WalRecordType::GraphTemporal) => has_graph_temporal = true,
+            Some(_) => {}
+            None => return BLOCKED, // unknown (future) type — fail closed
         }
         offset += record_len;
     }
-    false
+    SegmentPlaneScan {
+        blocks_recycle: false,
+        has_graph_temporal,
+    }
 }
 
 /// WAL v3 writer with segmented files, per-record LSN, and batched fsync.
@@ -585,8 +628,13 @@ impl WalWriterV3 {
             // Plane guard: WS/MQ/temporal records have no snapshot in any
             // mode — the WAL is their sole durable copy, so no LSN floor
             // makes this segment safe to delete. See
-            // `segment_holds_plane_history` for the fail-closed contract.
-            if segment_holds_plane_history(&seg.path) {
+            // `segment_plane_scan` for the fail-closed contract.
+            // `GraphTemporal` is no longer in that guard (K2, brief §1.3) —
+            // `scan.has_graph_temporal` observes when THIS caller's floor
+            // (already `min(kv, graph)`-derived by K2 callers) is what let
+            // such a segment through.
+            let scan = segment_plane_scan(&seg.path);
+            if scan.blocks_recycle {
                 segments_blocked_plane += 1;
                 continue;
             }
@@ -597,6 +645,10 @@ impl WalWriterV3 {
                     bytes_reclaimed += seg.file_size;
                     // Emit reclamation metrics for P10 INFO emitter.
                     crate::admin::metrics_setup::record_wal_aggressive_recycle(1, seg.file_size);
+                    if scan.has_graph_temporal {
+                        crate::command::info_reclamation::RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     // Log but continue — partial reclamation is better than none.
@@ -781,8 +833,13 @@ impl WalWriterV3 {
             }
             // Plane guard: the checkpoint floor covers KV pages + graph
             // only — WS/MQ/temporal history has no snapshot in any mode.
-            // See `segment_holds_plane_history` (fail-closed).
-            if segment_holds_plane_history(&seg.path) {
+            // See `segment_plane_scan` (fail-closed). `redo_lsn`
+            // is `min(control.last_checkpoint_lsn, control.graph_floor_lsn)`
+            // as of K2, so `GraphTemporal` segments (no longer in that
+            // guard's match arm) recycle here once the graph floor covers
+            // them.
+            let scan = segment_plane_scan(&seg.path);
+            if scan.blocks_recycle {
                 tracing::debug!(
                     "WAL recycle: keeping segment {:?} — holds sole-copy plane history",
                     seg.path
@@ -799,6 +856,10 @@ impl WalWriterV3 {
             } else {
                 total_wal_size -= seg.file_size;
                 recycled += 1;
+                if scan.has_graph_temporal {
+                    crate::command::info_reclamation::RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         Ok(recycled)
@@ -1318,6 +1379,146 @@ mod tests {
         assert!(
             plane_path.exists(),
             "segment holding sole-copy WS plane history must never be recycled"
+        );
+    }
+
+    /// Kernel M3 K2 — inverted mirror of
+    /// `test_recycle_aggressive_keeps_plane_history_segments`: a sealed
+    /// segment holding ONLY `GraphTemporal` records must now be freed once
+    /// the graph floor covers it (brief §1.3's "real, low-risk K2 win").
+    /// Also asserts the `RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL`
+    /// observability counter (work item 5) fires.
+    #[test]
+    fn test_recycle_frees_graphtemporal_segment_once_graph_floor_covers_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        // First record = a GraphTemporal (TEMPORAL.INVALIDATE) plane record
+        // → lands in segment 1.
+        writer.append(WalRecordType::GraphTemporal, b"\x01graph-temporal-payload");
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        assert!(
+            writer.current_segment_sequence() >= 4,
+            "need several sealed segments"
+        );
+
+        let before_freed =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+        // A high floor simulates K2's min(kv_floor, graph_floor) once a
+        // checkpoint's graph snapshot has covered this record — segment.rs
+        // itself only ever sees the pre-computed floor, never
+        // `ws_floor_lsn`/`mq_floor_lsn` (brief §Stage 2's min-across-planes
+        // correction: those stay excluded, see the sibling Risk #2 test).
+        let recycled = writer.recycle_segments_before(u64::MAX).unwrap();
+        assert!(recycled >= 1, "some segment must have been recycled");
+
+        let plane_path = WalSegment::segment_path(&wal_dir, 1);
+        assert!(
+            !plane_path.exists(),
+            "segment holding ONLY a GraphTemporal record must now recycle \
+             once the graph floor covers it (K2 — GraphTemporal is no \
+             longer in the no-floor bucket)"
+        );
+
+        let after_freed =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL
+                .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_freed > before_freed,
+            "freeing a GraphTemporal-holding segment must be observable via \
+             RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL"
+        );
+    }
+
+    /// Kernel M3 K2 brief Risk #2 — "min-across-planes collapsing to zero":
+    /// a pure-KV segment written AFTER the shard's last WS/MQ record must
+    /// still recycle once the KV+graph floor covers it. This is the
+    /// regression the brief explicitly warns against: folding `ws_floor_lsn`
+    /// (sentinel `0`, no snapshot format this milestone) into a single
+    /// scalar `min(kv, graph, ws, mq)` would make the floor `0` forever on
+    /// any shard that has EVER seen a WS/MQ record — recycling nothing,
+    /// ever, from that point on, which is strictly worse than the
+    /// per-segment content scan alone. The correct caller-side computation
+    /// (`persistence_tick.rs` / `autovacuum.rs`) excludes the WS/MQ
+    /// sentinel entirely; this test proves `recycle_segments_before` still
+    /// frees later pure-KV segments when driven by that (correct) floor,
+    /// not a WS/MQ-poisoned one.
+    #[test]
+    fn test_recycle_min_across_planes_pure_kv_after_ws_still_recycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        // The shard's ONLY WS record, early — segment 1.
+        writer.append(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
+        // Plenty of pure-KV traffic AFTER it, sealing several later
+        // Command-only segments.
+        for i in 0..120 {
+            writer.append(WalRecordType::Command, b"SET key val filler-bytes");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        assert!(
+            writer.current_segment_sequence() >= 5,
+            "need several sealed segments after the WS record"
+        );
+        let count_wals = || -> usize {
+            fs::read_dir(&wal_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                .count()
+        };
+        let before = count_wals();
+
+        // Correct K2 caller-side floor: min(kv_floor, graph_floor) ONLY —
+        // ws_floor_lsn (sentinel 0) is NOT part of this computation, per
+        // the brief's explicit correction. Simulate a fully-caught-up
+        // checkpoint (both KV and graph floors at the WAL's current head).
+        let kv_floor = writer.current_lsn();
+        let graph_floor = writer.current_lsn();
+        let correct_floor = kv_floor.min(graph_floor);
+
+        let recycled = writer.recycle_segments_before(correct_floor).unwrap();
+        assert!(
+            recycled >= 1,
+            "pure-KV segments after the shard's last WS record must still \
+             recycle under the correct min(kv, graph) floor"
+        );
+        let after = count_wals();
+        assert!(after < before, "segment count must have decreased");
+
+        // The WS-holding segment itself must still survive (content-scan
+        // AND-gate, orthogonal to the LSN floor).
+        let plane_path = WalSegment::segment_path(&wal_dir, 1);
+        assert!(
+            plane_path.exists(),
+            "the WS-holding segment must still survive — only pure-KV \
+             segments after it were expected to recycle"
+        );
+
+        // Negative control (documentation, not a runtime assertion — the
+        // whole point of Risk #2 is that a buggy caller folding
+        // `ws_floor_lsn` (sentinel 0) into the min would compute floor `0`
+        // here, at which point `recycle_segments_before(0)` recycles
+        // NOTHING — the opposite of what this test just proved with the
+        // correct floor above).
+        assert!(
+            correct_floor > 0,
+            "sanity: the correct floor is non-zero here"
         );
     }
 

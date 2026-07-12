@@ -144,6 +144,18 @@ pub static RECL_AUTOVACUUM_THROTTLED_DUE_TO_LOAD: AtomicU64 = AtomicU64::new(0);
 /// configured ceiling; it never means data was lost.
 pub static RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of sealed WAL segments recycled that contained at least
+/// one `GraphTemporal` (`TEMPORAL.INVALIDATE`) record — kernel M3 K2's
+/// complement counter to [`RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL`],
+/// making the `segment_holds_plane_history` guard shrink (`GraphTemporal`
+/// moved out of the WS/MQ "no floor ever" bucket once `graph_floor_lsn` is
+/// an explicit, checked value) observable to operators. Non-zero means the
+/// guard shrink is actively reclaiming disk that pre-K2 builds would have
+/// kept pinned forever; it never means data was lost — `graph_floor_lsn`
+/// only lets these segments through once the graph snapshot durably covers
+/// them.
+pub static RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative count of plane WAL records (MQ/WS/temporal) DROPPED because the
 /// shard's `wal_append` channel was full at enqueue time (capacity 4096,
 /// drained every 1ms by the same shard thread — blocking there would deadlock
@@ -209,10 +221,12 @@ pub fn write_reclamation_section(buf: &mut String) {
         "reclamation_wal_bytes:{}\r\n\
          reclamation_wal_segments:{}\r\n\
          reclamation_wal_recycle_blocked_no_checkpoint_total:{}\r\n\
+         reclamation_wal_recycle_graph_temporal_freed_total:{}\r\n\
          reclamation_wal_append_channel_dropped_total:{}\r\n",
         RECL_WAL_BYTES.load(Ordering::Relaxed),
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed),
         RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed),
+        RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
 
@@ -424,6 +438,7 @@ mod tests {
             "reclamation_plan_cache_evictions_total:",
             "reclamation_delete_pending_visible_lsn:",
             "reclamation_wal_append_channel_dropped_total:",
+            "reclamation_wal_recycle_graph_temporal_freed_total:",
         ];
 
         for field in required_fields {

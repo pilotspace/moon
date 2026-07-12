@@ -68,8 +68,10 @@
 //! vacuous kv-spill filler, a shared `red_guard` masking an unrelated GREEN
 //! atomicity claim, a missing `GRAPH.CREATE` sync-wait in the split-out
 //! atomicity check, a substring-based benign-error allowlist) — see git
-//! history for the fix-by-fix trail. **40 cells total: 29 GREEN by
-//! default, 11 RED.**
+//! history for the fix-by-fix trail. Kernel M3 stage 2 (K2, task #53) then
+//! root-caused and fixed former RED cell 4 (checkpoint-Finalize graph total
+//! loss), flipping its 2 cells GREEN. **40 cells total: 31 GREEN by
+//! default, 9 RED.**
 //!
 //! RED cells are gated by `harness::red_guard` — NOT by
 //! `#[ignore = "RED: ..."]` alone, because this suite's own execution
@@ -133,36 +135,40 @@
 //! atomicity check's own graph-leg assertion errors "graph not found"
 //! before it can ever evaluate atomicity).
 //!
-//! **RED cell 4 — checkpoint-Finalize window total-losses the graph plane,
-//! NEW (2 cells):** `cross_plane_prod_s1_mixed_all_planes_mid_checkpoint`,
+//! **FIXED (was RED cell 4) — checkpoint-Finalize window total-losses the
+//! graph plane, kernel M3 stage 2 / K2, task #53 (2 cells, now GREEN):**
+//! `cross_plane_prod_s1_mixed_all_planes_mid_checkpoint`,
 //! `cross_plane_prod_s4_mixed_all_planes_mid_checkpoint`. Found via
 //! `MOON_CRASH_MATRIX_ITERS` soak, NOT the default single-iteration run —
-//! this is a PROBABILISTIC finding (some, not all, kill offsets in the
-//! 0-150ms post-`BGSAVE` window trigger it — confirmed absent in the
-//! default `MOON_CRASH_MATRIX_RED=1`/`ITERS=1` full-suite run that produced
-//! this doc's final numbers, exactly as this caution note warns). Some
-//! offsets cause TOTAL loss of the graph plane's content — not the unsynced
-//! tail, the FULL `MixedPlan::default()` batch that was already confirmed
-//! durable via a wal-v3 sync-wait BEFORE `BGSAVE` was even issued — while
-//! KV, vector, WS, and MQ all survive in the same run. Reviewed and
-//! confirmed NOT a harness artifact (KV assertion runs first,
-//! unconditionally, in `assert_mixed_truth_recovered`, and never fails
-//! here). Reproduced via `MOON_CRASH_MATRIX_ITERS=20` in isolation at both
-//! shard counts (prod_s1: hit at iteration 11/20; prod_s4: hit at iteration
-//! 7/20) — confirming this is a real, load-sensitive timing window, not a
-//! one-off VM hiccup from the full-suite run that first surfaced it. See
-//! `scenarios::mixed_mid_checkpoint`'s doc for the full analysis
-//! (consistent with, though not proven at the step level to be, a
-//! `persist_graph_at_checkpoint`-vs-`wal.recycle_segments_before` ordering
-//! gap in `CheckpointAction::Finalize`). Strong P0 candidate for kernel M3
-//! stage 2 (K2, the unified per-shard floor register); not this stage's
-//! job to fix. **Caution when reproducing:** because this is probabilistic,
-//! `MOON_CRASH_MATRIX_RED=1` alone with the default `MOON_CRASH_MATRIX_ITERS=1`
-//! can report green by chance — use
-//! `MOON_CRASH_MATRIX_RED=1 MOON_CRASH_MATRIX_ITERS=20` to reproduce
-//! reliably.
+//! this was a PROBABILISTIC finding (some, not all, kill offsets in the
+//! 0-150ms post-`BGSAVE` window triggered it — confirmed absent in a
+//! default `MOON_CRASH_MATRIX_RED=1`/`ITERS=1` full-suite run, exactly as
+//! this caution note warns). Some offsets caused TOTAL loss of the graph
+//! plane's content — not the unsynced tail, the FULL `MixedPlan::default()`
+//! batch that was already confirmed durable via a wal-v3 sync-wait BEFORE
+//! `BGSAVE` was even issued — while KV, vector, WS, and MQ all survived in
+//! the same run. Root cause: `save_graph_store`
+//! (`src/graph/recovery.rs`) wrote the reference/floor
+//! (`graph_metadata.json`, via `GraphStore::save_metadata`) BEFORE the
+//! payload it claims durable (CSR segments + `manifest.json`) — an
+//! ARIES-inverted ordering. A kill-9 landing between the two writes left a
+//! fully-advanced floor pointing at a payload that never made it to disk,
+//! so recovery trusted the floor and skipped WAL replay for records the
+//! floor claimed were already covered. Fixed by reordering
+//! `save_graph_store` to write CSR segments + `manifest.json` FIRST,
+//! `store.save_metadata` LAST, and making `save_metadata` itself atomic
+//! (temp+fsync+rename+dir-fsync via
+//! `persistence::atomic::atomic_write_durable`). Safe against
+//! double-replay: `graph::replay::node_present` checks both `write_buf`
+//! and loaded CSR segments before re-inserting a WAL-logged node/edge, so
+//! replaying a record whose payload DID make it to disk before the kill is
+//! a no-op. See `scenarios::mixed_mid_checkpoint`'s doc for the full
+//! scenario analysis. Confirmed fixed via `MOON_CRASH_MATRIX_RED=1
+//! MOON_CRASH_MATRIX_ITERS=20` soak, 20/20 clean at both shard counts
+//! (pre-fix baseline: prod_s1 hit at iteration 11/20, prod_s4 at iteration
+//! 7/20) — these two tests now run ungated (green-only default suite).
 //!
-//! **Every other cell (29/40) is GREEN** — including, notably,
+//! **Every other cell (31/40) is GREEN** — including, notably,
 //! `kv_isolated`/`kv_spilled_isolated`/`vector_isolated` on ALL configs (KV
 //! and vector-HSET durability via the AOF; `kv_spilled_isolated`'s filler
 //! sizing was hardened in review round 3 — see
@@ -174,13 +180,13 @@
 //! #291's effect-record fix holds), `txn_isolated_atomicity` on
 //! `prod_s1`/`prod_s4` (queuing without `EXEC` then killing applies nothing
 //! — verified 3× consecutive), `mixed_all_planes_synced`/`mid_pass_c` on
-//! both production shard counts, `mixed_all_planes_mid_checkpoint` at the
-//! default single-iteration sample (RED cell 4 above is probabilistic —
-//! most single samples don't hit the window), and
-//! `mixed_all_planes_concurrent_burst_no_corruption` on all 3 configs it
-//! runs on (no plane's on-disk structures were ever corrupted badly enough
-//! to error post-restart, beyond the expected "schema object never made it
-//! to disk before the kill" not-found case).
+//! both production shard counts, `mixed_all_planes_mid_checkpoint` on both
+//! production shard counts (kernel M3 stage 2 / K2 fix above — now
+//! unconditionally GREEN, not just at the default single-iteration
+//! sample), and `mixed_all_planes_concurrent_burst_no_corruption` on all 3
+//! configs it runs on (no plane's on-disk structures were ever corrupted
+//! badly enough to error post-restart, beyond the expected "schema object
+//! never made it to disk before the kill" not-found case).
 //!
 //! # Soak cadence
 //!

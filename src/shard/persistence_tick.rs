@@ -1265,15 +1265,33 @@ pub(crate) fn handle_checkpoint_tick(
             // covers records strictly below it, so the floor is one less
             // (the G5 crash test's first post-checkpoint record lands
             // exactly on `current_lsn()` and must NOT be skipped).
-            if !graph_save(wal.current_lsn().saturating_sub(1)) {
+            //
+            // Kernel M3 K2: capture this LSN into a local variable ONCE and
+            // reuse it both as the arg to `graph_save` AND, below, as
+            // `control.graph_floor_lsn` — never a second, independently
+            // recomputed `wal.current_lsn()` call at the control-file write
+            // site. Two computations of "now" a few lines apart is exactly
+            // the silent-drift risk the brief's Risk #1 calls out: a future
+            // refactor that moves one call earlier than the other would
+            // desynchronize the mirror from what `persist_graph_at_checkpoint`
+            // actually snapshotted, with nothing failing except a rare crash
+            // test. Same variable, same tick, by construction.
+            let graph_floor_lsn = wal.current_lsn().saturating_sub(1);
+            if !graph_save(graph_floor_lsn) {
                 tracing::error!("Checkpoint aborted: graph snapshot failed");
                 checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
 
-            // 4. Update control file with new checkpoint LSN
+            // 4. Update control file with new checkpoint LSN + the graph
+            // floor mirror (K2). `graph_metadata.json` (written durably by
+            // `graph_save` above, which just returned `true`) remains the
+            // graph engine's own replay-skip authority; `graph_floor_lsn`
+            // here is a recycle-decision mirror of that SAME value, so the
+            // two can never disagree.
             control.last_checkpoint_lsn = redo_lsn;
             control.last_checkpoint_epoch = manifest.epoch();
+            control.graph_floor_lsn = graph_floor_lsn;
             if let Err(e) = control.write(control_path) {
                 tracing::error!("Checkpoint control file update failed: {}", e);
                 checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
@@ -1283,8 +1301,25 @@ pub(crate) fn handle_checkpoint_tick(
             // 5. Mark checkpoint complete (also clears the finalize backoff).
             checkpoint_mgr.complete();
 
-            // 6. Recycle old WAL segments that are fully before redo_lsn
-            match wal.recycle_segments_before(redo_lsn) {
+            // 6. Recycle old WAL segments — kernel M3 K2's min-across-planes
+            // floor. Only KV (`last_checkpoint_lsn`) and graph
+            // (`graph_floor_lsn`) publish a real LSN floor this milestone;
+            // ws/mq stay at the sentinel `0` and are DELIBERATELY excluded
+            // from this min (see `ShardControlFile::ws_floor_lsn` doc +
+            // brief §Stage 2's "min-across-planes" correction / Risk #2) —
+            // folding them in would collapse the floor to `0` forever on
+            // any shard that has ever seen a WS/MQ record, which is
+            // strictly worse than today's per-segment
+            // `segment_holds_plane_history` content scan (still applied
+            // inside `recycle_segments_before`, orthogonally, as the
+            // AND-gate for those planes). `redo_lsn == control.last_checkpoint_lsn`
+            // here (just assigned above), so this is `min(redo_lsn,
+            // graph_floor_lsn)` in practice — structurally `>= redo_lsn`
+            // always held implicitly via begin()-vs-Finalize call-site
+            // ordering before K2; this makes it an explicit, checked value
+            // instead of relying on that ordering never drifting.
+            let recycle_floor = control.last_checkpoint_lsn.min(control.graph_floor_lsn);
+            match wal.recycle_segments_before(recycle_floor) {
                 Ok(n) if n > 0 => {
                     tracing::info!("Checkpoint: recycled {} old WAL segment(s)", n);
                 }
@@ -1295,8 +1330,9 @@ pub(crate) fn handle_checkpoint_tick(
             }
 
             tracing::info!(
-                "Checkpoint complete: redo_lsn={}, epoch={}",
+                "Checkpoint complete: redo_lsn={}, graph_floor_lsn={}, epoch={}",
                 redo_lsn,
+                graph_floor_lsn,
                 manifest.epoch()
             );
             true

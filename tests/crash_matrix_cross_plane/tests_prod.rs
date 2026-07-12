@@ -21,26 +21,27 @@ const TXN_GRAPH_LEG_RED_REASON: &str = "cross-store TXN graph leg not durable, t
      the atomicity half (`cross_plane_*_txn_isolated_atomicity`) is a \
      genuinely different, unrelated, GREEN claim and runs ungated.";
 
-/// NEW finding (kernel M3, not a harness artifact — see
-/// `scenarios::mixed_mid_checkpoint`'s doc for the full analysis): some
-/// kill offsets in the post-`BGSAVE` window cause TOTAL loss of the graph
-/// plane's already-wal-v3-synced content. PROBABILISTIC, not
-/// deterministic — a single default run (`MOON_CRASH_MATRIX_ITERS=1`) has
-/// a real chance of NOT hitting the window and reporting green even with
-/// `MOON_CRASH_MATRIX_RED=1` set. Reproduce reliably with
-/// `MOON_CRASH_MATRIX_RED=1 MOON_CRASH_MATRIX_ITERS=20` (confirmed hit
-/// within 20 iterations on both shard counts during this stage's
-/// investigation — prod_s1 at iteration 11/20, prod_s4 at iteration
-/// 7/20).
-const MID_CHECKPOINT_GRAPH_LOSS_RED_REASON: &str = "checkpoint-Finalize window can total-loss the graph plane, NEW. Some \
-     kill offsets in the 0-150ms post-BGSAVE window lose the FULL synced \
-     graph batch (not just the unsynced tail) while KV/vector/WS/MQ all \
-     survive in the same run — reviewed and confirmed not a harness \
-     artifact. PROBABILISTIC (~1-in-7 to 1-in-12 per MOON_CRASH_MATRIX_ITERS \
-     sample in this stage's investigation) — reproduce reliably with \
-     MOON_CRASH_MATRIX_RED=1 MOON_CRASH_MATRIX_ITERS=20, a single default \
-     run may report green by chance. Strong P0 candidate for kernel M3 \
-     stage 2 (K2). Tracked separately, not this stage's job to fix.";
+/// FIXED (kernel M3 stage 2 / K2, task #53). Root cause: `save_graph_store`
+/// (`src/graph/recovery.rs`) wrote the reference/floor
+/// (`graph_metadata.json` via `store.save_metadata`) BEFORE the payload it
+/// claims durable (CSR segments + `manifest.json`) — an ARIES-inverted
+/// ordering. A kill-9 landing between the two writes left a
+/// fully-advanced floor pointing at a payload that was never persisted,
+/// so recovery trusted the floor and skipped WAL replay for records the
+/// floor claimed were already covered, total-losing the graph batch. Fixed
+/// by reordering `save_graph_store` to write CSR segments + manifest.json
+/// FIRST, `store.save_metadata` LAST, and making `save_metadata` itself
+/// atomic (temp+fsync+rename+dir-fsync via
+/// `persistence::atomic::atomic_write_durable`) so the floor write can
+/// never itself be torn. Safe against double-replay because
+/// `graph::replay::node_present` checks both `write_buf` and loaded CSR
+/// segments before re-inserting a WAL-logged node/edge — replaying a
+/// record whose payload actually made it to disk is a no-op, not a
+/// duplicate. Confirmed via `MOON_CRASH_MATRIX_RED=1
+/// MOON_CRASH_MATRIX_ITERS=20` soak, 20/20 clean on both prod_s1 and
+/// prod_s4 (pre-fix baseline: prod_s1 hit at iteration 11/20, prod_s4 at
+/// iteration 7/20). See `scenarios::mixed_mid_checkpoint`'s doc for the
+/// full scenario analysis.
 
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
@@ -106,9 +107,6 @@ fn cross_plane_prod_s1_mixed_all_planes_synced() {
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_prod_s1_mixed_all_planes_mid_checkpoint() {
-    if !harness::red_guard(MID_CHECKPOINT_GRAPH_LOSS_RED_REASON) {
-        return;
-    }
     scenarios::mixed_mid_checkpoint(&Config::PROD_S1);
 }
 
@@ -180,9 +178,6 @@ fn cross_plane_prod_s4_mixed_all_planes_synced() {
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_prod_s4_mixed_all_planes_mid_checkpoint() {
-    if !harness::red_guard(MID_CHECKPOINT_GRAPH_LOSS_RED_REASON) {
-        return;
-    }
     scenarios::mixed_mid_checkpoint(&Config::PROD_S4);
 }
 

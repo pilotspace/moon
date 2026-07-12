@@ -496,6 +496,14 @@ impl GraphStore {
     ///
     /// This captures enough information to recreate the GraphStore structure
     /// on recovery. Actual graph data lives in CSR segment files and WAL.
+    ///
+    /// This file carries `snapshot_lsn` — the WAL-replay floor recovery
+    /// trusts unconditionally — so its write must be atomic and fsync'd
+    /// (task #53 / kernel M3 K2 brief §1.2 root cause: a bare `fs::write`
+    /// here, on top of being called before its payload was durable, could
+    /// also leave a torn/partial file on a kill-9 mid-write). Uses the same
+    /// shared temp+fsync+rename+dir-fsync primitive as CSR segments
+    /// (`CsrSegment::write_to_file`) and the control file.
     pub fn save_metadata(&self, path: &Path) -> io::Result<()> {
         let entries: Vec<GraphMetadataEntry> = match &self.graphs {
             Some(map) => map
@@ -515,7 +523,8 @@ impl GraphStore {
         };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, json.as_bytes())
+        crate::persistence::atomic::atomic_write_durable(path, json.as_bytes())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Load graph metadata from a JSON file and recreate graph shells.

@@ -181,7 +181,31 @@ pub fn recover_graph_store(
 
 /// Save graph persistence data for a shard.
 ///
-/// Writes metadata, manifests, and CSR segment files.
+/// Writes CSR segments + manifests (the **payload**) first, then
+/// `graph_metadata.json` (the **reference** — it carries `snapshot_lsn`,
+/// the WAL-replay floor recovery trusts) LAST.
+///
+/// This order is load-bearing (task #53 / kernel M3 K2 brief §1.2 root
+/// cause): the OLD code wrote `graph_metadata.json` FIRST. A kill-9 in the
+/// window between that write landing and the segment/manifest writes that
+/// follow it durably advanced the WAL-replay floor (`snapshot_lsn`) past
+/// data whose on-disk segments were still stale or absent — replay then
+/// SKIPPED every record `<= snapshot_lsn` (trusting the published floor)
+/// while the segments claiming to cover that range were never actually
+/// written, permanently losing the entire batch since the prior checkpoint.
+/// Reference-before-payload is exactly the "floor must never advance past
+/// what is actually durable" violation this milestone's K2 register exists
+/// to prevent structurally; this call site had it backwards internally.
+///
+/// Writing metadata last does NOT introduce a new double-apply risk on the
+/// opposite crash window (segments/manifest durable, metadata still old):
+/// WAL replay's node/edge insert path (`src/graph/replay.rs`'s
+/// `node_present` cross-tier check) already probes loaded immutable
+/// segments before re-inserting a WAL-logged id — it was built for the
+/// "restart NodeKey aliasing" P0 and is exactly the redo-idempotency an
+/// ARIES-style "payload before reference" ordering requires of its replay
+/// path. A crash in this window only replays already-covered records
+/// again; it never duplicates them.
 pub fn save_graph_store(
     store: &GraphStore,
     persistence_dir: &Path,
@@ -190,11 +214,7 @@ pub fn save_graph_store(
     let shard_dir = persistence_dir.join(format!("shard_{shard_id}"));
     std::fs::create_dir_all(&shard_dir)?;
 
-    // Save metadata.
-    let meta_path = shard_dir.join(GRAPH_METADATA_FILE);
-    store.save_metadata(&meta_path)?;
-
-    // For each graph, save manifest and CSR segment files.
+    // For each graph, save manifest and CSR segment files (payload) FIRST.
     for graph_name_bytes in store.list_graphs() {
         let graph_name = String::from_utf8_lossy(graph_name_bytes);
         let graph = match store.get_graph(graph_name_bytes) {
@@ -220,7 +240,9 @@ pub fn save_graph_store(
 
         // Write manifest (including the write buffer's id-allocation
         // cursors, so recovery resumes allocation past every id ever
-        // handed out even if the WAL was truncated).
+        // handed out even if the WAL was truncated). Still payload-side —
+        // it must land before metadata publishes the floor that assumes
+        // these segments exist.
         let manifest = GraphManifest::from_segments(
             &graph_name,
             &segments.immutable,
@@ -230,6 +252,14 @@ pub fn save_graph_store(
         let manifest_path = graph_data_dir.join("manifest.json");
         manifest.save(&manifest_path)?;
     }
+
+    // Save metadata (the reference / replay-skip floor) LAST — only once
+    // every graph's segments + manifest for this snapshot are durably on
+    // disk. A crash before this point leaves the OLD (safe, lower) floor
+    // in place; the next checkpoint attempt simply retries with a fresh
+    // snapshot_lsn.
+    let meta_path = shard_dir.join(GRAPH_METADATA_FILE);
+    store.save_metadata(&meta_path)?;
 
     Ok(())
 }
