@@ -16,8 +16,11 @@ GAP-1/PR #170) folds in all of them — previously kv+vector only.
   dictionaries, FST fuzzy/prefix sidecars, per-document bookkeeping maps,
   and TAG/NUMERIC secondary indexes. FTS memory was hard-coded 0
   everywhere it was published (elastic budget, MEMORY DOCTOR, Prometheus)
-  until this change. **O(1) incremental accumulator** (same contract as
-  `ColdIndex`/graph below) — an initial version was an O(doc-count +
+  until this change. **Data-size-independent incremental accumulator**
+  (the publish-site read sums cached per-structure totals — O(schema
+  field count), bounded by `FT.CREATE` definitions, never corpus size;
+  same contract as `ColdIndex`/graph below) — an initial version was an
+  O(doc-count +
   vocabulary) full-recompute walk invoked unconditionally every 100ms from
   the shard eviction tick regardless of `maxmemory`, measured 6.4–21.3ms/call
   at 50K–200K docs (>20% of the tick budget, recurring P99 spikes for every
