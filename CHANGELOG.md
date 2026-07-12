@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — memory + tier accounting spine (kernel M2 stage 2 / K4)
+
+`resident_bytes()` is now implemented by every storage plane, and the
+elastic memory budget's used-term (`ShardDatabases::recompute_elastic_budget`,
+GAP-1/PR #170) folds in all of them — previously kv+vector only.
+
+- `TextStore`/`TextIndex::resident_bytes()`: posting lists, term
+  dictionaries, FST fuzzy/prefix sidecars, per-document bookkeeping maps,
+  and TAG/NUMERIC secondary indexes. FTS memory was hard-coded 0
+  everywhere it was published (elastic budget, MEMORY DOCTOR, Prometheus)
+  until this change. **Data-size-independent incremental accumulator**
+  (the publish-site read sums cached per-structure totals — O(schema
+  field count), bounded by `FT.CREATE` definitions, never corpus size;
+  same contract as `ColdIndex`/graph below) — an initial version was an
+  O(doc-count +
+  vocabulary) full-recompute walk invoked unconditionally every 100ms from
+  the shard eviction tick regardless of `maxmemory`, measured 6.4–21.3ms/call
+  at 50K–200K docs (>20% of the tick budget, recurring P99 spikes for every
+  command on that shard). Fixed before merge: `PostingStore`/
+  `TermDictionary`/`TextIndex` each carry a cached total maintained
+  incrementally at every mutation site (index/delete/upsert/TAG/NUMERIC
+  update/FST rebuild), verified against a `#[cfg(test)]` ground-truth
+  full-walk after a mixed mutation sequence.
+- `ColdIndex::resident_bytes()` (KV disk-offload bookkeeping): an O(1)
+  incremental accumulator (not a per-tick walk — sized for G2's "10x RAM"
+  scale target), charged into the shard's published KV memory.
+- Graph resident bytes (already computed) now also feed the elastic
+  budget's used-term, not just the observability atomic.
+- `moon_memory_bytes{kind="text"}` Prometheus gauge + `Text (FTS):` line
+  in `MEMORY DOCTOR`. Also fixes a pre-existing gap where
+  `moon_memory_bytes{kind="lua_scripts"}` was emitted but never primed.
+- New `src/storage/tier.rs`: `ResidencyTier` (Hot/WarmReloadable/ColdStub)
+  + `TierPolicy` trait skeleton — types only, no plane adoption in this
+  milestone (that is M4).
+
+No eviction policy semantics changed: this widens what the existing
+donor/hot formula sees, not how it decides. Verified against
+`eviction_parity`/`eviction_parity_hash_disk_offload` (shards 1 and 4,
+including the disk-offload `ColdIndex` path) with no behavior change.
+
 ### Fixed — Windows CI: `replication_planes` used un-gated `libc::kill`
 
 `tests/replication_planes.rs`'s `sigkill` helper called `libc::kill`
@@ -13,6 +53,7 @@ unconditionally — `libc` is not linked on Windows, so the `Check (Windows)`
 job failed to compile the suite on every `main` push since the Wave A merge.
 Now cfg-gated exactly like `tests/aof_multidb_kill9.rs` (`Child::kill` on
 non-unix). Test-only.
+
 ### Fixed — graph CSR segments and text/vector sidecars were not crash-durable (K3, storage-kernel M2 stage 1)
 
 Extracted the vector engine's Stack-B temp+fsync+rename+dir-fsync

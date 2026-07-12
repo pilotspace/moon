@@ -325,7 +325,14 @@ pub(crate) fn run_eviction_tick(
         s.store_memory
             .vector
             .store(mutable + immutable, Ordering::Relaxed);
-        s.store_memory.text.store(0, Ordering::Relaxed); // TextStore has no aggregate API yet
+        // K4 (kernel-m2-brief-2026-07-12 stage 2): TextStore now has a real
+        // resident_bytes() aggregate (posting lists, term dicts, FST
+        // sidecars, TAG/NUMERIC indexes) -- this was hard-coded 0, making
+        // FTS memory invisible to the elastic budget, MEMORY DOCTOR, and
+        // Prometheus.
+        s.store_memory
+            .text
+            .store(s.text_store.resident_bytes(), Ordering::Relaxed);
         #[cfg(feature = "graph")]
         {
             let graph_bytes = s.graph_store.resident_bytes();
@@ -351,10 +358,22 @@ pub(crate) fn run_eviction_tick(
         // an O(1) accumulator read). Published unconditionally: MEMORY DOCTOR
         // and the Prometheus KV gauge read this atomic even when maxmemory is
         // unlimited — gating it on maxmemory > 0 left them at a permanent 0.
+        //
+        // K4: also charge each db's ColdIndex (disk-offload bookkeeping RAM
+        // -- see storage::tiered::cold_index::ColdIndex::resident_bytes doc
+        // comment). This is a per-db O(1) accumulator read, same complexity
+        // class as estimated_memory() itself, so folding it in here does not
+        // change this tick's cost -- and it is intentionally NOT folded into
+        // Database::estimated_memory()/resident_bytes() themselves, which
+        // stay untouched O(1) hot-path reads for the per-write eviction
+        // pre-gate (inline_write_can_skip_eviction / try_evict_if_needed).
         let used = crate::shard::slice::with_shard(|s| {
             s.databases
                 .iter()
-                .map(|db| db.estimated_memory())
+                .map(|db| {
+                    db.estimated_memory()
+                        + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
+                })
                 .sum::<usize>()
         });
         shard_databases.publish_memory(shard_id, used);

@@ -411,27 +411,34 @@ fn memory_doctor() -> Frame {
     let csr_bytes: usize;
     let wal_bytes: usize = 0;
     let lua_bytes: usize;
+    // K4 (kernel-m2-brief-2026-07-12 stage 2): text (FTS) resident bytes,
+    // previously hard-coded 0 at the publish site.
+    let text_bytes: usize;
 
     if let Some(shard_dbs) = crate::admin::metrics_setup::get_global_shard_databases() {
         // KV memory: sum of per-shard published atomics. Lock-free.
         dashtable_bytes = shard_dbs.read_memory_sum();
 
-        // Store memory: sum published per-shard vector/graph atomics.
+        // Store memory: sum published per-shard vector/text/graph atomics.
         let mut vec_total = 0usize;
+        let mut text_total = 0usize;
         let mut csr_total = 0usize;
         let mut lua_total = 0usize;
         for mem in shard_dbs.store_memory_per_shard.iter() {
             vec_total += mem.vector.load(Ordering::Relaxed);
+            text_total += mem.text.load(Ordering::Relaxed);
             csr_total += mem.graph.load(Ordering::Relaxed);
             // C4 (wave-5 hygiene): Lua script-cache byte estimate.
             lua_total += mem.lua.load(Ordering::Relaxed);
         }
         hnsw_bytes = vec_total;
+        text_bytes = text_total;
         csr_bytes = csr_total;
         lua_bytes = lua_total;
     } else {
         dashtable_bytes = 0;
         hnsw_bytes = 0;
+        text_bytes = 0;
         csr_bytes = 0;
         lua_bytes = 0;
     }
@@ -448,6 +455,7 @@ fn memory_doctor() -> Frame {
     // ── Computed overhead ────────────────────────────────────────────────
     let tracked_sum = dashtable_bytes
         + hnsw_bytes
+        + text_bytes
         + csr_bytes
         + wal_bytes
         + sealed_bytes
@@ -469,6 +477,8 @@ fn memory_doctor() -> Frame {
         "DashTable dominates RSS (>50%). Consider increasing --initial-keyspace-hint to reduce segment splits."
     } else if hnsw_bytes > half_rss {
         "HNSW (vector) dominates RSS (>50%). Consider compacting (FT.COMPACT) or reducing ef_construction."
+    } else if text_bytes > half_rss {
+        "Text (FTS) dominates RSS (>50%). Consider FT.COMPACT to build FST sidecars, or reviewing indexed field cardinality."
     } else if csr_bytes > half_rss {
         "CSR (graph) dominates RSS (>50%). Review graph index sizes."
     } else if allocator_overhead > half_rss {
@@ -501,6 +511,12 @@ fn memory_doctor() -> Frame {
         "  HNSW (vector):          {}  ({:.1}%)",
         humanize_bytes(hnsw_bytes),
         pct(hnsw_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Text (FTS):             {}  ({:.1}%)",
+        humanize_bytes(text_bytes),
+        pct(text_bytes, rss)
     );
     let _ = writeln!(
         out,

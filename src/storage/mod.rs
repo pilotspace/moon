@@ -15,6 +15,7 @@ pub mod hotkey;
 pub mod intset;
 pub mod listpack;
 pub mod stream;
+pub mod tier;
 pub mod tiered;
 
 pub use db::Database;

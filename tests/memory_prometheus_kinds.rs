@@ -2,7 +2,7 @@
 //! (Phase 190 Plan 03).
 //!
 //! Spawns the release moon binary with an admin port, loads a small
-//! dataset, scrapes `/metrics`, and verifies all 7 subsystem kinds are
+//! dataset, scrapes `/metrics`, and verifies all 9 subsystem kinds are
 //! present with their sum within +/-10% of `moon_rss_bytes`.
 //!
 //! Run with:
@@ -26,7 +26,19 @@ fn redis_cli_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the release binary to spawn. Honors `MOON_BIN` when set so a
+/// pinned, freshly-built ELF binary can be supplied explicitly -- required
+/// inside the OrbStack Linux VM, where the shared checkout's
+/// `target/release/moon` may be a macOS Mach-O binary that gets silently
+/// host-proxied back to the Mac (the port never binds VM-side, producing a
+/// 30s accept timeout with no obvious cause). See
+/// `gotcha_orbstack_macho_binary_trap`.
 fn release_binary() -> std::path::PathBuf {
+    if let Ok(bin) = std::env::var("MOON_BIN") {
+        if !bin.trim().is_empty() {
+            return std::path::PathBuf::from(bin);
+        }
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
 }
 
@@ -175,18 +187,25 @@ fn parse_rss_bytes(body: &str) -> Option<f64> {
     None
 }
 
-const EXPECTED_KINDS: [&str; 7] = [
+// NOTE: `lua_scripts` was already emitted by `update_moon_memory_bytes`
+// (C4, wave-5 hygiene) but missing from this list -- a pre-existing
+// test/code mismatch this file's own count assertion should have caught.
+// Fixed alongside the K4 "text" addition since both land in this file.
+const EXPECTED_KINDS: [&str; 9] = [
     "dashtable",
     "hnsw",
+    // K4 (kernel-m2-brief-2026-07-12 stage 2): text (FTS) resident bytes.
+    "text",
     "csr",
     "wal",
     "sealed",
     "replication_backlog",
+    "lua_scripts",
     "allocator_overhead",
 ];
 
 #[test]
-fn metrics_endpoint_emits_seven_memory_kinds() {
+fn metrics_endpoint_emits_nine_memory_kinds() {
     let Some(m) = spawn_moon() else { return };
 
     // Load 1000 string keys so DashTable has non-zero resident bytes.
@@ -218,7 +237,7 @@ fn metrics_endpoint_emits_seven_memory_kinds() {
         thread::sleep(Duration::from_secs(2));
     }
 
-    // ── Assert all 7 kinds present ──────────────────────────────────────
+    // ── Assert all 9 kinds present ──────────────────────────────────────
     for expected in &EXPECTED_KINDS {
         assert!(
             kinds.contains_key(*expected),
@@ -230,8 +249,8 @@ fn metrics_endpoint_emits_seven_memory_kinds() {
     }
     assert_eq!(
         kinds.len(),
-        7,
-        "Expected exactly 7 kinds, got {}: {kinds:?}",
+        9,
+        "Expected exactly 9 kinds, got {}: {kinds:?}",
         kinds.len()
     );
 
@@ -245,7 +264,7 @@ fn metrics_endpoint_emits_seven_memory_kinds() {
     let sum: f64 = kinds.values().sum();
     assert!(
         sum > 0.0,
-        "Sum of all 7 kinds is 0 — update hook may not have fired"
+        "Sum of all 9 kinds is 0 — update hook may not have fired"
     );
 
     // ── Assert dashtable > 0 after loading 1000 keys ────────────────────
