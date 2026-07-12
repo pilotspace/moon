@@ -63,6 +63,13 @@ impl TriggerRegistry {
         self.entries.get_mut(key)
     }
 
+    /// Iterate over all entries (composite key, entry). Used by
+    /// `replication::mq_sync::export_mq_registry` (Wave B stage 2b) to
+    /// snapshot every registered trigger for FULLRESYNC.
+    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &TriggerEntry)> {
+        self.entries.iter()
+    }
+
     /// Return keys of entries whose pending fire time has elapsed.
     ///
     /// An entry is ready to fire when `pending_fire_ms > 0` and
@@ -305,5 +312,21 @@ mod tests {
         entry.debounce_ms = 2000;
 
         assert_eq!(reg.get(b"ws1:q1").unwrap().debounce_ms, 2000);
+    }
+
+    #[test]
+    fn test_iter() {
+        let mut reg = TriggerRegistry::new();
+        reg.register(
+            Bytes::from_static(b"ws1:q1"),
+            make_entry(b"q1", b"CMD1", 100),
+        );
+        reg.register(
+            Bytes::from_static(b"ws1:q2"),
+            make_entry(b"q2", b"CMD2", 200),
+        );
+        let mut keys: Vec<&[u8]> = reg.iter().map(|(k, _)| k.as_ref()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![&b"ws1:q1"[..], &b"ws1:q2"[..]]);
     }
 }

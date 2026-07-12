@@ -96,12 +96,12 @@ pub fn parse_mq_subcommand(args: &[Frame]) -> Result<&[u8], Frame> {
 ///
 /// `MQ` is registered blanket-WRITE in `command::metadata::COMMAND_META`
 /// (CREATE/PUSH/POP/ACK/TRIGGER/PUBLISH all mutate durable queue state), but
-/// DLQLEN only queries the dead-letter depth (same condition
-/// `try_handle_mq_command` already uses to skip `warn_unreplicated_plane`).
-/// A plain `MQ LEN` is referenced in that same skip-list but has no handler
-/// arm in `try_handle_mq_command` today (falls through to
-/// `ERR_MQ_UNKNOWN_SUB`) — it is included here defensively so that if it is
-/// ever wired up as a read, this classifier does not need a second change.
+/// DLQLEN only queries the dead-letter depth (the retired
+/// `warn_unreplicated_plane` marker skipped it for the same reason).
+/// A plain `MQ LEN` has no handler arm in `try_handle_mq_command` today
+/// (falls through to `ERR_MQ_UNKNOWN_SUB`) — it is included here
+/// defensively so that if it is ever wired up as a read, this classifier
+/// does not need a second change.
 /// Any subcommand not in this allow-list (including unknown ones) is
 /// conservatively treated as a write so `try_enforce_readonly` never
 /// false-negatives.

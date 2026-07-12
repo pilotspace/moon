@@ -217,6 +217,16 @@ pub(crate) fn apply_local(
             return;
         }
 
+        // MQ.* effect records (Wave B stage 2b) arrive as one of the
+        // `MQ._REPL.*` synthetic pseudo-commands `shard::mq_exec` emits —
+        // never a real client command. Route through the SAME apply engine
+        // (`apply_mq_*` in `shard::shared_databases`) boot-time WAL replay
+        // uses, generalized over `MqApplyTarget` so both share one codec.
+        if crate::mq::wal::is_mq_replay_command(cmd) {
+            apply_mq(s, cmd, args);
+            return;
+        }
+
         // TEMPORAL.INVALIDATE arrives as the master's deterministic
         // wall-clock-pinned form (`TEMPORAL.INVALIDATE-AT <graph> <N|E>
         // <entity_id> <wall_ms>`, round-2 finding B) — apply with the SAME
@@ -422,6 +432,134 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
     }
 }
 
+/// Apply one replicated MQ effect record (Wave B stage 2b): decode the
+/// SINGLE bulk-string payload arg (the verbatim `encode_mq_*` bytes
+/// `shard::mq_exec::replicate_mq_record` shipped) and dispatch to the same
+/// `apply_mq_*` functions boot-time WAL replay uses
+/// (`shard::shared_databases`, generic over `MqApplyTarget` so this
+/// `ShardSlice` target and that `ShardSliceInit` target share one engine).
+///
+/// A replica NEVER fires `MQ.TRIGGER` callbacks on apply (registrations are
+/// stored as opaque data, same as boot-time replay — firing only happens
+/// live via `MQ.PUSH`'s debounce arming on a master).
+fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+    use crate::mq::wal::{
+        MQ_REPL_ACK, MQ_REPL_CREATE, MQ_REPL_POP, MQ_REPL_PUSH, MQ_REPL_TRIGGER, decode_mq_ack,
+        decode_mq_create, decode_mq_pop, decode_mq_push, decode_mq_trigger,
+    };
+    use crate::shard::shared_databases::{
+        apply_mq_ack, apply_mq_create, apply_mq_pop, apply_mq_push, apply_mq_trigger,
+    };
+    use crate::storage::stream::StreamId;
+
+    let Some(Frame::BulkString(payload)) = args.first() else {
+        tracing::warn!(
+            "replica apply: malformed {} record — missing payload arg (diverges; \
+             full resync required)",
+            String::from_utf8_lossy(cmd)
+        );
+        return;
+    };
+
+    // Replicas configured with fewer logical dbs than the master clamp the
+    // payload's db index — same posture as the generic KV clamp in
+    // `apply_local` above. Without this, `MqApplyTarget::mq_databases_mut()
+    // .get_mut(out_of_range)` silently no-ops: CREATE would register the
+    // queue but never create the stream, and PUSH/POP/ACK would be dropped.
+    // (Boot-time WAL replay never needs this — a shard replays its OWN
+    // records, whose db indices are valid by construction.)
+    let db_count = s.databases.len();
+    fn clamp_mq_db(db_count: usize, db_index: u32) -> usize {
+        let idx = (db_index as usize).min(db_count.saturating_sub(1));
+        if idx != db_index as usize {
+            tracing::debug!(
+                "replica apply: MQ db {} clamped to {} ({} dbs on this shard)",
+                db_index,
+                idx,
+                db_count
+            );
+        }
+        idx
+    }
+
+    let applied = if cmd.eq_ignore_ascii_case(MQ_REPL_CREATE) {
+        decode_mq_create(payload).map(|(db_index, key, mdc)| {
+            apply_mq_create(s, clamp_mq_db(db_count, db_index), &key, mdc);
+        })
+    } else if cmd.eq_ignore_ascii_case(MQ_REPL_PUSH) {
+        decode_mq_push(payload).map(|(db_index, key, ms, seq, fields)| {
+            apply_mq_push(
+                s,
+                clamp_mq_db(db_count, db_index),
+                &key,
+                StreamId { ms, seq },
+                fields,
+            );
+        })
+    } else if cmd.eq_ignore_ascii_case(MQ_REPL_POP) {
+        decode_mq_pop(payload).map(|(db_index, key, last_delivered, claimed, dlq)| {
+            let claimed: Vec<(StreamId, u64)> = claimed
+                .into_iter()
+                .map(|(ms, seq, dc)| (StreamId { ms, seq }, dc))
+                .collect();
+            let dlq: Vec<(StreamId, StreamId)> = dlq
+                .into_iter()
+                .map(|(src_ms, src_seq, dlq_ms, dlq_seq)| {
+                    (
+                        StreamId {
+                            ms: src_ms,
+                            seq: src_seq,
+                        },
+                        StreamId {
+                            ms: dlq_ms,
+                            seq: dlq_seq,
+                        },
+                    )
+                })
+                .collect();
+            apply_mq_pop(
+                s,
+                clamp_mq_db(db_count, db_index),
+                &key,
+                StreamId {
+                    ms: last_delivered.0,
+                    seq: last_delivered.1,
+                },
+                claimed,
+                dlq,
+            );
+        })
+    } else if cmd.eq_ignore_ascii_case(MQ_REPL_ACK) {
+        decode_mq_ack(payload).map(|(db_index, key, ms, seq)| {
+            apply_mq_ack(
+                s,
+                clamp_mq_db(db_count, db_index),
+                &key,
+                StreamId { ms, seq },
+            );
+        })
+    } else if cmd.eq_ignore_ascii_case(MQ_REPL_TRIGGER) {
+        decode_mq_trigger(payload).map(|(trig_key, queue_key, callback_cmd, debounce_ms)| {
+            apply_mq_trigger(s, trig_key, queue_key, callback_cmd, debounce_ms);
+        })
+    } else {
+        // Unreachable: `is_mq_replay_command` gated this call. Defensive.
+        tracing::debug!(
+            "replica apply: unrecognized MQ replay command {}",
+            String::from_utf8_lossy(cmd)
+        );
+        Some(())
+    };
+
+    if applied.is_none() {
+        tracing::warn!(
+            "replica apply: malformed {} record payload — skipped (MQ plane diverges; \
+             full resync required)",
+            String::from_utf8_lossy(cmd)
+        );
+    }
+}
+
 /// Apply a replicated `TEMPORAL.INVALIDATE-AT` record: same mutation the
 /// master ran (`apply_invalidate`) with the master's pinned `wall_ms`. The
 /// returned `GraphTemporal` WAL payload is dropped (`Ok(_)` is ignored),
@@ -577,6 +715,10 @@ pub(crate) fn load_snapshot(
     // Wave B ws-plane: exactly one blob regardless of the master's shard
     // count (shard-0-authoritative — see `ws_sync` module docs).
     let ws_registry_blob = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_WORKSPACE_REGISTRY);
+    // Wave B stage 2b: same per-shard-blob collection as graph — a
+    // multi-shard master's merged snapshot carries one MQ registry aux
+    // entry PER shard.
+    let mq_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_MQ_REGISTRY);
     let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
         for db in s.databases.iter_mut() {
             db.clear();
@@ -616,6 +758,48 @@ pub(crate) fn load_snapshot(
                          exist — master predates graph replication; keeping local graphs \
                          (they may diverge)",
                         s.graph_store.graph_count()
+                    );
+                }
+            }
+        }
+        // Wave B stage 2b: install the master's MQ durable-queue + trigger
+        // registries (authoritative replace — an EMPTY blob list means the
+        // master sent no aux at all, a pre-MQ-replication master, so we
+        // warn-and-keep local state exactly like the graph fallback above;
+        // a non-empty list, even of all-zero-count blobs, is authoritative
+        // and clears local registries).
+        match &mq_blobs[..] {
+            blobs if !blobs.is_empty() => {
+                match crate::replication::mq_sync::install_mq_registry_many(s, blobs) {
+                    Some((queues, triggers)) => {
+                        if queues > 0 || triggers > 0 {
+                            tracing::info!(
+                                "replica snapshot: installed {} durable queue(s), {} \
+                                 trigger(s) from {} shard blob(s)",
+                                queues,
+                                triggers,
+                                blobs.len()
+                            );
+                        }
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "replica snapshot: malformed MQ registry aux blob"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let has_local = s
+                    .durable_queue_registry
+                    .as_ref()
+                    .is_some_and(|r| !r.is_empty())
+                    || s.trigger_registry.as_ref().is_some_and(|r| !r.is_empty());
+                if has_local {
+                    tracing::warn!(
+                        "replica snapshot carried no MQ-registry aux but local durable \
+                         queue/trigger state exists — master predates MQ replication; \
+                         keeping local state (it may diverge)"
                     );
                 }
             }

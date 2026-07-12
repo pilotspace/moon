@@ -531,6 +531,12 @@ pub struct PreparedShardSync {
     /// other shard replies `None` and the merge loop keeps the first `Some`
     /// (same "keep shard 0's copy" convention as `vector_defs`/`text_defs`).
     pub ws_registry_blob: Option<Vec<u8>>,
+    /// This shard's MQ durable-queue + trigger registry snapshot blob (Wave
+    /// B stage 2b). MQ registry state is genuinely per-shard (owner-hashed
+    /// by queue/trigger key, same as graph names), so the stitcher writes
+    /// one `moon-mq-registry` aux entry PER shard and the replica imports
+    /// all of them additively — see `replication::mq_sync`.
+    pub mq_blob: Vec<u8>,
 }
 
 /// Messages sent to a shard via SPSC channels from the connection layer

@@ -225,6 +225,78 @@ pub(crate) fn wal_append_on_slice(
     });
 }
 
+// ── Replication emission (Wave B stage 2b) ────────────────────────────────
+
+/// The current shard's index, read off the thread-local `ShardSlice`.
+/// `execute_mq_on_owner` always runs on a shard's own OS thread (either
+/// invoked locally by `write.rs::mq_hop_or_local` or via the `MqCommand`
+/// SPSC hop), so this is always available.
+#[inline]
+pub(crate) fn current_shard_id() -> usize {
+    crate::shard::slice::with_shard(|s| s.shard_id)
+}
+
+/// Replicate one MQ effect record to the live stream, mirroring the graph
+/// plane's single-shard gate
+/// (`server::conn::handler_monoio::write.rs`'s `record_local_write_db` call
+/// site: `num_shards == 1 && replication_fanout_active`). Ctx-free —
+/// `execute_mq_on_owner` runs on the shard's own OS thread without a
+/// `ConnectionContext` in scope, so this resolves the SAME per-process
+/// `ReplicationState` handle the connection layer uses via
+/// `replication::state::record_local_write_db_global` (see that function's
+/// docs for why sharing the global Arc is safe).
+///
+/// `cmd_name` is one of the `MQ._REPL.*` synthetic pseudo-commands
+/// (`crate::mq::wal::MQ_REPL_*`) — never dispatched to real clients, matched
+/// only by `replication::apply::apply_local`'s command-name routing (mirrors
+/// `GraphReplayCollector::is_graph_command`). `payload` is the SAME encoded
+/// WAL record bytes already built for `wal_append_on_slice`, so the
+/// replica's apply arm can call the identical `decode_mq_*` function WAL
+/// replay uses — one wire form, two consumers.
+///
+/// Multi-shard masters simply don't stream (the `num_shards == 1` gate),
+/// same durability-without-live-replication posture graph accepts for its
+/// own multi-shard gap — a durable queue is still WAL-durable and covered by
+/// FULLRESYNC, it just doesn't get incremental live updates yet.
+///
+/// monoio-only (`ShardSlice` / `shard::self_msg` are thread-per-core
+/// primitives — see `shard::self_msg` module docs); a no-op under
+/// `runtime-tokio`, where `execute_mq_on_owner` is unreachable in practice
+/// (`ShardSlice` is not the tokio runtime's storage model).
+#[cfg(feature = "runtime-monoio")]
+#[inline]
+fn replicate_mq_record(shard_id: usize, db_index: usize, cmd_name: &'static [u8], payload: &[u8]) {
+    if !crate::replication::state::fanout_hint_active() {
+        return;
+    }
+    let Some(repl_state) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
+        return;
+    };
+    let single_shard = repl_state.read().is_ok_and(|g| g.num_shards() == 1);
+    if !single_shard {
+        return;
+    }
+    let frame = Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from_static(cmd_name)),
+            Frame::BulkString(Bytes::copy_from_slice(payload)),
+        ]
+        .into(),
+    );
+    let record_bytes = crate::persistence::aof::serialize_command(&frame);
+    crate::replication::state::record_local_write_db_global(shard_id, db_index, record_bytes);
+}
+
+#[cfg(not(feature = "runtime-monoio"))]
+#[inline]
+fn replicate_mq_record(
+    _shard_id: usize,
+    _db_index: usize,
+    _cmd_name: &'static [u8],
+    _payload: &[u8],
+) {
+}
+
 // ── Subcommand handlers ───────────────────────────────────────────────────────
 
 /// MQ.CREATE — owner creates the durable stream + registry entry.
@@ -270,6 +342,12 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     {
         let payload =
             crate::mq::wal::encode_mq_create(db_index as u32, &eff_key, max_delivery_count);
+        replicate_mq_record(
+            current_shard_id(),
+            db_index,
+            crate::mq::wal::MQ_REPL_CREATE,
+            &payload,
+        );
         wal_append_on_slice(
             crate::persistence::wal_v3::record::WalRecordType::MqCreate,
             Bytes::from(payload),
@@ -322,8 +400,14 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
     match push_result {
         Ok(Some((msg_id, payload))) => {
-            // WAL: MqPush record on the owner shard (Wave B stage 2a) —
-            // durability plane only; no replication emission here (stage 2b).
+            // WAL: MqPush record on the owner shard (Wave B stage 2a), plus
+            // live replication fan-out of the SAME payload (Wave B stage 2b).
+            replicate_mq_record(
+                current_shard_id(),
+                db_index,
+                crate::mq::wal::MQ_REPL_PUSH,
+                &payload,
+            );
             wal_append_on_slice(
                 crate::persistence::wal_v3::record::WalRecordType::MqPush,
                 Bytes::from(payload),
@@ -506,6 +590,12 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
         });
 
     if let Some(payload) = wal_payload {
+        replicate_mq_record(
+            current_shard_id(),
+            db_index,
+            crate::mq::wal::MQ_REPL_POP,
+            &payload,
+        );
         wal_append_on_slice(
             crate::persistence::wal_v3::record::WalRecordType::MqPop,
             Bytes::from(payload),
@@ -548,8 +638,10 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             // if a request id was never actually in the PEL (matches this
             // aggregate-count live path, which can't distinguish per-id
             // success without changing `Stream::xack`'s return type).
+            let shard_id = current_shard_id();
             for (ms, seq) in &msg_ids {
                 let payload = crate::mq::wal::encode_mq_ack(db_index as u32, &eff_key, *ms, *seq);
+                replicate_mq_record(shard_id, db_index, crate::mq::wal::MQ_REPL_ACK, &payload);
                 wal_append_on_slice(
                     crate::persistence::wal_v3::record::WalRecordType::MqAck,
                     Bytes::from(payload),
@@ -617,15 +709,23 @@ fn handle_trigger(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame 
         reg.register(trig_key, entry);
     });
 
+    // `db_index` is unused by the TRIGGER *mutation* (registry is
+    // shard-level, not per-db) but is still passed through to
+    // `replicate_mq_record` for the SELECT-context invariant
+    // `record_local_write_db` documents: even a db-agnostic record must keep
+    // the replication stream's db context aligned with the writing
+    // connection's selected db, so the NEXT db-scoped record on this shard
+    // doesn't inherit a stale `SELECT`.
+    replicate_mq_record(
+        current_shard_id(),
+        db_index,
+        crate::mq::wal::MQ_REPL_TRIGGER,
+        &payload,
+    );
     wal_append_on_slice(
         crate::persistence::wal_v3::record::WalRecordType::MqTrigger,
         Bytes::from(payload),
     );
-
-    // `db_index` is unused for TRIGGER (registry is shard-level, not
-    // per-db) but kept in the signature for API uniformity. Suppress the
-    // unused-variable warning.
-    let _ = db_index;
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }

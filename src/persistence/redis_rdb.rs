@@ -20,6 +20,9 @@ use ordered_float::OrderedFloat;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::db::Database;
 use crate::storage::entry::{Entry, RedisValue, current_time_ms};
+use crate::storage::stream::{
+    Consumer, ConsumerGroup, PendingEntry, Stream as StreamData, StreamId,
+};
 
 // ---------------------------------------------------------------------------
 // Redis RDB opcodes and type tags
@@ -39,6 +42,14 @@ const RDB_TYPE_LIST: u8 = 1;
 const RDB_TYPE_SET: u8 = 2;
 const RDB_TYPE_HASH: u8 = 4;
 const RDB_TYPE_ZSET_2: u8 = 5;
+/// Moon-private extension type tag (real Redis reserves 6-18 and uses 19+ for
+/// native stream listpack encodings; this format is consumed ONLY by moon's
+/// own replica — see module docs — so a private tag well outside Redis's
+/// range is safe and does not need to match Redis's on-wire stream format).
+/// Wave B stage 2b: replaces the pre-existing `"__stream__:<len>"` placeholder
+/// STRING encoding, which discarded all entry/PEL/consumer-group content and
+/// would type-corrupt a Stream key into a plain string on FULLRESYNC.
+const RDB_TYPE_STREAM_MOON: u8 = 200;
 
 // Integer-encoded string prefixes (11xxxxxx)
 const RDB_ENC_INT8: u8 = 0;
@@ -404,13 +415,62 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
             }
         }
         RedisValueRef::Stream(stream) => {
-            // Streams: serialize as JSON string with type 0 for simplicity.
-            // Redis uses complex type 19+ for native stream encoding, but for
-            // PSYNC2 to our own replicas this is sufficient.
-            buf.push(RDB_TYPE_STRING);
+            // Full-fidelity moon-private stream encoding (Wave B stage 2b) —
+            // entries, last_id, consumer groups (PEL + per-consumer pending
+            // sets), and the MQ durability flags (`durable` /
+            // `max_delivery_count`), mirroring `persistence::rdb.rs`'s
+            // battle-tested Stream codec (that module's format is the same
+            // shape; kept as a separate encoder here because this module's
+            // string/length framing — `write_redis_string`/`write_length` —
+            // differs from that module's raw-LE-prefixed helpers).
+            buf.push(RDB_TYPE_STREAM_MOON);
             write_redis_string(buf, key);
-            let json = format!("__stream__:{}", stream.length);
-            write_redis_string(buf, json.as_bytes());
+            write_length(buf, stream.entries.len() as u64);
+            buf.extend_from_slice(&stream.last_id.ms.to_le_bytes());
+            buf.extend_from_slice(&stream.last_id.seq.to_le_bytes());
+            for (id, fields) in &stream.entries {
+                buf.extend_from_slice(&id.ms.to_le_bytes());
+                buf.extend_from_slice(&id.seq.to_le_bytes());
+                write_length(buf, fields.len() as u64);
+                for (field, value) in fields {
+                    write_redis_string(buf, field);
+                    write_redis_string(buf, value);
+                }
+            }
+            write_length(buf, stream.groups.len() as u64);
+            for (group_name, group) in &stream.groups {
+                write_redis_string(buf, group_name);
+                buf.extend_from_slice(&group.last_delivered_id.ms.to_le_bytes());
+                buf.extend_from_slice(&group.last_delivered_id.seq.to_le_bytes());
+                write_length(buf, group.pel.len() as u64);
+                for (id, pe) in &group.pel {
+                    buf.extend_from_slice(&id.ms.to_le_bytes());
+                    buf.extend_from_slice(&id.seq.to_le_bytes());
+                    write_redis_string(buf, &pe.consumer);
+                    buf.extend_from_slice(&pe.delivery_time.to_le_bytes());
+                    buf.extend_from_slice(&pe.delivery_count.to_le_bytes());
+                }
+                write_length(buf, group.consumers.len() as u64);
+                for (cname, consumer) in &group.consumers {
+                    write_redis_string(buf, cname);
+                    buf.extend_from_slice(&consumer.seen_time.to_le_bytes());
+                    write_length(buf, consumer.pending.len() as u64);
+                    for (id, _) in &consumer.pending {
+                        buf.extend_from_slice(&id.ms.to_le_bytes());
+                        buf.extend_from_slice(&id.seq.to_le_bytes());
+                    }
+                }
+            }
+            // MQ durability flags: a plain XADD stream round-trips these as
+            // `false`/`0` (harmless); an MQ.CREATE-managed stream needs them
+            // to survive FULLRESYNC so MQ.POP/MQ.ACK keep working on the
+            // freshly-synced replica without waiting for a registry-driven
+            // re-CREATE (the registry blob — `MOON_AUX_MQ_REGISTRY` — carries
+            // the SAME `max_delivery_count`, redundantly but harmlessly, for
+            // shard-level bookkeeping independent of which db the stream
+            // lives in).
+            buf.push(u8::from(stream.durable));
+            buf.extend_from_slice(&stream.max_delivery_count.to_le_bytes());
         }
     }
 }
@@ -455,6 +515,13 @@ pub const MOON_AUX_GRAPH_STORE: &[u8] = b"moon-graph-store";
 /// the merged RDB regardless of `--shards` (shard-0-authoritative; see
 /// `ws_sync` module docs). See [`MOON_AUX_VECTOR_DEFS`].
 pub const MOON_AUX_WORKSPACE_REGISTRY: &[u8] = b"moon-ws-registry";
+/// Moon replication aux key: one shard's MQ durable-queue + trigger registry
+/// snapshot (`replication::mq_sync::export_mq_registry` blob — see that
+/// module for the format). Stream CONTENT itself rides the ordinary keyspace
+/// RDB body (via `RDB_TYPE_STREAM_MOON`); this aux blob carries only the
+/// shard-level metadata that lives OUTSIDE the keyspace (`ShardSlice`'s
+/// `durable_queue_registry` / `trigger_registry`). See [`MOON_AUX_VECTOR_DEFS`].
+pub const MOON_AUX_MQ_REGISTRY: &[u8] = b"moon-mq-registry";
 
 /// `write_rdb_refs` plus moon-private AUX fields written immediately after
 /// the standard header aux block (before any SELECTDB), which is what lets
@@ -780,6 +847,132 @@ fn read_rdb_entry(
             let mut entry = Entry::new_sorted_set();
             if let Some(rv) = entry.redis_value_mut() {
                 *rv = RedisValue::SortedSet { members, scores };
+            }
+            entry
+        }
+        RDB_TYPE_STREAM_MOON => {
+            let (entry_count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, entry_count, 1, "stream_entries")?;
+            let mut last_id_ms = [0u8; 8];
+            let mut last_id_seq = [0u8; 8];
+            cursor.read_exact(&mut last_id_ms)?;
+            cursor.read_exact(&mut last_id_seq)?;
+            let mut stream = StreamData::new();
+            stream.last_id = StreamId {
+                ms: u64::from_le_bytes(last_id_ms),
+                seq: u64::from_le_bytes(last_id_seq),
+            };
+            for _ in 0..entry_count {
+                let mut ms_buf = [0u8; 8];
+                let mut seq_buf = [0u8; 8];
+                cursor.read_exact(&mut ms_buf)?;
+                cursor.read_exact(&mut seq_buf)?;
+                let id = StreamId {
+                    ms: u64::from_le_bytes(ms_buf),
+                    seq: u64::from_le_bytes(seq_buf),
+                };
+                let (field_count, _) = read_length(cursor)?;
+                check_alloc_bound(cursor, field_count, 1, "stream_fields")?;
+                let mut fields = Vec::with_capacity(field_count as usize);
+                for _ in 0..field_count {
+                    let field = read_redis_string(cursor)?;
+                    let value = read_redis_string(cursor)?;
+                    fields.push((Bytes::from(field), Bytes::from(value)));
+                }
+                stream.entries.insert(id, fields);
+                stream.length += 1;
+            }
+
+            let (group_count, _) = read_length(cursor)?;
+            check_alloc_bound(cursor, group_count, 1, "stream_groups")?;
+            for _ in 0..group_count {
+                let group_name = Bytes::from(read_redis_string(cursor)?);
+                let mut gld_ms = [0u8; 8];
+                let mut gld_seq = [0u8; 8];
+                cursor.read_exact(&mut gld_ms)?;
+                cursor.read_exact(&mut gld_seq)?;
+                let last_delivered_id = StreamId {
+                    ms: u64::from_le_bytes(gld_ms),
+                    seq: u64::from_le_bytes(gld_seq),
+                };
+                let (pel_count, _) = read_length(cursor)?;
+                check_alloc_bound(cursor, pel_count, 1, "stream_pel")?;
+                let mut pel = BTreeMap::new();
+                for _ in 0..pel_count {
+                    let mut pid_ms = [0u8; 8];
+                    let mut pid_seq = [0u8; 8];
+                    cursor.read_exact(&mut pid_ms)?;
+                    cursor.read_exact(&mut pid_seq)?;
+                    let pid = StreamId {
+                        ms: u64::from_le_bytes(pid_ms),
+                        seq: u64::from_le_bytes(pid_seq),
+                    };
+                    let consumer_name = Bytes::from(read_redis_string(cursor)?);
+                    let mut dt_buf = [0u8; 8];
+                    let mut dc_buf = [0u8; 8];
+                    cursor.read_exact(&mut dt_buf)?;
+                    cursor.read_exact(&mut dc_buf)?;
+                    pel.insert(
+                        pid,
+                        PendingEntry {
+                            consumer: consumer_name,
+                            delivery_time: u64::from_le_bytes(dt_buf),
+                            delivery_count: u64::from_le_bytes(dc_buf),
+                        },
+                    );
+                }
+                let (consumer_count, _) = read_length(cursor)?;
+                check_alloc_bound(cursor, consumer_count, 1, "stream_consumers")?;
+                let mut consumers = HashMap::new();
+                for _ in 0..consumer_count {
+                    let cname = Bytes::from(read_redis_string(cursor)?);
+                    let mut st_buf = [0u8; 8];
+                    cursor.read_exact(&mut st_buf)?;
+                    let seen_time = u64::from_le_bytes(st_buf);
+                    let (pending_count, _) = read_length(cursor)?;
+                    check_alloc_bound(cursor, pending_count, 1, "stream_pending")?;
+                    let mut pending = BTreeMap::new();
+                    for _ in 0..pending_count {
+                        let mut cid_ms = [0u8; 8];
+                        let mut cid_seq = [0u8; 8];
+                        cursor.read_exact(&mut cid_ms)?;
+                        cursor.read_exact(&mut cid_seq)?;
+                        pending.insert(
+                            StreamId {
+                                ms: u64::from_le_bytes(cid_ms),
+                                seq: u64::from_le_bytes(cid_seq),
+                            },
+                            (),
+                        );
+                    }
+                    consumers.insert(
+                        cname.clone(),
+                        Consumer {
+                            name: cname,
+                            pending,
+                            seen_time,
+                        },
+                    );
+                }
+                stream.groups.insert(
+                    group_name,
+                    ConsumerGroup {
+                        last_delivered_id,
+                        pel,
+                        consumers,
+                    },
+                );
+            }
+            let mut durable_buf = [0u8; 1];
+            cursor.read_exact(&mut durable_buf)?;
+            stream.durable = durable_buf[0] != 0;
+            let mut mdc_buf = [0u8; 4];
+            cursor.read_exact(&mut mdc_buf)?;
+            stream.max_delivery_count = u32::from_le_bytes(mdc_buf);
+
+            let mut entry = Entry::new_stream();
+            if let Some(rv) = entry.redis_value_mut() {
+                *rv = RedisValue::Stream(Box::new(stream));
             }
             entry
         }
@@ -1447,6 +1640,7 @@ mod tests {
             (RDB_TYPE_SET, "set"),
             (RDB_TYPE_HASH, "hash"),
             (RDB_TYPE_ZSET_2, "zset"),
+            (RDB_TYPE_STREAM_MOON, "stream"),
         ] {
             let mut buf = Vec::new();
             write_length(&mut buf, u64::MAX); // lying count, zero element data follows
@@ -1455,6 +1649,142 @@ mod tests {
             assert!(
                 result.is_err(),
                 "{name}: a count exceeding the remaining input must be rejected, not allocated"
+            );
+        }
+    }
+
+    /// Wave B stage 2b: `RDB_TYPE_STREAM_MOON` round-trips entries, PEL,
+    /// per-consumer pending sets, and the MQ durability flags — the fix for
+    /// the pre-existing `"__stream__:<len>"` placeholder that discarded all
+    /// of this on FULLRESYNC (a durable queue would come back as a plain
+    /// string, and MQ.POP/MQ.ACK would fail with a wrong-type error).
+    #[test]
+    fn test_stream_round_trip_full_fidelity() {
+        let mut stream = StreamData::new();
+        stream.durable = true;
+        stream.max_delivery_count = 5;
+        let id1 = StreamId { ms: 1000, seq: 0 };
+        let id2 = StreamId { ms: 1000, seq: 1 };
+        stream.add(
+            id1,
+            vec![(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))],
+        );
+        stream.add(
+            id2,
+            vec![(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"))],
+        );
+        let mut pel = BTreeMap::new();
+        pel.insert(
+            id1,
+            PendingEntry {
+                consumer: Bytes::from_static(b"c1"),
+                delivery_time: 42,
+                delivery_count: 2,
+            },
+        );
+        let mut pending = BTreeMap::new();
+        pending.insert(id1, ());
+        let mut consumers = HashMap::new();
+        consumers.insert(
+            Bytes::from_static(b"c1"),
+            Consumer {
+                name: Bytes::from_static(b"c1"),
+                pending,
+                seen_time: 99,
+            },
+        );
+        stream.groups.insert(
+            Bytes::from_static(b"g1"),
+            ConsumerGroup {
+                last_delivered_id: id1,
+                pel,
+                consumers,
+            },
+        );
+
+        let mut entry = Entry::new_stream();
+        if let Some(rv) = entry.redis_value_mut() {
+            *rv = RedisValue::Stream(Box::new(stream));
+        }
+
+        let mut buf = Vec::new();
+        write_rdb_entry(&mut buf, b"mystream", &entry, 0);
+        assert_eq!(
+            buf[0], RDB_TYPE_STREAM_MOON,
+            "no TTL set, first byte is the type tag"
+        );
+
+        let mut cursor = Cursor::new(&buf[1..]);
+        let key = read_redis_string(&mut cursor).unwrap();
+        assert_eq!(key, b"mystream");
+        let loaded = read_rdb_entry(&mut cursor, RDB_TYPE_STREAM_MOON, None).unwrap();
+        match loaded.as_redis_value() {
+            RedisValueRef::Stream(s) => {
+                assert_eq!(s.entries.len(), 2);
+                assert_eq!(s.last_id, id2);
+                assert!(s.durable, "durable flag must survive round-trip");
+                assert_eq!(s.max_delivery_count, 5);
+                let g = s
+                    .groups
+                    .get(&Bytes::from_static(b"g1"))
+                    .expect("group g1 must survive round-trip");
+                assert_eq!(g.last_delivered_id, id1);
+                assert_eq!(g.pel.len(), 1);
+                assert_eq!(g.pel.get(&id1).unwrap().delivery_count, 2);
+                assert_eq!(g.consumers.len(), 1);
+                assert_eq!(
+                    g.consumers
+                        .get(&Bytes::from_static(b"c1"))
+                        .unwrap()
+                        .pending
+                        .len(),
+                    1
+                );
+            }
+            _ => panic!("expected Stream"),
+        }
+    }
+
+    /// Truncating a valid stream encoding at any prefix length must error
+    /// cleanly (never panic / OOB read) — same discipline as the CRC and
+    /// oversized-count regressions above.
+    #[test]
+    fn test_stream_truncated_input_rejected_not_panicking() {
+        let mut stream = StreamData::new();
+        stream.add(
+            StreamId { ms: 1, seq: 0 },
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+        );
+        stream.groups.insert(
+            Bytes::from_static(b"g"),
+            ConsumerGroup {
+                last_delivered_id: StreamId { ms: 1, seq: 0 },
+                pel: BTreeMap::new(),
+                consumers: HashMap::new(),
+            },
+        );
+        let mut entry = Entry::new_stream();
+        if let Some(rv) = entry.redis_value_mut() {
+            *rv = RedisValue::Stream(Box::new(stream));
+        }
+        let mut full = Vec::new();
+        write_rdb_entry(&mut full, b"k", &entry, 0);
+
+        for cut in 1..full.len() {
+            let mut cursor = Cursor::new(&full[1..cut.max(1)]);
+            if cut <= 1 {
+                continue;
+            }
+            // Best-effort: skip the key first (may itself fail on tiny cuts).
+            if read_redis_string(&mut cursor).is_err() {
+                continue;
+            }
+            // Every strict prefix of the stream payload must be REJECTED —
+            // the encoding is a fixed sequence of length-prefixed fields, so
+            // a truncated read always hits EOF before completing.
+            assert!(
+                read_rdb_entry(&mut cursor, RDB_TYPE_STREAM_MOON, None).is_err(),
+                "truncated stream encoding at byte {cut} was accepted"
             );
         }
     }
