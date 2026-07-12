@@ -436,6 +436,16 @@ pub fn recover_shard_v3_pitr(
                     // WAL+AOF overlap. Counted (like Vector*/File* above) so
                     // `commands_replayed` reflects what was actually on disk;
                     // never dispatched.
+                    //
+                    // ASYMMETRY (intentional): the last-resort legacy fallback
+                    // `wal_v3::replay::replay_wal_v3_dir_commands` DOES apply
+                    // XactCommit via `replay_xact_commit`. That path runs only
+                    // when this Phase 4 replayed ZERO KV commands AND no
+                    // `appendonly.aof` exists — i.e. exactly when neither of
+                    // the redundant coverage sources argued above is present,
+                    // so applying the forward image there is the only way the
+                    // txn's writes survive at all. Same reasoning, opposite
+                    // conclusion, because the preconditions are complementary.
                     result.commands_replayed += 1;
                 }
                 _ => {}
