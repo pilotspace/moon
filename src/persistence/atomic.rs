@@ -155,10 +155,15 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), AtomicWrite
         temp_path_for(path).ok_or_else(|| AtomicWriteError::NoParentDir(path.to_path_buf()))?;
     // Parent existence was already implied by `temp_path_for` returning
     // `Some`, but re-derive it cheaply for the final dir-fsync rather than
-    // threading it through — `path.parent()` is O(1).
-    let parent = tmp_path
-        .parent()
-        .expect("temp_path_for always returns a path with a parent");
+    // threading it through — `path.parent()` is O(1). `temp_path_for`
+    // always builds `tmp_path` via `parent.join(...)`, so `.parent()` here
+    // cannot fail in practice; still handled via `let-else` (not
+    // `.expect()`) per repo policy — no unwrap/expect in library code, and
+    // a hypothetical future change to `temp_path_for` fails loud with a
+    // typed error instead of a panic.
+    let Some(parent) = tmp_path.parent() else {
+        return Err(AtomicWriteError::NoParentDir(path.to_path_buf()));
+    };
 
     let mut f = File::create(&tmp_path).map_err(|source| AtomicWriteError::WriteTemp {
         path: tmp_path.clone(),
