@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — cross-plane kill-9 crash-matrix suite (kernel M3 stage 1 / G1)
+
+New `tests/crash_matrix_cross_plane.rs` + `tests/crash_matrix_cross_plane/`
+harness: 37 kill-9 crash-recovery cells spanning every persistence plane
+(KV/AOF, KV disk-offload, graph/vector/WS/MQ WAL v3, cross-store MULTI/EXEC,
+mixed-plane concurrent workloads, and a checkpoint-`Finalize`-window kill)
+across the `{shards=1, shards=4} x {appendonly, disk-offload}` matrix. This
+is a RED-first tripwire suite — 27 cells run GREEN by default; 10 known-RED
+cells are gated behind a runtime guard (`harness::red_guard`, checked via
+`MOON_CRASH_MATRIX_RED=1`) rather than `#[ignore = "RED: ..."]`, because the
+suite's own `--ignored` invocation convention (every cell needs a release
+binary) makes an ignore-reason string alone non-functional as a gate. A
+`MOON_CRASH_MATRIX_ITERS` env var (default 1) enables ad-hoc soak runs for
+probabilistic findings.
+
+Two real, unresolved findings surfaced and are intentionally left RED (not
+fixed — that is out of scope for this stage) for the kernel M3 backlog:
+
+- **Cross-store TXN graph leg not durable (task #52):** a committed
+  `MULTI`/`EXEC` mixing `SET` + `GRAPH.ADDNODE` survives kill-9 on the KV
+  leg (PR #247's `persist_txn_aof`) but the graph leg is lost. Deterministic
+  repro (3x consecutive at shards=1 and shards=4): kill immediately after
+  the post-`EXEC` WAL-v3 sync wait, with `--checkpoint-timeout 3600` so no
+  periodic checkpoint can incidentally rescue the graph leg. See
+  `scenarios::txn_isolated`'s doc comment for the minimal repro.
+- **Checkpoint-`Finalize` window can total-loss the graph plane (new):**
+  some kill offsets in the 0-150ms window after `BGSAVE` lose the *entire*
+  already-wal-v3-synced graph batch (not just an unsynced tail) while
+  KV/vector/WS/MQ all survive in the same run. Probabilistic
+  (~1-in-7 to 1-in-12 per iteration) — a single default run can report
+  false-green even with `MOON_CRASH_MATRIX_RED=1`; reproduce reliably with
+  `MOON_CRASH_MATRIX_RED=1 MOON_CRASH_MATRIX_ITERS=20`. Strong P0 candidate
+  for kernel M3 stage 2 (K2). See `scenarios::mixed_mid_checkpoint`'s doc
+  comment.
+
+Also confirmed GREEN (not RED, contrary to the brief's grouping at the
+design-doc level): `WS DROP` durability under kill-9 — `WorkspaceDrop` WAL
+records replay correctly in order, unlike the sibling MQ generic-`DEL`
+resurrection gap (still RED, same bug class as the already-fixed KV/vector
+cold-plane resurrection, PR #257, not yet applied to MQ).
+
+Test-only; no production code changed in this stage.
+
 ### Added — memory + tier accounting spine (kernel M2 stage 2 / K4)
 
 `resident_bytes()` is now implemented by every storage plane, and the
