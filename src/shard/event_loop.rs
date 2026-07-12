@@ -1021,18 +1021,6 @@ impl super::Shard {
                             );
                         }
                     }
-                    // K3 site 3 (kernel-m2-brief-2026-07-12.md): reload each
-                    // restored index's FST term-dict sidecar so fuzzy/prefix
-                    // queries get FST-accelerated lookups immediately after
-                    // restart instead of brute-forcing until the next
-                    // FT.COMPACT. `load_fst_sidecars` only touches
-                    // `fst_maps` (a lookup-acceleration structure) — it does
-                    // not affect the postings the auto-reindex rescan below
-                    // rebuilds, so ordering relative to that rescan doesn't
-                    // matter. A missing sidecar (pre-K3 data, or an index
-                    // that was never FT.COMPACT'd) leaves fst_maps at None
-                    // per-field, same as a fresh index — never an error.
-                    s.text_store.load_fst_sidecars();
                 });
             }
 
