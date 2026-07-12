@@ -72,21 +72,20 @@ on the multi-shard master path) is installed authoritatively at
 `load_snapshot`, same convention as the graph/vector/text aux blobs. New
 `ws_registry_record` cargo-fuzz target covers the blob decoder.
 
-Split the former combined `warn_unreplicated_plane` fail-loud marker
-(`handler_monoio/ft.rs`) into per-plane functions — the WS half is retired
-now that this plane replicates; `warn_mq_unreplicated` survives for MQ,
-which is not yet wired in.
+The former combined `warn_unreplicated_plane` fail-loud marker
+(`handler_monoio/ft.rs`) is fully retired: its WS half by this WS-plane
+work, and its MQ half by the MQ-plane replication entry below.
 
 New `tests/replication_ws.rs`: live-stream parity (id + `created_at`
 round-trip through `WS.INFO`/`WS.AUTH` on the replica), snapshot-leg
 backfill, `WS.DROP` propagation, and a `--shards 4` leg exercising the
 shard-0 hop from connections that may land on any shard.
+
 ### Added — MQ-plane replication (Wave B stage 2b)
 
 Durable-queue MQ.* mutations now replicate to attached replicas, closing the
 plane gap `warn_unreplicated_plane` previously fail-loud-warned about for
-MQ.* (the WS.* half of that warning is unaffected and still armed). Builds
-on the stage-2a MQ WAL effect records (PR #291):
+MQ.*. Builds on the stage-2a MQ WAL effect records (PR #291):
 
 - **Live stream**: `shard::mq_exec::replicate_mq_record` emits the SAME
   encoded `MqCreate`/`MqPush`/`MqPop`/`MqAck`/`MqTrigger` payload bytes
