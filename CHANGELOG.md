@@ -50,6 +50,7 @@ unconditionally — `libc` is not linked on Windows, so the `Check (Windows)`
 job failed to compile the suite on every `main` push since the Wave A merge.
 Now cfg-gated exactly like `tests/aof_multidb_kill9.rs` (`Child::kill` on
 non-unix). Test-only.
+
 ### Fixed — graph CSR segments and text/vector sidecars were not crash-durable (K3, storage-kernel M2 stage 1)
 
 Extracted the vector engine's Stack-B temp+fsync+rename+dir-fsync
