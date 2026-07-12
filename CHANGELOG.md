@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — read-only replicas accepted client-issued `WS`/`MQ`/`TEMPORAL.*` writes (Wave B readonly-enforcement, task #34 follow-up)
+
+`WS` and `MQ` (dispatched as `WS <SUB> ...` / `MQ <SUB> ...`) and the dotted
+`TEMPORAL.SNAPSHOT_AT` / `TEMPORAL.INVALIDATE` commands were entirely absent
+from `command::metadata::COMMAND_META`, so `metadata::is_write` silently
+returned `false` for all of them. `try_enforce_readonly`
+(`handler_monoio::dispatch` / `handler_sharded::dispatch`) is driven purely
+by `is_write`, so a client could issue `WS CREATE`/`WS DROP`,
+`MQ CREATE`/`PUSH`/`POP`/`ACK`/`TRIGGER`/`PUBLISH`, and
+`TEMPORAL.SNAPSHOT_AT`/`TEMPORAL.INVALIDATE` directly against a read-only
+replica — mutating its workspace registry, message queues, or graph
+temporal state (`TEMPORAL.INVALIDATE` sets `valid_to`) with no path back to
+the master. A silent divergence source, same class of bug fixed for ACL in
+PR #258.
+
+`WS` and `MQ` now carry the blanket `WRITE` flag (their read-only
+subcommands — `WS LIST`/`INFO`/`AUTH`, `MQ DLQLEN` — are carved out at the
+`try_enforce_readonly` call site via the new
+`command::workspace::is_ws_readonly_subcommand` /
+`command::mq::is_mq_readonly_subcommand` classifiers, mirroring the existing
+`SELECT`/`GRAPH.QUERY` blanket-write-with-carve-out pattern). Both
+`TEMPORAL.*` commands are unconditionally `WRITE` (no subcommand token, so no
+carve-out is needed). The replica **apply** path is unaffected — it never
+calls `try_enforce_readonly` by construction (see the module doc on
+`replication::apply`), so replaying a master's own WS/MQ/TEMPORAL records on
+a replica still works.
+
+Covered by unit tests in `command::metadata`, `command::workspace`, and
+`command::mq`, plus a new black-box integration test,
+`tests/replication_readonly_ws_mq.rs` (`--ignored`, spawns a real `moon`
+binary — WS/MQ are only wired in the sharded handlers, so the synthetic
+single-shard harness used by `tests/replication_test.rs` can't exercise this
+fix). Verified against both a monoio (default-feature) build and a
+`runtime-tokio,jemalloc` build.
+
 ### Fixed — docs site strict build red since 2026-07-08 (root-relative links)
 
 `docs/guides/tuning.md` (PR #245) and `docs/PRODUCTION-CONTRACT.md` (PR #263)

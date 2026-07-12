@@ -91,6 +91,29 @@ pub fn parse_mq_subcommand(args: &[Frame]) -> Result<&[u8], Frame> {
     }
 }
 
+/// Wave B readonly-enforcement: classify whether a `MQ <SUB> ...` invocation
+/// is read-only.
+///
+/// `MQ` is registered blanket-WRITE in `command::metadata::COMMAND_META`
+/// (CREATE/PUSH/POP/ACK/TRIGGER/PUBLISH all mutate durable queue state), but
+/// DLQLEN only queries the dead-letter depth (same condition
+/// `try_handle_mq_command` already uses to skip `warn_unreplicated_plane`).
+/// A plain `MQ LEN` is referenced in that same skip-list but has no handler
+/// arm in `try_handle_mq_command` today (falls through to
+/// `ERR_MQ_UNKNOWN_SUB`) — it is included here defensively so that if it is
+/// ever wired up as a read, this classifier does not need a second change.
+/// Any subcommand not in this allow-list (including unknown ones) is
+/// conservatively treated as a write so `try_enforce_readonly` never
+/// false-negatives.
+#[inline]
+pub fn is_mq_readonly_subcommand(args: &[Frame]) -> bool {
+    matches!(
+        args.first(),
+        Some(Frame::BulkString(sub))
+            if sub.eq_ignore_ascii_case(b"DLQLEN") || sub.eq_ignore_ascii_case(b"LEN")
+    )
+}
+
 /// Validate MQ CREATE arguments.
 ///
 /// Expected: `MQ CREATE <key> [MAXDELIVERY <n>] [DEBOUNCE <ms>]`
@@ -355,6 +378,28 @@ mod tests {
     #[test]
     fn test_parse_mq_subcommand_empty() {
         assert!(parse_mq_subcommand(&[]).is_err());
+    }
+
+    // --- is_mq_readonly_subcommand (Wave B readonly-enforcement) ---
+
+    #[test]
+    fn mq_dlqlen_and_len_are_readonly() {
+        assert!(is_mq_readonly_subcommand(&[bs(b"DLQLEN"), bs(b"key")]));
+        assert!(is_mq_readonly_subcommand(&[bs(b"LEN"), bs(b"key")]));
+        // Case-insensitive, matching parse_mq_subcommand's own matching style.
+        assert!(is_mq_readonly_subcommand(&[bs(b"dlqlen"), bs(b"key")]));
+    }
+
+    #[test]
+    fn mq_write_and_unknown_subcommands_are_not_readonly() {
+        assert!(!is_mq_readonly_subcommand(&[bs(b"CREATE"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"PUSH"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"POP"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"ACK"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"TRIGGER"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"PUBLISH"), bs(b"key")]));
+        assert!(!is_mq_readonly_subcommand(&[bs(b"NOSUCHSUB")]));
+        assert!(!is_mq_readonly_subcommand(&[]));
     }
 
     #[test]
