@@ -413,7 +413,10 @@ pub fn replay_wal_v3_file_until(
             | WalRecordType::WorkspaceCreate
             | WalRecordType::WorkspaceDrop
             | WalRecordType::MqCreate
-            | WalRecordType::MqAck => {
+            | WalRecordType::MqAck
+            | WalRecordType::MqPush
+            | WalRecordType::MqPop
+            | WalRecordType::MqTrigger => {
                 on_command(&record);
                 result.commands_replayed += 1;
             }
