@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -106,5 +107,106 @@ pub fn spawn_listening(mut spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
     panic!(
         "spawn_listening: {ATTEMPTS} consecutive children exited before accepting — \
          not a port race; read the server stderr log in the test's --dir"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Kernel M3 / G1 (task #18 follow-up): consolidated binary-resolution + kill
+// helpers. Every crash suite used to carry its own copy of these three
+// functions (grepped: `crash_recovery_graph_durability.rs`,
+// `crash_recovery_wal_recycle_legacy.rs`, `crash_recovery_vector_durability.rs`
+// duplicated all three; `crash_recovery_mq_effects.rs` /
+// `crash_recovery_temporal_mq.rs` already used `spawn_listening` above but
+// still kept a local `find_moon_binary`). Consolidated here as the mechanical,
+// behavior-preserving union of every variant found (MOON_BIN override with a
+// non-empty guard, then the compile-time `CARGO_BIN_EXE_moon` path Cargo sets
+// for this test binary, then `target/{release,debug}/moon` as a last resort
+// for ad-hoc `cargo test --test <name>` invocations outside the normal
+// harness). `tests/aof_multidb_kill9.rs`'s `moon_bin()` returns a bare
+// `./target/release/moon` default with NO binary-existence check and no
+// `CARGO_BIN_EXE_moon` fallback — a real behavioral difference, so it is
+// deliberately left alone here rather than force-migrated (see the kernel M3
+// brief, Stage 1, decision #5: "if any suite needs behavioral adaptation,
+// skip it there and note it for a follow-up task instead").
+// ---------------------------------------------------------------------------
+
+/// Resolve the `moon` server binary for crash/integration suites.
+///
+/// Precedence: `MOON_BIN` env var (only if non-empty and the path exists) →
+/// `CARGO_BIN_EXE_moon` (the exact binary Cargo built for THIS test run —
+/// right profile, right `CARGO_TARGET_DIR`, right `.exe` suffix on Windows)
+/// → `target/release/moon` → `target/debug/moon`. Panics with a actionable
+/// message if none resolve.
+pub fn find_moon_binary() -> PathBuf {
+    if let Ok(bin) = std::env::var("MOON_BIN")
+        && !bin.trim().is_empty()
+    {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return p;
+        }
+    }
+    let cargo_bin = PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    if cargo_bin.exists() {
+        return cargo_bin;
+    }
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let release = PathBuf::from(format!("{manifest}/target/release/moon"));
+    if release.exists() {
+        return release;
+    }
+    let debug = PathBuf::from(format!("{manifest}/target/debug/moon"));
+    if debug.exists() {
+        return debug;
+    }
+    panic!(
+        "No moon binary found. Build with `cargo build --release` or set \
+         MOON_BIN=/path/to/moon."
+    );
+}
+
+/// SIGKILL a spawned child and reap it (never SIGTERM — SIGTERM +
+/// SO_REUSEPORT is a documented hang, see CLAUDE.md / the harness-speed
+/// gotcha ledger). `Child::kill()` is documented to send SIGKILL on Unix,
+/// so no raw `libc::kill` (and no `unsafe`, no cfg split) is needed.
+pub fn sigkill(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Wait until nothing is accepting on `port` — required before a same-port
+/// restart, or the new listener can race the dying process's socket
+/// teardown. moon binds `SO_REUSEPORT` per shard, so a plain bind-based
+/// check is useless here; two consecutive refused connects is the signal.
+pub fn wait_for_port_down(port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    let mut consecutive_refused = 0;
+    for _ in 0..120 {
+        match TcpStream::connect_timeout(&addr.parse().expect("addr"), Duration::from_millis(100)) {
+            Ok(_) => {
+                consecutive_refused = 0;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                consecutive_refused += 1;
+                if consecutive_refused >= 2 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    // No silent-pass verification helpers in a tripwire codebase (review
+    // round 3, P2): a caller that proceeds to bind the SAME port after this
+    // returns without the port actually being down races the dying
+    // process's socket teardown, which can manifest as a flaky bind failure
+    // or — worse — a same-port respawn silently talking to the wrong
+    // (still-dying) process. Loop exhaustion after 120 iterations (~18s
+    // worst case) is not a benign timeout here; it means the port never
+    // went down and every caller's assumption is false.
+    panic!(
+        "wait_for_port_down: port {port} never stopped accepting connections \
+         after 120 poll iterations (~18s) — the old process may still be \
+         alive, or SO_REUSEPORT is masking a listener that never exited"
     );
 }
