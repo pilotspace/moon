@@ -104,6 +104,7 @@ pub(super) async fn try_handle_ws_command(
                             Bytes::from(record),
                         );
                     }
+                    responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
                 } else {
                     let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
                     let msg = crate::shard::dispatch::ShardMessage::WsRegistryCreate(Box::new(
@@ -122,9 +123,28 @@ pub(super) async fn try_handle_ws_command(
                         &ctx.spsc_notifiers,
                     )
                     .await;
-                    let _ = crate::shard::coordinator::recv_reply_bounded(reply_rx).await;
+                    // Fail CLOSED on hop failure (adversarial-review P0): a
+                    // wedged ring or reply timeout must not report a phantom
+                    // ws_id the registry never saw. The registry itself is
+                    // process-global, so a post-failure probe disambiguates
+                    // "shard 0 executed but the reply was slow/lost" (entry
+                    // present → success) from "the mutation never happened"
+                    // (entry absent → retryable error).
+                    let hop_ok = crate::shard::coordinator::recv_reply_bounded(reply_rx)
+                        .await
+                        .is_ok();
+                    let created = hop_ok || {
+                        let guard = ctx.shard_databases.workspace_registry();
+                        guard.as_ref().is_some_and(|reg| reg.get(&ws_id).is_some())
+                    };
+                    if created {
+                        responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
+                    } else {
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"ERR workspace create failed (shard-0 registry hop timed out); not created, safe to retry",
+                        )));
+                    }
                 }
-                responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
             }
             Err(e) => responses.push(e),
         }
@@ -180,10 +200,25 @@ pub(super) async fn try_handle_ws_command(
                                 &ctx.spsc_notifiers,
                             )
                             .await;
-                            matches!(
-                                crate::shard::coordinator::recv_reply_bounded(reply_rx).await,
-                                Ok(true)
-                            )
+                            match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+                                Ok(removed) => removed,
+                                // Timeout/err ≠ failure (adversarial-review
+                                // P1): shard 0 may have completed the drop
+                                // and only the REPLY was lost — resolving
+                                // `false` here skipped the `{ws_hex}:` key
+                                // sweep below FOREVER (the registry entry is
+                                // gone, so no WS.DROP retry can re-trigger
+                                // it). The registry is process-global:
+                                // probe it — entry gone → the drop landed
+                                // (run the sweep; it is idempotent), entry
+                                // still present → the hop genuinely never
+                                // executed → fall through to
+                                // ERR_WS_NOT_FOUND-side handling as before.
+                                Err(_) => {
+                                    let guard = ctx.shard_databases.workspace_registry();
+                                    guard.as_ref().is_none_or(|reg| reg.get(&ws_id).is_none())
+                                }
+                            }
                         };
                         if removed {
                             // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
