@@ -2866,6 +2866,7 @@ pub(crate) fn handle_shard_message_shared(
             let mut text_defs: Option<Vec<u8>> = None;
             #[cfg(feature = "graph")]
             let mut graph_blob: Vec<u8> = Vec::new();
+            let mut mq_blob: Vec<u8> = Vec::new();
             crate::shard::slice::with_shard(|s| {
                 let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
                 crate::persistence::redis_rdb::write_rdb_body_refs(&refs, &mut rdb_body);
@@ -2888,6 +2889,10 @@ pub(crate) fn handle_shard_message_shared(
                     graph_blob =
                         crate::replication::graph_sync::export_graph_store(&mut s.graph_store);
                 }
+                mq_blob = crate::replication::mq_sync::export_mq_registry(
+                    s.durable_queue_registry.as_deref(),
+                    s.trigger_registry.as_deref(),
+                );
             });
             // Wave B ws-plane: the workspace registry is process-global, not
             // per-shard, so only shard 0 (the sole writer of it — see
@@ -2934,6 +2939,7 @@ pub(crate) fn handle_shard_message_shared(
                 #[cfg(feature = "graph")]
                 graph_blob,
                 ws_registry_blob,
+                mq_blob,
             };
             if reply_tx.try_send(prepared).is_err() {
                 // The PSYNC task is gone (replica dropped mid-handshake) —

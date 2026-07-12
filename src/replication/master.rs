@@ -748,6 +748,15 @@ pub async fn handle_psync_inline_single_shard(
                     let ws_registry_blob = crate::replication::ws_sync::export_workspace_registry(
                         shard_databases.workspace_registry().as_deref(),
                     );
+                    // Wave B stage 2b: this shard's MQ durable-queue +
+                    // trigger registry snapshot. ALWAYS written (empty blob
+                    // when both registries are unset) so the replica can
+                    // distinguish "master shard has no MQ state" from
+                    // "pre-MQ-replication master" (aux absent entirely).
+                    let mq_blob = crate::replication::mq_sync::export_mq_registry(
+                        s.durable_queue_registry.as_deref(),
+                        s.trigger_registry.as_deref(),
+                    );
                     let mut moon_aux: Vec<(&[u8], &[u8])> = Vec::new();
                     if let Some(ref v) = vec_defs {
                         moon_aux
@@ -764,6 +773,10 @@ pub async fn handle_psync_inline_single_shard(
                     moon_aux.push((
                         crate::persistence::redis_rdb::MOON_AUX_WORKSPACE_REGISTRY,
                         &ws_registry_blob[..],
+                    ));
+                    moon_aux.push((
+                        crate::persistence::redis_rdb::MOON_AUX_MQ_REGISTRY,
+                        &mq_blob[..],
                     ));
                     crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
                         &refs,
@@ -959,6 +972,7 @@ pub async fn handle_psync_inline_multi_shard(
     // `PreparedShardSync::ws_registry_blob`). "Keep the first Some" matches
     // the `vector_defs`/`text_defs` convention below.
     let mut ws_registry_blob: Option<Vec<u8>> = None;
+    let mut mq_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_shards);
     for (shard, reply_rx) in reply_rxs {
         // Bounded wait (review): a wedged shard must not park this task —
         // and its registrations — forever. 30s is far past any observed
@@ -1002,6 +1016,7 @@ pub async fn handle_psync_inline_multi_shard(
         }
         #[cfg(feature = "graph")]
         graph_blobs.push(prepared.graph_blob);
+        mq_blobs.push(prepared.mq_blob);
         bodies.push(prepared.rdb_body);
     }
 
@@ -1025,6 +1040,15 @@ pub async fn handle_psync_inline_multi_shard(
         moon_aux.push((
             crate::persistence::redis_rdb::MOON_AUX_WORKSPACE_REGISTRY,
             &w[..],
+        ));
+    }
+    // MQ registry state is per-shard (owner-hashed by queue/trigger key,
+    // same sharding model as graph names): one aux entry per shard, merged
+    // additively into every replica shard by `mq_sync::install_mq_registry_many`.
+    for blob in &mq_blobs {
+        moon_aux.push((
+            crate::persistence::redis_rdb::MOON_AUX_MQ_REGISTRY,
+            &blob[..],
         ));
     }
     let mut rdb_buf: Vec<u8> = Vec::new();
