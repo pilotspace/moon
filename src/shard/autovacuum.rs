@@ -231,8 +231,11 @@ impl AutovacuumDaemon {
     ///   "assume every sealed segment is durable elsewhere") as its floor —
     ///   true only when a checkpoint backs it. When `false`, Pass C does
     ///   NOT recycle; it logs a rate-limited warning and increments
-    ///   `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` instead. Disk-offload
-    ///   mode behavior is unchanged from before this fix.
+    ///   `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` instead. In
+    ///   disk-offload mode, recycling proceeds — but `recycle_aggressive`
+    ///   itself keeps any segment holding WS/MQ/temporal plane records
+    ///   (sole durable copy in EVERY mode; Wave B stage 2a review fix),
+    ///   surfacing them via the same blocked counter.
     /// * `manifest_retain_epochs` / `manifest_retain_secs` — P1 config.
     /// * `max_immutable_segments` — trigger threshold for vector compact pass.
     /// * `shutdown_requested` — if true, abort immediately after the current pass.
@@ -357,7 +360,12 @@ impl AutovacuumDaemon {
                         // a real redo_lsn and persist_graph_at_checkpoint
                         // snapshots the graph write-buffer, so recycling
                         // everything before current_lsn is backed by an
-                        // actual durable floor. UNCHANGED from before task #43.
+                        // actual durable floor — for KV and graph. The
+                        // WS/MQ/temporal planes have NO snapshot in this mode
+                        // either; `recycle_aggressive` itself skips any
+                        // segment holding such records (Wave B stage 2a
+                        // review fix) and reports them via
+                        // `segments_blocked_plane`.
                         let redo_lsn = wal.current_lsn();
                         match wal.recycle_aggressive(redo_lsn) {
                             Ok(recycled) => {
@@ -370,6 +378,26 @@ impl AutovacuumDaemon {
                                         pass_ms,
                                         "autovacuum: pass C (WAL recycle) freed segments"
                                     );
+                                }
+                                if recycled.segments_blocked_plane > 0 {
+                                    crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                                        .fetch_add(recycled.segments_blocked_plane as u64, Ordering::Relaxed);
+                                    let should_warn =
+                                        self.last_wal_recycle_warn_at.map_or(true, |t| {
+                                            now.duration_since(t) >= Duration::from_secs(300)
+                                        });
+                                    if should_warn {
+                                        tracing::warn!(
+                                            segments_blocked = recycled.segments_blocked_plane,
+                                            "autovacuum: pass C kept WAL segment(s) holding \
+                                             workspace/MQ/temporal history — these planes have \
+                                             no snapshot format, the WAL is their sole durable \
+                                             copy, so they are excluded from recycling and WAL \
+                                             size may stay above --max-wal-size until plane \
+                                             checkpointing lands (storage-kernel M3)"
+                                        );
+                                        self.last_wal_recycle_warn_at = Some(now);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -937,8 +965,73 @@ mod tests {
         );
     }
 
-    /// Disk-offload mode is unchanged by task #43: Pass C still recycles
-    /// aggressively against `current_lsn()`, exactly as before this fix.
+    /// Wave B stage 2a review fix: in disk-offload mode Pass C recycles
+    /// pure-KV segments but keeps any segment holding plane records
+    /// (WS/MQ/temporal — no snapshot format in any mode), counting them in
+    /// `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL`.
+    #[test]
+    fn test_pass_c_disk_offload_keeps_plane_segments_and_counts_blocked() {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer =
+            crate::persistence::wal_v3::segment::WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        // Plane record first (lands in segment 1), then KV filler.
+        writer.append(WalRecordType::MqPush, b"\x01mq-plane-payload");
+        for i in 0..80 {
+            writer.append(WalRecordType::Command, b"SET key val filler");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        let before = count_wal_segments(&wal_dir);
+        let before_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(Ordering::Relaxed);
+
+        let mut vector_store = crate::vector::store::VectorStore::new();
+        #[cfg(feature = "graph")]
+        let mut graph_store = crate::graph::store::GraphStore::new();
+        let mut daemon = AutovacuumDaemon::new(AutovacuumConfig::default());
+        daemon.run_tick(
+            &mut vector_store,
+            #[cfg(feature = "graph")]
+            &mut graph_store,
+            None,
+            Some(&mut writer),
+            256,  // max_wal_bytes: tiny, so the ceiling is already breached
+            true, // disk_offload_enabled
+            0,
+            0,
+            usize::MAX,
+            usize::MAX,
+            1.0,
+            false,
+        );
+
+        let after = count_wal_segments(&wal_dir);
+        assert!(
+            after < before,
+            "pure-KV sealed segments must still be recycled (before={before}, after={after})"
+        );
+        let plane_path = crate::persistence::wal_v3::segment::WalSegment::segment_path(&wal_dir, 1);
+        assert!(
+            plane_path.exists(),
+            "segment 1 (holds the MqPush plane record) must survive Pass C"
+        );
+        let after_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(Ordering::Relaxed);
+        assert!(
+            after_blocked > before_blocked,
+            "blocked plane segment must be observable via the RECL counter"
+        );
+    }
+
+    /// Disk-offload mode recycling of PURE-KV history is unchanged by task
+    /// #43 and by the stage-2a plane guard: Pass C still recycles
+    /// Command-only segments against `current_lsn()`.
     #[test]
     fn test_pass_c_disk_offload_mode_recycles_unchanged() {
         let tmp = tempfile::tempdir().unwrap();

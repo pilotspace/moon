@@ -58,6 +58,31 @@ DLQ routing, and trigger re-arming all survive. New fuzz target
 `mq_wal_record` covers the five new op-blob decoders (`fuzz/fuzz_targets/`,
 registered in both `fuzz-pr` and `fuzz-nightly` CI matrices).
 
+Measured WAL footprint (release, single shard): CREATE + 5×PUSH + POP(3)
+= 7 records, 576 bytes on disk including the 64-byte segment header —
+~68 bytes per small PUSH (48-byte payload + 20-byte framing/CRC), ~132
+bytes for a 3-claim POP.
+
+**WAL recycle plane guard (adversarial-review fix):** `recycle_aggressive`
+and `recycle_segments_before` now refuse to delete any sealed segment
+holding workspace/MQ/temporal records — those planes have no snapshot
+format in ANY mode, so the WAL is their sole durable copy and no caller's
+LSN floor (autovacuum Pass C in disk-offload mode, the checkpoint
+protocol, admin `VACUUM`) makes such a segment safe. Previously,
+disk-offload deployments under `--max-wal-size` pressure would silently
+and permanently lose MQ/WS/temporal history during normal operation, no
+crash required. Kept segments are counted in
+`reclamation_wal_recycle_blocked_no_checkpoint_total` and warned
+(rate-limited); WAL size may exceed `--max-wal-size` for plane-heavy
+workloads until plane checkpointing lands (storage-kernel M3). The
+guard fails closed: unreadable/torn/unknown-type segments are kept.
+
+Known limitation (pre-existing, now tracked): durable MQ streams deleted
+via generic `DEL`/`UNLINK`/`FLUSHALL`/`FLUSHDB` are resurrected — now with
+full content — by MQ WAL replay after a restart; there is no MQ tombstone
+record yet (same bug class as the fixed vector/KV cold-plane resurrection;
+follow-up task filed).
+
 Out of scope (stage 2b+): replication emission/apply for the MQ plane.
 
 ### Changed — WAL v3 `wal_append` channel now preserves the caller's REAL record type end-to-end (K1a, storage-kernel M1 stage 1)

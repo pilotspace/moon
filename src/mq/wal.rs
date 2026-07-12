@@ -677,4 +677,60 @@ mod tests {
     fn test_peek_version_empty() {
         assert_eq!(peek_version(&[]), None);
     }
+
+    /// Adversarial-review P2: pre-versioning (unversioned) MqCreate/MqAck
+    /// payloads written by dev builds between PR #286 and the stage-2a
+    /// version bump must FAIL CLOSED (`None` → skip-and-warn at replay),
+    /// never decode as garbage. The dangerous shape is a legacy record
+    /// whose `key_len` low byte equals `MQ_WAL_VERSION` (1): its first
+    /// byte passes the version check and the remaining bytes get
+    /// reinterpreted at shifted offsets.
+    #[test]
+    fn test_legacy_unversioned_payloads_fail_closed() {
+        // Legacy MqCreate: [key_len:u32][key][mdc:u32] with key_len = 1.
+        // First byte = 0x01 == MQ_WAL_VERSION → version check passes; the
+        // reinterpreted db_index/key_len fields must then fail the
+        // structural length checks.
+        let mut legacy_create = Vec::new();
+        legacy_create.extend_from_slice(&1u32.to_le_bytes());
+        legacy_create.push(b'q');
+        legacy_create.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            decode_mq_create(&legacy_create),
+            None,
+            "legacy 1-byte-key MqCreate must fail closed, not decode as garbage"
+        );
+
+        // Same shape with key_len = 257 (low byte still 0x01).
+        let key = vec![b'k'; 257];
+        let mut legacy_create_257 = Vec::new();
+        legacy_create_257.extend_from_slice(&257u32.to_le_bytes());
+        legacy_create_257.extend_from_slice(&key);
+        legacy_create_257.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            decode_mq_create(&legacy_create_257),
+            None,
+            "legacy 257-byte-key MqCreate must fail closed"
+        );
+
+        // Legacy MqAck: [key_len:u32][key][ms:u64][seq:u64], key_len = 1.
+        let mut legacy_ack = Vec::new();
+        legacy_ack.extend_from_slice(&1u32.to_le_bytes());
+        legacy_ack.push(b'q');
+        legacy_ack.extend_from_slice(&123u64.to_le_bytes());
+        legacy_ack.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(
+            decode_mq_ack(&legacy_ack),
+            None,
+            "legacy 1-byte-key MqAck must fail closed"
+        );
+
+        // Legacy layouts whose first byte is NOT the version (key_len 2)
+        // fail at the version gate directly.
+        let mut legacy_create_2 = Vec::new();
+        legacy_create_2.extend_from_slice(&2u32.to_le_bytes());
+        legacy_create_2.extend_from_slice(b"qq");
+        legacy_create_2.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(decode_mq_create(&legacy_create_2), None);
+    }
 }
