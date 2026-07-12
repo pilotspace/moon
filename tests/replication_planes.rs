@@ -255,12 +255,23 @@ fn spawn_into(guard: &mut Guard, dir: &str, shards: usize, extra: &[&str]) -> u1
 }
 
 /// SAFETY: `pid` is a live child PID we spawned ourselves; SIGKILL is always
-/// a valid signal to send. Mirrors `tests/replication_hardening.rs`.
+/// a valid signal to send. Mirrors `tests/aof_multidb_kill9.rs` (the
+/// cfg-gated cross-platform form — `libc` is not linked on Windows).
 fn sigkill(child: &mut Child) {
-    // SAFETY: see doc comment above.
-    let ret = unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
-    assert_eq!(ret, 0, "libc::kill failed");
-    let _ = child.wait();
+    #[cfg(unix)]
+    {
+        // SAFETY: see doc comment above.
+        let ret = unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0, "libc::kill failed");
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no SIGKILL; TerminateProcess via Child::kill is the
+        // closest immediate-death equivalent.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 // ============================================================================
