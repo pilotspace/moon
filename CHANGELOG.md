@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — memory + tier accounting spine (kernel M2 stage 2 / K4)
+
+`resident_bytes()` is now implemented by every storage plane, and the
+elastic memory budget's used-term (`ShardDatabases::recompute_elastic_budget`,
+GAP-1/PR #170) folds in all of them — previously kv+vector only.
+
+- `TextStore`/`TextIndex::resident_bytes()`: posting lists, term
+  dictionaries, FST fuzzy/prefix sidecars, per-document bookkeeping maps,
+  and TAG/NUMERIC secondary indexes. FTS memory was hard-coded 0
+  everywhere it was published (elastic budget, MEMORY DOCTOR, Prometheus)
+  until this change.
+- `ColdIndex::resident_bytes()` (KV disk-offload bookkeeping): an O(1)
+  incremental accumulator (not a per-tick walk — sized for G2's "10x RAM"
+  scale target), charged into the shard's published KV memory.
+- Graph resident bytes (already computed) now also feed the elastic
+  budget's used-term, not just the observability atomic.
+- `moon_memory_bytes{kind="text"}` Prometheus gauge + `Text (FTS):` line
+  in `MEMORY DOCTOR`. Also fixes a pre-existing gap where
+  `moon_memory_bytes{kind="lua_scripts"}` was emitted but never primed.
+- New `src/storage/tier.rs`: `ResidencyTier` (Hot/WarmReloadable/ColdStub)
+  + `TierPolicy` trait skeleton — types only, no plane adoption in this
+  milestone (that is M4).
+
+No eviction policy semantics changed: this widens what the existing
+donor/hot formula sees, not how it decides. Verified against
+`eviction_parity`/`eviction_parity_hash_disk_offload` (shards 1 and 4,
+including the disk-offload `ColdIndex` path) with no behavior change.
+
 ### Fixed — Windows CI: `replication_planes` used un-gated `libc::kill`
 
 `tests/replication_planes.rs`'s `sigkill` helper called `libc::kill`
