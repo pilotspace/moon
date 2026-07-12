@@ -35,12 +35,16 @@ write site the K3 audit flagged as missing part of the sequence
   filesystems a crash between rename and dir-fsync can revert the
   directory entry to the old name even though `rename()` returned
   success.
-- **FST term-dict sidecar wired into recovery**:
-  `TextStore::load_fst_sidecars` had zero callers — durably written at
-  every `FT.COMPACT`, never read back, so fuzzy/prefix queries
-  silently brute-forced the HashMap on every restart. Now called
-  during shard startup recovery right after text indexes are restored
-  from their sidecar metadata.
+- **FST term-dict sidecar deliberately left unwired** (and now
+  documented as such on `TextStore::load_fst_sidecars`): wiring the
+  load was attempted and REVERTED after adversarial review proved a
+  loaded FST's baked-in term-ids are stale id-space garbage against
+  the term dictionary the restart rescan rebuilds (first-encounter-
+  order ids over non-reproducible hash iteration) — merging them
+  silently corrupts `FT.SEARCH` FUZZY/PREFIX results. Restart fuzzy/
+  prefix queries keep the slow-but-correct brute-force path; making
+  the sidecar loadable requires persisting the term dictionary itself
+  (task #50, kernel M4 FTS persistence).
 
 Ref: `.planning/reviews/kernel-m2-brief-2026-07-12.md` (K3, stage 1).
 
