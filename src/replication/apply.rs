@@ -149,13 +149,33 @@ fn frame_to_usize(f: &Frame) -> Option<usize> {
 /// Returns `false` only if this thread has no initialized `ShardSlice` — which
 /// would indicate the replica task was spawned off a shard thread (a wiring
 /// bug); the caller logs and drops the stream.
-pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
+///
+/// `shard_databases` gives the WS.CREATE.APPLY / WS.DROP.APPLY arms
+/// (Wave B ws-plane) access to the process-global `WorkspaceRegistry`, which
+/// lives on `ShardDatabases` rather than the thread-local `ShardSlice` — R0
+/// replication is single-shard-only, so applying directly here (no shard-0
+/// hop) is correct: there is exactly one shard.
+pub(crate) fn apply_local(
+    rc: &ReplCommand,
+    shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+) -> bool {
     use crate::command::{DispatchResult, dispatch as cmd_dispatch};
     use crate::shard::spsc_handler::extract_command_static;
 
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
         return true; // not an array command — nothing to apply (defensive)
     };
+    if cmd.eq_ignore_ascii_case(crate::workspace::repl::WS_CREATE_APPLY_CMD) {
+        // Doesn't touch `ShardSlice`, but routes through `try_with_shard`
+        // anyway so a replica task wired to a non-shard thread is caught
+        // uniformly (same "no ShardSlice here" contract every other arm has).
+        return crate::shard::slice::try_with_shard(|_s| apply_ws_create(shard_databases, args))
+            .is_some();
+    }
+    if cmd.eq_ignore_ascii_case(crate::workspace::repl::WS_DROP_APPLY_CMD) {
+        return crate::shard::slice::try_with_shard(|s| apply_ws_drop(s, shard_databases, args))
+            .is_some();
+    }
     crate::shard::slice::try_with_shard(|s| {
         let db_count = s.databases.len();
         if db_count == 0 {
@@ -244,6 +264,85 @@ pub(crate) fn apply_local(rc: &ReplCommand) -> bool {
         warn_on_error(cmd, &resp);
     })
     .is_some()
+}
+
+/// Apply a replicated `WS.CREATE.APPLY` record (Wave B ws-plane): install the
+/// MASTER's `ws_id` + `name` + `created_at` VERBATIM into the process-global
+/// workspace registry. UUIDv7 is nondeterministic — a replica must never mint
+/// its own; it applies exactly what the master already decided (round-2
+/// finding A / task #34). In-memory only, matching `apply_graph`'s
+/// no-local-persistence model — a restarted replica resyncs from its master
+/// rather than replaying a local WAL copy of this record.
+fn apply_ws_create(
+    shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    args: &[Frame],
+) {
+    let Some(payload) = crate::workspace::repl::extract_payload(args) else {
+        tracing::warn!("replica apply: WS.CREATE.APPLY missing payload — skipped");
+        return;
+    };
+    let Some((ws_id_bytes, name, created_at)) =
+        crate::workspace::wal::decode_workspace_create(&payload)
+    else {
+        tracing::warn!("replica apply: WS.CREATE.APPLY payload malformed — skipped");
+        return;
+    };
+    let id = crate::workspace::WorkspaceId::from_bytes(ws_id_bytes);
+    let mut guard = shard_databases.workspace_registry();
+    let reg = guard.get_or_insert_with(|| Box::new(crate::workspace::WorkspaceRegistry::new()));
+    reg.insert(
+        id,
+        crate::workspace::registry::WorkspaceMetadata {
+            id,
+            name: bytes::Bytes::from(name),
+            created_at,
+        },
+    );
+}
+
+/// Apply a replicated `WS.DROP.APPLY` record (Wave B ws-plane): remove the
+/// workspace from the registry, then run the SAME best-effort key-prefix
+/// sweep the master's local-owner branch of `WsDropCleanup` runs (R0
+/// replication is single-shard-only, so there is no cross-shard hop to
+/// mirror — sweeping every db on this one shard IS the whole sweep).
+fn apply_ws_drop(
+    s: &mut crate::shard::slice::ShardSlice,
+    shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    args: &[Frame],
+) {
+    let Some(payload) = crate::workspace::repl::extract_payload(args) else {
+        tracing::warn!("replica apply: WS.DROP.APPLY missing payload — skipped");
+        return;
+    };
+    let Some(ws_id_bytes) = crate::workspace::wal::decode_workspace_drop(&payload) else {
+        tracing::warn!("replica apply: WS.DROP.APPLY payload malformed — skipped");
+        return;
+    };
+    let id = crate::workspace::WorkspaceId::from_bytes(ws_id_bytes);
+    let removed = {
+        let mut guard = shard_databases.workspace_registry();
+        match guard.as_mut() {
+            Some(reg) => reg.remove(&id).is_some(),
+            None => false,
+        }
+    };
+    if !removed {
+        // Already absent (e.g. a re-delivered record after a resync) —
+        // nothing to sweep.
+        return;
+    }
+    let prefix = format!("{{{}}}:", id.as_hex());
+    let prefix_bytes = prefix.into_bytes();
+    for db in s.databases.iter_mut() {
+        let keys_to_delete: Vec<Vec<u8>> = db
+            .keys()
+            .filter(|k| k.as_bytes().starts_with(&prefix_bytes[..]))
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        for key in &keys_to_delete {
+            db.remove(key);
+        }
+    }
 }
 
 /// Apply a replicated FT.* index-definition command (FT.CREATE / FT.DROPINDEX
@@ -456,7 +555,15 @@ fn apply_two_db(
 ///
 /// Returns the number of keys loaded, or an error if this thread has no
 /// `ShardSlice` or the RDB is malformed.
-pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
+///
+/// `shard_databases` carries the process-global `WorkspaceRegistry`
+/// (Wave B ws-plane) — installed AFTER the keyspace load, same authoritative-
+/// replace semantics as the graph store below, but outside `try_with_shard`
+/// since the registry lives on `ShardDatabases`, not `ShardSlice`.
+pub(crate) fn load_snapshot(
+    rdb: &[u8],
+    shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+) -> anyhow::Result<usize> {
     use crate::persistence::redis_rdb;
     // Moon-private aux fields (written by the master right after the RDB
     // header) carry the FT index DEFINITIONS; standard RDB loaders skip them.
@@ -467,7 +574,10 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
     // them all; a single-shard snapshot yields exactly one.
     #[cfg(feature = "graph")]
     let graph_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_GRAPH_STORE);
-    match crate::shard::slice::try_with_shard(|s| {
+    // Wave B ws-plane: exactly one blob regardless of the master's shard
+    // count (shard-0-authoritative — see `ws_sync` module docs).
+    let ws_registry_blob = redis_rdb::read_moon_aux(rdb, redis_rdb::MOON_AUX_WORKSPACE_REGISTRY);
+    let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
         for db in s.databases.iter_mut() {
             db.clear();
         }
@@ -516,7 +626,45 @@ pub(crate) fn load_snapshot(rdb: &[u8]) -> anyhow::Result<usize> {
         None => Err(anyhow::anyhow!(
             "replica snapshot load: no ShardSlice on this thread"
         )),
+    };
+    let loaded = result?;
+
+    // Wave B ws-plane: install the master's workspace registry AFTER a
+    // successful keyspace load — authoritative replace (an EMPTY blob drops
+    // replica-local workspaces; an ABSENT aux means a pre-WS-sync master,
+    // warn-and-keep), same convention as the graph store above.
+    match ws_registry_blob {
+        Some(blob) => match crate::replication::ws_sync::install_workspace_registry(&blob) {
+            Some(reg) => {
+                let count = reg.len();
+                *shard_databases.workspace_registry() = Some(Box::new(reg));
+                if count > 0 {
+                    tracing::info!("replica snapshot: installed {} workspace(s)", count);
+                }
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "replica snapshot: malformed workspace-registry aux blob"
+                ));
+            }
+        },
+        None => {
+            let existing = shard_databases
+                .workspace_registry()
+                .as_ref()
+                .map_or(0, |r| r.len());
+            if existing > 0 {
+                tracing::warn!(
+                    "replica snapshot carried no workspace-registry aux but {} local \
+                     workspace(s) exist — master predates WS replication; keeping local \
+                     registry (it may diverge)",
+                    existing
+                );
+            }
+        }
     }
+
+    Ok(loaded)
 }
 
 /// Full resync = authoritative replace: drop every replica-local FT index,
