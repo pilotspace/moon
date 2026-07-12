@@ -145,18 +145,41 @@ pub(super) async fn try_handle_txn_commit(
                             foreign.entry(owner).or_default().push(intent);
                         }
                     }
-                    // Apply self-shard intents synchronously (no borrow across .await).
+                    // Apply self-shard intents synchronously (no borrow
+                    // across .await). Collect WAL payloads inside the
+                    // closure (encoding is a pure function call, not a
+                    // nested `with_shard*` call) and emit them AFTER the
+                    // closure returns — each MqPush record captures the
+                    // ASSIGNED id so replay is outcome-deterministic (Wave B
+                    // stage 2a: MQ.PUBLISH materialization durability).
                     if !self_intents.is_empty() {
-                        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                            for intent in &self_intents {
-                                if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                    if stream.durable {
-                                        let msg_id = stream.next_auto_id();
-                                        stream.add(msg_id, intent.fields.clone());
+                        let db_index = conn.selected_db;
+                        let payloads: Vec<Vec<u8>> =
+                            crate::shard::slice::with_shard_db(db_index, |db| {
+                                let mut payloads = Vec::with_capacity(self_intents.len());
+                                for intent in &self_intents {
+                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                        if stream.durable {
+                                            let msg_id = stream.next_auto_id();
+                                            payloads.push(crate::mq::wal::encode_mq_push(
+                                                db_index as u32,
+                                                &intent.queue_key,
+                                                msg_id.ms,
+                                                msg_id.seq,
+                                                &intent.fields,
+                                            ));
+                                            stream.add(msg_id, intent.fields.clone());
+                                        }
                                     }
                                 }
-                            }
-                        });
+                                payloads
+                            });
+                        for payload in payloads {
+                            crate::shard::mq_exec::wal_append_on_slice(
+                                crate::persistence::wal_v3::record::WalRecordType::MqPush,
+                                Bytes::from(payload),
+                            );
+                        }
                     }
                     // Send MqTxnMaterialize to each foreign shard and await all
                     // acks. The commit is already WAL-durable at this point, so
