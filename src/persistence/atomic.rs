@@ -40,6 +40,42 @@
 //! 3-4 leaves the rename possibly-not-durable (step 4's error, if it
 //! surfaces at all, is reported to the caller — see the `SyncDir` variant).
 //!
+//! ## Concurrent-caller invariant
+//!
+//! Two *different* callers (different threads, or different processes)
+//! racing `atomic_write_durable` for the **same** final `path` at the same
+//! time is safe from corruption but not from ambiguity: `temp_path_for`
+//! mixes in a per-(process, calling-thread) fingerprint (see
+//! [`caller_fingerprint`]), so each racing caller writes its own
+//! independent temp file — no two callers ever share a temp name and
+//! stomp each other's unfsynced bytes mid-write. Each caller's own
+//! sequence still completes atomically. What this does NOT resolve is
+//! *which* caller's content ends up at `path`: two renames to the same
+//! target race at the filesystem level and the second `rename(2)` simply
+//! wins — a last-writer-wins outcome, not a torn one. Serializing writers
+//! to the same logical artifact (e.g. one shard thread owning a given
+//! `persist_dir`) is the caller's responsibility; this module only
+//! guarantees that whichever content wins is never a mix of the two.
+//!
+//! ## Windows notes
+//!
+//! - Directory fsync is a documented no-op on Windows (see
+//!   [`fsync_directory`]) — NTFS journals rename metadata without an
+//!   explicit directory flush, the same approach LevelDB/RocksDB take.
+//! - `rename(2)`'s Windows equivalent (`MoveFileEx`, which is what
+//!   `std::fs::rename` uses) can fail with `ERROR_SHARING_VIOLATION` if
+//!   any handle to `path` is open without `FILE_SHARE_DELETE` at the
+//!   moment of rename — unlike POSIX, where an open file descriptor never
+//!   blocks a rename over its path. This module never opens `path` itself
+//!   (only the temp file, which is closed via `drop(f)` before the
+//!   rename), so the only way to hit this is a caller or a concurrent
+//!   reader on the SAME machine holding `path` open with the default
+//!   (non-`FILE_SHARE_DELETE`) sharing mode — readers of these sidecars
+//!   use `std::fs::read`/`File::open` with default flags, which on
+//!   Windows already includes `FILE_SHARE_DELETE` via Rust's standard
+//!   library, so this has not been observed in practice; flagged here so
+//!   a future Windows-specific reader doesn't reintroduce it.
+//!
 //! ## Payload-before-reference ordering rule
 //!
 //! Whenever a durable artifact (e.g. a CSR graph segment, a vector
@@ -128,10 +164,20 @@ impl From<AtomicWriteError> for io::Error {
 }
 
 /// Build the same-directory hidden temp-file path used to stage `path`'s
-/// new contents: `{parent}/.{file_name}.tmp`. Hidden (dot-prefixed) to
-/// match the convention already used by the text/vector sidecar writers
-/// this module consolidates, and so it never collides with a glob over the
-/// final artifact's own extension.
+/// new contents: `{parent}/.{file_name}.{caller_fingerprint}.tmp`. Hidden
+/// (dot-prefixed) to match the convention already used by the text/vector
+/// sidecar writers this module consolidates, and so it never collides with
+/// a glob over the final artifact's own extension.
+///
+/// The fingerprint component (see [`caller_fingerprint`]) is deterministic
+/// per `(process, calling thread)`: the same thread computing this twice
+/// for the same `path` always gets the same temp name (so a caller that
+/// predicts its own temp path — as this module's own tests do — stays in
+/// sync with what `atomic_write_durable` will actually use), while two
+/// *different* threads or processes racing the same final `path` get
+/// distinct temp names and cannot stomp each other's unfsynced bytes. See
+/// the module docs' "Concurrent-caller invariant" section for what this
+/// does and does not guarantee.
 ///
 /// Returns `None` when `path` has no parent directory or no file name
 /// component (both treated as [`AtomicWriteError::NoParentDir`] by the
@@ -139,7 +185,26 @@ impl From<AtomicWriteError> for io::Error {
 fn temp_path_for(path: &Path) -> Option<PathBuf> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
     let file_name = path.file_name()?.to_string_lossy();
-    Some(parent.join(format!(".{file_name}.tmp")))
+    Some(parent.join(format!(".{file_name}.{:016x}.tmp", caller_fingerprint())))
+}
+
+/// A deterministic-per-`(process, calling thread)` fingerprint, used by
+/// [`temp_path_for`] to keep concurrent `atomic_write_durable` calls from
+/// colliding on the same temp-file name. Hashing `(pid, ThreadId)` with a
+/// fresh `DefaultHasher` each call is a pure function of the caller's
+/// identity — same process+thread always produces the same fingerprint
+/// (needed for the prediction property `temp_path_for`'s docs describe),
+/// different process or thread always produces a different one (with
+/// overwhelming probability — collisions are not cryptographically
+/// guarded against, since the only consequence of one is two writers
+/// briefly sharing a temp name, not corruption of the final `path`, which
+/// is still only ever reached via each writer's own atomic rename).
+fn caller_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Atomically write `bytes` to `path`. See the module docs for the full
@@ -239,7 +304,49 @@ mod tests {
     fn test_temp_path_is_hidden_and_same_directory() {
         let path = Path::new("/data/shard_0/manifest.json");
         let tmp = temp_path_for(path).unwrap();
-        assert_eq!(tmp, Path::new("/data/shard_0/.manifest.json.tmp"));
+        // Same directory, hidden (dot-prefixed), `.tmp`-suffixed. The
+        // fingerprint component in between is process/thread-dependent
+        // (see caller_fingerprint) and deliberately not asserted here —
+        // test_temp_path_is_deterministic_per_calling_thread covers that.
+        assert_eq!(tmp.parent(), Some(Path::new("/data/shard_0")));
+        let name = tmp.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with(".manifest.json.") && name.ends_with(".tmp"),
+            "unexpected temp name: {name}"
+        );
+    }
+
+    /// Pins the prediction property `temp_path_for`'s docs promise: the
+    /// same (process, calling thread) computing the temp path for the same
+    /// final `path` twice gets the identical answer — this is what lets
+    /// `test_original_untouched_when_temp_write_fails` (below) precompute
+    /// the exact path `atomic_write_durable` will use internally.
+    #[test]
+    fn test_temp_path_is_deterministic_for_same_thread() {
+        let path = Path::new("/data/shard_0/manifest.json");
+        assert_eq!(temp_path_for(path).unwrap(), temp_path_for(path).unwrap());
+    }
+
+    /// K3 P2a hardening (adversarial review): two different threads racing
+    /// `atomic_write_durable` for the SAME final path must get two
+    /// different temp names, so neither can stomp the other's unfsynced
+    /// bytes mid-write. Before this fix `temp_path_for` returned a fixed
+    /// `.{filename}.tmp` name regardless of caller — a documented trap for
+    /// any future multi-writer caller.
+    #[test]
+    fn test_temp_path_differs_across_threads_for_same_final_path() {
+        let path = PathBuf::from("/data/shard_0/manifest.json");
+        let this_thread_tmp = temp_path_for(&path).unwrap();
+
+        let other_path = path.clone();
+        let other_thread_tmp = std::thread::spawn(move || temp_path_for(&other_path).unwrap())
+            .join()
+            .unwrap();
+
+        assert_ne!(
+            this_thread_tmp, other_thread_tmp,
+            "different threads must not compute the same temp path for the same final path"
+        );
     }
 
     #[test]
