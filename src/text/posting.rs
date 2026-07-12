@@ -86,6 +86,27 @@ impl PostingList {
     }
 }
 
+/// Fixed per-term overhead charged exactly once, when a term's `PostingList`
+/// entry is first created in `postings` (K4 P0 fix: this entry is kept
+/// forever even after its last document is removed -- see `remove_doc`'s doc
+/// comment -- so the cost is charged once and never refunded, matching that
+/// contract). Approximates the `HashMap<u32, PostingList>` bucket overhead
+/// plus the `PostingList` struct shell (its growable contents are charged
+/// separately via `POSTING_OCCURRENCE_COST`/`POSITION_COST`).
+const POSTING_ENTRY_OVERHEAD: usize = 48 + std::mem::size_of::<PostingList>();
+
+/// Fixed approximate cost of one (term, doc) occurrence: one `term_freqs`
+/// `u32` slot plus an amortized per-id `RoaringBitmap` cost. A flat constant
+/// -- not `RoaringBitmap::serialized_size()` -- because compressed bitmap
+/// size is non-linear/non-additive across arbitrary insert/remove patterns
+/// and cannot be delta-tracked in O(1); this is the same "monotonic signal,
+/// not exact RSS" approximation style used by `ColdIndex`/`Database::
+/// entry_overhead` elsewhere in the accounting spine.
+const POSTING_OCCURRENCE_COST: usize = 4 + 4;
+
+/// Fixed approximate cost of one tracked token position (`u32`).
+const POSITION_COST: usize = std::mem::size_of::<u32>();
+
 /// Per-field inverted index storing term_id -> PostingList.
 pub struct PostingStore {
     postings: HashMap<u32, PostingList>,
@@ -95,6 +116,14 @@ pub struct PostingStore {
     /// re-index cliff (fts-upsert-incremental). Kept in sync with `postings`: `add_term_occurrence`
     /// records the edge on the new-doc branch; `remove_doc` erases the doc's entry.
     doc_terms: HashMap<u32, SmallVec<[u32; 8]>>,
+    /// K4 (P0 fix): O(1) cached total mirroring `estimated_bytes()`.
+    /// Maintained incrementally at every mutation site (`add_term_occurrence`,
+    /// `remove_doc`) instead of being recomputed by a full walk on every read
+    /// -- `estimated_bytes()` used to be an O(vocabulary) walk called
+    /// unconditionally every 100ms from the shard eviction tick, which does
+    /// not scale with corpus size. `estimated_bytes_ground_truth`
+    /// (`#[cfg(test)]`) is the walk this field must always match.
+    resident_bytes: usize,
 }
 
 impl PostingStore {
@@ -103,6 +132,7 @@ impl PostingStore {
         Self {
             postings: HashMap::new(),
             doc_terms: HashMap::new(),
+            resident_bytes: 0,
         }
     }
 
@@ -115,6 +145,7 @@ impl PostingStore {
     /// - `positions: Some(pos)` -- store positions; upgrades a no-position list to have positions
     /// - `positions: None` -- don't track positions for this occurrence; keeps existing positions if any
     pub fn add_term_occurrence(&mut self, term_id: u32, doc_id: u32, positions: Option<Vec<u32>>) {
+        let is_new_term = !self.postings.contains_key(&term_id);
         let posting = self.postings.entry(term_id).or_insert_with(|| {
             if positions.is_some() {
                 PostingList::new_with_positions()
@@ -122,13 +153,18 @@ impl PostingStore {
                 PostingList::new_without_positions()
             }
         });
+        if is_new_term {
+            self.resident_bytes += POSTING_ENTRY_OVERHEAD;
+        }
 
         if posting.doc_ids.contains(doc_id) {
             // Existing doc: increment at the rank-aligned index.
             let idx = posting.rank_index(doc_id);
             posting.term_freqs[idx] += 1;
             // Append positions if provided.
+            let mut added_positions = 0usize;
             if let Some(pos) = &positions {
+                added_positions = pos.len();
                 if let Some(pos_list) = &mut posting.positions {
                     pos_list[idx].extend_from_slice(pos);
                 } else {
@@ -138,6 +174,7 @@ impl PostingStore {
                     posting.positions = Some(pos_list);
                 }
             }
+            self.resident_bytes += added_positions * POSITION_COST;
         } else {
             // New document: insert into the bitmap, then insert tf/positions AT THE RANK
             // INDEX (not push) so term_freqs/positions stay rank-aligned with doc_ids — correct
@@ -145,11 +182,16 @@ impl PostingStore {
             posting.doc_ids.insert(doc_id);
             let idx = posting.rank_index(doc_id);
             posting.term_freqs.insert(idx, 1);
+            let mut added_positions = 0usize;
             match (&mut posting.positions, &positions) {
-                (Some(pos_list), Some(pos)) => pos_list.insert(idx, pos.clone()),
+                (Some(pos_list), Some(pos)) => {
+                    added_positions = pos.len();
+                    pos_list.insert(idx, pos.clone());
+                }
                 (Some(pos_list), None) => pos_list.insert(idx, Vec::new()),
                 (None, Some(pos)) => {
                     // Upgrade: track positions for all docs; this doc's positions at idx.
+                    added_positions = pos.len();
                     let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
                     pos_list[idx] = pos.clone();
                     posting.positions = Some(pos_list);
@@ -160,6 +202,7 @@ impl PostingStore {
             // time `doc_id` joins `term_id`'s posting, so no de-dup is needed. `posting`'s borrow of
             // `self.postings` has ended (last use above), so this disjoint-field access is sound.
             self.doc_terms.entry(doc_id).or_default().push(term_id);
+            self.resident_bytes += POSTING_OCCURRENCE_COST + added_positions * POSITION_COST;
         }
     }
 
@@ -209,12 +252,21 @@ impl PostingStore {
             if idx < posting.term_freqs.len() {
                 let old_tf = posting.term_freqs.remove(idx);
                 posting.doc_ids.remove(doc_id);
+                let mut freed_positions = 0usize;
                 if let Some(pos_list) = &mut posting.positions {
                     if idx < pos_list.len() {
+                        freed_positions = pos_list[idx].len();
                         pos_list.remove(idx);
                     }
                 }
                 removed.push((term_id, old_tf));
+                // K4 (P0 fix): symmetric uncharge for the occurrence + its positions
+                // added by `add_term_occurrence`. The entry's `POSTING_ENTRY_OVERHEAD`
+                // is deliberately NOT refunded here -- the `postings` map entry itself
+                // survives (see below), matching the never-refunded charge on creation.
+                self.resident_bytes = self
+                    .resident_bytes
+                    .saturating_sub(POSTING_OCCURRENCE_COST + freed_positions * POSITION_COST);
                 // The `postings` HashMap entry itself is kept even when empty
                 // (see doc comment on `remove_doc` — callers rely on
                 // `tf`/`doc_freq` for a "term with zero live docs" staying
@@ -268,16 +320,33 @@ impl PostingStore {
     }
 
     /// Estimated memory usage in bytes.
+    ///
+    /// K4 (P0 fix): O(1) cached read. This used to be an O(vocabulary) walk
+    /// calling `RoaringBitmap::serialized_size()` per term -- fine as an
+    /// occasional diagnostic, but this is invoked unconditionally every
+    /// 100ms from the shard eviction tick (`persistence_tick.rs`), where an
+    /// O(n) walk does not scale with corpus size. See
+    /// `estimated_bytes_ground_truth` (`#[cfg(test)]`) for the equivalent
+    /// full-walk formula this cached value must always match.
+    #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let mut total = 0;
+        self.resident_bytes
+    }
+
+    /// Ground-truth full recompute of `estimated_bytes()`, using the exact
+    /// same fixed-cost formula as the incremental accumulator. Test-only:
+    /// exists solely to assert the incremental accumulator never drifts from
+    /// a from-scratch recount after a mixed mutation sequence.
+    #[cfg(test)]
+    pub(crate) fn estimated_bytes_ground_truth(&self) -> usize {
+        let mut total = 0usize;
         for posting in self.postings.values() {
-            total += posting.doc_ids.serialized_size();
-            total += posting.term_freqs.len() * 4;
+            total += POSTING_ENTRY_OVERHEAD;
+            total += posting.doc_ids.len() as usize * POSTING_OCCURRENCE_COST;
             if let Some(ref pos_list) = posting.positions {
                 for positions in pos_list {
-                    total += positions.len() * 4;
+                    total += positions.len() * POSITION_COST;
                 }
-                total += pos_list.len() * std::mem::size_of::<Vec<u32>>();
             }
         }
         total
@@ -366,6 +435,111 @@ mod tests {
             posting.term_freqs.capacity(),
             cap_before,
             "must not shrink while the posting still has live docs"
+        );
+    }
+
+    /// K4 (P0 fix): RED-first — the O(1) incremental `resident_bytes`
+    /// accumulator maintained by `add_term_occurrence`/`remove_doc` must
+    /// never drift from a from-scratch ground-truth recompute, across a
+    /// mixed sequence of new terms, repeat occurrences (tf bump + position
+    /// append), a position-tracking upgrade, and both full and partial doc
+    /// removal (including the term_id-shared-across-docs case that leaves a
+    /// posting with live docs after another doc is removed).
+    #[test]
+    fn estimated_bytes_matches_ground_truth_after_mixed_mutations() {
+        let mut store = PostingStore::new();
+        assert_eq!(store.estimated_bytes(), 0);
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // New terms, some with positions, some without.
+        store.add_term_occurrence(1, 100, Some(vec![0, 3]));
+        store.add_term_occurrence(2, 100, None);
+        store.add_term_occurrence(3, 100, Some(vec![7]));
+        store.add_term_occurrence(1, 101, Some(vec![1]));
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Repeat occurrence: tf bump + position append on an existing doc.
+        store.add_term_occurrence(1, 100, Some(vec![5, 6]));
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Upgrade: term 2 had no position tracking, now gets one.
+        store.add_term_occurrence(2, 101, Some(vec![2]));
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Shared term across many docs.
+        for doc_id in 200..210u32 {
+            store.add_term_occurrence(3, doc_id, Some(vec![doc_id]));
+        }
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Partial removal: term 3 keeps live docs after doc 205 is removed.
+        store.remove_doc(205);
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Full removal of a document touching multiple terms.
+        store.remove_doc(100);
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+
+        // Drain every remaining document -- resident_bytes must settle back
+        // to the entry-overhead-only floor (never below it: entries survive
+        // empty per the documented contract), matching ground truth exactly.
+        for doc_id in [101, 200, 201, 202, 203, 204, 206, 207, 208, 209] {
+            store.remove_doc(doc_id);
+        }
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+        assert_eq!(
+            store.estimated_bytes(),
+            3 * POSTING_ENTRY_OVERHEAD,
+            "3 terms ever created, all doc occurrences drained -- only entry overhead remains"
+        );
+    }
+
+    /// K4 (P0 fix): `estimated_bytes()` must be a pure O(1) load with no
+    /// iteration in the accessor -- enforced by construction here: the
+    /// accessor is called on a store sized large enough that an O(n) walk
+    /// would be trivially detectable by any reasonable wall-clock budget,
+    /// paired with the source-level guarantee that the method body is a
+    /// single field read (see the implementation above).
+    #[test]
+    fn estimated_bytes_is_o1_not_a_walk() {
+        let mut store = PostingStore::new();
+        for term_id in 0..5_000u32 {
+            for doc_id in 0..20u32 {
+                store.add_term_occurrence(term_id, doc_id, Some(vec![doc_id]));
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            std::hint::black_box(store.estimated_bytes());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "100k reads of estimated_bytes() took {elapsed:?} -- looks like a walk, not O(1)"
         );
     }
 }
