@@ -81,6 +81,51 @@ New `tests/replication_ws.rs`: live-stream parity (id + `created_at`
 round-trip through `WS.INFO`/`WS.AUTH` on the replica), snapshot-leg
 backfill, `WS.DROP` propagation, and a `--shards 4` leg exercising the
 shard-0 hop from connections that may land on any shard.
+### Added — MQ-plane replication (Wave B stage 2b)
+
+Durable-queue MQ.* mutations now replicate to attached replicas, closing the
+plane gap `warn_unreplicated_plane` previously fail-loud-warned about for
+MQ.* (the WS.* half of that warning is unaffected and still armed). Builds
+on the stage-2a MQ WAL effect records (PR #291):
+
+- **Live stream**: `shard::mq_exec::replicate_mq_record` emits the SAME
+  encoded `MqCreate`/`MqPush`/`MqPop`/`MqAck`/`MqTrigger` payload bytes
+  already built for the WAL as one of five synthetic `MQ._REPL.*`
+  pseudo-commands (never dispatched to real clients), gated single-shard-only
+  (`num_shards == 1`) — the same posture graph's own live path takes for its
+  multi-shard gap. `MQ.PUBLISH`'s TXN-materialization leg
+  (`server::conn::handler_monoio::txn.rs`) replicates the same way at
+  commit. `replication::apply::apply_mq` decodes and applies through the
+  SAME `apply_mq_*` engine boot-time WAL replay uses
+  (`shard::shared_databases`, generalized over a new `MqApplyTarget` trait so
+  `ShardSliceInit` boot replay and `ShardSlice` live apply share one codec
+  instead of two).
+- **FULLRESYNC**: a per-shard `MOON_AUX_MQ_REGISTRY` aux blob
+  (`replication::mq_sync`) carries the durable-queue registry and trigger
+  registry — the shard-level bookkeeping that lives outside the keyspace.
+  Installed additively into every replica shard
+  (`mq_sync::install_mq_registry_many`), mirroring
+  `graph_sync::install_graph_store_many`.
+- **Fixed a pre-existing FULLRESYNC data-loss bug found along the way**: the
+  PSYNC RDB codec (`persistence::redis_rdb`, distinct from the
+  `persistence::rdb` SAVE/BGSAVE codec) serialized `Stream` values as a
+  placeholder `"__stream__:<len>"` string, discarding all entries/PEL/
+  consumer-group state. A full `RDB_TYPE_STREAM_MOON` (0xC8) codec — ported
+  from `persistence::rdb`'s battle-tested Stream serializer — now carries
+  entries, `last_id`, consumer groups (PEL + per-consumer pending), the
+  `durable` flag, and `max_delivery_count`. Without this fix, MQ FULLRESYNC
+  backfill would silently lose every durable queue's message content.
+- Two new `cargo-fuzz` targets: `mq_registry_blob` (the new
+  `install_mq_registry_many` decoder) and `redis_rdb_load` (the FULLRESYNC
+  RDB loader as a whole, including the new Stream type tag) — wired into
+  both PR and nightly fuzz matrices.
+- `tests/replication_mq.rs`: live-stream, snapshot-backfill, and a pinned
+  multi-shard-live-write-not-streamed limitation test (shards=1 scope,
+  matching graph's own precedent).
+
+A multi-shard master still does not live-stream MQ writes (durability is
+unaffected — WAL + FULLRESYNC still cover it); tracked as a known follow-up
+alongside graph's own multi-shard live-stream gap.
 
 ### Fixed — docs site strict build red since 2026-07-08 (root-relative links)
 
