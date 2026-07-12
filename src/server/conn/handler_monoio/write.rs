@@ -411,12 +411,15 @@ pub(super) async fn try_handle_mq_command(
         }
     };
 
-    // Round-2 finding A fail-loud: MQ mutations persist locally (WAL via
-    // execute_mq_on_owner) but are NOT replicated in v0.7 — surface the
-    // divergence once instead of letting a replica silently miss the plane.
-    if !sub.eq_ignore_ascii_case(b"LEN") && !sub.eq_ignore_ascii_case(b"DLQLEN") {
-        super::ft::warn_mq_unreplicated(ctx, cmd);
-    }
+    // Wave B stage 2b: MQ mutations now replicate live (see
+    // `shard::mq_exec::replicate_mq_record`) whenever `ctx.num_shards == 1`
+    // — the same single-shard gate graph's own live stream uses — so the
+    // round-2 `warn_mq_unreplicated` fail-loud no longer applies and is
+    // retired (its WS.* half was already retired by the WS-plane work).
+    // A multi-shard master still doesn't live-stream MQ writes (out of
+    // scope, tracked alongside graph's own un-warned multi-shard gap), but
+    // per graph precedent that gap is accepted silently rather than warned;
+    // a durable queue stays WAL-durable and FULLRESYNC-covered either way.
 
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_mq_create(cmd_args) {

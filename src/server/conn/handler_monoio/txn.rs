@@ -167,10 +167,34 @@ pub(super) async fn try_handle_txn_commit(
                                     }
                                     payloads
                                 });
+                            // Wave B stage 2b: replicate the SAME payloads
+                            // (num_shards==1 gate — graph precedent) before
+                            // (or alongside) the WAL append, `ctx` is
+                            // available here (this leg runs on the
+                            // connection's own thread, which — since
+                            // `owner == ctx.shard_id` — IS the owning
+                            // shard's thread).
+                            let replicate =
+                                ctx.num_shards == 1 && super::ft::replication_fanout_active(ctx);
                             for payload in payloads {
+                                let payload_bytes = Bytes::from(payload);
+                                if replicate {
+                                    let frame = Frame::Array(
+                                        vec![
+                                            Frame::BulkString(Bytes::from_static(
+                                                crate::mq::wal::MQ_REPL_PUSH,
+                                            )),
+                                            Frame::BulkString(payload_bytes.clone()),
+                                        ]
+                                        .into(),
+                                    );
+                                    let record_bytes =
+                                        crate::persistence::aof::serialize_command(&frame);
+                                    super::ft::record_local_write_db(ctx, db_index, record_bytes);
+                                }
                                 crate::shard::mq_exec::wal_append_on_slice(
                                     crate::persistence::wal_v3::record::WalRecordType::MqPush,
-                                    Bytes::from(payload),
+                                    payload_bytes,
                                 );
                             }
                         } else {

@@ -235,6 +235,16 @@ impl ReplicationState {
             .unwrap_or(0)
     }
 
+    /// Number of shards this state tracks (`shard_offsets.len()`) — the
+    /// SAME value `ConnectionContext::num_shards` is initialized from, so a
+    /// ctx-free caller (e.g. `shard::mq_exec::replicate_mq_record`) can
+    /// evaluate the identical "single-shard only" gate the connection layer
+    /// uses (`ctx.num_shards == 1`) without a `ConnectionContext` in scope.
+    #[inline]
+    pub fn num_shards(&self) -> usize {
+        self.shard_offsets.len()
+    }
+
     /// Clone out a lock-free handle to the offset atomics.
     ///
     /// Called once per shard at event-loop startup; the handle is what the
@@ -349,6 +359,73 @@ pub fn mark_fanout_active() {
 #[inline]
 pub fn fanout_hint_active() -> bool {
     FANOUT_HINT.load(Ordering::Relaxed)
+}
+
+/// Ctx-free twin of the connection layer's `record_local_write`
+/// (`server::conn::handler_monoio::ft::record_local_write`), for owner-shard
+/// execution paths that run on a shard's own OS thread WITHOUT a
+/// `ConnectionContext` in scope — today only `shard::mq_exec` (MQ.* effect-
+/// record replication, Wave B stage 2b).
+///
+/// Resolves the SAME per-process `ReplicationState` `Arc` the connection
+/// layer holds, via `admin::metrics_setup::get_global_repl_state_arc()` —
+/// both are clones of the one `Arc` built at boot (`main.rs` / `listener.rs`
+/// / `embedded.rs` all call `set_global_repl_state(repl_state.clone())` right
+/// after constructing it), so backlog append + offset advance land in the
+/// identical per-shard slot the connection-layer path would have used.
+/// No-op if replication was never initialized (embedded/library callers with
+/// no listener boot path).
+///
+/// Caller MUST be running on shard `shard_id`'s own OS thread — this pushes
+/// to `shard::self_msg`, which is a `thread_local!` queue (see that module's
+/// docs: "Tokio tasks must NOT push here").
+pub fn record_local_write_global(shard_id: usize, bytes: Bytes) {
+    let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
+        return;
+    };
+    let mut end_offset = u64::MAX;
+    if let Ok(g) = repl_state_arc.read() {
+        if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
+            if let Some(backlog) = slot.lock().as_mut() {
+                backlog.append(&bytes);
+            }
+        }
+        end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
+    }
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
+        bytes,
+        end_offset,
+    });
+}
+
+/// Db-aware ctx-free twin of `record_local_write_db`, for the same
+/// ctx-free callers as [`record_local_write_global`]. Implements only the
+/// single-shard "prepend `SELECT` on db change" branch — ctx-free MQ
+/// replication is gated `num_shards == 1` by its caller (graph precedent:
+/// live streaming is single-shard-only), so the N-shard fused-SELECT branch
+/// (which needs `ctx.num_shards`) is never reached and intentionally not
+/// implemented here.
+pub fn record_local_write_db_global(shard_id: usize, db: usize, bytes: Bytes) {
+    let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
+        return;
+    };
+    let needs_select = repl_state_arc.read().is_ok_and(|g| {
+        g.stream_db.get(shard_id).is_some_and(|slot| {
+            if slot.load(Ordering::Relaxed) != db as i64 {
+                slot.store(db as i64, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        })
+    });
+    if needs_select {
+        record_local_write_global(
+            shard_id,
+            crate::persistence::aof::serialize_select_record(db),
+        );
+    }
+    record_local_write_global(shard_id, bytes);
 }
 
 /// Load replication IDs from {dir}/replication.state.

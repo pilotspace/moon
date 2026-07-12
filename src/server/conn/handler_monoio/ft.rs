@@ -164,32 +164,6 @@ fn serialize_select(db: usize) -> Vec<u8> {
     buf
 }
 
-/// Fail-loud marker for the MQ.* plane, which is NOT yet wired into
-/// replication (round-2 finding A): MQ.* writes persist durably on the master
-/// but never reach a replica — deterministic effect-record forms + replica
-/// apply arms are a follow-up (task #34, MQ half). Warn ONCE per process so
-/// operators running replicas learn about the divergence at write time
-/// instead of at failover. No-op (one Relaxed load) when no replica has ever
-/// attached.
-///
-/// Split from the former combined `warn_unreplicated_plane` (Wave B
-/// ws-plane): the WS half retired when WS.CREATE/DROP replication shipped —
-/// see `handler_monoio::write::try_handle_ws_command`, which no longer calls
-/// a warn function at all. This MQ half survives until MQ effect-record
-/// replication lands.
-pub(super) fn warn_mq_unreplicated(ctx: &ConnectionContext, cmd: &[u8]) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if replication_fanout_active(ctx) && !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            command = %String::from_utf8_lossy(cmd),
-            "replication: MQ.* writes are NOT replicated in v0.7 — a replica \
-             will not see this plane (known limitation, further occurrences \
-             not logged)"
-        );
-    }
-}
-
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.
