@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — docs site strict build red since 2026-07-08 (root-relative links)
+
+`docs/guides/tuning.md` (PR #245) and `docs/PRODUCTION-CONTRACT.md` (PR #263)
+linked repo-root files (`BENCHMARK.md`, `RELEASES.md`,
+`.github/workflows/release.yml`) via relative paths that escape the MkDocs
+`docs/` tree — `mkdocs build --strict` aborts on the 5 resulting warnings, so
+the GitHub Pages deploy had failed on every main push since 2026-07-08.
+Converted the 5 links to absolute GitHub blob URLs; strict build verified
+clean locally. Docs-only.
+
 ### Changed — WAL v3 `wal_append` channel now preserves the caller's REAL record type end-to-end (K1a, storage-kernel M1 stage 1)
 
 `ShardDatabases::wal_append` / `try_wal_append_required` and

@@ -128,7 +128,7 @@ Moon's AOF write path is engineered so that durability is cheap at pipeline dept
 device-bound (not server-bound) when you demand fsync-per-write. The mechanics below are
 **automatic — there are no knobs to turn** — but knowing them tells you which policy fits
 your workload. Measured on GCE `c3-standard-8` (pd-ssd), `--shards 2`, vs Redis 7.0.15;
-full matrix in [`BENCHMARK.md` §7.3](../../BENCHMARK.md).
+full matrix in [`BENCHMARK.md` §7.3](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md).
 
 - **`everysec` (default): a win, not just free.** At pipeline depth SET runs **~1.32×
   Redis** (the writer coalesces each batch into one `write_all` and polls its queue
@@ -164,7 +164,7 @@ faster than a subscriber's socket drains, the whole burst is delivered in one `w
 instead of one syscall per message. In practice this means a fast publisher fanning out to
 many subscribers is no longer syscall-bound: measured fan-out delivery reached **5.09M
 msg/s (≈1.04× Redis) with zero drops**, versus near-total message loss on a per-message
-write path (see [`BENCHMARK.md` §7.3](../../BENCHMARK.md)). There are no knobs to turn.
+write path (see [`BENCHMARK.md` §7.3](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md)). There are no knobs to turn.
 
 The one thing to know: each subscriber has a bounded in-flight queue (256 messages). A
 subscriber that stays slower than the publish rate will still have messages **dropped** —
