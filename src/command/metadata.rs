@@ -435,6 +435,28 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "FT.NAVIGATE" => CommandMeta { name: "FT.NAVIGATE", arity: -6, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.RECOMMEND" => CommandMeta { name: "FT.RECOMMEND", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
 
+    // ---- Workspace / message-queue commands (Wave B readonly-enforcement fix) ----
+    // WS and MQ are single-token commands dispatched as `WS <SUB> ...` / `MQ
+    // <SUB> ...` (subcommand lives in the first argument, not the command
+    // name — same shape as CLIENT/CONFIG/ACL). Both carry mutating
+    // subcommands (WS CREATE/DROP; MQ CREATE/PUSH/POP/ACK/TRIGGER/PUBLISH)
+    // alongside read-only ones (WS LIST/INFO/AUTH; MQ DLQLEN), so — exactly
+    // like GRAPH.QUERY below — the blanket flag here is WRITE and the
+    // read-only subcommands are carved out at the `try_enforce_readonly`
+    // call site (`command::workspace::is_ws_readonly_subcommand` /
+    // `command::mq::is_mq_readonly_subcommand`), not in this table.
+    "WS" => CommandMeta { name: "WS", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
+    "MQ" => CommandMeta { name: "MQ", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
+
+    // ---- Temporal commands ----
+    // Full dotted command names (no subcommand token). TEMPORAL.INVALIDATE
+    // mutates graph `valid_to`; TEMPORAL.SNAPSHOT_AT mutates the shard-local
+    // `temporal_registry`. Neither is currently replicated/persisted
+    // independently, so both must be blocked on read-only replicas exactly
+    // like every other WRITE command (Wave B readonly-enforcement fix).
+    "TEMPORAL.SNAPSHOT_AT" => CommandMeta { name: "TEMPORAL.SNAPSHOT_AT", arity: 1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
+    "TEMPORAL.INVALIDATE" => CommandMeta { name: "TEMPORAL.INVALIDATE", arity: 4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
+
     // ---- Graph commands ----
     "GRAPH.CREATE" => CommandMeta { name: "GRAPH.CREATE", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.ADDNODE" => CommandMeta { name: "GRAPH.ADDNODE", arity: -3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
@@ -1040,6 +1062,52 @@ mod tests {
         assert!(
             !is_write(b"EVALSHA"),
             "EVALSHA must not carry the WRITE flag — see scripting::bridge module docs"
+        );
+    }
+
+    /// Wave B (task #34 follow-up): WS and MQ are single-token commands
+    /// dispatched via a `WS <SUB> ...` / `MQ <SUB> ...` shape (subcommand is
+    /// `cmd_args[0]`, not part of the command name — unlike `FT.CREATE` or
+    /// `GRAPH.QUERY`). Before this fix neither "WS" nor "MQ" existed in
+    /// `COMMAND_META` at all, so `is_write` silently returned `false` for
+    /// them and a read-only replica's `try_enforce_readonly` gate (which is
+    /// driven entirely by `is_write`) never blocked `WS CREATE` / `MQ PUSH`
+    /// etc. — a client could mutate a replica's workspace registry or
+    /// message queues directly. Both must be blanket-WRITE here (mirroring
+    /// the `GRAPH.QUERY`/`SELECT` precedent of a blanket-W command with a
+    /// read-only-subcommand carve-out applied at the `try_enforce_readonly`
+    /// call site, not in the metadata registry).
+    #[test]
+    fn ws_and_mq_are_write_commands() {
+        assert!(
+            is_write(b"WS"),
+            "WS must carry the WRITE flag so try_enforce_readonly blocks WS CREATE/DROP on replicas"
+        );
+        assert!(
+            is_write(b"MQ"),
+            "MQ must carry the WRITE flag so try_enforce_readonly blocks MQ CREATE/PUSH/POP/ACK/TRIGGER/PUBLISH on replicas"
+        );
+        // Case-insensitive, matching every other entry in this registry.
+        assert!(is_write(b"ws"));
+        assert!(is_write(b"mq"));
+    }
+
+    /// TEMPORAL.INVALIDATE mutates graph state (`valid_to`) and TEMPORAL.SNAPSHOT_AT
+    /// mutates the shard-local `temporal_registry` (neither is currently
+    /// replicated or persisted independently of the enclosing GRAPH.* WAL
+    /// stream) — both were also absent from `COMMAND_META` and therefore
+    /// bypassed `try_enforce_readonly` on a replica, the same bug class as
+    /// WS/MQ above. Unlike WS/MQ these are full dotted command names (no
+    /// subcommand token), so no read-only carve-out is needed.
+    #[test]
+    fn temporal_mutations_are_write_commands() {
+        assert!(
+            is_write(b"TEMPORAL.INVALIDATE"),
+            "TEMPORAL.INVALIDATE mutates graph valid_to and must be blocked on read-only replicas"
+        );
+        assert!(
+            is_write(b"TEMPORAL.SNAPSHOT_AT"),
+            "TEMPORAL.SNAPSHOT_AT mutates the shard-local temporal_registry and must be blocked on read-only replicas"
         );
     }
 

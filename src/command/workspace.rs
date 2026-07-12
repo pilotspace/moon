@@ -63,6 +63,30 @@ pub fn parse_ws_subcommand(args: &[Frame]) -> Result<&[u8], Frame> {
     }
 }
 
+/// Wave B readonly-enforcement: classify whether a `WS <SUB> ...` invocation
+/// is read-only.
+///
+/// `WS` is registered blanket-WRITE in `command::metadata::COMMAND_META`
+/// (CREATE/DROP mutate the process-global workspace registry + WAL), but
+/// LIST/INFO are pure reads and AUTH only mutates connection-local state
+/// (mirrors the SELECT carve-out in `try_enforce_readonly` — AUTH binds
+/// `ConnectionState::workspace_id`, never touches shard/server data). All
+/// three must still be servable on a read-only replica. Any subcommand not
+/// in this allow-list (including unknown ones) is conservatively treated as
+/// a write so `try_enforce_readonly` never false-negatives — an unknown
+/// subcommand itself gets rejected downstream by `try_handle_ws_command`
+/// with `ERR_WS_UNKNOWN_SUB` regardless of role.
+#[inline]
+pub fn is_ws_readonly_subcommand(args: &[Frame]) -> bool {
+    matches!(
+        args.first(),
+        Some(Frame::BulkString(sub))
+            if sub.eq_ignore_ascii_case(b"LIST")
+                || sub.eq_ignore_ascii_case(b"INFO")
+                || sub.eq_ignore_ascii_case(b"AUTH")
+    )
+}
+
 /// Validate WS CREATE arguments.
 ///
 /// Expected: `WS CREATE <name>` (args = [CREATE, name]).
@@ -172,6 +196,44 @@ mod tests {
     fn test_parse_ws_subcommand_wrong_type() {
         let args = [Frame::Integer(42)];
         assert!(parse_ws_subcommand(&args).is_err());
+    }
+
+    // --- is_ws_readonly_subcommand (Wave B readonly-enforcement) ---
+
+    #[test]
+    fn ws_read_subcommands_are_readonly() {
+        let list = [Frame::BulkString(Bytes::from_static(b"LIST"))];
+        let info = [
+            Frame::BulkString(Bytes::from_static(b"INFO")),
+            Frame::BulkString(Bytes::from_static(b"someid")),
+        ];
+        let auth = [
+            Frame::BulkString(Bytes::from_static(b"AUTH")),
+            Frame::BulkString(Bytes::from_static(b"someid")),
+        ];
+        assert!(is_ws_readonly_subcommand(&list));
+        assert!(is_ws_readonly_subcommand(&info));
+        assert!(is_ws_readonly_subcommand(&auth));
+        // Case-insensitive, matching parse_ws_subcommand's own matching style.
+        let lower = [Frame::BulkString(Bytes::from_static(b"list"))];
+        assert!(is_ws_readonly_subcommand(&lower));
+    }
+
+    #[test]
+    fn ws_write_and_unknown_subcommands_are_not_readonly() {
+        let create = [
+            Frame::BulkString(Bytes::from_static(b"CREATE")),
+            Frame::BulkString(Bytes::from_static(b"name")),
+        ];
+        let drop = [
+            Frame::BulkString(Bytes::from_static(b"DROP")),
+            Frame::BulkString(Bytes::from_static(b"id")),
+        ];
+        let unknown = [Frame::BulkString(Bytes::from_static(b"NOSUCHSUB"))];
+        assert!(!is_ws_readonly_subcommand(&create));
+        assert!(!is_ws_readonly_subcommand(&drop));
+        assert!(!is_ws_readonly_subcommand(&unknown));
+        assert!(!is_ws_readonly_subcommand(&[]));
     }
 
     // --- validate_ws_create ---

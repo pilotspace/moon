@@ -658,8 +658,21 @@ pub(super) fn try_enforce_readonly(
         {
             return false;
         }
-        #[cfg(not(feature = "graph"))]
-        let _ = cmd_args;
+        // WS and MQ are blanket-W (same reason as GRAPH.QUERY above — mixed
+        // read/write subcommands under one command name). Wave B
+        // readonly-enforcement fix (task #34 follow-up, see
+        // wave-b-ws-mq-scope-2026-07-12.md finding #2); see
+        // handler_monoio::dispatch for the full rationale.
+        if cmd.eq_ignore_ascii_case(b"WS")
+            && crate::command::workspace::is_ws_readonly_subcommand(cmd_args)
+        {
+            return false;
+        }
+        if cmd.eq_ignore_ascii_case(b"MQ")
+            && crate::command::mq::is_mq_readonly_subcommand(cmd_args)
+        {
+            return false;
+        }
         responses.push(Frame::Error(Bytes::from_static(
             b"READONLY You can't write against a read only replica.",
         )));
