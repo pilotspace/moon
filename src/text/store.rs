@@ -1705,7 +1705,40 @@ impl TextStore {
         }
     }
 
-    /// Load FST sidecars for all indexes. Called during startup/recovery (D-11).
+    /// Load FST sidecars for all indexes.
+    ///
+    /// # Deliberately NOT called during startup/recovery — do not wire this in
+    ///
+    /// It was wired into shard recovery once (kernel-m2-brief-2026-07-12.md,
+    /// K3 site 3) and reverted after adversarial review found it corrupts
+    /// FUZZY/PREFIX search results. The failure chain:
+    ///
+    /// 1. `TermDictionary::get_or_insert` assigns `term_id`s sequentially by
+    ///    first-encounter order.
+    /// 2. After a restart, the auto-reindex rescan rebuilds every text
+    ///    index's term dictionary from `DashTable` hash-iteration order,
+    ///    which is **not reproducible** across restarts — the same corpus
+    ///    can assign completely different `term_id`s to the same terms.
+    /// 3. The `.fst` sidecar on disk bakes in the OLD generation's
+    ///    `term_id`s, with no corpus fingerprint tying it to the specific
+    ///    term-dict generation it was built from.
+    /// 4. `fst_high_water_mark` stays `0`, so nothing stops `expand_terms`
+    ///    from merging stale-FST ids that now collide with unrelated,
+    ///    freshly-assigned ids from the new generation — silently wrong
+    ///    search results, not even a detectable error.
+    ///
+    /// This can't be fixed at the load site: the sidecar's `term_id`s are
+    /// only meaningful together with the exact term dictionary they were
+    /// built against, and that dictionary isn't persisted today. Making
+    /// this load safe requires persisting the term dictionary itself (so
+    /// ids survive a restart, or the sidecar can be fingerprint-checked
+    /// against the live corpus and discarded on mismatch) — that's kernel
+    /// M4 scope (FTS content persistence), filed as task #50. Until #50
+    /// lands, this function must stay uncalled in production; it is
+    /// exercised only by its own roundtrip unit tests
+    /// (`test_fst_sidecar_roundtrip`, `test_fst_sidecar_missing_returns_empty`
+    /// in this module's tests) which construct a single, self-consistent
+    /// generation and never see the cross-generation id collision.
     ///
     /// If a sidecar is missing for an index, that index's fst_maps remain None
     /// (fuzzy/prefix queries will fall back to HashMap brute-force, D-13).

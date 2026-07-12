@@ -33,7 +33,7 @@
 //!   [db_index: u8]   ← NEW in v2
 //! ```
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -182,18 +182,15 @@ pub fn deserialize_text_index_metas(data: &[u8]) -> io::Result<Vec<TextIndexMeta
 
 /// Write all active text index metadata to the sidecar file.
 ///
-/// Atomically replaces the file via write-to-temp + rename.
+/// Atomically replaces the file via `atomic_write_durable` (K3: temp +
+/// fsync + rename + dir-fsync). Before this fix the write skipped the
+/// directory fsync -- the rename could complete but not survive a crash,
+/// since `data=ordered`-journaled filesystems only make a rename durable
+/// once its containing directory is itself fsynced.
 pub fn save_text_index_metadata(shard_dir: &Path, indexes: &[TextIndexMeta]) -> io::Result<()> {
     let path = shard_dir.join("text-indexes.meta");
-    let tmp_path = shard_dir.join(".text-indexes.meta.tmp");
-
     let data = serialize_text_index_metas(indexes);
-
-    let mut f = std::fs::File::create(&tmp_path)?;
-    f.write_all(&data)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp_path, &path)?;
-
+    crate::persistence::atomic::atomic_write_durable(&path, &data)?;
     Ok(())
 }
 
@@ -304,7 +301,9 @@ fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<
 ///   (fst_len=0 means no FST for this field)
 /// ```
 ///
-/// Atomic: write to `.{index_name}.fst.tmp`, then `std::fs::rename` (same as TMIX pattern).
+/// Atomic via `atomic_write_durable` (K3: temp + fsync + rename +
+/// dir-fsync). Before this fix the write skipped the directory fsync, same
+/// gap as `save_text_index_metadata` above.
 pub fn save_fst_sidecar(
     shard_dir: &Path,
     index_name: &[u8],
@@ -312,7 +311,6 @@ pub fn save_fst_sidecar(
 ) -> io::Result<()> {
     let name_str = String::from_utf8_lossy(index_name);
     let path = shard_dir.join(format!("{name_str}.fst"));
-    let tmp_path = shard_dir.join(format!(".{name_str}.fst.tmp"));
 
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(FST_MAGIC);
@@ -331,10 +329,7 @@ pub fn save_fst_sidecar(
         }
     }
 
-    let mut f = std::fs::File::create(&tmp_path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp_path, &path)?;
+    crate::persistence::atomic::atomic_write_durable(&path, &buf)?;
     Ok(())
 }
 
@@ -490,6 +485,38 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "test_idx");
         assert_eq!(loaded[0].key_prefixes[0], "key:");
+    }
+
+    /// K3 regression guard: `save_text_index_metadata` must go through the
+    /// shared `atomic_write_durable` primitive (temp + fsync + rename +
+    /// dir-fsync), not the pre-fix write-temp+rename-with-no-dir-fsync
+    /// sequence. Directly observable in a unit test: only the final
+    /// `text-indexes.meta` file remains after a successful save -- no
+    /// leftover `.text-indexes.meta.tmp`.
+    #[test]
+    fn test_save_leaves_no_leftover_temp_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let meta = make_meta("idx", "key:", &[("title", 1.0, 0)]);
+        save_text_index_metadata(tmp.path(), &[meta]).expect("save");
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("text-indexes.meta")]);
+    }
+
+    /// Same regression guard as above, for the FST sidecar writer.
+    #[test]
+    fn test_save_fst_sidecar_leaves_no_leftover_temp_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_fst_sidecar(tmp.path(), b"idx", &[Some(b"fake-fst-bytes")]).expect("save");
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("idx.fst")]);
     }
 
     #[test]

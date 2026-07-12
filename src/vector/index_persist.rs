@@ -66,7 +66,7 @@
 //!   [rerank_mult: u32 LE] [exact_beam: u8] [reserved: 3B]   ← NEW in v5
 //! ```
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -467,18 +467,15 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
 /// across the many existing call sites — see module docs for the v4 wire format).
 ///
 /// Called after FT.CREATE / FT.DROPINDEX / FT.CONFIG SET COMPACTION_WEIGHT.
-/// Atomically replaces the file via write-to-temp + rename.
+/// Atomically replaces the file via `atomic_write_durable` (K3: temp +
+/// fsync + rename + dir-fsync). Before this fix the write skipped the
+/// directory fsync -- same gap as `src/text/index_persist.rs`'s sidecars,
+/// found by the same K3 grep sweep
+/// (`.planning/reviews/kernel-m2-brief-2026-07-12.md`).
 pub fn save_index_metadata_v3(shard_dir: &Path, pairs: &[(&IndexMeta, f32)]) -> io::Result<()> {
     let path = shard_dir.join("vector-indexes.meta");
-    let tmp_path = shard_dir.join(".vector-indexes.meta.tmp");
-
     let data = serialize_index_metas_v4(pairs);
-
-    let mut f = std::fs::File::create(&tmp_path)?;
-    f.write_all(&data)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp_path, &path)?;
-
+    crate::persistence::atomic::atomic_write_durable(&path, &data)?;
     Ok(())
 }
 
@@ -725,6 +722,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let loaded = load_index_metadata(tmp.path()).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// K3 regression guard: `save_index_metadata_v3` must go through the
+    /// shared `atomic_write_durable` primitive (temp + fsync + rename +
+    /// dir-fsync), not the pre-fix sequence that skipped the directory
+    /// fsync. Directly observable in a unit test: only the final
+    /// `vector-indexes.meta` file remains after a successful save -- no
+    /// leftover `.vector-indexes.meta.tmp`.
+    #[test]
+    fn test_save_leaves_no_leftover_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = make_meta("test_idx", 256, "key:", "vector");
+        save_index_metadata(tmp.path(), &[&meta]).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("vector-indexes.meta")]
+        );
     }
 
     #[test]
