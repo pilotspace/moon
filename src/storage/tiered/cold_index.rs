@@ -77,6 +77,32 @@ pub struct ColdIndex {
     /// sweep ([`Self::drain_pending_unlink`]). Pushed only on a zero-ref
     /// transition (rare), so it does not allocate on the common insert path.
     pending_unlink: Vec<u64>,
+    /// Running total of approximate resident bytes charged by [`Self::insert`]
+    /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
+    /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
+    ///
+    /// Deliberately an O(1) incremental accumulator, NOT an O(n) walk over
+    /// `map` computed at read time (the pattern used by
+    /// `graph::store::GraphStore::resident_bytes`, which is O(segment_count)
+    /// -- a much smaller bound). A cold index backing a disk-offloaded
+    /// dataset is exactly the structure G2 ("serve 10x RAM datasets") sizes
+    /// up to tens of millions of entries; an O(n) walk every 100ms shard
+    /// tick would regress the workload this index exists for. See
+    /// [`Self::resident_bytes`] for the read side.
+    resident_bytes: usize,
+}
+
+/// Approximate fixed cost of one cold-index entry beyond the key bytes: the
+/// `ColdLocation` value plus a `HashMap` bucket's control-byte/pointer
+/// overhead. Not exact -- `hashbrown`'s SwissTable layout is an
+/// implementation detail -- but monotonic, matching the approximation style
+/// already used by `Database::entry_overhead` (WS6) and
+/// `text::term_dict::TermDictionary::resident_bytes`.
+const COLD_ENTRY_OVERHEAD: usize = std::mem::size_of::<ColdLocation>() + 48;
+
+#[inline]
+fn cold_entry_cost(key_len: usize) -> usize {
+    key_len + COLD_ENTRY_OVERHEAD
 }
 
 impl ColdIndex {
@@ -85,7 +111,17 @@ impl ColdIndex {
             map: HashMap::new(),
             file_refs: HashMap::new(),
             pending_unlink: Vec::new(),
+            resident_bytes: 0,
         }
+    }
+
+    /// Approximate resident bytes of this index: O(1) read of the running
+    /// total maintained by every mutation site. See the field doc comment
+    /// on `resident_bytes` for why this is incremental rather than a
+    /// per-call walk.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     /// Increment a file's live-ref count.
@@ -117,6 +153,7 @@ impl ColdIndex {
     /// never see such a file because no key references it anymore.
     pub fn insert(&mut self, key: Bytes, location: ColdLocation) {
         let new_file = location.file_id;
+        let key_len = key.len();
         if let Some(old) = self.map.insert(key, location) {
             if old.file_id != new_file {
                 if self.ref_dec(old.file_id) {
@@ -124,9 +161,13 @@ impl ColdIndex {
                 }
                 self.ref_inc(new_file);
             }
-            // Same file_id (different slot/page): live-ref count is unchanged.
+            // Same file_id (different slot/page): live-ref count is
+            // unchanged. `HashMap::insert` keeps the pre-existing key on an
+            // overwrite (the new key argument, byte-equal, is dropped), so
+            // `resident_bytes` is unchanged too -- no delta to apply.
         } else {
             self.ref_inc(new_file);
+            self.resident_bytes += cold_entry_cost(key_len);
         }
     }
 
@@ -140,6 +181,9 @@ impl ColdIndex {
             if self.ref_dec(old.file_id) {
                 self.pending_unlink.push(old.file_id);
             }
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(cold_entry_cost(key.len()));
             true
         } else {
             false
@@ -152,6 +196,7 @@ impl ColdIndex {
     /// the manifest handle this method deliberately does not need.
     pub fn clear_all(&mut self) {
         self.map.clear();
+        self.resident_bytes = 0;
         for (&file_id, _) in self.file_refs.iter() {
             self.pending_unlink.push(file_id);
         }
@@ -314,6 +359,9 @@ impl ColdIndex {
         for key in &orphan_keys {
             if let Some(old) = self.map.remove(key.as_ref()) {
                 stats.entries_reclaimed += 1;
+                self.resident_bytes = self
+                    .resident_bytes
+                    .saturating_sub(cold_entry_cost(key.len()));
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
                 }
@@ -423,6 +471,9 @@ impl ColdIndex {
         for key in &expired_keys {
             if let Some(old) = self.map.remove(key.as_ref()) {
                 stats.entries_reclaimed += 1;
+                self.resident_bytes = self
+                    .resident_bytes
+                    .saturating_sub(cold_entry_cost(key.len()));
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
                 }
@@ -599,6 +650,76 @@ mod tests {
         assert!(idx.lookup(b"key1").is_none());
     }
 
+    // ── K4 accounting spine: resident_bytes O(1) accumulator ─────────────
+
+    #[test]
+    fn resident_bytes_zero_when_empty() {
+        assert_eq!(ColdIndex::new().resident_bytes(), 0);
+    }
+
+    #[test]
+    fn resident_bytes_grows_on_insert_shrinks_on_remove() {
+        let mut idx = ColdIndex::new();
+        let loc = ColdLocation {
+            file_id: 1,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+        };
+        idx.insert(Bytes::from_static(b"a_reasonably_long_key"), loc);
+        let after_one = idx.resident_bytes();
+        assert!(after_one > 0);
+
+        idx.insert(Bytes::from_static(b"another_key"), loc);
+        assert!(idx.resident_bytes() > after_one);
+
+        idx.remove(b"another_key");
+        assert_eq!(idx.resident_bytes(), after_one);
+
+        idx.remove(b"a_reasonably_long_key");
+        assert_eq!(idx.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn resident_bytes_overwrite_same_key_does_not_double_count() {
+        let mut idx = ColdIndex::new();
+        let loc_a = ColdLocation {
+            file_id: 1,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+        };
+        let loc_b = ColdLocation {
+            file_id: 2,
+            page_idx: 0,
+            slot_idx: 1,
+            ttl_ms: None,
+        };
+        idx.insert(Bytes::from_static(b"key1"), loc_a);
+        let after_first = idx.resident_bytes();
+        // Overwrite the SAME key with a different location (re-eviction to a
+        // different file). Byte length is unchanged, so resident_bytes must
+        // not grow.
+        idx.insert(Bytes::from_static(b"key1"), loc_b);
+        assert_eq!(idx.resident_bytes(), after_first);
+    }
+
+    #[test]
+    fn resident_bytes_zero_after_clear_all() {
+        let mut idx = ColdIndex::new();
+        let loc = ColdLocation {
+            file_id: 1,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+        };
+        idx.insert(Bytes::from_static(b"key1"), loc);
+        idx.insert(Bytes::from_static(b"key2"), loc);
+        assert!(idx.resident_bytes() > 0);
+        idx.clear_all();
+        assert_eq!(idx.resident_bytes(), 0);
+    }
+
     /// Create a shard dir with a `data/` subdir and a dummy heap-NNNNNN.mpf
     /// file standing in for a batched multi-KV spill file.
     fn make_shard_with_heap(file_ids: &[u64]) -> tempfile::TempDir {
@@ -649,9 +770,19 @@ mod tests {
             },
         );
 
+        let before_sweep = ci.resident_bytes();
+
         // Sweep ONLY the orphan key.
         ci.sweep_known_orphans(vec![Bytes::from_static(b"k_orphan")], shard_dir, None)
             .unwrap();
+
+        // K4: resident_bytes must shrink by exactly the orphan's cost, via
+        // the direct `self.map.remove` inside `sweep_known_orphans` (the
+        // bypass site that does NOT go through the public `remove()`).
+        assert!(
+            ci.resident_bytes() < before_sweep,
+            "sweeping an orphan must shrink resident_bytes"
+        );
 
         // The co-located live key must remain resolvable AND its file present.
         assert!(
@@ -777,6 +908,8 @@ mod tests {
             },
         );
 
+        assert!(ci.resident_bytes() > 0, "insert must charge resident_bytes");
+
         // Sweep strictly after expiry. The key was never read.
         let stats = ci
             .sweep_expired(2_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
@@ -785,6 +918,13 @@ mod tests {
         assert_eq!(
             stats.entries_reclaimed, 1,
             "sweep must reclaim the never-read expired entry"
+        );
+        // K4: the direct `self.map.remove` bypass inside `sweep_expired`
+        // must also decrement resident_bytes.
+        assert_eq!(
+            ci.resident_bytes(),
+            0,
+            "resident_bytes must drop to 0 once the only entry expires"
         );
         assert!(
             stats.bytes_reclaimed > 0,
