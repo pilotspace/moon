@@ -28,10 +28,11 @@
 //! back with `durable=false` (`Stream::new()`'s default) UNLESS
 //! `replay_mq_wal` re-applies the `MqCreate` WAL record.
 //!
-//! The MQ replay fix is proven by two white-box unit tests instead of a
-//! live-server round trip here — `src/shard/shared_databases.rs`
-//! `tests::test_replay_mq_wal_restores_registry_and_rolls_back_cursor` and
-//! `tests::test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop`. Reason: a
+//! The MQ replay fix (task #42's two defects: wrong dir + blind to nested
+//! `Command` framing) was originally proven by two white-box unit tests
+//! instead of a live-server round trip here — `src/shard/shared_databases.rs`
+//! `tests::test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop` (still
+//! present) and a since-replaced cursor-rollback-by-count test. Reason: a
 //! live MQ.CREATE -> kill -9 -> restart -> MQ.PUSH round trip requires
 //! `--appendonly yes` (WAL v3 only exists when `appendonly_enabled`, see
 //! `event_loop.rs`'s `wal_shard_dir` gate), but `--appendonly yes` triggers
@@ -47,9 +48,18 @@
 //! change fixes. Making it observable end-to-end needs either MQ AOF
 //! logging or a `.rrdshard`-only (non-AOF) recovery path — both are
 //! restructuring work forbidden by task #42's minimal-fix scope. The unit
-//! tests instead drive `replay_mq_wal` directly against real WAL v3 bytes
+//! tests instead drove `replay_mq_wal` directly against real WAL v3 bytes
 //! written with the production encoder (`write_wal_v3_record` +
 //! `WalWriterV3`), which isolates exactly the two fixed defects.
+//!
+//! Wave B stage 2a (task #34) closed the deeper gap this comment describes:
+//! MQ.CREATE/PUSH/POP/ACK/TRIGGER each now emit their own versioned WAL v3
+//! effect record at the owner-shard execution site
+//! (`src/shard/mq_exec.rs`), so the AOF-authority wipe above no longer loses
+//! MQ state — `replay_mq_wal` rebuilds it afterward. See
+//! `tests/crash_recovery_mq_effects.rs::mq_effect_records_survive_kill9` for
+//! the live kill-9 round trip this file's comment says was unreachable; it
+//! is now the reachable, faithful proof for MQ that TEMPORAL already had.
 //!
 //! TEMPORAL: `TEMPORAL.INVALIDATE` sets `valid_to` on the node/edge living
 //! in the graph's mutable `write_buf` and drains a `GraphTemporal` WAL
@@ -304,14 +314,16 @@ impl Conn {
 }
 
 // ---------------------------------------------------------------------------
-// MQ.CREATE / MQ.ACK durability: see the module doc comment above for why
-// this is proven by white-box unit tests in
-// `src/shard/shared_databases.rs` (`test_replay_mq_wal_restores_registry_and_rolls_back_cursor`,
-// `test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop`) rather than a live
-// server round trip in this file — a live MQ.CREATE round trip requires
-// `--appendonly yes`, which triggers an unrelated, out-of-scope
-// AOF-authority wipe that discards the Stream (MQ has zero AOF durability)
-// regardless of whether `replay_mq_wal` itself is correct.
+// MQ.CREATE / MQ.ACK durability: originally proven only by white-box unit
+// tests in `src/shard/shared_databases.rs`
+// (`test_replay_mq_wal_missing_wal_v3_subdir_is_a_noop` and others since
+// superseded) rather than a live server round trip in this file, because a
+// live MQ.CREATE round trip required `--appendonly yes`, which triggered an
+// AOF-authority wipe that discarded the Stream (MQ had zero AOF durability
+// at the time) regardless of whether `replay_mq_wal` itself was correct.
+// Wave B stage 2a (task #34) closed that gap — see the module doc comment
+// above and `tests/crash_recovery_mq_effects.rs` for the now-reachable live
+// round trip.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
