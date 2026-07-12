@@ -188,9 +188,15 @@ fn derive_trig_key(key_prefix: &Bytes, raw_queue_key: &Bytes) -> Bytes {
 /// pre-framing); the event-loop drain calls `wal.append(record_type, &payload)`
 /// directly.
 ///
-/// Mirrors `ShardDatabases::wal_append` semantics — `try_send` failures are
-/// ignored (the channel is bounded; under extreme backpressure the record is
-/// dropped, same as the existing lock-path).
+/// Failure policy (CodeRabbit PR #291): `try_send` is structurally required
+/// here — every caller runs ON the shard thread, which is also the channel's
+/// sole consumer (the 1ms-tick drain in `event_loop.rs`), so blocking on a
+/// full channel would deadlock the drain that empties it. Overflow therefore
+/// needs >4096 records enqueued within a single tick. When it DOES happen
+/// the mutation has already been applied and cannot be unwound mid-commit,
+/// so the record loss is made LOUD instead of silent: `tracing::error!` +
+/// the `RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL` INFO counter, giving
+/// operators a durability-gap signal to alert on.
 ///
 /// `pub(crate)`: also called from `src/server/conn/handler_monoio/txn.rs` and
 /// `src/server/conn/handler_sharded/txn.rs` (MQ.PUBLISH self-fold) and
@@ -203,7 +209,18 @@ pub(crate) fn wal_append_on_slice(
 ) {
     crate::shard::slice::with_shard(|s| {
         if let Some(ref tx) = s.wal_append_tx {
-            let _ = tx.try_send((record_type, payload));
+            if tx.try_send((record_type, payload)).is_err() {
+                crate::command::info_reclamation::RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    ?record_type,
+                    "WAL append channel rejected a plane record AFTER the \
+                     in-memory mutation was applied — this record will be \
+                     MISSING from crash recovery. The channel is drained by \
+                     this same shard thread every 1ms (capacity 4096), so \
+                     this indicates a pathological single-tick burst."
+                );
+            }
         }
     });
 }
