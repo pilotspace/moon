@@ -25,11 +25,13 @@ pub fn encode_workspace_create(ws_id: &[u8; 16], name: &[u8], created_at_ms: i64
 /// malformed. Returns owned `Vec<u8>` for name to avoid lifetime issues in
 /// WAL replay.
 ///
-/// K1b backward compatibility: a payload with EXACTLY `20 + name_len` bytes
-/// (the pre-K1b layout, no `created_at_ms`) decodes with `created_at_ms = 0`
-/// — matching the value restart used to restore unconditionally before this
-/// fix. A payload with `20 + name_len + 8` bytes decodes the trailing i64 as
-/// the real creation time. Any other length is malformed.
+/// K1b backward compatibility (lenient by design): if fewer than 8 bytes
+/// follow the name (including the pre-K1b `20 + name_len` layout), the
+/// payload decodes with `created_at_ms = 0` — matching the value restart
+/// used to restore unconditionally before this fix. If at least 8 bytes
+/// follow, the first 8 decode as the creation time and any further trailing
+/// bytes are ignored (room for future versioned suffixes). `None` only when
+/// the payload can't hold `ws_id` + `name_len` + `name`.
 pub fn decode_workspace_create(payload: &[u8]) -> Option<([u8; 16], Vec<u8>, i64)> {
     // Minimum: 16 (ws_id) + 4 (name_len) = 20 bytes
     if payload.len() < 20 {
