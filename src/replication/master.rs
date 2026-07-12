@@ -625,7 +625,7 @@ pub async fn handle_psync_inline_single_shard(
     client_offset: i64,
     mut stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
-    _shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
+    shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
     replica_addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
@@ -739,6 +739,15 @@ pub async fn handle_psync_inline_single_shard(
                     #[cfg(feature = "graph")]
                     let graph_blob =
                         crate::replication::graph_sync::export_graph_store(&mut s.graph_store);
+                    // Wave B ws-plane: the workspace registry snapshot. Shard
+                    // 0 IS this thread's shard (single-shard path), so this
+                    // capture is trivially in the same synchronous stretch as
+                    // the offset read above — same convention as the graph
+                    // blob: always written, an empty blob (0 entries) tells
+                    // the replica the master authoritatively has none.
+                    let ws_registry_blob = crate::replication::ws_sync::export_workspace_registry(
+                        shard_databases.workspace_registry().as_deref(),
+                    );
                     let mut moon_aux: Vec<(&[u8], &[u8])> = Vec::new();
                     if let Some(ref v) = vec_defs {
                         moon_aux
@@ -751,6 +760,10 @@ pub async fn handle_psync_inline_single_shard(
                     moon_aux.push((
                         crate::persistence::redis_rdb::MOON_AUX_GRAPH_STORE,
                         &graph_blob[..],
+                    ));
+                    moon_aux.push((
+                        crate::persistence::redis_rdb::MOON_AUX_WORKSPACE_REGISTRY,
+                        &ws_registry_blob[..],
                     ));
                     crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
                         &refs,
@@ -941,6 +954,11 @@ pub async fn handle_psync_inline_multi_shard(
     let mut snapshot_offset: u64 = 0;
     #[cfg(feature = "graph")]
     let mut graph_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_shards);
+    // Wave B ws-plane: the registry is process-global, so only shard 0's leg
+    // populates this (`Some`) — every other shard replies `None` (see
+    // `PreparedShardSync::ws_registry_blob`). "Keep the first Some" matches
+    // the `vector_defs`/`text_defs` convention below.
+    let mut ws_registry_blob: Option<Vec<u8>> = None;
     for (shard, reply_rx) in reply_rxs {
         // Bounded wait (review): a wedged shard must not park this task —
         // and its registrations — forever. 30s is far past any observed
@@ -979,6 +997,9 @@ pub async fn handle_psync_inline_multi_shard(
         if text_defs.is_none() {
             text_defs = prepared.text_defs;
         }
+        if ws_registry_blob.is_none() {
+            ws_registry_blob = prepared.ws_registry_blob;
+        }
         #[cfg(feature = "graph")]
         graph_blobs.push(prepared.graph_blob);
         bodies.push(prepared.rdb_body);
@@ -998,6 +1019,12 @@ pub async fn handle_psync_inline_multi_shard(
         moon_aux.push((
             crate::persistence::redis_rdb::MOON_AUX_GRAPH_STORE,
             &blob[..],
+        ));
+    }
+    if let Some(w) = &ws_registry_blob {
+        moon_aux.push((
+            crate::persistence::redis_rdb::MOON_AUX_WORKSPACE_REGISTRY,
+            &w[..],
         ));
     }
     let mut rdb_buf: Vec<u8> = Vec::new();
