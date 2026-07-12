@@ -251,6 +251,14 @@ impl ShardDatabases {
         // siblings while its true footprint was already over base, and the
         // pressure cascade then compared a vector-INCLUSIVE used against a
         // budget inflated by that donation. Two Relaxed loads per shard.
+        //
+        // K4 (kernel-m2-brief-2026-07-12 stage 2): extend the same fix to
+        // text (FTS) and graph resident bytes — a text- or graph-heavy/
+        // KV-light shard was exactly as misclassifiable as an idle donor as
+        // the vector case above (same mechanism, different plane). KV's own
+        // ColdIndex bytes are already folded into `memory_per_shard` at the
+        // publish site (persistence_tick.rs), so they flow through here for
+        // free. Four Relaxed loads per shard.
         let used: SmallVec<[usize; 16]> = self
             .memory_per_shard
             .iter()
@@ -258,6 +266,8 @@ impl ShardDatabases {
             .map(|(kv, store)| {
                 kv.load(Ordering::Relaxed)
                     .saturating_add(store.vector.load(Ordering::Relaxed))
+                    .saturating_add(store.text.load(Ordering::Relaxed))
+                    .saturating_add(store.graph.load(Ordering::Relaxed))
             })
             .collect();
         let budget = crate::storage::eviction::compute_elastic_budget(shard_id, base, &used);
@@ -1409,6 +1419,53 @@ mod tests {
         );
         // True idle shards keep base.
         assert_eq!(shared.recompute_elastic_budget(2, &rt), 100);
+    }
+
+    /// K4 (kernel-m2-brief-2026-07-12 stage 2): the same donor/hot
+    /// misclassification the vector fix (A4) addressed above applies
+    /// identically to text (FTS) and graph resident bytes -- the elastic
+    /// budget's used-term counted kv+vector ONLY until this commit. Mirrors
+    /// `recompute_elastic_budget_vector_heavy_shard_not_donor` exactly, but
+    /// splits the "hidden" RAM across text on one shard and graph on
+    /// another, so both plane wires are exercised in one test.
+    #[test]
+    fn recompute_elastic_budget_text_and_graph_heavy_shards_not_donors() {
+        let shared = new_shared(4, 1);
+        let rt = rt_config(400, 4); // base = 100 per shard
+
+        shared.publish_memory(0, 120); // hot
+        shared.publish_memory(1, 10); // KV-light...
+        shared.store_memory_per_shard[1]
+            .text
+            .store(200, Ordering::Relaxed); // ...but 200 of FTS RAM
+        shared.publish_memory(2, 10); // KV-light...
+        shared.store_memory_per_shard[2]
+            .graph
+            .store(200, Ordering::Relaxed); // ...but 200 of graph RAM
+        shared.publish_memory(3, 10);
+
+        // Blind-to-text/graph math: shards 1 and 2 look idle (10 < 100) and
+        // each donate 90 — surplus 90+90+90=270 to the one hot shard ⇒ 370.
+        // Aware: shards 1 and 2 are each truly at 210 > base — HOT, not
+        // donors. Only shard 3 (true 10) donates 90. Three hot shards split
+        // the 90 surplus ⇒ 100 + 30 = 130 each.
+        assert_eq!(
+            shared.recompute_elastic_budget(0, &rt),
+            130,
+            "text/graph-heavy shards must not be classified as idle donors"
+        );
+        assert_eq!(
+            shared.recompute_elastic_budget(1, &rt),
+            130,
+            "the text-heavy shard itself is hot and shares the pool"
+        );
+        assert_eq!(
+            shared.recompute_elastic_budget(2, &rt),
+            130,
+            "the graph-heavy shard itself is hot and shares the pool"
+        );
+        // The true idle shard keeps base.
+        assert_eq!(shared.recompute_elastic_budget(3, &rt), 100);
     }
 
     #[test]
