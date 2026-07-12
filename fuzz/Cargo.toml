@@ -93,3 +93,13 @@ doc = false
 name = "ws_registry_record"
 path = "fuzz_targets/ws_registry_record.rs"
 doc = false
+
+[[bin]]
+name = "mq_registry_blob"
+path = "fuzz_targets/mq_registry_blob.rs"
+doc = false
+
+[[bin]]
+name = "redis_rdb_load"
+path = "fuzz_targets/redis_rdb_load.rs"
+doc = false

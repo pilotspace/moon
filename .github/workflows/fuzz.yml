@@ -37,6 +37,8 @@ jobs:
           - fts_query_parse
           - mq_wal_record
           - ws_registry_record
+          - mq_registry_blob
+          - redis_rdb_load
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -90,6 +92,8 @@ jobs:
           - fts_query_parse
           - mq_wal_record
           - ws_registry_record
+          - mq_registry_blob
+          - redis_rdb_load
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
