@@ -2579,6 +2579,76 @@ pub(crate) fn handle_shard_message_shared(
             // completed; losing the ack is harmless.
             let _ = reply_tx.send(deleted_count);
         }
+        ShardMessage::WsRegistryCreate(payload) => {
+            // Wave B ws-plane: the WHOLE sequence (global-registry insert,
+            // WorkspaceCreate WAL record, replication live-push) runs here in
+            // ONE synchronous stretch on shard 0's own thread — this is what
+            // keeps the replication offset advance atomic with the mutation
+            // w.r.t. a concurrent PSYNC snapshot capture (same argument as
+            // `record_local_write`, applied to the one piece of state that is
+            // global rather than per-shard). `shard_id` is 0 here by
+            // construction: only shard 0 ever receives this message (see
+            // `try_handle_ws_command`'s hop routing).
+            let crate::shard::dispatch::WsRegistryCreatePayload {
+                ws_id,
+                name,
+                created_at,
+                reply_tx,
+            } = *payload;
+            let id = crate::workspace::WorkspaceId::from_bytes(ws_id);
+            {
+                let mut guard = shard_databases.workspace_registry();
+                let reg = guard
+                    .get_or_insert_with(|| Box::new(crate::workspace::WorkspaceRegistry::new()));
+                reg.insert(
+                    id,
+                    crate::workspace::registry::WorkspaceMetadata {
+                        id,
+                        name: name.clone(),
+                        created_at,
+                    },
+                );
+            }
+            let wal_payload =
+                crate::workspace::wal::encode_workspace_create(&ws_id, &name, created_at);
+            shard_databases.wal_append(
+                shard_id,
+                crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
+                bytes::Bytes::from(wal_payload.clone()),
+            );
+            if crate::replication::state::fanout_hint_active() {
+                let record = crate::workspace::repl::serialize_ws_create_apply(&wal_payload);
+                record_ws_registry_write(repl_backlog, repl_state, shard_id, record.into());
+            }
+            let _ = reply_tx.send(());
+        }
+        ShardMessage::WsRegistryDrop { ws_id, reply_tx } => {
+            // Wave B ws-plane: mirrors `WsRegistryCreate` above. `removed`
+            // mirrors the pre-hop connection-thread check — the caller's
+            // SEPARATE `WsDropCleanup` key-sweep hop only fires when this is
+            // `true`.
+            let id = crate::workspace::WorkspaceId::from_bytes(ws_id);
+            let removed = {
+                let mut guard = shard_databases.workspace_registry();
+                match guard.as_mut() {
+                    Some(reg) => reg.remove(&id).is_some(),
+                    None => false,
+                }
+            };
+            if removed {
+                let wal_payload = crate::workspace::wal::encode_workspace_drop(&ws_id);
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
+                    bytes::Bytes::from(wal_payload.clone()),
+                );
+                if crate::replication::state::fanout_hint_active() {
+                    let record = crate::workspace::repl::serialize_ws_drop_apply(&wal_payload);
+                    record_ws_registry_write(repl_backlog, repl_state, shard_id, record.into());
+                }
+            }
+            let _ = reply_tx.send(removed);
+        }
         ShardMessage::AofFold { reply_tx } => {
             // AOF cooperative-snapshot (C4): build an expired-filtered snapshot
             // of ALL databases on this shard and reply. The AOF rewrite writer
@@ -2819,6 +2889,20 @@ pub(crate) fn handle_shard_message_shared(
                         crate::replication::graph_sync::export_graph_store(&mut s.graph_store);
                 }
             });
+            // Wave B ws-plane: the workspace registry is process-global, not
+            // per-shard, so only shard 0 (the sole writer of it — see
+            // `try_handle_ws_command`'s shard-0 hop) captures it. Capturing
+            // it here keeps it in the SAME synchronous stretch as this
+            // shard's offset read below, mirroring the master's-thread
+            // atomicity argument the WS write path relies on.
+            let ws_registry_blob = if shard_id == 0 {
+                let guard = shard_databases.workspace_registry();
+                Some(crate::replication::ws_sync::export_workspace_registry(
+                    guard.as_deref(),
+                ))
+            } else {
+                None
+            };
             let shard_offset = repl_state
                 .as_ref()
                 .map(|h| h.shard_offset(shard_id))
@@ -2849,6 +2933,7 @@ pub(crate) fn handle_shard_message_shared(
                 text_defs,
                 #[cfg(feature = "graph")]
                 graph_blob,
+                ws_registry_blob,
             };
             if reply_tx.try_send(prepared).is_err() {
                 // The PSYNC task is gone (replica dropped mid-handshake) —
@@ -3715,6 +3800,43 @@ pub(crate) fn fanout_send_or_kick(
             // Drain task already gone; just stop queueing.
             Err(flume::TrySendError::Disconnected(_)) => false,
         }
+    });
+}
+
+/// Push a WS.CREATE.APPLY / WS.DROP.APPLY replication record (Wave B
+/// ws-plane): backlog append + offset advance happen HERE, synchronously
+/// (same argument as `record_local_write`/`wal_append_and_fanout`'s steps
+/// 2-4), and the live replica delivery is deferred through the shard's
+/// self-queue exactly like every other replication record.
+///
+/// A standalone helper rather than a call into `handler_monoio::ft`'s
+/// `record_local_write`/`record_local_write_db`: this runs inside
+/// `handle_shard_message_shared` (the `ShardMessage::WsRegistryCreate` /
+/// `WsRegistryDrop` arms), which has no `ConnectionContext` — only the raw
+/// per-shard pieces (`repl_backlog`, `repl_state`, `shard_id`) that are
+/// already threaded through this function's signature. WS records are
+/// db-agnostic (applied to the global registry, not a `Database`), so unlike
+/// `wal_append_and_fanout` there is no `SELECT` prefix to thread — the apply
+/// side ignores db context for these commands.
+fn record_ws_registry_write(
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    bytes: bytes::Bytes,
+) {
+    let mut end_offset = u64::MAX;
+    if let Some(offsets) = repl_state {
+        {
+            let mut guard = repl_backlog.lock();
+            if let Some(backlog) = guard.as_mut() {
+                backlog.append(&bytes);
+            }
+        }
+        end_offset = offsets.increment_shard_offset(shard_id, bytes.len() as u64);
+    }
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
+        bytes,
+        end_offset,
     });
 }
 
