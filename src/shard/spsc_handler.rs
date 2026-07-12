@@ -537,7 +537,11 @@ pub(crate) fn handle_shard_message_shared(
                         })
                     };
                     for record in wal_records {
-                        shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+                        shard_databases.wal_append(
+                            shard_id,
+                            crate::persistence::wal_v3::record::WalRecordType::Command,
+                            bytes::Bytes::from(record),
+                        );
                     }
                     let _ = reply_tx.send(frame);
                     return;
@@ -2225,16 +2229,31 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::GraphCommand { command, reply_tx } => {
             // GraphCommand is dispatched via connection handlers using ShardDatabases,
             // not through SPSC. If we receive one here, dispatch it locally.
-            let (response, wal_records) = {
+            // `temporal_wal_pending` carries a cross-shard-routed
+            // TEMPORAL.INVALIDATE's GraphTemporal payload — see
+            // `command::graph::dispatch_graph_command`'s doc comment.
+            let (response, wal_records, temporal_payload) = {
                 crate::shard::slice::with_shard(|s| {
                     let resp =
                         crate::command::graph::dispatch_graph_command(&mut s.graph_store, &command);
                     let records = s.graph_store.drain_wal();
-                    (resp, records)
+                    let temporal_payload = s.graph_store.temporal_wal_pending.take();
+                    (resp, records, temporal_payload)
                 })
             };
             for record in wal_records {
-                shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::Command,
+                    bytes::Bytes::from(record),
+                );
+            }
+            if let Some(payload) = temporal_payload {
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::GraphTemporal,
+                    bytes::Bytes::from(payload),
+                );
             }
             let _ = reply_tx.send(response);
         }
@@ -2260,7 +2279,11 @@ pub(crate) fn handle_shard_message_shared(
                 })
             };
             for record in wal_records {
-                shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::Command,
+                    bytes::Bytes::from(record),
+                );
             }
             let _ = reply_tx.send(crate::protocol::Frame::SimpleString(
                 bytes::Bytes::from_static(b"OK"),

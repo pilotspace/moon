@@ -453,7 +453,10 @@ impl super::Shard {
 
         // Per-shard WAL append channel for local writes.
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
-        let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
+        let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<(
+            crate::persistence::wal_v3::record::WalRecordType,
+            bytes::Bytes,
+        )>(4096);
         // INVARIANT: gate the sender wiring on `wal_writer.is_some()` — NOT on
         // `appendonly_enabled || disk_offload_enabled()` — because that OR is
         // broader than the condition that actually produced a writer above
@@ -1505,13 +1508,12 @@ impl super::Shard {
                         }
                     }
 
-                    // Drain local-write WAL channel (connection handler inline writes)
-                    while let Ok(data) = wal_append_rx.try_recv() {
+                    // Drain local-write WAL channel (connection handler inline writes).
+                    // K1a: the channel carries the producer's REAL record type —
+                    // append it as-is instead of re-wrapping everything as `Command`.
+                    while let Ok((record_type, data)) = wal_append_rx.try_recv() {
                         if let Some(ref mut wal) = wal_writer {
-                            wal.append(
-                                crate::persistence::wal_v3::record::WalRecordType::Command,
-                                &data,
-                            );
+                            wal.append(record_type, &data);
                         }
                     }
 
@@ -2123,13 +2125,11 @@ impl super::Shard {
                     }
                 }
 
-                // Drain local-write WAL channel
-                while let Ok(data) = wal_append_rx.try_recv() {
+                // Drain local-write WAL channel. K1a: append with the producer's
+                // REAL record type instead of forcing `Command` for everything.
+                while let Ok((record_type, data)) = wal_append_rx.try_recv() {
                     if let Some(ref mut wal) = wal_writer {
-                        wal.append(
-                            crate::persistence::wal_v3::record::WalRecordType::Command,
-                            &data,
-                        );
+                        wal.append(record_type, &data);
                     }
                 }
 

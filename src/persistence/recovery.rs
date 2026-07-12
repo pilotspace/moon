@@ -408,6 +408,46 @@ pub fn recover_shard_v3_pitr(
                     // File lifecycle events -- verify against manifest (future)
                     result.commands_replayed += 1;
                 }
+                WalRecordType::XactCommit => {
+                    // K1a decision (storage-audit-2026-07-12-wal.md §5.1):
+                    // intentional documented no-op, NOT a gap. Before K1a this
+                    // record arrived here nested inside an outer `Command`
+                    // frame, so `read_wal_v3_record`-parsing the payload as
+                    // RESP silently produced nothing (the audit's "XactCommit
+                    // replay is functionally dead"); now that the typed
+                    // channel preserves the real outer type, this arm is
+                    // reachable for the first time and needs an explicit
+                    // decision rather than silently falling into `_ => {}`.
+                    //
+                    // The forward-image KV payload
+                    // (`encode_xact_commit_payload`) is REDUNDANT here in
+                    // every reachable config: the transaction's individual
+                    // SET/DEL ops already ride EITHER this same Phase-4 WAL
+                    // replay as ordinary `Command` records (when
+                    // `--wal-kv-log` is on — ordinary KV write dispatch does
+                    // not distinguish "inside a cross-store txn" from any
+                    // other write) OR the AOF, which is the KV recovery
+                    // authority in every reachable config (Phase 4b below
+                    // falls back to it whenever `kv_commands_replayed == 0`).
+                    // Decoding + re-applying the forward image would at best
+                    // be a no-op (same final value) and at worst double-apply
+                    // a non-idempotent op if that invariant ever drifts — the
+                    // exact risk the Phase 4b comment above already flags for
+                    // WAL+AOF overlap. Counted (like Vector*/File* above) so
+                    // `commands_replayed` reflects what was actually on disk;
+                    // never dispatched.
+                    //
+                    // ASYMMETRY (intentional): the last-resort legacy fallback
+                    // `wal_v3::replay::replay_wal_v3_dir_commands` DOES apply
+                    // XactCommit via `replay_xact_commit`. That path runs only
+                    // when this Phase 4 replayed ZERO KV commands AND no
+                    // `appendonly.aof` exists — i.e. exactly when neither of
+                    // the redundant coverage sources argued above is present,
+                    // so applying the forward image there is the only way the
+                    // txn's writes survive at all. Same reasoning, opposite
+                    // conclusion, because the preconditions are complementary.
+                    result.commands_replayed += 1;
+                }
                 _ => {}
             }
         };

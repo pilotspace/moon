@@ -325,9 +325,12 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
 
 /// Apply a replicated `TEMPORAL.INVALIDATE-AT` record: same mutation the
 /// master ran (`apply_invalidate`) with the master's pinned `wall_ms`. The
-/// drained `GraphTemporal` WAL payload is dropped, matching `apply_graph`'s
-/// no-local-persistence model (a restarted replica resyncs from the master;
-/// leaving it in `wal_pending` would leak into an unrelated later drain).
+/// returned `GraphTemporal` WAL payload is dropped (`Ok(_)` is ignored),
+/// matching `apply_graph`'s no-local-persistence model (a restarted replica
+/// resyncs from the master).
+///
+/// K1a: `apply_invalidate` now returns the payload directly instead of
+/// pushing it into `gs.wal_pending` — there is nothing left to drain here.
 #[cfg(feature = "graph")]
 fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
     let Some((graph_name, is_node, entity_id, wall_ms)) =
@@ -354,7 +357,6 @@ fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8]
             String::from_utf8_lossy(e)
         );
     }
-    let _ = s.graph_store.drain_wal();
 }
 
 /// Mirror of the master's connection-layer index-parity block

@@ -182,17 +182,23 @@ fn derive_trig_key(key_prefix: &Bytes, raw_queue_key: &Bytes) -> Bytes {
 
 // ── WAL append helper ─────────────────────────────────────────────────────────
 
-/// Append a WAL record byte sequence on the current shard thread via the
-/// slice's `wal_append_tx` channel (fire-and-forget).
+/// Append a WAL record on the current shard thread via the slice's
+/// `wal_append_tx` channel (fire-and-forget), tagged with its REAL
+/// `record_type` (K1a) — the payload is UNFRAMED (no nested `write_wal_v3_record`
+/// pre-framing); the event-loop drain calls `wal.append(record_type, &payload)`
+/// directly.
 ///
 /// Mirrors `ShardDatabases::wal_append` semantics — `try_send` failures are
 /// ignored (the channel is bounded; under extreme backpressure the record is
 /// dropped, same as the existing lock-path).
 #[inline]
-fn wal_append_on_slice(record_bytes: bytes::Bytes) {
+fn wal_append_on_slice(
+    record_type: crate::persistence::wal_v3::record::WalRecordType,
+    payload: bytes::Bytes,
+) {
     crate::shard::slice::with_shard(|s| {
         if let Some(ref tx) = s.wal_append_tx {
-            let _ = tx.try_send(record_bytes);
+            let _ = tx.try_send((record_type, payload));
         }
     });
 }
@@ -235,17 +241,14 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
         reg.insert(eff_key.clone(), config);
     });
 
-    // WAL: MqCreate record on the owner shard.
+    // WAL: MqCreate record on the owner shard. K1a: send the unframed payload
+    // tagged with its real type — the event-loop drain does the single framing.
     {
         let payload = crate::mq::wal::encode_mq_create(&eff_key, max_delivery_count);
-        let mut wal_buf = Vec::new();
-        crate::persistence::wal_v3::record::write_wal_v3_record(
-            &mut wal_buf,
-            0,
+        wal_append_on_slice(
             crate::persistence::wal_v3::record::WalRecordType::MqCreate,
-            &payload,
+            Bytes::from(payload),
         );
-        wal_append_on_slice(Bytes::from(wal_buf));
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -446,17 +449,13 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
     match ack_result {
         Some(acked_count) => {
-            // Emit one WAL record per acked message id.
+            // Emit one WAL record per acked message id (unframed, real type).
             for (ms, seq) in &msg_ids {
                 let payload = crate::mq::wal::encode_mq_ack(&eff_key, *ms, *seq);
-                let mut wal_buf = Vec::new();
-                crate::persistence::wal_v3::record::write_wal_v3_record(
-                    &mut wal_buf,
-                    0,
+                wal_append_on_slice(
                     crate::persistence::wal_v3::record::WalRecordType::MqAck,
-                    &payload,
+                    Bytes::from(payload),
                 );
-                wal_append_on_slice(Bytes::from(wal_buf));
             }
             Frame::Integer(acked_count as i64)
         }

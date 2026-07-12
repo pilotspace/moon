@@ -252,7 +252,18 @@ pub struct GraphStore {
     next_lsn: u64,
     /// Pending WAL records produced by write handlers. Connection handlers
     /// drain this after dispatch and send bytes via `shard_databases.wal_append()`.
+    /// Always `WalRecordType::Command` (RESP-encoded GRAPH.* commands) — see
+    /// `temporal_wal_pending` for the one non-Command graph WAL record type.
     pub(crate) wal_pending: Vec<Vec<u8>>,
+    /// One pending `GraphTemporal` WAL payload (unframed, raw
+    /// `encode_graph_temporal` bytes), set by `TEMPORAL.INVALIDATE`'s
+    /// `command::temporal::apply_invalidate`. Kept separate from
+    /// `wal_pending` (which is always `Command`-typed RESP bytes) so the
+    /// cross-thread `wal_append` channel can carry each record's REAL
+    /// `WalRecordType` end-to-end instead of nesting a second WAL frame
+    /// inside a `Command` payload. Callers `.take()` this immediately after
+    /// dispatch, same drain discipline as `drain_wal()`.
+    pub(crate) temporal_wal_pending: Option<Vec<u8>>,
     /// Monotonic freshness counter for the GRAPH engine on this shard.
     ///
     /// Bumped (Release) after every successful mutating operation: `create_graph`,
@@ -286,6 +297,7 @@ impl GraphStore {
             graphs: None,
             next_lsn: 0,
             wal_pending: Vec::new(),
+            temporal_wal_pending: None,
             version_token: AtomicU64::new(0),
             dirty: false,
             snapshot_lsn: 0,

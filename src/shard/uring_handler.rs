@@ -172,24 +172,27 @@ pub(crate) fn handle_uring_event(
                                     let name = args.get(1).and_then(|f| {
                                         if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
                                     }).unwrap_or_else(|| bytes::Bytes::from_static(b""));
+                                    let created_at = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as i64;
                                     registry.insert(ws_id, crate::workspace::registry::WorkspaceMetadata {
                                         id: ws_id,
                                         name: name.clone(),
-                                        created_at: 0,
+                                        created_at,
                                     });
-                                    // WAL: WorkspaceCreate to shard 0 — the global
-                                    // registry's single stream (mirrors the conn
-                                    // handlers; without it, workspaces created via
-                                    // this batch path were lost on restart).
-                                    let payload = crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &name);
-                                    let mut wal_buf = Vec::new();
-                                    crate::persistence::wal_v3::record::write_wal_v3_record(
-                                        &mut wal_buf,
+                                    // WAL: WorkspaceCreate to shard 0 (unframed,
+                                    // real type — K1a) — the global registry's
+                                    // single stream (mirrors the conn handlers;
+                                    // without it, workspaces created via this
+                                    // batch path were lost on restart). K1b: the
+                                    // payload carries `created_at` too.
+                                    let payload = crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &name, created_at);
+                                    shard_databases.wal_append(
                                         0,
                                         crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
-                                        &payload,
+                                        bytes::Bytes::from(payload),
                                     );
-                                    shard_databases.wal_append(0, bytes::Bytes::from(wal_buf));
                                     return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
                                 }
                                 Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
@@ -202,14 +205,11 @@ pub(crate) fn handle_uring_event(
                                             // reply is pre-existing batch-path behavior.
                                             if registry.remove(&ws_id).is_some() {
                                                 let payload = crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
-                                                let mut wal_buf = Vec::new();
-                                                crate::persistence::wal_v3::record::write_wal_v3_record(
-                                                    &mut wal_buf,
+                                                shard_databases.wal_append(
                                                     0,
                                                     crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
-                                                    &payload,
+                                                    bytes::Bytes::from(payload),
                                                 );
-                                                shard_databases.wal_append(0, bytes::Bytes::from(wal_buf));
                                             }
                                             return crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK"));
                                         }
