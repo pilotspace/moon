@@ -400,9 +400,62 @@ pub fn decode_mq_trigger(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, u
     Some((trig_key, queue_key, callback_cmd, debounce_ms))
 }
 
+// ── Replication wire framing (Wave B stage 2b) ────────────────────────────
+//
+// MQ effect records are versioned BINARY payloads, not RESP commands (unlike
+// GRAPH.*/TEMPORAL.INVALIDATE-AT, which stream deterministic user-syntax
+// commands). Replication wraps each one in a synthetic pseudo-command that
+// carries the SAME `encode_mq_*` payload verbatim as a single bulk-string
+// arg: `MQ._REPL.PUSH <payload bytes>`. These names are NEVER dispatched to
+// a real client (no `CommandMeta`/ACL entry, no overlap with
+// `is_mq_command`'s `"MQ"` check) — they are matched only by
+// `replication::apply::apply_local`'s command-name routing, exactly like
+// `GraphReplayCollector::is_graph_command`, and decoded with the SAME
+// `decode_mq_*` functions above so the replica's apply arm and boot-time WAL
+// replay share one codec.
+
+/// Synthetic replication pseudo-command for [`WalRecordType::MqCreate`].
+pub const MQ_REPL_CREATE: &[u8] = b"MQ._REPL.CREATE";
+/// Synthetic replication pseudo-command for [`WalRecordType::MqPush`].
+pub const MQ_REPL_PUSH: &[u8] = b"MQ._REPL.PUSH";
+/// Synthetic replication pseudo-command for [`WalRecordType::MqPop`].
+pub const MQ_REPL_POP: &[u8] = b"MQ._REPL.POP";
+/// Synthetic replication pseudo-command for [`WalRecordType::MqAck`].
+pub const MQ_REPL_ACK: &[u8] = b"MQ._REPL.ACK";
+/// Synthetic replication pseudo-command for [`WalRecordType::MqTrigger`].
+pub const MQ_REPL_TRIGGER: &[u8] = b"MQ._REPL.TRIGGER";
+
+/// True for any `MQ._REPL.*` synthetic replication pseudo-command emitted by
+/// [`crate::shard::mq_exec`]'s live fan-out. Used by
+/// `replication::apply::apply_local` to route a replicated command to the
+/// MQ apply engine instead of generic dispatch.
+///
+/// [`WalRecordType`]: crate::persistence::wal_v3::record::WalRecordType
+#[inline]
+pub fn is_mq_replay_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(MQ_REPL_CREATE)
+        || cmd.eq_ignore_ascii_case(MQ_REPL_PUSH)
+        || cmd.eq_ignore_ascii_case(MQ_REPL_POP)
+        || cmd.eq_ignore_ascii_case(MQ_REPL_ACK)
+        || cmd.eq_ignore_ascii_case(MQ_REPL_TRIGGER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_mq_replay_command() {
+        assert!(is_mq_replay_command(b"MQ._REPL.CREATE"));
+        assert!(is_mq_replay_command(b"mq._repl.push"));
+        assert!(is_mq_replay_command(b"MQ._REPL.POP"));
+        assert!(is_mq_replay_command(b"MQ._REPL.ACK"));
+        assert!(is_mq_replay_command(b"MQ._REPL.TRIGGER"));
+        assert!(!is_mq_replay_command(b"MQ"));
+        assert!(!is_mq_replay_command(b"MQ.PUSH"));
+        assert!(!is_mq_replay_command(b"GRAPH.ADDNODE"));
+        assert!(!is_mq_replay_command(b""));
+    }
 
     // --- MqCreate roundtrip ---
 

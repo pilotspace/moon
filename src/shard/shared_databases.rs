@@ -459,25 +459,75 @@ fn warn_skip_mq_record(shard_id: usize, kind: &str, payload: &[u8], stats: &mut 
     }
 }
 
+/// Shared field accessors for the MQ apply engine, implemented by both the
+/// boot-time WAL-replay target (`ShardSliceInit`, single-threaded, pre-shard-
+/// spawn) and the live-replica-apply target (`ShardSlice`, the running
+/// shard's thread-local aggregate) — Wave B stage 2b. `durable_queue_registry`
+/// / `trigger_registry` / `databases` are identically named and typed on
+/// both structs (see `shard::slice`), so the trait is a thin adapter that
+/// lets `apply_mq_*` stay generic instead of existing twice: `replay_mq_wal`
+/// (boot) and `replication::apply::apply_mq` (live stream) share ONE engine.
+pub(crate) trait MqApplyTarget {
+    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database];
+    fn mq_durable_queue_registry_mut(
+        &mut self,
+    ) -> &mut Option<Box<crate::mq::DurableQueueRegistry>>;
+    fn mq_trigger_registry_mut(&mut self) -> &mut Option<Box<crate::mq::TriggerRegistry>>;
+}
+
+impl MqApplyTarget for crate::shard::slice::ShardSliceInit {
+    #[inline]
+    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database] {
+        &mut self.databases
+    }
+    #[inline]
+    fn mq_durable_queue_registry_mut(
+        &mut self,
+    ) -> &mut Option<Box<crate::mq::DurableQueueRegistry>> {
+        &mut self.durable_queue_registry
+    }
+    #[inline]
+    fn mq_trigger_registry_mut(&mut self) -> &mut Option<Box<crate::mq::TriggerRegistry>> {
+        &mut self.trigger_registry
+    }
+}
+
+impl MqApplyTarget for crate::shard::slice::ShardSlice {
+    #[inline]
+    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database] {
+        &mut self.databases
+    }
+    #[inline]
+    fn mq_durable_queue_registry_mut(
+        &mut self,
+    ) -> &mut Option<Box<crate::mq::DurableQueueRegistry>> {
+        &mut self.durable_queue_registry
+    }
+    #[inline]
+    fn mq_trigger_registry_mut(&mut self) -> &mut Option<Box<crate::mq::TriggerRegistry>> {
+        &mut self.trigger_registry
+    }
+}
+
 /// Apply a single decoded MqCreate record: registers the shard-level durable
 /// queue config AND (re)creates the stream in the record's OWN db (fixes the
 /// pre-K2 db-0 hardcode — MqCreate now carries `db_index`).
-fn apply_mq_create(
-    init: &mut crate::shard::slice::ShardSliceInit,
+pub(crate) fn apply_mq_create<T: MqApplyTarget>(
+    target: &mut T,
     db_index: usize,
     key: &[u8],
     max_delivery_count: u32,
 ) {
     let key_bytes = bytes::Bytes::copy_from_slice(key);
-    let reg = init
-        .durable_queue_registry
+    let reg = target
+        .mq_durable_queue_registry_mut()
         .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
     reg.insert(
         key_bytes.clone(),
         crate::mq::DurableStreamConfig::new(key_bytes, max_delivery_count),
     );
 
-    if let Some(db) = init.databases.get_mut(db_index) {
+    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
         if let Ok(stream) = db.get_or_create_stream(key) {
             stream.durable = true;
             stream.max_delivery_count = max_delivery_count;
@@ -494,14 +544,14 @@ fn apply_mq_create(
 /// ORIGINAL assigned id. Idempotent — replaying the same id twice (e.g. a
 /// stream that already had this entry via a surviving RDB/rrdshard load) is
 /// a harmless no-op rather than double-counting `length`.
-fn apply_mq_push(
-    init: &mut crate::shard::slice::ShardSliceInit,
+pub(crate) fn apply_mq_push<T: MqApplyTarget>(
+    target: &mut T,
     db_index: usize,
     key: &[u8],
     id: crate::storage::stream::StreamId,
     fields: Vec<(bytes::Bytes, bytes::Bytes)>,
 ) {
-    if let Some(db) = init.databases.get_mut(db_index) {
+    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
         if let Ok(stream) = db.get_or_create_stream(key) {
             if !stream.entries.contains_key(&id) {
                 stream.add(id, fields);
@@ -517,8 +567,8 @@ fn apply_mq_push(
 /// for DLQ pushes is looked up from the main stream's `entries` map, which
 /// by this point already reflects every MqPush record replayed so far
 /// (records are applied strictly in WAL order).
-fn apply_mq_pop(
-    init: &mut crate::shard::slice::ShardSliceInit,
+pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
+    target: &mut T,
     db_index: usize,
     key: &[u8],
     last_delivered: crate::storage::stream::StreamId,
@@ -530,7 +580,7 @@ fn apply_mq_pop(
 ) {
     use crate::storage::stream::{Consumer, PendingEntry};
 
-    let Some(db) = init.databases.get_mut(db_index) else {
+    let Some(db) = target.mq_databases_mut().get_mut(db_index) else {
         return;
     };
 
@@ -615,13 +665,13 @@ fn apply_mq_pop(
 /// for the old cursor-rollback-by-count heuristic. `Stream::xack` is
 /// idempotent (no-ops if the id isn't in the PEL), so replaying the same ack
 /// twice or acking an id that was never actually pending is harmless.
-fn apply_mq_ack(
-    init: &mut crate::shard::slice::ShardSliceInit,
+pub(crate) fn apply_mq_ack<T: MqApplyTarget>(
+    target: &mut T,
     db_index: usize,
     key: &[u8],
     id: crate::storage::stream::StreamId,
 ) {
-    if let Some(db) = init.databases.get_mut(db_index) {
+    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
         if let Ok(Some(stream)) = db.get_stream_mut(key) {
             let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
             let _ = stream.xack(&group_name, &[id]);
@@ -633,8 +683,8 @@ fn apply_mq_ack(
 /// data. Registration is durable/replayed but NEVER fired during replay —
 /// firing only happens from live `MQ.PUSH` debounce arming
 /// (`src/shard/timers.rs::fire_pending_mq_triggers`).
-fn apply_mq_trigger(
-    init: &mut crate::shard::slice::ShardSliceInit,
+pub(crate) fn apply_mq_trigger<T: MqApplyTarget>(
+    target: &mut T,
     trig_key: Vec<u8>,
     queue_key: Vec<u8>,
     callback_cmd: Vec<u8>,
@@ -647,8 +697,8 @@ fn apply_mq_trigger(
         last_fire_ms: 0,
         pending_fire_ms: 0,
     };
-    let reg = init
-        .trigger_registry
+    let reg = target
+        .mq_trigger_registry_mut()
         .get_or_insert_with(|| Box::new(crate::mq::TriggerRegistry::new()));
     reg.register(bytes::Bytes::from(trig_key), entry);
 }
