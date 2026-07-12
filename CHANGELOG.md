@@ -16,7 +16,16 @@ GAP-1/PR #170) folds in all of them — previously kv+vector only.
   dictionaries, FST fuzzy/prefix sidecars, per-document bookkeeping maps,
   and TAG/NUMERIC secondary indexes. FTS memory was hard-coded 0
   everywhere it was published (elastic budget, MEMORY DOCTOR, Prometheus)
-  until this change.
+  until this change. **O(1) incremental accumulator** (same contract as
+  `ColdIndex`/graph below) — an initial version was an O(doc-count +
+  vocabulary) full-recompute walk invoked unconditionally every 100ms from
+  the shard eviction tick regardless of `maxmemory`, measured 6.4–21.3ms/call
+  at 50K–200K docs (>20% of the tick budget, recurring P99 spikes for every
+  command on that shard). Fixed before merge: `PostingStore`/
+  `TermDictionary`/`TextIndex` each carry a cached total maintained
+  incrementally at every mutation site (index/delete/upsert/TAG/NUMERIC
+  update/FST rebuild), verified against a `#[cfg(test)]` ground-truth
+  full-walk after a mixed mutation sequence.
 - `ColdIndex::resident_bytes()` (KV disk-offload bookkeeping): an O(1)
   incremental accumulator (not a per-tick walk — sized for G2's "10x RAM"
   scale target), charged into the shard's published KV memory.
