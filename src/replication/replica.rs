@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::replication::handshake::ReplicaHandshakeState;
 use crate::replication::state::{ReplicationRole, ReplicationState, save_replication_state};
+use crate::shard::shared_databases::ShardDatabases;
 
 /// Process-global generation counter for replica tasks (attach-under-write
 /// P0, found while testing R2): `REPLICAOF host port` used to spawn a fresh
@@ -55,6 +56,10 @@ pub struct ReplicaTaskConfig {
     pub num_shards: usize,
     pub persistence_dir: Option<String>,
     pub listening_port: u16,
+    /// Gives `apply::load_snapshot` / `apply::apply_local` access to the
+    /// process-global `WorkspaceRegistry` (Wave B ws-plane), which lives on
+    /// `ShardDatabases` rather than the thread-local `ShardSlice`.
+    pub shard_databases: Arc<ShardDatabases>,
     /// Generation ticket from [`bump_replica_task_epoch`] — the task exits
     /// as soon as a newer generation exists.
     pub epoch: u64,
@@ -267,7 +272,7 @@ async fn run_handshake_and_stream(
         }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
-            match crate::replication::apply::load_snapshot(&rdb_bytes) {
+            match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
                     shard_id,
@@ -380,7 +385,7 @@ async fn stream_commands_read_loop(
         let outcome =
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
-            if !crate::replication::apply::apply_local(rc) {
+            if !crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
                 return Err(anyhow::anyhow!(
                     "replica has no ShardSlice on this thread — cannot apply replication stream"
                 ));
@@ -598,7 +603,7 @@ async fn run_handshake_and_stream(
         }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
-            match crate::replication::apply::load_snapshot(&rdb_bytes) {
+            match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
                     shard_id,
@@ -720,7 +725,7 @@ async fn stream_commands_read_loop(
         let outcome =
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
-            if !crate::replication::apply::apply_local(rc) {
+            if !crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
                 return Err(anyhow::anyhow!(
                     "replica has no ShardSlice on this thread — cannot apply replication stream"
                 ));

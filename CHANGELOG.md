@@ -40,6 +40,47 @@ binary — WS/MQ are only wired in the sharded handlers, so the synthetic
 single-shard harness used by `tests/replication_test.rs` can't exercise this
 fix). Verified against both a monoio (default-feature) build and a
 `runtime-tokio,jemalloc` build.
+### Added — WS.CREATE/DROP replication (Wave B ws-plane)
+
+`WS.CREATE`/`WS.DROP` mutated the process-global `WorkspaceRegistry` from
+whichever connection thread received the command and pinned their WAL
+records to shard 0 without actually running on shard 0's thread — the
+replication offset advance (which must happen synchronously with the
+mutation on shard 0, matching the snapshot-capture atomicity argument used
+elsewhere) had no such guarantee, and the plane was not replicated at all
+(round-2 finding A / task #34).
+
+Routed the whole mutation + WAL-append + replication-record sequence through
+a dedicated shard-0 hop (`ShardMessage::WsRegistryCreate` /
+`WsRegistryDrop`, mirroring the existing `WsDropCleanup` hop): a connection
+already on shard 0 runs the sequence inline, every other connection hops
+over via `spsc_send` + a bounded oneshot reply. After the shard-0 execution,
+the WorkspaceCreate/WorkspaceDrop record (same payload as the WAL record —
+`ws_id` + `name` + `created_at_ms`) is pushed into the replication stream via
+the graph-plane's `record_local_write_db` pattern (offset advances IFF the
+backlog append happens).
+
+Replica apply arms (`WS.CREATE.APPLY` / `WS.DROP.APPLY` internal
+pseudo-commands, `replication::apply::apply_local`) install the MASTER's
+`ws_id` + `created_at` VERBATIM — UUIDv7 is nondeterministic, so a replica
+must never mint its own id. `WS.DROP.APPLY` reruns the master's best-effort
+`{ws_hex}:`-prefix key sweep on the replica's single shard (R0 replication is
+single-shard-only). Full-resync backfill: a new versioned
+`MOON_AUX_WORKSPACE_REGISTRY` RDB aux blob (`replication::ws_sync`,
+shard-0-authoritative — captured only in shard 0's `PrepareReplicaSync` leg
+on the multi-shard master path) is installed authoritatively at
+`load_snapshot`, same convention as the graph/vector/text aux blobs. New
+`ws_registry_record` cargo-fuzz target covers the blob decoder.
+
+Split the former combined `warn_unreplicated_plane` fail-loud marker
+(`handler_monoio/ft.rs`) into per-plane functions — the WS half is retired
+now that this plane replicates; `warn_mq_unreplicated` survives for MQ,
+which is not yet wired in.
+
+New `tests/replication_ws.rs`: live-stream parity (id + `created_at`
+round-trip through `WS.INFO`/`WS.AUTH` on the replica), snapshot-leg
+backfill, `WS.DROP` propagation, and a `--shards 4` leg exercising the
+shard-0 hop from connections that may land on any shard.
 
 ### Fixed — docs site strict build red since 2026-07-08 (root-relative links)
 

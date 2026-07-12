@@ -36,6 +36,7 @@ jobs:
           - graph_props_record
           - fts_query_parse
           - mq_wal_record
+          - ws_registry_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -88,6 +89,7 @@ jobs:
           - graph_props_record
           - fts_query_parse
           - mq_wal_record
+          - ws_registry_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

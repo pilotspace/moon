@@ -88,3 +88,8 @@ doc = false
 name = "mq_wal_record"
 path = "fuzz_targets/mq_wal_record.rs"
 doc = false
+
+[[bin]]
+name = "ws_registry_record"
+path = "fuzz_targets/ws_registry_record.rs"
+doc = false

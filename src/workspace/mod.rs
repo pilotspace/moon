@@ -6,6 +6,7 @@
 //! via `extract_hash_tag()` in `shard::dispatch`.
 
 pub mod registry;
+pub mod repl;
 pub mod wal;
 
 use bytes::Bytes;

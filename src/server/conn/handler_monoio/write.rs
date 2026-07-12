@@ -46,16 +46,6 @@ pub(super) async fn try_handle_ws_command(
         }
     };
 
-    // Round-2 finding A fail-loud: WS.CREATE/WS.DROP persist locally
-    // (WorkspaceCreate/Drop WAL records) but are NOT replicated in v0.7 —
-    // surface the divergence once instead of letting a replica silently miss
-    // the plane. (WS.CREATE is non-deterministic — fresh UUIDv7 per execution
-    // — so verbatim streaming would be wrong; task #34 tracks the id-pinned
-    // record form.)
-    if sub.eq_ignore_ascii_case(b"CREATE") || sub.eq_ignore_ascii_case(b"DROP") {
-        super::ft::warn_unreplicated_plane(ctx, cmd);
-    }
-
     if sub.eq_ignore_ascii_case(b"CREATE") {
         match validate_ws_create(cmd_args) {
             Ok(ws_name) => {
@@ -64,34 +54,97 @@ pub(super) async fn try_handle_ws_command(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                let meta = crate::workspace::WorkspaceMetadata {
-                    id: ws_id,
-                    name: ws_name.clone(),
-                    created_at,
-                };
-                {
-                    let mut guard = ctx.shard_databases.workspace_registry();
-                    let reg = guard.get_or_insert_with(|| {
-                        Box::new(crate::workspace::WorkspaceRegistry::new())
-                    });
-                    reg.insert(ws_id, meta);
+                // Wave B ws-plane: the registry is process-global, so the
+                // WHOLE mutation+WAL+replication-record sequence pins to
+                // shard 0's own thread — the replication offset advance must
+                // stay in the SAME synchronous stretch as the mutation (see
+                // `record_local_write`'s snapshot-consistency argument). A
+                // connection whose OWN shard is 0 runs the sequence inline
+                // (no hop, already on that thread); every other connection
+                // sends `WsRegistryCreate` to shard 0 and awaits the reply —
+                // same dual-path shape as `WsDropCleanup` below, except the
+                // "owner" here is always shard 0.
+                if ctx.shard_id == 0 {
+                    let meta = crate::workspace::WorkspaceMetadata {
+                        id: ws_id,
+                        name: ws_name.clone(),
+                        created_at,
+                    };
+                    {
+                        let mut guard = ctx.shard_databases.workspace_registry();
+                        let reg = guard.get_or_insert_with(|| {
+                            Box::new(crate::workspace::WorkspaceRegistry::new())
+                        });
+                        reg.insert(ws_id, meta);
+                    }
+                    // WAL: WorkspaceCreate record (unframed, real type — K1a).
+                    // K1b: the payload carries `created_at` so it survives a
+                    // restart.
+                    let wal_payload = crate::workspace::wal::encode_workspace_create(
+                        ws_id.as_bytes(),
+                        &ws_name,
+                        created_at,
+                    );
+                    ctx.shard_databases.wal_append(
+                        0,
+                        crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
+                        Bytes::from(wal_payload.clone()),
+                    );
+                    // Wave B ws-plane: live replication push (same payload as
+                    // the WAL record, wrapped as the internal
+                    // WS.CREATE.APPLY pseudo-command — see
+                    // `workspace::repl`). Gated on fanout-active exactly like
+                    // the graph plane's `record_local_write_db` call.
+                    if super::ft::replication_fanout_active(ctx) {
+                        let record =
+                            crate::workspace::repl::serialize_ws_create_apply(&wal_payload);
+                        super::ft::record_local_write_db(
+                            ctx,
+                            conn.selected_db,
+                            Bytes::from(record),
+                        );
+                    }
+                    responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
+                } else {
+                    let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                    let msg = crate::shard::dispatch::ShardMessage::WsRegistryCreate(Box::new(
+                        crate::shard::dispatch::WsRegistryCreatePayload {
+                            ws_id: *ws_id.as_bytes(),
+                            name: ws_name.clone(),
+                            created_at,
+                            reply_tx,
+                        },
+                    ));
+                    let _ = crate::shard::coordinator::spsc_send(
+                        &ctx.dispatch_tx,
+                        ctx.shard_id,
+                        0,
+                        msg,
+                        &ctx.spsc_notifiers,
+                    )
+                    .await;
+                    // Fail CLOSED on hop failure (adversarial-review P0): a
+                    // wedged ring or reply timeout must not report a phantom
+                    // ws_id the registry never saw. The registry itself is
+                    // process-global, so a post-failure probe disambiguates
+                    // "shard 0 executed but the reply was slow/lost" (entry
+                    // present → success) from "the mutation never happened"
+                    // (entry absent → retryable error).
+                    let hop_ok = crate::shard::coordinator::recv_reply_bounded(reply_rx)
+                        .await
+                        .is_ok();
+                    let created = hop_ok || {
+                        let guard = ctx.shard_databases.workspace_registry();
+                        guard.as_ref().is_some_and(|reg| reg.get(&ws_id).is_some())
+                    };
+                    if created {
+                        responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
+                    } else {
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"ERR workspace create failed (shard-0 registry hop timed out); not created, safe to retry",
+                        )));
+                    }
                 }
-                // WAL: WorkspaceCreate record (unframed, real type — K1a). The
-                // registry is global, so its WAL stream is pinned to shard 0 —
-                // one stream gives replay a total order over Create/Drop
-                // regardless of which connection issued them. K1b: the payload
-                // carries `created_at` so it survives a restart.
-                let payload = crate::workspace::wal::encode_workspace_create(
-                    ws_id.as_bytes(),
-                    &ws_name,
-                    created_at,
-                );
-                ctx.shard_databases.wal_append(
-                    0,
-                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
-                    Bytes::from(payload),
-                );
-                responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
             }
             Err(e) => responses.push(e),
         }
@@ -103,22 +156,71 @@ pub(super) async fn try_handle_ws_command(
             Ok(ws_id_raw) => {
                 match parse_workspace_id_from_bytes(&ws_id_raw) {
                     Some(ws_id) => {
-                        let removed = {
-                            let mut guard = ctx.shard_databases.workspace_registry();
-                            match guard.as_mut() {
-                                Some(reg) => reg.remove(&ws_id).is_some(),
-                                None => false,
+                        // Wave B ws-plane: same shard-0 hop as WS.CREATE above.
+                        let removed = if ctx.shard_id == 0 {
+                            let removed = {
+                                let mut guard = ctx.shard_databases.workspace_registry();
+                                match guard.as_mut() {
+                                    Some(reg) => reg.remove(&ws_id).is_some(),
+                                    None => false,
+                                }
+                            };
+                            if removed {
+                                // WAL: WorkspaceDrop record (unframed, real type — K1a).
+                                let wal_payload =
+                                    crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
+                                ctx.shard_databases.wal_append(
+                                    0,
+                                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
+                                    Bytes::from(wal_payload.clone()),
+                                );
+                                if super::ft::replication_fanout_active(ctx) {
+                                    let record = crate::workspace::repl::serialize_ws_drop_apply(
+                                        &wal_payload,
+                                    );
+                                    super::ft::record_local_write_db(
+                                        ctx,
+                                        conn.selected_db,
+                                        Bytes::from(record),
+                                    );
+                                }
+                            }
+                            removed
+                        } else {
+                            let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                            let msg = crate::shard::dispatch::ShardMessage::WsRegistryDrop {
+                                ws_id: *ws_id.as_bytes(),
+                                reply_tx,
+                            };
+                            let _ = crate::shard::coordinator::spsc_send(
+                                &ctx.dispatch_tx,
+                                ctx.shard_id,
+                                0,
+                                msg,
+                                &ctx.spsc_notifiers,
+                            )
+                            .await;
+                            match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+                                Ok(removed) => removed,
+                                // Timeout/err ≠ failure (adversarial-review
+                                // P1): shard 0 may have completed the drop
+                                // and only the REPLY was lost — resolving
+                                // `false` here skipped the `{ws_hex}:` key
+                                // sweep below FOREVER (the registry entry is
+                                // gone, so no WS.DROP retry can re-trigger
+                                // it). The registry is process-global:
+                                // probe it — entry gone → the drop landed
+                                // (run the sweep; it is idempotent), entry
+                                // still present → the hop genuinely never
+                                // executed → fall through to
+                                // ERR_WS_NOT_FOUND-side handling as before.
+                                Err(_) => {
+                                    let guard = ctx.shard_databases.workspace_registry();
+                                    guard.as_ref().is_none_or(|reg| reg.get(&ws_id).is_none())
+                                }
                             }
                         };
                         if removed {
-                            // WAL: WorkspaceDrop record (unframed, real type — K1a).
-                            let payload =
-                                crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
-                            ctx.shard_databases.wal_append(
-                                0,
-                                crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
-                                Bytes::from(payload),
-                            );
                             // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
                             // Owner-route the cleanup via WsDropCleanup hop. The {wsid} hash
                             // tag co-locates every workspace key on ONE shard.
@@ -313,7 +415,7 @@ pub(super) async fn try_handle_mq_command(
     // execute_mq_on_owner) but are NOT replicated in v0.7 — surface the
     // divergence once instead of letting a replica silently miss the plane.
     if !sub.eq_ignore_ascii_case(b"LEN") && !sub.eq_ignore_ascii_case(b"DLQLEN") {
-        super::ft::warn_unreplicated_plane(ctx, cmd);
+        super::ft::warn_mq_unreplicated(ctx, cmd);
     }
 
     if sub.eq_ignore_ascii_case(b"CREATE") {

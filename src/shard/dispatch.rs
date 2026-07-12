@@ -492,6 +492,17 @@ pub struct PrepareReplicaSyncPayload {
     pub reply_tx: channel::MpscSender<PreparedShardSync>,
 }
 
+/// Payload of [`ShardMessage::WsRegistryCreate`] (Wave B ws-plane).
+pub struct WsRegistryCreatePayload {
+    /// The MASTER-minted workspace id (UUIDv7, allocated on the connecting
+    /// thread BEFORE the hop) — shard 0 applies this verbatim, never
+    /// allocating its own.
+    pub ws_id: [u8; 16],
+    pub name: Bytes,
+    pub created_at: i64,
+    pub reply_tx: channel::OneshotSender<()>,
+}
+
 /// One shard's prepared full-resync leg — the reply to
 /// [`ShardMessage::PrepareReplicaSync`].
 pub struct PreparedShardSync {
@@ -514,6 +525,12 @@ pub struct PreparedShardSync {
     /// replica imports all of them (`read_moon_aux_all`).
     #[cfg(feature = "graph")]
     pub graph_blob: Vec<u8>,
+    /// The process-global `WorkspaceRegistry` snapshot blob
+    /// (`replication::ws_sync::export_workspace_registry`). The registry is
+    /// NOT sharded, so only shard 0's leg populates this (`Some`); every
+    /// other shard replies `None` and the merge loop keeps the first `Some`
+    /// (same "keep shard 0's copy" convention as `vector_defs`/`text_defs`).
+    pub ws_registry_blob: Option<Vec<u8>>,
 }
 
 /// Messages sent to a shard via SPSC channels from the connection layer
@@ -822,6 +839,34 @@ pub enum ShardMessage {
     WsDropCleanup {
         prefix: Bytes,
         reply_tx: channel::OneshotSender<u64>,
+    },
+    /// WS.CREATE shard-0 affinity hop (Wave B ws-plane).
+    ///
+    /// The workspace registry is process-global, so its mutation + WAL
+    /// record + replication live-push must run in ONE synchronous stretch on
+    /// shard 0's own thread — otherwise the replication offset advance
+    /// (which must happen on shard 0's thread; see `record_local_write`'s
+    /// snapshot-consistency argument) could race a concurrent PSYNC snapshot
+    /// capture on shard 0. A connection whose OWN shard is 0 runs the
+    /// sequence inline (no hop, already on that thread); every other shard's
+    /// connection sends this message to shard 0 and awaits the reply — same
+    /// dual-path shape as `WsDropCleanup`, except the "owner" here is always
+    /// shard 0, never a hash-tag-derived shard.
+    ///
+    /// Boxed: `[u8;16](16) + Bytes(32) + i64(8) + OneshotSender(8)` = 64 B,
+    /// which would push the enum past the 64-byte inline cap once the
+    /// discriminant and alignment padding are added.
+    WsRegistryCreate(Box<WsRegistryCreatePayload>),
+    /// WS.DROP shard-0 affinity hop (Wave B ws-plane) — same rationale as
+    /// [`ShardMessage::WsRegistryCreate`]. Reply carries whether the id
+    /// existed (mirrors the connection handler's pre-hop "removed: bool"
+    /// check); the caller's SEPARATE `WsDropCleanup` key-sweep hop (unchanged
+    /// by this variant) only runs when this reply is `true`.
+    ///
+    /// Inline: `[u8;16](16) + OneshotSender(8)` = 24 B — within the cap.
+    WsRegistryDrop {
+        ws_id: [u8; 16],
+        reply_tx: channel::OneshotSender<bool>,
     },
     /// AOF cooperative-snapshot hop (C2/C4, shardslice-migration Wave A1).
     ///
