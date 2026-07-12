@@ -9,7 +9,7 @@ description: "Moon's v1.0 promises: SLOs, durability modes, supported platforms,
 what the `v1.0` release gate checks.
 **Last updated:** 2026-07-10
 **Milestone:** v0.6.1 Hygiene & reliability hotfix
-**Current release:** v0.6.0 (2026-07-08, PR #249) — see [`RELEASES.md`](../RELEASES.md)
+**Current release:** v0.6.0 (2026-07-08, PR #249) — see [`RELEASES.md`](https://github.com/pilotspace/moon/blob/main/RELEASES.md)
 **Roadmap:** [`docs/roadmap/ROADMAP.md`](roadmap/ROADMAP.md) §1 (proven strengths / reality check) is the
 authoritative source this ledger was verified against.
 
@@ -21,7 +21,7 @@ shipped). **No aspirational ticks** — a row is only ✅ if the linked evidence
 exist and do what the row claims, as of this refresh.
 
 `scripts/check-production-contract.sh` greps this file and is wired into
-[`.github/workflows/release.yml`](../.github/workflows/release.yml):
+[`.github/workflows/release.yml`](https://github.com/pilotspace/moon/blob/main/.github/workflows/release.yml):
 
 - On any `v0.x` tag it **reports** unticked GA-blocking rows but does not fail the build — Moon is
   pre-GA and the whole point of this ledger is to track the gap honestly.
@@ -46,7 +46,7 @@ in `.github/workflows/ci.yml`); production **benchmark numbers** still MUST come
 
 ## Performance
 
-Numbers are tracked in [`BENCHMARK.md`](../BENCHMARK.md) (KV pipelined/p=1, vector iso-recall vs
+Numbers are tracked in [`BENCHMARK.md`](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md) (KV pipelined/p=1, vector iso-recall vs
 Qdrant/RediSearch, graph vs FalkorDB), refreshed per release rather than pinned as static SLOs in
 this document — no automated 24h HDR rig or Criterion CI regression gate exists yet (`PERF-01`/`PERF-02`
 below are unticked). Headline, evidence-cited numbers as of v0.6.0:
