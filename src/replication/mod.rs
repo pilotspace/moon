@@ -7,3 +7,4 @@ pub mod master;
 pub mod reason_del;
 pub mod replica;
 pub mod state;
+pub mod ws_sync;
