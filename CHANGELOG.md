@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Windows CI: `replication_planes` used un-gated `libc::kill`
+
+`tests/replication_planes.rs`'s `sigkill` helper called `libc::kill`
+unconditionally — `libc` is not linked on Windows, so the `Check (Windows)`
+job failed to compile the suite on every `main` push since the Wave A merge.
+Now cfg-gated exactly like `tests/aof_multidb_kill9.rs` (`Child::kill` on
+non-unix). Test-only.
+
 ### Fixed — read-only replicas accepted client-issued `WS`/`MQ`/`TEMPORAL.*` writes (Wave B readonly-enforcement, task #34 follow-up)
 
 `WS` and `MQ` (dispatched as `WS <SUB> ...` / `MQ <SUB> ...`) and the dotted
