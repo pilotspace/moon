@@ -195,42 +195,59 @@ fn replica_syncs_mq_live_stream() {
         "MQ PUSH must return a stream id: {push}"
     );
 
-    // 2. The replica must be able to POP the pushed message — proving both
-    // the durable-queue registry (MQ.CREATE) and the message content
-    // (MQ.PUSH) replicated, not just the raw stream key.
-    let popped = wait_until(Duration::from_secs(10), || {
-        send_resp(replica_addr, &["MQ", "POP", "mq1", "COUNT", "1"]).contains("v1")
+    // 2. Read-only content check: `MQ POP` is a WRITE (claims PEL entries)
+    // and readonly enforcement (PR #292) correctly rejects it on a replica,
+    // so replica-side observation uses plain stream READS instead — XRANGE
+    // shows the pushed fields once MQ.CREATE + MQ.PUSH applied.
+    let seen = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &["XRANGE", "mq1", "-", "+"]).contains("v1")
     });
     assert!(
-        popped,
+        seen,
         "replica never saw the streamed MQ.PUSH message: {}",
-        send_resp(replica_addr, &["MQ", "POP", "mq1", "COUNT", "1"])
+        send_resp(replica_addr, &["XRANGE", "mq1", "-", "+"])
     );
 
-    // 3. A second push + ack on the master must also converge (ACK removes
-    // the entry from the PEL; DLQLEN stays 0 — proves MQ.ACK replicates,
-    // not just CREATE/PUSH).
-    let push2 = send_resp(master_addr, &["MQ", "PUSH", "mq1", "f2", "v2"]);
-    let id2 = parse_bulk_string(&push2).unwrap_or_default();
+    // 3. MqPop replication: the MASTER pops (claiming the entry into the
+    // consumer-group PEL and advancing last_delivered) — the replica's PEL,
+    // read via the XPENDING summary form, must converge to 1 pending.
+    let pop = send_resp(master_addr, &["MQ", "POP", "mq1", "COUNT", "1"]);
+    assert!(pop.contains("v1"), "master MQ POP failed: {pop}");
+    let pel_grew = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &["XPENDING", "mq1", "__mq_consumers"]).starts_with("*4\r\n:1")
+    });
     assert!(
-        id2.contains('-'),
+        pel_grew,
+        "replica PEL never showed the master's claim: {}",
+        send_resp(replica_addr, &["XPENDING", "mq1", "__mq_consumers"])
+    );
+
+    // 4. MqAck replication: acking the claimed id on the master must drain
+    // the replica's PEL back to 0.
+    let id1 = parse_bulk_string(&push).unwrap_or_default();
+    let ack = send_resp(master_addr, &["MQ", "ACK", "mq1", &id1]);
+    assert!(ack.starts_with(':'), "MQ ACK failed: {ack}");
+    let pel_drained = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &["XPENDING", "mq1", "__mq_consumers"]).starts_with("*4\r\n:0")
+    });
+    assert!(
+        pel_drained,
+        "replica MQ.ACK never applied — PEL still shows the acked entry: {}",
+        send_resp(replica_addr, &["XPENDING", "mq1", "__mq_consumers"])
+    );
+
+    // 5. A second push keeps streaming past the pop/ack cycle.
+    let push2 = send_resp(master_addr, &["MQ", "PUSH", "mq1", "f2", "v2"]);
+    assert!(
+        parse_bulk_string(&push2).is_some_and(|id| id.contains('-')),
         "MQ PUSH #2 must return a stream id: {push2}"
     );
-    let ack = send_resp(master_addr, &["MQ", "ACK", "mq1", &id2]);
-    assert!(ack.starts_with(':'), "MQ ACK failed: {ack}");
-
-    let acked_visible = wait_until(Duration::from_secs(10), || {
-        // After MQ.ACK replicates, a replica POP for the acked id's fields
-        // must NOT re-surface it (POP claims un-acked PEL entries fresh —
-        // the acked id was already removed from the group's PEL).
-        !send_resp(replica_addr, &["MQ", "POP", "mq1", "COUNT", "5"]).contains("v2")
+    let seen2 = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &["XRANGE", "mq1", "-", "+"]).contains("v2")
     });
-    assert!(
-        acked_visible,
-        "replica MQ.ACK never applied — acked message still POP-able"
-    );
+    assert!(seen2, "second MQ.PUSH never reached the replica");
 
-    // 4. STREAM-HEALTH: everything above must have arrived on ONE live
+    // 6. STREAM-HEALTH: everything above must have arrived on ONE live
     // stream (no reconnect/full-resync loop masking a dead live stream —
     // `replication_graph.rs`'s REPL-GRAPH-01 precedent).
     let log = std::fs::read_to_string(&replica_log).unwrap_or_default();
@@ -238,6 +255,24 @@ fn replica_syncs_mq_live_stream() {
     assert_eq!(
         reconnects, 0,
         "replica reconnected {reconnects}x — live stream did not hold:\n{log}"
+    );
+
+    // 7. FAILOVER proof: promote the replica — a consumer must be able to
+    // POP the un-consumed message (v2) from it. This is the operational
+    // point of the whole plane: the replicated durable-flag, consumer-group
+    // state, and last_delivered cursor (advanced past v1 by the master's
+    // replicated pop) all have to be correct for the claim to work.
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF NO ONE").starts_with("+OK"),
+        "promotion failed"
+    );
+    let promoted_pop = wait_until(Duration::from_secs(5), || {
+        send_resp(replica_addr, &["MQ", "POP", "mq1", "COUNT", "1"]).contains("v2")
+    });
+    assert!(
+        promoted_pop,
+        "promoted replica could not POP the unconsumed message: {}",
+        send_resp(replica_addr, &["MQ", "POP", "mq1", "COUNT", "1"])
     );
 }
 
@@ -287,14 +322,17 @@ fn replica_backfills_mq_from_snapshot() {
         "REPLICAOF failed"
     );
 
+    // Read-only observation (MQ POP is a write and is READONLY-rejected on
+    // a replica, per PR #292): the snapshot's stream content must appear
+    // via XRANGE.
     let backfilled = wait_until(Duration::from_secs(10), || {
-        let popped = send_resp(replica_addr, &["MQ", "POP", "mqsnap", "COUNT", "3"]);
-        popped.contains("v1") && popped.contains("v2") && popped.contains("v3")
+        let range = send_resp(replica_addr, &["XRANGE", "mqsnap", "-", "+"]);
+        range.contains("v1") && range.contains("v2") && range.contains("v3")
     });
     assert!(
         backfilled,
         "replica never backfilled the 3 pre-existing snapshot messages: {}",
-        send_resp(replica_addr, &["MQ", "POP", "mqsnap", "COUNT", "3"])
+        send_resp(replica_addr, &["XRANGE", "mqsnap", "-", "+"])
     );
 
     // A live write AFTER the snapshot must also land (stream continues past
@@ -305,9 +343,30 @@ fn replica_backfills_mq_from_snapshot() {
         "post-snapshot MQ PUSH failed: {r}"
     );
     let grew = wait_until(Duration::from_secs(10), || {
-        send_resp(replica_addr, &["MQ", "POP", "mqsnap", "COUNT", "1"]).contains("v4")
+        send_resp(replica_addr, &["XRANGE", "mqsnap", "-", "+"]).contains("v4")
     });
     assert!(grew, "post-snapshot live MQ.PUSH did not replicate");
+
+    // FAILOVER proof: a promoted replica must serve real consumers — POP
+    // has to claim all 4 messages, which exercises the snapshot-carried
+    // `durable` flag + consumer group (RDB_TYPE_STREAM_MOON codec) and the
+    // MQ registry aux blob end-to-end.
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF NO ONE").starts_with("+OK"),
+        "promotion failed"
+    );
+    let promoted_pop = wait_until(Duration::from_secs(5), || {
+        let popped = send_resp(replica_addr, &["MQ", "POP", "mqsnap", "COUNT", "4"]);
+        popped.contains("v1")
+            && popped.contains("v2")
+            && popped.contains("v3")
+            && popped.contains("v4")
+    });
+    assert!(
+        promoted_pop,
+        "promoted replica could not POP the backfilled messages: {}",
+        send_resp(replica_addr, &["XRANGE", "mqsnap", "-", "+"])
+    );
 }
 
 /// REPL-MQ-03 (documented scope limitation): a multi-shard master does not
