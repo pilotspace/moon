@@ -13,6 +13,36 @@ unconditionally — `libc` is not linked on Windows, so the `Check (Windows)`
 job failed to compile the suite on every `main` push since the Wave A merge.
 Now cfg-gated exactly like `tests/aof_multidb_kill9.rs` (`Child::kill` on
 non-unix). Test-only.
+### Fixed — graph CSR segments and text/vector sidecars were not crash-durable (K3, storage-kernel M2 stage 1)
+
+Extracted the vector engine's Stack-B temp+fsync+rename+dir-fsync
+sequence into one shared `atomic_write_durable(path, bytes)`
+(`src/persistence/atomic.rs`) and adopted it at every durable-artifact
+write site the K3 audit flagged as missing part of the sequence
+(`storage-audit-2026-07-12-graph-fts.md`):
+
+- **Graph CSR segments** (`CsrSegment::write_to_file`) used a bare
+  `std::fs::write` — no fsync at all, and the final path was
+  overwritten in place instead of replaced via rename. A crash
+  mid-write left a torn segment directly at the path `GraphManifest`
+  already references. Proven with a concurrent-writer regression test
+  that reliably caught a torn read (`InvalidData("data shorter than
+  header")`) against the pre-fix code.
+- **Text sidecars** (`save_text_index_metadata`, `save_fst_sidecar`)
+  and the **vector index metadata sidecar**
+  (`save_index_metadata_v3`) already did temp-write + fsync + rename,
+  but never fsync'd the parent directory — on `data=ordered`-journaled
+  filesystems a crash between rename and dir-fsync can revert the
+  directory entry to the old name even though `rename()` returned
+  success.
+- **FST term-dict sidecar wired into recovery**:
+  `TextStore::load_fst_sidecars` had zero callers — durably written at
+  every `FT.COMPACT`, never read back, so fuzzy/prefix queries
+  silently brute-forced the HashMap on every restart. Now called
+  during shard startup recovery right after text indexes are restored
+  from their sidecar metadata.
+
+Ref: `.planning/reviews/kernel-m2-brief-2026-07-12.md` (K3, stage 1).
 
 ### Fixed — read-only replicas accepted client-issued `WS`/`MQ`/`TEMPORAL.*` writes (Wave B readonly-enforcement, task #34 follow-up)
 
