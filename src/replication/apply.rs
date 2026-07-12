@@ -461,13 +461,40 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
         return;
     };
 
+    // Replicas configured with fewer logical dbs than the master clamp the
+    // payload's db index — same posture as the generic KV clamp in
+    // `apply_local` above. Without this, `MqApplyTarget::mq_databases_mut()
+    // .get_mut(out_of_range)` silently no-ops: CREATE would register the
+    // queue but never create the stream, and PUSH/POP/ACK would be dropped.
+    // (Boot-time WAL replay never needs this — a shard replays its OWN
+    // records, whose db indices are valid by construction.)
+    let db_count = s.databases.len();
+    fn clamp_mq_db(db_count: usize, db_index: u32) -> usize {
+        let idx = (db_index as usize).min(db_count.saturating_sub(1));
+        if idx != db_index as usize {
+            tracing::debug!(
+                "replica apply: MQ db {} clamped to {} ({} dbs on this shard)",
+                db_index,
+                idx,
+                db_count
+            );
+        }
+        idx
+    }
+
     let applied = if cmd.eq_ignore_ascii_case(MQ_REPL_CREATE) {
         decode_mq_create(payload).map(|(db_index, key, mdc)| {
-            apply_mq_create(s, db_index as usize, &key, mdc);
+            apply_mq_create(s, clamp_mq_db(db_count, db_index), &key, mdc);
         })
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_PUSH) {
         decode_mq_push(payload).map(|(db_index, key, ms, seq, fields)| {
-            apply_mq_push(s, db_index as usize, &key, StreamId { ms, seq }, fields);
+            apply_mq_push(
+                s,
+                clamp_mq_db(db_count, db_index),
+                &key,
+                StreamId { ms, seq },
+                fields,
+            );
         })
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_POP) {
         decode_mq_pop(payload).map(|(db_index, key, last_delivered, claimed, dlq)| {
@@ -492,7 +519,7 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
                 .collect();
             apply_mq_pop(
                 s,
-                db_index as usize,
+                clamp_mq_db(db_count, db_index),
                 &key,
                 StreamId {
                     ms: last_delivered.0,
@@ -504,7 +531,12 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
         })
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_ACK) {
         decode_mq_ack(payload).map(|(db_index, key, ms, seq)| {
-            apply_mq_ack(s, db_index as usize, &key, StreamId { ms, seq });
+            apply_mq_ack(
+                s,
+                clamp_mq_db(db_count, db_index),
+                &key,
+                StreamId { ms, seq },
+            );
         })
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_TRIGGER) {
         decode_mq_trigger(payload).map(|(trig_key, queue_key, callback_cmd, debounce_ms)| {

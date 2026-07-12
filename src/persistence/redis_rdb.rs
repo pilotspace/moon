@@ -1779,8 +1779,13 @@ mod tests {
             if read_redis_string(&mut cursor).is_err() {
                 continue;
             }
-            let _ = read_rdb_entry(&mut cursor, RDB_TYPE_STREAM_MOON, None);
-            // No panic reaching here is the assertion.
+            // Every strict prefix of the stream payload must be REJECTED —
+            // the encoding is a fixed sequence of length-prefixed fields, so
+            // a truncated read always hits EOF before completing.
+            assert!(
+                read_rdb_entry(&mut cursor, RDB_TYPE_STREAM_MOON, None).is_err(),
+                "truncated stream encoding at byte {cut} was accepted"
+            );
         }
     }
 }
