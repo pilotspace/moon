@@ -1,9 +1,12 @@
 name: CodeQL
 
 on:
+  # PR runs removed (2026-07-13 CI optimization): CodeQL is a full
+  # instrumented build (20-40 min, the slowest job on every PR) and is
+  # audit/supply-chain tooling, not a per-PR review gate. Main-push +
+  # weekly keeps continuous coverage; findings surface in the Security
+  # tab either way.
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     - cron: '0 6 * * 1'
