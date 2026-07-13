@@ -3,10 +3,28 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only changes don't need the Rust matrix. A push/PR is skipped
+    # only when EVERY changed file matches — any code file still triggers
+    # the full run. CHANGELOG.md matches '**.md', but code PRs always touch
+    # code too, so only genuinely docs-only PRs are skipped.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.planning/**'
+      - '.add/**'
+      - 'mkdocs.yml'
+      - 'LICENSE*'
   pull_request:
     branches: [main]
-  # Manual trigger: lets the main-push-only jobs (check-windows,
-  # check-console) run against any branch before merging.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.planning/**'
+      - '.add/**'
+      - 'mkdocs.yml'
+      - 'LICENSE*'
+  # Manual trigger: lets the main-push-only jobs (check-macos,
+  # check-windows, check-console) run against any branch before merging.
   workflow_dispatch: {}
 
 concurrency:
@@ -65,23 +83,27 @@ jobs:
   # Clippy checks compile the crate; test reuses those artifacts via
   # cargo's incremental cache in the same runner. Saves ~5 min vs
   # separate jobs that each compile from scratch.
+  # Runs on the self-hosted moon-dev runner (OrbStack VM, aarch64 Linux):
+  # zero queue time vs the org-wide hosted-runner concurrency cap, and a
+  # persistent CARGO_TARGET_DIR outside the runner workspace (checkout's
+  # git clean can't wipe it) makes warm builds incremental — no cache
+  # download/upload at all. Fork-PR safety: repo requires manual approval
+  # for ALL outside-collaborator workflow runs. If the runner is offline
+  # the job queues — bring the VM up or retag runs-on to ubuntu-latest.
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, moon-dev]
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/check
+      # Spawned test servers must not trip the diskfull write-pause on the
+      # VM's shared-volume mounts.
+      MOON_DISK_FREE_MIN_PCT: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Cache key covers all 3 feature combos so incremental builds hit.
-          # No Cargo.lock hash in the key (2026-07-13): rust-cache already
-          # invalidates changed deps via its internal lockfile-aware restore;
-          # hashing the lock into the key cold-started every job on each
-          # dependency bump.
-          shared-key: check
 
       # Clippy (3 feature configurations — shares compilation between runs)
       - name: Clippy (default)
@@ -107,15 +129,24 @@ jobs:
         timeout-minutes: 5
 
   # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
+  # Main-push only (2026-07-13 queue-killer round): macOS runners are the
+  # scarcest hosted pool and were the long pole on every PR. Development
+  # happens on macOS locally anyway; regressions still surface on every
+  # main push, and any branch can opt in via workflow_dispatch.
   check-macos:
     name: Check (macOS)
     runs-on: macos-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
@@ -146,12 +177,16 @@ jobs:
     name: Check (Windows)
     runs-on: windows-latest
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows
@@ -221,9 +256,13 @@ jobs:
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv
@@ -237,9 +276,13 @@ jobs:
     name: Memory steady-state gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: memory-gate
