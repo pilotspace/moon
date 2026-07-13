@@ -120,7 +120,10 @@ jobs:
         # (profile "ci" in .config/nextest.toml). Doctests are not run by
         # nextest — covered by the separate --doc step below.
         run: cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc
-        timeout-minutes: 15
+        # 30m not 15m: the step budget includes compiling all test binaries,
+        # and a cold CARGO_TARGET_DIR on the self-hosted VM exceeds 15m.
+        # Warm runs finish in a few minutes.
+        timeout-minutes: 30
       - name: Doctests
         run: cargo test --doc --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 5
