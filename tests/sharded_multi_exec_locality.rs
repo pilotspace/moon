@@ -25,7 +25,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use moon::shard::dispatch::{graph_to_shard, key_to_shard};
+#[cfg(feature = "graph")]
+use moon::shard::dispatch::graph_to_shard;
+use moon::shard::dispatch::key_to_shard;
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
@@ -353,6 +355,7 @@ fn single_shard_unaffected() {
 /// Rows array from a GRAPH.QUERY reply (`[headers, rows, stats]`), returning
 /// just the row count — enough to prove presence/absence without depending
 /// on cell encoding.
+#[cfg(feature = "graph")]
 fn graph_row_count(c: &mut Client, graph: &str, cypher: &str) -> usize {
     match c.cmd(&["GRAPH.QUERY", graph, cypher]) {
         Reply::Array(outer) => match outer.get(1) {
@@ -368,6 +371,7 @@ fn graph_row_count(c: &mut Client, graph: &str, cypher: &str) -> usize {
 /// every run since the hash function is pure and the candidate list is
 /// fixed, unlike relying on which shard a client connection happens to land
 /// on.
+#[cfg(feature = "graph")]
 fn pick_kv_and_graph_on_different_shards(num_shards: usize) -> (String, String) {
     for i in 0..256u32 {
         let key = format!("txnglocxs:{i}");
@@ -391,6 +395,8 @@ fn pick_kv_and_graph_on_different_shards(num_shards: usize) -> (String, String) 
 /// misclassified `SingleShard(kv_owner)` (or `Keyless`, ignoring the KV key
 /// entirely for a graph-only body) and the `GRAPH.ADDNODE` durably applied
 /// to the WRONG shard's `graph_store`.
+#[cfg(feature = "graph")]
+#[cfg(feature = "graph")]
 #[test]
 fn graph_leg_cross_shard_rejected() {
     let Some(m) = spawn_moon("4") else { return };
@@ -440,6 +446,8 @@ fn graph_leg_cross_shard_rejected() {
 /// `graph_to_shard` — if the write had landed on the wrong shard (the
 /// pre-fix `Keyless` bug: always the connection's OWN current shard), this
 /// read would see nothing.
+#[cfg(feature = "graph")]
+#[cfg(feature = "graph")]
 #[test]
 fn graph_only_txn_routes_to_true_owner() {
     let Some(m) = spawn_moon("4") else { return };
