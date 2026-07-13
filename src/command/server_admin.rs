@@ -932,12 +932,18 @@ impl VacuumCounts {
 /// - `freeze`: when `true`, calls `mark_old_snapshots_killed` with
 ///   `threshold = Duration::ZERO` (kills ALL non-system snapshots).
 /// - `mvcc_prune_margin`: `oldest_snapshot - margin` is the GC floor.
+/// - `disk_offload_dir` / `shard_id`: kernel M3 K2 review round 2 / P0-2.
+///   Used ONLY to locate this shard's `ShardControlFile` for the WAL
+///   recycle pass below — see that pass's own doc for why the unified
+///   floor register must gate this exactly like autovacuum Pass C.
 fn run_vacuum_passes(
     vector_store: &mut crate::vector::store::VectorStore,
     manifest: Option<&mut ShardManifest>,
     wal: Option<&mut WalWriterV3>,
     freeze: bool,
     mvcc_prune_margin: u64,
+    disk_offload_dir: Option<&std::path::Path>,
+    shard_id: usize,
 ) -> VacuumCounts {
     let now = Instant::now();
     let mut counts = VacuumCounts::default();
@@ -985,17 +991,65 @@ fn run_vacuum_passes(
 
     // ── 6. WAL aggressive recycle (P6) ──────────────────────────────────────
     // Only runs when WAL is configured AND total WAL exceeds max_wal_bytes.
+    //
+    // Kernel M3 K2 review round 2 / P0-2: this used to recycle to
+    // `w.current_lsn()` — the LIVE, uncheckpointed LSN counter — with NO
+    // disk-offload gate at all. That is not a durable floor: in legacy
+    // mode it deleted the sole durable copy of live KV/graph/plane data on
+    // a routine client command (legacy has no checkpoint/snapshot
+    // protocol whatsoever); in disk-offload mode it deleted
+    // not-yet-checkpointed pages/graph writes recycle should never touch.
+    // The "unified floor register" K2 claims to be does not exist while a
+    // client-reachable command bypasses it — VACUUM must use EXACTLY the
+    // same recycle floor as autovacuum Pass C
+    // (`AutovacuumDaemon::run_tick`, `src/shard/autovacuum.rs`):
+    // `min(control.last_checkpoint_lsn, control.graph_floor_lsn)` in
+    // checkpoint-backed mode, refused entirely in legacy mode.
     if let Some(w) = wal {
         let should_recycle = w
             .stats()
             .map(|s| s.total_bytes > w.max_wal_bytes())
             .unwrap_or(false);
         if should_recycle {
-            let redo_lsn = w.current_lsn();
-            match w.recycle_aggressive(redo_lsn) {
-                Ok(stats) => counts.wal_segments_recycled = stats.segments_recycled as u64,
-                Err(e) => {
-                    tracing::warn!("VACUUM: WAL recycle_aggressive failed: {e}");
+            match disk_offload_dir {
+                None => {
+                    // Legacy (non-disk-offload) mode: no checkpoint or
+                    // plane-snapshot protocol exists at all, so there is no
+                    // durable floor to recycle against — mirror Pass C's
+                    // skip-and-warn (task #43) exactly, including the same
+                    // shared counter, so operators see WHY a routine
+                    // VACUUM freed 0 WAL segments here (visible via `INFO`
+                    // / `DEBUG RECLAMATION`'s `# Reclamation` section).
+                    crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        "VACUUM: WAL recycle SKIPPED — this shard has no checkpoint \
+                         floor to recycle against (legacy/non-disk-offload mode); \
+                         recycling here would risk permanently losing graph/ \
+                         workspace/MQ/temporal history that has no snapshot outside \
+                         the WAL. Enable --disk-offload for bounded WAL growth."
+                    );
+                }
+                Some(dir) => {
+                    let shard_dir = dir.join(format!("shard-{shard_id}"));
+                    let ctrl_path = crate::persistence::control::ShardControlFile::control_path(
+                        &shard_dir, shard_id,
+                    );
+                    // Same-shape fallback as autovacuum's first tick
+                    // (before any checkpoint has ever completed): no
+                    // control file yet -> floor 0, i.e. recycle nothing
+                    // this call. Maximally conservative, self-heals once
+                    // Finalize runs.
+                    let redo_lsn = crate::persistence::control::ShardControlFile::read(&ctrl_path)
+                        .ok()
+                        .map(|c| c.last_checkpoint_lsn.min(c.graph_floor_lsn))
+                        .unwrap_or(0);
+                    match w.recycle_aggressive(redo_lsn) {
+                        Ok(stats) => counts.wal_segments_recycled = stats.segments_recycled as u64,
+                        Err(e) => {
+                            tracing::warn!("VACUUM: WAL recycle_aggressive failed: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -1049,6 +1103,16 @@ fn run_vacuum_passes(
 /// - Under disk-pause: runs normally (VACUUM reclaims, does not write data).
 /// - During active checkpoint: WAL recycle is idempotent (P6 `recycle_aggressive`
 ///   is a no-op if no segments are over the threshold).
+/// - **Legacy mode (`--disk-offload disable`):** WAL recycle is REFUSED
+///   entirely (kernel M3 K2 review round 2 / P0-2) — legacy mode has no
+///   checkpoint/plane-snapshot protocol, so there is no durable floor to
+///   recycle against; `wal_segments_recycled` stays 0 and
+///   `RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` increments (same
+///   counter, same reasoning as autovacuum Pass C's legacy-mode skip).
+/// - **Checkpoint-backed mode:** recycles to
+///   `min(control.last_checkpoint_lsn, control.graph_floor_lsn)` — the
+///   exact same floor Pass C uses — never the live, uncheckpointed
+///   `wal.current_lsn()`.
 ///
 /// ## FREEZE warning
 /// `VACUUM (FREEZE)` forcibly kills ALL non-system MVCC snapshots on this shard,
@@ -1062,6 +1126,13 @@ pub fn vacuum(
     wal: Option<&mut WalWriterV3>,
     args: &[Frame],
     mvcc_prune_margin: u64,
+    // Kernel M3 K2 review round 2 / P0-2: `None` on the direct-dispatch
+    // callers (handler_single/handler_sharded/handler_monoio — `wal` is
+    // always `None` there too per this fn's own doc, so these are dead on
+    // that path), `Some(..)`/real shard id on the SPSC/console-gateway
+    // path where `wal` is real. See `run_vacuum_passes`'s WAL-recycle pass.
+    disk_offload_dir: Option<&std::path::Path>,
+    shard_id: usize,
 ) -> Frame {
     // Parse subcommand (optional first arg).
     let sub = args.first().and_then(|f| extract_bytes(f));
@@ -1091,7 +1162,15 @@ pub fn vacuum(
                     b"ERR syntax error: VACUUM (VERBOSE) takes no additional arguments",
                 ));
             }
-            let counts = run_vacuum_passes(vector_store, manifest, wal, false, mvcc_prune_margin);
+            let counts = run_vacuum_passes(
+                vector_store,
+                manifest,
+                wal,
+                false,
+                mvcc_prune_margin,
+                disk_offload_dir,
+                shard_id,
+            );
             counts.to_verbose_frame()
         }
 
@@ -1106,7 +1185,15 @@ pub fn vacuum(
                 "VACUUM (FREEZE): forcibly killing ALL active MVCC snapshots on this shard. \
                  In-flight TXN.BEGIN clients will receive 'snapshot too old' errors."
             );
-            let counts = run_vacuum_passes(vector_store, manifest, wal, true, mvcc_prune_margin);
+            let counts = run_vacuum_passes(
+                vector_store,
+                manifest,
+                wal,
+                true,
+                mvcc_prune_margin,
+                disk_offload_dir,
+                shard_id,
+            );
             counts.to_frame()
         }
 
@@ -1124,7 +1211,15 @@ pub fn vacuum(
 
         // ── Plain VACUUM ─────────────────────────────────────────────────────
         None => {
-            let counts = run_vacuum_passes(vector_store, manifest, wal, false, mvcc_prune_margin);
+            let counts = run_vacuum_passes(
+                vector_store,
+                manifest,
+                wal,
+                false,
+                mvcc_prune_margin,
+                disk_offload_dir,
+                shard_id,
+            );
             counts.to_frame()
         }
 
@@ -1548,7 +1643,7 @@ mod tests {
     #[test]
     fn vacuum_no_persistence_returns_array() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[], 1000);
+        let f = vacuum(&mut store, None, None, &[], 1000, None, 0);
         match f {
             Frame::Array(ref arr) => {
                 assert_eq!(arr.len(), 12, "expect 6 key/value pairs = 12 elements");
@@ -1573,7 +1668,7 @@ mod tests {
     #[test]
     fn vacuum_files_no_manifest_returns_zero() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[bulk(b"FILES")], 1000);
+        let f = vacuum(&mut store, None, None, &[bulk(b"FILES")], 1000, None, 0);
         match f {
             Frame::Array(ref arr) => {
                 assert_eq!(arr.len(), 2);
@@ -1592,7 +1687,7 @@ mod tests {
     #[test]
     fn vacuum_verbose_includes_diagnostic_lines() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[bulk(b"(VERBOSE)")], 1000);
+        let f = vacuum(&mut store, None, None, &[bulk(b"(VERBOSE)")], 1000, None, 0);
         match f {
             Frame::Array(ref arr) => {
                 // Must have at least 6 diagnostic lines + 12 kv pairs
@@ -1620,7 +1715,7 @@ mod tests {
     #[test]
     fn vacuum_freeze_returns_kv_array() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000);
+        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000, None, 0);
         match f {
             Frame::Array(ref arr) => {
                 assert_eq!(arr.len(), 12, "FREEZE must return 12-element kv array");
@@ -1639,6 +1734,8 @@ mod tests {
             None,
             &[bulk(b"VECTOR"), bulk(b"myidx")],
             1000,
+            None,
+            0,
         );
         match f {
             Frame::SimpleString(ref b) => {
@@ -1656,7 +1753,15 @@ mod tests {
     #[test]
     fn vacuum_graph_returns_pending() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[bulk(b"GRAPH"), bulk(b"g")], 1000);
+        let f = vacuum(
+            &mut store,
+            None,
+            None,
+            &[bulk(b"GRAPH"), bulk(b"g")],
+            1000,
+            None,
+            0,
+        );
         match f {
             Frame::SimpleString(ref b) => {
                 assert!(
@@ -1673,7 +1778,7 @@ mod tests {
     #[test]
     fn vacuum_unknown_subcommand_returns_error() {
         let mut store = crate::vector::store::VectorStore::new();
-        let f = vacuum(&mut store, None, None, &[bulk(b"BOGUS")], 1000);
+        let f = vacuum(&mut store, None, None, &[bulk(b"BOGUS")], 1000, None, 0);
         match f {
             Frame::Error(_) => {}
             _ => panic!("expected ERR for unknown VACUUM subcommand, got {f:?}"),
@@ -1686,7 +1791,7 @@ mod tests {
     fn vacuum_freeze_kills_active_snapshots() {
         let mut store = crate::vector::store::VectorStore::new();
         let _txn = store.txn_manager_mut().begin();
-        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000);
+        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000, None, 0);
         // Extract mvcc_snapshots_killed from returned array.
         let killed = match &f {
             Frame::Array(arr) => {
@@ -1729,6 +1834,161 @@ mod tests {
             }
             _ => panic!("expected BulkString from DEBUG RECLAMATION, got {f:?}"),
         }
+    }
+
+    // ── Kernel M3 K2 review round 2 / P0-2: VACUUM floor unification ───────
+
+    /// Count `*.wal` files under `wal_dir` (pattern:
+    /// `shard::autovacuum::tests::count_wal_segments`).
+    fn count_wal_segments(wal_dir: &std::path::Path) -> usize {
+        std::fs::read_dir(wal_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Build a `WalWriterV3` with enough sealed (non-active) segments to
+    /// exceed a tiny `max_wal_bytes` ceiling, so the recycle-eligibility
+    /// check in `run_vacuum_passes` fires (pattern:
+    /// `shard::autovacuum::tests::wal_writer_over_ceiling`).
+    fn wal_writer_over_ceiling(
+        wal_dir: &std::path::Path,
+    ) -> crate::persistence::wal_v3::segment::WalWriterV3 {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        let mut writer =
+            crate::persistence::wal_v3::segment::WalWriterV3::new(0, wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, 256);
+        for i in 0..80 {
+            writer.append(WalRecordType::Command, b"vacuum-p0-2 EARLY-MARKER");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        assert!(
+            writer.current_segment_sequence() >= 3,
+            "test setup must produce several sealed segments"
+        );
+        writer
+    }
+
+    /// P0-2 (drop-resurrection sibling finding): `VACUUM` in legacy
+    /// (non-disk-offload) mode used to recycle WAL segments against the
+    /// live, uncheckpointed `wal.current_lsn()` — deleting the sole
+    /// durable copy of unflushed data on a routine client command. Must
+    /// now refuse entirely, mirroring autovacuum Pass C's task #43 fix,
+    /// including the same shared blocked-counter.
+    #[test]
+    fn vacuum_legacy_mode_refuses_wal_recycle_and_counts_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = wal_writer_over_ceiling(&wal_dir);
+        let before_segments = count_wal_segments(&wal_dir);
+        let before_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut store = crate::vector::store::VectorStore::new();
+        // disk_offload_dir: None => legacy mode, no matter what `wal` holds.
+        let counts = run_vacuum_passes(&mut store, None, Some(&mut writer), false, 1000, None, 0);
+
+        assert_eq!(
+            counts.wal_segments_recycled, 0,
+            "legacy mode must recycle 0 segments via VACUUM"
+        );
+        let after_segments = count_wal_segments(&wal_dir);
+        assert_eq!(
+            after_segments, before_segments,
+            "legacy mode must not delete any WAL segment via VACUUM (P0-2)"
+        );
+        let after_blocked =
+            crate::command::info_reclamation::RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL
+                .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_blocked > before_blocked,
+            "legacy-mode VACUUM skip must be observable via \
+             RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL (same counter as Pass C)"
+        );
+    }
+
+    /// P0-2: `VACUUM` in checkpoint-backed (disk-offload) mode must recycle
+    /// to exactly the same floor as autovacuum Pass C —
+    /// `min(control.last_checkpoint_lsn, control.graph_floor_lsn)` read
+    /// from this shard's `ShardControlFile` — never the live
+    /// `wal.current_lsn()`. With both floors pinned to `u64::MAX` (a
+    /// checkpoint that has covered everything written), recycling must
+    /// actually happen.
+    #[test]
+    fn vacuum_disk_offload_mode_recycles_to_control_file_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let wal_dir = dir.join("shard-0").join("wal-v3");
+        let mut writer = wal_writer_over_ceiling(&wal_dir);
+        let before_segments = count_wal_segments(&wal_dir);
+
+        let shard_dir = dir.join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mut control = crate::persistence::control::ShardControlFile::new([0u8; 16]);
+        control.last_checkpoint_lsn = u64::MAX;
+        control.graph_floor_lsn = u64::MAX;
+        let ctrl_path = crate::persistence::control::ShardControlFile::control_path(&shard_dir, 0);
+        control.write(&ctrl_path).unwrap();
+
+        let mut store = crate::vector::store::VectorStore::new();
+        let counts = run_vacuum_passes(
+            &mut store,
+            None,
+            Some(&mut writer),
+            false,
+            1000,
+            Some(&dir),
+            0,
+        );
+
+        assert!(
+            counts.wal_segments_recycled > 0,
+            "disk-offload mode with a control-file floor covering everything \
+             must actually recycle via VACUUM (P0-2)"
+        );
+        let after_segments = count_wal_segments(&wal_dir);
+        assert!(
+            after_segments < before_segments,
+            "recycled segments must actually be removed from disk"
+        );
+    }
+
+    /// P0-2 edge case: disk-offload mode but no control file has ever been
+    /// written yet (very first VACUUM before any checkpoint completes).
+    /// Must be maximally conservative — floor 0, recycle nothing — not
+    /// panic or fall back to the unsafe live-LSN behavior.
+    #[test]
+    fn vacuum_disk_offload_mode_no_control_file_yet_recycles_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let wal_dir = dir.join("shard-0").join("wal-v3");
+        let mut writer = wal_writer_over_ceiling(&wal_dir);
+        let before_segments = count_wal_segments(&wal_dir);
+
+        let mut store = crate::vector::store::VectorStore::new();
+        let counts = run_vacuum_passes(
+            &mut store,
+            None,
+            Some(&mut writer),
+            false,
+            1000,
+            Some(&dir),
+            0,
+        );
+
+        assert_eq!(
+            counts.wal_segments_recycled, 0,
+            "no control file yet => floor 0 => recycle nothing"
+        );
+        assert_eq!(count_wal_segments(&wal_dir), before_segments);
     }
 }
 

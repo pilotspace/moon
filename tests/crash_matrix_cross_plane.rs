@@ -70,8 +70,14 @@
 //! atomicity check, a substring-based benign-error allowlist) — see git
 //! history for the fix-by-fix trail. Kernel M3 stage 2 (K2, task #53) then
 //! root-caused and fixed former RED cell 4 (checkpoint-Finalize graph total
-//! loss), flipping its 2 cells GREEN. **40 cells total: 31 GREEN by
-//! default, 9 RED.**
+//! loss), flipping its 2 cells GREEN. A K2 adversarial review round then
+//! found and fixed a second graph-durability P0 (drop-resurrection across
+//! repeated checkpoints — an empty-but-dirty graph store's checkpoint save
+//! was wrongly short-circuited) and added 2 new regression cells,
+//! `cross_plane_prod_s1_graph_drop_survives_repeated_checkpoints` /
+//! `cross_plane_prod_s4_graph_drop_survives_repeated_checkpoints`, both
+//! GREEN by default (RED-first verified against the pre-fix code before
+//! the fix landed). **42 cells total: 33 GREEN by default, 9 RED.**
 //!
 //! RED cells are gated by `harness::red_guard` — NOT by
 //! `#[ignore = "RED: ..."]` alone, because this suite's own execution
@@ -168,7 +174,7 @@
 //! (pre-fix baseline: prod_s1 hit at iteration 11/20, prod_s4 at iteration
 //! 7/20) — these two tests now run ungated (green-only default suite).
 //!
-//! **Every other cell (31/40) is GREEN** — including, notably,
+//! **Every other cell (33/42) is GREEN** — including, notably,
 //! `kv_isolated`/`kv_spilled_isolated`/`vector_isolated` on ALL configs (KV
 //! and vector-HSET durability via the AOF; `kv_spilled_isolated`'s filler
 //! sizing was hardened in review round 3 — see

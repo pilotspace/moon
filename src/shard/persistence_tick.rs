@@ -1045,7 +1045,12 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     // was a no-op (checkpoint already active) or failed silently, using the
     // current WAL head would be unsafe — we would recycle segments whose dirty
     // pages have not been flushed to data files yet.
-    let redo_lsn = control.last_checkpoint_lsn;
+    //
+    // Kernel M3 K2 review round 2 / P1-1: same min-across-planes floor as
+    // every other recycle call site (Finalize, Pass C, VACUUM) — KV alone
+    // is not enough, the graph engine's own snapshot floor must also cover
+    // whatever this emergency path is about to recycle.
+    let redo_lsn = control.last_checkpoint_lsn.min(control.graph_floor_lsn);
     match wal.recycle_aggressive(redo_lsn) {
         Ok(stats) if stats.segments_recycled > 0 => {
             tracing::info!(

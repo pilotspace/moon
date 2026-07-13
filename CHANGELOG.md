@@ -56,7 +56,10 @@ respectively). `cross_plane_prod_s1_mixed_all_planes_mid_checkpoint` /
 the crash-matrix suite's default-GREEN count moves from 29/40 to 31/40 (9
 RED cells remain: task #52's cross-store TXN graph leg and the legacy-mode
 graph-reconstruction/MQ-resurrection findings above, all still tracked
-separately and explicitly out of scope for this stage).
+separately and explicitly out of scope for this stage). A subsequent
+adversarial review round found a second graph-durability P0 plus a VACUUM
+floor bypass on top of this fix — see the next section — which add 2 more
+GREEN cells, moving the suite to 42 cells total (33 GREEN by default).
 
 `src/persistence/recovery.rs`'s PITR path threads the three new floors
 through unchanged on replay. New unit tests: control-file round-trip +
@@ -71,6 +74,67 @@ No per-write hot path touched — `ShardControlFile` is only written at
 checkpoint `Finalize` and read at Pass C/recovery, both off the command
 dispatch path; a VM hot-path A/B bench was judged unnecessary for this
 change and not run.
+
+### Fixed — K2 adversarial review round: graph drop-resurrection + VACUUM floor bypass (kernel M3 stage 2)
+
+An adversarial review of the floor-register work above (SHIP-WITH-FIXES
+verdict) found two P0s and a P1 in the same area before the stage could
+close:
+
+**P0 — `GRAPH.DELETE`'d graphs could resurrect across repeated
+checkpoints.** `persist_graph_at_checkpoint`'s short-circuit
+(`!store.is_dirty() || store.graph_count() == 0 -> return true`) skipped
+`save_graph_store` whenever a delete emptied the graph map — even though
+the delete itself marks the store dirty via the WAL drain. `graph_count()
+== 0` and "nothing to persist" are independent conditions: an
+empty-but-dirty store still needs `graph_metadata.json` rewritten to
+reflect zero graphs at the new `snapshot_lsn`. With the skip in place,
+metadata stayed stale forever (dirty never clears without a real save)
+while every later checkpoint kept advancing `control.graph_floor_lsn` past
+the WAL record holding the `DELETE` — once that segment was recycled, a
+crash+restart loaded the stale metadata with nothing left in the WAL to
+replay the deletion. Fixed by dropping `graph_count() == 0` from the
+short-circuit; dirty alone gates it now, and `save_graph_store`'s per-graph
+loop correctly no-ops on zero graphs while `store.save_metadata` still
+durably rewrites the (now-empty) graph list. New regression cells
+`cross_plane_prod_s1_graph_drop_survives_repeated_checkpoints` /
+`_s4_...` (`tests/crash_matrix_cross_plane/scenarios.rs`), RED-first
+verified against the pre-fix binary at both shard counts (two earlier
+padding designs — a live second graph, then MQ pushes — were each proven
+NOT to reproduce the bug before a third, using throwaway create+delete
+graph cycles as padding, did).
+
+**P0 — manual `VACUUM` bypassed the unified floor register.**
+`run_vacuum_passes` (`src/command/server_admin.rs`) recycled WAL to
+`w.current_lsn()` unconditionally — a client-reachable path around the
+`min(kv_floor, graph_floor)` invariant K2 established for the checkpoint
+and autovacuum recycle sites. Fixed by threading the control-file floors
+into `VACUUM`: in checkpoint-backed (disk-offload) mode it now recycles to
+`min(last_checkpoint_lsn, graph_floor_lsn)` read from the shard's
+`ShardControlFile`, mirroring autovacuum Pass C; in legacy mode (no
+disk-offload dir — no snapshot format to bound WS/MQ recycling against) it
+now REFUSES to recycle WAL at all and increments the shared
+`RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL` counter (surfaced in
+`INFO`/`DEBUG RECLAMATION`'s `# Reclamation` section), the same
+skip-and-warn shape Pass C already uses for the identical precondition.
+
+**P1 — the WAL-overflow emergency recycle path** (`src/shard/
+persistence_tick.rs`) used `last_checkpoint_lsn` alone; now
+`.min(control.graph_floor_lsn)`, closing the same gap in the emergency
+code path.
+
+Plus two P2s: `GraphManifest::save` (`src/graph/manifest.rs`) now routes
+through the shared `atomic_write_durable` helper instead of a hand-rolled
+temp+fsync+rename+dir-fsync sequence (behavior-equivalent); and a stale
+doc comment on `scenarios::mixed_mid_checkpoint` that still described the
+Finalize-ordering bug as unfixed was corrected.
+
+Re-gated after these fixes: the crash-matrix suite (42 cells, 33 GREEN by
+default, including the 2 new regression cells), `mixed_mid_checkpoint`
+`MOON_CRASH_MATRIX_RED=1 MOON_CRASH_MATRIX_ITERS=20` soak at both shard
+counts (re-verified since the P0 fix touches the same `Finalize` path),
+`g4`/`g5` graph durability cells, `cargo fmt --check`, and both clippy
+matrices (default features; `runtime-tokio,jemalloc`).
 
 ### Added — cross-plane kill-9 crash-matrix suite (kernel M3 stage 1 / G1)
 

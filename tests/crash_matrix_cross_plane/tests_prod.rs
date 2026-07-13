@@ -110,6 +110,14 @@ fn cross_plane_prod_s1_mixed_all_planes_mid_checkpoint() {
     scenarios::mixed_mid_checkpoint(&Config::PROD_S1);
 }
 
+/// Task #53 review round 2 / P0-1 regression cell — see
+/// `scenarios::graph_drop_survives_repeated_checkpoints`'s doc.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s1_graph_drop_survives_repeated_checkpoints() {
+    scenarios::graph_drop_survives_repeated_checkpoints(&Config::PROD_S1);
+}
+
 #[test]
 #[ignore]
 fn cross_plane_prod_s1_mixed_all_planes_concurrent_burst_no_corruption() {
@@ -179,6 +187,14 @@ fn cross_plane_prod_s4_mixed_all_planes_synced() {
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_prod_s4_mixed_all_planes_mid_checkpoint() {
     scenarios::mixed_mid_checkpoint(&Config::PROD_S4);
+}
+
+/// Task #53 review round 2 / P0-1 regression cell — see
+/// `scenarios::graph_drop_survives_repeated_checkpoints`'s doc.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s4_graph_drop_survives_repeated_checkpoints() {
+    scenarios::graph_drop_survives_repeated_checkpoints(&Config::PROD_S4);
 }
 
 #[test]

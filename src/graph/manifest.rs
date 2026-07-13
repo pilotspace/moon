@@ -89,24 +89,17 @@ impl GraphManifest {
     }
 
     /// Write this manifest as pretty-printed JSON to `path` atomically.
-    /// Uses write-to-temp + fsync + rename to prevent corruption on crash.
+    ///
+    /// Kernel M3 K2 review round 2 / P2-2 (behavior-equivalent refactor):
+    /// routed through the shared `atomic_write_durable` helper
+    /// (`src/persistence/atomic.rs`, K3) instead of a hand-rolled
+    /// temp+fsync+rename+dir-fsync sequence — same durability contract,
+    /// one fewer independent implementation of it to keep in sync.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        use std::io::Write;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp_path = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, path)?;
-        // Fsync the parent directory to ensure the rename metadata is durable.
-        // Without this, a crash between rename and directory fsync loses the manifest.
-        // Routed through the cross-platform helper (no-op on Windows); errors
-        // propagate so callers see a save() that is not actually durable.
-        if let Some(parent) = path.parent() {
-            crate::persistence::fsync::fsync_directory(parent)?;
-        }
-        Ok(())
+        crate::persistence::atomic::atomic_write_durable(path, json.as_bytes())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Load a manifest from a JSON file at `path`.

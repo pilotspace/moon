@@ -294,7 +294,26 @@ pub fn persist_graph_at_checkpoint(
     shard_id: usize,
     snapshot_lsn: u64,
 ) -> bool {
-    if !store.is_dirty() || store.graph_count() == 0 {
+    // Task #53 review round 2 / P0-1: `graph_count() == 0` must NOT be part
+    // of this short-circuit. A GRAPH.DELETE that empties the graph map
+    // marks the store dirty via the WAL drain but drives `graph_count()`
+    // to 0 in the SAME tick — the old `!is_dirty() || graph_count() == 0`
+    // condition then short-circuited on the `== 0` disjunct and skipped
+    // `save_graph_store` entirely, leaving `graph_metadata.json` on disk
+    // stale (still describing the graph as it existed before the delete).
+    // Later checkpoints kept advancing `control.graph_floor_lsn` past the
+    // WAL record holding the DELETE (nothing here ever re-checks
+    // `is_dirty` once it's been wrongly treated as "nothing to persist"),
+    // so recycle eventually freed the segment holding that DELETE — crash,
+    // and recovery loads the stale pre-delete metadata with no WAL record
+    // left to replay the deletion: the dropped graph resurrects. Dirty
+    // alone is now the only gate; an empty-but-dirty store still calls
+    // `save_graph_store` below, whose per-graph loop correctly no-ops on
+    // zero graphs while `store.save_metadata` still rewrites
+    // `graph_metadata.json` to reflect zero graphs at the new
+    // `snapshot_lsn` — advancing the floor and clearing dirty only once
+    // that fact is durable.
+    if !store.is_dirty() {
         return true;
     }
     // No persistence dir (e.g. --appendonly no): graph writes carry no

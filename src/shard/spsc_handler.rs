@@ -568,6 +568,8 @@ pub(crate) fn handle_shard_message_shared(
                             wal_writer.as_mut(),
                             args,
                             mvcc_prune_margin,
+                            disk_offload_dir,
+                            shard_id,
                         )
                     });
                     let _ = reply_tx.send(frame);

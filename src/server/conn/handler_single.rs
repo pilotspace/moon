@@ -2097,6 +2097,8 @@ pub async fn handle_connection(
                                                 None, // wal_v3 — not available here
                                                 d_args,
                                                 crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
+                                                None, // disk_offload_dir — dead: wal is None on this path too
+                                                0,    // shard_id — dead, see above
                                             );
                                             drop(vs_guard);
                                             responses[resp_idx] = response;
@@ -2399,6 +2401,8 @@ pub async fn handle_connection(
                                                 None, // wal_v3 — not available here
                                                 d_args,
                                                 crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
+                                                None, // disk_offload_dir — dead: wal is None on this path too
+                                                0,    // shard_id — dead, see above
                                             );
                                             drop(vs_guard);
                                             responses[resp_idx] = response;
