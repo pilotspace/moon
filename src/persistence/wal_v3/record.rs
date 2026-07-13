@@ -94,6 +94,14 @@ pub enum WalRecordType {
     /// durable/replayed as opaque data; the callback is never fired during
     /// replay (only live `MQ.PUSH` debounce arming fires it).
     MqTrigger = 0x74,
+    /// MQ durable-stream tombstone record (kernel M3 stage 3 / task #46).
+    /// Emitted when a durable MQ stream is removed via generic keyspace
+    /// `DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL` — without this, `replay_mq_wal`
+    /// has no way to represent "this queue was deleted after these pushes"
+    /// and re-materializes full pre-delete content on every restart. Replay
+    /// applies it strictly in WAL order, so it only kills PRIOR records for
+    /// this `(db_index, key)`; a later `MqCreate` re-materializes normally.
+    MqDrop = 0x75,
 }
 
 impl WalRecordType {
@@ -124,6 +132,7 @@ impl WalRecordType {
             0x72 => Some(Self::MqPush),
             0x73 => Some(Self::MqPop),
             0x74 => Some(Self::MqTrigger),
+            0x75 => Some(Self::MqDrop),
             _ => None,
         }
     }
@@ -526,11 +535,12 @@ mod tests {
         assert_eq!(WalRecordType::MqPush as u8, 0x72);
         assert_eq!(WalRecordType::MqPop as u8, 0x73);
         assert_eq!(WalRecordType::MqTrigger as u8, 0x74);
+        assert_eq!(WalRecordType::MqDrop as u8, 0x75);
 
         // from_u8 roundtrips
         for &v in &[
             0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x40, 0x41, 0x42, 0x50,
-            0x52, 0x53, 0x60, 0x61, 0x70, 0x71,
+            0x52, 0x53, 0x60, 0x61, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }

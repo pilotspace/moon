@@ -435,12 +435,13 @@ struct MqReplayStats {
     pop: u64,
     ack: u64,
     trigger: u64,
+    drop: u64,
     skipped: u64,
 }
 
 impl MqReplayStats {
     fn total(&self) -> u64 {
-        self.create + self.push + self.pop + self.ack + self.trigger
+        self.create + self.push + self.pop + self.ack + self.trigger + self.drop
     }
 }
 
@@ -713,6 +714,31 @@ pub(crate) fn apply_mq_trigger<T: MqApplyTarget>(
     reg.register(bytes::Bytes::from(trig_key), entry);
 }
 
+/// Apply a single decoded MqDrop record: tombstones a durable MQ stream
+/// deleted via generic keyspace `DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL` (kernel
+/// M3 stage 3 / task #46). Removes the registry entry (by key — the
+/// registry itself carries no db index, mirroring `apply_mq_create`'s
+/// existing db-lax registry design) and deletes the stream from the
+/// record's own db. Idempotent: a key with no registry entry / no stream is
+/// a harmless no-op (e.g. replaying a Drop for a stream a prior malformed
+/// record already failed to (re)create).
+///
+/// # Ordering
+///
+/// Applied strictly in WAL order alongside every other MQ record (task #46
+/// review): a `Drop` only undoes records that precede it for this key — a
+/// LATER `MqCreate` for the same key re-materializes normally, so
+/// create -> drop -> create survives a kill-9 with the second incarnation
+/// intact.
+pub(crate) fn apply_mq_drop<T: MqApplyTarget>(target: &mut T, db_index: usize, key: &[u8]) {
+    if let Some(reg) = target.mq_durable_queue_registry_mut().as_mut() {
+        reg.remove(key);
+    }
+    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
+        let _ = db.remove_counting_cold(key);
+    }
+}
+
 /// Decode + dispatch one MQ WAL record to its `apply_mq_*` handler,
 /// skip-and-warn on any decode failure (malformed payload OR an
 /// unsupported/future version byte).
@@ -791,6 +817,13 @@ fn apply_mq_wal_record(
             }
             None => warn_skip_mq_record(shard_id, "MqTrigger", payload, stats),
         },
+        WalRecordType::MqDrop => match crate::mq::wal::decode_mq_drop(payload) {
+            Some((db_index, key)) => {
+                apply_mq_drop(init, db_index as usize, &key);
+                stats.drop += 1;
+            }
+            None => warn_skip_mq_record(shard_id, "MqDrop", payload, stats),
+        },
         _ => {}
     }
 }
@@ -863,7 +896,8 @@ pub fn replay_mq_wal(
                 | WalRecordType::MqAck
                 | WalRecordType::MqPush
                 | WalRecordType::MqPop
-                | WalRecordType::MqTrigger => {
+                | WalRecordType::MqTrigger
+                | WalRecordType::MqDrop => {
                     handle_record(record.record_type, &record.payload);
                 }
                 WalRecordType::Command => {
@@ -873,7 +907,8 @@ pub fn replay_mq_wal(
                             | WalRecordType::MqAck
                             | WalRecordType::MqPush
                             | WalRecordType::MqPop
-                            | WalRecordType::MqTrigger => {
+                            | WalRecordType::MqTrigger
+                            | WalRecordType::MqDrop => {
                                 handle_record(inner.record_type, &inner.payload);
                             }
                             _ => {}
@@ -903,13 +938,14 @@ pub fn replay_mq_wal(
         if stats.total() > 0 || stats.skipped > 0 {
             tracing::info!(
                 "Shard {}: replayed MQ WAL — {} create, {} push, {} pop, {} ack, \
-                 {} trigger record(s), {} skipped (malformed/unsupported version)",
+                 {} trigger, {} drop record(s), {} skipped (malformed/unsupported version)",
                 shard_id,
                 stats.create,
                 stats.push,
                 stats.pop,
                 stats.ack,
                 stats.trigger,
+                stats.drop,
                 stats.skipped,
             );
         }
@@ -1870,6 +1906,185 @@ mod tests {
             db.get_or_create_stream(&queue_key).unwrap().entries.len(),
             1,
             "a well-formed record after a skipped malformed one must still apply"
+        );
+    }
+
+    // ── MqDrop tombstone replay (kernel M3 stage 3 / task #46) ──────────────
+
+    #[test]
+    fn test_replay_mq_wal_drop_tombstones_stream_and_registry() {
+        // Create + push, then Drop: the stream must be gone from the db AND
+        // the registry entry removed after replay.
+        use crate::mq::wal::{encode_mq_create, encode_mq_drop, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"dropped-queue".to_vec();
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 3)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        1,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"v"),
+                        )],
+                    ),
+                ),
+                (WalRecordType::MqDrop, encode_mq_drop(0, &queue_key)),
+            ],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        assert!(
+            inits[0]
+                .durable_queue_registry
+                .as_ref()
+                .is_none_or(|reg| reg.get(&queue_key).is_none()),
+            "MqDrop must remove the registry entry"
+        );
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        assert!(
+            db.get_stream_mut(&queue_key).unwrap().is_none(),
+            "MqDrop must remove the stream from the db"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_drop_only_kills_prior_records() {
+        // create -> drop -> create -> push must leave the SECOND
+        // incarnation intact: a Drop only undoes records that precede it in
+        // WAL order, never a later MqCreate/MqPush for the same key.
+        use crate::mq::wal::{encode_mq_create, encode_mq_drop, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"recreated-queue".to_vec();
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 3)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        1,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"old"),
+                        )],
+                    ),
+                ),
+                (WalRecordType::MqDrop, encode_mq_drop(0, &queue_key)),
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 5)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        2,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"new"),
+                        )],
+                    ),
+                ),
+            ],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        assert!(
+            inits[0]
+                .durable_queue_registry
+                .as_ref()
+                .and_then(|reg| reg.get(&queue_key))
+                .is_some(),
+            "the SECOND MqCreate must re-register the queue"
+        );
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let stream = db
+            .get_stream_mut(&queue_key)
+            .unwrap()
+            .expect("second incarnation stream must exist");
+        assert_eq!(
+            stream.entries.len(),
+            1,
+            "only the SECOND incarnation's push must survive — the first \
+             incarnation's push preceded the Drop and must not resurrect"
+        );
+        let entry = stream.entries.values().next().expect("exactly one entry");
+        assert_eq!(
+            entry[0].1.as_ref(),
+            b"new",
+            "the surviving entry must be from the SECOND incarnation, not \
+             a stale first-incarnation record the Drop should have killed"
+        );
+    }
+
+    #[test]
+    fn test_replay_mq_wal_drop_malformed_skipped_not_fatal() {
+        use crate::mq::wal::{encode_mq_create, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"q".to_vec();
+
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+
+        let bogus_drop = vec![99u8, 0, 0, 0, 0]; // bad version byte
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 3)),
+                (WalRecordType::MqDrop, bogus_drop),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(
+                        0,
+                        &queue_key,
+                        1,
+                        0,
+                        &[(
+                            bytes::Bytes::from_static(b"f"),
+                            bytes::Bytes::from_static(b"v"),
+                        )],
+                    ),
+                ),
+            ],
+        );
+
+        // Must not panic; the malformed Drop is skipped, the stream must
+        // survive with the later well-formed Push applied.
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let db = inits[0].databases.get_mut(0).expect("db 0");
+        assert_eq!(
+            db.get_or_create_stream(&queue_key).unwrap().entries.len(),
+            1,
+            "a well-formed record after a skipped malformed MqDrop must still apply"
         );
     }
 

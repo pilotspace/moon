@@ -380,6 +380,10 @@ pub(crate) fn execute_transaction_sharded(
                     cmd_args,
                     selected as u8,
                 );
+                // task #46: tombstone any durable MQ stream(s) this generic
+                // DEL/UNLINK removed, so `replay_mq_wal` doesn't resurrect
+                // them.
+                crate::shard::mq_exec::auto_drop_mq_streams(s, cmd_args, selected);
             });
         }
 
@@ -406,6 +410,9 @@ pub(crate) fn execute_transaction_sharded(
                     cmd.eq_ignore_ascii_case(b"FLUSHDB"),
                     selected as u8,
                 );
+                // task #46: tombstone every durable MQ stream this
+                // FLUSHDB/FLUSHALL cleared.
+                crate::shard::mq_exec::auto_drop_mq_streams_on_flush(s, selected);
             });
         }
 

@@ -444,11 +444,12 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
 /// live via `MQ.PUSH`'s debounce arming on a master).
 fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
     use crate::mq::wal::{
-        MQ_REPL_ACK, MQ_REPL_CREATE, MQ_REPL_POP, MQ_REPL_PUSH, MQ_REPL_TRIGGER, decode_mq_ack,
-        decode_mq_create, decode_mq_pop, decode_mq_push, decode_mq_trigger,
+        MQ_REPL_ACK, MQ_REPL_CREATE, MQ_REPL_DROP, MQ_REPL_POP, MQ_REPL_PUSH, MQ_REPL_TRIGGER,
+        decode_mq_ack, decode_mq_create, decode_mq_drop, decode_mq_pop, decode_mq_push,
+        decode_mq_trigger,
     };
     use crate::shard::shared_databases::{
-        apply_mq_ack, apply_mq_create, apply_mq_pop, apply_mq_push, apply_mq_trigger,
+        apply_mq_ack, apply_mq_create, apply_mq_drop, apply_mq_pop, apply_mq_push, apply_mq_trigger,
     };
     use crate::storage::stream::StreamId;
 
@@ -542,6 +543,10 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
         decode_mq_trigger(payload).map(|(trig_key, queue_key, callback_cmd, debounce_ms)| {
             apply_mq_trigger(s, trig_key, queue_key, callback_cmd, debounce_ms);
         })
+    } else if cmd.eq_ignore_ascii_case(MQ_REPL_DROP) {
+        decode_mq_drop(payload).map(|(db_index, key)| {
+            apply_mq_drop(s, clamp_mq_db(db_count, db_index), &key);
+        })
     } else {
         // Unreachable: `is_mq_replay_command` gated this call. Defensive.
         tracing::debug!(
@@ -624,6 +629,11 @@ fn apply_index_parity_hooks(
         }
     } else if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
         hooks::auto_delete_vectors(&mut s.vector_store, args, db_index);
+        // task #46: a replica must also tombstone its OWN WAL for any
+        // durable MQ stream a replicated generic DEL/UNLINK removed —
+        // otherwise the replica resurrects it on its own restart even
+        // though the master's copy stayed correctly deleted.
+        crate::shard::mq_exec::auto_drop_mq_streams(s, args, db_index as usize);
     } else if cmd.eq_ignore_ascii_case(b"HDEL") {
         hooks::auto_hdel_vectors(&mut s.vector_store, args, db_index);
     } else if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
@@ -633,6 +643,9 @@ fn apply_index_parity_hooks(
             cmd.eq_ignore_ascii_case(b"FLUSHDB"),
             db_index,
         );
+        // task #46: same replica-side tombstone requirement as DEL/UNLINK
+        // above.
+        crate::shard::mq_exec::auto_drop_mq_streams_on_flush(s, db_index as usize);
     }
 }
 

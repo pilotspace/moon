@@ -2,13 +2,14 @@
 use libfuzzer_sys::fuzz_target;
 
 use moon::mq::wal::{
-    decode_mq_ack, decode_mq_create, decode_mq_pop, decode_mq_push, decode_mq_trigger,
-    peek_version,
+    decode_mq_ack, decode_mq_create, decode_mq_drop, decode_mq_pop, decode_mq_push,
+    decode_mq_trigger, peek_version,
 };
 
-/// Fuzz the MQ WAL v3 op-blob decoders (Wave B stage 2a / task #34).
+/// Fuzz the MQ WAL v3 op-blob decoders (Wave B stage 2a / task #34; MqDrop
+/// added kernel M3 stage 3 / task #46).
 ///
-/// `data` is fed to all five decoders directly -- exactly what
+/// `data` is fed to all six decoders directly -- exactly what
 /// `src/shard/shared_databases.rs::apply_mq_wal_record` does with a raw WAL
 /// record payload straight off disk (attacker/corruption-controlled: a
 /// truncated write, a torn page, or a future-version payload written by a
@@ -23,4 +24,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = decode_mq_push(data);
     let _ = decode_mq_pop(data);
     let _ = decode_mq_trigger(data);
+    let _ = decode_mq_drop(data);
 });

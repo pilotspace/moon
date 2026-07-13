@@ -203,7 +203,8 @@ fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
                 | WalRecordType::MqAck
                 | WalRecordType::MqPush
                 | WalRecordType::MqPop
-                | WalRecordType::MqTrigger,
+                | WalRecordType::MqTrigger
+                | WalRecordType::MqDrop,
             ) => return BLOCKED,
             Some(WalRecordType::GraphTemporal) => has_graph_temporal = true,
             Some(_) => {}

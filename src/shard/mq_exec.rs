@@ -297,6 +297,112 @@ fn replicate_mq_record(
 ) {
 }
 
+// ── Generic-keyspace tombstone hooks (kernel M3 stage 3 / task #46) ───────────
+//
+// MQ durable streams live as ordinary keys in the shard's keyspace, so a
+// GENERIC `DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL` (not an `MQ.*` command) can
+// remove one without going through `handle_create`/etc. Before this fix
+// `replay_mq_wal` had no way to represent "this queue was deleted after
+// these pushes": a kill-9 after such a delete resurrected the full
+// pre-delete content on restart. These hooks mirror the vector/text
+// index-parity hooks (`auto_delete_vectors` / `auto_flush_indexes` in
+// `spsc_handler.rs`) and the WS.DROP `WorkspaceDrop` precedent, and are
+// called from every connection-layer write path AFTER the generic command
+// already succeeded (same call shape as those hooks) — using DIRECT field
+// access on an already-owned `&mut ShardSlice` (never re-enters
+// `with_shard`, matching the "Direct field access" convention documented at
+// the KV undo-log call site in `handler_monoio/mod.rs`).
+//
+// Scope decision: `DurableQueueRegistry` keys are NOT db-indexed (the same
+// pre-existing limitation `MqCreate`'s registry already has — see its doc
+// comment); a key match tombstones regardless of which db the command ran
+// in, and `FLUSHDB` drops every registered durable queue exactly like
+// `FLUSHALL` does (the registry has no way to scope to one db). Two
+// different dbs sharing an MQ queue NAME is not a supported configuration.
+
+/// Tombstone any durable MQ stream(s) removed by a generic-keyspace
+/// `DEL`/`UNLINK`. For each key argument found in
+/// `s.durable_queue_registry`, removes the registry entry, deletes the
+/// stream from `s.databases[db_index]` (idempotent if the generic command
+/// already did so), and appends + replicates an `MqDrop` WAL tombstone.
+pub(crate) fn auto_drop_mq_streams(
+    s: &mut crate::shard::slice::ShardSlice,
+    cmd_args: &[Frame],
+    db_index: usize,
+) {
+    let Some(reg) = s.durable_queue_registry.as_mut() else {
+        return;
+    };
+    if reg.is_empty() {
+        return;
+    }
+    let mut dropped: smallvec::SmallVec<[Bytes; 4]> = smallvec::SmallVec::new();
+    for arg in cmd_args {
+        if let Frame::BulkString(key) = arg {
+            if reg.get(key).is_some() {
+                reg.remove(key);
+                dropped.push(key.clone());
+            }
+        }
+    }
+    if dropped.is_empty() {
+        return;
+    }
+    emit_mq_drops(s, db_index, &dropped);
+}
+
+/// Tombstone every durable MQ stream cleared by `FLUSHDB`/`FLUSHALL`. Both
+/// clear the WHOLE registry (see the module-level scope note above) — the
+/// only difference from `FLUSHALL` would be db-scoping, which the registry
+/// cannot represent.
+pub(crate) fn auto_drop_mq_streams_on_flush(
+    s: &mut crate::shard::slice::ShardSlice,
+    db_index: usize,
+) {
+    let Some(reg) = s.durable_queue_registry.as_mut() else {
+        return;
+    };
+    if reg.is_empty() {
+        return;
+    }
+    let dropped: smallvec::SmallVec<[Bytes; 4]> = reg.iter().map(|(k, _)| k.clone()).collect();
+    for key in &dropped {
+        reg.remove(key);
+    }
+    emit_mq_drops(s, db_index, &dropped);
+}
+
+/// Shared tail: append + replicate one `MqDrop` WAL record per already-
+/// removed key. `db_index` is the record's db attribution — matches the
+/// `MqCreate` convention of tagging the record with the acting command's
+/// db, not a per-queue stored value (the registry has none).
+fn emit_mq_drops(s: &mut crate::shard::slice::ShardSlice, db_index: usize, dropped: &[Bytes]) {
+    let shard_id = s.shard_id;
+    for key in dropped {
+        let payload = crate::mq::wal::encode_mq_drop(db_index as u32, key);
+        replicate_mq_record(shard_id, db_index, crate::mq::wal::MQ_REPL_DROP, &payload);
+        if let Some(ref tx) = s.wal_append_tx {
+            if tx
+                .try_send((
+                    crate::persistence::wal_v3::record::WalRecordType::MqDrop,
+                    Bytes::from(payload),
+                ))
+                .is_err()
+            {
+                crate::command::info_reclamation::RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    "MqDrop WAL append channel rejected a tombstone record for a deleted \
+                     durable MQ stream AFTER the in-memory removal was applied — this \
+                     queue may resurrect on crash recovery. The channel is drained by \
+                     this same shard thread every 1ms (capacity 4096), so this indicates \
+                     a pathological single-tick burst."
+                );
+            }
+        }
+    }
+}
+
 // ── Subcommand handlers ───────────────────────────────────────────────────────
 
 /// MQ.CREATE — owner creates the durable stream + registry entry.
