@@ -1258,9 +1258,14 @@ mod tests {
     /// performance-sensitive) rather than weakening the assertions.
     static POISON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // Without the graph feature `apply_graph` is compiled out, so a
+    // GRAPH.* record falls through to generic dispatch and is warn-and-
+    // continue (unknown command), not Poisoned — the poison contract for
+    // graph records only exists when the graph plane does.
+    #[cfg(feature = "graph")]
     #[test]
     fn poison_graph_record_kicks_and_counts() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             // GRAPH.ADDNODE with a missing required arg — `collect_command`
@@ -1281,7 +1286,7 @@ mod tests {
 
     #[test]
     fn poison_mq_record_kicks_and_counts() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::mq::wal::MQ_REPL_PUSH;
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
@@ -1297,9 +1302,11 @@ mod tests {
         assert_eq!(poison_count(), before + 1);
     }
 
+    // TEMPORAL.INVALIDATE-AT apply lives behind the graph feature too.
+    #[cfg(feature = "graph")]
     #[test]
     fn poison_temporal_invalidate_record_kicks_and_counts() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             // Wrong arg count (`parse_invalidate_at` requires exactly 4).
@@ -1315,7 +1322,7 @@ mod tests {
 
     #[test]
     fn poison_ws_create_record_kicks_counts_and_leaves_registry_untouched() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = poison_count();
         let (outcome, registry_after) = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(crate::workspace::repl::WS_CREATE_APPLY_CMD, &[]); // missing payload
@@ -1339,7 +1346,7 @@ mod tests {
 
     #[test]
     fn poison_ws_drop_record_kicks_and_counts() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(crate::workspace::repl::WS_DROP_APPLY_CMD, &[]); // missing payload
@@ -1354,7 +1361,7 @@ mod tests {
 
     #[test]
     fn well_formed_record_does_not_poison() {
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(b"SET", &[b"k", b"v"]);
@@ -1447,7 +1454,7 @@ mod tests {
         // Also increments the shared poison counter (see `poison()`) — take
         // the same lock the dedicated poison tests use so it can't land its
         // increment inside another test's before/after window.
-        let _guard = POISON_TEST_LOCK.lock().unwrap();
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A bulk-string length that cannot parse → hard parse error.
         let bytes = b"*1\r\n$-5\r\nX\r\n".to_vec();
         let mut buf = BytesMut::from(&bytes[..]);
