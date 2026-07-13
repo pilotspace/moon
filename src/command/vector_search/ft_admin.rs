@@ -152,8 +152,10 @@ pub fn ft_compact(
     #[cfg(feature = "text-index")]
     if let Some(text_idx) = text_store.get_index_mut_for_db(name.as_ref(), db_index) {
         text_idx.build_fst();
-        // Persist FST sidecar to disk so it survives server restart (FUZ-02).
-        text_store.save_fst_sidecar_for_index(name.as_ref());
+        // Persist term-dict + FST sidecar to disk so it survives server
+        // restart (FUZ-02; kernel M4 task #50 -- combined saver so the
+        // loaded FST's ids are always backed by a matching term dict).
+        text_store.save_term_fst_sidecar_for_index(name.as_ref());
     }
 
     // Return OK if either a vector index or text index exists with this name (db-scoped).

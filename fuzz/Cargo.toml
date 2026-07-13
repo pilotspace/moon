@@ -103,3 +103,8 @@ doc = false
 name = "redis_rdb_load"
 path = "fuzz_targets/redis_rdb_load.rs"
 doc = false
+
+[[bin]]
+name = "term_fst_sidecar"
+path = "fuzz_targets/term_fst_sidecar.rs"
+doc = false

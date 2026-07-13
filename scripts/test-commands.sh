@@ -784,6 +784,13 @@ if should_run "persistence"; then
 
     assert_moon "BGSAVE"               "Background saving started" BGSAVE
     sleep 1
+
+    # SHUTDOWN [NOSAVE|SAVE] is intentionally NOT exercised in this section:
+    # it terminates the server process this whole script shares across every
+    # other category, which would abort the run. Coverage lives in
+    # tests/shutdown_integration.rs (spawns its own throwaway server per
+    # case) and scripts/test-consistency.sh (cross-shard durability smoke
+    # check against its own dedicated instance).
 fi
 
 # ===========================================================================

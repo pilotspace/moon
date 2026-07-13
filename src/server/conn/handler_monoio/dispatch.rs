@@ -1121,6 +1121,83 @@ pub(super) fn try_handle_persistence(
     false
 }
 
+/// Outcome of `try_handle_shutdown`. See the sharded-handler twin
+/// (`handler_sharded::dispatch::ShutdownOutcome`) for the full rationale.
+pub(super) enum ShutdownOutcome {
+    NotShutdown,
+    Rejected,
+    Exiting,
+}
+
+/// Handle SHUTDOWN [NOSAVE|SAVE] on the monoio runtime.
+///
+/// Mirrors `handler_sharded::dispatch::try_handle_shutdown`: a forced save
+/// uses the cooperative per-shard BGSAVE snapshot (there is no synchronous
+/// single-threaded SAVE in this mode) and polls for completion with a
+/// bounded timeout via `monoio::time::sleep` (this handler's native runtime
+/// -- `tokio::time::sleep` would not drive monoio's `!Send` reactor).
+pub(super) async fn try_handle_shutdown(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    ctx: &ConnectionContext,
+    shutdown: &CancellationToken,
+    responses: &mut Vec<Frame>,
+) -> ShutdownOutcome {
+    if !cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
+        return ShutdownOutcome::NotShutdown;
+    }
+    use crate::command::persistence::{self, ShutdownSaveMode};
+
+    let mode = match persistence::parse_shutdown_args(cmd_args) {
+        Ok(m) => m,
+        Err(e) => {
+            responses.push(e);
+            return ShutdownOutcome::Rejected;
+        }
+    };
+    let should_save = match mode {
+        ShutdownSaveMode::Save => true,
+        ShutdownSaveMode::NoSave => false,
+        ShutdownSaveMode::Default => {
+            persistence::shutdown_default_should_save(ctx.config.save.as_deref())
+        }
+    };
+    if should_save {
+        match persistence::bgsave_start_sharded(&ctx.snapshot_trigger_tx, ctx.num_shards) {
+            Frame::Error(e) => {
+                responses.push(Frame::Error(e));
+                return ShutdownOutcome::Rejected;
+            }
+            _ => {}
+        }
+        let start = std::time::Instant::now();
+        loop {
+            if !persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if start.elapsed().as_millis() as u64 > persistence::SHUTDOWN_SAVE_TIMEOUT_MS {
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR SHUTDOWN failed: background save timed out, check logs",
+                )));
+                return ShutdownOutcome::Rejected;
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(
+                persistence::SHUTDOWN_SAVE_POLL_MS,
+            ))
+            .await;
+        }
+        if !persistence::BGSAVE_LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR SHUTDOWN failed: background save error, check logs",
+            )));
+            return ShutdownOutcome::Rejected;
+        }
+    }
+    tracing::info!("SHUTDOWN command received -- initiating graceful shutdown");
+    shutdown.cancel();
+    ShutdownOutcome::Exiting
+}
+
 /// Handle SWAPDB — atomically exchange two databases across all shards.
 ///
 /// Validates arguments, enforces the BGREWRITEAOF guard, handles the same-index
