@@ -749,6 +749,21 @@ pub fn recover_shard_v3_pitr(
     new_control.wal_flush_lsn = result.last_lsn;
     new_control.next_txn_id = control.as_ref().map(|c| c.next_txn_id).unwrap_or(0);
     new_control.next_page_id = control.as_ref().map(|c| c.next_page_id).unwrap_or(0);
+    // Kernel M3 K2: carry the per-plane floor register forward across
+    // restart, same pattern as every other field above. `graph_floor_lsn`
+    // is only a recycle-decision MIRROR of `graph_metadata.json`'s own
+    // `snapshot_lsn` (graph's real replay-skip authority, loaded
+    // independently by `recover_graph_store`); both were written together
+    // in the same Finalize tick, so the last successfully-written control
+    // file's mirror is still consistent with it. Losing this on restart
+    // (resetting to the `0` sentinel) would not be UNSAFE — `0` is
+    // maximally conservative — but it would silently disable WAL recycling
+    // for graph-touched shards until the next checkpoint completes, which
+    // is a real, avoidable regression. ws/mq stay at whatever sentinel they
+    // already were (always `0` this milestone — no writer exists yet).
+    new_control.graph_floor_lsn = control.as_ref().map(|c| c.graph_floor_lsn).unwrap_or(0);
+    new_control.ws_floor_lsn = control.as_ref().map(|c| c.ws_floor_lsn).unwrap_or(0);
+    new_control.mq_floor_lsn = control.as_ref().map(|c| c.mq_floor_lsn).unwrap_or(0);
     if let Err(e) = new_control.write(&control_path) {
         tracing::error!(
             "Shard {}: control file update to Running failed: {}",

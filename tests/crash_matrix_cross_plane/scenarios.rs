@@ -657,33 +657,21 @@ pub fn mixed_synced(cfg: &Config) {
 /// injection). Only meaningful when `disk_offload` is enabled (Finalize is
 /// the checkpoint-backed-mode-only code path, brief §1.1).
 ///
-/// REAL RED FINDING (kernel M3, NEW — found via `MOON_CRASH_MATRIX_ITERS`
-/// soak, reviewed and confirmed NOT a harness artifact): on both
-/// `prod_s1` and `prod_s4`, some kill offsets in the 0-150ms
-/// post-`BGSAVE` window cause TOTAL loss of the graph plane's content —
-/// not partial loss of the unsynced tail, but the FULL set of already
-/// wal-v3-synced nodes (the entire `MixedPlan::default()` graph batch,
-/// confirmed durable via `graph_addnode_marker`'s wal-v3 wait BEFORE
-/// `BGSAVE` is even issued) comes back completely EMPTY. KV, vector, WS,
-/// and MQ all survive in the same run (`assert_mixed_truth_recovered`
-/// checks KV first, unconditionally, before the graph check that panics —
-/// KV never fails here). Reproduced via `MOON_CRASH_MATRIX_ITERS=20` in
-/// isolation (not full-suite — the full-suite run's contention only
-/// makes this window easier to hit, it isn't the cause): prod_s1 hit at
-/// iteration 11/20, prod_s4 at iteration 7/20 — a real, load-sensitive but
-/// unambiguous timing window, not a one-off VM hiccup. Consistent with
-/// (though not proven to be exactly) a checkpoint `Finalize` step ordering
-/// gap between `persist_graph_at_checkpoint`'s snapshot write and
-/// `wal.recycle_segments_before`'s WAL-v3 segment recycle
-/// (`src/shard/persistence_tick.rs` ~1182-1301) — if recycle can run (or
-/// its effect become visible after a kill) before the graph snapshot is
-/// durably on disk, the WAL copy of the data is gone AND the snapshot
-/// never had it either. Not proven at the step level (no fault-injection
-/// hooks exist — see the module doc's `kill_mid_checkpoint` honesty note);
-/// this is exactly the class of finding that note anticipated soak testing
-/// would surface. This is a strong candidate P0 for kernel M3 stage 2 (K2,
-/// the unified per-shard floor register) to close, not this stage's job to
-/// fix.
+/// FIXED (kernel M3 stage 2 / K2, task #53): on both `prod_s1` and
+/// `prod_s4`, some kill offsets in the 0-150ms post-`BGSAVE` window used
+/// to cause TOTAL loss of the graph plane's content — not partial loss of
+/// the unsynced tail, but the FULL set of already wal-v3-synced nodes.
+/// Root cause: `save_graph_store` (`src/graph/recovery.rs`) wrote the
+/// reference/floor (`graph_metadata.json`) BEFORE the payload it claims
+/// durable (CSR segments + `manifest.json`) — an ARIES-inverted write
+/// order; a kill-9 between the two writes left a fully-advanced floor
+/// pointing at a payload that never reached disk. Fixed by reordering
+/// `save_graph_store` to write the payload first, the floor last (atomic
+/// via `atomic_write_durable`). Confirmed via `MOON_CRASH_MATRIX_RED=1
+/// MOON_CRASH_MATRIX_ITERS=20` soak: 20/20 clean at both shard counts
+/// (pre-fix baseline: prod_s1 hit at iteration 11/20, prod_s4 at iteration
+/// 7/20). See `tests/crash_matrix_cross_plane.rs`'s module doc for the
+/// full writeup.
 pub fn mixed_mid_checkpoint(cfg: &Config) {
     assert!(
         cfg.disk_offload,
@@ -799,6 +787,166 @@ pub fn mixed_mid_pass_c(cfg: &Config) {
         }
         drop(guard2);
     }
+}
+
+/// `BGSAVE` + poll `INFO persistence` until `rdb_bgsave_in_progress:0` —
+/// makes each checkpoint in [`graph_drop_survives_repeated_checkpoints`] an
+/// awaited, deterministic step instead of a fire-and-forget async kick.
+/// `SAVE_IN_PROGRESS` (`src/command/persistence.rs`) is a single
+/// process-global atomic cleared only once every shard's local checkpoint
+/// finishes, so polling it via any one connection is valid at every shard
+/// count this suite runs, including `prod_s4`.
+fn wait_for_bgsave(c: &mut Conn) {
+    let reply = c.cmd_s(&["BGSAVE"]);
+    assert!(
+        matches!(reply, crate::resp::Resp::Simple(_))
+            || matches!(&reply, crate::resp::Resp::Error(e)
+                if e.to_lowercase().contains("already in progress")),
+        "BGSAVE must be accepted (or report already-in-progress), got {reply:?}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let info = c.cmd_s(&["INFO", "persistence"]).flat();
+        if info.contains("rdb_bgsave_in_progress:0") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "BGSAVE never completed within 20s (INFO persistence: {info})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Task #53 review round 2 / P0-1 regression cell: a `GRAPH.DELETE`'d
+/// graph must stay deleted across repeated checkpoints, even though the
+/// delete leaves the graph map EMPTY (`graph_count() == 0`).
+///
+/// Root cause this cell pins down: `persist_graph_at_checkpoint`'s old
+/// short-circuit (`!is_dirty() || graph_count() == 0`) skipped
+/// `save_graph_store` whenever a delete emptied the graph map — even
+/// though the delete itself marks the store dirty via the WAL drain — so
+/// `graph_metadata.json` kept describing the PRE-delete graph while later
+/// checkpoints kept advancing `control.graph_floor_lsn` past the WAL
+/// segment holding the DELETE record. Once that segment is recycled, a
+/// crash + restart loads the stale metadata with nothing left in the WAL
+/// to replay the delete: the dropped graph resurrects. Fixed by dropping
+/// `graph_count() == 0` from the short-circuit — dirty alone gates it now;
+/// `save_graph_store` on an empty graph store correctly no-ops its
+/// per-graph loop while still rewriting `graph_metadata.json` to describe
+/// zero graphs, durably advancing the floor past the delete.
+///
+/// Tiny `--wal-segment-size`/`--max-wal-size` (pattern: `mixed_mid_pass_c`)
+/// force real WAL segment rotation so the DELETE's record actually becomes
+/// recycle-eligible within the test's lifetime; `--checkpoint-timeout
+/// 3600` disables the periodic background checkpoint so every checkpoint
+/// in this cell is an explicit, awaited `BGSAVE` (`wait_for_bgsave`) —
+/// deterministic step count, no timer race with the kill point.
+pub fn graph_drop_survives_repeated_checkpoints(cfg: &Config) {
+    assert!(
+        cfg.disk_offload,
+        "graph_drop_survives_repeated_checkpoints requires disk-offload enable"
+    );
+    let dir = harness::unique_dir(&format!("graphdrop-{}", cfg.label));
+    let extra = [
+        "--wal-segment-size",
+        "32kb",
+        "--max-wal-size",
+        "96kb",
+        "--checkpoint-timeout",
+        "3600",
+        // Default is 30s (`--autovacuum-interval-secs`, `src/config.rs`) —
+        // far too slow for this cell to observe a Pass C tick. Ordinary
+        // checkpoint recycle (`recycle_segments_before`) respects a
+        // hardcoded 48 MiB `min_wal_bytes` floor with no CLI override, so
+        // it NEVER physically removes segments at this test's WAL volume
+        // regardless of how low the (buggy) floor computes — only Pass C's
+        // `recycle_aggressive` (which skips that floor check) can, so this
+        // cell is unreproducible without it.
+        "--autovacuum-interval-secs",
+        "1",
+    ];
+    let (guard, port) = harness::spawn_moon_on(&dir, cfg, &extra);
+    let mut c = Conn::open(port);
+    let name = graph_name("graphdrop");
+
+    graph_create(&mut c, &name);
+    let handles: Vec<i64> = (0..6)
+        .map(|i| graph_addnode(&mut c, &name, "N", i))
+        .collect();
+    for i in 0..6 {
+        graph_addedge(&mut c, &name, handles[i], handles[(i + 1) % 6]);
+    }
+
+    // Checkpoint 1: the graph exists — durably snapshots it. This is the
+    // pre-delete state `graph_metadata.json` must NOT still describe once
+    // the delete below has been through a later checkpoint.
+    wait_for_bgsave(&mut c);
+
+    graph_delete(&mut c, &name);
+
+    // Several more checkpoints under WAL-v3 traffic, each round padded
+    // enough to roll the tiny WAL ceiling and each checkpoint fully
+    // awaited. Padding must NOT (a) touch the SAME `GraphStore` in a way
+    // that leaves `graph_count() > 0` at a later checkpoint time, or
+    // (b) land on a plane `segment_plane_scan` treats as having no
+    // snapshot format (WorkspaceCreate/Drop, MQ, GraphTemporal,
+    // TemporalUpsert) — those block recycling of ANY segment that holds
+    // them, including a segment that also holds the DELETE record this
+    // cell targets. Two earlier designs were hand-verified against the
+    // pre-fix binary and BOTH failed to reproduce the bug for exactly
+    // these reasons before this one was found:
+    //   1. A single live padding graph: creating it un-empties
+    //      `graph_count()`, so the very next checkpoint takes the NORMAL
+    //      (non-buggy) path and correctly rewrites `graph_metadata.json`
+    //      — which also correctly excludes the deleted graph, self-healing
+    //      the exact precondition under test before any crash occurs.
+    //   2. MQ pushes: `segment_plane_scan` (`src/persistence/wal_v3/segment.rs`)
+    //      blocks recycling of any segment holding an `MqPush` record, and
+    //      that block covers the SAME segment holding the DELETE (pushes
+    //      immediately follow it) — so the DELETE's segment survives
+    //      autovacuum and WAL replay correctly re-applies the delete on
+    //      restart despite the stale metadata, masking the bug.
+    //
+    // Fix: pad with THROWAWAY graphs that are created AND deleted within
+    // the same round, before that round's checkpoint — `graph_count()` is
+    // back to 0 by checkpoint time every round, so the buggy short-circuit
+    // keeps firing (never self-heals) while `GRAPH.ADDNODE`/`GRAPH.DELETE`
+    // are still real WAL-v3 `Command` records (unconditionally logged,
+    // unlike plain KV SETs which need `--wal-kv-log on` and still bypass
+    // wal-v3 on connection-local writes per the recovery warning text) —
+    // enough volume to roll the tiny segment ceiling. Same hash tag as
+    // `name` so the padding lands on the SAME shard at `prod_s4` (cross-tag
+    // padding would roll a sibling shard's WAL, not the one holding the
+    // DELETE).
+    let padding = "x".repeat(2048);
+    const ROUNDS: u64 = 4;
+    for round in 0..ROUNDS {
+        let pad_graph = format!("{{graphdrop}}pad{round}");
+        graph_create(&mut c, &pad_graph);
+        for i in 0..80u64 {
+            graph_addnode_marker(&mut c, &pad_graph, &format!("{padding}{round}-{i}"));
+        }
+        graph_delete(&mut c, &pad_graph);
+        wait_for_bgsave(&mut c);
+    }
+    // Give the 1s autovacuum Pass C tick several chances to aggressively
+    // recycle (pattern: `mixed_mid_pass_c`) before the kill — this is what
+    // physically removes the WAL segment holding the DELETE record.
+    std::thread::sleep(Duration::from_secs(4));
+
+    harness::crash(guard, port);
+
+    let (guard2, port2) = harness::spawn_moon_on(&dir, cfg, &extra);
+    let mut c2 = Conn::open(port2);
+    let names = graph_list_names(&mut c2);
+    assert!(
+        !names.contains(&name),
+        "cell {}: GRAPH.DELETE'd graph {name:?} resurrected after \
+         {ROUNDS} post-delete checkpoints + kill-9 — GRAPH.LIST = {names:?}",
+        cfg.label,
+    );
+    drop(guard2);
 }
 
 /// Genuinely-concurrent mid-burst kill: no synchronization at all. Proves

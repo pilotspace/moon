@@ -1292,6 +1292,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         None, // wal_v3 — not available in connection handler
                         cmd_args,
                         crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN,
+                        None, // disk_offload_dir — dead: wal is None on this path too
+                        0,    // shard_id — dead, see above
                     )
                 });
                 responses.push(response);

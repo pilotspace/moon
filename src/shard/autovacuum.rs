@@ -245,6 +245,11 @@ impl AutovacuumDaemon {
         #[cfg(feature = "graph")] graph_store: &mut crate::graph::store::GraphStore,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         wal_v3: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
+        // Kernel M3 K2: the shard's floor register, read-only here (Pass C
+        // never writes it — only checkpoint Finalize does). `None` in
+        // legacy/non-disk-offload mode (no control file exists there) or
+        // before the first checkpoint has run.
+        control_file: Option<&crate::persistence::control::ShardControlFile>,
         max_wal_bytes: u64,
         disk_offload_enabled: bool,
         manifest_retain_epochs: u64,
@@ -356,17 +361,33 @@ impl AutovacuumDaemon {
             match wal.stats() {
                 Ok(wal_stats) if max_wal_bytes > 0 && wal_stats.total_bytes > max_wal_bytes => {
                     if disk_offload_enabled {
-                        // Disk-offload mode: the checkpoint protocol maintains
-                        // a real redo_lsn and persist_graph_at_checkpoint
-                        // snapshots the graph write-buffer, so recycling
-                        // everything before current_lsn is backed by an
-                        // actual durable floor — for KV and graph. The
-                        // WS/MQ/temporal planes have NO snapshot in this mode
-                        // either; `recycle_aggressive` itself skips any
-                        // segment holding such records (Wave B stage 2a
-                        // review fix) and reports them via
-                        // `segments_blocked_plane`.
-                        let redo_lsn = wal.current_lsn();
+                        // Disk-offload mode: kernel M3 K2 min-across-planes
+                        // floor. `wal.current_lsn()` (the live, not-yet-
+                        // checkpointed LSN counter) is NOT a durable floor —
+                        // using it here would let Pass C recycle segments
+                        // holding KV/graph records that no completed
+                        // checkpoint or graph snapshot has actually
+                        // materialized yet. The real floor is
+                        // `min(control.last_checkpoint_lsn,
+                        // control.graph_floor_lsn)` — only KV and graph
+                        // publish a real LSN floor; ws/mq stay at the
+                        // sentinel `0` and are DELIBERATELY excluded from
+                        // this min (see `ShardControlFile::ws_floor_lsn`
+                        // doc + brief §Stage 2's "min-across-planes"
+                        // correction) — folding them in would collapse the
+                        // floor to `0` forever on any shard that has ever
+                        // seen a WS/MQ record. `segment_holds_plane_history`
+                        // remains the orthogonal, per-segment, content-scan
+                        // AND-gate for those planes (`recycle_aggressive`
+                        // skips any segment holding such a record and
+                        // reports it via `segments_blocked_plane`). No
+                        // control file yet (very first tick, before any
+                        // checkpoint has completed) → floor `0`, i.e.
+                        // recycle nothing this tick — maximally
+                        // conservative, self-heals once Finalize runs.
+                        let redo_lsn = control_file
+                            .map(|c| c.last_checkpoint_lsn.min(c.graph_floor_lsn))
+                            .unwrap_or(0);
                         match wal.recycle_aggressive(redo_lsn) {
                             Ok(recycled) => {
                                 let pass_ms = pass_start.elapsed().as_millis() as u64;
@@ -941,6 +962,7 @@ mod tests {
             &mut graph_store,
             None,
             Some(&mut writer),
+            None,  // control_file: legacy mode never publishes a floor
             256,   // max_wal_bytes: tiny, so the ceiling is already breached
             false, // disk_offload_enabled: legacy mode — the fix under test
             0,
@@ -994,12 +1016,19 @@ mod tests {
         #[cfg(feature = "graph")]
         let mut graph_store = crate::graph::store::GraphStore::new();
         let mut daemon = AutovacuumDaemon::new(AutovacuumConfig::default());
+        // Kernel M3 K2: Pass C now floors on min(kv, graph) from the control
+        // file rather than the live `wal.current_lsn()` — simulate a
+        // checkpoint that has already covered everything written above.
+        let mut control_file = crate::persistence::control::ShardControlFile::new([0u8; 16]);
+        control_file.last_checkpoint_lsn = u64::MAX;
+        control_file.graph_floor_lsn = u64::MAX;
         daemon.run_tick(
             &mut vector_store,
             #[cfg(feature = "graph")]
             &mut graph_store,
             None,
             Some(&mut writer),
+            Some(&control_file),
             256,  // max_wal_bytes: tiny, so the ceiling is already breached
             true, // disk_offload_enabled
             0,
@@ -1031,7 +1060,9 @@ mod tests {
 
     /// Disk-offload mode recycling of PURE-KV history is unchanged by task
     /// #43 and by the stage-2a plane guard: Pass C still recycles
-    /// Command-only segments against `current_lsn()`.
+    /// Command-only segments once a real checkpoint floor
+    /// (`min(control.last_checkpoint_lsn, control.graph_floor_lsn)`, kernel
+    /// M3 K2) covers them.
     #[test]
     fn test_pass_c_disk_offload_mode_recycles_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1044,12 +1075,16 @@ mod tests {
         #[cfg(feature = "graph")]
         let mut graph_store = crate::graph::store::GraphStore::new();
         let mut daemon = AutovacuumDaemon::new(AutovacuumConfig::default());
+        let mut control_file = crate::persistence::control::ShardControlFile::new([0u8; 16]);
+        control_file.last_checkpoint_lsn = u64::MAX;
+        control_file.graph_floor_lsn = u64::MAX;
         daemon.run_tick(
             &mut vector_store,
             #[cfg(feature = "graph")]
             &mut graph_store,
             None,
             Some(&mut writer),
+            Some(&control_file),
             256,  // max_wal_bytes: tiny, so the ceiling is already breached
             true, // disk_offload_enabled: checkpoint-backed mode — unchanged
             0,

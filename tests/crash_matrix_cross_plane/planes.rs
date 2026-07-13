@@ -180,6 +180,35 @@ pub fn temporal_invalidate_node(c: &mut Conn, node_id: &str, graph: &str) {
     );
 }
 
+/// `GRAPH.DELETE <graph>` — drops a named graph and all its data.
+pub fn graph_delete(c: &mut Conn, name: &str) {
+    assert_eq!(
+        c.cmd_s(&["GRAPH.DELETE", name]),
+        Resp::Simple("OK".into()),
+        "GRAPH.DELETE {name}"
+    );
+}
+
+/// `GRAPH.LIST` — the set of currently-registered graph names. Used as the
+/// single source of truth for "does this graph still exist" (task #53
+/// review round 2 / P0-1 drop-resurrection regression cell) instead of
+/// `GRAPH.QUERY`'s error-string matching, which conflates "graph never
+/// existed" with "graph correctly deleted".
+pub fn graph_list_names(c: &mut Conn) -> BTreeSet<String> {
+    match c.cmd_s(&["GRAPH.LIST"]) {
+        Resp::Array(Some(items)) => items
+            .iter()
+            .map(|it| match it {
+                Resp::Bulk(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+                Resp::Simple(s) => s.clone(),
+                other => panic!("GRAPH.LIST unexpected item: {other:?}"),
+            })
+            .collect(),
+        Resp::Array(None) => BTreeSet::new(),
+        other => panic!("GRAPH.LIST malformed reply: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Vector
 // ---------------------------------------------------------------------------
