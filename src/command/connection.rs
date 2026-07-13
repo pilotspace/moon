@@ -189,14 +189,32 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
 
     sections.push_str("# Memory\r\n");
     let rss = crate::admin::metrics_setup::get_rss_bytes();
+    // task #58: allocator_overhead_bytes is sampled continuously by shard 0's
+    // 100ms tick (persistence_tick::run_eviction_tick), not recomputed here.
+    // pagecache_bytes sums each shard's published PageCache resident-buffer
+    // atomic (same cross-shard sum pattern as MEMORY DOCTOR). Both are
+    // observability-only figures -- neither feeds eviction or budget gating.
+    let allocator_overhead_bytes = crate::admin::metrics_setup::get_allocator_overhead_bytes();
+    let pagecache_bytes =
+        crate::admin::metrics_setup::get_global_shard_databases().map_or(0, |shard_dbs| {
+            shard_dbs
+                .store_memory_per_shard
+                .iter()
+                .map(|mem| mem.pagecache.load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<usize>()
+        });
     let _ = write!(
         sections,
         "used_memory:{rss}\r\n\
          used_memory_human:{human}\r\n\
          used_memory_rss:{rss}\r\n\
-         used_memory_peak:{rss}\r\n",
+         used_memory_peak:{rss}\r\n\
+         allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
+         pagecache_bytes:{pagecache_bytes}\r\n",
         rss = rss,
         human = format_memory_human(rss),
+        allocator_overhead_bytes = allocator_overhead_bytes,
+        pagecache_bytes = pagecache_bytes,
     );
     sections.push_str("\r\n");
 

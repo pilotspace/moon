@@ -3,7 +3,7 @@
 //! Uses the `metrics` facade crate so metric recording is a single atomic
 //! operation on the hot path (counter increment or histogram observation).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use metrics::{Unit, counter, describe_gauge, gauge, histogram};
 
@@ -265,6 +265,8 @@ fn prime_moon_memory_bytes() {
         // didn't appear in `/metrics` until the first 15s update tick.
         "lua_scripts",
         "allocator_overhead",
+        // task #58 (LOW-2): per-shard PageCache resident buffer bytes.
+        "pagecache",
     ] {
         gauge!("moon_memory_bytes", "kind" => kind).set(0.0);
     }
@@ -1010,6 +1012,31 @@ pub fn update_rss_bytes(rss: u64) {
     gauge!("moon_rss_bytes").set(rss as f64);
 }
 
+/// Continuously-updated `allocator_overhead_bytes` (task #58, LOW-1):
+/// `RSS - tracked_sum` (DashTable+entries + vector/text/graph/lua planes +
+/// PageCache + replication backlog), sampled once per 100ms tick by shard 0
+/// (`persistence_tick::run_eviction_tick`) rather than recomputed on demand.
+/// INFO memory and `/metrics` both read this single published atomic so the
+/// two surfaces never drift relative to each other between reads.
+static ALLOCATOR_OVERHEAD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the allocator-overhead figure computed by the 100ms tick.
+/// Observability only -- never consulted by eviction or budget gating.
+#[inline]
+pub fn update_allocator_overhead_bytes(bytes: usize) {
+    ALLOCATOR_OVERHEAD_BYTES.store(bytes, Ordering::Relaxed);
+    if METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(bytes as f64);
+    }
+}
+
+/// Read the last-published `allocator_overhead_bytes` (INFO memory / MEMORY
+/// STATS). Lock-free; lags at most one 100ms tick.
+#[inline]
+pub fn get_allocator_overhead_bytes() -> usize {
+    ALLOCATOR_OVERHEAD_BYTES.load(Ordering::Relaxed)
+}
+
 // ── Memory helpers ──────────────────────────────────────────────────────
 
 /// Query jemalloc `stats.resident` via raw `mallctl` FFI.
@@ -1406,6 +1433,8 @@ fn update_moon_memory_bytes() {
     let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
     let mut backlog: usize = 0;
     let mut lua: usize = 0;
+    // task #58 (LOW-2): per-shard PageCache resident buffer bytes.
+    let mut pagecache: usize = 0;
 
     if let Some(shard_dbs) = get_global_shard_databases() {
         // KV memory: sum of per-shard published atomics. Lock-free.
@@ -1421,6 +1450,7 @@ fn update_moon_memory_bytes() {
             csr += mem.graph.load(Ordering::Relaxed);
             // C4 (wave-5 hygiene): Lua script-cache byte estimate.
             lua += mem.lua.load(Ordering::Relaxed);
+            pagecache += mem.pagecache.load(Ordering::Relaxed);
         }
     }
 
@@ -1431,8 +1461,12 @@ fn update_moon_memory_bytes() {
         }
     }
 
-    let other_sum = dashtable + hnsw + text + csr + wal + sealed + backlog + lua;
-    let alloc_overhead = rss.saturating_sub(other_sum);
+    // task #58 (LOW-1): read the allocator-overhead figure sampled by shard
+    // 0's 100ms tick (`persistence_tick::run_eviction_tick`) rather than
+    // recomputing `rss - other_sum` here. This keeps INFO memory and
+    // `/metrics` reading the SAME published number instead of two
+    // independently-timed RSS snapshots drifting apart.
+    let alloc_overhead = get_allocator_overhead_bytes();
 
     gauge!("moon_memory_bytes", "kind" => "dashtable").set(dashtable as f64);
     gauge!("moon_memory_bytes", "kind" => "hnsw").set(hnsw as f64);
@@ -1442,6 +1476,7 @@ fn update_moon_memory_bytes() {
     gauge!("moon_memory_bytes", "kind" => "sealed").set(sealed as f64);
     gauge!("moon_memory_bytes", "kind" => "replication_backlog").set(backlog as f64);
     gauge!("moon_memory_bytes", "kind" => "lua_scripts").set(lua as f64);
+    gauge!("moon_memory_bytes", "kind" => "pagecache").set(pagecache as f64);
     gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
 
     // Update the existing RSS gauge in the same snapshot so the integration

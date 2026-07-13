@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — allocator-overhead and PageCache observability in INFO memory / Prometheus (task #58)
+
+`INFO memory` and `/metrics` previously had no way to see the gap between
+process RSS and what Moon could account for (DashTable+entries, vector/text/
+graph/lua planes, replication backlog) — the only place that gap was ever
+computed was `MEMORY DOCTOR`'s on-demand snapshot. Similarly, the disk-offload
+`PageCache`'s resident 4KB/64KB frame buffers were tracked internally but
+never surfaced anywhere.
+
+Added `allocator_overhead_bytes` (= `RSS - tracked_sum`, now including
+PageCache and the replication backlog) as a continuously-updated metric,
+sampled once per 100ms tick by shard 0 (`persistence_tick::run_eviction_tick`)
+rather than recomputed per-request, and published through a single atomic
+(`admin::metrics_setup::{update,get}_allocator_overhead_bytes`) that both
+`INFO memory` and the Prometheus `moon_memory_bytes{kind="allocator_overhead"}`
+gauge now read — the 15s Prometheus updater no longer independently
+recomputes it against a separately-timed RSS read, closing a drift source.
+Added `pagecache_bytes` (`PageCache::resident_buffer_bytes()`, published into
+a new `ShardStoreMemory.pagecache` atomic alongside vector/text/graph/lua on
+the same tick) as its own INFO/Prometheus line
+(`moon_memory_bytes{kind="pagecache"}`, `memory_prometheus_kinds` test now
+expects 10 kinds). Both figures are observability-only — neither feeds
+eviction or elastic-budget gating. See `src/shard/shared_databases.rs`
+(`ShardStoreMemory.pagecache`), `src/shard/persistence_tick.rs`
+(`compute_allocator_overhead`, publish sites), `src/admin/metrics_setup.rs`,
+`src/command/connection.rs` (`INFO memory`). New test:
+`tests/info_memory_allocator_pagecache.rs`.
+
 ### Fixed — startup blocked ~153s on the crash-orphan heap-file sweep at scale (task #55)
 
 `recover_shard_v3_pitr` called `kv_spill::sweep_orphan_heap_files` synchronously

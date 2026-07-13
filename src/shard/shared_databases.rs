@@ -29,6 +29,11 @@ pub struct ShardStoreMemory {
     /// hygiene). The cache itself stays unbounded (Redis parity -- `SCRIPT
     /// FLUSH` is the only eviction path); this is observability only.
     pub lua: AtomicUsize,
+    /// Resident bytes of this shard's `PageCache` frame buffers (task #58,
+    /// LOW-2): `PageCache::resident_buffer_bytes()` -- num 4KB frames actually
+    /// grown * 4096 + num 64KB frames actually grown * 65536. Observability
+    /// only: NOT read by any eviction or budget-gating path.
+    pub pagecache: AtomicUsize,
 }
 
 /// Shared infrastructure handle — the residual cross-shard state after M5.
@@ -113,6 +118,7 @@ impl ShardDatabases {
                     text: AtomicUsize::new(0),
                     graph: AtomicUsize::new(0),
                     lua: AtomicUsize::new(0),
+                    pagecache: AtomicUsize::new(0),
                 })
             })
             .collect::<Vec<_>>()
