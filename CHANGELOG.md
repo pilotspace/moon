@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — cross-store MULTI/EXEC graph leg durability (kernel M3 stage 3 / task #52)
+
+A committed cross-store transaction (`MULTI`; `SET k v`; `GRAPH.ADDNODE g
+Label id 1`; `EXEC`) survived kill-9 on the KV leg (PR #247's
+`persist_txn_aof`) but silently lost the graph leg — worse than a missed
+durability leg, the `GRAPH.ADDNODE` never even applied in memory. Root
+cause: `execute_transaction_sharded` (`src/server/conn/shared.rs`), the
+executor both the sharded and monoio connection handlers use for `EXEC`,
+had no `GRAPH.*` branch at all — a queued `GRAPH.ADDNODE` fell through to
+the generic KV `dispatch()` table (which only knows keyspace commands) and
+errored `ERR unknown command`, an error MULTI/EXEC's per-command tolerance
+swallowed without surfacing it to the client. Fixed by giving the txn
+executor a `GRAPH.*` branch that mirrors the single-command path
+(`try_handle_graph_command`): dispatches writes/reads against
+`ShardSlice::graph_store`, and flushes every command's drained wal-v3
+records via `wal_append` after the whole transaction body runs (same
+per-shard append-order contract as the live path). Verified 3× consecutive
+GREEN at shards=1 and shards=4; the sibling atomicity claim (a transaction
+queued but killed before `EXEC` applies nothing) was unaffected and stays
+GREEN. Crash-matrix cells `cross_plane_prod_s1_txn_isolated_committed` /
+`cross_plane_prod_s4_txn_isolated_committed` (`tests/crash_matrix_cross_plane/`)
+flip from `red_guard`-gated RED to default-GREEN tripwires (42 cells: 33→35
+GREEN by default, 9→7 RED).
+
 ### Added — unified per-shard floor register + min-across-planes WAL recycle (kernel M3 stage 2 / K2)
 
 `ShardControlFile` (`src/persistence/control.rs`) gains `graph_floor_lsn`,

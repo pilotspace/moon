@@ -209,7 +209,7 @@ pub(crate) fn execute_transaction(
 /// persistence, so MULTI/EXEC writes were silently lost on restart).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-    _shard_id: usize,
+    shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     cached_clock: &CachedClock,
@@ -225,6 +225,21 @@ pub(crate) fn execute_transaction_sharded(
     // switches dbs.
     let mut aof_entries: Vec<(usize, Bytes)> = Vec::new();
     let mut selected = selected_db;
+    // task #52: graph-leg WAL records produced by GRAPH.* commands queued
+    // inside this MULTI/EXEC body. The single-command path
+    // (`try_handle_graph_command`) drains+appends these to wal-v3 per
+    // command; the txn executor previously had NO graph branch at all, so a
+    // queued GRAPH.* command fell through to the generic KV `dispatch()`
+    // table and errored as "unknown command" -- never applied to the graph
+    // store, never durable. Collected here and flushed to wal-v3 AFTER the
+    // whole body runs (below), same append-order-per-shard contract as the
+    // live path, mirrored 1:1 into a Vec instead of an immediate per-command
+    // append only because this function has no `.await` point to interleave
+    // with the KV AOF group-commit -- ordering between the two log families
+    // is otherwise unconstrained (each is its own durability leg, proven
+    // independently by the crash-matrix scenario's two separate sync-waits).
+    #[cfg(feature = "graph")]
+    let mut graph_wal_records: Vec<Vec<u8>> = Vec::new();
 
     for cmd_frame in command_queue {
         let (cmd, cmd_args) = match extract_command(cmd_frame) {
@@ -242,6 +257,48 @@ pub(crate) fn execute_transaction_sharded(
         // transaction body (all preceding writes applied first) and leave a
         // placeholder the caller patches with the receiver count.
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
+
+        // task #52: GRAPH.* commands live in a separate per-shard store
+        // (`ShardSlice::graph_store`), not the KV `Database` this loop
+        // otherwise dispatches against -- route them to the graph engine
+        // exactly like the single-command path (`try_handle_graph_command`)
+        // does, and stash the drained WAL records for the post-loop flush.
+        #[cfg(feature = "graph")]
+        if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
+            let is_write = crate::command::graph::is_graph_write_cmd(cmd)
+                || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                    && crate::command::graph::is_cypher_write_query(cmd_args));
+            let (response, records) = crate::shard::slice::with_shard(|s| {
+                if is_write {
+                    let resp = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                        crate::command::graph::graph_query_or_write(&mut s.graph_store, cmd_args).0
+                    } else {
+                        crate::command::graph::dispatch_graph_write(
+                            &mut s.graph_store,
+                            cmd,
+                            cmd_args,
+                        )
+                    };
+                    let records = s.graph_store.drain_wal();
+                    (resp, records)
+                } else {
+                    let resp = crate::command::graph::dispatch_graph_read(
+                        &s.graph_store,
+                        cmd,
+                        cmd_args,
+                        None,
+                    );
+                    (resp, Vec::new())
+                }
+            });
+            // Parity with the KV branch below: an errored write must not
+            // reach the WAL.
+            if !records.is_empty() && !matches!(&response, Frame::Error(_)) {
+                graph_wal_records.extend(records);
+            }
+            results.push(response);
             continue;
         }
 
@@ -340,6 +397,22 @@ pub(crate) fn execute_transaction_sharded(
 
         results.push(response);
     }
+
+    // task #52: flush every graph-leg WAL record collected above through the
+    // same K1 typed channel (`wal_append`) the live single-command graph
+    // path uses -- this is what makes the graph leg of a committed
+    // cross-store MULTI/EXEC durable across kill-9. Order preserved
+    // (per-shard wal-v3 append order = per-command execution order).
+    #[cfg(feature = "graph")]
+    for record in graph_wal_records {
+        shard_databases.wal_append(
+            shard_id,
+            crate::persistence::wal_v3::record::WalRecordType::Command,
+            bytes::Bytes::from(record),
+        );
+    }
+    #[cfg(not(feature = "graph"))]
+    let _ = shard_id;
 
     (Frame::Array(results.into()), aof_entries)
 }
