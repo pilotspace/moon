@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
+
+`replay_graph_wal` (`src/shard/shared_databases.rs`, the legacy-mode-only
+replay path taken when `persistence_dir` is set but disk-offload is
+disabled) passed the raw RESP-encoded `WalRecord::payload` directly as the
+`cmd` argument to `CommandReplayEngine::replay_command`, instead of parsing
+it into frames and passing the bare command name + `&[Frame]` args as the
+sibling `replay_graph_wal_v3` (disk-offload-enabled path) and
+`recovery.rs`'s KV `Command` replay both already did.
+`GraphReplayCollector::is_graph_command` compares against literal names
+like `b"GRAPH.CREATE"`, so it never matched the multi-line RESP blob —
+`graph_command_count()` stayed 0, the `replay_graph_commands` guard never
+fired, and every graph mutation was silently lost on restart. Regression
+from PR #236 (WAL v2 → v3 port). Un-gates 6 previously-RED crash-matrix
+cells (`tests/crash_matrix_cross_plane/{tests_legacy.rs,tests_spot.rs}`):
+legacy s1 `graph_isolated`, `txn_isolated_committed`,
+`txn_isolated_atomicity`, `mixed_all_planes_synced`,
+`mixed_all_planes_mid_pass_c`, and spot-check
+`cross_plane_spot_legacy_s4_graph_isolated`.
+
 ### Added — allocator-overhead and PageCache observability in INFO memory / Prometheus (task #58)
 
 `INFO memory` and `/metrics` previously had no way to see the gap between

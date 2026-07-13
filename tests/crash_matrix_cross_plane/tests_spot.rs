@@ -2,7 +2,7 @@
 //! production/legacy set (brief: "spot-check the remaining cells with 1-2
 //! representative scenarios each").
 
-use crate::harness::{self, Config};
+use crate::harness::Config;
 use crate::scenarios;
 
 // ---------------------------------------------------------------------------
@@ -27,25 +27,15 @@ fn cross_plane_spot_offload_no_s4_no_durability_contract_liveness() {
 // ---------------------------------------------------------------------------
 // Legacy mode at shards=4 (excluded from the full matrix — "legacy mode has
 // no cross-shard novelty" — but the brief still wants 1-2 representative
-// scenarios). graph_isolated here reproduces the SAME RED gap as
-// legacy_yes_s1 (the bug is legacy-mode WAL replay, not shard-count-specific;
-// spot-checking at shards=4 confirms the gap is not accidentally
-// shard-count-dependent). Gated by `harness::red_guard` — see that
-// function's doc for why `#[ignore = "RED: ..."]` alone does not skip it.
+// scenarios). graph_isolated here used to reproduce the SAME RED gap as
+// legacy_yes_s1 (the bug was legacy-mode WAL replay, not shard-count-
+// specific). GREEN as of task #60 (see `tests_legacy.rs` module doc for the
+// root cause); confirms the fix is not accidentally shard-count-dependent.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_spot_legacy_s4_graph_isolated() {
-    if !harness::red_guard(
-        "legacy-mode (--disk-offload disable) graph WAL replay does not \
-         reconstruct the graph — same gap as \
-         cross_plane_legacy_yes_s1_graph_isolated, confirmed shard-count- \
-         independent (PR #288 / task #43 changelog). Not this stage's job \
-         to fix — tracked separately.",
-    ) {
-        return;
-    }
     scenarios::graph_isolated(&Config::SPOT_LEGACY_S4);
 }
 
