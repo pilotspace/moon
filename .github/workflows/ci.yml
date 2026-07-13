@@ -98,6 +98,11 @@ jobs:
       # Spawned test servers must not trip the diskfull write-pause on the
       # VM's shared-volume mounts.
       MOON_DISK_FREE_MIN_PCT: "0"
+      # Cap rustc parallelism: the first run OOM-killed the runner service
+      # (kernel oom-kill at 3G peak + 2.5G swap) when -j<cores> rustc
+      # processes ran concurrently in the VM. VM memory is 12G now, but
+      # keep headroom for nextest's spawned test servers.
+      CARGO_BUILD_JOBS: "6"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
