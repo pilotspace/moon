@@ -73,6 +73,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           # Cache key covers all 3 feature combos so incremental builds hit.
@@ -93,10 +94,16 @@ jobs:
       # Test — reuses .rlib artifacts from clippy's check compilation above.
       # Only the test harness + test binaries need building (incremental).
       - name: Test
-        run: cargo test --no-default-features --features runtime-tokio,jemalloc
+        # nextest: per-test-binary parallelism + automated flake retries
+        # (profile "ci" in .config/nextest.toml). Doctests are not run by
+        # nextest — covered by the separate --doc step below.
+        run: cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
+      - name: Doctests
+        run: cargo test --doc --no-default-features --features runtime-tokio,jemalloc
+        timeout-minutes: 5
       - name: Test (graph)
-        run: "cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::"
+        run: "cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc,graph --lib -E 'test(graph::)'"
         timeout-minutes: 5
 
   # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
@@ -108,6 +115,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
@@ -116,7 +124,7 @@ jobs:
       - name: Clippy (tokio)
         run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
       - name: Test (tokio)
-        run: cargo test --no-default-features --features runtime-tokio,jemalloc
+        run: cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc
         # 15m was too tight: the step budget includes compilation, and a
         # cold/rebased cache spends ~11m compiling + ~8m testing (>15m),
         # tripping a wall-clock timeout with zero test failures. Match the
@@ -143,6 +151,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows
@@ -164,7 +173,8 @@ jobs:
       # hiding failures in later binaries. This job runs at most once per main
       # push / dispatch — full visibility is worth the extra red-run minutes.
       - name: Test (windows)
-        run: cargo test --no-default-features --features runtime-tokio,graph,text-index --no-fail-fast
+        # fail-fast=false lives in .config/nextest.toml (both profiles).
+        run: cargo nextest run --profile ci --no-default-features --features runtime-tokio,graph,text-index
         timeout-minutes: 30
         env:
           # windows-latest images run with <5% free on C:, permanently
