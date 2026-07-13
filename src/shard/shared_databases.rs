@@ -588,8 +588,28 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
         crate::storage::stream::StreamId,
         crate::storage::stream::StreamId,
     )>,
+    // task #47: WAL v2 `MqPop` carries the ORIGINAL `delivery_time`/
+    // `seen_time` captured at claim time. A v1 payload (or a captured `0`,
+    // which should never legitimately happen post-epoch) decodes these as
+    // sentinel `0` -- resolved HERE, at apply time, to "now" so a replayed
+    // PEL entry reports a plausible idle time instead of "maximally idle
+    // since epoch" (the pre-task-#47 behavior this replaces).
+    delivery_time_ms: u64,
+    seen_time_ms: u64,
 ) {
+    use crate::storage::entry::current_time_ms;
     use crate::storage::stream::{Consumer, PendingEntry};
+
+    let delivery_time = if delivery_time_ms != 0 {
+        delivery_time_ms
+    } else {
+        current_time_ms()
+    };
+    let seen_time = if seen_time_ms != 0 {
+        seen_time_ms
+    } else {
+        current_time_ms()
+    };
 
     let Some(db) = target.mq_databases_mut().get_mut(db_index) else {
         return;
@@ -625,7 +645,7 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
                             *id,
                             PendingEntry {
                                 consumer: consumer_name.clone(),
-                                delivery_time: 0,
+                                delivery_time,
                                 delivery_count: *delivery_count,
                             },
                         );
@@ -636,7 +656,7 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
                                 .or_insert_with(|| Consumer {
                                     name: consumer_name.clone(),
                                     pending: std::collections::BTreeMap::new(),
-                                    seen_time: 0,
+                                    seen_time,
                                 });
                         consumer.pending.insert(*id, ());
                     }
@@ -768,7 +788,7 @@ fn apply_mq_wal_record(
             None => warn_skip_mq_record(shard_id, "MqPush", payload, stats),
         },
         WalRecordType::MqPop => match crate::mq::wal::decode_mq_pop(payload) {
-            Some((db_index, key, last_delivered, claimed, dlq)) => {
+            Some((db_index, key, last_delivered, claimed, dlq, delivery_time_ms, seen_time_ms)) => {
                 let claimed: Vec<(StreamId, u64)> = claimed
                     .into_iter()
                     .map(|(ms, seq, dc)| (StreamId { ms, seq }, dc))
@@ -798,6 +818,8 @@ fn apply_mq_wal_record(
                     },
                     claimed,
                     dlq,
+                    delivery_time_ms,
+                    seen_time_ms,
                 );
                 stats.pop += 1;
             }
@@ -1641,7 +1663,7 @@ mod tests {
                 // resulting last_delivered_id = (1,1); no DLQ routing.
                 (
                     WalRecordType::MqPop,
-                    encode_mq_pop(0, &queue_key, (1, 1), &[(1, 0, 1), (1, 1, 1)], &[]),
+                    encode_mq_pop(0, &queue_key, (1, 1), &[(1, 0, 1), (1, 1, 1)], &[], 1, 1),
                 ),
                 // ACK only (1,0) — (1,1) must remain pending.
                 (WalRecordType::MqAck, encode_mq_ack(0, &queue_key, 1, 0)),
@@ -1722,7 +1744,7 @@ mod tests {
                 // assigned id (2,0) in the sibling DLQ stream.
                 (
                     WalRecordType::MqPop,
-                    encode_mq_pop(0, &queue_key, (1, 0), &[(1, 0, 1)], &[(1, 0, 2, 0)]),
+                    encode_mq_pop(0, &queue_key, (1, 0), &[(1, 0, 1)], &[(1, 0, 2, 0)], 1, 1),
                 ),
             ],
         );

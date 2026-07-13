@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — MqPop WAL/replication payload v2 carries real PEL idle metadata (task #47)
+
+`apply_mq_pop` (boot-time WAL replay AND live replica apply — same function,
+`src/shard/shared_databases.rs`) hardcoded a claimed PEL entry's
+`delivery_time`/`seen_time` to `0` regardless of when the original `MQ.POP`
+actually claimed it. Since `XPENDING`'s idle time is `now - delivery_time`,
+a kill-9 restart or a promoted replica reported "idle since the Unix epoch"
+(an astronomically large idle time) instead of the real elapsed duration —
+`XPENDING`/`XPENDING ... IDLE` consumers on a recovered node saw wrong data
+for every pre-crash claim.
+
+Fixed by bumping the `MqPop` WAL record to its own v2 payload
+(`MQ_POP_WAL_V1`/`MQ_POP_WAL_V2` in `src/mq/wal.rs` — `MqPop` now versions
+independently of the shared `MQ_WAL_VERSION` used by every other MQ record
+kind) that appends `[delivery_time_ms:u64][seen_time_ms:u64]` captured once
+per POP batch (every entry one `MQ.POP` claims shares a single `now`, per
+`Stream::read_group_new`). `src/shard/mq_exec.rs`'s POP handler now reads
+these back out of the PEL/consumer state it just wrote instead of
+discarding them. Decode is version-led and fail-closed: v1 payloads (no
+trailing timing fields) still decode, filling an explicit `0` sentinel that
+`apply_mq_pop` resolves to `current_time_ms()` at apply time — a strict
+improvement over the old hardcoded-`0` behavior, not a behavior match to it.
+Any version byte other than 1 or 2 is rejected (`None`), same fail-closed
+posture as every other MQ WAL decoder.
+
+Producer (`src/shard/mq_exec.rs`), boot-time replay
+(`src/shard/shared_databases.rs::apply_mq_pop`), and live replica apply
+(`src/replication/apply.rs::apply_mq`) all updated; the MQ WAL fuzz target
+(`fuzz/fuzz_targets/mq_wal_record.rs`) needed no changes since it fuzzes
+`decode_mq_pop` generically. New coverage: codec round-trip tests for v1
+(sentinel-filled) and v2 (full round-trip) in `src/mq/wal.rs`, a kill-9
+integration test asserting `XPENDING` idle survives restart
+(`tests/crash_recovery_mq_effects.rs::xpending_idle_metadata_survives_kill9`),
+and a replica-promotion test asserting the promoted node's `XPENDING` idle
+reflects the master's original claim time, not the replica's own apply time
+(`tests/replication_mq.rs::promoted_replica_reports_real_pending_idle_time`).
+
 ### Changed — CI pipeline optimization (round 1)
 
 - CodeQL no longer runs on every PR (main-push + weekly schedule only) — it

@@ -428,3 +428,111 @@ fn multi_shard_live_mq_write_not_streamed() {
          known-limitation suite"
     );
 }
+
+/// Extract every `:`-prefixed integer reply line from a raw RESP blob, in
+/// order. XPENDING's extended form (`XPENDING key group - + count`) is the
+/// only integer-bearing element in a claimed entry (id + consumer are bulk
+/// strings) — `[idle_ms, delivery_count]` for a single-entry reply.
+fn extract_ints(raw: &str) -> Vec<i64> {
+    raw.split("\r\n")
+        .filter_map(|line| line.strip_prefix(':'))
+        .filter_map(|n| n.parse::<i64>().ok())
+        .collect()
+}
+
+/// task #47: MqPop WAL v2 replicates the ORIGINAL `delivery_time`/
+/// `seen_time` (not a replica-local "just applied" timestamp), so a
+/// promoted replica's `XPENDING` idle time reflects when the message was
+/// REALLY claimed on the master — matching what `XPENDING` would report on
+/// the master itself. Pre-task-#47 the replica applied `apply_mq_pop` with
+/// `delivery_time: 0` regardless of payload content, which (since
+/// `idle = now - delivery_time`) would report an idle time on the order of
+/// "milliseconds since the Unix epoch" instead of the real elapsed wall
+/// time since the claim.
+#[test]
+#[ignore]
+fn promoted_replica_reports_real_pending_idle_time() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let master_addr = "127.0.0.1:16746";
+    let replica_addr = "127.0.0.1:16747";
+
+    let _master = Killer(start_moon(16746, master_dir.path().to_str().unwrap(), 1));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+    let _replica = Killer(start_moon(16747, replica_dir.path().to_str().unwrap(), 1));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16746").starts_with("+OK"),
+        "REPLICAOF failed"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(
+        send_cmd(master_addr, "MQ CREATE mqidle MAXDELIVERY 0").starts_with("+OK"),
+        "MQ CREATE failed"
+    );
+    let push = send_resp(master_addr, &["MQ", "PUSH", "mqidle", "f", "v"]);
+    assert!(
+        parse_bulk_string(&push).is_some_and(|id| id.contains('-')),
+        "MQ PUSH failed: {push}"
+    );
+
+    // Master claims the message NOW -- this is the delivery_time that must
+    // survive the replication hop unchanged.
+    let pop = send_resp(master_addr, &["MQ", "POP", "mqidle", "COUNT", "1"]);
+    assert!(pop.contains("v"), "master MQ POP failed: {pop}");
+
+    // Wait for the replica's PEL to converge to 1 pending BEFORE the real
+    // idle window elapses, so the accumulated idle time below is measured
+    // on the (already-applied) replica entry, not on catch-up latency.
+    let pel_grew = wait_until(Duration::from_secs(10), || {
+        send_resp(replica_addr, &["XPENDING", "mqidle", "__mq_consumers"]).starts_with("*4\r\n:1")
+    });
+    assert!(pel_grew, "replica PEL never showed the master's claim");
+
+    // Accumulate real wall-clock idle time BEFORE promoting/reading.
+    let idle_floor_ms: i64 = 1200;
+    std::thread::sleep(Duration::from_millis(idle_floor_ms as u64));
+
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF NO ONE").starts_with("+OK"),
+        "promotion failed"
+    );
+
+    let extended = send_resp(
+        replica_addr,
+        &["XPENDING", "mqidle", "__mq_consumers", "-", "+", "10"],
+    );
+    let ints = extract_ints(&extended);
+    assert_eq!(
+        ints.len(),
+        2,
+        "expected exactly [idle_ms, delivery_count] from a single-entry \
+         extended XPENDING reply: {extended}"
+    );
+    let idle_ms = ints[0];
+    let delivery_count = ints[1];
+
+    assert_eq!(delivery_count, 1, "delivery_count must replicate verbatim");
+    assert!(
+        idle_ms >= idle_floor_ms,
+        "RED: promoted replica's idle_ms ({idle_ms}) must be >= the real \
+         idle floor ({idle_floor_ms}ms) accumulated since the master's \
+         claim -- a replica that used its OWN apply-time instead of the \
+         replicated delivery_time would report an idle time close to the \
+         (much shorter) time since promotion instead"
+    );
+    assert!(
+        idle_ms < 60_000,
+        "RED: promoted replica's idle_ms ({idle_ms}) must be a plausible \
+         small elapsed duration, not an epoch-relative reading"
+    );
+}
