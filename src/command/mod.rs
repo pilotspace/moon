@@ -765,9 +765,19 @@ fn dispatch_inner(
         (8, b's') => {
             // SMEMBERS SETRANGE SHUTDOWN
             if cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
-                // Acknowledge but don't kill — actual shutdown is handled by the server
+                // Real SHUTDOWN handling (parse NOSAVE/SAVE, force a durable
+                // save, then trigger the same graceful shutdown sequence used
+                // by SIGTERM) is intercepted at the connection-handler level
+                // (handler_single.rs / handler_sharded / handler_monoio) --
+                // like BGSAVE/ACL, it needs access to the full database
+                // handle and the shard's shutdown CancellationToken, neither
+                // of which this single-`Database` dispatch path has. This
+                // arm is reached only when SHUTDOWN slips past that
+                // intercept (e.g. queued inside MULTI/EXEC), where Redis
+                // itself also refuses admin commands -- fail closed rather
+                // than silently no-op.
                 return resp(Frame::Error(Bytes::from_static(
-                    b"ERR Errors trying to SHUTDOWN. Check logs.",
+                    b"ERR SHUTDOWN is not allowed in this context",
                 )));
             }
             if cmd.eq_ignore_ascii_case(b"SMEMBERS") {

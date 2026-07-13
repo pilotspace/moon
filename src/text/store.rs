@@ -189,6 +189,14 @@ pub struct TextIndex {
     /// See `resident_bytes_ground_truth` (`#[cfg(test)]`) for the equivalent
     /// full-walk formula this field must always match.
     resident_bytes_extra: usize,
+
+    /// Kernel M4 (task #50): set to `true` when this index's term
+    /// dictionaries (and, where present, FST maps) were reconstructed from
+    /// the `.tfst` sidecar on boot instead of rebuilt from scratch by the
+    /// keyspace rescan. Surfaced additively via `FT.INFO` so operators can
+    /// see when the fast-boot path was actually taken vs silently falling
+    /// back to a full rescan (missing/stale/corrupt sidecar).
+    pub recovered_from_sidecar: bool,
 }
 
 impl TextIndex {
@@ -251,6 +259,7 @@ impl TextIndex {
             doc_numeric_entries: HashMap::new(),
             db_index: 0,
             resident_bytes_extra: 0,
+            recovered_from_sidecar: false,
         }
     }
 
@@ -2126,7 +2135,14 @@ impl TextStore {
     /// Save FST sidecar for a specific index. No-op if persist_dir not set.
     ///
     /// Called after `TextIndex::build_fst()` at FT.COMPACT time (D-11).
+    ///
+    /// Deprecated by [`Self::save_term_fst_sidecar_for_index`] (kernel M4,
+    /// task #50), which persists the term dictionary the FST's ids were
+    /// built against in the same atomic write -- kept only for the existing
+    /// FST-only roundtrip unit tests below; production code should call the
+    /// combined saver instead.
     #[cfg(feature = "text-index")]
+    #[cfg(test)]
     pub fn save_fst_sidecar_for_index(&self, index_name: &[u8]) {
         if let Some(ref dir) = self.persist_dir {
             if let Some(idx) = self.indexes.get(index_name) {
@@ -2148,7 +2164,50 @@ impl TextStore {
         }
     }
 
-    /// Load FST sidecars for all indexes.
+    /// Save the combined term-dict + FST sidecar for a specific index.
+    /// No-op if persist_dir not set. Called after `TextIndex::build_fst()`
+    /// at FT.COMPACT time (kernel M4, task #50 -- supersedes the FST-only
+    /// sidecar so the loaded FST's ids are always backed by a matching term
+    /// dictionary).
+    #[cfg(feature = "text-index")]
+    pub fn save_term_fst_sidecar_for_index(&self, index_name: &[u8]) {
+        let Some(ref dir) = self.persist_dir else {
+            return;
+        };
+        let Some(idx) = self.indexes.get(index_name) else {
+            return;
+        };
+        let fields: Vec<crate::text::index_persist::FieldTermFstSidecar> = idx
+            .field_term_dicts
+            .iter()
+            .enumerate()
+            .map(|(field_idx, dict)| {
+                let terms: Vec<(String, u32)> =
+                    dict.iter().map(|(t, &id)| (t.to_owned(), id)).collect();
+                let fst_bytes = idx
+                    .fst_maps
+                    .get(field_idx)
+                    .and_then(|m| m.as_ref())
+                    .map(|m| m.as_fst().as_bytes().to_vec());
+                crate::text::index_persist::FieldTermFstSidecar {
+                    next_id: dict.next_id(),
+                    fst_high_water_mark: dict.fst_high_water_mark,
+                    terms,
+                    fst_bytes,
+                }
+            })
+            .collect();
+        if let Err(e) = crate::text::index_persist::save_term_fst_sidecar(dir, index_name, &fields)
+        {
+            tracing::warn!(
+                "Failed to save term-dict+FST sidecar for {}: {}",
+                String::from_utf8_lossy(index_name),
+                e
+            );
+        }
+    }
+
+    /// Load FST-only sidecars for all indexes (legacy, id-space UNSAFE).
     ///
     /// # Deliberately NOT called during startup/recovery — do not wire this in
     ///
@@ -2170,22 +2229,13 @@ impl TextStore {
     ///    freshly-assigned ids from the new generation — silently wrong
     ///    search results, not even a detectable error.
     ///
-    /// This can't be fixed at the load site: the sidecar's `term_id`s are
-    /// only meaningful together with the exact term dictionary they were
-    /// built against, and that dictionary isn't persisted today. Making
-    /// this load safe requires persisting the term dictionary itself (so
-    /// ids survive a restart, or the sidecar can be fingerprint-checked
-    /// against the live corpus and discarded on mismatch) — that's kernel
-    /// M4 scope (FTS content persistence), filed as task #50. Until #50
-    /// lands, this function must stay uncalled in production; it is
-    /// exercised only by its own roundtrip unit tests
-    /// (`test_fst_sidecar_roundtrip`, `test_fst_sidecar_missing_returns_empty`
-    /// in this module's tests) which construct a single, self-consistent
-    /// generation and never see the cross-generation id collision.
-    ///
-    /// If a sidecar is missing for an index, that index's fst_maps remain None
-    /// (fuzzy/prefix queries will fall back to HashMap brute-force, D-13).
+    /// Fixed by [`Self::load_term_fst_sidecars`] (kernel M4, task #50),
+    /// which persists AND restores the term dictionary itself before the
+    /// keyspace rescan runs, so ids never drift out from under a loaded
+    /// FST. This FST-only function is kept solely for its own pre-existing
+    /// roundtrip unit tests and must stay uncalled in production.
     #[cfg(feature = "text-index")]
+    #[cfg(test)]
     pub fn load_fst_sidecars(&mut self) {
         if let Some(ref dir) = self.persist_dir {
             let dir = dir.clone();
@@ -2222,6 +2272,111 @@ impl TextStore {
                     ),
                 }
             }
+        }
+    }
+
+    /// Load term-dict + FST sidecars for all indexes -- the SAFE loader
+    /// (kernel M4, task #50).
+    ///
+    /// MUST be called after `create_index` has restored the index schemas
+    /// from `text-indexes.meta` and BEFORE the keyspace auto-reindex rescan
+    /// runs any `index_document` calls -- see `src/shard/event_loop.rs`'s
+    /// recovery sequencing. Seeding `field_term_dicts` first makes the
+    /// rescan's `TermDictionary::get_or_insert` calls resolve already-known
+    /// terms to their PERSISTED ids (not fresh ones), and only ever assign
+    /// brand-new ids (continuing from the persisted `next_id`) to terms that
+    /// are genuinely new since the sidecar was written. That is what makes
+    /// loading the FST alongside it safe: the FST's baked-in ids and the
+    /// live term dictionary's ids are now the same id-space by construction.
+    ///
+    /// Fail-closed per index: any missing, truncated, corrupt,
+    /// version-mismatched, or field-count-mismatched (schema changed since
+    /// the sidecar was written) sidecar causes that index to be skipped
+    /// entirely -- both the term dict AND the FST stay at their fresh-start
+    /// state, identical to today's always-rescan behavior. Never partially
+    /// apply a sidecar (e.g. seed the dict but skip a corrupt FST, or vice
+    /// versa) -- that would silently reintroduce the id-space mismatch this
+    /// function exists to prevent.
+    #[cfg(feature = "text-index")]
+    pub fn load_term_fst_sidecars(&mut self) {
+        let Some(ref dir) = self.persist_dir else {
+            return;
+        };
+        let dir = dir.clone();
+        let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
+        for name in names {
+            let loaded = match crate::text::index_persist::load_term_fst_sidecar(
+                &dir,
+                name.as_ref(),
+            ) {
+                Ok(Some(fields)) => fields,
+                Ok(None) => continue, // no sidecar -- fresh start, today's behavior
+                Err(e) => {
+                    tracing::warn!(
+                        "Term-dict+FST sidecar for {} failed to load, falling back to full rescan: {}",
+                        String::from_utf8_lossy(name.as_ref()),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let Some(idx) = self.indexes.get_mut(name.as_ref()) else {
+                continue;
+            };
+            if loaded.len() != idx.field_term_dicts.len() {
+                // Schema changed (field count differs) since the sidecar
+                // was written -- stale, fail closed.
+                tracing::warn!(
+                    "Term-dict+FST sidecar for {} has {} field(s), index has {} -- stale sidecar, falling back to full rescan",
+                    String::from_utf8_lossy(name.as_ref()),
+                    loaded.len(),
+                    idx.field_term_dicts.len()
+                );
+                continue;
+            }
+
+            // Build every field's TermDictionary BEFORE mutating anything on
+            // `idx`, so a single bad field aborts the whole index cleanly
+            // (all-or-nothing per index).
+            let mut rebuilt_dicts = Vec::with_capacity(loaded.len());
+            let mut ok = true;
+            for field in &loaded {
+                match TermDictionary::from_pairs(
+                    field.terms.clone(),
+                    field.next_id,
+                    field.fst_high_water_mark,
+                ) {
+                    Some(dict) => rebuilt_dicts.push(dict),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || rebuilt_dicts.len() != loaded.len() {
+                tracing::warn!(
+                    "Term-dict+FST sidecar for {} is internally inconsistent -- falling back to full rescan",
+                    String::from_utf8_lossy(name.as_ref())
+                );
+                continue;
+            }
+
+            for (field_idx, (dict, field)) in rebuilt_dicts.into_iter().zip(loaded).enumerate() {
+                idx.field_term_dicts[field_idx] = dict;
+                if let Some(fst_bytes) = field.fst_bytes {
+                    match fst::Map::new(fst_bytes) {
+                        Ok(map) => idx.set_fst_map(field_idx, Some(map)),
+                        Err(e) => tracing::warn!(
+                            "FST bytes for {}[{}] failed to parse despite a valid term-dict sidecar: {}",
+                            String::from_utf8_lossy(name.as_ref()),
+                            field_idx,
+                            e
+                        ),
+                    }
+                }
+            }
+            idx.recovered_from_sidecar = true;
         }
     }
 }
@@ -2594,6 +2749,218 @@ mod tests {
         // No file written — load should return empty Vec (not error)
         let loaded = load_fst_sidecar(tmp.path(), b"nonexistent_idx").expect("load");
         assert!(loaded.is_empty(), "Missing sidecar should return empty Vec");
+    }
+
+    // ── Kernel M4 (task #50): term-dict + FST sidecar durability ─────────
+
+    /// Build a fresh TextStore of the same shape `make_index_with_docs`
+    /// builds directly on TextIndex, so both the "before crash" and
+    /// "after restart" sides of the equivalence test share one schema.
+    fn make_store_with_docs(persist_dir: &std::path::Path, docs: &[(&str, &str)]) -> TextStore {
+        use crate::protocol::Frame;
+        use crate::text::types::BM25Config;
+        let mut store = TextStore::new();
+        store.set_persist_dir(persist_dir.to_path_buf());
+        let field = TextFieldDef::new(Bytes::from_static(b"body"));
+        let idx = TextIndex::new(
+            Bytes::from_static(b"test_idx"),
+            Vec::new(),
+            vec![field],
+            BM25Config::default(),
+        );
+        store
+            .create_index(Bytes::from_static(b"test_idx"), idx)
+            .expect("create_index");
+        let idx = store.get_index_mut(b"test_idx").expect("index exists");
+        for (i, (key, text)) in docs.iter().enumerate() {
+            let args = vec![
+                Frame::BulkString(Bytes::from_static(b"body")),
+                Frame::BulkString(Bytes::copy_from_slice(text.as_bytes())),
+            ];
+            idx.index_document(i as u64, key.as_bytes(), &args);
+        }
+        store
+    }
+
+    /// The core equivalence gate for task #50: an index recovered from the
+    /// `.tfst` sidecar (term-dict seed + rescan) must answer FUZZY and
+    /// PREFIX queries -- which exercise the FST, not just the HashMap
+    /// brute-force path -- IDENTICALLY to a from-scratch rebuilt index over
+    /// the same corpus.
+    #[test]
+    fn load_term_fst_sidecars_survives_restart_and_matches_rebuilt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let docs: &[(&str, &str)] = &[
+            ("doc:0", "machine vision"),
+            ("doc:1", "deep learning"),
+            ("doc:2", "machine learning deep"),
+        ];
+
+        // "Before crash": build the index, compact (builds FST), persist
+        // the combined term-dict+FST sidecar -- mirrors FT.COMPACT.
+        let mut before = make_store_with_docs(tmp.path(), docs);
+        {
+            let idx = before.get_index_mut(b"test_idx").expect("index exists");
+            idx.build_fst();
+        }
+        before.save_term_fst_sidecar_for_index(b"test_idx");
+
+        let expected_fuzzy = {
+            let idx = before.get_index(b"test_idx").expect("index exists");
+            idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1))
+        };
+        let expected_prefix = {
+            let idx = before.get_index(b"test_idx").expect("index exists");
+            idx.expand_terms(0, "lear", &TermModifier::Prefix)
+        };
+        assert!(!expected_fuzzy.is_empty(), "fixture sanity: fuzzy matches");
+        assert!(
+            !expected_prefix.is_empty(),
+            "fixture sanity: prefix matches"
+        );
+
+        // "After restart": schema-only empty index (as `create_index`
+        // restores from `text-indexes.meta`), THEN load_term_fst_sidecars
+        // (seeds term dicts + FST BEFORE any doc is re-indexed), THEN the
+        // keyspace rescan re-indexes the same docs -- exactly the sequence
+        // wired in `src/shard/event_loop.rs`.
+        let mut after = TextStore::new();
+        after.set_persist_dir(tmp.path().to_path_buf());
+        let field = TextFieldDef::new(Bytes::from_static(b"body"));
+        let empty_idx = TextIndex::new(
+            Bytes::from_static(b"test_idx"),
+            Vec::new(),
+            vec![field],
+            crate::text::types::BM25Config::default(),
+        );
+        after
+            .create_index(Bytes::from_static(b"test_idx"), empty_idx)
+            .expect("create_index");
+        after.load_term_fst_sidecars();
+        assert!(
+            after.get_index(b"test_idx").unwrap().recovered_from_sidecar,
+            "sidecar was valid -- recovered_from_sidecar must be true"
+        );
+        {
+            use crate::protocol::Frame;
+            let idx = after.get_index_mut(b"test_idx").expect("index exists");
+            for (i, (key, text)) in docs.iter().enumerate() {
+                let args = vec![
+                    Frame::BulkString(Bytes::from_static(b"body")),
+                    Frame::BulkString(Bytes::copy_from_slice(text.as_bytes())),
+                ];
+                idx.index_document(i as u64, key.as_bytes(), &args);
+            }
+        }
+
+        let actual_fuzzy = {
+            let idx = after.get_index(b"test_idx").expect("index exists");
+            idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1))
+        };
+        let actual_prefix = {
+            let idx = after.get_index(b"test_idx").expect("index exists");
+            idx.expand_terms(0, "lear", &TermModifier::Prefix)
+        };
+
+        let sorted = |mut v: Vec<u32>| {
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(actual_fuzzy),
+            sorted(expected_fuzzy),
+            "FUZZY term-id expansion after sidecar-recovered restart must match a from-scratch rebuild"
+        );
+        assert_eq!(
+            sorted(actual_prefix),
+            sorted(expected_prefix),
+            "PREFIX term-id expansion after sidecar-recovered restart must match a from-scratch rebuild"
+        );
+
+        // And the search results built on top of those ids must match too.
+        let expected_results = {
+            let idx = before.get_index(b"test_idx").expect("index exists");
+            let ids = idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1));
+            let mut r = idx.search_field_or(0, &ids, None, None, 10);
+            r.sort_by(|a, b| a.key.cmp(&b.key));
+            r.into_iter().map(|r| r.key).collect::<Vec<_>>()
+        };
+        let actual_results = {
+            let idx = after.get_index(b"test_idx").expect("index exists");
+            let ids = idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1));
+            let mut r = idx.search_field_or(0, &ids, None, None, 10);
+            r.sort_by(|a, b| a.key.cmp(&b.key));
+            r.into_iter().map(|r| r.key).collect::<Vec<_>>()
+        };
+        assert_eq!(actual_results, expected_results);
+    }
+
+    /// No `.tfst` sidecar on disk (fresh index, or FT.COMPACT was never
+    /// called) -- `load_term_fst_sidecars` must be a silent no-op, leaving
+    /// `recovered_from_sidecar` false and the term dict empty (today's
+    /// full-rescan behavior).
+    #[test]
+    fn load_term_fst_sidecars_missing_is_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut store = TextStore::new();
+        store.set_persist_dir(tmp.path().to_path_buf());
+        let field = TextFieldDef::new(Bytes::from_static(b"body"));
+        let idx = TextIndex::new(
+            Bytes::from_static(b"test_idx"),
+            Vec::new(),
+            vec![field],
+            crate::text::types::BM25Config::default(),
+        );
+        store
+            .create_index(Bytes::from_static(b"test_idx"), idx)
+            .expect("create_index");
+
+        store.load_term_fst_sidecars();
+
+        let idx = store.get_index(b"test_idx").expect("index exists");
+        assert!(!idx.recovered_from_sidecar);
+        assert_eq!(idx.field_term_dicts[0].term_count(), 0);
+    }
+
+    /// A sidecar written for a 1-field schema must NOT be applied to an
+    /// index that now has 2 fields (schema changed since the sidecar was
+    /// written) -- fail closed rather than silently misapplying ids to the
+    /// wrong field.
+    #[test]
+    fn load_term_fst_sidecars_field_count_mismatch_falls_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let docs: &[(&str, &str)] = &[("doc:0", "machine vision")];
+        let mut before = make_store_with_docs(tmp.path(), docs);
+        {
+            let idx = before.get_index_mut(b"test_idx").expect("index exists");
+            idx.build_fst();
+        }
+        before.save_term_fst_sidecar_for_index(b"test_idx");
+
+        let mut after = TextStore::new();
+        after.set_persist_dir(tmp.path().to_path_buf());
+        let idx = TextIndex::new(
+            Bytes::from_static(b"test_idx"),
+            Vec::new(),
+            vec![
+                TextFieldDef::new(Bytes::from_static(b"body")),
+                TextFieldDef::new(Bytes::from_static(b"body2")),
+            ],
+            crate::text::types::BM25Config::default(),
+        );
+        after
+            .create_index(Bytes::from_static(b"test_idx"), idx)
+            .expect("create_index");
+
+        after.load_term_fst_sidecars();
+
+        let idx = after.get_index(b"test_idx").expect("index exists");
+        assert!(
+            !idx.recovered_from_sidecar,
+            "field-count mismatch must fail closed, not partially apply"
+        );
+        assert_eq!(idx.field_term_dicts[0].term_count(), 0);
+        assert_eq!(idx.field_term_dicts[1].term_count(), 0);
     }
 
     // ── v0.1.10 G-1: BM25 AS_OF MVCC filter ──────────────────────────────

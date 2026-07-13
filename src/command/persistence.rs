@@ -389,6 +389,79 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
     }
 }
 
+/// Modifier parsed from SHUTDOWN's optional argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSaveMode {
+    /// `SHUTDOWN SAVE` — force a synchronous save regardless of configured
+    /// save points.
+    Save,
+    /// `SHUTDOWN NOSAVE` — skip any extra RDB save (Redis parity: whatever
+    /// AOF/WAL already made durable is all that survives).
+    NoSave,
+    /// Bare `SHUTDOWN` — save iff RDB save points are configured (Redis
+    /// parity).
+    Default,
+}
+
+/// Parse SHUTDOWN's argument list.
+///
+/// Redis SHUTDOWN accepts an optional single modifier: `NOSAVE` or `SAVE`.
+/// `ABORT` is rejected here — Moon's SHUTDOWN runs synchronously to
+/// completion inside the command itself, so there is never an in-progress
+/// shutdown to abort. The `FORCE`/`NOW` timeout-override modifiers Redis
+/// added later are accepted as no-ops for client compatibility: Moon's
+/// shutdown path already flushes durably via the same bounded sequence used
+/// for SIGTERM and has no separate "hung shutdown" timeout to override.
+pub fn parse_shutdown_args(args: &[Frame]) -> Result<ShutdownSaveMode, Frame> {
+    let mut mode = None;
+    for a in args {
+        let bytes: &[u8] = match a {
+            Frame::BulkString(b) => b.as_ref(),
+            Frame::SimpleString(b) => b.as_ref(),
+            _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+        };
+        if bytes.eq_ignore_ascii_case(b"NOSAVE") {
+            if mode.is_some() {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            }
+            mode = Some(ShutdownSaveMode::NoSave);
+        } else if bytes.eq_ignore_ascii_case(b"SAVE") {
+            if mode.is_some() {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            }
+            mode = Some(ShutdownSaveMode::Save);
+        } else if bytes.eq_ignore_ascii_case(b"FORCE") || bytes.eq_ignore_ascii_case(b"NOW") {
+            continue;
+        } else if bytes.eq_ignore_ascii_case(b"ABORT") {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR No shutdown in progress",
+            )));
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+    }
+    Ok(mode.unwrap_or(ShutdownSaveMode::Default))
+}
+
+/// Poll interval used by SHUTDOWN SAVE in sharded/monoio mode while waiting
+/// for the cooperative per-shard BGSAVE snapshot it triggers to complete.
+pub const SHUTDOWN_SAVE_POLL_MS: u64 = 5;
+
+/// Bound on how long SHUTDOWN SAVE waits for that snapshot. A wedged shard
+/// must not hang SHUTDOWN forever; exceeding this fails the command (server
+/// stays up, Redis parity: a save that doesn't complete blocks shutdown)
+/// rather than exiting against a torn snapshot. 10s: long enough for a real
+/// (large) snapshot under normal disk I/O, short enough that an operator
+/// (or a client with a bounded read timeout) isn't left hanging.
+pub const SHUTDOWN_SAVE_TIMEOUT_MS: u64 = 10_000;
+
+/// Decide whether SHUTDOWN's `Default` mode should perform a synchronous
+/// save, mirroring Redis: save iff at least one RDB save point is
+/// configured.
+pub fn shutdown_default_should_save(save_points: Option<&str>) -> bool {
+    save_points.is_some_and(|s| !s.trim().is_empty())
+}
+
 /// LASTSAVE command: returns Unix timestamp of last successful save.
 pub fn handle_lastsave() -> Frame {
     let ts = LAST_SAVE_TIME.load(Ordering::Relaxed);
@@ -541,5 +614,77 @@ mod tests {
             }
             other => panic!("expected Frame::Error when gate is ON, got {other:?}"),
         }
+    }
+
+    // ── SHUTDOWN argument parsing (task #27) ────────────────────────────
+
+    #[test]
+    fn test_parse_shutdown_args_bare() {
+        assert_eq!(parse_shutdown_args(&[]).unwrap(), ShutdownSaveMode::Default);
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_nosave() {
+        let args = [Frame::BulkString(Bytes::from_static(b"NOSAVE"))];
+        assert_eq!(
+            parse_shutdown_args(&args).unwrap(),
+            ShutdownSaveMode::NoSave
+        );
+        // Case-insensitive, matching Redis.
+        let args = [Frame::BulkString(Bytes::from_static(b"nosave"))];
+        assert_eq!(
+            parse_shutdown_args(&args).unwrap(),
+            ShutdownSaveMode::NoSave
+        );
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_save() {
+        let args = [Frame::BulkString(Bytes::from_static(b"SAVE"))];
+        assert_eq!(parse_shutdown_args(&args).unwrap(), ShutdownSaveMode::Save);
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_save_force_noop() {
+        // SAVE FORCE / NOW are accepted no-ops for client compatibility.
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"SAVE")),
+            Frame::BulkString(Bytes::from_static(b"FORCE")),
+        ];
+        assert_eq!(parse_shutdown_args(&args).unwrap(), ShutdownSaveMode::Save);
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_conflicting_modifiers_reject() {
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"SAVE")),
+            Frame::BulkString(Bytes::from_static(b"NOSAVE")),
+        ];
+        assert!(matches!(parse_shutdown_args(&args), Err(Frame::Error(_))));
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_abort_rejected() {
+        let args = [Frame::BulkString(Bytes::from_static(b"ABORT"))];
+        match parse_shutdown_args(&args) {
+            Err(Frame::Error(msg)) => {
+                assert!(std::str::from_utf8(&msg).unwrap().contains("No shutdown"));
+            }
+            other => panic!("expected ABORT rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shutdown_args_garbage_rejected() {
+        let args = [Frame::BulkString(Bytes::from_static(b"BOGUS"))];
+        assert!(matches!(parse_shutdown_args(&args), Err(Frame::Error(_))));
+    }
+
+    #[test]
+    fn test_shutdown_default_should_save() {
+        assert!(!shutdown_default_should_save(None));
+        assert!(!shutdown_default_should_save(Some("")));
+        assert!(!shutdown_default_should_save(Some("   ")));
+        assert!(shutdown_default_should_save(Some("3600 1 300 100")));
     }
 }
