@@ -333,17 +333,17 @@ pub fn config_rewrite(runtime_config: &RuntimeConfig, server_config: &ServerConf
 
     let content = lines.join("\n") + "\n";
 
-    // Atomic write: tmpfile + rename
+    // Atomic write via `atomic_write_durable` (task #49): temp + fsync +
+    // rename + dir-fsync. The prior code wrote+renamed with no fsync at
+    // all, so a kill-9 right after `rename()` returned could still revert
+    // moon.conf to empty/stale on ext4/xfs (the directory-entry update was
+    // never made durable).
     let dir = &runtime_config.dir;
     let conf_path = std::path::Path::new(dir).join("moon.conf");
-    let tmp_path = std::path::Path::new(dir).join("moon.conf.tmp");
 
-    if let Err(e) = std::fs::write(&tmp_path, content.as_bytes()) {
+    if let Err(e) = crate::persistence::atomic::atomic_write_durable(&conf_path, content.as_bytes())
+    {
         return Frame::Error(Bytes::from(format!("ERR failed to write config: {e}")));
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &conf_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Frame::Error(Bytes::from(format!("ERR failed to rename config: {e}")));
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))

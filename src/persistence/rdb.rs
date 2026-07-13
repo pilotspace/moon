@@ -102,15 +102,12 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
 pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
     let buf = save_to_bytes(databases)?;
 
-    // Atomic write: write to tmp, then rename
-    let tmp_path = path.with_extension("rdb.tmp");
-    std::fs::write(&tmp_path, &buf).map_err(|e| RdbError::Io {
-        path: tmp_path.clone(),
-        source: e,
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|e| RdbError::Io {
+    // Atomic write: temp + fsync + rename + dir-fsync via the shared K3
+    // primitive (task #49) -- kill-9 between write and rename can never
+    // surface a torn or empty RDB at `path`.
+    crate::persistence::atomic::atomic_write_durable(path, &buf).map_err(|e| RdbError::Io {
         path: path.to_path_buf(),
-        source: e,
+        source: e.into(),
     })?;
 
     Ok(())
@@ -157,14 +154,9 @@ pub fn save_from_snapshot(
     let checksum = hasher.finalize();
     buf.write_all(&checksum.to_le_bytes())?;
 
-    let tmp_path = path.with_extension("rdb.tmp");
-    std::fs::write(&tmp_path, &buf).map_err(|e| RdbError::Io {
-        path: tmp_path.clone(),
-        source: e,
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|e| RdbError::Io {
+    crate::persistence::atomic::atomic_write_durable(path, &buf).map_err(|e| RdbError::Io {
         path: path.to_path_buf(),
-        source: e,
+        source: e.into(),
     })?;
 
     Ok(())
@@ -1810,6 +1802,24 @@ mod tests {
         assert!(loaded[0].get(b"k0").is_some());
         assert_eq!(loaded[1].len(), 0); // DB 1 should be empty
         assert!(loaded[2].get(b"k2").is_some());
+    }
+
+    /// Task #49: `save` (and `save_from_snapshot`) must go through
+    /// `atomic_write_durable` instead of a bare tmp-write + rename.
+    /// Regression pin: no leftover `.rdb.tmp` after a successful save.
+    #[test]
+    fn test_save_leaves_no_leftover_temp_file() {
+        let (dir, path) = rdb_path();
+        let mut dbs = vec![Database::new()];
+        dbs[0].set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+
+        save(&dbs, &path).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("dump.rdb")]);
     }
 
     #[test]

@@ -331,10 +331,17 @@ pub fn save_replication_state(
     repl_id: &str,
     repl_id2: &str,
 ) -> std::io::Result<()> {
-    let tmp = dir.join("replication.state.tmp");
     let dst = dir.join("replication.state");
-    std::fs::write(&tmp, format!("{}\n{}\n", repl_id, repl_id2))?;
-    std::fs::rename(&tmp, &dst)?;
+    // Atomic via `atomic_write_durable` (task #49): temp + fsync + rename
+    // + dir-fsync. The prior code (comment claimed "same pattern as
+    // WalWriter::truncate_after_snapshot") only did write+rename with no
+    // fsync -- a kill-9 right after `rename()` returned could still revert
+    // replication.state on ext4/xfs, losing the master replication ID
+    // across a restart.
+    crate::persistence::atomic::atomic_write_durable(
+        &dst,
+        format!("{}\n{}\n", repl_id, repl_id2).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -508,6 +515,23 @@ mod tests {
         let (loaded1, loaded2) = load_replication_state(dir.path());
         assert_eq!(loaded1, id1);
         assert_eq!(loaded2, id2);
+    }
+
+    /// Task #49: `save_replication_state` must go through
+    /// `atomic_write_durable`, not a bare write+rename. Regression pin: no
+    /// leftover `replication.state.tmp` after a successful save.
+    #[test]
+    fn test_save_replication_state_leaves_no_leftover_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = generate_repl_id();
+        let id2 = generate_repl_id();
+        save_replication_state(dir.path(), &id1, &id2).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("replication.state")]);
     }
 
     #[test]

@@ -181,6 +181,30 @@ fire-and-forget channel drained on its own 1ms tick, so an AOF-only marker
 no longer proves anything about the tombstone's own durability. Both tests
 now also sync a throwaway durable queue's `MQ.PUSH` (wal-v3-family) after
 the delete/flush before crashing.
+### Fixed — adopt shared `atomic_write_durable` at remaining bare-write persistence sites (kernel M4 prep / task #49)
+
+Six durable-state writers still hand-rolled their own (often incomplete)
+tmp-write/rename sequence instead of the shared K3 primitive
+(`src/persistence/atomic.rs`, PR #296): `acl::io::acl_save` and the ACL
+SAVE command handler (`src/command/acl.rs`) had **zero** atomicity at all
+(bare `fs::write` + `rename`, no fsync); CONFIG REWRITE
+(`src/command/config.rs`), `cluster::migration::save_nodes_conf`
+(nodes.conf), and `replication::save_replication_state` all did
+write+rename with no fsync, so a kill-9 immediately after `rename()`
+returns could still revert the file to stale/empty contents on
+`data=ordered` ext4/xfs; `persistence::clog::write_clog_page` and
+`persistence::kv_page::write_datafile`/`write_datafile_mixed` wrote
+directly to the FINAL path with no temp file or rename at all (only a
+trailing `sync_all`/`fsync_file`), so a crash mid-write could leave a torn
+CLOG page or KV data file. The native RDB save paths
+(`persistence::rdb::save`/`save_from_snapshot`,
+`persistence::redis_rdb::save`, used by BGSAVE) also lacked the
+parent-directory fsync step. All eight sites now route through
+`atomic_write_durable` (temp file, `sync_all`, `rename`, dir-fsync); each
+conversion is paired with a "no leftover temp file after a successful
+write" regression test. AOF appends, WAL segments, and the legacy
+`#[allow(dead_code)]` `rewrite_aof_sync` RDB-preamble path are out of
+scope (different framing/fsync mechanisms, per task brief).
 
 ### Added — unified per-shard floor register + min-across-planes WAL recycle (kernel M3 stage 2 / K2)
 

@@ -155,11 +155,17 @@ pub fn scan_clog_dir(clog_dir: &std::path::Path) -> std::io::Result<Vec<ClogPage
 }
 
 /// Write a ClogPage to `{clog_dir}/clog-{page_index:06}.page`.
+///
+/// Atomic via `atomic_write_durable` (task #49): temp + fsync + rename +
+/// dir-fsync. The prior code wrote the page bytes directly to the FINAL
+/// path with no temp file at all (the trailing `fsync_file` only proved
+/// the bytes were durable, not that a concurrent reader or a crash
+/// mid-write could never observe a torn page at that path).
 pub fn write_clog_page(clog_dir: &std::path::Path, page: &ClogPage) -> std::io::Result<()> {
     std::fs::create_dir_all(clog_dir)?;
     let path = clog_dir.join(format!("clog-{:06}.page", page.page_index()));
-    std::fs::write(&path, page.to_page())?;
-    crate::persistence::fsync::fsync_file(&path)
+    crate::persistence::atomic::atomic_write_durable(&path, &page.to_page())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,5 +356,28 @@ mod tests {
         let clog_dir = tmp.path().join("nonexistent");
         let pages = scan_clog_dir(&clog_dir).unwrap();
         assert!(pages.is_empty());
+    }
+
+    /// Task #49: `write_clog_page` must go through `atomic_write_durable`
+    /// instead of a bare `fs::write` directly to the final path.
+    /// Regression pin: no leftover hidden temp file after a successful
+    /// write, and a page overwrite leaves exactly one page file behind.
+    #[test]
+    fn test_write_clog_page_leaves_no_leftover_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clog_dir = tmp.path().join("clog");
+
+        let mut page = ClogPage::new(7);
+        page.set_status(3, TxnStatus::Committed);
+        write_clog_page(&clog_dir, &page).unwrap();
+        // Overwrite to exercise the rename-over-existing-file path too.
+        page.set_status(3, TxnStatus::Aborted);
+        write_clog_page(&clog_dir, &page).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&clog_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("clog-000007.page")]);
     }
 }
