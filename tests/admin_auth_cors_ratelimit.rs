@@ -6,6 +6,15 @@
 //! binary with the flags under test, exercises the HTTP API, and kills the
 //! child on drop. Tests tolerate a missing release binary (return Ok early)
 //! so `cargo test` without `--features console` doesn't fail spuriously.
+//!
+//! ureq 3 note: `Error::Status(code, resp)` from ureq 2 is gone — a 4xx/5xx
+//! response is no longer even routed through `Result::Err` unless
+//! `http_status_as_error` is left at its (default-on) setting, and when it
+//! is, the response (and thus its headers) are discarded. These tests need
+//! to assert on headers of error responses (`www-authenticate`,
+//! `retry-after`), so every request here disables `http_status_as_error`
+//! and inspects `resp.status()` / `resp.headers()` directly instead of
+//! matching on `ureq::Error::Status`.
 
 #![cfg(feature = "console")]
 
@@ -14,6 +23,8 @@ mod common;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use ureq::http::Response;
+use ureq::{Body, Error};
 
 /// RAII wrapper around a moon child process. `Drop` SIGKILLs the child and
 /// waits so the port is released before the next test runs.
@@ -33,6 +44,40 @@ impl Drop for Moon {
 
 fn bin_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+}
+
+/// GET `url` with the given headers, returning the raw response even for
+/// 4xx/5xx status codes (see module doc for why `http_status_as_error` is
+/// disabled here). Only genuine transport errors (timeout, connection
+/// refused, ...) surface as `Err`.
+fn get(url: &str, headers: &[(&str, &str)]) -> Result<Response<Body>, Error> {
+    let mut req = ureq::get(url);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.config()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .call()
+}
+
+/// OPTIONS `url` with the given headers (CORS preflight). Same
+/// error-tolerant status handling as [`get`].
+fn options(url: &str, headers: &[(&str, &str)]) -> Result<Response<Body>, Error> {
+    let mut req = ureq::options(url);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.config()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .call()
+}
+
+fn header<'a>(resp: &'a Response<Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 fn spawn_moon(extra: &[&str]) -> Option<Moon> {
@@ -74,7 +119,11 @@ fn spawn_moon(extra: &[&str]) -> Option<Moon> {
             break;
         }
         let url = format!("http://127.0.0.1:{}/healthz", admin);
-        if let Ok(resp) = ureq::get(&url).timeout(Duration::from_millis(500)).call()
+        if let Ok(resp) = ureq::get(&url)
+            .config()
+            .timeout_global(Some(Duration::from_millis(500)))
+            .build()
+            .call()
             && resp.status() == 200
         {
             return Some(Moon { child, port, admin });
@@ -119,28 +168,20 @@ fn hard01_auth_required_rejects_anon_and_accepts_bearer() {
 
     // No Authorization header → 401 with WWW-Authenticate: Bearer.
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
-    let err = ureq::get(&url).call().expect_err("expected non-200");
-    match err {
-        ureq::Error::Status(code, resp) => {
-            assert_eq!(code, 401, "expected 401 Unauthorized");
-            assert!(
-                resp.header("www-authenticate")
-                    .map(|v| v.contains("Bearer"))
-                    .unwrap_or(false),
-                "www-authenticate header missing or not Bearer: {:?}",
-                resp.header("www-authenticate"),
-            );
-        }
-        other => panic!("expected Status error, got {other:?}"),
-    }
+    let resp = get(&url, &[]).expect("request should complete");
+    assert_eq!(resp.status(), 401, "expected 401 Unauthorized");
+    assert!(
+        header(&resp, "www-authenticate")
+            .map(|v| v.contains("Bearer"))
+            .unwrap_or(false),
+        "www-authenticate header missing or not Bearer: {:?}",
+        header(&resp, "www-authenticate"),
+    );
 
     // Valid Bearer → 200.
     let tok = sign_token(b"testsecret-0123456789", "alice");
     let auth = format!("Bearer {}", tok);
-    let resp = ureq::get(&url)
-        .set("authorization", &auth)
-        .call()
-        .expect("200 with bearer");
+    let resp = get(&url, &[("authorization", &auth)]).expect("200 with bearer");
     assert_eq!(resp.status(), 200);
 }
 
@@ -152,14 +193,8 @@ fn hard01_tampered_signature_rejected() {
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
     // Valid user prefix but garbage signature.
     let auth = "Bearer alice.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let err = ureq::get(&url)
-        .set("authorization", auth)
-        .call()
-        .expect_err("expected 401");
-    match err {
-        ureq::Error::Status(code, _) => assert_eq!(code, 401),
-        other => panic!("expected 401, got {other:?}"),
-    }
+    let resp = get(&url, &[("authorization", auth)]).expect("request should complete");
+    assert_eq!(resp.status(), 401);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -174,21 +209,15 @@ fn hard02_cors_allowlist_only_echoes_allowed_origin() {
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
 
     // Allowed origin → header echoes the exact origin (not '*').
-    let resp = ureq::get(&url)
-        .set("origin", "https://allowed.example")
-        .call()
-        .unwrap();
+    let resp = get(&url, &[("origin", "https://allowed.example")]).unwrap();
     assert_eq!(
-        resp.header("access-control-allow-origin"),
+        header(&resp, "access-control-allow-origin"),
         Some("https://allowed.example")
     );
 
     // Disallowed origin → no Allow-Origin header at all.
-    let resp = ureq::get(&url)
-        .set("origin", "https://evil.example")
-        .call()
-        .unwrap();
-    assert!(resp.header("access-control-allow-origin").is_none());
+    let resp = get(&url, &[("origin", "https://evil.example")]).unwrap();
+    assert!(header(&resp, "access-control-allow-origin").is_none());
 }
 
 #[test]
@@ -251,20 +280,15 @@ fn hard03_rate_limit_returns_429_with_retry_after() {
     // Drain the bucket — 5 should succeed (or at worst one is captured by
     // the initial healthz probe during startup; tolerate a small slack).
     for _ in 0..10 {
-        let _ = ureq::get(&url).call();
+        let _ = get(&url, &[]);
     }
     // Now ask once more; must 429.
-    let err = ureq::get(&url).call().err();
-    match err {
-        Some(ureq::Error::Status(code, resp)) => {
-            assert_eq!(code, 429, "expected 429 Too Many Requests");
-            assert!(
-                resp.header("retry-after").is_some(),
-                "retry-after header must be set on 429"
-            );
-        }
-        other => panic!("expected 429 Status error, got {other:?}"),
-    }
+    let resp = get(&url, &[]).expect("request should complete");
+    assert_eq!(resp.status(), 429, "expected 429 Too Many Requests");
+    assert!(
+        header(&resp, "retry-after").is_some(),
+        "retry-after header must be set on 429"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -283,17 +307,20 @@ fn preflight_bypasses_auth() {
         return;
     };
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
-    let resp = ureq::request("OPTIONS", &url)
-        .set("origin", "https://ui.example")
-        .set("access-control-request-method", "GET")
-        .call()
-        .expect("OPTIONS should succeed without auth");
+    let resp = options(
+        &url,
+        &[
+            ("origin", "https://ui.example"),
+            ("access-control-request-method", "GET"),
+        ],
+    )
+    .expect("OPTIONS should succeed without auth");
     assert_eq!(resp.status(), 204);
     assert_eq!(
-        resp.header("access-control-allow-origin"),
+        header(&resp, "access-control-allow-origin"),
         Some("https://ui.example"),
     );
-    assert!(resp.header("access-control-allow-methods").is_some());
+    assert!(header(&resp, "access-control-allow-methods").is_some());
 }
 
 #[test]
@@ -303,14 +330,10 @@ fn healthz_and_readyz_bypass_auth() {
     };
     for path in ["/healthz", "/readyz", "/metrics"] {
         let url = format!("http://127.0.0.1:{}{}", m.admin, path);
-        let resp = ureq::get(&url).call();
         // /readyz may return 503 until ready; we tolerate 200/503 as long
         // as it isn't 401.
-        match resp {
-            Ok(r) => assert_ne!(r.status(), 401, "{path} should not require auth"),
-            Err(ureq::Error::Status(code, _)) => {
-                assert_ne!(code, 401, "{path} returned 401 — auth exemption broken");
-            }
+        match get(&url, &[]) {
+            Ok(resp) => assert_ne!(resp.status(), 401, "{path} should not require auth"),
             Err(e) => panic!("{path} request failed: {e}"),
         }
     }
