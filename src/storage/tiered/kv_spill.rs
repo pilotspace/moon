@@ -4,7 +4,7 @@
 //! instead of permanently deleting them.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use tracing::warn;
@@ -381,15 +381,53 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 ///
 /// Returns the number of files removed. I/O errors are logged and skipped —
 /// a sweep failure must never abort recovery.
+///
+/// Runs classification + deletion in one synchronous pass — kept for tests
+/// and any caller that genuinely wants blocking behavior. The startup path
+/// (task #55) instead calls [`classify_orphan_heap_files`] synchronously
+/// (cheap: metadata-only) and defers [`remove_orphan_heap_file`] per entry
+/// to a background sweep so `remove_file` I/O never blocks readiness.
 pub fn sweep_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) -> usize {
+    let candidates = classify_orphan_heap_files(shard_dir, manifest);
+    let removed = candidates.len();
+    for path in candidates {
+        remove_orphan_heap_file(&path);
+    }
+    removed
+}
+
+/// Classification half of the crash-orphan sweep (task #55).
+///
+/// Scans `{shard_dir}/data` and returns the paths of `heap-*.mpf` files whose
+/// `file_id` is not registered in `manifest`, plus any `heap-*.tmp` leftovers
+/// — WITHOUT deleting anything. `read_dir` + a `HashSet` membership test are
+/// pure in-memory/metadata work (no `remove_file` syscalls), so this stays
+/// fast even at hundreds of thousands of spilled files; the multi-minute
+/// startup stall measured in production (G2 bench: ~40s/shard at ~59K files)
+/// is the deletion I/O, not the classification.
+///
+/// Splitting classification from deletion lets the caller run classification
+/// synchronously during startup recovery — correct, because it observes the
+/// exact manifest state recovery just rebuilt, before the shard has served a
+/// single command, so no spill can have raced ahead of it — while deferring
+/// the actual `remove_file` calls to a background sweep that runs only after
+/// the shard is already serving traffic. The file-id namespace is monotonic
+/// and this snapshot is taken before any new spill can occur on this shard,
+/// so a path returned here stays correct to delete arbitrarily later:
+/// nothing that gets registered afterward can retroactively alias one of
+/// these on-disk file ids.
+///
+/// Only call this AFTER the manifest has been opened successfully — see
+/// [`sweep_orphan_heap_files`]'s doc for why.
+pub fn classify_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) -> Vec<PathBuf> {
     let data_dir = shard_dir.join("data");
     let Ok(read_dir) = std::fs::read_dir(&data_dir) else {
-        return 0;
+        return Vec::new();
     };
     let registered: std::collections::HashSet<u64> =
         manifest.files().iter().map(|e| e.file_id).collect();
 
-    let mut removed = 0usize;
+    let mut orphans = Vec::new();
     for dir_entry in read_dir.flatten() {
         let path = dir_entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -410,16 +448,32 @@ pub fn sweep_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) -> us
                 .is_some()
         };
         if orphan {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    removed += 1;
-                    tracing::info!("cold-tier sweep: removed crash-orphaned {}", name);
-                }
-                Err(e) => warn!("cold-tier sweep: failed to remove {}: {}", name, e),
-            }
+            orphans.push(path);
         }
     }
-    removed
+    orphans
+}
+
+/// Delete one file already classified as a crash orphan by
+/// [`classify_orphan_heap_files`].
+///
+/// I/O errors are logged and skipped — a sweep failure must never abort
+/// recovery or crash the background reclaim task. A `NotFound` error is not
+/// even logged: harmless if something else already reclaimed the path (e.g.
+/// a re-run of the sweep, or the classify→delete window overlapping a manual
+/// cleanup).
+pub fn remove_orphan_heap_file(path: &Path) {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!("cold-tier sweep: removed crash-orphaned {}", name);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("cold-tier sweep: failed to remove {}: {}", name, e),
+    }
 }
 
 #[cfg(test)]
@@ -500,6 +554,78 @@ mod tests {
         assert!(
             data_dir.join("notes.txt").exists(),
             "unrelated files must survive"
+        );
+    }
+
+    /// Task #55: `classify_orphan_heap_files` must be a pure, deletion-free
+    /// scan — the whole point of splitting it out of `sweep_orphan_heap_files`
+    /// is that recovery can run classification synchronously (cheap) while
+    /// deferring the actual `remove_file` I/O (measured ~40s/shard at ~59K
+    /// files in production) to a background task. If this ever regresses to
+    /// deleting inline, callers relying on "classify is safe to run on the
+    /// startup critical path" silently reintroduce task #55's readiness
+    /// stall.
+    #[test]
+    fn test_classify_orphan_heap_files_does_not_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // Registered spill: must be classified as NOT orphaned.
+        let entry = Entry::new_string(Bytes::from_static(b"registered"));
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, &mut manifest, None).unwrap();
+
+        let data_dir = shard_dir.join("data");
+        // A larger batch of unregistered files, standing in for a
+        // production-scale crash-orphan backlog.
+        const N: usize = 500;
+        for i in 0..N {
+            std::fs::write(
+                data_dir.join(format!("heap-{:06}.mpf", 100_000 + i)),
+                [0u8; 16],
+            )
+            .unwrap();
+        }
+        std::fs::write(data_dir.join("heap-000050.tmp"), b"partial").unwrap();
+
+        let candidates = classify_orphan_heap_files(shard_dir, &manifest);
+
+        // Classification found every orphan...
+        assert_eq!(
+            candidates.len(),
+            N + 1,
+            "must classify every orphan/tmp file"
+        );
+        // ...but deleted NONE of them.
+        for path in &candidates {
+            assert!(
+                path.exists(),
+                "classify_orphan_heap_files must not delete {:?} — deletion is deferred",
+                path
+            );
+        }
+        // The registered file was correctly excluded and untouched.
+        assert!(data_dir.join("heap-000001.mpf").exists());
+        assert!(
+            !candidates.contains(&data_dir.join("heap-000001.mpf")),
+            "registered file must not be classified as orphan"
+        );
+
+        // Now prove the deferred half actually reclaims them.
+        for path in &candidates {
+            remove_orphan_heap_file(path);
+        }
+        for path in &candidates {
+            assert!(
+                !path.exists(),
+                "remove_orphan_heap_file must delete {:?}",
+                path
+            );
+        }
+        assert!(
+            data_dir.join("heap-000001.mpf").exists(),
+            "registered file must still survive after the deferred sweep runs"
         );
     }
 

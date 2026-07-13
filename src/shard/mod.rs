@@ -82,6 +82,15 @@ pub struct Shard {
     /// RSS win (they used to never be reattached at all -- discovered, then
     /// discarded along with the rest of this throwaway store).
     pub recovered_warm_segments: Vec<(u64, std::path::PathBuf)>,
+    /// Crash-orphaned `heap-*.mpf`/`.tmp` files classified during recovery
+    /// (task #55, `RecoveryResult.pending_heap_orphans`) but not yet deleted.
+    /// Staged here for the same reason as `recovered_warm_segments`: this
+    /// `Shard` is constructed and recovered on the main thread before the
+    /// event loop exists, so the actual background-sweep task (which must
+    /// run on the shard's own event-loop thread, after the listener is
+    /// already accepting connections) is spawned by `event_loop.rs`, which
+    /// drains this field via `std::mem::take`.
+    pub pending_heap_orphans: Vec<std::path::PathBuf>,
 }
 
 impl Shard {
@@ -129,6 +138,7 @@ impl Shard {
             pubsub_registry: PubSubRegistry::new(),
             vector_store: VectorStore::new(),
             recovered_warm_segments: Vec::new(),
+            pending_heap_orphans: Vec::new(),
         }
     }
 
@@ -213,6 +223,11 @@ impl Shard {
                         // dropped along with the rest of this throwaway
                         // struct, so WARM's RSS win never survived a restart.
                         self.recovered_warm_segments = result.warm_segments;
+                        // Task #55: crash-orphaned heap files were only
+                        // CLASSIFIED during recovery (cheap), not deleted.
+                        // Stage the paths for `event_loop.rs` to reclaim in
+                        // the background once this shard is serving traffic.
+                        self.pending_heap_orphans = result.pending_heap_orphans;
                         return result.commands_replayed;
                     }
                     Err(e) => {
