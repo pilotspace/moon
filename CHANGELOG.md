@@ -205,6 +205,44 @@ conversion is paired with a "no leftover temp file after a successful
 write" regression test. AOF appends, WAL segments, and the legacy
 `#[allow(dead_code)]` `rewrite_aof_sync` RDB-preamble path are out of
 scope (different framing/fsync mechanisms, per task brief).
+### Fixed — task #45: tick-path eviction now spills collections instead of plain-dropping them
+
+Root cause of the intermittent `tests/cold_collection_visibility.rs` CI flake
+(stable GHOST: `EXISTS == 1`, `LRANGE`/`ZRANGE`/etc. permanently empty — only
+observed on shared/slow Linux runners, never test-induced). Two compounding
+defects in `src/storage/eviction.rs`'s synchronous spill path
+(`evict_one_with_spill`):
+
+1. Collection victims (Hash/List/Set/ZSet/Stream) were gated behind a
+   stale `is_string` check that predates `kv_spill::spill_to_datafile`
+   gaining full collection support (it already serializes any
+   `RedisValueRef` via `kv_serde`) — so a collection picked as a victim
+   while a `SpillContext` WAS present still fell through to a silent
+   plain-drop, indistinguishable from `spill: None`.
+2. Even for strings, a successful sync spill never registered a
+   `ColdIndex` entry (`spill_to_datafile` was always called with
+   `cold_index: None`) — the durable `.mpf` file existed and was
+   manifest-registered, but nothing could ever read it back via
+   `promote_cold_if_present`.
+
+Separately, `src/shard/timers::run_eviction` (the periodic 100ms tick,
+independent of the memory-pressure cascade) *never* received a
+`SpillContext` at all — every victim it picked was plain-dropped even with
+`--disk-offload enable` and a durability backstop (`--appendonly yes`)
+configured. `src/shard/persistence_tick.rs`'s `run_eviction_tick` now
+builds a real `SpillContext` (from the shard's `ShardManifest` + shard
+data dir + `next_file_id`) whenever disk-offload is enabled and a manifest
+is present, and threads it through — falling back to the pre-existing
+fail-close plain-drop (PR #273 policy-aware discipline: `noeviction` still
+OOMs, an evicting policy still frees RAM) when no durability backstop
+exists, matching the already-documented "spill is inert without one" rule.
+
+New deterministic regression tests (no server process, no timing race):
+`storage::eviction::tests::sync_spill_non_string_victim_is_durably_spilled_not_plain_dropped`
+and `shard::timers::tests::test_run_eviction_spills_collection_victim_when_spill_context_given`.
+`tests/cold_collection_visibility.rs` (10x local reruns, both runtimes)
+remains green and unmodified — its GHOST assertions still fail the suite on
+any regression.
 
 ### Added — unified per-shard floor register + min-across-planes WAL recycle (kernel M3 stage 2 / K2)
 
