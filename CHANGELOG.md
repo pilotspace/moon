@@ -6,6 +6,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — real SHUTDOWN [NOSAVE|SAVE] (task #27)
+
+`SHUTDOWN` was previously a stub that always replied `ERR Errors trying to
+SHUTDOWN. Check logs.` and never terminated the process. It is now handled
+at the connection-handler level (like BGSAVE/ACL, alongside all three
+dispatch paths: `handler_single`, `handler_sharded`, `handler_monoio`):
+
+- Parses the optional `NOSAVE` / `SAVE` modifier (Redis parity: bare
+  `SHUTDOWN` forces a save iff RDB save points are configured; `NOSAVE`
+  always skips it; `SAVE` always forces it). `ABORT` is rejected (Moon's
+  SHUTDOWN runs synchronously to completion, so there is never an
+  in-progress shutdown); `FORCE`/`NOW` are accepted no-ops.
+- A forced save that fails replies an error and the server stays up
+  (single-shard: synchronous `SAVE`; sharded/monoio: the cooperative
+  per-shard BGSAVE snapshot, polled with a bounded timeout).
+- On success, triggers the exact same `CancellationToken`-driven graceful
+  shutdown sequence already used for SIGTERM — per-shard WAL/AOF flush +
+  fsync across every plane, accept-loop stop, and clean connection
+  teardown — rather than reimplementing it. No reply is sent (Redis
+  parity: the client observes the connection close).
+- ACL category was already `admin/dangerous` (`DNG`) in the command
+  registry; unchanged.
+
+Coverage: `tests/shutdown_integration.rs` (NOSAVE prompt exit + waitpid
+status, AOF durability across a SHUTDOWN→restart round trip, a failed
+forced SAVE keeps the server up, syntax errors keep the server up) plus a
+cross-shard durability smoke section in `scripts/test-consistency.sh`.
+
+### Fixed — AOF writer manifest-wait/cancellation data-loss race (found via task #27)
+
+Writing the SHUTDOWN durability test surfaced a real, pre-existing bug: on
+first boot, main.rs's recovery creates the AOF manifest on a separate
+thread/task from the one that starts accepting connections, so a client can
+already be writing (queuing `Append` messages) while the AOF writer thread
+is still polling for that manifest to appear (`src/persistence/aof/writer_task.rs`,
+three writer-loop variants). That polling loop checked
+`cancel.is_cancelled()` *before* attempting `AofManifest::load` each
+iteration — a graceful shutdown landing in the same ~50ms poll window made
+the writer return immediately without ever loading the (by-then-current)
+manifest, silently discarding every already-queued `Append`. Reproduced
+reliably (>80% of runs) by sending `SHUTDOWN` within tens of milliseconds of
+boot: `AOF writer: cancelled while waiting for manifest` in the log, and a
+0-byte incr AOF file. Fixed by trying the load first in all three affected
+loops (TopLevel-monoio, PerShard-tokio, PerShard-monoio); a manifest that
+exists by the time the writer gets there is never missed just because a
+shutdown signal happened to land in the same instant. In practice this
+window was rarely hit via SIGTERM (real signal delivery has enough latency
+to clear it), which is presumably why it went unnoticed until a command
+that can call `cancel()` synchronously, milliseconds after the connection
+that issued the write, existed.
+
 ### Changed — CI pipeline optimization (round 1)
 
 - CodeQL no longer runs on every PR (main-push + weekly schedule only) — it

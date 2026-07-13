@@ -708,6 +708,46 @@ pub async fn handle_connection(
                             responses.push(crate::command::persistence::handle_lastsave());
                             continue;
                         }
+                        // SHUTDOWN [NOSAVE|SAVE] -- Redis parity: on success no reply
+                        // is sent (the client observes the connection close as the
+                        // server exits); on failure (bad syntax, or a forced SAVE
+                        // that failed) an error is returned and the server stays up.
+                        if cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
+                            match crate::command::persistence::parse_shutdown_args(cmd_args) {
+                                Ok(mode) => {
+                                    use crate::command::persistence::ShutdownSaveMode;
+                                    let should_save = match mode {
+                                        ShutdownSaveMode::Save => true,
+                                        ShutdownSaveMode::NoSave => false,
+                                        ShutdownSaveMode::Default => {
+                                            crate::command::persistence::shutdown_default_should_save(
+                                                config.save.as_deref(),
+                                            )
+                                        }
+                                    };
+                                    if should_save
+                                        && let err @ Frame::Error(_) = crate::command::persistence::handle_save(
+                                            &db,
+                                            &config.dir,
+                                            &config.dbfilename,
+                                        )
+                                    {
+                                        responses.push(err);
+                                        continue;
+                                    }
+                                    tracing::info!(
+                                        "SHUTDOWN command received -- initiating graceful shutdown"
+                                    );
+                                    shutdown.cancel();
+                                    should_quit = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    responses.push(e);
+                                    continue;
+                                }
+                            }
+                        }
                         // BGREWRITEAOF
                         if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
                             let response = if let Some(ref pool) = aof_pool {

@@ -1040,6 +1040,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
                 continue;
             }
+            // --- SHUTDOWN [NOSAVE|SAVE] ---
+            match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, &mut responses).await
+            {
+                dispatch::ShutdownOutcome::NotShutdown => {}
+                dispatch::ShutdownOutcome::Rejected => {
+                    continue;
+                }
+                dispatch::ShutdownOutcome::Exiting => {
+                    should_quit = true;
+                    break;
+                }
+            }
             // ACL gate MUST run before any privileged intercept (SWAPDB included)
             // — otherwise unauthenticated clients can mutate cross-DB state.
             // handler_sharded already enforces this ordering; this matches it.

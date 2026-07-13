@@ -1075,6 +1075,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- SHUTDOWN [NOSAVE|SAVE] ---
+                    match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, &mut responses).await {
+                        dispatch::ShutdownOutcome::NotShutdown => {}
+                        dispatch::ShutdownOutcome::Rejected => { continue; }
+                        dispatch::ShutdownOutcome::Exiting => { should_quit = true; break; }
+                    }
+
                     // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
                     if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
                         continue;
