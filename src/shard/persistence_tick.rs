@@ -12,6 +12,36 @@ use crate::runtime::channel;
 
 use super::shared_databases::ShardDatabases;
 
+/// Compute `allocator_overhead_bytes` = `max(0, RSS - tracked_sum)` (task
+/// #58, LOW-1). `tracked_sum` is every subsystem this build can currently
+/// account for: DashTable+entries, vector (mutable+immutable), text (FTS),
+/// graph (CSR), Lua script cache, PageCache resident buffers, and the
+/// replication backlog ring. Saturating: a stale/racing snapshot where
+/// `tracked_sum` transiently exceeds `rss` (all reads are independent
+/// Relaxed loads, at most one 100ms tick apart) clamps to 0 rather than
+/// underflowing. Observability only -- the result is published for INFO
+/// memory / Prometheus and is never read by eviction or budget-gating code.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_allocator_overhead(
+    rss_bytes: usize,
+    dashtable_bytes: usize,
+    vector_bytes: usize,
+    text_bytes: usize,
+    graph_bytes: usize,
+    lua_bytes: usize,
+    pagecache_bytes: usize,
+    repl_backlog_bytes: usize,
+) -> usize {
+    let tracked_sum = dashtable_bytes
+        + vector_bytes
+        + text_bytes
+        + graph_bytes
+        + lua_bytes
+        + pagecache_bytes
+        + repl_backlog_bytes;
+    rss_bytes.saturating_sub(tracked_sum)
+}
+
 /// Handle a pending SnapshotBegin that was collected from SPSC drain.
 ///
 /// If a snapshot is already in progress, sends an error reply.
@@ -351,6 +381,22 @@ pub(crate) fn run_eviction_tick(
         mutable + immutable
     });
 
+    // task #58 (LOW-2): publish this shard's PageCache resident bytes
+    // (actually-grown 4KB/64KB frame buffers, NOT the configured capacity --
+    // see `PageCache::resident_buffer_bytes()`) alongside vector/text/graph/
+    // lua above. Observability only: never read by eviction or budget gating.
+    // `None` (disk-offload disabled) publishes 0, matching the disabled-
+    // subsystem convention the other kinds already use.
+    {
+        use std::sync::atomic::Ordering;
+        let pagecache_bytes = page_cache
+            .as_ref()
+            .map_or(0, PageCache::resident_buffer_bytes);
+        shard_databases.store_memory_per_shard[shard_id]
+            .pagecache
+            .store(pagecache_bytes, Ordering::Relaxed);
+    }
+
     {
         let rt = runtime_config.read();
         // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
@@ -381,6 +427,45 @@ pub(crate) fn run_eviction_tick(
         if rt.maxmemory > 0 {
             shard_databases.recompute_elastic_budget(shard_id, &rt);
         }
+    }
+
+    // task #58 (LOW-1): publish `allocator_overhead_bytes` = RSS - tracked_sum
+    // on this 100ms tick instead of only computing it on-demand (MEMORY
+    // DOCTOR's existing on-demand formula in server_admin.rs is left as-is).
+    // Only shard 0 performs this -- it needs a process-wide RSS read plus a
+    // cross-shard sum, and every sibling's 100ms tick would otherwise repeat
+    // the same syscall + O(num_shards) sum for an identical process-wide
+    // number. Observability only: never read by eviction or budget gating.
+    if shard_id == 0 {
+        use std::sync::atomic::Ordering;
+        let rss = crate::admin::metrics_setup::get_rss_bytes() as usize;
+        let dashtable_bytes = shard_databases.read_memory_sum();
+        let mut vector_bytes = 0usize;
+        let mut text_bytes = 0usize;
+        let mut graph_bytes = 0usize;
+        let mut lua_bytes = 0usize;
+        let mut pagecache_bytes = 0usize;
+        for mem in shard_databases.store_memory_per_shard.iter() {
+            vector_bytes += mem.vector.load(Ordering::Relaxed);
+            text_bytes += mem.text.load(Ordering::Relaxed);
+            graph_bytes += mem.graph.load(Ordering::Relaxed);
+            lua_bytes += mem.lua.load(Ordering::Relaxed);
+            pagecache_bytes += mem.pagecache.load(Ordering::Relaxed);
+        }
+        let repl_backlog_bytes = crate::admin::metrics_setup::get_global_repl_state_arc()
+            .and_then(|state| state.read().ok().map(|g| g.backlog_resident_bytes()))
+            .unwrap_or(0);
+        let allocator_overhead = compute_allocator_overhead(
+            rss,
+            dashtable_bytes,
+            vector_bytes,
+            text_bytes,
+            graph_bytes,
+            lua_bytes,
+            pagecache_bytes,
+            repl_backlog_bytes,
+        );
+        crate::admin::metrics_setup::update_allocator_overhead_bytes(allocator_overhead);
     }
 
     if server_config.disk_offload_enabled()
@@ -1775,6 +1860,99 @@ mod tests {
         assert!(
             should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes),
             "vector resident memory must contribute to the pressure trigger"
+        );
+    }
+
+    // ── task #58 (LOW-1/LOW-2): allocator_overhead + pagecache accounting ──
+
+    #[test]
+    fn test_compute_allocator_overhead_subtracts_every_tracked_plane() {
+        // RSS 1000, tracked planes sum to 400 (100 dashtable + 50 vector +
+        // 40 text + 30 graph + 20 lua + 100 pagecache + 60 backlog) => 600
+        // left over as allocator overhead.
+        let overhead = compute_allocator_overhead(1000, 100, 50, 40, 30, 20, 100, 60);
+        assert_eq!(overhead, 600);
+    }
+
+    #[test]
+    fn test_compute_allocator_overhead_saturates_at_zero() {
+        // Tracked sum exceeds RSS (stale cross-thread snapshot, e.g. a
+        // pagecache figure a tick ahead of a shrinking RSS read) => clamp to
+        // 0 instead of underflowing usize.
+        let overhead = compute_allocator_overhead(100, 80, 0, 0, 0, 0, 50, 0);
+        assert_eq!(overhead, 0);
+    }
+
+    #[test]
+    fn test_compute_allocator_overhead_zero_tracked_equals_rss() {
+        // A build with every subsystem disabled/empty attributes the whole
+        // RSS to allocator overhead (matches MEMORY DOCTOR's existing
+        // on-demand formula's degenerate case).
+        let overhead = compute_allocator_overhead(2048, 0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(overhead, 2048);
+    }
+
+    #[test]
+    fn test_pagecache_publishes_into_shard_store_memory() {
+        // Wire-through test: a shard's ShardStoreMemory.pagecache atomic
+        // round-trips through the same publisher `run_eviction_tick` uses
+        // (store_memory_per_shard[shard_id].pagecache), and sums correctly
+        // across shards the way INFO memory / the Prometheus 15s updater do.
+        let dbs: Vec<Vec<crate::storage::Database>> = vec![
+            vec![crate::storage::Database::new()],
+            vec![crate::storage::Database::new()],
+        ];
+        let (shared, _inits) = ShardDatabases::new(dbs);
+
+        shared.store_memory_per_shard[0]
+            .pagecache
+            .store(4096 * 10, std::sync::atomic::Ordering::Relaxed);
+        shared.store_memory_per_shard[1]
+            .pagecache
+            .store(65536 * 3, std::sync::atomic::Ordering::Relaxed);
+
+        let total: usize = shared
+            .store_memory_per_shard
+            .iter()
+            .map(|m| m.pagecache.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        assert_eq!(total, 4096 * 10 + 65536 * 3);
+    }
+
+    #[test]
+    fn test_pagecache_resident_bytes_matches_frame_counts_formula() {
+        // Task #58's stated formula: num 4k frames actually grown * 4096 +
+        // num 64k frames actually grown * 65536. Exercise the real
+        // PageCache::resident_buffer_bytes() (not a re-implementation) to
+        // pin the contract this module's publish call relies on.
+        let cache = PageCache::new(8, 4);
+        assert_eq!(
+            cache.resident_buffer_bytes(),
+            0,
+            "freshly constructed cache has no grown buffers"
+        );
+
+        // Growing one 4KB and one 64KB frame via fetch_page (miss path reads
+        // through read_fn, which fills the buffer to a full page).
+        let handle_small = cache
+            .fetch_page(1, 0, false, |buf: &mut [u8]| -> std::io::Result<()> {
+                buf.fill(0xAB);
+                Ok(())
+            })
+            .expect("fetch 4KB page");
+        cache.unpin_page(handle_small);
+        let handle_large = cache
+            .fetch_page(2, 0, true, |buf: &mut [u8]| -> std::io::Result<()> {
+                buf.fill(0xCD);
+                Ok(())
+            })
+            .expect("fetch 64KB page");
+        cache.unpin_page(handle_large);
+
+        assert_eq!(
+            cache.resident_buffer_bytes(),
+            4096 + 65536,
+            "resident_buffer_bytes must equal grown-4KB*4096 + grown-64KB*65536"
         );
     }
 }

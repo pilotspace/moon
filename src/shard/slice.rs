@@ -612,6 +612,7 @@ pub(crate) mod test_support {
                 text: AtomicUsize::new(0),
                 graph: AtomicUsize::new(0),
                 lua: AtomicUsize::new(0),
+                pagecache: AtomicUsize::new(0),
             }),
         }
     }

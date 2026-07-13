@@ -2,7 +2,7 @@
 //! (Phase 190 Plan 03).
 //!
 //! Spawns the release moon binary with an admin port, loads a small
-//! dataset, scrapes `/metrics`, and verifies all 9 subsystem kinds are
+//! dataset, scrapes `/metrics`, and verifies all 10 subsystem kinds are
 //! present with their sum within +/-10% of `moon_rss_bytes`.
 //!
 //! Run with:
@@ -191,7 +191,9 @@ fn parse_rss_bytes(body: &str) -> Option<f64> {
 // (C4, wave-5 hygiene) but missing from this list -- a pre-existing
 // test/code mismatch this file's own count assertion should have caught.
 // Fixed alongside the K4 "text" addition since both land in this file.
-const EXPECTED_KINDS: [&str; 9] = [
+// task #58 (LOW-2): "pagecache" added -- PageCache resident buffer bytes,
+// published alongside vector/text/graph/lua by the same 100ms tick.
+const EXPECTED_KINDS: [&str; 10] = [
     "dashtable",
     "hnsw",
     // K4 (kernel-m2-brief-2026-07-12 stage 2): text (FTS) resident bytes.
@@ -202,10 +204,11 @@ const EXPECTED_KINDS: [&str; 9] = [
     "replication_backlog",
     "lua_scripts",
     "allocator_overhead",
+    "pagecache",
 ];
 
 #[test]
-fn metrics_endpoint_emits_nine_memory_kinds() {
+fn metrics_endpoint_emits_ten_memory_kinds() {
     let Some(m) = spawn_moon() else { return };
 
     // Load 1000 string keys so DashTable has non-zero resident bytes.
@@ -237,7 +240,7 @@ fn metrics_endpoint_emits_nine_memory_kinds() {
         thread::sleep(Duration::from_secs(2));
     }
 
-    // ── Assert all 9 kinds present ──────────────────────────────────────
+    // ── Assert all 10 kinds present ──────────────────────────────────────
     for expected in &EXPECTED_KINDS {
         assert!(
             kinds.contains_key(*expected),
@@ -249,8 +252,8 @@ fn metrics_endpoint_emits_nine_memory_kinds() {
     }
     assert_eq!(
         kinds.len(),
-        9,
-        "Expected exactly 9 kinds, got {}: {kinds:?}",
+        10,
+        "Expected exactly 10 kinds, got {}: {kinds:?}",
         kinds.len()
     );
 
@@ -264,7 +267,7 @@ fn metrics_endpoint_emits_nine_memory_kinds() {
     let sum: f64 = kinds.values().sum();
     assert!(
         sum > 0.0,
-        "Sum of all 9 kinds is 0 — update hook may not have fired"
+        "Sum of all 10 kinds is 0 — update hook may not have fired"
     );
 
     // ── Assert dashtable > 0 after loading 1000 keys ────────────────────
