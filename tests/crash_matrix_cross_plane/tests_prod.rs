@@ -4,22 +4,8 @@
 //! (flat function names, per the brief's explicit suggestion — avoids the
 //! `g1_` prefix collision `crash_recovery_graph_durability.rs` already has).
 
-use crate::harness::{self, Config};
+use crate::harness::Config;
 use crate::scenarios;
-
-const TXN_GRAPH_LEG_RED_REASON: &str = "cross-store TXN graph leg not durable, task #52. A \
-     committed cross-store transaction (SET+GRAPH.ADDNODE) survives kill-9 \
-     on the KV leg (PR #247's persist_txn_aof) but the graph leg is lost — \
-     reviewed and confirmed not a harness artifact (property-value query, \
-     no VALID_AT, both legs' WAL flush confirmed synced before the kill), \
-     and confirmed deterministic 3x consecutive at both shards=1 and \
-     shards=4 after the task #52 hardening pass (own crash cycle per \
-     round, --checkpoint-timeout 3600, kill immediately post-sync-wait). \
-     Minimal repro in scenarios::txn_isolated_committed's doc comment. \
-     P1 finding for kernel M3 — tracked separately, not this stage's job to \
-     fix. Gates ONLY the committed-transaction half (review round 3, P1): \
-     the atomicity half (`cross_plane_*_txn_isolated_atomicity`) is a \
-     genuinely different, unrelated, GREEN claim and runs ungated.";
 
 /// FIXED (kernel M3 stage 2 / K2, task #53). Root cause: `save_graph_store`
 /// (`src/graph/recovery.rs`) wrote the reference/floor
@@ -79,12 +65,18 @@ fn cross_plane_prod_s1_mq_isolated() {
     scenarios::mq_isolated(&Config::PROD_S1);
 }
 
+/// FIXED (kernel M3 stage 3 / task #52). Root cause: `execute_transaction_sharded`
+/// (`src/server/conn/shared.rs`) had no GRAPH.* branch at all — a queued
+/// GRAPH.ADDNODE fell through to the generic KV `dispatch()` table (which
+/// doesn't know graph commands), erroring as "unknown command" and never
+/// reaching the graph store, let alone its WAL. Fixed by routing GRAPH.*
+/// commands queued inside MULTI/EXEC to the graph engine (mirroring the
+/// single-command path in `try_handle_graph_command`) and flushing the
+/// drained wal-v3 records after the transaction body runs. Verified 3x
+/// consecutive GREEN at both shards=1 and shards=4.
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_prod_s1_txn_isolated_committed() {
-    if !harness::red_guard(TXN_GRAPH_LEG_RED_REASON) {
-        return;
-    }
     scenarios::txn_isolated_committed(&Config::PROD_S1);
 }
 
@@ -160,12 +152,11 @@ fn cross_plane_prod_s4_mq_isolated() {
     scenarios::mq_isolated(&Config::PROD_S4);
 }
 
+/// FIXED (kernel M3 stage 3 / task #52). See
+/// `cross_plane_prod_s1_txn_isolated_committed`'s doc for the root cause.
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn cross_plane_prod_s4_txn_isolated_committed() {
-    if !harness::red_guard(TXN_GRAPH_LEG_RED_REASON) {
-        return;
-    }
     scenarios::txn_isolated_committed(&Config::PROD_S4);
 }
 

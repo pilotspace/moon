@@ -25,6 +25,10 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "graph")]
+use moon::shard::dispatch::graph_to_shard;
+use moon::shard::dispatch::key_to_shard;
+
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
         return Some(std::path::PathBuf::from(p));
@@ -323,4 +327,161 @@ fn single_shard_unaffected() {
     let mut r = Client::connect(m.port);
     assert_eq!(r.cmd(&["GET", "s:a"]), Reply::Bulk(Some("1".into())));
     assert_eq!(r.cmd(&["GET", "s:b"]), Reply::Bulk(Some("2".into())));
+}
+
+// ---------------------------------------------------------------------------
+// GRAPH.* leg locality (task #52 review round 3, CodeRabbit finding, P1)
+// ---------------------------------------------------------------------------
+//
+// `GRAPH.*` commands declare NO keys in command metadata (`first_key ==
+// last_key == 0`) — `analyze_txn_locality`'s KV-key scan (`command_keys`)
+// therefore contributed nothing for them, so a queued body was classified
+// purely by its KV keys (or `Keyless` if it had none), ignoring the graph
+// name's REAL owner shard entirely. The standalone (non-MULTI) `GRAPH.*`
+// path routes by `graph_to_shard(name, num_shards)` — identical hashing to
+// `key_to_shard` (same hash-tag-aware xxh64) — so a graph write committed
+// inside a misclassified MULTI/EXEC body could silently land on the WRONG
+// shard's `graph_store`, invisible to that normally-routed standalone read
+// path. Fixed by folding the graph name into `analyze_txn_locality`'s same
+// `visit` closure used for KV keys: a body whose KV keys and graph name
+// disagree on owner becomes `CrossShard` (rejected `CROSSSLOT`, same
+// posture as the SORT/GEORADIUS `STORE`-dest case above); a graph-only body
+// becomes `SingleShard(graph_owner)`, which routes through the SAME
+// whole-body-atomic owner hop (`execute_txn_on_owner` /
+// `ShardMessage::TxnExecute`) a KV-only remote-owner body already uses —
+// no NEW hop mechanism, so the "body runs on ONE local shard slice"
+// invariant is preserved.
+
+/// Rows array from a GRAPH.QUERY reply (`[headers, rows, stats]`), returning
+/// just the row count — enough to prove presence/absence without depending
+/// on cell encoding.
+#[cfg(feature = "graph")]
+fn graph_row_count(c: &mut Client, graph: &str, cypher: &str) -> usize {
+    match c.cmd(&["GRAPH.QUERY", graph, cypher]) {
+        Reply::Array(outer) => match outer.get(1) {
+            Some(Reply::Array(rows)) => rows.len(),
+            other => panic!("malformed GRAPH.QUERY reply, rows slot = {other:?}"),
+        },
+        other => panic!("malformed GRAPH.QUERY reply: {other:?}"),
+    }
+}
+
+/// Deterministically (not randomly) search fixed candidate suffixes for a KV
+/// key and a graph name whose owners differ at `num_shards` — reproducible
+/// every run since the hash function is pure and the candidate list is
+/// fixed, unlike relying on which shard a client connection happens to land
+/// on.
+#[cfg(feature = "graph")]
+fn pick_kv_and_graph_on_different_shards(num_shards: usize) -> (String, String) {
+    for i in 0..256u32 {
+        let key = format!("txnglocxs:{i}");
+        let key_owner = key_to_shard(key.as_bytes(), num_shards);
+        for j in 0..256u32 {
+            let graph = format!("txnglocxsgraph:{j}");
+            let graph_owner = graph_to_shard(graph.as_bytes(), num_shards);
+            if key_owner != graph_owner {
+                return (key, graph);
+            }
+        }
+    }
+    panic!("could not find a KV key / graph name pair on different shards at {num_shards} shards");
+}
+
+/// THE CODERABBIT FINDING, made RED-then-GREEN: a `MULTI` body whose KV key
+/// and `GRAPH.*` name are computed (not guessed) to hash to DIFFERENT
+/// shards at shards=4 must be rejected `CROSSSLOT`, and neither leg may have
+/// applied — same golden invariant as `multi_shard_span_rejected`, extended
+/// across the KV/graph boundary. Pre-fix this body was silently
+/// misclassified `SingleShard(kv_owner)` (or `Keyless`, ignoring the KV key
+/// entirely for a graph-only body) and the `GRAPH.ADDNODE` durably applied
+/// to the WRONG shard's `graph_store`.
+#[cfg(feature = "graph")]
+#[cfg(feature = "graph")]
+#[test]
+fn graph_leg_cross_shard_rejected() {
+    let Some(m) = spawn_moon("4") else { return };
+    let (key, graph) = pick_kv_and_graph_on_different_shards(4);
+
+    assert_eq!(
+        Client::connect(m.port).cmd(&["GRAPH.CREATE", &graph]),
+        Reply::Simple("OK".into()),
+        "GRAPH.CREATE {graph}"
+    );
+
+    let mut c = Client::connect(m.port);
+    assert_eq!(c.cmd(&["MULTI"]), Reply::Simple("OK".into()));
+    assert_eq!(c.cmd(&["SET", &key, "v"]), Reply::Simple("QUEUED".into()));
+    assert_eq!(
+        c.cmd(&["GRAPH.ADDNODE", &graph, "Label", "id", "1"]),
+        Reply::Simple("QUEUED".into())
+    );
+    match c.cmd(&["EXEC"]) {
+        Reply::Error(e) => assert!(
+            e.starts_with("CROSSSLOT"),
+            "KV key and graph name on different shards must be CROSSSLOT, got: {e}"
+        ),
+        other => panic!("cross-shard KV+graph body must be rejected, got: {other:?}"),
+    }
+
+    // Neither leg applied — same "EXEC says OK but the data isn't there"
+    // golden invariant, checked from a fresh connection routed normally.
+    let mut r = Client::connect(m.port);
+    assert_eq!(
+        r.cmd(&["GET", &key]),
+        Reply::Bulk(None),
+        "rejected cross-shard txn must not have written the KV leg"
+    );
+    assert_eq!(
+        graph_row_count(&mut r, &graph, "MATCH (n:Label {id: 1}) RETURN n.id"),
+        0,
+        "rejected cross-shard txn must not have applied the graph leg"
+    );
+}
+
+/// A graph-only `MULTI` body (no KV key at all — the `Keyless` misclassification
+/// half of the finding) must still commit to the graph's TRUE owner shard,
+/// regardless of which shard the writing connection happened to land on
+/// (`SO_REUSEPORT` placement is not client-controllable). Verified by
+/// reading back through a FRESH connection, which routes normally by
+/// `graph_to_shard` — if the write had landed on the wrong shard (the
+/// pre-fix `Keyless` bug: always the connection's OWN current shard), this
+/// read would see nothing.
+#[cfg(feature = "graph")]
+#[cfg(feature = "graph")]
+#[test]
+fn graph_only_txn_routes_to_true_owner() {
+    let Some(m) = spawn_moon("4") else { return };
+
+    for i in 0..12 {
+        let graph = format!("txnglocowner:{i}");
+        assert_eq!(
+            Client::connect(m.port).cmd(&["GRAPH.CREATE", &graph]),
+            Reply::Simple("OK".into()),
+            "GRAPH.CREATE {graph}"
+        );
+
+        let mut c = Client::connect(m.port);
+        assert_eq!(c.cmd(&["MULTI"]), Reply::Simple("OK".into()));
+        assert_eq!(
+            c.cmd(&["GRAPH.ADDNODE", &graph, "Label", "id", &i.to_string()]),
+            Reply::Simple("QUEUED".into())
+        );
+        match c.cmd(&["EXEC"]) {
+            Reply::Array(items) => assert_eq!(
+                items.len(),
+                1,
+                "EXEC array has one reply per queued write for {graph}"
+            ),
+            other => panic!("graph-only txn must succeed (owner hop), got: {other:?} for {graph}"),
+        }
+
+        let mut r = Client::connect(m.port);
+        let cypher = format!("MATCH (n:Label {{id: {i}}}) RETURN n.id");
+        assert_eq!(
+            graph_row_count(&mut r, &graph, &cypher),
+            1,
+            "committed graph-only txn for {graph} must be visible via the normally-routed read \
+             (proves owner-shard placement, not the connection's current shard)"
+        );
+    }
 }

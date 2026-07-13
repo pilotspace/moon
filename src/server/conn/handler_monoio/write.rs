@@ -841,7 +841,7 @@ pub(super) async fn try_handle_multi_exec(
                     _ => {}
                 }
             }
-            let (result, aof_entries) = execute_transaction_sharded(
+            let (result, aof_entries, graph_records) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
                 &conn.command_queue,
@@ -875,6 +875,37 @@ pub(super) async fn try_handle_multi_exec(
                     super::ft::record_local_write_db(ctx, *entry_db, bytes.clone());
                 }
             }
+            // task #52 review round 2 (P1): the graph-leg records need the
+            // SAME replicate-then-append treatment as the live single-command
+            // graph path (`try_handle_graph_command`, ~line 1123 below) —
+            // `execute_transaction_sharded` only collects them (it has no
+            // `ConnectionContext`/replication access), so the fan-out and the
+            // wal_append both happen HERE, in the same synchronous stretch as
+            // the txn body that just ran. Graph replication is single-shard
+            // scope only (multi-shard graph replication rides the R2
+            // broadcast redesign), matching the live path's `num_shards == 1`
+            // gate exactly — this is NOT relaxed to the KV leg's
+            // `repl_active` alone.
+            #[cfg(feature = "graph")]
+            {
+                let graph_repl_active = ctx.num_shards == 1 && repl_active;
+                for (entry_db, record) in &graph_records {
+                    if graph_repl_active {
+                        super::ft::record_local_write_db(
+                            ctx,
+                            *entry_db,
+                            bytes::Bytes::from(record.clone()),
+                        );
+                    }
+                    ctx.shard_databases.wal_append(
+                        ctx.shard_id,
+                        crate::persistence::wal_v3::record::WalRecordType::Command,
+                        bytes::Bytes::from(record.clone()),
+                    );
+                }
+            }
+            #[cfg(not(feature = "graph"))]
+            let _ = graph_records;
             // DURABILITY: append every successful write in the body to THIS
             // shard's AOF via the same group-commit path as normal writes, then
             // issue ONE fsync barrier under appendfsync=always before acking.

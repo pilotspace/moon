@@ -77,7 +77,9 @@
 //! `cross_plane_prod_s1_graph_drop_survives_repeated_checkpoints` /
 //! `cross_plane_prod_s4_graph_drop_survives_repeated_checkpoints`, both
 //! GREEN by default (RED-first verified against the pre-fix code before
-//! the fix landed). **42 cells total: 33 GREEN by default, 9 RED.**
+//! the fix landed). Kernel M3 stage 3 (task #52) then root-caused and fixed
+//! former RED cell 3 (cross-store TXN graph leg not durable), flipping its
+//! 2 cells GREEN. **42 cells total: 35 GREEN by default, 7 RED.**
 //!
 //! RED cells are gated by `harness::red_guard` — NOT by
 //! `#[ignore = "RED: ..."]` alone, because this suite's own execution
@@ -118,24 +120,34 @@
 //! WAL records DO replay in order); it stays an ordinary `#[ignore]` (needs
 //! a release binary), not RED.
 //!
-//! **RED cell 3 — cross-store TXN graph leg not durable, task #52 (NEW, 2
-//! cells):** `cross_plane_prod_s1_txn_isolated_committed`,
+//! **FIXED (was RED cell 3) — cross-store TXN graph leg not durable, task
+//! #52 (2 cells, now GREEN):** `cross_plane_prod_s1_txn_isolated_committed`,
 //! `cross_plane_prod_s4_txn_isolated_committed`. A committed cross-store
-//! transaction (`SET` + `GRAPH.ADDNODE` in one `MULTI`/`EXEC`) survives
-//! kill-9 on the KV leg (PR #247's `persist_txn_aof`) but the graph leg is
-//! lost. Reviewed and confirmed NOT a harness artifact; confirmed
-//! deterministic 3× consecutive at both shard counts after a task #52
-//! hardening pass (own crash cycle per round, `--checkpoint-timeout 3600`,
-//! kill immediately after the sync-wait — see
-//! `scenarios::txn_isolated_committed`'s doc for the full analysis and
-//! minimal repro). New P1 finding for kernel M3. The SIBLING atomicity
-//! claim (`cross_plane_prod_s1_txn_isolated_atomicity` /
-//! `_s4_txn_isolated_atomicity` — a transaction queued but killed BEFORE
-//! `EXEC` must apply NOTHING) is a genuinely different, unrelated claim and
-//! is GREEN on these two configs (review round 3, P1: it used to share this
-//! same `red_guard`, incorrectly hiding a working regression tripwire by
-//! default — split into its own ungated `#[test]` per config). It stays RED
-//! on `legacy_yes_s1` only, folded into RED cell 1 above (same
+//! transaction (`SET` + `GRAPH.ADDNODE` in one `MULTI`/`EXEC`) survived
+//! kill-9 on the KV leg (PR #247's `persist_txn_aof`) but lost the graph
+//! leg. Root cause: `execute_transaction_sharded`
+//! (`src/server/conn/shared.rs`) had no `GRAPH.*` branch — the txn body
+//! dispatcher only knew the generic KV command table, so a queued
+//! `GRAPH.ADDNODE` fell through to it and errored "unknown command",
+//! never reaching the graph store (let alone its WAL) at all. This is a
+//! stronger bug than a missed durability leg: the mutation itself never
+//! applied in memory before the kill, MULTI/EXEC's per-command error
+//! tolerance just swallowed the error silently. Fixed by giving the txn
+//! executor a `GRAPH.*` branch that mirrors the single-command path
+//! (`try_handle_graph_command`) — dispatches to `ShardSlice::graph_store`,
+//! collects the drained wal-v3 records per command, and flushes them via
+//! `wal_append` after the whole transaction body runs (same per-shard
+//! append-order contract as the live path). Verified 3× consecutive GREEN
+//! at both shard counts (kernel M3 stage 3 hardening pass); both cells now
+//! run ungated (green-only default suite). The SIBLING atomicity claim
+//! (`cross_plane_prod_s1_txn_isolated_atomicity` / `_s4_txn_isolated_atomicity`
+//! — a transaction queued but killed BEFORE `EXEC` must apply NOTHING) was
+//! always a genuinely different, unrelated claim and was already GREEN on
+//! these two configs (review round 3, P1: it used to share this same
+//! `red_guard`, incorrectly hiding a working regression tripwire by default
+//! — split into its own ungated `#[test]` per config, unaffected by this
+//! fix since nothing in that path executes before `EXEC`). It stays RED on
+//! `legacy_yes_s1` only, folded into RED cell 1 above (same
 //! legacy-graph-reconstruction root cause — confirmed on the VM, not
 //! assumed: `GRAPH.CREATE` itself never survives a restart there, so the
 //! atomicity check's own graph-leg assertion errors "graph not found"
@@ -174,7 +186,7 @@
 //! (pre-fix baseline: prod_s1 hit at iteration 11/20, prod_s4 at iteration
 //! 7/20) — these two tests now run ungated (green-only default suite).
 //!
-//! **Every other cell (33/42) is GREEN** — including, notably,
+//! **Every other cell (35/42) is GREEN** — including, notably,
 //! `kv_isolated`/`kv_spilled_isolated`/`vector_isolated` on ALL configs (KV
 //! and vector-HSET durability via the AOF; `kv_spilled_isolated`'s filler
 //! sizing was hardened in review round 3 — see
@@ -183,9 +195,11 @@
 //! both `prod_s1`/`prod_s4` (structural writes + GraphTemporal
 //! `TEMPORAL.INVALIDATE`, incl. a VALID_AT positive control — checkpoint-backed
 //! mode does NOT share legacy mode's gap), `mq_isolated` everywhere (PR
-//! #291's effect-record fix holds), `txn_isolated_atomicity` on
-//! `prod_s1`/`prod_s4` (queuing without `EXEC` then killing applies nothing
-//! — verified 3× consecutive), `mixed_all_planes_synced`/`mid_pass_c` on
+//! #291's effect-record fix holds), `txn_isolated_committed`/`txn_isolated_atomicity`
+//! on `prod_s1`/`prod_s4` (committed KV+graph legs both survive kill-9 —
+//! kernel M3 stage 3 / task #52 fix above; queuing without `EXEC` then
+//! killing applies nothing — verified 3× consecutive each),
+//! `mixed_all_planes_synced`/`mid_pass_c` on
 //! both production shard counts, `mixed_all_planes_mid_checkpoint` on both
 //! production shard counts (kernel M3 stage 2 / K2 fix above — now
 //! unconditionally GREEN, not just at the default single-iteration

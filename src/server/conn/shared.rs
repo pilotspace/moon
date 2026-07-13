@@ -203,10 +203,21 @@ pub(crate) fn execute_transaction(
 /// (see `analyze_txn_locality`) — the body runs on the local slice with no
 /// per-key routing.
 ///
-/// Returns the result Frame (an array of per-command responses) **and** the
-/// serialized AOF bytes for each successful write, in order. The caller MUST
-/// append those entries to the shard's AOF (previously this path did no
-/// persistence, so MULTI/EXEC writes were silently lost on restart).
+/// Returns the result Frame (an array of per-command responses), the
+/// serialized AOF bytes for each successful write in order, and the
+/// graph-leg wal-v3 records (db, bytes) produced by any `GRAPH.*` command in
+/// the body. The caller MUST append the AOF entries to the shard's AOF
+/// (previously this path did no persistence, so MULTI/EXEC writes were
+/// silently lost on restart) and MUST both fan the graph records out to
+/// replicas (single-shard, monoio only — see the live single-command
+/// contract at `handler_monoio::write::try_handle_graph_command`) and
+/// `wal_append` them (task #52 review round 2: appending them INSIDE this
+/// function skipped the replication leg the live path always takes,
+/// silently diverging a replica from a committed cross-store transaction —
+/// this function has no `ConnectionContext`/replication access, so the
+/// caller must do both, in the same synchronous stretch as the
+/// already-synchronous call to this function, replicate-then-append, same
+/// order as the live path).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
     _shard_id: usize,
@@ -214,7 +225,7 @@ pub(crate) fn execute_transaction_sharded(
     selected_db: usize,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
-) -> (Frame, Vec<(usize, Bytes)>) {
+) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
 
     let mut results = Vec::with_capacity(command_queue.len());
@@ -225,6 +236,21 @@ pub(crate) fn execute_transaction_sharded(
     // switches dbs.
     let mut aof_entries: Vec<(usize, Bytes)> = Vec::new();
     let mut selected = selected_db;
+    // task #52: graph-leg WAL records produced by GRAPH.* commands queued
+    // inside this MULTI/EXEC body, bound to the db THIS command executed in
+    // (same per-entry-db discipline as `aof_entries` — a queued SELECT
+    // redirects the commands after it, never itself). The single-command
+    // path (`try_handle_graph_command`) drains+appends these to wal-v3 (and
+    // replicates them) per command; the txn executor previously had NO graph
+    // branch at all, so a queued GRAPH.* command fell through to the generic
+    // KV `dispatch()` table and errored as "unknown command" -- never
+    // applied to the graph store, never durable, never replicated. Collected
+    // here and returned for the CALLER to replicate + flush to wal-v3 (this
+    // function has no replication access — see the doc comment above).
+    #[cfg(feature = "graph")]
+    let mut graph_records: Vec<(usize, Vec<u8>)> = Vec::new();
+    #[cfg(not(feature = "graph"))]
+    let graph_records: Vec<(usize, Vec<u8>)> = Vec::new();
 
     for cmd_frame in command_queue {
         let (cmd, cmd_args) = match extract_command(cmd_frame) {
@@ -242,6 +268,51 @@ pub(crate) fn execute_transaction_sharded(
         // transaction body (all preceding writes applied first) and leave a
         // placeholder the caller patches with the receiver count.
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
+
+        // task #52: GRAPH.* commands live in a separate per-shard store
+        // (`ShardSlice::graph_store`), not the KV `Database` this loop
+        // otherwise dispatches against -- route them to the graph engine
+        // exactly like the single-command path (`try_handle_graph_command`)
+        // does, and stash the drained WAL records (bound to the db THIS
+        // command executed in, captured before dispatch, same rule as
+        // `entry_db` below) for the caller to replicate + flush.
+        #[cfg(feature = "graph")]
+        if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
+            let entry_db = selected;
+            let is_write = crate::command::graph::is_graph_write_cmd(cmd)
+                || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                    && crate::command::graph::is_cypher_write_query(cmd_args));
+            let (response, records) = crate::shard::slice::with_shard(|s| {
+                if is_write {
+                    let resp = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                        crate::command::graph::graph_query_or_write(&mut s.graph_store, cmd_args).0
+                    } else {
+                        crate::command::graph::dispatch_graph_write(
+                            &mut s.graph_store,
+                            cmd,
+                            cmd_args,
+                        )
+                    };
+                    let records = s.graph_store.drain_wal();
+                    (resp, records)
+                } else {
+                    let resp = crate::command::graph::dispatch_graph_read(
+                        &s.graph_store,
+                        cmd,
+                        cmd_args,
+                        None,
+                    );
+                    (resp, Vec::new())
+                }
+            });
+            // Parity with the KV branch below: an errored write must not
+            // reach the WAL.
+            if !records.is_empty() && !matches!(&response, Frame::Error(_)) {
+                graph_records.extend(records.into_iter().map(|r| (entry_db, r)));
+            }
+            results.push(response);
             continue;
         }
 
@@ -341,7 +412,7 @@ pub(crate) fn execute_transaction_sharded(
         results.push(response);
     }
 
-    (Frame::Array(results.into()), aof_entries)
+    (Frame::Array(results.into()), aof_entries, graph_records)
 }
 
 /// Persist the AOF entries of a just-executed sharded MULTI/EXEC body.
@@ -753,6 +824,39 @@ pub(crate) fn analyze_txn_locality(command_queue: &[Frame], num_shards: usize) -
         if let Some(dest) = store_clause_dest(cmd, args) {
             if !visit(dest, &mut owner) {
                 return TxnLocality::CrossShard;
+            }
+        }
+        // task #52 review round 3 (CodeRabbit, P1): GRAPH.* commands declare
+        // NO keys in command metadata (first_key==last_key==0), so
+        // `command_keys` above contributes nothing for them — a graph-only
+        // body was misclassified `Keyless` (executed on whatever shard the
+        // connection happened to be pinned to) and a mixed KV+graph body was
+        // classified by its KV keys alone, ignoring the graph name entirely.
+        // The STANDALONE `GRAPH.*` path (`try_handle_graph_command`) routes
+        // by `graph_to_shard(name, num_shards)` — which is IDENTICALLY
+        // `key_to_shard` (same hash-tag-aware xxh64, see
+        // `shard::dispatch::graph_to_shard`'s doc) — so treating the graph
+        // name as just another "key" via the SAME `visit` closure used above
+        // reuses that exact routing rule: a body whose graph name and KV
+        // keys disagree on owner becomes `CrossShard` (rejected CROSSSLOT,
+        // same as the SORT/GEORADIUS STORE-dest case above) instead of
+        // silently applying the graph write to the wrong shard's store,
+        // invisible to later normally-routed single-command reads. A
+        // graph-only body becomes `SingleShard(graph_owner)`, which the
+        // caller already hops to the owner shard for (`execute_txn_on_owner`
+        // / `ShardMessage::TxnExecute`, the same whole-body-atomic mechanism
+        // a KV-only body routes through when queued from a non-owner shard)
+        // — no NEW hop is introduced, so the "body runs on ONE local slice"
+        // invariant holds. `GRAPH.LIST` is excluded: it has no name argument
+        // and is a scatter-gather read across every shard, not owned by one.
+        if cmd.len() > 6
+            && cmd[..6].eq_ignore_ascii_case(b"GRAPH.")
+            && !cmd.eq_ignore_ascii_case(b"GRAPH.LIST")
+        {
+            if let Some(name) = args.first().and_then(super::util::extract_bytes) {
+                if !visit(&name, &mut owner) {
+                    return TxnLocality::CrossShard;
+                }
             }
         }
     }

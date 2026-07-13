@@ -94,6 +94,40 @@ fn send_resp(addr: &str, parts: &[&str]) -> String {
     read_quiet(&mut stream)
 }
 
+/// RESP-encode and send MULTI + every queued command in `cmds` + the commit
+/// command as ONE pipelined write on a single connection (transaction state
+/// is per-connection, so this can't reuse `send_resp`'s connect-per-call
+/// helper). Returns the concatenated raw reply text (QUEUED markers + the
+/// commit's array reply), same "eyeball the buffer" convention as
+/// `send_resp`/`send_cmd`.
+fn send_txn(addr: &str, cmds: &[&[&str]]) -> String {
+    let Ok(mut stream) = TcpStream::connect(addr) else {
+        return String::new();
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
+    let mut out = Vec::new();
+    let encode = |parts: &[&str], out: &mut Vec<u8>| {
+        out.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for p in parts {
+            out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            out.extend_from_slice(p.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    };
+    encode(&["MULTI"], &mut out);
+    for cmd in cmds {
+        encode(cmd, &mut out);
+    }
+    let commit = ["E", "X", "E", "C"].concat();
+    encode(&[commit.as_str()], &mut out);
+    if stream.write_all(&out).is_err() {
+        return String::new();
+    }
+    read_quiet(&mut stream)
+}
+
 fn read_quiet(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -374,5 +408,104 @@ fn replica_applies_temporal_invalidate() {
         .contains("alice")),
         "TEMPORAL.INVALIDATE never applied on the replica (valid_to diverged): {}",
         send_resp(replica_addr, &visible_query)
+    );
+}
+
+/// REPL-GRAPH-04 (task #52 review round 2, P1): the graph leg of a
+/// cross-store `MULTI`/`EXEC` transaction must reach a replica exactly like
+/// any other successful local write — `execute_transaction_sharded`'s
+/// `GRAPH.*` branch (added for task #52's durability fix) must not skip the
+/// replication fan-out that the KV leg (`persist_txn_aof`'s
+/// `record_local_write_db` call) already takes, or the master and replica
+/// silently diverge on a COMMITTED transaction. Single-shard master scope,
+/// matching every other graph-replication test in this file.
+#[test]
+#[ignore]
+fn replica_syncs_multi_exec_graph_leg() {
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let master_addr = "127.0.0.1:16740";
+    let replica_addr = "127.0.0.1:16741";
+
+    let replica_log = replica_dir.path().join("replica-stderr.log");
+
+    let _master = Killer(start_moon(16740, master_dir.path().to_str().unwrap()));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(master_addr, "PING")
+            .starts_with("+PONG")),
+        "master never became ready"
+    );
+    let _replica = Killer(start_moon_logged(
+        16741,
+        replica_dir.path().to_str().unwrap(),
+        Some(&replica_log),
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), || send_cmd(replica_addr, "PING")
+            .starts_with("+PONG")),
+        "replica never became ready"
+    );
+    assert!(
+        send_cmd(replica_addr, "REPLICAOF 127.0.0.1 16740").starts_with("+OK"),
+        "REPLICAOF failed"
+    );
+    // Let the handshake settle before the first write.
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(send_cmd(master_addr, "GRAPH.CREATE gtxn").contains("OK"));
+
+    // A single MULTI/EXEC body that writes BOTH a KV key and a graph node —
+    // the minimal repro from the task #52 crash-matrix scenario
+    // (`scenarios::txn_isolated_committed`), reused here for the
+    // replication claim instead of the durability claim.
+    let reply = send_txn(
+        master_addr,
+        &[
+            &["SET", "txnkey", "txnval"],
+            &["GRAPH.ADDNODE", "gtxn", "Person", "name", "carol"],
+        ],
+    );
+    assert!(
+        !reply.contains("-ERR") && !reply.contains("unknown command"),
+        "MULTI/EXEC body errored: {reply}"
+    );
+
+    // 1. KV leg replicates (the PR #247 baseline this bug shared a code path
+    // with — asserted here as a control, not the new claim).
+    let kv_synced = wait_until(Duration::from_secs(10), || {
+        send_cmd(replica_addr, "GET txnkey") == "$6\r\ntxnval\r\n"
+    });
+    assert!(
+        kv_synced,
+        "replica never saw the txn's KV leg: {}",
+        send_cmd(replica_addr, "GET txnkey")
+    );
+
+    // 2. THE CLAIM: the graph leg — committed in the SAME transaction —
+    // replicates too.
+    let graph_synced = wait_until(Duration::from_secs(10), || {
+        send_resp(
+            replica_addr,
+            &["GRAPH.QUERY", "gtxn", "MATCH (n:Person) RETURN n.name"],
+        )
+        .contains("carol")
+    });
+    assert!(
+        graph_synced,
+        "replica never saw the txn's graph leg (node 'carol'): {}",
+        send_resp(
+            replica_addr,
+            &["GRAPH.QUERY", "gtxn", "MATCH (n:Person) RETURN n.name"]
+        )
+    );
+
+    // 3. STREAM-HEALTH: both legs must have arrived on ONE live stream, not
+    // via a reconnect/full-resync loop masking a dead live producer (same
+    // check as `replica_syncs_graph_live_stream`).
+    let log = std::fs::read_to_string(&replica_log).unwrap_or_default();
+    let reconnects = log.matches("reconnecting").count();
+    assert_eq!(
+        reconnects, 0,
+        "replica reconnected {reconnects}x — live stream did not hold:\n{log}"
     );
 }

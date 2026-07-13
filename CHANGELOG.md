@@ -6,6 +6,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — cross-shard MULTI/EXEC graph-leg misrouting (kernel M3 stage 3 / task #52, review round 3, P1)
+
+CodeRabbit finding on PR #300: `analyze_txn_locality` (the pre-EXEC classifier
+that decides whether a queued body runs locally, hops to a remote owner
+shard, or is rejected `CROSSSLOT`) only scans KV keys via `command_keys`.
+`GRAPH.*` commands declare NO keys in command metadata
+(`first_key==last_key==0`), so a graph-bearing body was misclassified —
+`Keyless` for a graph-only body, or by its KV keys alone for a mixed body —
+completely ignoring the graph name's REAL owner shard (the standalone
+`GRAPH.*` path routes by `graph_to_shard(name, num_shards)`, identical
+hash-tag-aware xxh64 to `key_to_shard`). At `num_shards > 1` a transaction
+whose true graph owner differed from the classified owner would durably
+apply the `GRAPH.*` write to the WRONG shard's `graph_store` — invisible to
+subsequent normally-routed single-command reads. The task #52 crash cells
+never caught this because their KV key and graph name deliberately share one
+`{txniso}` hash tag (co-location by construction), so they always agree on
+owner regardless of the bug.
+
+Fixed by folding the graph name into `analyze_txn_locality`'s existing
+`visit` closure (the same one KV keys and the SORT/GEORADIUS `STORE`-dest
+already use): a body whose KV keys and graph name disagree on owner becomes
+`CrossShard` (rejected `CROSSSLOT`, same posture as any other genuine
+cross-shard body); a graph-only body becomes `SingleShard(graph_owner)`,
+which routes through the SAME whole-body-atomic owner hop
+(`execute_txn_on_owner` / `ShardMessage::TxnExecute`) a KV-only remote-owner
+body already uses — no new hop mechanism, so the "body runs on ONE local
+shard slice" invariant is preserved.
+
+New tests in `tests/sharded_multi_exec_locality.rs`:
+`graph_leg_cross_shard_rejected` (a KV key and graph name deterministically
+computed, not guessed, to hash to different shards at shards=4 → `CROSSSLOT`,
+neither leg applied) and `graph_only_txn_routes_to_true_owner` (a graph-only
+body commits and is visible via a fresh, normally-routed connection —
+proving owner placement, not "whatever shard the connection landed on").
+Confirmed RED without the `analyze_txn_locality` fix (both new tests fail:
+the rejected-body test instead applies the KV leg and errors "graph not
+found" on the misrouted `GRAPH.ADDNODE`; the owner-routing test reads back 0
+rows), GREEN with it, 3× consecutive. `no_silent_divergence_across_shards` /
+`multi_shard_span_rejected` / `single_shard_unaffected` (pre-existing KV-only
+locality tests) and the task #52 crash-matrix txn cells are unaffected.
+
+### Fixed — cross-store MULTI/EXEC graph leg replication (kernel M3 stage 3 / task #52, review round 2, P1)
+
+Follow-up to the durability fix below: `execute_transaction_sharded`'s new
+`GRAPH.*` branch originally `wal_append`ed the graph-leg records itself,
+*inside* the function — but that function has no `ConnectionContext` /
+replication access, so the graph leg applied and persisted on the master
+but never reached a replica, a NEW master/replica divergence the durability
+fix introduced (pre-fix the in-txn `GRAPH.*` applied nowhere, so there was
+no divergence to have). `execute_transaction_sharded` now returns the
+collected graph records (bound to the db each command executed in, same
+per-entry-db rule as the AOF entries — a queued `SELECT` redirects later
+commands) instead of appending them itself. The monoio EXEC caller
+(`handler_monoio/write.rs`) now replicates each record via
+`record_local_write_db` — gated `ctx.num_shards == 1 &&
+replication_fanout_active(ctx)`, matching the live single-command graph
+path's scope exactly (graph replication is single-shard only; multi-shard
+graph replication rides the R2 broadcast redesign) — in the same
+synchronous stretch as the mutation, THEN `wal_append`s, same
+replicate-then-append order as the live path. The tokio/sharded caller and
+the cross-shard `TxnExecute` shard-message arm (`src/shard/spsc_handler.rs`)
+only `wal_append` (no replication plane in scope there; the `TxnExecute` hop
+only fires at `num_shards > 1`, where graph replication is out of scope by
+design regardless). New regression test
+`replica_syncs_multi_exec_graph_leg` (`tests/replication_graph.rs`):
+shards=1 master+replica, `MULTI`/`SET`+`GRAPH.ADDNODE`/`EXEC` on the master,
+asserts both legs land on the replica over one live stream (no
+reconnect/full-resync masking) — confirmed RED (graph leg missing) with
+just the new replication call disabled, GREEN 3× consecutive with the fix.
+
+### Fixed — cross-store MULTI/EXEC graph leg durability (kernel M3 stage 3 / task #52)
+
+A committed cross-store transaction (`MULTI`; `SET k v`; `GRAPH.ADDNODE g
+Label id 1`; `EXEC`) survived kill-9 on the KV leg (PR #247's
+`persist_txn_aof`) but silently lost the graph leg — worse than a missed
+durability leg, the `GRAPH.ADDNODE` never even applied in memory. Root
+cause: `execute_transaction_sharded` (`src/server/conn/shared.rs`), the
+executor both the sharded and monoio connection handlers use for `EXEC`,
+had no `GRAPH.*` branch at all — a queued `GRAPH.ADDNODE` fell through to
+the generic KV `dispatch()` table (which only knows keyspace commands) and
+errored `ERR unknown command`, an error MULTI/EXEC's per-command tolerance
+swallowed without surfacing it to the client. Fixed by giving the txn
+executor a `GRAPH.*` branch that mirrors the single-command path
+(`try_handle_graph_command`): dispatches writes/reads against
+`ShardSlice::graph_store`, and flushes every command's drained wal-v3
+records via `wal_append` after the whole transaction body runs (same
+per-shard append-order contract as the live path). Verified 3× consecutive
+GREEN at shards=1 and shards=4; the sibling atomicity claim (a transaction
+queued but killed before `EXEC` applies nothing) was unaffected and stays
+GREEN. Crash-matrix cells `cross_plane_prod_s1_txn_isolated_committed` /
+`cross_plane_prod_s4_txn_isolated_committed` (`tests/crash_matrix_cross_plane/`)
+flip from `red_guard`-gated RED to default-GREEN tripwires (42 cells: 33→35
+GREEN by default, 9→7 RED).
+
 ### Added — unified per-shard floor register + min-across-planes WAL recycle (kernel M3 stage 2 / K2)
 
 `ShardControlFile` (`src/persistence/control.rs`) gains `graph_floor_lsn`,
