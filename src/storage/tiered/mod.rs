@@ -1,5 +1,6 @@
 pub mod cold_index;
 pub mod cold_read;
+pub mod cold_read_pool;
 pub mod kv_serde;
 pub mod kv_spill;
 pub mod segment_handle;

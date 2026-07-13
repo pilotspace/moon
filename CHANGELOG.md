@@ -25,6 +25,51 @@ legacy s1 `graph_isolated`, `txn_isolated_committed`,
 `txn_isolated_atomicity`, `mixed_all_planes_synced`,
 `mixed_all_planes_mid_pass_c`, and spot-check
 `cross_plane_spot_legacy_s4_graph_isolated`.
+### Fixed — async-park cold GET off the shard event loop, no timeout (task #59)
+
+`Database::get()`'s cold-tier fallback (`promote_cold_if_present` ->
+`cold_read::read_cold_entry`) does a blocking `pread` inline on the
+single-threaded shard event loop; under spill/AOF write backlog on the same
+disk that read can block for up to ~1.9s, stalling every connection on the
+shard for the duration. The monoio connection handler's GET fast path
+(`src/server/conn/handler_monoio/mod.rs`) now peeks whether the key needs a
+disk read and, if so, `.await`s the real result via a new off-thread worker
+pool (`storage::tiered::cold_read_pool::read_cold_entry_async`, 2 threads by
+default, `MOON_COLD_READ_POOL_THREADS` override) — **no timeout**: the
+awaiting connection task yields, letting sibling connections on the same
+shard thread keep running while the real disk I/O completes, and the
+resolved outcome (never a placeholder) is promoted into hot RAM
+(`Database::promote_cold_outcome`) before the normal synchronous dispatch
+path answers. An earlier revision of this fix used a bounded/timeout pool
+that could answer `Miss` for an existing spilled key under backlog — a
+silent correctness regression — and has been fully removed; there is no
+timeout anywhere in the new design. A second review round caught a
+DEL-during-await TOCTOU: a `DEL`/`FLUSHDB` on the same key running on the
+same shard thread while the GET's `.await` was suspended could resurrect
+the deleted key once the stale `Hit` outcome resolved. Fixed by
+revalidating, synchronously and without any intervening `.await`, that the
+cold index still maps the key to the SAME `ColdLocation` (now
+`PartialEq`/`Eq`) the outcome was read from before promoting anything —
+otherwise the outcome is discarded and the caller's normal dispatch answers
+from current state. MULTI/EXEC bodies, Lua `redis.call`, and every non-GET
+command (MGET/HGET/etc.) are architecturally unable to `.await` from their
+current synchronous call sites and continue to use the original,
+unmodified synchronous blocking read — slower under backlog, but never
+wrong. A third review round caught that the round-1/round-2 fix, though
+correct in isolation, was landed on a branch plain `GET key` never actually
+reaches: `src/server/conn/blocking.rs`'s synchronous inline fast path
+(`try_inline_dispatch`, which handles plain GET UNCONDITIONALLY — unlike
+SET, GET inlining isn't gated by disk-offload) still called the blocking
+`read_cold_entry_at` directly on a cold miss, before the async pre-warm
+hook was ever reached — so `redis-benchmark GET` and the task's own repro
+were completely unaffected by rounds 1-2. Fixed: the inline GET path now
+distinguishes "genuinely absent" (still answered inline, fast `$-1`) from
+"a real cold entry exists" (declines to inline — returns the pre-existing
+"not inlined" sentinel with the command bytes unconsumed, exactly like
+every other early-return in that function) and lets the already-correct
+fall-through hand it to the async pre-warm hook instead. See
+`tmp/task59-design.md` for the full call-site audit and the scope this pass
+covers vs. defers.
 
 ### Added — allocator-overhead and PageCache observability in INFO memory / Prometheus (task #58)
 

@@ -901,22 +901,101 @@ impl Database {
     /// right there in the cold tier. The fabricated container then got
     /// written back over the cold copy on the next `set`/mutation,
     /// permanently destroying it. Calling this method first closes that gap.
+    ///
+    /// Correctness (task #59 review): this is a plain, ORIGINAL synchronous
+    /// blocking disk read — no timeout, no possibility of returning "not
+    /// found" for a key that actually exists on disk. A prior revision of
+    /// this method routed through a bounded/timeout off-thread pool that
+    /// could time out and silently answer `Miss` for an existing spilled
+    /// key; that was a correctness regression (a GET on an existing key
+    /// could return nil under disk backlog) and has been removed. See
+    /// `tmp/task59-design.md` for the corrected design: the shard-thread
+    /// stall is instead addressed by [`Self::promote_cold_outcome`] +
+    /// `storage::tiered::cold_read_pool::read_cold_entry_async`, used from
+    /// the async connection-handler layer for the read-only single-key
+    /// commands that can afford to `.await` (currently GET); MULTI/EXEC
+    /// bodies and Lua `redis.call` keep calling this original synchronous
+    /// method unchanged.
     pub fn promote_cold_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
         if self.data.contains_key(key) {
             return true;
         }
+        // Look up the location first (cheap, in-memory) so the outcome below
+        // can be paired with the location it was read from -- required by
+        // `promote_cold_outcome`'s revalidation (see its doc comment). This
+        // path never awaits between lookup and use, so the location can't
+        // actually change out from under it, but sharing one code path with
+        // the async caller keeps the invariant enforced in exactly one
+        // place instead of two.
+        let Some((location, shard_dir)) = self.cold_lookup_location(key) else {
+            return false;
+        };
+        let outcome =
+            crate::storage::tiered::cold_read::read_cold_entry(&shard_dir, location, now_ms, None);
+        self.promote_cold_outcome(key, now_ms, location, outcome)
+    }
+
+    /// Apply an already-computed [`cold_read::ColdReadOutcome`] to hot RAM +
+    /// the cold index, without performing any disk I/O itself.
+    ///
+    /// Factored out of [`Self::promote_cold_if_present`] (task #59) so a
+    /// caller that can `.await` an off-shard-thread disk read (see
+    /// `storage::tiered::cold_read_pool::read_cold_entry_async`) can do the
+    /// slow part outside any lock/borrow of `self`, then come back and apply
+    /// the *real* outcome here — never a timed-out placeholder. Same
+    /// return-value contract as `promote_cold_if_present`: `true` iff `key`
+    /// is present in hot RAM after this call.
+    ///
+    /// TOCTOU fix (task #59 review round 2): `outcome` was read from disk at
+    /// `expected_location`, possibly across an `.await` on the caller's
+    /// side. Anything can happen to `key` while that await was suspended —
+    /// most importantly `DEL`/`FLUSHDB`/`UNLINK` on the SAME shard thread
+    /// (single-threaded event loop; no lock protects this window). If we
+    /// blindly promoted `outcome` here, a deleted key would come back to
+    /// life: `self.data.contains_key(key)` is false (DEL removed the hot
+    /// copy, and there never was one for a cold-only key), so the guard
+    /// above doesn't catch it, and `self.set(...)` would resurrect the
+    /// key permanently. So: before applying a `Hit`/`Expired` outcome,
+    /// re-read the CURRENT cold-index location for `key` and only proceed
+    /// if it's still exactly `expected_location`. If the entry is gone
+    /// (DEL/FLUSHDB) or now points somewhere else (SET-then-re-evict during
+    /// the await), discard `outcome` entirely and let the caller's normal
+    /// dispatch answer from current state instead. This re-check and the
+    /// mutation that follows it both run synchronously with no `.await`
+    /// between them, so they're atomic from every other task's perspective
+    /// on this single-threaded shard — the race window closes here.
+    pub fn promote_cold_outcome(
+        &mut self,
+        key: &[u8],
+        _now_ms: u64,
+        expected_location: crate::storage::tiered::cold_index::ColdLocation,
+        outcome: crate::storage::tiered::cold_read::ColdReadOutcome,
+    ) -> bool {
         use crate::storage::tiered::cold_read::ColdReadOutcome;
-        // Extract an owned result first to drop immutable borrows of
-        // `self.cold_index` / `self.cold_shard_dir` before the mutation below.
-        let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
-            self.cold_index.as_ref().map(|ci| {
-                crate::storage::tiered::cold_read::cold_read_through_outcome(
-                    ci, shard_dir, key, now_ms,
-                )
-            })
-        });
-        match cold_result {
-            Some(ColdReadOutcome::Hit(redis_value, ttl_ms)) => {
+        if self.data.contains_key(key) {
+            return true;
+        }
+        if matches!(outcome, ColdReadOutcome::Hit(..) | ColdReadOutcome::Expired) {
+            let still_valid = self
+                .cold_index
+                .as_ref()
+                .and_then(|ci| ci.lookup(key))
+                .is_some_and(|current| current == expected_location);
+            if !still_valid {
+                // The cold entry this outcome was read from is gone (DEL/
+                // FLUSHDB/UNLINK/expiry-sweep) or has been replaced (a fresh
+                // SET-then-re-evict landed a NEW cold entry for this key)
+                // since we started reading it. Applying `outcome` now would
+                // either resurrect a deleted key or clobber a newer cold
+                // entry with stale bytes. Discard it and report "not
+                // promoted" — the caller's normal dispatch path re-reads
+                // current state and answers correctly (nil for a deleted
+                // key, the new value for a re-spilled one).
+                return false;
+            }
+        }
+        match outcome {
+            ColdReadOutcome::Hit(redis_value, ttl_ms) => {
                 let key_bytes = Bytes::copy_from_slice(key);
                 // Build an entry from the RedisValue (works for strings and collections).
                 let mut entry = Entry::new_string(Bytes::new()); // placeholder
@@ -931,15 +1010,19 @@ impl Database {
                 }
                 true
             }
-            Some(ColdReadOutcome::Expired) => {
+            ColdReadOutcome::Expired => {
                 // Expired on disk: reclaim the index entry now, or it leaks
                 // (the orphan sweep only checks hot-shadowing, never TTL).
+                // Safe to remove unconditionally here -- the revalidation
+                // above already confirmed the index still points at
+                // `expected_location`, so this can't be clobbering a newer
+                // entry.
                 if let Some(ref mut ci) = self.cold_index {
                     ci.remove(key);
                 }
                 false
             }
-            Some(ColdReadOutcome::Miss) | None => false,
+            ColdReadOutcome::Miss => false,
         }
     }
 

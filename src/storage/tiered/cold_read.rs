@@ -104,12 +104,39 @@ pub fn read_cold_entry_at_cached(
     }
 }
 
-fn read_cold_entry(
+/// Test-only injected latency (milliseconds), checked at the top of
+/// [`read_cold_entry`] before any real I/O. Lets tests deterministically
+/// simulate a slow/backlogged disk (task #59) without real disk contention.
+/// `0` (the default) is a no-op.
+#[cfg(test)]
+pub(crate) static TEST_INJECT_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide lock serializing any test (in this module or
+/// `cold_read_pool`) that mutates [`TEST_INJECT_DELAY_MS`] or the pool's
+/// timeout knob -- `cargo test`'s default parallelism otherwise lets one
+/// test's injected delay leak into an unrelated concurrently-running test.
+#[cfg(test)]
+pub(crate) static TEST_DELAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `pub(crate)` (rather than private) so [`super::cold_read_pool`] can call
+/// it from its off-shard-thread worker pool (task #59). Prefer the
+/// pooled/bounded entry points (`read_cold_entry_at_bounded`,
+/// `cold_read_through_outcome_bounded`) on the shard event-loop path; this
+/// raw synchronous form remains for tests and for the pool worker itself.
+pub(crate) fn read_cold_entry(
     shard_dir: &Path,
     location: ColdLocation,
     now_ms: u64,
     page_cache: Option<&PageCache>,
 ) -> ColdReadOutcome {
+    #[cfg(test)]
+    {
+        let delay_ms = TEST_INJECT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
@@ -435,6 +462,11 @@ mod tests {
     /// entry (and thereby the file refcount) instead of leaking it forever.
     #[test]
     fn test_expired_cold_read_reclaims_index_entry() {
+        // task #59: `db.get()` now routes through the bounded off-thread
+        // pool; a concurrently-running injected-delay test elsewhere could
+        // otherwise starve this read past the pool's timeout and turn the
+        // expiry-reclaim path into a plain (non-reclaiming) timeout Miss.
+        let _guard = TEST_DELAY_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         // TTL 1ms in the past relative to the read below.
         let mut db = db_with_spilled_key(tmp.path(), b"stale", b"old", Some(1));
