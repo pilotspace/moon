@@ -666,7 +666,7 @@ pub(super) async fn try_handle_multi_exec(
                     _ => {}
                 }
             }
-            let (result, aof_entries) = execute_transaction_sharded(
+            let (result, aof_entries, graph_records) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
                 &conn.command_queue,
@@ -674,6 +674,21 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // task #52: flush the graph-leg wal-v3 records collected by the
+            // txn executor. Replication is monoio-only by design (see
+            // `handler_monoio::write`'s EXEC handling) — this tokio/sharded
+            // caller has no replication plane to fan out to, so it only
+            // needs the local durability leg.
+            #[cfg(feature = "graph")]
+            for (_entry_db, record) in graph_records {
+                ctx.shard_databases.wal_append(
+                    ctx.shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::Command,
+                    bytes::Bytes::from(record),
+                );
+            }
+            #[cfg(not(feature = "graph"))]
+            let _ = graph_records;
             // DURABILITY: append every successful write in the body to THIS
             // shard's AOF via the same group-commit path as normal writes, then
             // issue ONE fsync barrier under appendfsync=always before acking.

@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — cross-store MULTI/EXEC graph leg replication (kernel M3 stage 3 / task #52, review round 2, P1)
+
+Follow-up to the durability fix below: `execute_transaction_sharded`'s new
+`GRAPH.*` branch originally `wal_append`ed the graph-leg records itself,
+*inside* the function — but that function has no `ConnectionContext` /
+replication access, so the graph leg applied and persisted on the master
+but never reached a replica, a NEW master/replica divergence the durability
+fix introduced (pre-fix the in-txn `GRAPH.*` applied nowhere, so there was
+no divergence to have). `execute_transaction_sharded` now returns the
+collected graph records (bound to the db each command executed in, same
+per-entry-db rule as the AOF entries — a queued `SELECT` redirects later
+commands) instead of appending them itself. The monoio EXEC caller
+(`handler_monoio/write.rs`) now replicates each record via
+`record_local_write_db` — gated `ctx.num_shards == 1 &&
+replication_fanout_active(ctx)`, matching the live single-command graph
+path's scope exactly (graph replication is single-shard only; multi-shard
+graph replication rides the R2 broadcast redesign) — in the same
+synchronous stretch as the mutation, THEN `wal_append`s, same
+replicate-then-append order as the live path. The tokio/sharded caller and
+the cross-shard `TxnExecute` shard-message arm (`src/shard/spsc_handler.rs`)
+only `wal_append` (no replication plane in scope there; the `TxnExecute` hop
+only fires at `num_shards > 1`, where graph replication is out of scope by
+design regardless). New regression test
+`replica_syncs_multi_exec_graph_leg` (`tests/replication_graph.rs`):
+shards=1 master+replica, `MULTI`/`SET`+`GRAPH.ADDNODE`/`EXEC` on the master,
+asserts both legs land on the replica over one live stream (no
+reconnect/full-resync masking) — confirmed RED (graph leg missing) with
+just the new replication call disabled, GREEN 3× consecutive with the fix.
+
 ### Fixed — cross-store MULTI/EXEC graph leg durability (kernel M3 stage 3 / task #52)
 
 A committed cross-store transaction (`MULTI`; `SET k v`; `GRAPH.ADDNODE g

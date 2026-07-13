@@ -2703,14 +2703,34 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
-            let (result, aof_entries) = crate::server::conn::shared::execute_transaction_sharded(
-                shard_databases,
-                shard_id,
-                &commands,
-                db_index,
-                cached_clock,
-                &mut exec_publishes,
-            );
+            let (result, aof_entries, graph_records) =
+                crate::server::conn::shared::execute_transaction_sharded(
+                    shard_databases,
+                    shard_id,
+                    &commands,
+                    db_index,
+                    cached_clock,
+                    &mut exec_publishes,
+                );
+            // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
+            // connection's shard differs from the owner shard, which by
+            // construction only happens at num_shards > 1) -- graph
+            // replication is single-shard scope only (see
+            // `execute_transaction_sharded`'s doc / the monoio EXEC handler's
+            // `graph_repl_active = ctx.num_shards == 1 && ...` gate), so it
+            // never applies here. Only the local wal-v3 durability leg is
+            // needed, via the same K1 typed channel every other graph write
+            // path uses.
+            #[cfg(feature = "graph")]
+            for (_entry_db, record) in graph_records {
+                shard_databases.wal_append(
+                    shard_id,
+                    crate::persistence::wal_v3::record::WalRecordType::Command,
+                    bytes::Bytes::from(record),
+                );
+            }
+            #[cfg(not(feature = "graph"))]
+            let _ = graph_records;
             // Persist via the SAME sync path as normal cross-shard writes (the
             // MultiExecute arm): fire-and-forget append + WAL/replica fan-out,
             // ONE shared backpressure budget for the whole body so a stall costs
