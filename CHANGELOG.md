@@ -42,6 +42,88 @@ integration test asserting `XPENDING` idle survives restart
 and a replica-promotion test asserting the promoted node's `XPENDING` idle
 reflects the master's original claim time, not the replica's own apply time
 (`tests/replication_mq.rs::promoted_replica_reports_real_pending_idle_time`).
+### Fixed — unified replica poison-record policy across graph/MQ/WS/temporal planes (task #48)
+
+Each replica-apply plane (graph WAL replay, MQ effect records, workspace
+create/drop, temporal invalidate, RESP framing) previously handled a
+malformed/undecodable record ad hoc — mostly `tracing::warn!` + silently
+skip-and-continue, one path (`WS.CREATE.APPLY`/`WS.DROP.APPLY`) even
+swallowed the failure entirely (`try_with_shard(...).is_some()` returned
+`true` regardless of the inner decode outcome). A silent skip means every
+subsequent record in the stream keeps applying against state that has
+already diverged from the master — invisible until an operator notices
+missing data.
+
+Unified policy (`replication::apply`, see its "Unified poison-record policy"
+module docs): any decode/parse failure on a live-stream record is now a
+`ApplyOutcome::Poisoned` — logged loud (rate-limited to 1/sec), counted in
+a new INFO counter, and propagated up so the replica connection task drops
+the link and lets the existing reconnect/resync loop renegotiate PSYNC
+(never silently skip, never panic). PSYNC snapshot install already
+fail-closed correctly (a malformed aux blob fails the whole install); it now
+also increments the same counter. Semantic apply errors on well-formed
+records (e.g. `WRONGTYPE`, "entity not found") keep the existing
+warn-and-continue posture — that is data-level divergence from a command
+that legitimately executed differently, not stream corruption.
+
+- New `INFO replication` field: `replication_poison_records_total`.
+- `src/replication/apply.rs`: `ApplyOutcome` enum, `poison()` helper,
+  `apply_graph`/`apply_mq`/`apply_ws_create`/`apply_ws_drop`/
+  `apply_temporal_invalidate` now return `bool` (poisoned vs. applied)
+  instead of logging-and-swallowing.
+- `src/replication/replica.rs`: both tokio and monoio stream-apply loops
+  match on `ApplyOutcome` and drop the connection on `Poisoned`, same as the
+  existing `NoShardSlice` / `DrainResult::fatal` paths.
+### Added — real SHUTDOWN [NOSAVE|SAVE] (task #27)
+
+`SHUTDOWN` was previously a stub that always replied `ERR Errors trying to
+SHUTDOWN. Check logs.` and never terminated the process. It is now handled
+at the connection-handler level (like BGSAVE/ACL, alongside all three
+dispatch paths: `handler_single`, `handler_sharded`, `handler_monoio`):
+
+- Parses the optional `NOSAVE` / `SAVE` modifier (Redis parity: bare
+  `SHUTDOWN` forces a save iff RDB save points are configured; `NOSAVE`
+  always skips it; `SAVE` always forces it). `ABORT` is rejected (Moon's
+  SHUTDOWN runs synchronously to completion, so there is never an
+  in-progress shutdown); `FORCE`/`NOW` are accepted no-ops.
+- A forced save that fails replies an error and the server stays up
+  (single-shard: synchronous `SAVE`; sharded/monoio: the cooperative
+  per-shard BGSAVE snapshot, polled with a bounded timeout).
+- On success, triggers the exact same `CancellationToken`-driven graceful
+  shutdown sequence already used for SIGTERM — per-shard WAL/AOF flush +
+  fsync across every plane, accept-loop stop, and clean connection
+  teardown — rather than reimplementing it. No reply is sent (Redis
+  parity: the client observes the connection close).
+- ACL category was already `admin/dangerous` (`DNG`) in the command
+  registry; unchanged.
+
+Coverage: `tests/shutdown_integration.rs` (NOSAVE prompt exit + waitpid
+status, AOF durability across a SHUTDOWN→restart round trip, a failed
+forced SAVE keeps the server up, syntax errors keep the server up) plus a
+cross-shard durability smoke section in `scripts/test-consistency.sh`.
+
+### Fixed — AOF writer manifest-wait/cancellation data-loss race (found via task #27)
+
+Writing the SHUTDOWN durability test surfaced a real, pre-existing bug: on
+first boot, main.rs's recovery creates the AOF manifest on a separate
+thread/task from the one that starts accepting connections, so a client can
+already be writing (queuing `Append` messages) while the AOF writer thread
+is still polling for that manifest to appear (`src/persistence/aof/writer_task.rs`,
+three writer-loop variants). That polling loop checked
+`cancel.is_cancelled()` *before* attempting `AofManifest::load` each
+iteration — a graceful shutdown landing in the same ~50ms poll window made
+the writer return immediately without ever loading the (by-then-current)
+manifest, silently discarding every already-queued `Append`. Reproduced
+reliably (>80% of runs) by sending `SHUTDOWN` within tens of milliseconds of
+boot: `AOF writer: cancelled while waiting for manifest` in the log, and a
+0-byte incr AOF file. Fixed by trying the load first in all three affected
+loops (TopLevel-monoio, PerShard-tokio, PerShard-monoio); a manifest that
+exists by the time the writer gets there is never missed just because a
+shutdown signal happened to land in the same instant. In practice this
+window was rarely hit via SIGTERM (real signal delivery has enough latency
+to clear it), which is presumably why it went unnoticed until a command
+that can call `cancel()` synchronously, milliseconds after the connection
+that issued the write, existed.
 ### Changed — CI pipeline optimization (round 2: cargo-nextest)
 
 - CI test steps (Linux/macOS/Windows) now run under `cargo nextest run
@@ -65,6 +147,39 @@ reflects the master's original claim time, not the replica's own apply time
 - CI builds/tests run with `debug = 0` (no debuginfo) via
   `CARGO_PROFILE_*_DEBUG` env — smaller artifacts (faster cache
   save/restore) and faster linking; local builds unaffected.
+### Fixed — FTS term-dict + FST sidecar durability, ends restart-rescan-only recovery (kernel M4, task #50)
+
+The full-text-search inverted index was the last plane not kill-9-lossless:
+every restart rebuilt every text index by rescanning the keyspace and
+reassigning term ids by `DashTable` hash-iteration first-encounter order —
+not reproducible across restarts, which is why the pre-existing `.fst`
+sidecar write path had its load path (`load_fst_sidecars`) deliberately left
+uncalled in production (wiring it once corrupted FUZZY/PREFIX results: the
+sidecar's baked-in term ids silently collided with a freshly-rescanned
+dictionary's differently-assigned ids).
+
+Fixed by persisting the term dictionary itself alongside the FST, in one
+atomic sidecar (`{shard_dir}/{index}.tfst`, magic `TFS2`, version-stamped,
+`atomic_write_durable`): per TEXT field, `next_id`, `fst_high_water_mark`,
+every `(term, id)` pair, and the optional FST bytes. `TermDictionary::from_pairs`
+reconstructs a dictionary whose ids are taken verbatim from the sidecar
+(never reassigned) and whose `next_id` continues the persisted high-water
+mark. Wired into shard boot (`src/shard/event_loop.rs`) so
+`TextStore::load_term_fst_sidecars` runs AFTER text index schemas are
+restored but BEFORE the keyspace auto-reindex rescan — seeding the term
+dicts first makes the rescan's `get_or_insert` calls resolve known terms to
+their persisted ids and assign fresh, non-colliding ids only to genuinely
+new terms, which is what makes loading the FST alongside it safe (FST ids
+and live dict ids are the same id-space by construction). Fails closed per
+index on any missing/truncated/corrupt/version-mismatched/field-count-
+mismatched sidecar — falls back to today's full rescan, never partially
+applies a sidecar. `FT.COMPACT` now calls the combined saver
+(`save_term_fst_sidecar_for_index`) instead of the old FST-only one. New
+`FT.INFO` counters `sidecar_recovered_indexes` / `text_indexes_total`
+(additive across shards) surface fast-boot coverage. New default-GREEN
+crash-matrix cells `cross_plane_prod_{s1,s4}_text_fts_sidecar_isolated`
+verify a FUZZY query survives kill-9 identically to a from-scratch rebuild.
+New fuzz target `term_fst_sidecar` covers the sidecar decoder.
 ### Security — clear dependency vulnerability backlog (task #51)
 
 `sdk/python` (uv.lock, 36 open Dependabot alerts incl. 1 CRITICAL) and

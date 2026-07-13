@@ -49,6 +49,34 @@ const DEFAULT_DB_INDEX_ON_LOAD: u8 = 0;
 const FST_MAGIC: &[u8; 4] = b"TFST";
 const FST_VERSION: u8 = 1;
 
+/// Combined term-dict + FST sidecar (kernel M4, task #50).
+///
+/// Extends the FST-only sidecar with the term dictionary the FST's ids were
+/// built against, so a loader can reconstruct BOTH pieces from the same
+/// generation and never mix a stale-id-space FST with a freshly-rescanned
+/// (differently-ordered) term dictionary -- see `TextStore::load_fst_sidecars`'s
+/// doc comment in `src/text/store.rs` for the full corruption mechanism this
+/// closes.
+///
+/// ```text
+/// [magic: 4B "TFS2"] [version: 1B] [field_count: 2B]
+/// Per field:
+///   [next_id: 4B] [fst_high_water_mark: 4B] [term_count: 4B]
+///   Per term: [term_len: 2B] [term: bytes] [term_id: 4B]
+///   [fst_len: 4B] [fst_bytes: fst_len]   (fst_len=0 -> no FST for this field)
+/// ```
+const TERM_FST_MAGIC: &[u8; 4] = b"TFS2";
+const TERM_FST_VERSION: u8 = 1;
+
+/// One field's persisted term-dict + optional FST bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldTermFstSidecar {
+    pub next_id: u32,
+    pub fst_high_water_mark: u32,
+    pub terms: Vec<(String, u32)>,
+    pub fst_bytes: Option<Vec<u8>>,
+}
+
 /// Lightweight schema-only representation of a TextIndex for persistence.
 ///
 /// Contains everything needed to reconstruct an empty TextIndex (without
@@ -382,6 +410,131 @@ pub fn load_fst_sidecar(shard_dir: &Path, index_name: &[u8]) -> io::Result<Vec<O
     Ok(result)
 }
 
+/// Serialize the combined term-dict + FST sidecar (pure function, fuzzable).
+pub fn serialize_term_fst_sidecar(fields: &[FieldTermFstSidecar]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(TERM_FST_MAGIC);
+    buf.push(TERM_FST_VERSION);
+    buf.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+
+    for field in fields {
+        buf.extend_from_slice(&field.next_id.to_le_bytes());
+        buf.extend_from_slice(&field.fst_high_water_mark.to_le_bytes());
+        buf.extend_from_slice(&(field.terms.len() as u32).to_le_bytes());
+        for (term, id) in &field.terms {
+            buf.extend_from_slice(&(term.len() as u16).to_le_bytes());
+            buf.extend_from_slice(term.as_bytes());
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        match &field.fst_bytes {
+            Some(bytes) => {
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => buf.extend_from_slice(&0u32.to_le_bytes()),
+        }
+    }
+    buf
+}
+
+/// Deserialize the combined term-dict + FST sidecar (pure function, fuzzable).
+///
+/// Fails closed on ANY structural problem (bad magic/version, truncation,
+/// non-UTF8 term bytes) by returning `Err` -- callers must treat an `Err`
+/// exactly like a missing sidecar (full rescan), never partially apply the
+/// result.
+pub fn deserialize_term_fst_sidecar(data: &[u8]) -> io::Result<Vec<FieldTermFstSidecar>> {
+    if data.len() < 7 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "term-fst sidecar too short",
+        ));
+    }
+    if &data[0..4] != TERM_FST_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad term-fst magic",
+        ));
+    }
+    let version = data[4];
+    if version != TERM_FST_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported term-fst version {version}"),
+        ));
+    }
+    let field_count = u16::from_le_bytes([data[5], data[6]]) as usize;
+    let mut cursor = 7;
+    let mut fields = Vec::with_capacity(field_count);
+
+    for _ in 0..field_count {
+        let next_id = read_u32(data, &mut cursor)?;
+        let fst_high_water_mark = read_u32(data, &mut cursor)?;
+        let term_count = read_u32(data, &mut cursor)? as usize;
+        let mut terms = Vec::with_capacity(term_count);
+        for _ in 0..term_count {
+            let term_len = read_u16(data, &mut cursor)? as usize;
+            let term_bytes = read_bytes(data, &mut cursor, term_len)?;
+            let term = std::str::from_utf8(term_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 term"))?
+                .to_owned();
+            let id = read_u32(data, &mut cursor)?;
+            terms.push((term, id));
+        }
+        let fst_len = read_u32(data, &mut cursor)? as usize;
+        let fst_bytes = if fst_len == 0 {
+            None
+        } else {
+            Some(read_bytes(data, &mut cursor, fst_len)?.to_vec())
+        };
+        fields.push(FieldTermFstSidecar {
+            next_id,
+            fst_high_water_mark,
+            terms,
+            fst_bytes,
+        });
+    }
+
+    Ok(fields)
+}
+
+/// Persist per-field term-dict + FST bytes to `{shard_dir}/{index_name}.tfst`.
+///
+/// Atomic via `atomic_write_durable` (K3: temp + fsync + rename + dir-fsync),
+/// same primitive as every other text/vector sidecar writer.
+pub fn save_term_fst_sidecar(
+    shard_dir: &Path,
+    index_name: &[u8],
+    fields: &[FieldTermFstSidecar],
+) -> io::Result<()> {
+    let name_str = String::from_utf8_lossy(index_name);
+    let path = shard_dir.join(format!("{name_str}.tfst"));
+    let data = serialize_term_fst_sidecar(fields);
+    crate::persistence::atomic::atomic_write_durable(&path, &data)?;
+    Ok(())
+}
+
+/// Load per-field term-dict + FST bytes from `{shard_dir}/{index_name}.tfst`.
+///
+/// Returns `Ok(None)` if the file doesn't exist (D-11-style: no sidecar is
+/// not an error, caller falls back to today's full-rescan behavior). Returns
+/// `Err` on any structural corruption -- callers MUST treat that identically
+/// to "missing" (fail closed), never load a partially-valid result.
+pub fn load_term_fst_sidecar(
+    shard_dir: &Path,
+    index_name: &[u8],
+) -> io::Result<Option<Vec<FieldTermFstSidecar>>> {
+    let name_str = String::from_utf8_lossy(index_name);
+    let path = shard_dir.join(format!("{name_str}.tfst"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut f = std::fs::File::open(&path)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    deserialize_term_fst_sidecar(&data).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +784,127 @@ mod tests {
         assert_eq!(result[0].key_prefixes[0], "a:");
         assert_eq!(result[0].key_prefixes[1], "b:");
         assert_eq!(result[0].key_prefixes[2], "c:");
+    }
+
+    // ── Kernel M4 (task #50): combined term-dict + FST sidecar ───────────
+
+    fn sample_fields() -> Vec<FieldTermFstSidecar> {
+        vec![
+            FieldTermFstSidecar {
+                next_id: 3,
+                fst_high_water_mark: 3,
+                terms: vec![
+                    ("alpha".to_owned(), 0),
+                    ("beta".to_owned(), 1),
+                    ("gamma".to_owned(), 2),
+                ],
+                fst_bytes: Some(b"fake_fst_bytes_field0".to_vec()),
+            },
+            FieldTermFstSidecar {
+                next_id: 1,
+                fst_high_water_mark: 0,
+                terms: vec![("delta".to_owned(), 0)],
+                fst_bytes: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn term_fst_sidecar_roundtrips() {
+        let fields = sample_fields();
+        let data = serialize_term_fst_sidecar(&fields);
+        let decoded = deserialize_term_fst_sidecar(&data).expect("deserialize");
+        assert_eq!(decoded, fields);
+    }
+
+    #[test]
+    fn term_fst_sidecar_save_load_roundtrips_through_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fields = sample_fields();
+        save_term_fst_sidecar(tmp.path(), b"idx", &fields).expect("save");
+        let loaded = load_term_fst_sidecar(tmp.path(), b"idx")
+            .expect("load")
+            .expect("sidecar present");
+        assert_eq!(loaded, fields);
+    }
+
+    #[test]
+    fn term_fst_sidecar_missing_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let loaded = load_term_fst_sidecar(tmp.path(), b"nonexistent").expect("load");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn term_fst_sidecar_empty_fields_roundtrips() {
+        let data = serialize_term_fst_sidecar(&[]);
+        let decoded = deserialize_term_fst_sidecar(&data).expect("deserialize");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn term_fst_sidecar_bad_magic_rejected() {
+        let mut data = serialize_term_fst_sidecar(&sample_fields());
+        data[0] = b'X';
+        assert!(deserialize_term_fst_sidecar(&data).is_err());
+    }
+
+    #[test]
+    fn term_fst_sidecar_bad_version_rejected() {
+        let mut data = serialize_term_fst_sidecar(&sample_fields());
+        data[4] = 0xFF;
+        assert!(deserialize_term_fst_sidecar(&data).is_err());
+    }
+
+    #[test]
+    fn term_fst_sidecar_too_short_rejected() {
+        let data = vec![0u8; 3];
+        assert!(deserialize_term_fst_sidecar(&data).is_err());
+    }
+
+    #[test]
+    fn term_fst_sidecar_truncated_term_bytes_rejected() {
+        let data = serialize_term_fst_sidecar(&sample_fields());
+        // Truncate mid-way through the term/FST payload -- any cut here
+        // must fail closed (Err), never panic or return a partial Vec.
+        let truncated = &data[..data.len() - 5];
+        assert!(deserialize_term_fst_sidecar(truncated).is_err());
+    }
+
+    #[test]
+    fn term_fst_sidecar_non_utf8_term_rejected() {
+        let mut fields = sample_fields();
+        // Overwrite the first field's term list with invalid UTF-8 bytes
+        // encoded at the right length so the byte-level framing still
+        // parses right up to the UTF-8 validation step.
+        fields[0].terms.clear();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&TERM_FST_MAGIC[..]);
+        buf.push(TERM_FST_VERSION);
+        buf.extend_from_slice(&1u16.to_le_bytes()); // field_count = 1
+        buf.extend_from_slice(&1u32.to_le_bytes()); // next_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // fst_high_water_mark
+        buf.extend_from_slice(&1u32.to_le_bytes()); // term_count
+        buf.extend_from_slice(&2u16.to_le_bytes()); // term_len = 2
+        buf.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        buf.extend_from_slice(&0u32.to_le_bytes()); // term_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // fst_len = 0
+        assert!(deserialize_term_fst_sidecar(&buf).is_err());
+    }
+
+    /// K3 regression guard (mirrors `test_save_leaves_no_leftover_temp_file`):
+    /// the combined saver must go through `atomic_write_durable`, leaving no
+    /// leftover `.tfst.tmp` file after a successful save.
+    #[test]
+    fn term_fst_sidecar_save_leaves_no_leftover_temp_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_term_fst_sidecar(tmp.path(), b"idx", &sample_fields()).expect("save");
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one file: {entries:?}");
+        assert_eq!(entries[0].to_string_lossy(), "idx.tfst");
     }
 }

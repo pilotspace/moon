@@ -253,6 +253,17 @@ pub fn ft_info(
         // Independent from vector_version_token — hybrid-index callers check both.
         items.push(Frame::BulkString(Bytes::from_static(b"text_version_token")));
         items.push(Frame::Integer(text_store.version_token() as i64));
+        // Kernel M4 (task #50): coverage counter mirroring
+        // `segments_with_exact_rerank` for the vector engine -- additive
+        // across shards so `sidecar_recovered_indexes < text_indexes_total`
+        // means at least one shard fell back to a full keyspace rescan for
+        // at least one index (missing/stale/corrupt `.tfst` sidecar).
+        items.push(Frame::BulkString(Bytes::from_static(
+            b"sidecar_recovered_indexes",
+        )));
+        items.push(Frame::Integer(text_idx.recovered_from_sidecar as i64));
+        items.push(Frame::BulkString(Bytes::from_static(b"text_indexes_total")));
+        items.push(Frame::Integer(1));
     }
 
     Frame::Array(items.into())
@@ -272,6 +283,8 @@ pub fn ft_info(
 /// aggregate).
 /// Additive per-field keys (matched by `field_name` inside `vector_fields` /
 /// `text_fields`): `num_docs`, `mutable_vectors`, `immutable_segments`.
+/// Also additive: `sidecar_recovered_indexes` / `text_indexes_total`
+/// (kernel M4, task #50 -- FT.INFO term-dict sidecar recovery coverage).
 ///
 /// Any `Frame::Error` (local or remote) is propagated unchanged (fail-loud,
 /// same semantics as `scatter_invalidate_range`).
@@ -288,6 +301,8 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         b"warm_segments_with_exact_rerank",
         b"unloaded_segments",
         b"unloaded_segments_with_exact_rerank",
+        b"sidecar_recovered_indexes",
+        b"text_indexes_total",
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 
@@ -482,6 +497,16 @@ fn ft_info_text_only(
     // drop_index. Use to detect stale query-cache entries.
     items.push(Frame::BulkString(Bytes::from_static(b"text_version_token")));
     items.push(Frame::Integer(text_store.version_token() as i64));
+
+    // Kernel M4 (task #50): coverage counters mirroring the hybrid-index
+    // path above (`sidecar_recovered_indexes` / `text_indexes_total`) --
+    // additive across shards via `merge_ft_info_responses`.
+    items.push(Frame::BulkString(Bytes::from_static(
+        b"sidecar_recovered_indexes",
+    )));
+    items.push(Frame::Integer(idx.recovered_from_sidecar as i64));
+    items.push(Frame::BulkString(Bytes::from_static(b"text_indexes_total")));
+    items.push(Frame::Integer(1));
 
     Frame::Array(items.into())
 }

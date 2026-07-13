@@ -62,6 +62,62 @@ impl TermDictionary {
         self.terms.get(term).copied()
     }
 
+    /// Reconstruct a `TermDictionary` from a persisted `(term, id)` pair set
+    /// (kernel M4 / task #50: term-dict sidecar load path).
+    ///
+    /// This is the id-space-preserving counterpart to repeated
+    /// `get_or_insert` calls: instead of assigning ids by first-encounter
+    /// order (which is NOT reproducible across a restart because the
+    /// keyspace rescan iterates `DashTable` hash-iteration order, not the
+    /// original insertion order), every id is taken verbatim from the
+    /// sidecar. `next_id` continues from the persisted high-water mark so
+    /// terms discovered fresh by the post-load rescan get NEW, non-colliding
+    /// ids rather than restarting from 0.
+    ///
+    /// Callers MUST validate the sidecar (magic/version/checksum) and
+    /// reject anything malformed BEFORE calling this -- this constructor
+    /// trusts its inputs (ids may be sparse or unsorted; both are fine,
+    /// duplicates are rejected by returning `None` since a single term
+    /// can't legitimately hold two persisted ids and a collision means the
+    /// sidecar was corrupted between writes).
+    #[must_use]
+    pub fn from_pairs(
+        pairs: Vec<(String, u32)>,
+        next_id: u32,
+        fst_high_water_mark: u32,
+    ) -> Option<Self> {
+        let mut terms = HashMap::with_capacity(pairs.len());
+        let mut seen_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(pairs.len());
+        let mut resident_bytes = 0usize;
+        let mut max_id_plus_one = 0u32;
+        for (term, id) in pairs {
+            if id >= next_id {
+                // A persisted id can never reach/exceed the persisted
+                // next_id counter -- that would mean the sidecar's own
+                // invariant was violated when it was written.
+                return None;
+            }
+            if !seen_ids.insert(id) {
+                return None; // duplicate id -- corrupt sidecar
+            }
+            resident_bytes += term.len() + std::mem::size_of::<u32>() + MAP_ENTRY_OVERHEAD;
+            max_id_plus_one = max_id_plus_one.max(id + 1);
+            if terms.insert(term, id).is_some() {
+                return None; // duplicate term -- corrupt sidecar
+            }
+        }
+        if max_id_plus_one > next_id || fst_high_water_mark > next_id {
+            return None; // internal inconsistency -- fail closed
+        }
+        Some(Self {
+            terms,
+            next_id,
+            fst_high_water_mark,
+            resident_bytes,
+        })
+    }
+
     /// Number of unique terms in the dictionary.
     pub fn term_count(&self) -> usize {
         self.terms.len()
@@ -156,5 +212,63 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "100k reads of resident_bytes() took {elapsed:?} -- looks like a walk, not O(1)"
         );
+    }
+
+    /// Kernel M4 (task #50): `from_pairs` reconstructs a dictionary whose
+    /// ids/lookups/resident_bytes are indistinguishable from one built by
+    /// live `get_or_insert` calls in the same order.
+    #[test]
+    fn from_pairs_roundtrips_equivalent_to_get_or_insert() {
+        let mut live = TermDictionary::new();
+        let id_a = live.get_or_insert("alpha");
+        let id_b = live.get_or_insert("beta");
+        let id_c = live.get_or_insert("gamma");
+        live.fst_high_water_mark = live.next_id();
+
+        let pairs: Vec<(String, u32)> = live.iter().map(|(t, &id)| (t.to_owned(), id)).collect();
+        let restored = TermDictionary::from_pairs(pairs, live.next_id(), live.fst_high_water_mark)
+            .expect("valid sidecar pairs must reconstruct");
+
+        assert_eq!(restored.get("alpha"), Some(id_a));
+        assert_eq!(restored.get("beta"), Some(id_b));
+        assert_eq!(restored.get("gamma"), Some(id_c));
+        assert_eq!(restored.next_id(), live.next_id());
+        assert_eq!(restored.fst_high_water_mark, live.fst_high_water_mark);
+        assert_eq!(restored.resident_bytes(), live.resident_bytes());
+        assert_eq!(
+            restored.resident_bytes(),
+            restored.resident_bytes_ground_truth()
+        );
+    }
+
+    /// A term whose id is not less than `next_id` violates the sidecar's
+    /// own invariant -- fail closed (return `None`), never silently clamp.
+    #[test]
+    fn from_pairs_rejects_id_at_or_above_next_id() {
+        let pairs = vec![("x".to_owned(), 5u32)];
+        assert!(TermDictionary::from_pairs(pairs, 5, 0).is_none());
+    }
+
+    /// Two different terms claiming the same persisted id is a corrupt
+    /// sidecar -- fail closed.
+    #[test]
+    fn from_pairs_rejects_duplicate_ids() {
+        let pairs = vec![("x".to_owned(), 0u32), ("y".to_owned(), 0u32)];
+        assert!(TermDictionary::from_pairs(pairs, 2, 0).is_none());
+    }
+
+    /// A `fst_high_water_mark` above `next_id` is internally inconsistent
+    /// -- fail closed.
+    #[test]
+    fn from_pairs_rejects_hwm_above_next_id() {
+        let pairs = vec![("x".to_owned(), 0u32)];
+        assert!(TermDictionary::from_pairs(pairs, 1, 5).is_none());
+    }
+
+    #[test]
+    fn from_pairs_empty_is_valid() {
+        let restored = TermDictionary::from_pairs(Vec::new(), 0, 0).expect("empty is valid");
+        assert_eq!(restored.term_count(), 0);
+        assert_eq!(restored.next_id(), 0);
     }
 }

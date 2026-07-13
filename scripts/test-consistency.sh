@@ -1450,6 +1450,83 @@ fi
 # MEMORY DOCTOR: Moon-specific schema, not parity-tested against Redis.
 # Coverage: integration test tests/memory_doctor_response.rs + test-commands.sh.
 
+# ===========================================================================
+# SHUTDOWN [NOSAVE|SAVE] -- task #27
+#
+# Destructive by nature (the command exits the server), so it cannot share
+# $RUST_PID with the sections above -- it runs against its own throwaway
+# instance on a dedicated port/dir and cleans up after itself. Full
+# correctness/edge-case coverage (syntax errors, forced-SAVE failure keeps
+# the server up, etc.) lives in the Rust integration test
+# tests/shutdown_integration.rs; this section is the cross-shard durability
+# smoke check the new-command convention asks for.
+# ===========================================================================
+echo ""
+echo "=== SHUTDOWN [NOSAVE|SAVE] ==="
+
+PORT_SHUTDOWN=$((PORT_RUST + 500))
+SHUTDOWN_DIR=$(mktemp -d /tmp/moon-shutdown-dir.XXXXXX)
+
+# NOSAVE: exits promptly, appendonly=no so no durability is expected -- this
+# only checks the process actually terminates instead of erroring forever.
+"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
+    --appendonly no --disk-free-min-pct 0 >/dev/null 2>&1 &
+SHUTDOWN_PID=$!
+for _ in $(seq 1 50); do
+    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
+    sleep 0.1
+done
+redis-cli -p "$PORT_SHUTDOWN" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+SHUTDOWN_EXITED=false
+for _ in $(seq 1 50); do
+    kill -0 "$SHUTDOWN_PID" 2>/dev/null || { SHUTDOWN_EXITED=true; break; }
+    sleep 0.1
+done
+if $SHUTDOWN_EXITED; then
+    PASS=$((PASS + 1)); echo "  PASS: SHUTDOWN NOSAVE exits promptly"
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN NOSAVE did not exit within 5s"
+    kill -9 "$SHUTDOWN_PID" 2>/dev/null || true
+fi
+wait "$SHUTDOWN_PID" 2>/dev/null || true
+rm -rf "$SHUTDOWN_DIR"
+
+# appendonly=yes: SHUTDOWN must flush the AOF durably -- write, shut down,
+# restart, and confirm the key survived (no kill-9 tail loss on a clean exit).
+SHUTDOWN_DIR=$(mktemp -d /tmp/moon-shutdown-dir.XXXXXX)
+"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
+    --appendonly yes --disk-free-min-pct 0 >/dev/null 2>&1 &
+SHUTDOWN_PID=$!
+for _ in $(seq 1 50); do
+    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
+    sleep 0.1
+done
+redis-cli -p "$PORT_SHUTDOWN" SET shutdown:durable hello >/dev/null 2>&1
+redis-cli -p "$PORT_SHUTDOWN" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do
+    kill -0 "$SHUTDOWN_PID" 2>/dev/null || break
+    sleep 0.1
+done
+wait "$SHUTDOWN_PID" 2>/dev/null || true
+
+"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
+    --appendonly yes --disk-free-min-pct 0 >/dev/null 2>&1 &
+SHUTDOWN_PID=$!
+for _ in $(seq 1 50); do
+    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
+    sleep 0.1
+done
+SHUTDOWN_RESTORED=$(redis-cli -p "$PORT_SHUTDOWN" GET shutdown:durable 2>&1)
+if [[ "$SHUTDOWN_RESTORED" == "hello" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: SHUTDOWN flushes AOF durably (appendonly=yes survives restart)"
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN did not persist AOF durably: got '$SHUTDOWN_RESTORED'"
+fi
+kill "$SHUTDOWN_PID" 2>/dev/null || true
+wait "$SHUTDOWN_PID" 2>/dev/null || true
+pkill -f "moon.*${PORT_SHUTDOWN}" 2>/dev/null || true
+rm -rf "$SHUTDOWN_DIR"
+
 # Restart moon with the originally-requested shard count so summary works.
 start_moon_with_shards "$SHARDS" || true
 

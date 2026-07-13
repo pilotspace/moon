@@ -397,6 +397,90 @@ pub(super) fn try_handle_persistence(
     false
 }
 
+/// Outcome of `try_handle_shutdown`.
+pub(super) enum ShutdownOutcome {
+    /// Not a SHUTDOWN command -- caller should keep dispatching.
+    NotShutdown,
+    /// SHUTDOWN was rejected (syntax error, forced SAVE failed) -- an error
+    /// frame was pushed onto `responses`; caller should `continue`.
+    Rejected,
+    /// SHUTDOWN succeeded and the graceful shutdown sequence has been
+    /// triggered -- Redis parity: no reply is sent, caller must close the
+    /// connection (`should_quit = true; break;`) without pushing anything
+    /// onto `responses`.
+    Exiting,
+}
+
+/// Handle SHUTDOWN [NOSAVE|SAVE] in sharded mode.
+///
+/// Sharded mode has no single-threaded synchronous SAVE path (see plain
+/// SAVE's "not supported" rejection above), so a forced save here uses the
+/// same cooperative per-shard BGSAVE snapshot (`bgsave_start_sharded`) and
+/// polls for its completion with a bounded timeout -- a wedged shard must
+/// not hang SHUTDOWN forever; timing out fails the command (server stays
+/// up) rather than exiting with a torn snapshot.
+pub(super) async fn try_handle_shutdown(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    ctx: &ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    responses: &mut Vec<Frame>,
+) -> ShutdownOutcome {
+    if !cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
+        return ShutdownOutcome::NotShutdown;
+    }
+    use crate::command::persistence::{self, ShutdownSaveMode};
+
+    let mode = match persistence::parse_shutdown_args(cmd_args) {
+        Ok(m) => m,
+        Err(e) => {
+            responses.push(e);
+            return ShutdownOutcome::Rejected;
+        }
+    };
+    let should_save = match mode {
+        ShutdownSaveMode::Save => true,
+        ShutdownSaveMode::NoSave => false,
+        ShutdownSaveMode::Default => {
+            persistence::shutdown_default_should_save(ctx.config.save.as_deref())
+        }
+    };
+    if should_save {
+        match persistence::bgsave_start_sharded(&ctx.snapshot_trigger_tx, ctx.num_shards) {
+            Frame::Error(e) => {
+                responses.push(Frame::Error(e));
+                return ShutdownOutcome::Rejected;
+            }
+            _ => {}
+        }
+        let start = std::time::Instant::now();
+        loop {
+            if !persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if start.elapsed().as_millis() as u64 > persistence::SHUTDOWN_SAVE_TIMEOUT_MS {
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR SHUTDOWN failed: background save timed out, check logs",
+                )));
+                return ShutdownOutcome::Rejected;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                persistence::SHUTDOWN_SAVE_POLL_MS,
+            ))
+            .await;
+        }
+        if !persistence::BGSAVE_LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR SHUTDOWN failed: background save error, check logs",
+            )));
+            return ShutdownOutcome::Rejected;
+        }
+    }
+    tracing::info!("SHUTDOWN command received -- initiating graceful shutdown");
+    shutdown.cancel();
+    ShutdownOutcome::Exiting
+}
+
 /// Handle cross-shard KEYS, SCAN, DBSIZE aggregation.
 /// Returns `true` if consumed.
 pub(super) async fn try_handle_cross_shard_scan(

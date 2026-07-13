@@ -23,10 +23,94 @@
 //! incremental persistence is a documented follow-up.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::BytesMut;
 
 use crate::protocol::{Frame, ParseConfig, parse};
+
+// ── Unified poison-record policy (task #48) ────────────────────────────
+//
+// A replicated record that fails to DECODE (malformed graph/MQ/WS/temporal
+// payload, wrong arg shape, etc.) is PROTOCOL-level evidence that this
+// replica's view of the stream has desynced from the master — the same
+// class of event as `DrainResult::fatal` (an unparseable RESP frame) and
+// "no ShardSlice on this thread". All three now share ONE outcome:
+//
+//   1. Never silently skip-and-continue applying. A skip means every
+//      subsequent record in the stream keeps applying against state that
+//      has already silently diverged — the divergence is permanent and
+//      invisible until an operator notices data loss.
+//   2. Never panic. A malformed record is untrusted network input (or a
+//      benign version-skew record from an older/newer master), not a
+//      local invariant violation.
+//   3. Log loud (rate-limited — a poisoned link can produce many records
+//      per second before the caller tears the connection down) and count
+//      it in an INFO-visible counter (`replication_poison_records_total`,
+//      `# Replication` section, precedent: `info_reclamation.rs`).
+//   4. Signal the caller to KICK the link: drop the connection and let the
+//      existing reconnect/resync loop (`run_replica_task`'s backoff loop)
+//      renegotiate PSYNC. That loop is the ONLY recovery path — it either
+//      resumes with `+CONTINUE` from a clean offset or falls back to a
+//      full resync, both of which re-establish a known-good state instead
+//      of compounding a guess.
+//
+// PSYNC snapshot install (`load_snapshot`) already behaves correctly for
+// this class of failure: a malformed aux blob fails the WHOLE install via
+// `anyhow::Result` (fail-closed), propagated up through `run_replica_task`
+// as a hard error that drops the connection — no change needed there, only
+// documented here for completeness.
+//
+// This is distinct from a SEMANTIC apply error (e.g. `WRONGTYPE`, "entity
+// not found") on an otherwise well-formed, successfully decoded record —
+// that is data-level divergence from a command that legitimately executed
+// differently than on the master (should not happen, but is not stream
+// corruption); those keep the existing warn-and-continue behavior
+// (`warn_on_error`), matching the generic KV dispatch path's long-standing
+// posture. Decode failure vs. semantic failure is the line every plane
+// below now draws consistently.
+
+/// Process-wide count of poison (malformed/undecodable) replicated records
+/// observed on this replica, across every plane (graph/MQ/WS/temporal/RESP
+/// framing). Exposed via `INFO replication` as
+/// `replication_poison_records_total`.
+pub static REPL_POISON_RECORDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Rate-limit gate for the loud poison log line: epoch millis of the last
+/// emitted log, so a burst of poison records (the common case — once the
+/// stream desyncs, every subsequent record is usually poison too, until the
+/// caller tears the connection down) logs once per window instead of
+/// flooding.
+static REPL_POISON_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum spacing between poison log lines, in milliseconds.
+const REPL_POISON_LOG_WINDOW_MS: u64 = 1000;
+
+/// Record one poison event: increments the INFO counter unconditionally,
+/// emits a rate-limited loud `warn!`, and returns `false` — the unified
+/// signal every apply helper below uses to tell its caller "this record did
+/// not apply; the stream desynced; drop the connection and resync."
+fn poison(cmd: &[u8], reason: &str) -> bool {
+    REPL_POISON_RECORDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = REPL_POISON_LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= REPL_POISON_LOG_WINDOW_MS
+        && REPL_POISON_LAST_LOG_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "replica apply: POISON RECORD {} — {} — dropping replication link to force resync \
+             (replica desynced; silent skip would diverge permanently)",
+            String::from_utf8_lossy(cmd),
+            reason
+        );
+    }
+    false
+}
 
 /// One replicated data command, already resolved to its logical db.
 #[derive(Debug)]
@@ -79,6 +163,15 @@ pub(crate) fn drain_replicated_commands(
             // the next socket read to complete it.
             Ok(None) => break,
             Err(_) => {
+                // Unframed RESP-level corruption is the same poison-record
+                // class as a malformed graph/MQ/WS/temporal payload (task
+                // #48 unified policy) — count it in the same INFO counter,
+                // even though the caller (not this function) owns the
+                // actual "drop the connection" step via `DrainResult::fatal`.
+                poison(
+                    b"<resp-frame>",
+                    "unparseable RESP frame in replication stream",
+                );
                 fatal = true;
                 break;
             }
@@ -139,6 +232,31 @@ fn frame_to_usize(f: &Frame) -> Option<usize> {
     }
 }
 
+/// Outcome of [`apply_local`] — the unified poison-record contract (task
+/// #48). `Poisoned` and `NoShardSlice` both mean "the caller must drop the
+/// connection to force a resync"; they are kept distinct only so the
+/// caller's error message names the right cause. See the module-level
+/// "Unified poison-record policy" docs above.
+pub(crate) enum ApplyOutcome {
+    /// Applied cleanly, or a well-formed record hit a semantic dispatch
+    /// error (already logged loud by `warn_on_error`) — not stream
+    /// corruption, no action required beyond the existing log.
+    Applied,
+    /// A malformed/undecodable record — desync evidence. Already logged +
+    /// counted by [`poison`]; caller must drop the connection.
+    Poisoned,
+    /// This thread has no initialized `ShardSlice` — the replica task was
+    /// spawned off a shard thread (a wiring bug); caller must drop the
+    /// stream.
+    NoShardSlice,
+}
+
+impl ApplyOutcome {
+    fn from_poison_bool(ok: bool) -> Self {
+        if ok { Self::Applied } else { Self::Poisoned }
+    }
+}
+
 /// Apply one replicated command to the local shard's database.
 ///
 /// Runs synchronously on the shard thread through the thread-local `ShardSlice`
@@ -146,9 +264,10 @@ fn frame_to_usize(f: &Frame) -> Option<usize> {
 /// `with_shard` access on the same cooperative thread. Bypasses the read-only
 /// guard by construction (see module docs).
 ///
-/// Returns `false` only if this thread has no initialized `ShardSlice` — which
-/// would indicate the replica task was spawned off a shard thread (a wiring
-/// bug); the caller logs and drops the stream.
+/// Returns [`ApplyOutcome::NoShardSlice`] only if this thread has no
+/// initialized `ShardSlice`; returns [`ApplyOutcome::Poisoned`] for any
+/// malformed/undecodable record (task #48 unified policy) — both signal the
+/// caller to drop the connection and let the reconnect loop resync.
 ///
 /// `shard_databases` gives the WS.CREATE.APPLY / WS.DROP.APPLY arms
 /// (Wave B ws-plane) access to the process-global `WorkspaceRegistry`, which
@@ -158,28 +277,36 @@ fn frame_to_usize(f: &Frame) -> Option<usize> {
 pub(crate) fn apply_local(
     rc: &ReplCommand,
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-) -> bool {
+) -> ApplyOutcome {
     use crate::command::{DispatchResult, dispatch as cmd_dispatch};
     use crate::shard::spsc_handler::extract_command_static;
 
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
-        return true; // not an array command — nothing to apply (defensive)
+        return ApplyOutcome::Applied; // not an array command — nothing to apply (defensive)
     };
     if cmd.eq_ignore_ascii_case(crate::workspace::repl::WS_CREATE_APPLY_CMD) {
         // Doesn't touch `ShardSlice`, but routes through `try_with_shard`
         // anyway so a replica task wired to a non-shard thread is caught
         // uniformly (same "no ShardSlice here" contract every other arm has).
-        return crate::shard::slice::try_with_shard(|_s| apply_ws_create(shard_databases, args))
-            .is_some();
+        return match crate::shard::slice::try_with_shard(|_s| {
+            apply_ws_create(shard_databases, cmd, args)
+        }) {
+            Some(ok) => ApplyOutcome::from_poison_bool(ok),
+            None => ApplyOutcome::NoShardSlice,
+        };
     }
     if cmd.eq_ignore_ascii_case(crate::workspace::repl::WS_DROP_APPLY_CMD) {
-        return crate::shard::slice::try_with_shard(|s| apply_ws_drop(s, shard_databases, args))
-            .is_some();
+        return match crate::shard::slice::try_with_shard(|s| {
+            apply_ws_drop(s, shard_databases, cmd, args)
+        }) {
+            Some(ok) => ApplyOutcome::from_poison_bool(ok),
+            None => ApplyOutcome::NoShardSlice,
+        };
     }
-    crate::shard::slice::try_with_shard(|s| {
+    let result = crate::shard::slice::try_with_shard(|s| -> bool {
         let db_count = s.databases.len();
         if db_count == 0 {
-            return;
+            return true;
         }
         let db_idx = rc.db_index.min(db_count - 1);
         if db_idx != rc.db_index {
@@ -201,7 +328,7 @@ pub(crate) fn apply_local(
         if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
             let resp = apply_ft(s, cmd, args, db_idx);
             warn_on_error(cmd, &resp);
-            return;
+            return true;
         }
 
         // GRAPH.* mutations (v0.7 graph replication) arrive as the master's
@@ -213,8 +340,7 @@ pub(crate) fn apply_local(
         // exactly like restart recovery does.
         #[cfg(feature = "graph")]
         if crate::graph::replay::GraphReplayCollector::is_graph_command(cmd) {
-            apply_graph(s, cmd, args);
-            return;
+            return apply_graph(s, cmd, args);
         }
 
         // MQ.* effect records (Wave B stage 2b) arrive as one of the
@@ -223,8 +349,7 @@ pub(crate) fn apply_local(
         // (`apply_mq_*` in `shard::shared_databases`) boot-time WAL replay
         // uses, generalized over `MqApplyTarget` so both share one codec.
         if crate::mq::wal::is_mq_replay_command(cmd) {
-            apply_mq(s, cmd, args);
-            return;
+            return apply_mq(s, cmd, args);
         }
 
         // TEMPORAL.INVALIDATE arrives as the master's deterministic
@@ -234,8 +359,7 @@ pub(crate) fn apply_local(
         // `dispatch()` does not know this internal record.
         #[cfg(feature = "graph")]
         if cmd.eq_ignore_ascii_case(b"TEMPORAL.INVALIDATE-AT") {
-            apply_temporal_invalidate(s, cmd, args);
-            return;
+            return apply_temporal_invalidate(s, cmd, args);
         }
 
         // MOVE / cross-db COPY touch two databases at once and are intercepted
@@ -247,7 +371,7 @@ pub(crate) fn apply_local(
         if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
             if let Some(resp) = apply_two_db(cmd, args, &mut s.databases, db_idx, db_count) {
                 warn_on_error(cmd, &resp);
-                return;
+                return true;
             }
             // COPY with no DB clause / same-db COPY: fall through to dispatch.
         }
@@ -272,8 +396,12 @@ pub(crate) fn apply_local(
             apply_index_parity_hooks(s, cmd, args, db_idx as u8);
         }
         warn_on_error(cmd, &resp);
-    })
-    .is_some()
+        true
+    });
+    match result {
+        Some(ok) => ApplyOutcome::from_poison_bool(ok),
+        None => ApplyOutcome::NoShardSlice,
+    }
 }
 
 /// Apply a replicated `WS.CREATE.APPLY` record (Wave B ws-plane): install the
@@ -285,17 +413,16 @@ pub(crate) fn apply_local(
 /// rather than replaying a local WAL copy of this record.
 fn apply_ws_create(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    cmd: &[u8],
     args: &[Frame],
-) {
+) -> bool {
     let Some(payload) = crate::workspace::repl::extract_payload(args) else {
-        tracing::warn!("replica apply: WS.CREATE.APPLY missing payload — skipped");
-        return;
+        return poison(cmd, "WS.CREATE.APPLY missing payload arg");
     };
     let Some((ws_id_bytes, name, created_at)) =
         crate::workspace::wal::decode_workspace_create(&payload)
     else {
-        tracing::warn!("replica apply: WS.CREATE.APPLY payload malformed — skipped");
-        return;
+        return poison(cmd, "WS.CREATE.APPLY payload malformed");
     };
     let id = crate::workspace::WorkspaceId::from_bytes(ws_id_bytes);
     let mut guard = shard_databases.workspace_registry();
@@ -308,6 +435,7 @@ fn apply_ws_create(
             created_at,
         },
     );
+    true
 }
 
 /// Apply a replicated `WS.DROP.APPLY` record (Wave B ws-plane): remove the
@@ -318,15 +446,14 @@ fn apply_ws_create(
 fn apply_ws_drop(
     s: &mut crate::shard::slice::ShardSlice,
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    cmd: &[u8],
     args: &[Frame],
-) {
+) -> bool {
     let Some(payload) = crate::workspace::repl::extract_payload(args) else {
-        tracing::warn!("replica apply: WS.DROP.APPLY missing payload — skipped");
-        return;
+        return poison(cmd, "WS.DROP.APPLY missing payload arg");
     };
     let Some(ws_id_bytes) = crate::workspace::wal::decode_workspace_drop(&payload) else {
-        tracing::warn!("replica apply: WS.DROP.APPLY payload malformed — skipped");
-        return;
+        return poison(cmd, "WS.DROP.APPLY payload malformed");
     };
     let id = crate::workspace::WorkspaceId::from_bytes(ws_id_bytes);
     let removed = {
@@ -339,7 +466,7 @@ fn apply_ws_drop(
     if !removed {
         // Already absent (e.g. a re-delivered record after a resync) —
         // nothing to sweep.
-        return;
+        return true;
     }
     let prefix = format!("{{{}}}:", id.as_hex());
     let prefix_bytes = prefix.into_bytes();
@@ -353,6 +480,7 @@ fn apply_ws_drop(
             db.remove(key);
         }
     }
+    true
 }
 
 /// Apply a replicated FT.* index-definition command (FT.CREATE / FT.DROPINDEX
@@ -397,30 +525,20 @@ fn apply_ft(
 /// resolves edge/SET targets against nodes applied by EARLIER records via the
 /// write-buffer seeding in `replay_epoch_aware`.
 #[cfg(feature = "graph")]
-fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) -> bool {
     use crate::graph::replay::GraphReplayCollector;
     let mut arg_bytes: Vec<&[u8]> = Vec::with_capacity(args.len());
     for a in args {
         match a {
             Frame::BulkString(b) | Frame::SimpleString(b) => arg_bytes.push(b.as_ref()),
             _ => {
-                tracing::warn!(
-                    "replica apply: non-bulk arg in graph record {} — skipped (graph diverges; \
-                     full resync required)",
-                    String::from_utf8_lossy(cmd)
-                );
-                return;
+                return poison(cmd, "non-bulk arg in graph record");
             }
         }
     }
     let mut collector = GraphReplayCollector::new();
     if !collector.collect_command(cmd, &arg_bytes) {
-        tracing::warn!(
-            "replica apply: unparseable graph record {} — skipped (graph diverges; \
-             full resync required)",
-            String::from_utf8_lossy(cmd)
-        );
-        return;
+        return poison(cmd, "unparseable graph record");
     }
     if collector.replay_into(&mut s.graph_store) == 0 {
         // Not always divergence (e.g. GRAPH.CREATE of an existing graph
@@ -430,6 +548,7 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
             String::from_utf8_lossy(cmd)
         );
     }
+    true
 }
 
 /// Apply one replicated MQ effect record (Wave B stage 2b): decode the
@@ -442,7 +561,7 @@ fn apply_graph(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Fram
 /// A replica NEVER fires `MQ.TRIGGER` callbacks on apply (registrations are
 /// stored as opaque data, same as boot-time replay — firing only happens
 /// live via `MQ.PUSH`'s debounce arming on a master).
-fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) -> bool {
     use crate::mq::wal::{
         MQ_REPL_ACK, MQ_REPL_CREATE, MQ_REPL_DROP, MQ_REPL_POP, MQ_REPL_PUSH, MQ_REPL_TRIGGER,
         decode_mq_ack, decode_mq_create, decode_mq_drop, decode_mq_pop, decode_mq_push,
@@ -454,12 +573,7 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
     use crate::storage::stream::StreamId;
 
     let Some(Frame::BulkString(payload)) = args.first() else {
-        tracing::warn!(
-            "replica apply: malformed {} record — missing payload arg (diverges; \
-             full resync required)",
-            String::from_utf8_lossy(cmd)
-        );
-        return;
+        return poison(cmd, "missing payload arg");
     };
 
     // Replicas configured with fewer logical dbs than the master clamp the
@@ -560,12 +674,9 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
         Some(())
     };
 
-    if applied.is_none() {
-        tracing::warn!(
-            "replica apply: malformed {} record payload — skipped (MQ plane diverges; \
-             full resync required)",
-            String::from_utf8_lossy(cmd)
-        );
+    match applied {
+        Some(()) => true,
+        None => poison(cmd, "malformed record payload"),
     }
 }
 
@@ -578,17 +689,20 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
 /// K1a: `apply_invalidate` now returns the payload directly instead of
 /// pushing it into `gs.wal_pending` — there is nothing left to drain here.
 #[cfg(feature = "graph")]
-fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame]) {
+fn apply_temporal_invalidate(
+    s: &mut crate::shard::slice::ShardSlice,
+    cmd: &[u8],
+    args: &[Frame],
+) -> bool {
     let Some((graph_name, is_node, entity_id, wall_ms)) =
         crate::command::temporal::parse_invalidate_at(args)
     else {
-        tracing::warn!(
-            "replica apply: malformed {} record — skipped (graph diverges; \
-             full resync required)",
-            String::from_utf8_lossy(cmd)
-        );
-        return;
+        return poison(cmd, "malformed TEMPORAL.INVALIDATE-AT record");
     };
+    // A decode-failure (above) is stream corruption — poison. An `Err` here
+    // is a SEMANTIC failure on a well-formed record (e.g. the entity id no
+    // longer exists) — logged loud but not treated as protocol desync,
+    // matching `warn_on_error`'s posture for the generic KV path.
     if let Err(e) = crate::command::temporal::apply_invalidate(
         &mut s.graph_store,
         entity_id,
@@ -598,11 +712,12 @@ fn apply_temporal_invalidate(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8]
     ) {
         tracing::warn!(
             "replica apply: TEMPORAL.INVALIDATE-AT entity_id={} failed: {} \
-             (graph diverges; full resync required)",
+             (replica may diverge from master)",
             entity_id,
             String::from_utf8_lossy(e)
         );
     }
+    true
 }
 
 /// Mirror of the master's connection-layer index-parity block
@@ -762,6 +877,7 @@ pub(crate) fn load_snapshot(
                         }
                     }
                     None => {
+                        poison(b"<snapshot-graph-aux>", "malformed graph-store aux blob");
                         return Err(anyhow::anyhow!(
                             "replica snapshot: malformed graph-store aux blob"
                         ));
@@ -800,6 +916,7 @@ pub(crate) fn load_snapshot(
                         }
                     }
                     None => {
+                        poison(b"<snapshot-mq-aux>", "malformed MQ registry aux blob");
                         return Err(anyhow::anyhow!(
                             "replica snapshot: malformed MQ registry aux blob"
                         ));
@@ -844,6 +961,10 @@ pub(crate) fn load_snapshot(
                 }
             }
             None => {
+                poison(
+                    b"<snapshot-ws-aux>",
+                    "malformed workspace-registry aux blob",
+                );
                 return Err(anyhow::anyhow!(
                     "replica snapshot: malformed workspace-registry aux blob"
                 ));
@@ -1085,6 +1206,179 @@ mod tests {
         }
     }
 
+    // ── Poison-record policy tests (task #48) ──────────────────────────
+    //
+    // Each test feeds ONE malformed record for a different plane through
+    // `apply_local` on a freshly-initialized `ShardSlice` and asserts the
+    // unified outcome: `ApplyOutcome::Poisoned`, the INFO counter advanced
+    // by exactly one, and — where the plane has externally observable state
+    // (the workspace registry) — that state is untouched.
+
+    /// Build a `ReplCommand` bound to db 0 from `cmd` + raw byte args (no
+    /// RESP round-trip needed; `apply_local` only reads the already-parsed
+    /// `Frame::Array`).
+    fn repl_cmd(cmd: &[u8], args: &[&[u8]]) -> ReplCommand {
+        let mut arr = vec![Frame::BulkString(Bytes::copy_from_slice(cmd))];
+        arr.extend(
+            args.iter()
+                .map(|a| Frame::BulkString(Bytes::copy_from_slice(a))),
+        );
+        ReplCommand {
+            db_index: 0,
+            command: Arc::new(Frame::Array(arr.into())),
+        }
+    }
+
+    /// Run `body` on a freshly-initialized `ShardSlice` (one db, shard 0) on
+    /// a dedicated OS thread, with a matching `ShardDatabases` Arc — same
+    /// recipe `shard::shared_databases`'s own tests use.
+    fn on_fresh_shard<F, R>(body: F) -> R
+    where
+        F: FnOnce(&std::sync::Arc<crate::shard::shared_databases::ShardDatabases>) -> R
+            + Send
+            + 'static,
+        R: Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let dbs = vec![vec![crate::storage::Database::new()]];
+            let (shared, mut inits) = crate::shard::shared_databases::ShardDatabases::new(dbs);
+            crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(inits.remove(0)));
+            body(&shared)
+        })
+        .join()
+        .expect("test shard thread panicked")
+    }
+
+    fn poison_count() -> u64 {
+        REPL_POISON_RECORDS_TOTAL.load(Ordering::Relaxed)
+    }
+
+    /// `REPL_POISON_RECORDS_TOTAL` is a single process-wide atomic (by
+    /// design — it backs one INFO counter), so the `before`/`after` delta
+    /// assertions below are only meaningful if no other poison test runs
+    /// concurrently. `cargo test` runs tests in the same binary in parallel
+    /// by default; serialize just this file's poison tests against each
+    /// other with a dedicated lock (cheap — these tests are not
+    /// performance-sensitive) rather than weakening the assertions.
+    static POISON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Without the graph feature `apply_graph` is compiled out, so a
+    // GRAPH.* record falls through to generic dispatch and is warn-and-
+    // continue (unknown command), not Poisoned — the poison contract for
+    // graph records only exists when the graph plane does.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn poison_graph_record_kicks_and_counts() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = poison_count();
+        let outcome = on_fresh_shard(|shard_databases| {
+            // GRAPH.ADDNODE with a missing required arg — `collect_command`
+            // rejects it (wrong shape), never a valid mutation.
+            let rc = repl_cmd(b"GRAPH.ADDNODE", &[b"mygraph"]);
+            apply_local(&rc, shard_databases)
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::Poisoned),
+            "malformed graph record must be Poisoned, not silently applied/skipped"
+        );
+        assert_eq!(
+            poison_count(),
+            before + 1,
+            "poison counter must advance by exactly one"
+        );
+    }
+
+    #[test]
+    fn poison_mq_record_kicks_and_counts() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::mq::wal::MQ_REPL_PUSH;
+        let before = poison_count();
+        let outcome = on_fresh_shard(|shard_databases| {
+            // Missing the single payload bulk-string arg every MQ._REPL.*
+            // record requires.
+            let rc = repl_cmd(MQ_REPL_PUSH, &[]);
+            apply_local(&rc, shard_databases)
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::Poisoned),
+            "malformed MQ record must be Poisoned, not silently applied/skipped"
+        );
+        assert_eq!(poison_count(), before + 1);
+    }
+
+    // TEMPORAL.INVALIDATE-AT apply lives behind the graph feature too.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn poison_temporal_invalidate_record_kicks_and_counts() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = poison_count();
+        let outcome = on_fresh_shard(|shard_databases| {
+            // Wrong arg count (`parse_invalidate_at` requires exactly 4).
+            let rc = repl_cmd(b"TEMPORAL.INVALIDATE-AT", &[b"g", b"N"]);
+            apply_local(&rc, shard_databases)
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::Poisoned),
+            "malformed TEMPORAL.INVALIDATE-AT record must be Poisoned"
+        );
+        assert_eq!(poison_count(), before + 1);
+    }
+
+    #[test]
+    fn poison_ws_create_record_kicks_counts_and_leaves_registry_untouched() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = poison_count();
+        let (outcome, registry_after) = on_fresh_shard(|shard_databases| {
+            let rc = repl_cmd(crate::workspace::repl::WS_CREATE_APPLY_CMD, &[]); // missing payload
+            let outcome = apply_local(&rc, shard_databases);
+            let count = shard_databases
+                .workspace_registry()
+                .as_ref()
+                .map_or(0, |r| r.len());
+            (outcome, count)
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::Poisoned),
+            "malformed WS.CREATE.APPLY record must be Poisoned, not silently skipped"
+        );
+        assert_eq!(poison_count(), before + 1);
+        assert_eq!(
+            registry_after, 0,
+            "no workspace must be installed from a poison record"
+        );
+    }
+
+    #[test]
+    fn poison_ws_drop_record_kicks_and_counts() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = poison_count();
+        let outcome = on_fresh_shard(|shard_databases| {
+            let rc = repl_cmd(crate::workspace::repl::WS_DROP_APPLY_CMD, &[]); // missing payload
+            apply_local(&rc, shard_databases)
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::Poisoned),
+            "malformed WS.DROP.APPLY record must be Poisoned, not silently skipped"
+        );
+        assert_eq!(poison_count(), before + 1);
+    }
+
+    #[test]
+    fn well_formed_record_does_not_poison() {
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = poison_count();
+        let outcome = on_fresh_shard(|shard_databases| {
+            let rc = repl_cmd(b"SET", &[b"k", b"v"]);
+            apply_local(&rc, shard_databases)
+        });
+        assert!(matches!(outcome, ApplyOutcome::Applied));
+        assert_eq!(
+            poison_count(),
+            before,
+            "a well-formed record must never advance the poison counter"
+        );
+    }
+
     #[test]
     fn single_complete_command_consumes_all() {
         let bytes = resp_cmd(&[b"SET", b"foo", b"bar"]);
@@ -1161,6 +1455,10 @@ mod tests {
 
     #[test]
     fn malformed_frame_is_fatal() {
+        // Also increments the shared poison counter (see `poison()`) — take
+        // the same lock the dedicated poison tests use so it can't land its
+        // increment inside another test's before/after window.
+        let _guard = POISON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A bulk-string length that cannot parse → hard parse error.
         let bytes = b"*1\r\n$-5\r\nX\r\n".to_vec();
         let mut buf = BytesMut::from(&bytes[..]);
