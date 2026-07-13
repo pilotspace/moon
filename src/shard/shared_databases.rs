@@ -1042,8 +1042,32 @@ pub fn replay_graph_wal(
         let mut dummy_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
         let mut selected_db = 0usize;
         let on_command = &mut |record: &WalRecord| {
-            if record.record_type == WalRecordType::Command {
-                engine.replay_command(&mut dummy_dbs, &record.payload, &[], &mut selected_db);
+            if record.record_type != WalRecordType::Command {
+                return;
+            }
+            // Payload is RESP-encoded (same format as AOF/WAL v2 blocks) — it
+            // must be parsed into frames before dispatch. `replay_command`
+            // expects a bare command name plus already-parsed `&[Frame]`
+            // args, never the raw multi-line RESP blob (mirrors
+            // `replay_graph_wal_v3` above and `recovery.rs`'s KV Command
+            // replay; passing the raw payload as `cmd` made
+            // `GraphReplayCollector::is_graph_command` never match, silently
+            // dropping the entire legacy-mode graph plane on restart).
+            let mut buf = bytes::BytesMut::from(&record.payload[..]);
+            let parse_cfg = crate::protocol::ParseConfig::default();
+            while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+                let crate::protocol::Frame::Array(ref arr) = frame else {
+                    continue;
+                };
+                if arr.is_empty() {
+                    continue;
+                }
+                let cmd_name: &[u8] = match &arr[0] {
+                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
+                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
+                    _ => continue,
+                };
+                engine.replay_command(&mut dummy_dbs, cmd_name, &arr[1..], &mut selected_db);
             }
         };
         let on_fpi = &mut |_record: &WalRecord| {};
