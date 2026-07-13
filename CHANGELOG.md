@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — cross-shard MULTI/EXEC graph-leg misrouting (kernel M3 stage 3 / task #52, review round 3, P1)
+
+CodeRabbit finding on PR #300: `analyze_txn_locality` (the pre-EXEC classifier
+that decides whether a queued body runs locally, hops to a remote owner
+shard, or is rejected `CROSSSLOT`) only scans KV keys via `command_keys`.
+`GRAPH.*` commands declare NO keys in command metadata
+(`first_key==last_key==0`), so a graph-bearing body was misclassified —
+`Keyless` for a graph-only body, or by its KV keys alone for a mixed body —
+completely ignoring the graph name's REAL owner shard (the standalone
+`GRAPH.*` path routes by `graph_to_shard(name, num_shards)`, identical
+hash-tag-aware xxh64 to `key_to_shard`). At `num_shards > 1` a transaction
+whose true graph owner differed from the classified owner would durably
+apply the `GRAPH.*` write to the WRONG shard's `graph_store` — invisible to
+subsequent normally-routed single-command reads. The task #52 crash cells
+never caught this because their KV key and graph name deliberately share one
+`{txniso}` hash tag (co-location by construction), so they always agree on
+owner regardless of the bug.
+
+Fixed by folding the graph name into `analyze_txn_locality`'s existing
+`visit` closure (the same one KV keys and the SORT/GEORADIUS `STORE`-dest
+already use): a body whose KV keys and graph name disagree on owner becomes
+`CrossShard` (rejected `CROSSSLOT`, same posture as any other genuine
+cross-shard body); a graph-only body becomes `SingleShard(graph_owner)`,
+which routes through the SAME whole-body-atomic owner hop
+(`execute_txn_on_owner` / `ShardMessage::TxnExecute`) a KV-only remote-owner
+body already uses — no new hop mechanism, so the "body runs on ONE local
+shard slice" invariant is preserved.
+
+New tests in `tests/sharded_multi_exec_locality.rs`:
+`graph_leg_cross_shard_rejected` (a KV key and graph name deterministically
+computed, not guessed, to hash to different shards at shards=4 → `CROSSSLOT`,
+neither leg applied) and `graph_only_txn_routes_to_true_owner` (a graph-only
+body commits and is visible via a fresh, normally-routed connection —
+proving owner placement, not "whatever shard the connection landed on").
+Confirmed RED without the `analyze_txn_locality` fix (both new tests fail:
+the rejected-body test instead applies the KV leg and errors "graph not
+found" on the misrouted `GRAPH.ADDNODE`; the owner-routing test reads back 0
+rows), GREEN with it, 3× consecutive. `no_silent_divergence_across_shards` /
+`multi_shard_span_rejected` / `single_shard_unaffected` (pre-existing KV-only
+locality tests) and the task #52 crash-matrix txn cells are unaffected.
+
 ### Fixed — cross-store MULTI/EXEC graph leg replication (kernel M3 stage 3 / task #52, review round 2, P1)
 
 Follow-up to the durability fix below: `execute_transaction_sharded`'s new

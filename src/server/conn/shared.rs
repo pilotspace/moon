@@ -826,6 +826,39 @@ pub(crate) fn analyze_txn_locality(command_queue: &[Frame], num_shards: usize) -
                 return TxnLocality::CrossShard;
             }
         }
+        // task #52 review round 3 (CodeRabbit, P1): GRAPH.* commands declare
+        // NO keys in command metadata (first_key==last_key==0), so
+        // `command_keys` above contributes nothing for them — a graph-only
+        // body was misclassified `Keyless` (executed on whatever shard the
+        // connection happened to be pinned to) and a mixed KV+graph body was
+        // classified by its KV keys alone, ignoring the graph name entirely.
+        // The STANDALONE `GRAPH.*` path (`try_handle_graph_command`) routes
+        // by `graph_to_shard(name, num_shards)` — which is IDENTICALLY
+        // `key_to_shard` (same hash-tag-aware xxh64, see
+        // `shard::dispatch::graph_to_shard`'s doc) — so treating the graph
+        // name as just another "key" via the SAME `visit` closure used above
+        // reuses that exact routing rule: a body whose graph name and KV
+        // keys disagree on owner becomes `CrossShard` (rejected CROSSSLOT,
+        // same as the SORT/GEORADIUS STORE-dest case above) instead of
+        // silently applying the graph write to the wrong shard's store,
+        // invisible to later normally-routed single-command reads. A
+        // graph-only body becomes `SingleShard(graph_owner)`, which the
+        // caller already hops to the owner shard for (`execute_txn_on_owner`
+        // / `ShardMessage::TxnExecute`, the same whole-body-atomic mechanism
+        // a KV-only body routes through when queued from a non-owner shard)
+        // — no NEW hop is introduced, so the "body runs on ONE local slice"
+        // invariant holds. `GRAPH.LIST` is excluded: it has no name argument
+        // and is a scatter-gather read across every shard, not owned by one.
+        if cmd.len() > 6
+            && cmd[..6].eq_ignore_ascii_case(b"GRAPH.")
+            && !cmd.eq_ignore_ascii_case(b"GRAPH.LIST")
+        {
+            if let Some(name) = args.first().and_then(super::util::extract_bytes) {
+                if !visit(&name, &mut owner) {
+                    return TxnLocality::CrossShard;
+                }
+            }
+        }
     }
     match owner {
         None => TxnLocality::Keyless,
