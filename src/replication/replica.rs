@@ -385,10 +385,25 @@ async fn stream_commands_read_loop(
         let outcome =
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
-            if !crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
-                return Err(anyhow::anyhow!(
-                    "replica has no ShardSlice on this thread — cannot apply replication stream"
-                ));
+            use crate::replication::apply::ApplyOutcome;
+            match crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
+                ApplyOutcome::Applied => {}
+                // Unified poison-record policy (task #48): a malformed
+                // record has already been logged + counted inside
+                // `apply_local`; drop the connection so the reconnect loop
+                // renegotiates PSYNC instead of continuing to apply against
+                // a desynced state.
+                ApplyOutcome::Poisoned => {
+                    return Err(anyhow::anyhow!(
+                        "replication stream: poison record — dropping connection to force resync"
+                    ));
+                }
+                ApplyOutcome::NoShardSlice => {
+                    return Err(anyhow::anyhow!(
+                        "replica has no ShardSlice on this thread — cannot apply replication \
+                         stream"
+                    ));
+                }
             }
         }
         if outcome.consumed > 0 {
@@ -725,10 +740,25 @@ async fn stream_commands_read_loop(
         let outcome =
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
-            if !crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
-                return Err(anyhow::anyhow!(
-                    "replica has no ShardSlice on this thread — cannot apply replication stream"
-                ));
+            use crate::replication::apply::ApplyOutcome;
+            match crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
+                ApplyOutcome::Applied => {}
+                // Unified poison-record policy (task #48): a malformed
+                // record has already been logged + counted inside
+                // `apply_local`; drop the connection so the reconnect loop
+                // renegotiates PSYNC instead of continuing to apply against
+                // a desynced state.
+                ApplyOutcome::Poisoned => {
+                    return Err(anyhow::anyhow!(
+                        "replication stream: poison record — dropping connection to force resync"
+                    ));
+                }
+                ApplyOutcome::NoShardSlice => {
+                    return Err(anyhow::anyhow!(
+                        "replica has no ShardSlice on this thread — cannot apply replication \
+                         stream"
+                    ));
+                }
             }
         }
         if outcome.consumed > 0 {

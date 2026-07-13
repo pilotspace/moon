@@ -304,12 +304,21 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     // # Replication
     sections.push_str("# Replication\r\n");
     let (role, slaves, offset, repl_id) = crate::admin::metrics_setup::get_replication_info();
+    // task #48: unified poison-record counter, incremented by every replica
+    // apply plane (RESP framing / graph / MQ / WS / temporal / snapshot
+    // install) on a malformed/undecodable record — see
+    // `replication::apply`'s "Unified poison-record policy" docs. Zero on a
+    // master (a master never applies a replicated stream) and on a replica
+    // that has never seen a corrupt record.
+    let poison_total = crate::replication::apply::REPL_POISON_RECORDS_TOTAL
+        .load(std::sync::atomic::Ordering::Relaxed);
     let _ = write!(
         sections,
         "role:{role}\r\n\
          connected_slaves:{slaves}\r\n\
          master_replid:{repl_id}\r\n\
-         master_repl_offset:{offset}\r\n",
+         master_repl_offset:{offset}\r\n\
+         replication_poison_records_total:{poison_total}\r\n",
     );
     sections.push_str("\r\n");
 

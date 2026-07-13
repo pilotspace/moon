@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — unified replica poison-record policy across graph/MQ/WS/temporal planes (task #48)
+
+Each replica-apply plane (graph WAL replay, MQ effect records, workspace
+create/drop, temporal invalidate, RESP framing) previously handled a
+malformed/undecodable record ad hoc — mostly `tracing::warn!` + silently
+skip-and-continue, one path (`WS.CREATE.APPLY`/`WS.DROP.APPLY`) even
+swallowed the failure entirely (`try_with_shard(...).is_some()` returned
+`true` regardless of the inner decode outcome). A silent skip means every
+subsequent record in the stream keeps applying against state that has
+already diverged from the master — invisible until an operator notices
+missing data.
+
+Unified policy (`replication::apply`, see its "Unified poison-record policy"
+module docs): any decode/parse failure on a live-stream record is now a
+`ApplyOutcome::Poisoned` — logged loud (rate-limited to 1/sec), counted in
+a new INFO counter, and propagated up so the replica connection task drops
+the link and lets the existing reconnect/resync loop renegotiate PSYNC
+(never silently skip, never panic). PSYNC snapshot install already
+fail-closed correctly (a malformed aux blob fails the whole install); it now
+also increments the same counter. Semantic apply errors on well-formed
+records (e.g. `WRONGTYPE`, "entity not found") keep the existing
+warn-and-continue posture — that is data-level divergence from a command
+that legitimately executed differently, not stream corruption.
+
+- New `INFO replication` field: `replication_poison_records_total`.
+- `src/replication/apply.rs`: `ApplyOutcome` enum, `poison()` helper,
+  `apply_graph`/`apply_mq`/`apply_ws_create`/`apply_ws_drop`/
+  `apply_temporal_invalidate` now return `bool` (poisoned vs. applied)
+  instead of logging-and-swallowing.
+- `src/replication/replica.rs`: both tokio and monoio stream-apply loops
+  match on `ApplyOutcome` and drop the connection on `Poisoned`, same as the
+  existing `NoShardSlice` / `DrainResult::fatal` paths.
+
 ### Changed — CI pipeline optimization (round 1)
 
 - CodeQL no longer runs on every PR (main-push + weekly schedule only) — it
