@@ -602,9 +602,12 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     write_rdb(databases, &mut buf);
 
-    let tmp_path = path.with_extension("rdb.tmp");
-    std::fs::write(&tmp_path, &buf).context("Failed to write temporary Redis RDB file")?;
-    std::fs::rename(&tmp_path, path).context("Failed to rename temporary Redis RDB file")?;
+    // Temp + fsync + rename + dir-fsync via the shared K3 primitive (task
+    // #49) -- a bare tmp-write+rename (the prior code) can leave an EMPTY
+    // file at `path` on ext4/xfs if the crash lands between rename and the
+    // parent-directory fsync.
+    crate::persistence::atomic::atomic_write_durable(path, &buf)
+        .context("Failed to atomically write Redis RDB file")?;
 
     Ok(())
 }

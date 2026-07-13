@@ -23,9 +23,8 @@ use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
 
 pub fn save_nodes_conf(state: &ClusterState, dir: &Path) -> std::io::Result<()> {
     let path = dir.join("nodes.conf");
-    let tmp_path = dir.join("nodes.conf.tmp");
 
-    let mut f = std::fs::File::create(&tmp_path)?;
+    let mut buf: Vec<u8> = Vec::new();
 
     for node in state.nodes.values() {
         let flags_str = if node.node_id == state.node_id {
@@ -55,7 +54,7 @@ pub fn save_nodes_conf(state: &ClusterState, dir: &Path) -> std::io::Result<()> 
         let slot_ranges = bitmap_to_ranges_migration(&node.slots);
 
         writeln!(
-            f,
+            buf,
             "{} {}:{}@{} {} {} {} {} {} {} {}",
             node.node_id,
             node.addr.ip(),
@@ -71,13 +70,17 @@ pub fn save_nodes_conf(state: &ClusterState, dir: &Path) -> std::io::Result<()> 
         )?;
     }
     writeln!(
-        f,
+        buf,
         "vars currentEpoch {} lastVoteEpoch {}",
         state.epoch, state.last_vote_epoch
     )?;
 
-    drop(f);
-    std::fs::rename(&tmp_path, &path)?;
+    // Atomic via `atomic_write_durable` (task #49): temp + fsync + rename
+    // + dir-fsync. The prior code wrote+renamed with no fsync at all, so a
+    // kill-9 right after `rename()` returned could still revert
+    // nodes.conf on ext4/xfs -- a corrupted/stale cluster topology file
+    // read back at the next boot.
+    crate::persistence::atomic::atomic_write_durable(&path, &buf)?;
     Ok(())
 }
 
@@ -270,6 +273,24 @@ mod tests {
         assert!(loaded.owns_slot(0));
         assert!(loaded.owns_slot(100));
         assert!(!loaded.owns_slot(50));
+    }
+
+    /// Task #49: `save_nodes_conf` must go through `atomic_write_durable`,
+    /// not a hand-rolled `File::create(tmp)` + `rename`. Regression pin: no
+    /// leftover `nodes.conf.tmp` after a successful save.
+    #[test]
+    fn test_save_nodes_conf_leaves_no_leftover_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let my_id = "c".repeat(40);
+        let state = ClusterState::new(my_id, test_addr(6379));
+
+        save_nodes_conf(&state, tmp.path()).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("nodes.conf")]);
     }
 
     /// handle_get_keys_in_slot returns matching keys only.

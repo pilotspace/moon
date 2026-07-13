@@ -569,20 +569,23 @@ pub fn read_overflow_chain(file_data: &[u8], start_page_idx: usize) -> Option<Ve
 
 /// Write a KvLeaf page followed by overflow pages to a `.mpf` DataFile.
 ///
-/// The file is fsynced after writing.
+/// Atomic via `atomic_write_durable` (task #49): temp + fsync + rename +
+/// dir-fsync. The prior code opened `path` directly with `File::create`
+/// and wrote in place -- no temp file, no rename, so a kill-9 mid-write
+/// (or a concurrent reader) could observe a torn `.mpf` at the final path
+/// even though the trailing `sync_all()` made whatever bytes landed
+/// durable.
 pub fn write_datafile_mixed(
     path: &Path,
     leaf: &KvLeafPage,
     overflow: &[KvOverflowPage],
 ) -> io::Result<()> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&leaf.data)?;
+    let mut buf = Vec::with_capacity(PAGE_4K * (1 + overflow.len()));
+    buf.extend_from_slice(&leaf.data);
     for page in overflow {
-        file.write_all(&page.data)?;
+        buf.extend_from_slice(&page.data);
     }
-    file.sync_all()?;
+    crate::persistence::atomic::atomic_write_durable(path, &buf)?;
     Ok(())
 }
 
@@ -590,15 +593,16 @@ pub fn write_datafile_mixed(
 
 /// Write a sequence of KvLeaf pages to a `.mpf` DataFile.
 ///
-/// Each page is written as a raw 4KB block. The file is fsynced after writing.
+/// Each page is written as a raw 4KB block. Atomic via
+/// `atomic_write_durable` (task #49): temp + fsync + rename + dir-fsync.
+/// See `write_datafile_mixed` for why the prior direct-`File::create`
+/// write was a gap.
 pub fn write_datafile(path: &Path, pages: &[&KvLeafPage]) -> io::Result<()> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(path)?;
+    let mut buf = Vec::with_capacity(PAGE_4K * pages.len());
     for page in pages {
-        file.write_all(&page.data)?;
+        buf.extend_from_slice(&page.data);
     }
-    file.sync_all()?;
+    crate::persistence::atomic::atomic_write_durable(path, &buf)?;
     Ok(())
 }
 
@@ -850,6 +854,42 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Task #49: `write_datafile` / `write_datafile_mixed` must go through
+    /// `atomic_write_durable` instead of a bare `File::create` write
+    /// directly to the final path. Regression pin: no leftover hidden
+    /// temp file after a successful write.
+    #[test]
+    fn test_write_datafile_leaves_no_leftover_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heap-000001.mpf");
+
+        let mut p1 = KvLeafPage::new(0, 1);
+        p1.insert(b"k1", b"v1", ValueType::String, 0, None).unwrap();
+        p1.finalize();
+        write_datafile(&path, &[&p1]).expect("write should succeed");
+
+        let mixed_path = dir.path().join("heap-000002.mpf");
+        let mut overflow_leaf = KvLeafPage::new(2, 1);
+        overflow_leaf
+            .insert(b"k3", b"v3", ValueType::String, 0, None)
+            .unwrap();
+        overflow_leaf.finalize();
+        write_datafile_mixed(&mixed_path, &overflow_leaf, &[]).expect("write should succeed");
+
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("heap-000001.mpf"),
+                std::ffi::OsString::from("heap-000002.mpf"),
+            ]
+        );
     }
 
     #[test]

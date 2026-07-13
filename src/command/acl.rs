@@ -286,18 +286,17 @@ pub fn handle_acl(
                     let Ok(table) = acl_table.read() else {
                         return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
                     };
-                    // Blocking save -- acceptable for admin command
-                    let content: String = table
-                        .list_users()
-                        .iter()
-                        .map(|u| crate::acl::io::user_to_acl_line(u) + "\n")
-                        .collect();
+                    // Blocking save -- acceptable for admin command.
+                    // Routed through `acl::io::acl_save`, which is now
+                    // atomic via `atomic_write_durable` (task #49): temp +
+                    // fsync + rename + dir-fsync. The prior inline code
+                    // here did a bare tmp-write + rename with NO fsync at
+                    // all -- ACL SAVE was the one durable-state site in
+                    // this codebase with zero crash protection.
+                    let result = crate::acl::io::acl_save(&path, &table);
                     drop(table);
-                    let tmp = format!("{}.tmp", path);
-                    match std::fs::write(&tmp, content.as_bytes())
-                        .and_then(|_| std::fs::rename(&tmp, &path))
-                    {
-                        Ok(_) => Frame::SimpleString(Bytes::from_static(b"OK")),
+                    match result {
+                        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
                         Err(e) => Frame::Error(Bytes::from(format!("ERR ACL save failed: {}", e))),
                     }
                 }

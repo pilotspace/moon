@@ -72,16 +72,25 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
     Some(user)
 }
 
-/// Save all users to an ACL file (atomic tmp+rename).
+/// Save all users to an ACL file.
+///
+/// Atomic via `atomic_write_durable` (task #49, kernel M4 prep): temp
+/// file, fsync, rename, parent-dir fsync, so a kill-9 mid-save can never
+/// leave a torn or (post-rename, pre-dir-fsync) reverted ACL file. The
+/// prior code did a bare tmp-write + rename with no fsync at all -- on
+/// ext4/xfs a crash right after `rename()` returns can still lose the
+/// directory-entry update, silently reverting `path` to its old contents
+/// (or nothing at all, on first save).
 pub fn acl_save(path: &str, table: &AclTable) -> std::io::Result<()> {
-    let tmp_path = format!("{}.tmp", path);
     let mut content = String::new();
     for user in table.list_users() {
         content.push_str(&user_to_acl_line(user));
         content.push('\n');
     }
-    std::fs::write(&tmp_path, content.as_bytes())?;
-    std::fs::rename(&tmp_path, path)?;
+    crate::persistence::atomic::atomic_write_durable(
+        std::path::Path::new(path),
+        content.as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -225,5 +234,29 @@ mod tests {
         let default_loaded = loaded.get_user("default").unwrap();
         assert!(default_loaded.enabled);
         assert!(default_loaded.nopass);
+    }
+
+    /// Task #49: `acl_save` must go through `atomic_write_durable`, not a
+    /// bare tmp-write+rename. Regression pin: no leftover `.tmp` file and
+    /// the directory holds exactly the final `.acl` file after a
+    /// successful save -- what a hand-rolled `format!("{}.tmp", path)`
+    /// helper (the pre-fix code) would also achieve on the happy path, but
+    /// silently skip the fsync/dir-fsync durability steps.
+    #[test]
+    fn test_acl_save_leaves_no_leftover_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.acl");
+        let path_str = path.to_str().unwrap();
+
+        let mut table = AclTable::new();
+        table.set_user("default".to_string(), AclUser::new_default_nopass());
+
+        acl_save(path_str, &table).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("test.acl")]);
     }
 }
