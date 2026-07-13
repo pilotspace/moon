@@ -47,6 +47,14 @@ fn cross_plane_prod_s1_graph_isolated() {
     scenarios::graph_isolated(&Config::PROD_S1);
 }
 
+/// Kernel M4, task #50: term-dict + FST sidecar durability -- default-GREEN
+/// tripwire, see `scenarios::text_fts_sidecar_isolated`'s doc comment.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s1_text_fts_sidecar_isolated() {
+    scenarios::text_fts_sidecar_isolated(&Config::PROD_S1);
+}
+
 #[test]
 #[ignore]
 fn cross_plane_prod_s1_vector_isolated() {
@@ -138,6 +146,14 @@ fn cross_plane_prod_s4_graph_isolated() {
 #[ignore]
 fn cross_plane_prod_s4_vector_isolated() {
     scenarios::vector_isolated(&Config::PROD_S4);
+}
+
+/// Kernel M4, task #50 -- shards=4 leg (multi-shard: verifies the sidecar
+/// is keyed/loaded per-shard, not once globally).
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn cross_plane_prod_s4_text_fts_sidecar_isolated() {
+    scenarios::text_fts_sidecar_isolated(&Config::PROD_S4);
 }
 
 #[test]

@@ -79,6 +79,39 @@ that issued the write, existed.
 - CI builds/tests run with `debug = 0` (no debuginfo) via
   `CARGO_PROFILE_*_DEBUG` env — smaller artifacts (faster cache
   save/restore) and faster linking; local builds unaffected.
+### Fixed — FTS term-dict + FST sidecar durability, ends restart-rescan-only recovery (kernel M4, task #50)
+
+The full-text-search inverted index was the last plane not kill-9-lossless:
+every restart rebuilt every text index by rescanning the keyspace and
+reassigning term ids by `DashTable` hash-iteration first-encounter order —
+not reproducible across restarts, which is why the pre-existing `.fst`
+sidecar write path had its load path (`load_fst_sidecars`) deliberately left
+uncalled in production (wiring it once corrupted FUZZY/PREFIX results: the
+sidecar's baked-in term ids silently collided with a freshly-rescanned
+dictionary's differently-assigned ids).
+
+Fixed by persisting the term dictionary itself alongside the FST, in one
+atomic sidecar (`{shard_dir}/{index}.tfst`, magic `TFS2`, version-stamped,
+`atomic_write_durable`): per TEXT field, `next_id`, `fst_high_water_mark`,
+every `(term, id)` pair, and the optional FST bytes. `TermDictionary::from_pairs`
+reconstructs a dictionary whose ids are taken verbatim from the sidecar
+(never reassigned) and whose `next_id` continues the persisted high-water
+mark. Wired into shard boot (`src/shard/event_loop.rs`) so
+`TextStore::load_term_fst_sidecars` runs AFTER text index schemas are
+restored but BEFORE the keyspace auto-reindex rescan — seeding the term
+dicts first makes the rescan's `get_or_insert` calls resolve known terms to
+their persisted ids and assign fresh, non-colliding ids only to genuinely
+new terms, which is what makes loading the FST alongside it safe (FST ids
+and live dict ids are the same id-space by construction). Fails closed per
+index on any missing/truncated/corrupt/version-mismatched/field-count-
+mismatched sidecar — falls back to today's full rescan, never partially
+applies a sidecar. `FT.COMPACT` now calls the combined saver
+(`save_term_fst_sidecar_for_index`) instead of the old FST-only one. New
+`FT.INFO` counters `sidecar_recovered_indexes` / `text_indexes_total`
+(additive across shards) surface fast-boot coverage. New default-GREEN
+crash-matrix cells `cross_plane_prod_{s1,s4}_text_fts_sidecar_isolated`
+verify a FUZZY query survives kill-9 identically to a from-scratch rebuild.
+New fuzz target `term_fst_sidecar` covers the sidecar decoder.
 ### Security — clear dependency vulnerability backlog (task #51)
 
 `sdk/python` (uv.lock, 36 open Dependabot alerts incl. 1 CRITICAL) and
