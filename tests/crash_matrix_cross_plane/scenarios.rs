@@ -336,11 +336,16 @@ pub fn text_fts_sidecar_isolated(cfg: &Config) {
         return;
     }
 
-    // Pre-compact corpus: every doc contains a term stemming to "machin",
-    // FUZZY-reachable via edit-distance-1 probe "machn".
+    // Pre-compact corpus: every doc contains "machine", which stems to
+    // "machin" -- FUZZY-reachable via edit-distance-1 probe "machn". (Note:
+    // "machinery" stems to a DIFFERENT token ("machineri") that is NOT
+    // within edit-distance-1 of "machn" -- an earlier draft of this fixture
+    // used "deep learning machinery" and got a false-negative FUZZY miss
+    // that looked like a sidecar-recovery bug but was actually a test-data
+    // bug in the fixture, not the product.)
     let pre_compact: Vec<(String, &str)> = vec![
         (text_key(tag, 0), "machine vision system"),
-        (text_key(tag, 1), "deep learning machinery"),
+        (text_key(tag, 1), "deep learning machine"),
         (text_key(tag, 2), "machine learning pipeline"),
     ];
     for (key, body) in &pre_compact {
