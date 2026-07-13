@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — CI pipeline optimization (round 1)
+
+- CodeQL no longer runs on every PR (main-push + weekly schedule only) — it
+  was a full instrumented 20-40 min build and the slowest job on every PR,
+  while serving as audit tooling rather than a per-PR review gate.
+- `Swatinem/rust-cache` `shared-key`s no longer embed the `Cargo.lock` hash:
+  the action already invalidates changed dependencies via its own
+  lockfile-aware restore, and hashing the lock into the key cold-started
+  every job's cache on each dependency bump.
+- CI builds/tests run with `debug = 0` (no debuginfo) via
+  `CARGO_PROFILE_*_DEBUG` env — smaller artifacts (faster cache
+  save/restore) and faster linking; local builds unaffected.
+
 ### Fixed — cross-shard MULTI/EXEC graph-leg misrouting (kernel M3 stage 3 / task #52, review round 3, P1)
 
 CodeRabbit finding on PR #300: `analyze_txn_locality` (the pre-EXEC classifier

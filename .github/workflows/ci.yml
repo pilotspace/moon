@@ -16,6 +16,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   MOON_NO_URING: "1"
+  # 2026-07-13 CI optimization: no debuginfo in CI builds/tests — halves
+  # artifact size (faster rust-cache save/restore) and speeds linking.
+  # Backtraces in CI keep function names via symbol table; local builds
+  # are unaffected.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
   # ── Fast gate: no compilation needed (~10s) ─────────────────────────
@@ -69,7 +76,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Cache key covers all 3 feature combos so incremental builds hit.
-          shared-key: check-${{ hashFiles('Cargo.lock') }}
+          # No Cargo.lock hash in the key (2026-07-13): rust-cache already
+          # invalidates changed deps via its internal lockfile-aware restore;
+          # hashing the lock into the key cold-started every job on each
+          # dependency bump.
+          shared-key: check
 
       # Clippy (3 feature configurations — shares compilation between runs)
       - name: Clippy (default)
@@ -99,7 +110,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-${{ hashFiles('Cargo.lock') }}
+          shared-key: macos
       - name: Clippy (default monoio)
         run: cargo clippy -- -D warnings
       - name: Clippy (tokio)
@@ -134,7 +145,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows-${{ hashFiles('Cargo.lock') }}
+          shared-key: windows
       # NASM is required by aws-lc-sys (TLS) on Windows.
       # SHA-pinned to v1.5.2 (72793074) for supply-chain safety;
       # choco fallback fires only if the action itself fails.
@@ -180,7 +191,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: console-${{ hashFiles('Cargo.lock') }}
+          shared-key: console
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -205,7 +216,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: msrv-${{ hashFiles('Cargo.lock') }}
+          shared-key: msrv
       - run: cargo build --no-default-features --features runtime-tokio
 
   # ── Memory steady-state gate (~4 min) ──────────────────────────────
@@ -221,7 +232,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: memory-gate-${{ hashFiles('Cargo.lock') }}
+          shared-key: memory-gate
       - name: Install redis tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools jq
       - name: Build moon
