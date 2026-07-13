@@ -612,38 +612,42 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
             );
         })
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_POP) {
-        decode_mq_pop(payload).map(|(db_index, key, last_delivered, claimed, dlq)| {
-            let claimed: Vec<(StreamId, u64)> = claimed
-                .into_iter()
-                .map(|(ms, seq, dc)| (StreamId { ms, seq }, dc))
-                .collect();
-            let dlq: Vec<(StreamId, StreamId)> = dlq
-                .into_iter()
-                .map(|(src_ms, src_seq, dlq_ms, dlq_seq)| {
-                    (
-                        StreamId {
-                            ms: src_ms,
-                            seq: src_seq,
-                        },
-                        StreamId {
-                            ms: dlq_ms,
-                            seq: dlq_seq,
-                        },
-                    )
-                })
-                .collect();
-            apply_mq_pop(
-                s,
-                clamp_mq_db(db_count, db_index),
-                &key,
-                StreamId {
-                    ms: last_delivered.0,
-                    seq: last_delivered.1,
-                },
-                claimed,
-                dlq,
-            );
-        })
+        decode_mq_pop(payload).map(
+            |(db_index, key, last_delivered, claimed, dlq, delivery_time_ms, seen_time_ms)| {
+                let claimed: Vec<(StreamId, u64)> = claimed
+                    .into_iter()
+                    .map(|(ms, seq, dc)| (StreamId { ms, seq }, dc))
+                    .collect();
+                let dlq: Vec<(StreamId, StreamId)> = dlq
+                    .into_iter()
+                    .map(|(src_ms, src_seq, dlq_ms, dlq_seq)| {
+                        (
+                            StreamId {
+                                ms: src_ms,
+                                seq: src_seq,
+                            },
+                            StreamId {
+                                ms: dlq_ms,
+                                seq: dlq_seq,
+                            },
+                        )
+                    })
+                    .collect();
+                apply_mq_pop(
+                    s,
+                    clamp_mq_db(db_count, db_index),
+                    &key,
+                    StreamId {
+                        ms: last_delivered.0,
+                        seq: last_delivered.1,
+                    },
+                    claimed,
+                    dlq,
+                    delivery_time_ms,
+                    seen_time_ms,
+                );
+            },
+        )
     } else if cmd.eq_ignore_ascii_case(MQ_REPL_ACK) {
         decode_mq_ack(payload).map(|(db_index, key, ms, seq)| {
             apply_mq_ack(

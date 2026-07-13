@@ -487,3 +487,90 @@ fn mq_effect_records_survive_kill9() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// task #47: MqPop WAL v2 carries the ORIGINAL PEL delivery_time/seen_time,
+// so a kill-9 restart reports REAL XPENDING idle metadata instead of
+// resetting the PEL entry's clock (pre-task-#47: apply_mq_pop hardcoded
+// `delivery_time: 0` / `seen_time: 0`, which — since XPENDING computes
+// `idle = now - delivery_time` — reported "idle since the Unix epoch"
+// instead of "idle since it was actually claimed").
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn xpending_idle_metadata_survives_kill9() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let extra: &[&str] = &["--appendonly", "yes", "--disk-free-min-pct", "0"];
+
+    // How long the claimed message sits pending BEFORE the kill -- this is
+    // the real idle time a correct restart must approximately reproduce.
+    // Generous enough to dwarf process-restart + WAL-flush jitter.
+    let pre_kill_idle_floor_ms: i64 = 1200;
+
+    {
+        let (child, port) = spawn_moon(dir.path(), 1, extra);
+        let _guard = ServerGuard(child);
+        drop(wait_ready(port));
+
+        let mut c = Conn::open(port);
+        assert_eq!(
+            c.cmd_s(&["MQ", "CREATE", "idleq", "MAXDELIVERY", "0"]),
+            Resp::Simple("OK".into())
+        );
+        c.cmd_s(&["MQ", "PUSH", "idleq", "f", "v"]);
+        // Claim it -- this is the delivery_time/seen_time that must survive.
+        let popped = c.cmd_s(&["MQ", "POP", "idleq", "COUNT", "1"]);
+        assert_eq!(as_array(&popped).len(), 1, "must claim exactly 1 message");
+
+        // Let real wall-clock idle time accumulate BEFORE the kill, then let
+        // the 1ms WAL flush tick drain the MqPop effect record.
+        std::thread::sleep(Duration::from_millis(pre_kill_idle_floor_ms as u64));
+        std::thread::sleep(Duration::from_millis(500));
+        // _guard dropped here -> SIGKILL
+    }
+
+    {
+        let (child2, port2) = spawn_moon(dir.path(), 1, extra);
+        let _guard2 = ServerGuard(child2);
+        drop(wait_ready(port2));
+
+        let mut c = Conn::open(port2);
+
+        // Extended form: XPENDING key group - + count -> per-entry
+        // [id, consumer, idle_ms, delivery_count].
+        let pending = c.cmd_s(&["XPENDING", "idleq", "__mq_consumers", "-", "+", "10"]);
+        let entries = as_array(&pending);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the one claimed message must still be pending"
+        );
+        let entry_fields = as_array(&entries[0]);
+        let idle_ms = as_int(&entry_fields[2]);
+        let delivery_count = as_int(&entry_fields[3]);
+
+        assert_eq!(delivery_count, 1, "delivery_count must survive verbatim");
+
+        // RED (pre-task-#47): delivery_time was hardcoded to 0 on replay,
+        // so `idle = now - 0` reports a HUGE idle time (milliseconds since
+        // the Unix epoch, i.e. tens of trillions of ms) -- not zero, and
+        // not close to `pre_kill_idle_floor_ms` either. GREEN: idle_ms must
+        // be in the same order of magnitude as the real elapsed wall time
+        // (>= the floor established before the kill, and bounded well below
+        // an epoch-relative reading).
+        assert!(
+            idle_ms >= pre_kill_idle_floor_ms,
+            "RED: idle_ms ({idle_ms}) must be >= the real pre-kill idle floor \
+             ({pre_kill_idle_floor_ms}ms) -- a lost delivery_time would show \
+             an idle time close to 0 (reset-to-now) or astronomically large \
+             (reset-to-0/epoch), never a plausible elapsed duration"
+        );
+        assert!(
+            idle_ms < 60_000,
+            "RED: idle_ms ({idle_ms}) must be a plausible small elapsed \
+             duration, not an epoch-relative reading (delivery_time reset to \
+             0 would make `now - 0` on the order of 10^12 ms)"
+        );
+    }
+}

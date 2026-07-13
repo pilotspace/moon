@@ -223,30 +223,50 @@ pub type ClaimedEntry = (u64, u64, u64);
 /// One DLQ routing decision: (source_ms, source_seq, dlq_ms, dlq_seq).
 pub type DlqRouting = (u64, u64, u64, u64);
 
+/// `MqPop` diverges from the shared `MQ_WAL_VERSION` scheme: it carries its
+/// OWN version byte because task #47 needed to add fields to this one
+/// record kind without bumping every other MQ record's format in lockstep.
+/// v1 is the pre-task-#47 layout (no PEL timing metadata); v2 (current)
+/// adds `delivery_time_ms`/`seen_time_ms` so a promoted replica or a
+/// kill-9 restart can reconstruct real `XPENDING` idle times instead of
+/// resetting the PEL entry's clock to 0 (which reported "maximally idle"
+/// until the entry was next touched).
+pub const MQ_POP_WAL_V1: u8 = 1;
+/// Current `MqPop` payload version. See [`MQ_POP_WAL_V1`].
+pub const MQ_POP_WAL_V2: u8 = 2;
+
 /// Encode an MqPop WAL payload. Captures the full outcome of a POP: which
 /// ids were claimed (and at what delivery_count), the consumer group's
-/// resulting `last_delivered_id`, and which claimed ids were immediately
-/// routed to the DLQ (source id -> assigned DLQ-stream id). The fixed
-/// group/consumer names (`__mq_consumers` / `__mq_default`) used by every
-/// MQ.POP are NOT carried -- baked in at replay, matching the single-group-
-/// per-queue design `src/shard/mq_exec.rs` implements today.
+/// resulting `last_delivered_id`, which claimed ids were immediately
+/// routed to the DLQ (source id -> assigned DLQ-stream id), and (v2+) the
+/// PEL timing metadata (`delivery_time_ms`, `seen_time_ms`) captured at
+/// claim time. The fixed group/consumer names (`__mq_consumers` /
+/// `__mq_default`) used by every MQ.POP are NOT carried -- baked in at
+/// replay, matching the single-group-per-queue design
+/// `src/shard/mq_exec.rs` implements today. Every entry claimed by one
+/// MQ.POP shares a single `delivery_time_ms`/`seen_time_ms` (the call's
+/// `now`, per `Stream::read_group_new`), so one pair of `u64`s covers the
+/// whole batch losslessly -- no need for a per-entry timestamp.
 ///
-/// Layout:
-/// `[version:u8=1][db_index:u32][key_len:u32][key:N]`
+/// Layout (v2):
+/// `[version:u8=2][db_index:u32][key_len:u32][key:N]`
 /// `[last_delivered_ms:u64][last_delivered_seq:u64]`
 /// `[claimed_count:u32]` then per entry `[ms:u64][seq:u64][delivery_count:u64]`
 /// `[dlq_count:u32]` then per entry `[src_ms:u64][src_seq:u64][dlq_ms:u64][dlq_seq:u64]`
+/// `[delivery_time_ms:u64][seen_time_ms:u64]`
 pub fn encode_mq_pop(
     db_index: u32,
     queue_key: &[u8],
     last_delivered: (u64, u64),
     claimed: &[ClaimedEntry],
     dlq: &[DlqRouting],
+    delivery_time_ms: u64,
+    seen_time_ms: u64,
 ) -> Vec<u8> {
     let mut payload = Vec::with_capacity(
-        1 + 4 + 4 + queue_key.len() + 16 + 4 + claimed.len() * 24 + 4 + dlq.len() * 32,
+        1 + 4 + 4 + queue_key.len() + 16 + 4 + claimed.len() * 24 + 4 + dlq.len() * 32 + 16,
     );
-    payload.push(MQ_WAL_VERSION);
+    payload.push(MQ_POP_WAL_V2);
     payload.extend_from_slice(&db_index.to_le_bytes());
     payload.extend_from_slice(&(queue_key.len() as u32).to_le_bytes());
     payload.extend_from_slice(queue_key);
@@ -265,18 +285,42 @@ pub fn encode_mq_pop(
         payload.extend_from_slice(&dlq_ms.to_le_bytes());
         payload.extend_from_slice(&dlq_seq.to_le_bytes());
     }
+    payload.extend_from_slice(&delivery_time_ms.to_le_bytes());
+    payload.extend_from_slice(&seen_time_ms.to_le_bytes());
     payload
 }
 
 /// Decode an MqPop WAL payload.
 ///
-/// Returns `(db_index, queue_key, last_delivered, claimed, dlq)` or `None`
-/// if malformed or an unsupported version.
+/// Returns `(db_index, queue_key, last_delivered, claimed, dlq,
+/// delivery_time_ms, seen_time_ms)` or `None` if malformed or an
+/// unsupported version.
+///
+/// Version handling (own scheme, see [`MQ_POP_WAL_V2`]):
+/// - v1: legacy layout with no trailing timing fields. Decodes fine;
+///   `delivery_time_ms`/`seen_time_ms` are returned as sentinel `0`,
+///   EXPLICITLY meaning "not recorded -- the apply-time caller must
+///   substitute its own current-time reading" (this is a STRICT
+///   IMPROVEMENT over the pre-task-#47 apply behavior, which hardcoded the
+///   PEL entry's clock to 0 forever; callers now resolve the sentinel to
+///   "now" instead).
+/// - v2: full layout: real captured timestamps round-trip exactly.
+/// - anything else: rejected (`None`), same fail-closed posture as every
+///   other MQ WAL decoder in this module.
 #[allow(clippy::type_complexity)]
 pub fn decode_mq_pop(
     payload: &[u8],
-) -> Option<(u32, Vec<u8>, (u64, u64), Vec<ClaimedEntry>, Vec<DlqRouting>)> {
-    if payload.is_empty() || payload[0] != MQ_WAL_VERSION {
+) -> Option<(
+    u32,
+    Vec<u8>,
+    (u64, u64),
+    Vec<ClaimedEntry>,
+    Vec<DlqRouting>,
+    u64,
+    u64,
+)> {
+    let version = *payload.first()?;
+    if version != MQ_POP_WAL_V1 && version != MQ_POP_WAL_V2 {
         return None;
     }
     let p = &payload[1..];
@@ -331,7 +375,27 @@ pub fn decode_mq_pop(
         dlq.push((src_ms, src_seq, dlq_ms, dlq_seq));
     }
 
-    Some((db_index, key, (last_ms, last_seq), claimed, dlq))
+    let (delivery_time_ms, seen_time_ms) = if version >= MQ_POP_WAL_V2 {
+        if p.len() < off + 16 {
+            return None;
+        }
+        let delivery_time_ms = u64::from_le_bytes(p[off..off + 8].try_into().ok()?);
+        off += 8;
+        let seen_time_ms = u64::from_le_bytes(p[off..off + 8].try_into().ok()?);
+        (delivery_time_ms, seen_time_ms)
+    } else {
+        (0u64, 0u64)
+    };
+
+    Some((
+        db_index,
+        key,
+        (last_ms, last_seq),
+        claimed,
+        dlq,
+        delivery_time_ms,
+        seen_time_ms,
+    ))
 }
 
 // ── MqTrigger (0x74) ──────────────────────────────────────────────────────
@@ -703,27 +767,33 @@ mod tests {
     fn test_mq_pop_roundtrip() {
         let claimed: Vec<ClaimedEntry> = vec![(1, 0, 1), (1, 1, 1), (1, 2, 2)];
         let dlq: Vec<DlqRouting> = vec![(1, 2, 2, 0)];
-        let payload = encode_mq_pop(1, b"orders", (1, 2), &claimed, &dlq);
-        let (db, key, last, decoded_claimed, decoded_dlq) = decode_mq_pop(&payload).unwrap();
+        let payload = encode_mq_pop(1, b"orders", (1, 2), &claimed, &dlq, 12345, 12300);
+        let (db, key, last, decoded_claimed, decoded_dlq, delivery_time_ms, seen_time_ms) =
+            decode_mq_pop(&payload).unwrap();
         assert_eq!(db, 1);
         assert_eq!(key, b"orders");
         assert_eq!(last, (1, 2));
         assert_eq!(decoded_claimed, claimed);
         assert_eq!(decoded_dlq, dlq);
+        assert_eq!(delivery_time_ms, 12345);
+        assert_eq!(seen_time_ms, 12300);
     }
 
     #[test]
     fn test_mq_pop_roundtrip_empty() {
-        let payload = encode_mq_pop(0, b"q", (0, 0), &[], &[]);
-        let (_, _, last, claimed, dlq) = decode_mq_pop(&payload).unwrap();
+        let payload = encode_mq_pop(0, b"q", (0, 0), &[], &[], 0, 0);
+        let (_, _, last, claimed, dlq, delivery_time_ms, seen_time_ms) =
+            decode_mq_pop(&payload).unwrap();
         assert_eq!(last, (0, 0));
         assert!(claimed.is_empty());
         assert!(dlq.is_empty());
+        assert_eq!(delivery_time_ms, 0);
+        assert_eq!(seen_time_ms, 0);
     }
 
     #[test]
     fn test_mq_pop_malformed_truncated_claimed() {
-        let mut bad = vec![MQ_WAL_VERSION];
+        let mut bad = vec![MQ_POP_WAL_V2];
         bad.extend_from_slice(&0u32.to_le_bytes());
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.push(b'q');
@@ -735,9 +805,54 @@ mod tests {
 
     #[test]
     fn test_mq_pop_unknown_version_rejected() {
-        let mut payload = encode_mq_pop(0, b"q", (0, 0), &[], &[]);
+        let mut payload = encode_mq_pop(0, b"q", (0, 0), &[], &[], 0, 0);
         payload[0] = 42;
         assert!(decode_mq_pop(&payload).is_none());
+    }
+
+    /// v1 payloads (pre-task-#47, no trailing timing fields) must still
+    /// decode -- and must fill the sentinel `0` for both new fields,
+    /// documented in `decode_mq_pop` as "not recorded; apply-time caller
+    /// substitutes current time" rather than silently misreporting a real
+    /// timestamp.
+    #[test]
+    fn test_mq_pop_v1_decodes_with_sentinel_timing() {
+        let claimed: Vec<ClaimedEntry> = vec![(1, 0, 1)];
+        let dlq: Vec<DlqRouting> = vec![];
+        let mut v1 = vec![MQ_POP_WAL_V1];
+        v1.extend_from_slice(&0u32.to_le_bytes()); // db_index
+        v1.extend_from_slice(&(b"q".len() as u32).to_le_bytes());
+        v1.extend_from_slice(b"q");
+        v1.extend_from_slice(&1u64.to_le_bytes()); // last_delivered ms
+        v1.extend_from_slice(&0u64.to_le_bytes()); // last_delivered seq
+        v1.extend_from_slice(&(claimed.len() as u32).to_le_bytes());
+        for (ms, seq, dc) in &claimed {
+            v1.extend_from_slice(&ms.to_le_bytes());
+            v1.extend_from_slice(&seq.to_le_bytes());
+            v1.extend_from_slice(&dc.to_le_bytes());
+        }
+        v1.extend_from_slice(&(dlq.len() as u32).to_le_bytes());
+        // NOTE: no trailing delivery_time_ms/seen_time_ms -- that's the v1/v2 delta.
+
+        let (db, key, last, decoded_claimed, decoded_dlq, delivery_time_ms, seen_time_ms) =
+            decode_mq_pop(&v1).unwrap();
+        assert_eq!(db, 0);
+        assert_eq!(key, b"q");
+        assert_eq!(last, (1, 0));
+        assert_eq!(decoded_claimed, claimed);
+        assert!(decoded_dlq.is_empty());
+        assert_eq!(delivery_time_ms, 0);
+        assert_eq!(seen_time_ms, 0);
+    }
+
+    #[test]
+    fn test_mq_pop_v2_truncated_timing_rejected() {
+        // A v2-tagged payload that's missing the trailing 16 timing bytes
+        // must fail closed, not silently degrade to sentinel-0 (that would
+        // hide real truncation/corruption behind the v1 fallback path).
+        let payload = encode_mq_pop(0, b"q", (0, 0), &[], &[], 999, 888);
+        let truncated = &payload[..payload.len() - 16];
+        assert!(decode_mq_pop(truncated).is_none());
     }
 
     // --- MqDrop roundtrip ---

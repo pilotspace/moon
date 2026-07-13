@@ -610,14 +610,22 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             // read_group_new just inserted into the PEL).
             let mut claimed_for_wal: Vec<crate::mq::wal::ClaimedEntry> =
                 Vec::with_capacity(claimed.len());
+            // task #47: every entry `read_group_new` just claimed shares one
+            // `delivery_time` (the call's single `now`) — capture it once
+            // from the first claimed PEL entry so a promoted replica / a
+            // kill-9 replay reports the SAME idle time XPENDING would have
+            // reported on the original node, instead of resetting to 0.
+            let mut delivery_time_for_wal: u64 = 0;
 
             for (id, fields) in &claimed {
-                let delivery_count = stream
+                let pe = stream
                     .groups
                     .get(group_name.as_ref())
-                    .and_then(|g| g.pel.get(id))
-                    .map(|pe| pe.delivery_count)
-                    .unwrap_or(1);
+                    .and_then(|g| g.pel.get(id));
+                let delivery_count = pe.map(|pe| pe.delivery_count).unwrap_or(1);
+                if delivery_time_for_wal == 0 {
+                    delivery_time_for_wal = pe.map(|pe| pe.delivery_time).unwrap_or(0);
+                }
                 claimed_for_wal.push((id.ms, id.seq, delivery_count));
                 if mdc > 0 && delivery_count >= mdc as u64 {
                     dlq_entries.push((*id, fields.clone()));
@@ -626,6 +634,16 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                     results.push((*id, fields.clone()));
                 }
             }
+
+            // Consumer-level `seen_time` for the fixed `__mq_default`
+            // consumer this POP claimed under — same "single value for the
+            // whole batch" reasoning as `delivery_time_for_wal` above.
+            let seen_time_for_wal: u64 = stream
+                .groups
+                .get(group_name.as_ref())
+                .and_then(|g| g.consumers.get(consumer_name.as_ref()))
+                .map(|c| c.seen_time)
+                .unwrap_or(0);
 
             // Step 4: ACK DLQ entries from the main stream PEL.
             if !dlq_ack_ids.is_empty() {
@@ -666,6 +684,8 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 (last_delivered_id.ms, last_delivered_id.seq),
                 &claimed_for_wal,
                 &dlq_for_wal,
+                delivery_time_for_wal,
+                seen_time_for_wal,
             );
 
             // Step 6: build response frames.
