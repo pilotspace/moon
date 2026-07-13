@@ -10,7 +10,7 @@ keywords = ["redis", "database", "cache", "server"]
 categories = ["database", "network-programming"]
 
 [dependencies]
-atoi = "2.0"
+atoi = "3.1"
 bumpalo = { version = "3.20", features = ["collections"] }
 bytes = "1.10"
 memchr = "2.8"
