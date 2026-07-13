@@ -43,6 +43,16 @@ pub struct RecoveryResult {
     pub warm_segments: Vec<(u64, std::path::PathBuf)>,
     /// Number of KV entries reloaded from heap DataFiles.
     pub kv_heap_entries_loaded: usize,
+    /// Paths of crash-orphaned `heap-*.mpf`/`.tmp` files classified during
+    /// recovery (task #55) but NOT yet deleted. Classification is cheap
+    /// (metadata-only) and safe to run synchronously here — it observes the
+    /// manifest state recovery just rebuilt, before any command has been
+    /// served on this shard. The actual `remove_file` I/O (the part that
+    /// measured ~40s/shard at ~59K files in production) is deferred to a
+    /// background sweep that starts only after the shard is already serving
+    /// traffic, so restart-to-ready stays seconds-scale regardless of
+    /// cold-plane size. See `storage::tiered::kv_spill::classify_orphan_heap_files`.
+    pub pending_heap_orphans: Vec<std::path::PathBuf>,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -340,17 +350,25 @@ pub fn recover_shard_v3_pitr(
                     }
                 }
             }
-            // Crash-orphan sweep: heap files written but never registered in
-            // the manifest (crash between spill write and manifest commit)
-            // leak disk forever otherwise. Manifest opened OK — safe to sweep.
-            let swept =
-                crate::storage::tiered::kv_spill::sweep_orphan_heap_files(shard_dir, &manifest);
-            if swept > 0 {
+            // Crash-orphan sweep (task #55): heap files written but never
+            // registered in the manifest (crash between spill write and
+            // manifest commit) leak disk forever otherwise. Manifest opened
+            // OK — safe to classify. Only CLASSIFY here (cheap: read_dir +
+            // HashSet membership, no `remove_file` syscalls) so recovery
+            // stays fast at any cold-plane size; the actual deletes are
+            // deferred to a background sweep the caller starts once the
+            // shard is serving traffic (see `Shard::restore_from_persistence`
+            // / `event_loop.rs`'s `pending_heap_orphans` handoff).
+            let pending =
+                crate::storage::tiered::kv_spill::classify_orphan_heap_files(shard_dir, &manifest);
+            if !pending.is_empty() {
                 info!(
-                    "Shard {}: swept {} crash-orphaned heap file(s)",
-                    shard_id, swept
+                    "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
+                    shard_id,
+                    pending.len()
                 );
             }
+            result.pending_heap_orphans = pending;
         }
     }
 

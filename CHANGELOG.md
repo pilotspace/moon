@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — startup blocked ~153s on the crash-orphan heap-file sweep at scale (task #55)
+
+`recover_shard_v3_pitr` called `kv_spill::sweep_orphan_heap_files` synchronously
+— classify AND delete — for every shard on the main thread, before any
+listener/event loop started. At production scale (G2 crash-matrix bench:
+~236K spilled files) this stalled restart-to-first-served-command by ~153s
+(~40s/shard × 4 shards), even though the manifests themselves recovered in
+~4s: the deletion I/O, not the manifest rebuild, was the bottleneck.
+
+Split the sweep into a cheap synchronous classify (`read_dir` + `HashSet`
+membership, no `remove_file` syscalls — safe to run during recovery because
+it observes the exact manifest state recovery just rebuilt, before the shard
+serves a single command) and a deferred delete
+(`kv_spill::remove_orphan_heap_file`) that now runs on a plain `std::thread`
+spawned once the shard's own event loop starts, fully decoupled from the
+accept path. Orphan files are by definition unreferenced by the manifest or
+any in-memory index, so reclaiming them needs no shard-state synchronization,
+and the file-id namespace is monotonic — nothing a shard writes after this
+snapshot can retroactively register one of the already-classified paths, so
+no epoch fence beyond "classify before serving" is required. Restart-to-ready
+is now seconds-scale regardless of cold-plane size, and the orphans are still
+fully reclaimed shortly after. See `src/persistence/recovery.rs`,
+`src/storage/tiered/kv_spill.rs` (`classify_orphan_heap_files` /
+`remove_orphan_heap_file`), `src/shard/mod.rs` (`pending_heap_orphans`
+staging, mirroring the existing `recovered_warm_segments` pattern), and
+`src/shard/event_loop.rs`. New test:
+`tests/crash_recovery_orphan_sweep_readiness.rs`.
+
 ### Fixed — read-only replicas silently executed writing EVAL/EVALSHA (task #38)
 
 A client-issued `EVAL`/`EVALSHA` on a read-only replica ran unconditionally:

@@ -629,6 +629,47 @@ impl super::Shard {
             } else {
                 None
             };
+        // Task #55: background reclaim of crash-orphaned heap files that
+        // recovery only CLASSIFIED (see `Shard::restore_from_persistence` /
+        // `persistence::recovery::recover_shard_v3_pitr`). Classification is
+        // cheap and already ran synchronously before this event loop existed
+        // (metadata-only, observed the exact recovered manifest state); the
+        // slow part — `remove_file` I/O, ~40s/shard at ~59K files in the G2
+        // production bench — runs here, off a plain `std::thread` fully
+        // decoupled from the event loop, so it never delays this shard's
+        // first accepted connection and never contends with the shard's own
+        // spill/cold-index state (crash orphans are by definition NOT
+        // referenced by the manifest or any in-memory index, so deleting
+        // them needs no `with_shard`/manifest-commit synchronization).
+        //
+        // No epoch-fence race is possible here: the file-id namespace is
+        // monotonic and the snapshot of "which on-disk files are orphaned"
+        // was taken before this shard served a single command, so nothing
+        // this shard writes afterward can retroactively register one of
+        // these exact paths — see `classify_orphan_heap_files`'s doc.
+        {
+            let pending_heap_orphans = std::mem::take(&mut self.pending_heap_orphans);
+            if !pending_heap_orphans.is_empty() {
+                let n = pending_heap_orphans.len();
+                info!(
+                    "Shard {}: starting background reclaim of {} crash-orphaned heap file(s)",
+                    shard_id, n
+                );
+                std::thread::Builder::new()
+                    .name(format!("moon-heap-orphan-sweep-{shard_id}"))
+                    .spawn(move || {
+                        for path in &pending_heap_orphans {
+                            crate::storage::tiered::kv_spill::remove_orphan_heap_file(path);
+                        }
+                        info!(
+                            "Shard {}: background reclaim of {} crash-orphaned heap file(s) complete",
+                            shard_id, n
+                        );
+                    })
+                    .ok();
+            }
+        }
+
         // Per-shard background spill thread for async eviction pwrite.
         // When disk-offload is enabled, evicted KV entries are written to disk
         // on a background std::thread instead of blocking the event loop.
