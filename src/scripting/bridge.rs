@@ -92,6 +92,14 @@ struct LuaEvictionInner {
     repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
     #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
     aof_pool: Option<Arc<AofWriterPool>>,
+    /// Task #38: lock-free snapshot of `ReplicationState::is_replica_mirror`,
+    /// cloned out once at ctx-construction time — same pattern as
+    /// `ConnectionContext::is_replica_mirror` (`server/conn/core.rs`), so a
+    /// tight `redis.call('SET', ...)` loop from Lua checks a single
+    /// `Acquire` load instead of taking `repl_state`'s `RwLock` per write.
+    /// `ReplicationState::set_role()` is the single owner of the mirror
+    /// invariant and updates the same `AtomicBool` thereafter.
+    is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LuaEvictionCtx {
@@ -123,6 +131,13 @@ impl LuaEvictionCtx {
         repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
         aof_pool: Option<Arc<AofWriterPool>>,
     ) -> Self {
+        // Task #38: snapshot the lock-free mirror the same way
+        // `ConnectionContext::new` does (`server/conn/core.rs`) — cloned out
+        // under the read-lock once here, kept in sync thereafter by
+        // `ReplicationState::set_role()` writing the same `AtomicBool`.
+        let is_replica_mirror = repl_state
+            .as_ref()
+            .and_then(|rs| rs.read().ok().map(|guard| guard.is_replica_mirror.clone()));
         LuaEvictionCtx(Some(LuaEvictionInner {
             shard_databases,
             runtime_config,
@@ -133,7 +148,23 @@ impl LuaEvictionCtx {
             num_shards,
             repl_state,
             aof_pool,
+            is_replica_mirror,
         }))
+    }
+
+    /// Task #38: true iff this shard currently believes it is a read-only
+    /// replica (`ReplicationState::role == Replica`). Checked by
+    /// `make_redis_call_fn` before letting a Lua `redis.call`/`redis.pcall`
+    /// execute a `WRITE`-flagged inner command — mirrors upstream Redis,
+    /// which fails a script at the *first* write attempt inside it rather
+    /// than rejecting `EVAL`/`EVALSHA` outright (a read-only script must
+    /// still run on a replica). `false` for a disabled ctx (unit tests) and
+    /// whenever no `ReplicationState` is wired up (standalone server).
+    fn is_replica(&self) -> bool {
+        self.0
+            .as_ref()
+            .and_then(|inner| inner.is_replica_mirror.as_ref())
+            .is_some_and(|mirror| mirror.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Run the same eviction/OOM gate the connection handlers use
@@ -358,6 +389,42 @@ pub fn make_redis_call_fn(
                     "Write commands are not allowed from read-only scripts".to_string(),
                 ));
             }
+            // Task #38: reject a write attempted from a CLIENT-issued script
+            // on a read-only replica, at the first offending `redis.call`/
+            // `redis.pcall` — matching upstream Redis (a script that never
+            // writes still runs on a replica; one that does is aborted mid-
+            // script with `-READONLY`). This intentionally mirrors the exact
+            // carve-outs `try_enforce_readonly` uses for the connection-level
+            // gate (`server/conn/handler_monoio/dispatch.rs`) — commands that
+            // are blanket-`WRITE`-flagged in `COMMAND_META` but carry
+            // read-only subcommands. Master→replica Lua effect replication
+            // (Wave A part 2, task #34) NEVER reaches this closure: replayed
+            // effects are applied via `replication::apply::apply_local`,
+            // which dispatches the inner command directly against storage
+            // and never runs a Lua VM at all (see that module's doc comment)
+            // — so this check cannot collide with, or block, replica apply.
+            if cmd_is_write && eviction_ctx.is_replica() {
+                let allowed_on_replica = if cmd_bytes.eq_ignore_ascii_case(b"WS") {
+                    crate::command::workspace::is_ws_readonly_subcommand(&frames[1..])
+                } else if cmd_bytes.eq_ignore_ascii_case(b"MQ") {
+                    crate::command::mq::is_mq_readonly_subcommand(&frames[1..])
+                } else {
+                    #[cfg(feature = "graph")]
+                    {
+                        cmd_bytes.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                            && !crate::command::graph::is_cypher_write_query(&frames[1..])
+                    }
+                    #[cfg(not(feature = "graph"))]
+                    {
+                        false
+                    }
+                };
+                if !allowed_on_replica {
+                    return Ok(Frame::Error(Bytes::from_static(
+                        b"READONLY You can't write against a read only replica.",
+                    )));
+                }
+            }
             if cmd_is_write {
                 // Track writes for SCRIPT KILL safety check
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));
@@ -523,5 +590,78 @@ mod tests {
             saw_del_for_bystander,
             "bystander eviction inside the Lua gate must emit a DEL record to the AOF plane"
         );
+    }
+
+    /// Task #38: `LuaEvictionCtx::is_replica()` must track
+    /// `ReplicationState::is_replica_mirror` exactly, including transitions
+    /// made AFTER the ctx was constructed — `make_redis_call_fn` calls this
+    /// per `redis.call`, so a `REPLICAOF`/`REPLICAOF NO ONE` mid-lifetime
+    /// role flip (S3.5a's whole reason for the mirror existing) must be
+    /// visible to a long-lived shard's Lua bridge without rebuilding the
+    /// ctx.
+    ///
+    /// RED (before this task): `LuaEvictionInner` carried no
+    /// `is_replica_mirror` field at all — `LuaEvictionCtx` had no way to
+    /// answer "is this shard a read-only replica right now," so
+    /// `make_redis_call_fn` could not reject a writing script on a replica.
+    #[test]
+    fn is_replica_tracks_role_transitions_after_construction() {
+        use crate::replication::state::{ReplicaHandshakeState, ReplicationRole, ReplicationState};
+
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "noeviction")));
+        let repl_state = Arc::new(std::sync::RwLock::new(ReplicationState::new(
+            1,
+            "a".repeat(40),
+            "0".repeat(40),
+        )));
+
+        let ctx = LuaEvictionCtx::new(
+            shard_databases,
+            runtime_config,
+            0,
+            None,
+            Rc::new(Cell::new(1)),
+            None,
+            1,
+            Some(repl_state.clone()),
+            None,
+        );
+
+        assert!(
+            !ctx.is_replica(),
+            "fresh ReplicationState defaults to Master"
+        );
+
+        repl_state
+            .write()
+            .unwrap()
+            .set_role(ReplicationRole::Replica {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                state: ReplicaHandshakeState::PingPending,
+            });
+        assert!(
+            ctx.is_replica(),
+            "is_replica() must observe a role flip that happened after ctx construction"
+        );
+
+        repl_state
+            .write()
+            .unwrap()
+            .set_role(ReplicationRole::Master);
+        assert!(
+            !ctx.is_replica(),
+            "REPLICAOF NO ONE must flip is_replica() back to false"
+        );
+    }
+
+    /// `is_replica()` on a `disabled()` ctx (no shard context — plain unit
+    /// tests of Lua scripts that don't go through a real shard) must be
+    /// `false`, never panic.
+    #[test]
+    fn is_replica_false_for_disabled_ctx() {
+        let ctx = LuaEvictionCtx::disabled();
+        assert!(!ctx.is_replica());
     }
 }

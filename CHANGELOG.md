@@ -6,6 +6,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — read-only replicas silently executed writing EVAL/EVALSHA (task #38)
+
+A client-issued `EVAL`/`EVALSHA` on a read-only replica ran unconditionally:
+`EVAL`/`EVALSHA` deliberately carry no `WRITE` command-metadata flag (a
+script's writes replicate as individually-emitted effect records, not as the
+literal `EVAL`), so the connection-layer `try_enforce_readonly` gate that
+blocks every other write command on a replica never saw them — a script's
+`redis.call('SET', ...)` mutated the replica's local state with no
+rejection at all, silently diverging it from the master.
+
+Fixed at the actual write boundary — `scripting::bridge::make_redis_call_fn`
+(the `redis.call`/`redis.pcall` bridge) now rejects a `WRITE`-flagged inner
+command with `-READONLY You can't write against a read only replica.` the
+moment the shard's `ReplicationState` reports the replica role, mirroring
+upstream Redis semantics: a script that never writes still runs to
+completion on a replica (`EVAL_RO`/`FCALL_RO` and plain read scripts are
+unaffected), while one that does write aborts at the first offending call.
+Reuses the same `WS`/`MQ`/`GRAPH.QUERY` read-only-subcommand carve-outs as
+the connection-level gate, and reads a lock-free `AtomicBool` mirror of
+`ReplicationState::is_replica_mirror` (same pattern as
+`ConnectionContext::is_replica_mirror`) so a tight script write-loop never
+takes the `ReplicationState` lock.
+
+Verified this does not regress master→replica Lua effect replication (Wave
+A part 2, task #34): replayed effects apply via
+`replication::apply::apply_local`, which dispatches the inner write command
+directly against storage and never touches the Lua bridge, so the new gate
+cannot see — and cannot block — replica apply of a master's script effects
+(`eval_effects_parity_shards1`/`_shards4`, `eval_incr_no_double_apply`,
+`eval_writes_survive_restart` all still green).
+
+Multi-db note: `redis.call('SELECT', ...)` was already rejected inside
+scripts (pre-existing fail-loud guard — the `CURRENT_DB` thread-local is
+pinned to one `Database` for the whole script execution), so there is no
+per-script db-switching path that could race or diverge from this new
+readonly check.
 ### Fixed — MqPop WAL/replication payload v2 carries real PEL idle metadata (task #47)
 
 `apply_mq_pop` (boot-time WAL replay AND live replica apply — same function,
