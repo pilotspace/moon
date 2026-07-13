@@ -303,6 +303,92 @@ pub fn vector_isolated(cfg: &Config) {
     drop(guard2);
 }
 
+/// Text (FTS) isolated: kernel M4, task #50 tripwire. FT.CREATE, index docs,
+/// FT.COMPACT (builds + persists the term-dict + FST sidecar), index MORE
+/// docs post-compact (so boot must both recover the sidecar AND correctly
+/// continue assigning ids to genuinely-new terms), kill-9, restart, verify a
+/// FUZZY query -- which exercises the FST expansion path, not just exact
+/// HashMap lookup -- still finds every doc, and that `FT.INFO` reports the
+/// index as sidecar-recovered (not a silent fallback to full rescan).
+///
+/// This is a default-GREEN cell: unlike the RED root-cause groups tracked
+/// elsewhere in this matrix, task #50's fix is expected to hold here. A
+/// regression here means either the `.tfst` sidecar stopped being written
+/// at FT.COMPACT time, `load_term_fst_sidecars` stopped being wired into
+/// shard boot before the rescan, or the id-continuation invariant
+/// (`TermDictionary::from_pairs`'s `next_id` handoff) broke.
+pub fn text_fts_sidecar_isolated(cfg: &Config) {
+    let dir = harness::unique_dir(&format!("txtiso-{}", cfg.label));
+    let (guard, port) = harness::spawn_moon_on(&dir, cfg, &[]);
+    let mut c = Conn::open(port);
+    let tag = "txtiso";
+    let idx = text_index_name(tag);
+    let prefix = format!("{{{tag}}}:txt:");
+    ft_create_text(&mut c, &idx, &prefix);
+
+    if cfg.no_durability_contract() {
+        hset_text(&mut c, &format!("{prefix}0"), "machine vision system");
+        harness::crash(guard, port);
+        let (guard2, port2) = harness::spawn_moon_on(&dir, cfg, &[]);
+        let mut c2 = Conn::open(port2);
+        assert!(matches!(c2.cmd_s(&["PING"]), crate::resp::Resp::Simple(_)));
+        drop(guard2);
+        return;
+    }
+
+    // Pre-compact corpus: every doc contains a term stemming to "machin",
+    // FUZZY-reachable via edit-distance-1 probe "machn".
+    let pre_compact: Vec<(String, &str)> = vec![
+        (text_key(tag, 0), "machine vision system"),
+        (text_key(tag, 1), "deep learning machinery"),
+        (text_key(tag, 2), "machine learning pipeline"),
+    ];
+    for (key, body) in &pre_compact {
+        hset_text(&mut c, key, body);
+    }
+    ft_compact(&mut c, &idx);
+
+    // Post-compact corpus: NEW terms discovered only by the rescan after a
+    // sidecar-recovered boot -- proves `next_id` continuation doesn't
+    // collide with the loaded sidecar's id-space.
+    let post_compact: Vec<(String, &str)> = vec![
+        (text_key(tag, 3), "machine translation service"),
+        (text_key(tag, 4), "robotic machine arm"),
+    ];
+    for (key, body) in &post_compact {
+        hset_text(&mut c, key, body);
+    }
+
+    let all_docs: Vec<(String, &str)> = pre_compact
+        .into_iter()
+        .chain(post_compact)
+        .collect::<Vec<_>>();
+    harness::wait_for_aof_bytes_any_shard(
+        &dir,
+        all_docs.last().expect("non-empty corpus").0.as_bytes(),
+    );
+    harness::crash(guard, port);
+
+    let (guard2, port2) = harness::spawn_moon_on(&dir, cfg, &[]);
+    let mut c2 = Conn::open(port2);
+    for (key, _) in &all_docs {
+        assert!(
+            ft_search_fuzzy_contains(&mut c2, &idx, "machn", key),
+            "cell {}: FUZZY 'machn' must find {key} after sidecar-recovered restart \
+             (term-dict+FST sidecar durability, kernel M4 task #50)",
+            cfg.label
+        );
+    }
+    assert!(
+        ft_info_sidecar_recovered_indexes(&mut c2, &idx) >= 1,
+        "cell {}: FT.INFO sidecar_recovered_indexes must be >= 1 after a clean \
+         restart with a valid .tfst sidecar on disk -- 0 means boot silently \
+         fell back to a full keyspace rescan",
+        cfg.label
+    );
+    drop(guard2);
+}
+
 /// WS isolated: WS CREATE, synced, kill, verify WS LIST.
 pub fn ws_isolated(cfg: &Config) {
     let dir = harness::unique_dir(&format!("wsiso-{}", cfg.label));

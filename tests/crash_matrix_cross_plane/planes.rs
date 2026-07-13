@@ -289,6 +289,88 @@ pub fn vec_search_contains(c: &mut Conn, idx: &str, k: u32, blob: &[u8], key: &s
 }
 
 // ---------------------------------------------------------------------------
+// Text (FTS) — kernel M4, task #50: term-dict + FST sidecar durability
+// ---------------------------------------------------------------------------
+
+pub fn text_index_name(tag: &str) -> String {
+    format!("{tag}textidx")
+}
+
+pub fn text_key(tag: &str, n: u64) -> String {
+    format!("{{{tag}}}:txt:{n}")
+}
+
+pub fn ft_create_text(c: &mut Conn, idx: &str, prefix: &str) {
+    let reply = c.cmd(&[
+        b"FT.CREATE",
+        idx.as_bytes(),
+        b"ON",
+        b"HASH",
+        b"PREFIX",
+        b"1",
+        prefix.as_bytes(),
+        b"SCHEMA",
+        b"body",
+        b"TEXT",
+    ]);
+    assert_eq!(reply, Resp::Simple("OK".into()), "FT.CREATE {idx} failed");
+}
+
+pub fn hset_text(c: &mut Conn, key: &str, body: &str) {
+    match c.cmd(&[b"HSET", key.as_bytes(), b"body", body.as_bytes()]) {
+        Resp::Int(_) => {}
+        other => panic!("HSET {key} failed: {other:?}"),
+    }
+}
+
+/// FT.COMPACT: builds + persists the term-dict + FST sidecar
+/// (`TextStore::save_term_fst_sidecar_for_index`) so it survives kill-9.
+pub fn ft_compact(c: &mut Conn, idx: &str) {
+    let reply = c.cmd(&[b"FT.COMPACT", idx.as_bytes()]);
+    assert_eq!(reply, Resp::Simple("OK".into()), "FT.COMPACT {idx} failed");
+}
+
+/// True if `key` is among the results of a FUZZY query against `idx` --
+/// FUZZY expansion exercises the FST path (`TermModifier::Fuzzy`), which is
+/// exactly the path that is unsafe to serve from a stale-id-space sidecar
+/// (see `TextStore::load_fst_sidecars`'s doc comment). A crash-durability
+/// cell that only checked exact-term search would miss that corruption
+/// class entirely.
+pub fn ft_search_fuzzy_contains(c: &mut Conn, idx: &str, fuzzy_term: &str, key: &str) -> bool {
+    let query = format!("@body:%{fuzzy_term}%");
+    let r = c.cmd(&[
+        b"FT.SEARCH",
+        idx.as_bytes(),
+        query.as_bytes(),
+        b"DIALECT",
+        b"2",
+    ]);
+    let items = as_array(&r);
+    items[1..]
+        .iter()
+        .step_by(2)
+        .any(|v| matches!(v, Resp::Bulk(Some(b)) if b == key.as_bytes()))
+}
+
+/// Additive `FT.INFO` `sidecar_recovered_indexes` counter (kernel M4, task
+/// #50) — 1+ means at least one shard's boot took the fast sidecar-recovery
+/// path instead of falling back to a full keyspace rescan.
+pub fn ft_info_sidecar_recovered_indexes(c: &mut Conn, idx: &str) -> i64 {
+    let r = c.cmd(&[b"FT.INFO", idx.as_bytes()]);
+    let items = as_array(&r);
+    let mut i = 0;
+    while i + 1 < items.len() {
+        if let Resp::Bulk(Some(k)) = &items[i] {
+            if k == b"sidecar_recovered_indexes" {
+                return as_int(&items[i + 1]);
+            }
+        }
+        i += 2;
+    }
+    panic!("FT.INFO {idx}: sidecar_recovered_indexes key not found");
+}
+
+// ---------------------------------------------------------------------------
 // WS (workspace registry — process-global, shard-0-pinned per Wave B)
 // ---------------------------------------------------------------------------
 

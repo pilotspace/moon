@@ -1022,6 +1022,18 @@ impl super::Shard {
                         }
                     }
                 });
+
+                // Kernel M4 (task #50): seed each restored text index's term
+                // dictionaries (and, where the sidecar validates cleanly,
+                // FST maps) from the `.tfst` combined sidecar BEFORE the
+                // keyspace rescan below runs any `index_document` calls.
+                // This MUST happen in this order -- see
+                // `TextStore::load_term_fst_sidecars`'s doc comment for why
+                // seeding after the rescan (or not at all) is exactly the
+                // stale-id-space corruption this closes.
+                crate::shard::slice::with_shard(|s| {
+                    s.text_store.load_term_fst_sidecars();
+                });
             }
 
             // Auto-reindex existing HASH keys that match vector or text index prefixes.
