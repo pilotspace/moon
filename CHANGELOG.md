@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — CI pipeline optimization (round 2: cargo-nextest)
+
+- CI test steps (Linux/macOS/Windows) now run under `cargo nextest run
+  --profile ci`: per-test-binary parallelism and two automatic retries for
+  the known flaky classes (fixed-port listeners, kill-9 timing under
+  full-suite load) — a pass-on-retry is reported as FLAKY, keeping the
+  signal while ending manual reroll round-trips. `fail-fast = false`
+  surfaces every failure in one run. Doctests keep a dedicated
+  `cargo test --doc` step (nextest does not run them). Config in
+  `.config/nextest.toml`; local `cargo test` is unaffected.
+
 ### Changed — CI pipeline optimization (round 1)
 
 - CodeQL no longer runs on every PR (main-push + weekly schedule only) — it
