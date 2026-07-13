@@ -99,6 +99,75 @@ GREEN. Crash-matrix cells `cross_plane_prod_s1_txn_isolated_committed` /
 `cross_plane_prod_s4_txn_isolated_committed` (`tests/crash_matrix_cross_plane/`)
 flip from `red_guard`-gated RED to default-GREEN tripwires (42 cells: 33→35
 GREEN by default, 9→7 RED).
+### Fixed — MQ durable-stream tombstone: DEL/UNLINK/FLUSHALL/FLUSHDB no longer resurrect on kill-9 (kernel M3 stage 3 / task #46)
+
+Root cause: MQ durable streams live as ordinary keys in the shard keyspace,
+but `replay_mq_wal` had no way to represent "this queue was deleted after
+these pushes" — a generic `DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL` removed the
+stream from the live db and the `DurableQueueRegistry`, but a kill-9
+afterward re-materialized the full pre-delete content on the next restart
+(replay reapplies every `MqCreate`/`MqPush`/... record regardless). Same
+bug class as the already-fixed KV/vector cold-plane resurrection (PR #257),
+now closed for MQ. Proven by the former RED crash-matrix cell
+`cross_plane_seeded_red_mq_generic_del_resurrection`
+(`tests/crash_matrix_cross_plane/tests_seeded_red.rs`), now un-gated (no
+more `harness::red_guard`) and green 3/3 consecutive runs.
+
+Fix: a new `MqDrop` WAL v3 record (discriminant `0x75`,
+`src/persistence/wal_v3/record.rs`; versioned encode/decode in
+`src/mq/wal.rs` — `[version:u8][db_index:u32][key_len:u32][key:N]`, fails
+closed on any malformed/future-version payload like every other MQ record)
+is emitted whenever a durable MQ stream is removed via generic
+`DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL` — new hooks
+`mq_exec::auto_drop_mq_streams` / `auto_drop_mq_streams_on_flush`, wired
+into every connection-layer write path that already runs the equivalent
+vector/text index-parity hooks (`handler_monoio/mod.rs`,
+`handler_sharded/mod.rs`, the sharded MULTI/EXEC helper in
+`server/conn/shared.rs`, and the replica-side `apply_index_parity_hooks` in
+`replication/apply.rs` — a replica must tombstone its OWN WAL too, or it
+resurrects the stream on its own restart even though its live copy stayed
+correctly deleted). Boot-time replay applies `apply_mq_drop`
+(`src/shard/shared_databases.rs`) strictly in WAL order alongside every
+other MQ record, so a Drop only kills records that PRECEDE it for that
+key — a later `MqCreate`/`MqPush` for the same key survives intact
+(create -> drop -> create round-trips a kill-9 with the second incarnation
+whole; new regression tests
+`test_replay_mq_wal_drop_only_kills_prior_records` and the crash-matrix
+`cross_plane_mq_create_drop_create_survives`). `segment_plane_scan`'s
+plane-history block set (`src/persistence/wal_v3/segment.rs`) gained
+`MqDrop` alongside the other MQ discriminants so autovacuum/recycle never
+deletes a sealed segment still holding an unfloored tombstone. The MQ WAL
+fuzz target (`fuzz/fuzz_targets/mq_wal_record.rs`) now also fuzzes
+`decode_mq_drop`.
+
+Replication decision: MQ effect records replicate live only at
+`num_shards == 1` (the pre-existing gate, matching `MqCreate`/etc — see
+`mq_exec::replicate_mq_record`'s docs). `MqDrop` follows the same posture:
+`MQ._REPL.DROP` is emitted and applied by `replication::apply::apply_mq`
+exactly like the other MQ replay commands. Separately — and regardless of
+that gate — a REPLICATED generic `DEL`/`UNLINK`/`FLUSHDB`/`FLUSHALL`
+already removes the stream from the replica's live keyspace via normal
+command replication; what it did NOT do before this fix is tombstone the
+replica's OWN wal-v3 MQ plane, so the replica's live state was correct but
+its restart-durability was not. `apply_index_parity_hooks` now closes that
+gap identically on the replica side.
+
+Scope decision (documented in code, not re-litigated per-callsite):
+`DurableQueueRegistry` entries are NOT db-indexed (pre-existing limitation,
+same as `MqCreate`'s registry) — a key match tombstones regardless of
+which db the deleting command ran in, and `FLUSHDB` drops every registered
+durable queue exactly like `FLUSHALL` (the registry has no way to scope to
+one db). Two different dbs sharing an MQ queue NAME is not a supported
+configuration.
+
+Test-gotcha fixed along the way: the crash-matrix DEL/FLUSHALL scenarios'
+original sync-marker strategy waited on an AOF-family write to prove the
+delete was durable — correct pre-fix (DEL only touched the AOF), but the
+new `MqDrop` record lands on the wal-v3 MQ plane via a separate
+fire-and-forget channel drained on its own 1ms tick, so an AOF-only marker
+no longer proves anything about the tombstone's own durability. Both tests
+now also sync a throwaway durable queue's `MQ.PUSH` (wal-v3-family) after
+the delete/flush before crashing.
 
 ### Added — unified per-shard floor register + min-across-planes WAL recycle (kernel M3 stage 2 / K2)
 
@@ -283,9 +352,10 @@ fixed — that is out of scope for this stage) for the kernel M3 backlog:
 
 Also confirmed GREEN (not RED, contrary to the brief's grouping at the
 design-doc level): `WS DROP` durability under kill-9 — `WorkspaceDrop` WAL
-records replay correctly in order, unlike the sibling MQ generic-`DEL`
-resurrection gap (still RED, same bug class as the already-fixed KV/vector
-cold-plane resurrection, PR #257, not yet applied to MQ).
+records replay correctly in order. The sibling MQ generic-`DEL`
+resurrection gap (same bug class as the already-fixed KV/vector cold-plane
+resurrection, PR #257) was RED at the time of this entry; **fixed in
+kernel M3 stage 3 (task #46)** — see the `MqDrop` entry below.
 
 `tests/common/mod.rs` gains `find_moon_binary()`/`sigkill()`/
 `wait_for_port_down()` shared helpers this suite depends on (the latter now
@@ -577,11 +647,12 @@ crash required. Kept segments are counted in
 workloads until plane checkpointing lands (storage-kernel M3). The
 guard fails closed: unreadable/torn/unknown-type segments are kept.
 
-Known limitation (pre-existing, now tracked): durable MQ streams deleted
-via generic `DEL`/`UNLINK`/`FLUSHALL`/`FLUSHDB` are resurrected — now with
-full content — by MQ WAL replay after a restart; there is no MQ tombstone
-record yet (same bug class as the fixed vector/KV cold-plane resurrection;
-follow-up task filed).
+Known limitation (pre-existing, tracked as task #46): durable MQ streams
+deleted via generic `DEL`/`UNLINK`/`FLUSHALL`/`FLUSHDB` are resurrected —
+now with full content — by MQ WAL replay after a restart; there is no MQ
+tombstone record yet (same bug class as the fixed vector/KV cold-plane
+resurrection). **Fixed in kernel M3 stage 3** — see the "MQ durable-stream
+tombstone" entry below.
 
 Out of scope (stage 2b+): replication emission/apply for the MQ plane.
 

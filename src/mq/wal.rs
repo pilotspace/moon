@@ -9,6 +9,12 @@
 //! trigger registrations all survive a kill-9 even when `--appendonly yes`
 //! would otherwise discard the whole keyspace.
 //!
+//! Kernel M3 stage 3 (task #46) adds `MqDrop` (0x75): a tombstone emitted
+//! when a durable stream is removed via generic keyspace `DEL`/`UNLINK`/
+//! `FLUSHDB`/`FLUSHALL` (as opposed to any `MQ.*` command), closing the gap
+//! where such a delete had no WAL representation and replay resurrected the
+//! full pre-delete content after a kill-9.
+//!
 //! All payloads share a leading `version: u8` byte. Current version is `1`
 //! for every record kind below. Decoders return `None` for ANY structurally
 //! invalid payload (including an unrecognized/future version byte) -- NEVER
@@ -400,6 +406,47 @@ pub fn decode_mq_trigger(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, u
     Some((trig_key, queue_key, callback_cmd, debounce_ms))
 }
 
+// ── MqDrop (0x75) ─────────────────────────────────────────────────────────
+
+/// Encode an MqDrop WAL payload — a tombstone emitted when a durable MQ
+/// stream is removed via generic keyspace `DEL`/`UNLINK`/`FLUSHDB`/
+/// `FLUSHALL` (kernel M3 stage 3 / task #46). Replay applies these strictly
+/// in WAL order, so a `Drop` only kills the `MqCreate`/`MqPush`/... records
+/// that precede it for this `(db_index, key)` pair — a later `MqCreate` for
+/// the same key re-materializes normally (create -> drop -> create survives
+/// intact).
+///
+/// Layout: `[version:u8=1][db_index:u32 LE][key_len:u32 LE][key:N]`
+pub fn encode_mq_drop(db_index: u32, queue_key: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + queue_key.len());
+    payload.push(MQ_WAL_VERSION);
+    payload.extend_from_slice(&db_index.to_le_bytes());
+    payload.extend_from_slice(&(queue_key.len() as u32).to_le_bytes());
+    payload.extend_from_slice(queue_key);
+    payload
+}
+
+/// Decode an MqDrop WAL payload.
+///
+/// Returns `(db_index, queue_key)` or `None` if malformed or an unsupported
+/// version.
+pub fn decode_mq_drop(payload: &[u8]) -> Option<(u32, Vec<u8>)> {
+    if payload.is_empty() || payload[0] != MQ_WAL_VERSION {
+        return None;
+    }
+    let p = &payload[1..];
+    if p.len() < 8 {
+        return None;
+    }
+    let db_index = u32::from_le_bytes(p[0..4].try_into().ok()?);
+    let key_len = u32::from_le_bytes(p[4..8].try_into().ok()?) as usize;
+    if p.len() < 8 + key_len {
+        return None;
+    }
+    let key = p[8..8 + key_len].to_vec();
+    Some((db_index, key))
+}
+
 // ── Replication wire framing (Wave B stage 2b) ────────────────────────────
 //
 // MQ effect records are versioned BINARY payloads, not RESP commands (unlike
@@ -424,6 +471,8 @@ pub const MQ_REPL_POP: &[u8] = b"MQ._REPL.POP";
 pub const MQ_REPL_ACK: &[u8] = b"MQ._REPL.ACK";
 /// Synthetic replication pseudo-command for [`WalRecordType::MqTrigger`].
 pub const MQ_REPL_TRIGGER: &[u8] = b"MQ._REPL.TRIGGER";
+/// Synthetic replication pseudo-command for [`WalRecordType::MqDrop`].
+pub const MQ_REPL_DROP: &[u8] = b"MQ._REPL.DROP";
 
 /// True for any `MQ._REPL.*` synthetic replication pseudo-command emitted by
 /// [`crate::shard::mq_exec`]'s live fan-out. Used by
@@ -438,6 +487,7 @@ pub fn is_mq_replay_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(MQ_REPL_POP)
         || cmd.eq_ignore_ascii_case(MQ_REPL_ACK)
         || cmd.eq_ignore_ascii_case(MQ_REPL_TRIGGER)
+        || cmd.eq_ignore_ascii_case(MQ_REPL_DROP)
 }
 
 #[cfg(test)]
@@ -451,6 +501,8 @@ mod tests {
         assert!(is_mq_replay_command(b"MQ._REPL.POP"));
         assert!(is_mq_replay_command(b"MQ._REPL.ACK"));
         assert!(is_mq_replay_command(b"MQ._REPL.TRIGGER"));
+        assert!(is_mq_replay_command(b"MQ._REPL.DROP"));
+        assert!(is_mq_replay_command(b"mq._repl.drop"));
         assert!(!is_mq_replay_command(b"MQ"));
         assert!(!is_mq_replay_command(b"MQ.PUSH"));
         assert!(!is_mq_replay_command(b"GRAPH.ADDNODE"));
@@ -686,6 +738,54 @@ mod tests {
         let mut payload = encode_mq_pop(0, b"q", (0, 0), &[], &[]);
         payload[0] = 42;
         assert!(decode_mq_pop(&payload).is_none());
+    }
+
+    // --- MqDrop roundtrip ---
+
+    #[test]
+    fn test_mq_drop_roundtrip() {
+        let payload = encode_mq_drop(3, b"orders");
+        let (db, key) = decode_mq_drop(&payload).unwrap();
+        assert_eq!(db, 3);
+        assert_eq!(key, b"orders");
+    }
+
+    #[test]
+    fn test_mq_drop_roundtrip_empty_key() {
+        let payload = encode_mq_drop(0, b"");
+        let (db, key) = decode_mq_drop(&payload).unwrap();
+        assert_eq!(db, 0);
+        assert!(key.is_empty());
+    }
+
+    #[test]
+    fn test_mq_drop_malformed_empty() {
+        assert!(decode_mq_drop(b"").is_none());
+    }
+
+    #[test]
+    fn test_mq_drop_malformed_truncated_key() {
+        let mut bad = vec![MQ_WAL_VERSION];
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        bad.extend_from_slice(&100u32.to_le_bytes()); // key_len = 100
+        bad.extend_from_slice(&[0u8; 10]); // only 10 bytes of key
+        assert!(decode_mq_drop(&bad).is_none());
+    }
+
+    #[test]
+    fn test_mq_drop_unknown_version_rejected() {
+        let mut payload = encode_mq_drop(0, b"q");
+        payload[0] = 42;
+        assert!(decode_mq_drop(&payload).is_none());
+    }
+
+    #[test]
+    fn test_mq_drop_extra_bytes_ignored() {
+        let mut payload = encode_mq_drop(1, b"q");
+        payload.extend_from_slice(b"trailing");
+        let (db, key) = decode_mq_drop(&payload).unwrap();
+        assert_eq!(db, 1);
+        assert_eq!(key, b"q");
     }
 
     // --- MqTrigger roundtrip ---

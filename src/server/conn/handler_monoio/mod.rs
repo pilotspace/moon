@@ -1647,6 +1647,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 cmd_args,
                                 sel_db as u8,
                             );
+                            // task #46: tombstone any durable MQ stream(s)
+                            // this generic DEL/UNLINK removed, so
+                            // `replay_mq_wal` doesn't resurrect them.
+                            crate::shard::mq_exec::auto_drop_mq_streams(s, cmd_args, sel_db);
                         }
 
                         // R4: HDEL of an indexed vector field tombstones it.
@@ -1671,6 +1675,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 cmd.eq_ignore_ascii_case(b"FLUSHDB"),
                                 sel_db as u8,
                             );
+                            // task #46: tombstone every durable MQ stream
+                            // this FLUSHDB/FLUSHALL cleared.
+                            crate::shard::mq_exec::auto_drop_mq_streams_on_flush(s, sel_db);
                         }
 
                         // Blocking wakeup: re-borrow db by index (NLL)
