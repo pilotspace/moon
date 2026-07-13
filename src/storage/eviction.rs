@@ -1151,40 +1151,89 @@ pub(crate) fn evict_one_with_spill(
     // record. Tying the flag to the branch that actually performs the write
     // makes the two cases (no `SpillContext` vs. a `SpillContext` that
     // couldn't spill this value type) equivalent by construction.
+    // task #45: `kv_spill::spill_to_datafile` has fully supported collection
+    // types (Hash/List/Set/ZSet/Stream, serialized via `kv_serde`) since the
+    // async write-path eviction gate started using it -- but this synchronous
+    // path (background tick `timers::run_eviction`, the memory-pressure
+    // cascade's sync-spill fallback, and `db_quota`) still gated the call
+    // behind an `is_string` check left over from before that support existed.
+    // A Hash/List/Set/ZSet/Stream victim picked here while a `SpillContext`
+    // WAS present therefore never got a byte written to `shard_dir`, yet fell
+    // through to the same unconditional `db.remove` a genuine plain-drop
+    // takes -- but WITHOUT the `on_plain_drop` accounting (the old
+    // `is_plain_drop = spill.is_none()` snapshot read `false` even though
+    // nothing durable exists anywhere for that key). Spilling every type here
+    // closes that gap; `spill_to_datafile`'s own type match is exhaustive
+    // (compile error if a new `RedisValueRef` variant is ever added without a
+    // `ValueType` mapping).
+    //
+    // `file_id`/`ttl_for_cold` are captured from the immutable `entry`
+    // borrow BEFORE `db.remove` (which also clears any pre-existing cold
+    // copy of this key, D1: DEL-before-spill ordering) and the index insert
+    // into `db.cold_index` (a different field of `db`, taken as `&mut` only
+    // AFTER the `entry` borrow has ended) -- same split-borrow shape as
+    // `evict_batch_durable_no_aof`'s `db.remove` -> `ci.insert` ordering
+    // above.
     let mut spilled = false;
+    let mut spilled_file_id = 0u64;
+    let mut spilled_ttl_ms: Option<u64> = None;
     if let Some(ctx) = spill {
         if let Some(entry) = db.data().get(key.as_bytes()) {
-            // Only spill string entries (collection types not yet supported)
-            let is_string = matches!(entry.as_redis_value(), RedisValueRef::String(_));
-            if is_string {
-                if let Err(e) = kv_spill::spill_to_datafile(
-                    ctx.shard_dir,
-                    *ctx.next_file_id,
-                    key.as_bytes(),
-                    entry,
-                    ctx.manifest,
-                    None,
-                ) {
-                    warn!(
-                        key = %String::from_utf8_lossy(key.as_bytes()),
-                        error = %e,
-                        "kv_spill: I/O error during spill; retaining hot value, \
-                         aborting this eviction attempt (no silent drop)"
-                    );
-                    // Spill failed: the value has no durable copy anywhere.
-                    // Do NOT evict -- keep the hot value resident and let the
-                    // caller retry (or surface OOM) instead of losing data.
-                    return false;
-                }
-                *ctx.next_file_id += 1;
-                spilled = true;
+            let file_id = *ctx.next_file_id;
+            let ttl_ms = if entry.has_expiry() {
+                Some(entry.expires_at_ms(0))
+            } else {
+                None
+            };
+            if let Err(e) = kv_spill::spill_to_datafile(
+                ctx.shard_dir,
+                file_id,
+                key.as_bytes(),
+                entry,
+                ctx.manifest,
+                None,
+            ) {
+                warn!(
+                    key = %String::from_utf8_lossy(key.as_bytes()),
+                    error = %e,
+                    "kv_spill: I/O error during spill; retaining hot value, \
+                     aborting this eviction attempt (no silent drop)"
+                );
+                // Spill failed: the value has no durable copy anywhere.
+                // Do NOT evict -- keep the hot value resident and let the
+                // caller retry (or surface OOM) instead of losing data.
+                return false;
             }
+            *ctx.next_file_id += 1;
+            spilled = true;
+            spilled_file_id = file_id;
+            spilled_ttl_ms = ttl_ms;
         }
     }
 
     db.remove(key.as_bytes());
     crate::admin::metrics_setup::record_eviction();
-    if !spilled {
+    if spilled {
+        // Register the cold location so `Database::exists`/`get`/the
+        // type-specific accessors' `promote_cold_if_present` can find this
+        // key again -- `spill_to_datafile` itself only inserts into a
+        // `ColdIndex` it is explicitly handed (`None` here, split-borrow
+        // constraint above), so the caller owns the insert. Single-page spill
+        // only (no overflow-chain support in this path, same limitation
+        // `spill_to_datafile`'s single-file layout has), so `page_idx`/
+        // `slot_idx` are always the entry's sole slot: 0/0.
+        if let Some(ref mut ci) = db.cold_index {
+            ci.insert(
+                Bytes::copy_from_slice(key.as_bytes()),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: spilled_file_id,
+                    page_idx: 0,
+                    slot_idx: 0,
+                    ttl_ms: spilled_ttl_ms,
+                },
+            );
+        }
+    } else {
         on_plain_drop(key.as_bytes());
     }
     true
@@ -2218,20 +2267,23 @@ mod tests {
         assert!(db.data().get(&b"spill_key"[..]).is_some());
     }
 
-    /// RED (defect 1, task #34 review): `evict_one_with_spill`'s spill body
-    /// only durably spills `RedisValueRef::String` entries (see the
-    /// `is_string` gate). A Hash (or List/Set/ZSet) victim picked while a
-    /// `SpillContext` IS present therefore takes neither branch of the
-    /// `if is_string` check — no bytes are ever written to `shard_dir` — yet
-    /// falls through to the unconditional `db.remove` a few lines later. The
-    /// bug: `is_plain_drop` was snapshotted from `spill.is_none()` BEFORE
-    /// this happened, so it reads `false` (a `SpillContext` was passed) and
-    /// `on_plain_drop` never fires even though nothing durable exists for
-    /// this key anywhere. This must be a reported plain-drop, indistinguishable
-    /// from `spill: None`, because the outcome (no cold copy, no AOF/repl
-    /// record) is identical.
+    /// GREEN (task #45 fix, was RED as `sync_spill_non_string_victim_reports_plain_drop`
+    /// under the old `is_string` gate): `evict_one_with_spill`'s spill body
+    /// now durably spills every `RedisValueRef` type via
+    /// `kv_spill::spill_to_datafile` (which has fully supported collections
+    /// since the async write-path eviction gate started using it). A Hash
+    /// victim picked here while a `SpillContext` is present must therefore
+    /// (a) write real bytes to `shard_dir`, (b) register a `ColdIndex` entry
+    /// so `EXISTS`/`HGETALL`/etc. can find it again via
+    /// `promote_cold_if_present`, and (c) NOT be reported to `on_plain_drop`
+    /// (a spilled entry stays cold-readable, not deleted). Before this fix a
+    /// Hash/List/Set/ZSet victim under a live `SpillContext` was silently
+    /// plain-dropped with no cold copy anywhere -- the tick/cascade root
+    /// cause of the `cold_collection_visibility` stable-ghost flake (task
+    /// #45): `EXISTS` on a key with a stale cold-index reference to an OLDER
+    /// spill could read `1` while every content read came back empty forever.
     #[test]
-    fn sync_spill_non_string_victim_reports_plain_drop() {
+    fn sync_spill_non_string_victim_is_durably_spilled_not_plain_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path();
         let manifest_path = tmp.path().join("shard.manifest");
@@ -2239,6 +2291,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
         // Hash victim: get_or_create_hash + a field write, matching how HSET
         // populates a real hash entry (mirrors src/storage/db.rs's own test
         // fixture pattern).
@@ -2267,16 +2320,23 @@ mod tests {
         assert!(evicted, "the hash victim must still be evicted from RAM");
         assert_eq!(db.len(), 0);
         assert!(
-            !shard_dir.join("data").exists(),
-            "setup invariant: a Hash entry must never actually be spilled \
-             to disk today (spill body is string-only)"
+            shard_dir.join("data").exists(),
+            "P0 fix: a Hash victim under a live SpillContext must be durably \
+             spilled to disk, not plain-dropped"
         );
-        assert_eq!(
-            reported,
-            vec![b"hash_key".to_vec()],
-            "a Hash victim that was NOT actually spilled must be reported to \
-             on_plain_drop (no cold copy exists anywhere for it) -- silent \
-             data loss otherwise, with no AOF/replication DEL record"
+        assert!(
+            reported.is_empty(),
+            "a durably-spilled Hash victim must NOT be reported to \
+             on_plain_drop -- it stays cold-readable, not deleted: {reported:?}"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"hash_key")
+                .is_some(),
+            "the spilled Hash key must be registered in ColdIndex so EXISTS/ \
+             promote_cold_if_present can find it again"
         );
     }
 
