@@ -1,0 +1,18 @@
+# cargo-nextest configuration (CI test runner — 2026-07-13 CI optimization
+# round 2). Local `cargo test` still works; CI uses `cargo nextest run` for
+# per-test-binary parallelism and automated flake retries.
+
+[profile.default]
+# Surface every failure in one run instead of stopping at the first failing
+# test binary (parity with the Windows job's --no-fail-fast rationale).
+fail-fast = false
+
+[profile.ci]
+# Known-flaky classes (fixed-port listeners, kill-9 timing under full-suite
+# parallel load) get two automatic retries. A test that passes on retry is
+# reported as FLAKY — the signal is kept, the manual reroll round-trip is not.
+retries = 2
+fail-fast = false
+# Integration tests spawn real servers; a hung server must fail the test,
+# not the 30-minute job budget.
+slow-timeout = { period = "60s", terminate-after = 8 }

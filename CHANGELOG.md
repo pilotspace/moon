@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — CI pipeline optimization (round 2: cargo-nextest)
+
+- CI test steps (Linux/macOS/Windows) now run under `cargo nextest run
+  --profile ci`: per-test-binary parallelism and two automatic retries for
+  the known flaky classes (fixed-port listeners, kill-9 timing under
+  full-suite load) — a pass-on-retry is reported as FLAKY, keeping the
+  signal while ending manual reroll round-trips. `fail-fast = false`
+  surfaces every failure in one run. Doctests keep a dedicated
+  `cargo test --doc` step (nextest does not run them). Config in
+  `.config/nextest.toml`; local `cargo test` is unaffected.
+
 ### Changed — CI pipeline optimization (round 1)
 
 - CodeQL no longer runs on every PR (main-push + weekly schedule only) — it
@@ -51,6 +62,35 @@ applies a sidecar. `FT.COMPACT` now calls the combined saver
 crash-matrix cells `cross_plane_prod_{s1,s4}_text_fts_sidecar_isolated`
 verify a FUZZY query survives kill-9 identically to a from-scratch rebuild.
 New fuzz target `term_fst_sidecar` covers the sidecar decoder.
+### Security — clear dependency vulnerability backlog (task #51)
+
+`sdk/python` (uv.lock, 36 open Dependabot alerts incl. 1 CRITICAL) and
+`console` (pnpm-lock.yaml, 17 open alerts incl. 2 HIGH react-router):
+
+- **sdk/python**: bumped `requires-python` floor `>=3.9` → `>=3.10` (Python
+  3.9 reached EOL 2025-10). This was required, not cosmetic — `nltk` (pulled
+  transitively via the `llama-index` extra) has no python-3.9-compatible
+  release past 3.9.2, which carries the CRITICAL zip-slip advisory
+  (GHSA, `nltk.corpus.util.LazyCorpusLoader` zip extraction) plus 4 more
+  high/medium path-traversal and XSS CVEs. Collapsing the py3.9 resolution
+  branch lets `uv lock --upgrade` land on `nltk` 3.10.0 everywhere. Also
+  picked up `pillow` 12.3.0, `aiohttp` 3.14.1, `urllib3` 2.7.0, `requests`
+  2.34.2, `orjson` 3.11.9, `langsmith` 0.10.2, `langchain-core` 1.4.9,
+  `pytest` 9.1.1 (all natural resolutions within existing `>=` floors — no
+  manifest ceiling changes needed beyond the python floor). 263/263 SDK
+  tests green post-bump.
+- **console**: targeted `pnpm update` (no `package.json` range changes
+  needed — all fixes were already inside existing `^`/transitive ranges)
+  for `react-router-dom` 7.14.0→7.18.1 (clears the react-router vendored
+  turbo-stream RCE + 3 more), `dompurify` 3.4.0→3.4.12 (transitive via
+  `@cosmos.gl/graph`, clears 8 XSS/pollution advisories), `vite`
+  7.3.5→7.3.6 (needed first — 7.3.5 hard-pins `esbuild@^0.27.0`, below the
+  fixed 0.28.1), `esbuild` 0.28.1, `form-data` 4.0.6, `ws` 8.21.0,
+  `js-yaml` 4.3.0, `@babel/core` 7.29.7. `pnpm audit --audit-level high`
+  clean. `pnpm build` and `pnpm install --frozen-lockfile` verified; the pre-existing
+  `console.test.ts` failures (7/56 tests — zustand persist middleware vs.
+  mocked storage) are unrelated to this change, reproduced identically on
+  the pre-bump lockfile, left untouched.
 
 ### Fixed — cross-shard MULTI/EXEC graph-leg misrouting (kernel M3 stage 3 / task #52, review round 3, P1)
 
