@@ -409,6 +409,30 @@ pub(crate) fn run_eviction_tick(
             wal_kv_log,
         );
     } else {
+        // task #45: give the tick eviction path the same write-then-durable
+        // -then-drop discipline the interactive write-path gate and the
+        // cascade's sync-spill fallback (step 3, above) already have. Only
+        // built when there is BOTH a live disk-offload config AND a
+        // `ShardManifest` (the durability backstop -- `--appendonly yes` or
+        // `--save`; "spill is inert without one" is an existing, documented
+        // rule, see `tests/cold_collection_visibility.rs`'s module doc) --
+        // otherwise `spill_ctx` stays `None` and `run_eviction` falls back to
+        // its pre-existing fail-close plain-drop (policy-aware: `noeviction`
+        // still OOMs, an evicting policy still frees RAM, just with no cold
+        // copy -- matches PR #273's fail-close discipline).
+        let eviction_shard_dir = server_config
+            .effective_disk_offload_dir()
+            .join(format!("shard-{}", shard_id));
+        let mut spill_ctx: Option<crate::storage::eviction::SpillContext<'_>> = None;
+        if server_config.disk_offload_enabled()
+            && let Some(ref mut manifest) = *shard_manifest
+        {
+            spill_ctx = Some(crate::storage::eviction::SpillContext {
+                shard_dir: &eviction_shard_dir,
+                manifest,
+                next_file_id,
+            });
+        }
         super::timers::run_eviction(
             shard_databases,
             shard_id,
@@ -419,6 +443,7 @@ pub(crate) fn run_eviction_tick(
             repl_state,
             aof_pool,
             wal_kv_log,
+            spill_ctx.as_mut(),
         );
     }
 

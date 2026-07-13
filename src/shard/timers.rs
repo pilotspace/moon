@@ -68,10 +68,28 @@ pub(crate) fn run_active_expiry(
 
 /// Run background eviction if maxmemory (or a per-db quota) is configured.
 ///
-/// task #34 (Wave A): plain-dropped victims (no disk-offload spill in this
-/// path — `--disk-offload disable`, or disk-offload's own budget cascade
-/// handles the spill-capable case elsewhere) get a dual-plane `DEL` record
-/// via the same `record_reason_del` handles `run_active_expiry` uses.
+/// task #45: `spill` carries the same write-then-durable-then-drop
+/// `SpillContext` the interactive write-path eviction gate and the memory-
+/// pressure cascade's sync-spill fallback use. Before this fix the tick
+/// NEVER received one — every collection (and, separately, every string —
+/// see `evict_one_with_spill`'s task #45 fix) victim it picked was plain-
+/// dropped even with `--disk-offload enable` and a durability backstop
+/// (`--appendonly yes`/`--save`) present, producing the
+/// `cold_collection_visibility` stable-ghost flake: a key whose hot copy this
+/// path dropped without a cold copy stayed `EXISTS == 1` if some OTHER
+/// eviction path's earlier (or later, via the async spill-completion race)
+/// cold-index entry for the same key was still live, while every content
+/// read on it came back empty forever. Threading a real `SpillContext`
+/// through (built by the caller from `shard_manifest`/`shard_dir`/
+/// `next_file_id` — `None` when no durability backstop exists, matching the
+/// documented "spill is inert without one" rule) makes this path spill
+/// exactly like every other eviction path, closing the race at its root
+/// instead of papering over one instance of it.
+///
+/// task #34 (Wave A): plain-dropped victims (no `spill` context passed in —
+/// `--disk-offload disable`, or no durability backstop) get a dual-plane
+/// `DEL` record via the same `record_reason_del` handles `run_active_expiry`
+/// uses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_eviction(
     shard_databases: &Arc<ShardDatabases>,
@@ -83,6 +101,7 @@ pub(crate) fn run_eviction(
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
+    mut spill: Option<&mut crate::storage::eviction::SpillContext<'_>>,
 ) {
     let rt = runtime_config.read();
     if rt.maxmemory > 0 {
@@ -129,7 +148,7 @@ pub(crate) fn run_eviction(
             crate::shard::slice::with_shard_db(i, |db| {
                 let before = db.estimated_memory();
                 let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
-                    db, &rt, None, remaining, budget,
+                    db, &rt, spill.as_deref_mut(), remaining, budget,
                     &mut |key| {
                         crate::replication::reason_del::record_reason_del(
                             key,
@@ -606,6 +625,7 @@ mod tests {
             &h.repl_state,
             None,
             false,
+            None,
         );
 
         let len0 = crate::shard::slice::with_shard_db(0, |db| db.len());
@@ -668,6 +688,7 @@ mod tests {
             &h.repl_state,
             None,
             false,
+            None,
         );
         let before = crate::shard::slice::with_shard_db(0, |db| db.len());
         assert_eq!(before, 100, "KV under budget must not evict");
@@ -687,11 +708,107 @@ mod tests {
             &h.repl_state,
             None,
             false,
+            None,
         );
         let after = crate::shard::slice::with_shard_db(0, |db| db.len());
         assert!(
             after < before,
             "vector bytes over budget must trigger KV eviction ({after} vs {before})"
+        );
+    }
+
+    /// RED before the task #45 fix (`run_eviction` always passed `None` for
+    /// `spill`, no matter what the caller had available): the tick eviction
+    /// path plain-dropped a Hash victim even though a `SpillContext` (a real
+    /// `ShardManifest` + `shard_dir` + `next_file_id`, exactly what
+    /// `persistence_tick::run_eviction_tick` builds when disk-offload is
+    /// enabled and a durability backstop is configured) was available. This
+    /// is the deterministic, non-racy reproduction of the
+    /// `cold_collection_visibility` stable-ghost flake's root cause: a
+    /// single call, single victim, no server process, no timing race between
+    /// two eviction paths -- just "does `run_eviction` use the `SpillContext`
+    /// it was handed."
+    ///
+    /// GREEN after the fix: the Hash victim is durably spilled (a `.mpf` file
+    /// exists under `shard_dir/data/` and `db.cold_index` has a live entry
+    /// for the key), NOT plain-dropped -- so a subsequent `EXISTS`/`HGETALL`
+    /// can find it via `promote_cold_if_present` instead of returning a
+    /// stable ghost (`EXISTS == 1`, empty read).
+    #[test]
+    fn test_run_eviction_spills_collection_victim_when_spill_context_given() {
+        use crate::storage::eviction::SpillContext;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let dbs = vec![vec![Database::new()]];
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
+
+        // A real Hash key -- the exact shape `tests/cold_collection_visibility.rs`
+        // probes (HSET f1/v1 f2/v2) -- plus enough filler so the shard is
+        // over its 1-byte-effective budget and `allkeys-lru` is forced to
+        // pick it as the (only) victim.
+        crate::shard::slice::with_shard_db(0, |db| {
+            db.cold_index = Some(ColdIndex::new());
+            let h = db.get_or_create_hash(b"probehash:0").unwrap();
+            h.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+            h.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
+        });
+
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1; // force eviction of the one key present
+        rt.num_shards = 1;
+        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest =
+            crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+        let mut ctx = SpillContext {
+            shard_dir: &shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+        };
+
+        let mut h = NoOpReasonDelHandles::new();
+        run_eviction(
+            &shared,
+            0,
+            &runtime_config,
+            &mut h.wal_writer,
+            &h.repl_backlog,
+            &mut h.replica_txs,
+            &h.repl_state,
+            None,
+            false,
+            Some(&mut ctx),
+        );
+
+        let (len, has_cold_entry) = crate::shard::slice::with_shard_db(0, |db| {
+            (
+                db.len(),
+                db.cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.lookup(b"probehash:0").is_some()),
+            )
+        });
+        assert_eq!(len, 0, "the hash victim must be evicted from hot RAM");
+        assert!(
+            shard_dir.join("data").exists(),
+            "P0 (task #45): the tick eviction path must durably spill a \
+             collection victim to disk when a SpillContext is available, not \
+             plain-drop it"
+        );
+        assert!(
+            has_cold_entry,
+            "P0 (task #45): the spilled hash must be registered in \
+             ColdIndex, or EXISTS/HGETALL can never find it again -- a \
+             stable ghost"
         );
     }
 }
