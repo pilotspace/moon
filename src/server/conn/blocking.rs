@@ -1301,26 +1301,42 @@ pub(crate) fn try_inline_dispatch(
             }
         });
         match outcome {
-            GetOutcome::Handled => {}
+            GetOutcome::Handled => {
+                let _ = read_buf.split_to(consumed);
+                return 1;
+            }
             GetOutcome::Miss => {
-                let cold = cold_loc.and_then(|(loc, shard_dir)| {
-                    crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
-                });
-                if let Some((value, _ttl)) = cold {
-                    if let crate::storage::entry::RedisValue::String(v) = value {
-                        write_buf.extend_from_slice(b"$");
-                        let mut itoa_buf2 = itoa::Buffer::new();
-                        write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
-                        write_buf.extend_from_slice(b"\r\n");
-                        write_buf.extend_from_slice(&v);
-                        write_buf.extend_from_slice(b"\r\n");
-                    } else {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
+                match cold_loc {
+                    // task #59 (coverage-gap fix): a REAL cold entry exists
+                    // for this key. `try_inline_dispatch` is synchronous --
+                    // it cannot `.await` the off-shard-thread pool read
+                    // (`storage::tiered::cold_read_pool::read_cold_entry_async`)
+                    // the async connection-handler layer uses for exactly
+                    // this case. Doing the blocking `pread` HERE, inline on
+                    // the shard event-loop thread, is precisely the ~1.9s
+                    // stall this task targets -- and plain `GET key` (what
+                    // redis-benchmark and the task's repro hit) is served
+                    // by THIS inline fast path, not the handler's general
+                    // dispatch_read branch, so skipping the fix here left
+                    // the benchmarked path completely unchanged.
+                    //
+                    // Fix: decline to inline this command. Do NOT consume
+                    // the bytes (`read_buf` is left untouched, exactly as
+                    // every other "not eligible for inlining" early-return
+                    // above already does) and do NOT write a response --
+                    // return 0 so `try_inline_dispatch_loop` stops and the
+                    // caller falls through to normal Frame parsing +
+                    // `handler_monoio`'s async GET pre-warm hook, which
+                    // `.await`s the REAL result off-thread without blocking
+                    // the shard.
+                    //
+                    // The genuine-miss case (`cold_loc.is_none()` -- key is
+                    // absent from BOTH tiers) is unaffected: still answered
+                    // inline with a fast `$-1`, no disk I/O either way.
+                    Some(_) => return 0,
+                    None => {
+                        write_buf.extend_from_slice(b"$-1\r\n");
                     }
-                } else {
-                    write_buf.extend_from_slice(b"$-1\r\n");
                 }
             }
         }

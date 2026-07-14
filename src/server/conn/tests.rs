@@ -438,3 +438,126 @@ fn test_inline_multiple_gets() {
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$1\r\n1\r\n$1\r\n2\r\n");
 }
+
+/// task #59 (coverage-gap fix, review round 3): plain `GET key` for a key
+/// that only lives in the cold tier is served by THIS inline fast path
+/// first (before the general async `dispatch_read` branch in
+/// `handler_monoio` ever runs) -- redis-benchmark and the task's original
+/// repro both hit this path. `try_inline_dispatch` is synchronous and
+/// cannot `.await` the off-shard-thread pool read, so doing the blocking
+/// `pread` here would reproduce the exact ~1.9s inline stall the task
+/// targets. It must instead DECLINE (return the "not inlined" sentinel,
+/// bytes unconsumed) and let the caller fall through to the async path.
+///
+/// This test proves it deterministically: inject a large synthetic delay
+/// into the cold-read path, call `try_inline_dispatch` on a `GET` of a key
+/// that IS cold-indexed, and assert it returns almost instantly (nowhere
+/// near the injected delay) with the sentinel `0` and the input bytes
+/// completely unconsumed -- i.e. it never touched the slow path at all,
+/// rather than merely "returned before the delay elapsed" (which a buggy
+/// spawn-and-abandon implementation could also satisfy).
+#[test]
+fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
+    let _guard = crate::storage::tiered::cold_read::TEST_DELAY_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::storage::tiered::cold_read::TEST_INJECT_DELAY_MS
+        .store(1_000, std::sync::atomic::Ordering::Relaxed);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = crate::persistence::manifest::ShardManifest::create(&manifest_path)
+            .expect("create manifest");
+        let mut cold_index = crate::storage::tiered::cold_index::ColdIndex::new();
+        let entry = Entry::new_string(Bytes::from_static(b"cold-value-on-disk"));
+        crate::storage::tiered::kv_spill::spill_to_datafile(
+            tmp.path(),
+            70,
+            b"coldkey",
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .expect("spill");
+        db.cold_shard_dir = Some(tmp.path().to_path_buf());
+        db.cold_index = Some(cold_index);
+    });
+
+    let cmd = b"*2\r\n$3\r\nGET\r\n$7\r\ncoldkey\r\n";
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let original = read_buf.clone();
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    let start = std::time::Instant::now();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        false,
+        &rt_config,
+    );
+    let elapsed = start.elapsed();
+
+    crate::storage::tiered::cold_read::TEST_INJECT_DELAY_MS
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(
+        result, 0,
+        "a cold GET must decline inlining (sentinel 0), not answer it with a blocking read"
+    );
+    assert_eq!(
+        read_buf, original,
+        "declining must leave the command bytes completely unconsumed so the fall-through \
+         parser sees the exact same command"
+    );
+    assert!(
+        write_buf.is_empty(),
+        "declining must not have written any response bytes"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "must return almost immediately -- a 1000ms injected cold-read delay must never be \
+         paid on this synchronous inline path; got {elapsed:?}"
+    );
+}
+
+/// Genuine miss (key absent from BOTH tiers -- no cold index configured at
+/// all) must still be answered inline with a fast `$-1`, unaffected by the
+/// cold-GET bail-out above (which only fires when `cold_lookup_location`
+/// actually finds an entry).
+#[test]
+fn test_inline_get_genuine_miss_still_answers_inline() {
+    let dbs = make_dbs();
+    let cmd = b"*2\r\n$3\r\nGET\r\n$7\r\nnokeyat\r\n";
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        false,
+        &rt_config,
+    );
+    assert_eq!(result, 1);
+    assert!(read_buf.is_empty());
+    assert_eq!(&write_buf[..], b"$-1\r\n");
+}

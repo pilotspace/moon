@@ -1936,6 +1936,61 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
+                    // task #59: GET on a key that only lives in the cold tier
+                    // otherwise pays a blocking `pread` inline on this shard's
+                    // event-loop thread (up to ~1.9s under spill/AOF write
+                    // backlog), stalling every sibling connection on the
+                    // shard. Peek (cheap, in-memory) whether this key needs a
+                    // disk read; if so, `.await` the REAL result (no
+                    // timeout -- see `tmp/task59-design.md` for why a bounded
+                    // fallback was rejected as a correctness regression) off
+                    // this shard thread, which lets siblings run while we
+                    // wait, then promote the actual outcome into hot RAM so
+                    // the normal synchronous `dispatch_read` below answers
+                    // from RAM with no disk I/O of its own. Scoped to GET
+                    // only for now; MGET/HGET/etc. and MULTI/EXEC/Lua keep
+                    // using the original synchronous cold-read path
+                    // (`Database::promote_cold_if_present`), unchanged.
+                    if cmd.eq_ignore_ascii_case(b"GET") {
+                        if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                            let cold_loc =
+                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                    if db.is_hot(key.as_ref()) {
+                                        None
+                                    } else {
+                                        db.cold_lookup_location(key.as_ref())
+                                    }
+                                });
+                            if let Some((loc, shard_dir)) = cold_loc {
+                                let prewarm_now_ms = ctx.cached_clock.ms();
+                                let outcome =
+                                    crate::storage::tiered::cold_read_pool::read_cold_entry_async(
+                                        &shard_dir,
+                                        loc,
+                                        prewarm_now_ms,
+                                    )
+                                    .await;
+                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                    // TOCTOU fix (task #59 review round 2):
+                                    // `promote_cold_outcome` revalidates that
+                                    // the cold index still maps `key` to
+                                    // `loc` before promoting -- closes the
+                                    // window where a concurrent DEL/FLUSHDB
+                                    // on this same shard thread ran while we
+                                    // were suspended on the `.await` above,
+                                    // which would otherwise resurrect a
+                                    // deleted key.
+                                    db.promote_cold_outcome(
+                                        key.as_ref(),
+                                        prewarm_now_ms,
+                                        loc,
+                                        outcome,
+                                    );
+                                });
+                            }
+                        }
+                    }
+
                     // READ PATH: shared lock — no contention with other shards' reads
                     let now_ms = ctx.cached_clock.ms();
                     conn.cmd_counter = conn.cmd_counter.wrapping_add(1);

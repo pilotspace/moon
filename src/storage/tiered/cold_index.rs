@@ -31,7 +31,12 @@ pub struct SweepStats {
 /// `page_idx` is the FILE-ABSOLUTE 4 KB chunk index (0-based); `slot_idx`
 /// is the slot within that page.  For the legacy single-page path, both are
 /// always 0.
-#[derive(Debug, Clone, Copy)]
+/// `PartialEq`/`Eq` (task #59): lets an async cold-read caller that
+/// suspended mid-read revalidate, once it resumes on the shard thread, that
+/// the cold index still maps its key to the SAME location before promoting
+/// the (now possibly stale) result — see
+/// `Database::promote_cold_outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColdLocation {
     /// Manifest file_id of the heap DataFile.
     pub file_id: u64,
