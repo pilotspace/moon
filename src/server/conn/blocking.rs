@@ -1147,7 +1147,7 @@ pub(crate) fn try_inline_dispatch(
     selected_db: usize,
     aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: &Option<
-        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+        std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
     >,
     now_ms: u64,
     num_shards: usize,
@@ -1512,7 +1512,7 @@ pub(crate) fn try_inline_dispatch_loop(
     selected_db: usize,
     aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: &Option<
-        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+        std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
     >,
     now_ms: u64,
     num_shards: usize,

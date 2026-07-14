@@ -635,9 +635,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 /// Read replication backlog resident bytes via the global state.
 fn replication_backlog_bytes() -> usize {
     if let Some(state) = crate::admin::metrics_setup::get_global_repl_state_arc() {
-        if let Ok(guard) = state.read() {
-            return guard.backlog_resident_bytes();
-        }
+        return state.read().backlog_resident_bytes();
     }
     0
 }

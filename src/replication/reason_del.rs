@@ -139,7 +139,7 @@ pub(crate) fn record_reason_del(
 #[cfg(feature = "runtime-monoio")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_reason_del_conn(
-    repl_state: &Option<std::sync::Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
     num_shards: usize,
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
@@ -177,7 +177,7 @@ pub(crate) fn record_reason_del_conn(
 /// PSYNC and the shard self-msg relay this rides on are monoio-only.
 #[cfg(feature = "runtime-monoio")]
 pub(crate) fn record_effect_write(
-    repl_state: &Option<std::sync::Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
     num_shards: usize,
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
@@ -219,7 +219,7 @@ fn conn_has_work(aof_pool: Option<&std::sync::Arc<AofWriterPool>>) -> bool {
 /// mechanics for an arbitrary pre-serialized record instead of only `DEL`.
 #[cfg(feature = "runtime-monoio")]
 fn record_bytes_conn(
-    repl_state: &Option<std::sync::Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
     num_shards: usize,
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
@@ -246,7 +246,7 @@ fn record_bytes_conn(
 /// dispatch fast path only threads the individual fields it needs).
 #[cfg(feature = "runtime-monoio")]
 fn push_record_db(
-    repl_state: &Option<std::sync::Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
     num_shards: usize,
     db: usize,
@@ -261,15 +261,13 @@ fn push_record_db(
         return;
     }
     let needs_select = repl_state.as_ref().is_some_and(|rs| {
-        rs.read().is_ok_and(|g| {
-            g.stream_db.get(shard_id).is_some_and(|slot| {
-                if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
-                    slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
-            })
+        rs.read().stream_db.get(shard_id).is_some_and(|slot| {
+            if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
+                slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
         })
     });
     if needs_select {
@@ -286,20 +284,19 @@ fn push_record_db(
 /// mirrors `handler_monoio::ft::record_local_write` exactly.
 #[cfg(feature = "runtime-monoio")]
 fn push_record(
-    repl_state: &Option<std::sync::Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
     bytes: Bytes,
 ) {
     let mut end_offset = u64::MAX;
     if let Some(rs) = repl_state.as_ref() {
-        if let Ok(g) = rs.read() {
-            if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
-                if let Some(backlog) = slot.lock().as_mut() {
-                    backlog.append(&bytes);
-                }
+        let g = rs.read();
+        if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
+            if let Some(backlog) = slot.lock().as_mut() {
+                backlog.append(&bytes);
             }
-            end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
         }
+        end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
     }
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
         bytes,

@@ -734,10 +734,9 @@ impl AofWriterPool {
     /// `ReplicationState::issue_lsn` so handler call sites collapse to a
     /// single line.
     ///
-    /// Returns 0 when:
-    /// - `repl_state` is None (test fixtures or shutdown paths)
-    /// - the `RwLock` is poisoned (shouldn't happen in production —
-    ///   ReplicationState is only `write()`-locked under known-safe paths)
+    /// Returns 0 when `repl_state` is None (test fixtures or shutdown paths).
+    /// `parking_lot::RwLock` does not poison, so there is no lock-error case
+    /// to fall back on here (task #70 — was a std::sync poisoning dance).
     ///
     /// 0 is a sentinel meaning "no replication ordering for this write".
     /// TopLevel writers ignore the LSN entirely so 0 is harmless there;
@@ -746,13 +745,13 @@ impl AofWriterPool {
     /// for the cross-shard `OrderedAcrossShards` merge in RFC step 5.
     #[inline]
     pub fn issue_append_lsn(
-        repl_state: &Option<Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>>,
+        repl_state: &Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
         shard_id: usize,
         delta: usize,
     ) -> u64 {
         repl_state
             .as_ref()
-            .and_then(|rs| rs.read().ok().map(|g| g.issue_lsn(shard_id, delta as u64)))
+            .map(|rs| rs.read().issue_lsn(shard_id, delta as u64))
             .unwrap_or(0)
     }
 

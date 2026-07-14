@@ -122,13 +122,33 @@ impl ReplicationState {
     /// subsequent writes on the shard's event loop start being captured for
     /// partial resync. Capacity comes from `self.backlog_capacity`
     /// (`--repl-backlog-size`, default 1 MiB per shard).
+    ///
+    /// Task #70: allocation is deliberately split from [`mark_fanout_active`]
+    /// — a bare `REPLCONF` (sent by any prober, or the first two steps of a
+    /// handshake that never reaches `PSYNC`) used to flip the process-global
+    /// `FANOUT_HINT` here, and the hint is never cleared, so a single failed
+    /// handshake permanently taxed every future write with the replication
+    /// serialize+SPSC round trip. Backlog allocation itself stays load-
+    /// bearing on `REPLCONF` (a real handshake's `REPLCONF` arrives before
+    /// `PSYNC`, so deferring allocation to `PSYNC` would buffer zero bytes
+    /// during the handshake window); only the hint activation moved to
+    /// `try_handle_psync` (dispatch.rs), which runs on an actual `PSYNC`
+    /// arrival — never on a `REPLCONF`-only probe.
+    ///
+    /// ⚠ Correctness invariant (task #70 follow-up): allocating here seeds
+    /// the backlog at the shard's offset AT ALLOCATION TIME, but the gap
+    /// between a bare `REPLCONF` and an actual `PSYNC`/replica registration
+    /// can be arbitrarily long (or never close, for a probe). During that
+    /// gap `FANOUT_HINT` is false, so local writes take the bare-`issue_lsn`
+    /// branch and advance the shard offset with NO backlog append — the
+    /// allocated backlog silently skews stale. Backlog byte positions are
+    /// therefore only trustworthy from the LAST activation-time
+    /// [`Self::realign_backlog`] call onward, never from allocation alone.
+    /// Every activation site (`try_handle_psync`, and the per-shard
+    /// `RegisterReplica`/`PrepareReplicaSync` arms in `spsc_handler.rs`)
+    /// MUST call `realign_backlog` before capturing any snapshot/cut offset
+    /// from this backlog.
     pub fn ensure_backlogs_allocated(&self) {
-        // Hint FIRST: any write racing this allocation that still sees the
-        // hint as false advances the offset without a backlog append, and the
-        // seed below (reading the offset AFTER that advance) re-aligns. At
-        // shards=1 both run on the same shard thread, so there is no race at
-        // all. (Multi-shard masters ride the R2 redesign.)
-        mark_fanout_active();
         for (shard_id, slot) in self.per_shard_backlogs.iter().enumerate() {
             let mut guard = slot.lock();
             if guard.is_none() {
@@ -144,6 +164,45 @@ impl ReplicationState {
                     offset,
                 ));
             }
+        }
+    }
+
+    /// Realign an already-allocated backlog for `shard_id` to the shard's
+    /// CURRENT real offset, discarding any bytes/positions that skewed away
+    /// from the offset counter during the REPLCONF-allocated /
+    /// FANOUT_HINT-false window (see [`Self::ensure_backlogs_allocated`]).
+    /// No-op if the shard has no backlog allocated yet, or if the backlog
+    /// is already aligned (`ReplicationBacklog::realign_to` is itself a
+    /// no-op in that case).
+    ///
+    /// MUST be called at every activation site — an actual PSYNC arrival
+    /// (`try_handle_psync`) or a shard's own `RegisterReplica` /
+    /// `PrepareReplicaSync` arm (`spsc_handler.rs`) — BEFORE that call site
+    /// captures any snapshot/cut/push offset from this backlog. A skewed
+    /// buffer's contents are already useless (they cover positions the real
+    /// counter never confirmed), so resetting is correct: any partial-resync
+    /// request for an offset below the new `start_offset` falls through
+    /// `bytes_from` returning `None`, and the caller's existing fail-safe —
+    /// full resync — kicks in. Never silently serves wrong bytes.
+    ///
+    /// Race-free ONLY when called from the shard thread that owns
+    /// `shard_id`'s own offset advances — true for every call site above
+    /// (the inline single-shard PSYNC leg at shards=1 runs on that shard's
+    /// event-loop thread; the SPSC arms run there by construction), so the
+    /// offset read below and the realign happen back-to-back with nothing
+    /// else able to interleave on that shard's own append/advance sequence.
+    pub fn realign_backlog(&self, shard_id: usize) {
+        let Some(slot) = self.per_shard_backlogs.get(shard_id) else {
+            return;
+        };
+        let mut guard = slot.lock();
+        if let Some(backlog) = guard.as_mut() {
+            let offset = self
+                .shard_offsets
+                .get(shard_id)
+                .map(|o| o.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            backlog.realign_to(offset);
         }
     }
 
@@ -387,9 +446,15 @@ pub fn save_replication_state(
 /// Write hot paths gate their replication-fanout serialization on this ONE
 /// Relaxed load instead of taking `repl_state.read()` per command (the same
 /// S3.5a rationale that gave READONLY its `is_replica_mirror` AtomicBool).
-/// Set by `ensure_backlogs_allocated` (REPLCONF/PSYNC arrival) and never
-/// cleared — once a replica has attached, the master keeps feeding the
-/// backlog so partial resync stays possible, exactly like Redis.
+///
+/// Set by an actual `PSYNC` arrival (`try_handle_psync` in
+/// `handler_monoio::dispatch`) or multi-shard replica registration — NOT by
+/// a bare `REPLCONF` (task #70: `REPLCONF` only allocates the backlog via
+/// [`ReplicationState::ensure_backlogs_allocated`], which does not touch this
+/// hint, so a prober or a handshake that never reaches `PSYNC` cannot flip it
+/// on). Never cleared once set — once a replica has genuinely begun
+/// attaching, the master keeps feeding the backlog so partial resync stays
+/// possible, exactly like Redis.
 static FANOUT_HINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mark the fanout hint (idempotent). See [`FANOUT_HINT`].
@@ -427,15 +492,14 @@ pub fn record_local_write_global(shard_id: usize, bytes: Bytes) {
     let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
         return;
     };
-    let mut end_offset = u64::MAX;
-    if let Ok(g) = repl_state_arc.read() {
-        if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
-            if let Some(backlog) = slot.lock().as_mut() {
-                backlog.append(&bytes);
-            }
+    let g = repl_state_arc.read();
+    if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
+        if let Some(backlog) = slot.lock().as_mut() {
+            backlog.append(&bytes);
         }
-        end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
     }
+    let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
+    drop(g);
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
         bytes,
         end_offset,
@@ -453,16 +517,18 @@ pub fn record_local_write_db_global(shard_id: usize, db: usize, bytes: Bytes) {
     let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
         return;
     };
-    let needs_select = repl_state_arc.read().is_ok_and(|g| {
-        g.stream_db.get(shard_id).is_some_and(|slot| {
+    let needs_select = repl_state_arc
+        .read()
+        .stream_db
+        .get(shard_id)
+        .is_some_and(|slot| {
             if slot.load(Ordering::Relaxed) != db as i64 {
                 slot.store(db as i64, Ordering::Relaxed);
                 true
             } else {
                 false
             }
-        })
-    });
+        });
     if needs_select {
         record_local_write_global(
             shard_id,
@@ -689,6 +755,194 @@ mod tests {
         backlog.append(&data);
         assert_eq!(backlog.start_offset(), 100, "evicts past configured cap");
         assert_eq!(backlog.end_offset(), (MIN_REPL_BACKLOG_SIZE + 100) as u64);
+    }
+
+    /// Task #70 RED/GREEN: `ensure_backlogs_allocated` — the side effect of a
+    /// bare REPLCONF (`try_handle_replconf`, dispatch.rs) — must NOT flip the
+    /// sticky, process-global `FANOUT_HINT`. Only an actual PSYNC arrival
+    /// (`try_handle_psync`) or replica registration (`RegisterReplica`/
+    /// `PrepareReplicaSync` in `spsc_handler.rs`) may.
+    ///
+    /// RED on the pre-fix code: the old `ensure_backlogs_allocated` called
+    /// `mark_fanout_active()` unconditionally as its first line, so this
+    /// delta assertion (`before == after`) fails — `after` flips to `true`
+    /// regardless of `before` — proving a probe/failed handshake that only
+    /// ever sends REPLCONF (never PSYNC) permanently taxed every future
+    /// write. GREEN on the fix: `ensure_backlogs_allocated` only allocates
+    /// the backlog (still load-bearing, asserted below), the hint is
+    /// untouched.
+    ///
+    /// `FANOUT_HINT` is a process-global `static` shared by every test in
+    /// this binary; the delta form (`before == after`) is deliberately
+    /// robust to whatever the ambient value already is — no test in this
+    /// codebase's unit-test-reachable surface calls `mark_fanout_active`
+    /// outside a real `ConnectionContext`/`RegisterReplica` path, so `before`
+    /// is `false` in practice, but the assertion does not depend on that.
+    #[test]
+    fn test_ensure_backlogs_allocated_does_not_activate_fanout_hint() {
+        let before = fanout_hint_active();
+        let state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
+        state.ensure_backlogs_allocated();
+        let after = fanout_hint_active();
+        assert_eq!(
+            before, after,
+            "ensure_backlogs_allocated (bare-REPLCONF path) must not change \
+             the sticky process-global fanout hint — task #70"
+        );
+        // Allocation itself is unchanged, still load-bearing: writes between
+        // REPLCONF and PSYNC are captured once PSYNC actually flips the hint.
+        assert!(
+            state.per_shard_backlogs[0].lock().is_some(),
+            "backlog allocation must still happen on REPLCONF"
+        );
+        assert!(state.per_shard_backlogs[1].lock().is_some());
+    }
+
+    /// Task #70 companion: the actual activation path (`mark_fanout_active`,
+    /// called from `try_handle_psync` on a genuine PSYNC arrival and from the
+    /// `RegisterReplica`/`PrepareReplicaSync` shard-message arms) still sets
+    /// the hint — monotonic, so this holds regardless of the ambient value.
+    #[test]
+    fn test_mark_fanout_active_sets_hint() {
+        mark_fanout_active();
+        assert!(
+            fanout_hint_active(),
+            "mark_fanout_active (actual PSYNC/replica registration) must set the hint"
+        );
+    }
+
+    /// Task #70 correctness follow-up (orchestrator-caught regression):
+    /// `ensure_backlogs_allocated` (bare REPLCONF) seeds the backlog at the
+    /// shard's offset AT THAT INSTANT. If the hint stays false afterward
+    /// (no PSYNC yet — exactly the window this task's fix widened), local
+    /// writes advance the shard offset via the bare `issue_lsn` path with NO
+    /// backlog append, so the backlog silently skews stale relative to the
+    /// real offset counter. This test proves the skew is real (asserting it
+    /// BEFORE calling the fix), then proves `realign_backlog` — called at
+    /// every activation site — repairs it.
+    ///
+    /// RED without the fix: if a caller captured a snapshot/cut offset from
+    /// the backlog at this point (skipping `realign_backlog`), it would read
+    /// `backlog.end_offset() == 0` while the shard's real offset is `300` —
+    /// a 300-byte skew. `bytes_from(300)` against the unrealigned backlog
+    /// returns `None` (300 is treated as a future offset past a backlog
+    /// whose `end_offset` is still 0), which silently drops partial-resync
+    /// catch-up instead of correctly triggering a full resync at the RIGHT
+    /// offset — the corruption the orchestrator flagged.
+    /// GREEN with the fix: after `realign_backlog`, `end_offset` matches the
+    /// real offset exactly and `bytes_from` at that offset returns the
+    /// (empty) live tail, not `None`.
+    #[test]
+    fn test_realign_backlog_fixes_skew_after_hint_false_window() {
+        let state = ReplicationState::new(1, generate_repl_id(), ZEROED_ID.to_string());
+
+        // 1. Bare REPLCONF: allocates + seeds the backlog at offset 0.
+        state.ensure_backlogs_allocated();
+        assert_eq!(
+            state.per_shard_backlogs[0]
+                .lock()
+                .as_ref()
+                .unwrap()
+                .end_offset(),
+            0
+        );
+
+        // 2. The FANOUT_HINT-false window: local writes advance the shard's
+        // real offset via the bare-LSN path (no backlog append — this is
+        // exactly what `record_local_write` skips while
+        // `replication_fanout_active` is false).
+        state.issue_lsn(0, 100);
+        state.issue_lsn(0, 150);
+        state.issue_lsn(0, 50);
+        let real_offset = state.shard_offset(0);
+        assert_eq!(real_offset, 300);
+
+        // Prove the skew actually exists before the fix runs: the backlog
+        // is still stuck at its allocation-time offset while the real
+        // counter has moved on.
+        let skewed_end = state.per_shard_backlogs[0]
+            .lock()
+            .as_ref()
+            .unwrap()
+            .end_offset();
+        assert_eq!(skewed_end, 0, "backlog must still be stale pre-realign");
+        assert_ne!(
+            skewed_end, real_offset,
+            "skew must exist: this is the bug the orchestrator caught"
+        );
+        // A caller that (incorrectly) trusted the skewed backlog now would
+        // silently drop catch-up instead of full-resyncing: bytes_from at
+        // the real offset returns None because the backlog doesn't know
+        // any offset that high exists yet.
+        assert_eq!(
+            state.per_shard_backlogs[0]
+                .lock()
+                .as_ref()
+                .unwrap()
+                .bytes_from(real_offset),
+            None,
+            "unrealigned backlog treats the real offset as an unreachable future position"
+        );
+
+        // 3. Activation (PSYNC arrival / RegisterReplica arm): realign BEFORE
+        // any snapshot/cut offset is captured.
+        state.realign_backlog(0);
+
+        let realigned_end = state.per_shard_backlogs[0]
+            .lock()
+            .as_ref()
+            .unwrap()
+            .end_offset();
+        assert_eq!(
+            realigned_end, real_offset,
+            "realign_backlog must bring the backlog's end_offset back in sync \
+             with the shard's real offset counter — task #70 correctness fix"
+        );
+        assert_eq!(
+            state.per_shard_backlogs[0]
+                .lock()
+                .as_ref()
+                .unwrap()
+                .bytes_from(real_offset),
+            Some(vec![]),
+            "post-realign, the real offset is a valid (empty) live-tail position"
+        );
+    }
+
+    /// Integration-shaped companion: after realign, a record appended via
+    /// the normal write path lands at exactly the pre-append real offset —
+    /// end-to-end proof that catch-up reads from the correct byte range
+    /// once activation has realigned the backlog.
+    #[test]
+    fn test_realign_backlog_then_append_reads_back_exact_record() {
+        let state = ReplicationState::new(1, generate_repl_id(), ZEROED_ID.to_string());
+        state.ensure_backlogs_allocated();
+        state.issue_lsn(0, 300); // hint-false window skew, as above.
+        state.realign_backlog(0); // activation.
+
+        let pre_append_offset = state.shard_offset(0);
+        assert_eq!(pre_append_offset, 300);
+
+        // Simulate the write path's post-activation record append
+        // (`record_local_write`'s backlog.append + increment_shard_offset
+        // pairing) directly against the now-realigned backlog.
+        let record = b"*1\r\n$4\r\nPING\r\n";
+        {
+            let mut guard = state.per_shard_backlogs[0].lock();
+            guard.as_mut().unwrap().append(record);
+        }
+        state.increment_shard_offset(0, record.len() as u64);
+
+        let bytes = state.per_shard_backlogs[0]
+            .lock()
+            .as_ref()
+            .unwrap()
+            .bytes_from(pre_append_offset)
+            .expect("pre_append_offset must still be live after realign+append");
+        assert_eq!(
+            bytes, record,
+            "catch-up from the pre-append offset must return exactly that record's bytes"
+        );
     }
 
     #[test]

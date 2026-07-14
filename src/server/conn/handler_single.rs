@@ -62,7 +62,7 @@ pub(crate) async fn flush_with_aof_ack<S>(
     mut responses: Vec<Frame>,
     aof_entries: Vec<(usize, usize, Bytes)>,
     pool: &crate::persistence::aof::AofWriterPool,
-    repl_state: &Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    repl_state: &Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
     change_counter: &Option<Arc<AtomicU64>>,
 ) -> bool
 where
@@ -146,7 +146,7 @@ pub async fn handle_connection(
     runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     tracking_table: Arc<Mutex<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
     text_store: Option<Arc<Mutex<crate::text::store::TextStore>>>,
@@ -868,13 +868,11 @@ pub async fn handle_connection(
                                 if let Some(ref rs) = repl_state {
                                     match action {
                                         ReplicaofAction::StartReplication { host, port } => {
-                                            if let Ok(mut rs_guard) = rs.write() {
-                                                rs_guard.set_role(crate::replication::state::ReplicationRole::Replica {
-                                                    host: host.clone(),
-                                                    port,
-                                                    state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
-                                                });
-                                            }
+                                            rs.write().set_role(crate::replication::state::ReplicationRole::Replica {
+                                                host: host.clone(),
+                                                port,
+                                                state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
+                                            });
                                         }
                                         ReplicaofAction::PromoteToMaster => {
                                             use crate::replication::state::generate_repl_id;
@@ -882,11 +880,10 @@ pub async fn handle_connection(
                                             // bump the generation anyway so any task spawned by
                                             // another handler path stops applying.
                                             let _ = crate::replication::replica::bump_replica_task_epoch();
-                                            if let Ok(mut rs_guard) = rs.write() {
-                                                rs_guard.repl_id2 = rs_guard.repl_id.clone();
-                                                rs_guard.repl_id = generate_repl_id();
-                                                rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
-                                            }
+                                            let mut rs_guard = rs.write();
+                                            rs_guard.repl_id2 = rs_guard.repl_id.clone();
+                                            rs_guard.repl_id = generate_repl_id();
+                                            rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
                                         }
                                         ReplicaofAction::NoOp => {}
                                     }
@@ -952,7 +949,7 @@ pub async fn handle_connection(
                                     Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
                                     _ => String::new(),
                                 };
-                                if let Ok(rs_guard) = rs.try_read() {
+                                if let Some(rs_guard) = rs.try_read() {
                                     response_text.push_str(
                                         &crate::replication::handshake::build_info_replication(&rs_guard),
                                     );
@@ -965,7 +962,7 @@ pub async fn handle_connection(
 
                         // --- READONLY enforcement: reject writes on replicas ---
                         if let Some(ref rs) = repl_state {
-                            if let Ok(rs_guard) = rs.try_read() {
+                            if let Some(rs_guard) = rs.try_read() {
                                 if matches!(
                                     rs_guard.role,
                                     crate::replication::state::ReplicationRole::Replica { .. }

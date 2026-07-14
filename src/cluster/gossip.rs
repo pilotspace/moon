@@ -360,7 +360,7 @@ pub async fn run_gossip_ticker(
     node_timeout_ms: u64,
     shutdown: CancellationToken,
     vote_tx: SharedVoteTx,
-    repl_state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    repl_state: std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut election_spawned = false;
@@ -402,7 +402,7 @@ pub async fn run_gossip_ticker(
                                 }
                                 let cs_election = cluster_state.clone();
                                 let sa = self_addr;
-                                let offset = repl_state.read().unwrap().total_offset();
+                                let offset = repl_state.read().total_offset();
                                 let vtx = vote_tx.clone();
                                 tokio::spawn(async move {
                                     crate::cluster::failover::run_election_task(
@@ -494,7 +494,7 @@ pub async fn run_gossip_ticker(
     node_timeout_ms: u64,
     shutdown: CancellationToken,
     vote_tx: SharedVoteTx,
-    repl_state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    repl_state: std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
 ) {
     let mut election_spawned = false;
     // Bound outstanding PING probes (see the tokio variant): one probe at a
@@ -530,7 +530,7 @@ pub async fn run_gossip_ticker(
                                 }
                                 let cs_election = cluster_state.clone();
                                 let sa = self_addr;
-                                let offset = repl_state.read().unwrap().total_offset();
+                                let offset = repl_state.read().total_offset();
                                 let vtx = vote_tx.clone();
                                 monoio::spawn(async move {
                                     crate::cluster::failover::run_election_task(

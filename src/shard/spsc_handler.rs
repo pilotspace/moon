@@ -2791,15 +2791,33 @@ pub(crate) fn handle_shard_message_shared(
             // silently diverge from the handshake-path allocation.
             crate::replication::state::mark_fanout_active();
             let mut guard = repl_backlog.lock();
-            if guard.is_none() {
-                // Seed byte positions at the current shard offset so range
-                // math stays aligned with pre-attach `issue_lsn` advances —
-                // see `ReplicationBacklog::new_at`.
-                let offset = repl_state
-                    .as_ref()
-                    .map(|h| h.shard_offset(shard_id))
-                    .unwrap_or(0);
-                *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
+            let current_offset = repl_state
+                .as_ref()
+                .map(|h| h.shard_offset(shard_id))
+                .unwrap_or(0);
+            match guard.as_mut() {
+                None => {
+                    // Seed byte positions at the current shard offset so
+                    // range math stays aligned with pre-attach `issue_lsn`
+                    // advances — see `ReplicationBacklog::new_at`.
+                    *guard = Some(ReplicationBacklog::new_at(backlog_capacity, current_offset));
+                }
+                Some(backlog) => {
+                    // Task #70 correctness fix (orchestrator-caught
+                    // regression): this backlog may already have been
+                    // allocated by an earlier bare REPLCONF and skewed
+                    // stale during the FANOUT_HINT-false window — writes in
+                    // that window advanced `current_offset` via the
+                    // bare-`issue_lsn` branch with no matching append. This
+                    // arm runs on the shard's OWN event-loop thread (both
+                    // same-thread self-queue and cross-thread SPSC
+                    // registrations drain here), so this offset read and
+                    // the realign are race-free with this shard's own
+                    // append/advance sequence. Realign BEFORE `cut` /
+                    // `push_offset` are captured below — see
+                    // `ReplicationState::realign_backlog` / `ReplicationBacklog::realign_to`.
+                    backlog.realign_to(current_offset);
+                }
             }
             drop(guard);
             // Exactly-once cut (per-shard axis): pusher-captured when the
@@ -2874,12 +2892,26 @@ pub(crate) fn handle_shard_message_shared(
             // PSYNC always answers with a full resync).
             {
                 let mut guard = repl_backlog.lock();
-                if guard.is_none() {
-                    let offset = repl_state
-                        .as_ref()
-                        .map(|h| h.shard_offset(shard_id))
-                        .unwrap_or(0);
-                    *guard = Some(ReplicationBacklog::new_at(backlog_capacity, offset));
+                let current_offset = repl_state
+                    .as_ref()
+                    .map(|h| h.shard_offset(shard_id))
+                    .unwrap_or(0);
+                match guard.as_mut() {
+                    None => {
+                        *guard = Some(ReplicationBacklog::new_at(backlog_capacity, current_offset));
+                    }
+                    Some(backlog) => {
+                        // Task #70 correctness fix (orchestrator-caught
+                        // regression): same skew risk and same race-free
+                        // argument as the `RegisterReplica` arm above — this
+                        // whole leg runs synchronously on this shard's own
+                        // thread, BEFORE `shard_offset` (the `cut` for this
+                        // leg) is captured further down. Realigning here
+                        // guarantees the backlog's own `end_offset` matches
+                        // that `cut` exactly, even though this path doesn't
+                        // replay the backlog itself for the snapshot body.
+                        backlog.realign_to(current_offset);
+                    }
                 }
             }
             let started = std::time::Instant::now();

@@ -455,14 +455,13 @@ pub(super) fn try_handle_replicaof(
         if let Some(ref rs) = ctx.repl_state {
             match action {
                 ReplicaofAction::StartReplication { host, port } => {
-                    if let Ok(mut rs_guard) = rs.write() {
-                        rs_guard.set_role(crate::replication::state::ReplicationRole::Replica {
+                    rs.write()
+                        .set_role(crate::replication::state::ReplicationRole::Replica {
                             host: host.clone(),
                             port,
                             state:
                                 crate::replication::handshake::ReplicaHandshakeState::PingPending,
                         });
-                    }
                     let rs_clone = Arc::clone(rs);
                     // Bump the task generation FIRST: any previously spawned
                     // replica task (old REPLICAOF target) sees itself
@@ -488,11 +487,10 @@ pub(super) fn try_handle_replicaof(
                     // left it streaming + applying forever (each NO ONE →
                     // re-attach cycle stacked one more live applier).
                     let _ = crate::replication::replica::bump_replica_task_epoch();
-                    if let Ok(mut rs_guard) = rs.write() {
-                        rs_guard.repl_id2 = rs_guard.repl_id.clone();
-                        rs_guard.repl_id = generate_repl_id();
-                        rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
-                    }
+                    let mut rs_guard = rs.write();
+                    rs_guard.repl_id2 = rs_guard.repl_id.clone();
+                    rs_guard.repl_id = generate_repl_id();
+                    rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
                 }
                 ReplicaofAction::NoOp => {}
             }
@@ -510,6 +508,12 @@ pub(super) fn try_handle_replicaof(
 /// chicken-and-egg gap where the original code only allocated on
 /// `RegisterReplica` (after PSYNC), causing the master to buffer zero bytes
 /// during the handshake window.
+///
+/// Task #70: allocation-only — does NOT activate the sticky `FANOUT_HINT`.
+/// A bare REPLCONF (health-checker probe, or a handshake that never sends
+/// PSYNC) must not permanently tax every subsequent write with the
+/// replication serialize+SPSC round trip. The hint is activated on the
+/// actual PSYNC arrival instead (`try_handle_psync` above).
 #[inline]
 pub(super) fn try_handle_replconf(
     cmd: &[u8],
@@ -521,10 +525,9 @@ pub(super) fn try_handle_replconf(
         return false;
     }
     if let Some(ref rs) = ctx.repl_state {
-        if let Ok(g) = rs.read() {
-            if matches!(g.role, crate::replication::state::ReplicationRole::Master) {
-                g.ensure_backlogs_allocated();
-            }
+        let g = rs.read();
+        if matches!(g.role, crate::replication::state::ReplicationRole::Master) {
+            g.ensure_backlogs_allocated();
         }
     }
     responses.push(crate::command::connection::replconf(cmd_args));
@@ -577,20 +580,31 @@ pub(super) fn try_handle_psync(
         return None;
     };
     {
-        let g = rs.read().ok();
-        let is_master = g
-            .as_ref()
-            .map(|g| matches!(g.role, crate::replication::state::ReplicationRole::Master))
-            .unwrap_or(false);
+        let g = rs.read();
+        let is_master = matches!(g.role, crate::replication::state::ReplicationRole::Master);
         if !is_master {
             responses.push(Frame::Error(Bytes::from_static(
                 b"ERR PSYNC is only valid on a master",
             )));
             return None;
         }
-        if let Some(g) = g {
-            g.ensure_backlogs_allocated();
-        }
+        g.ensure_backlogs_allocated();
+        // Task #70: this is the actual-PSYNC arrival — activate the sticky
+        // fanout hint HERE, not on a bare REPLCONF (see
+        // `ReplicationState::ensure_backlogs_allocated` doc comment). A
+        // handshake that reaches PSYNC is a genuine replica attaching; a
+        // REPLCONF-only probe never reaches this line.
+        crate::replication::state::mark_fanout_active();
+        // Correctness fix (orchestrator-caught regression on the above):
+        // a bare REPLCONF may have already allocated this shard's backlog
+        // and left it skewed stale during the FANOUT_HINT-false window (see
+        // `ReplicationState::realign_backlog` doc comment). Realign BEFORE
+        // any snapshot/cut offset is captured below — this function runs on
+        // the connection task, which at shards=1 (the only case this
+        // single-shard inline leg handles) IS the owning shard's own
+        // event-loop thread, so the offset read inside `realign_backlog`
+        // and this shard's own append/advance sequence cannot interleave.
+        g.realign_backlog(ctx.shard_id);
     }
     let repl_id = match &cmd_args[0] {
         Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).into_owned(),
@@ -662,7 +676,7 @@ pub(super) async fn try_handle_info(
     });
     let mut response_text = response_text;
     if let Some(ref rs) = ctx.repl_state {
-        if let Ok(rs_guard) = rs.try_read() {
+        if let Some(rs_guard) = rs.try_read() {
             response_text.push_str(&crate::replication::handshake::build_info_replication(
                 &rs_guard,
             ));

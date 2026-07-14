@@ -272,7 +272,7 @@ fn replicate_mq_record(shard_id: usize, db_index: usize, cmd_name: &'static [u8]
     let Some(repl_state) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
         return;
     };
-    let single_shard = repl_state.read().is_ok_and(|g| g.num_shards() == 1);
+    let single_shard = repl_state.read().num_shards() == 1;
     if !single_shard {
         return;
     }

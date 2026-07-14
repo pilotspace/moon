@@ -59,7 +59,7 @@ impl super::Shard {
         persistence_dir: Option<String>,
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
         snapshot_trigger_tx: channel::WatchSender<u64>,
-        repl_state_ext: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+        repl_state_ext: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
         acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>>,
@@ -729,25 +729,21 @@ impl super::Shard {
         // path doesn't need to traverse ReplicationState's outer RwLock per write.
         let repl_backlog: crate::replication::backlog::SharedBacklog = match repl_state_ext.as_ref()
         {
-            Some(rs) => match rs.read() {
-                Ok(g) => g
-                    .per_shard_backlogs
-                    .get(self.id)
-                    .cloned()
-                    .unwrap_or_else(|| std::sync::Arc::new(parking_lot::Mutex::new(None))),
-                Err(_) => std::sync::Arc::new(parking_lot::Mutex::new(None)),
-            },
+            Some(rs) => rs
+                .read()
+                .per_shard_backlogs
+                .get(self.id)
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(parking_lot::Mutex::new(None))),
             None => std::sync::Arc::new(parking_lot::Mutex::new(None)),
         };
         let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
-        let repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>> = repl_state_ext;
+        let repl_state: Option<Arc<parking_lot::RwLock<ReplicationState>>> = repl_state_ext;
         // QW3 (2026-06 review): lock-free offset handle cloned ONCE at shard
         // startup. The SPSC drain's per-write offset advance goes through this
         // handle, so the surrounding RwLock is never read-locked per write.
-        let repl_offsets: Option<crate::replication::state::OffsetHandle> = repl_state
-            .as_ref()
-            .and_then(|rs| rs.read().ok())
-            .map(|g| g.offset_handle());
+        let repl_offsets: Option<crate::replication::state::OffsetHandle> =
+            repl_state.as_ref().map(|rs| rs.read().offset_handle());
 
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();

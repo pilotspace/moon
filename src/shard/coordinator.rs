@@ -372,7 +372,7 @@ async fn run_on_owner_persist(
 /// Type of the replication-state handle threaded into the coordinator's local
 /// persistence path (same shape `AofWriterPool::issue_append_lsn` expects).
 type ReplStateRef<'a> =
-    &'a Option<Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>>;
+    &'a Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>;
 
 /// Persist a coordinator LOCAL-leg write to the owning shard's AOF, matching the
 /// local single-key write contract (the `is_write` block in
