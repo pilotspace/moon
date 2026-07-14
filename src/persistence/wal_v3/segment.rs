@@ -156,9 +156,109 @@ struct SegmentPlaneScan {
     has_graph_temporal: bool,
 }
 
+/// True for the plane record types whose ONLY durable copy is the WAL
+/// itself (see [`segment_plane_scan`]'s doc-comment for why). Shared
+/// between the outer-type match arm and the v0.6.0 nested-Command unwrap
+/// arm so the two can never drift apart.
+#[inline]
+fn plane_type_blocks_recycle(t: WalRecordType) -> bool {
+    matches!(
+        t,
+        WalRecordType::TemporalUpsert
+            | WalRecordType::WorkspaceCreate
+            | WalRecordType::WorkspaceDrop
+            | WalRecordType::MqCreate
+            | WalRecordType::MqAck
+            | WalRecordType::MqPush
+            | WalRecordType::MqPop
+            | WalRecordType::MqTrigger
+            | WalRecordType::MqDrop
+    )
+}
+
+/// Peeks a `Command` record's raw payload bytes for a nested WAL v3 record
+/// frame, without allocating or decompressing.
+///
+/// **Why this exists (v0.6.0 upgrade-boundary contract, task #69):** the
+/// v0.6.0 shard event-loop's `wal_append` drain hardcoded
+/// `WalRecordType::Command` as the OUTER wrapper for EVERY plane record —
+/// `TemporalUpsert`, `WorkspaceCreate`/`Drop`, and every `Mq*` variant —
+/// verified against the v0.6.0 tag's `event_loop.rs` (lines 1452/2070). A
+/// v0.6.0-written segment therefore has no plane records at the outer-type
+/// level at all; they are all nested one level down, inside a `Command`
+/// payload. `shared_databases.rs`'s replay path
+/// (`replay_workspace_wal` / `replay_mq_wal` / `replay_temporal_wal`)
+/// already unwraps this shape via `read_wal_v3_record(&record.payload)` on
+/// every `Command` record it sees — this function mirrors that EXACT
+/// byte layout (length prefix + 12-byte header + CRC32C trailer, see
+/// `record.rs`'s module doc) so the content scan and replay never
+/// disagree about what counts as a nested record. Post-v0.6.0 builds
+/// pre-frame plane records the same way at the point of emission (see
+/// `mq_exec.rs`, `command::temporal::apply_invalidate`), so this shape is
+/// not purely historical — it is the SAME nested framing new builds still
+/// produce for those planes; only bare (non-nested) records are the
+/// newer, separate on-disk arrangement `segment_plane_scan`'s outer match
+/// already covered.
+///
+/// Returns:
+/// - `Some(Some(record_type))` — `payload` contains a structurally valid
+///   nested frame (length bounds AND CRC32C both check out) whose inner
+///   type byte decodes to a known [`WalRecordType`].
+/// - `Some(None)` — `payload` contains a structurally valid nested frame,
+///   but the inner type byte does not decode (a future plane type this
+///   build predates). Callers must fail closed on this case.
+/// - `None` — `payload` does not contain a validly-framed nested record at
+///   all (the CRC32C did not match, or the length was out of bounds) —
+///   the overwhelmingly common case: an ordinary opaque RESP command
+///   payload. `write_wal_v3_record` never LZ4-compresses `Command`
+///   payloads (only `FullPageImage` is compression-eligible), so no
+///   decompression step is needed here — this is a pure byte-slice peek,
+///   allocation-free like the rest of this scan.
+fn peek_nested_plane_record_type(payload: &[u8]) -> Option<Option<WalRecordType>> {
+    // Minimum inner framing: len(4) + header(12) + crc(4) = 20, matching
+    // `record::MIN_RECORD_SIZE` (not exported — duplicated as a literal
+    // here, same as this file's own outer-record framing check below).
+    const MIN_INNER_RECORD_SIZE: usize = 20;
+    if payload.len() < MIN_INNER_RECORD_SIZE {
+        return None;
+    }
+    let inner_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if inner_len < MIN_INNER_RECORD_SIZE || inner_len > payload.len() {
+        return None;
+    }
+    // CRC32C covers bytes [4..inner_len-4] of the nested frame — identical
+    // span to `read_wal_v3_record`'s `crc32c::crc32c(&data[4..record_len -
+    // 4])` check in `record.rs`.
+    let crc_stored = u32::from_le_bytes([
+        payload[inner_len - 4],
+        payload[inner_len - 3],
+        payload[inner_len - 2],
+        payload[inner_len - 1],
+    ]);
+    let crc_computed = crc32c::crc32c(&payload[4..inner_len - 4]);
+    if crc_stored != crc_computed {
+        return None; // not a nested frame — plain opaque Command payload
+    }
+    Some(WalRecordType::from_u8(payload[12]))
+}
+
 /// Single-pass content scan backing both the recycle-gating boolean
 /// (`blocks_recycle`) and the K2 `GraphTemporal` observability
 /// counter, so recyclers never need to read a sealed segment file twice.
+///
+/// **v0.6.0 wire-history note (task #69):** every plane record a v0.6.0
+/// binary ever wrote is nested inside a `WalRecordType::Command` outer
+/// record (see [`peek_nested_plane_record_type`]'s doc-comment). Without
+/// unwrapping that shape here, a post-upgrade recycle pass sees only
+/// `Command` at the outer level and misclassifies a pre-upgrade segment as
+/// pure-KV history — deleting the sole durable copy of that segment's
+/// WS/MQ/temporal records (no snapshot format exists for those planes, in
+/// ANY mode). The `Some(WalRecordType::Command)` arm below exists solely
+/// to close that upgrade-boundary gap; it must stay byte-layout-identical
+/// to the unwrap `shared_databases.rs::replay_workspace_wal` /
+/// `replay_mq_wal` / `replay_temporal_wal` perform via
+/// `read_wal_v3_record(&record.payload)`, or scan and replay could
+/// disagree about which segments are safe to delete.
 fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
     use super::record::WalRecordType;
 
@@ -195,17 +295,25 @@ fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
             return BLOCKED; // torn/malformed sealed tail — fail closed
         }
         match WalRecordType::from_u8(data[offset + 12]) {
-            Some(
-                WalRecordType::TemporalUpsert
-                | WalRecordType::WorkspaceCreate
-                | WalRecordType::WorkspaceDrop
-                | WalRecordType::MqCreate
-                | WalRecordType::MqAck
-                | WalRecordType::MqPush
-                | WalRecordType::MqPop
-                | WalRecordType::MqTrigger
-                | WalRecordType::MqDrop,
-            ) => return BLOCKED,
+            Some(WalRecordType::Command) => {
+                // v0.6.0 upgrade-boundary unwrap — see doc-comment above.
+                let payload = &data[offset + 16..offset + record_len - 4];
+                match peek_nested_plane_record_type(payload) {
+                    Some(Some(inner_type)) if plane_type_blocks_recycle(inner_type) => {
+                        return BLOCKED;
+                    }
+                    Some(Some(WalRecordType::GraphTemporal)) => has_graph_temporal = true,
+                    Some(Some(_)) => {}
+                    // Structurally valid nested frame, unrecognized inner
+                    // type — fail closed (a future plane type this build
+                    // predates might have no snapshot format either).
+                    Some(None) => return BLOCKED,
+                    // No valid nested frame — an ordinary opaque RESP
+                    // command payload, never blocking.
+                    None => {}
+                }
+            }
+            Some(t) if plane_type_blocks_recycle(t) => return BLOCKED,
             Some(WalRecordType::GraphTemporal) => has_graph_temporal = true,
             Some(_) => {}
             None => return BLOCKED, // unknown (future) type — fail closed
@@ -1673,5 +1781,144 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
         let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
         assert_eq!(writer.append(WalRecordType::Command, b"x"), 1);
+    }
+
+    // ── task #69 (P1, v0.7.0 upgrade-path data loss): v0.6.0's event-loop
+    // `wal_append` drain hardcoded `WalRecordType::Command` as the OUTER
+    // wrapper for every plane record (WS/MQ/Temporal/GraphTemporal) — see
+    // v0.6.0 tag `event_loop.rs` lines 1452/2070. `segment_plane_scan` must
+    // peek inside a Command payload for that nested v3 frame shape, exactly
+    // like `shared_databases.rs::replay_workspace_wal` /
+    // `replay_mq_wal` / `replay_temporal_wal` already do via
+    // `read_wal_v3_record(&record.payload)` — otherwise a post-upgrade
+    // recycle pass misclassifies a pre-upgrade segment as pure-KV and
+    // deletes the sole durable copy of that plane's history.
+
+    /// Builds the exact byte shape a v0.6.0 binary wrote for every plane
+    /// record: an inner v3 frame (`inner_type`/`inner_payload`) serialized
+    /// via `write_wal_v3_record`, with THAT whole frame used as the payload
+    /// of an outer `WalRecordType::Command` record.
+    fn v060_nested_command_payload(inner_type: WalRecordType, inner_payload: &[u8]) -> Vec<u8> {
+        let mut nested = Vec::new();
+        write_wal_v3_record(&mut nested, 1, inner_type, inner_payload);
+        nested
+    }
+
+    #[test]
+    fn test_segment_plane_scan_blocks_v060_nested_workspace_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        let nested =
+            v060_nested_command_payload(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
+        writer.append(WalRecordType::Command, &nested);
+        writer.flush_sync().unwrap();
+
+        let seg_path = WalSegment::segment_path(&wal_dir, 1);
+        let scan = segment_plane_scan(&seg_path);
+        assert!(
+            scan.blocks_recycle,
+            "a v0.6.0-style Command-nested WorkspaceCreate record must block \
+             recycle — it is the sole durable copy of that plane's history"
+        );
+    }
+
+    #[test]
+    fn test_segment_plane_scan_flags_v060_nested_graph_temporal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        let nested =
+            v060_nested_command_payload(WalRecordType::GraphTemporal, b"graph-temporal-payload");
+        writer.append(WalRecordType::Command, &nested);
+        writer.flush_sync().unwrap();
+
+        let seg_path = WalSegment::segment_path(&wal_dir, 1);
+        let scan = segment_plane_scan(&seg_path);
+        assert!(
+            scan.has_graph_temporal,
+            "a v0.6.0-style Command-nested GraphTemporal record must be \
+             observable via has_graph_temporal, same as a direct-typed one"
+        );
+        assert!(
+            !scan.blocks_recycle,
+            "GraphTemporal alone must never block recycle by itself — that \
+             is graph_floor_lsn's job (K2), not the content scan's"
+        );
+    }
+
+    /// Fail-closed contract (function doc-comment): a nested frame whose
+    /// length+CRC32C validate but whose inner type byte is unrecognized (a
+    /// future plane type this build predates) must still block recycle —
+    /// never silently treated as an opaque non-nested Command payload.
+    #[test]
+    fn test_segment_plane_scan_blocks_nested_frame_with_unknown_inner_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        // Hand-build a validly-framed (length + CRC32C both correct) inner
+        // record with a type byte no `WalRecordType` variant claims.
+        let inner_payload = b"future-plane-payload";
+        let mut nested = Vec::new();
+        let record_len = (20 + inner_payload.len()) as u32;
+        nested.extend_from_slice(&record_len.to_le_bytes());
+        let crc_start = nested.len();
+        nested.extend_from_slice(&1u64.to_le_bytes()); // lsn
+        nested.push(0x99); // unrecognized record-type byte
+        nested.push(0u8); // flags
+        nested.extend_from_slice(&[0u8; 2]); // padding
+        nested.extend_from_slice(inner_payload);
+        let crc = crc32c::crc32c(&nested[crc_start..]);
+        nested.extend_from_slice(&crc.to_le_bytes());
+        assert!(
+            WalRecordType::from_u8(0x99).is_none(),
+            "0x99 must stay an unassigned discriminant for this test to be meaningful"
+        );
+
+        writer.append(WalRecordType::Command, &nested);
+        writer.flush_sync().unwrap();
+
+        let seg_path = WalSegment::segment_path(&wal_dir, 1);
+        let scan = segment_plane_scan(&seg_path);
+        assert!(
+            scan.blocks_recycle,
+            "a structurally valid nested frame with an unrecognized inner \
+             type byte must fail closed and block recycle"
+        );
+    }
+
+    /// Pins the entire point of the content scan: an ordinary (non-nested)
+    /// `Command` payload — the common case, a plain RESP-encoded write —
+    /// must NOT block recycling. Without this the fix above could
+    /// over-trigger on any payload and defeat recycling altogether.
+    #[test]
+    fn test_segment_plane_scan_plain_command_payload_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+
+        writer.append(
+            WalRecordType::Command,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n",
+        );
+        writer.flush_sync().unwrap();
+
+        let seg_path = WalSegment::segment_path(&wal_dir, 1);
+        let scan = segment_plane_scan(&seg_path);
+        assert!(
+            !scan.blocks_recycle,
+            "an ordinary non-nested Command (RESP) payload must stay recyclable"
+        );
+        assert!(
+            !scan.has_graph_temporal,
+            "an ordinary non-nested Command payload must never set has_graph_temporal"
+        );
     }
 }
