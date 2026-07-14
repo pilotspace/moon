@@ -1,10 +1,10 @@
 //! CRASH-COLD-NOAOF: disk-offload cold recovery WITHOUT AOF (#22 regression).
 //!
 //! Reproduces and guards the #22 durability bug: with `--appendonly no` and
-//! `--disk-offload enable`, cold (spilled-to-disk) keys must survive a hard
-//! crash and be served via cold read-through after restart — driven PURELY by
-//! the per-shard manifest, with NO AOF replay (there is no AOF under
-//! `appendonly no`).
+//! `--disk-offload enable`, keys that DID make it durably to a manifest-active
+//! `heap-*.mpf` file must survive a hard crash and be served via cold
+//! read-through after restart — driven PURELY by the per-shard manifest, with
+//! NO AOF replay (there is no AOF under `appendonly no`).
 //!
 //! Root cause (main.rs): `persistence_dir` was derived as `Some(..)` only when
 //! `appendonly == "yes" || save.is_some()`. Under `appendonly no` it was `None`,
@@ -14,11 +14,50 @@
 //! recovered 0/200. The fix fires recovery when
 //! `persistence_dir.is_some() || disk_offload_base.is_some()`.
 //!
+//! ## task #44: why this no longer floors on `PROBE_COUNT * 65%`
+//!
+//! The original version of this test forced eviction by blasting `FILLER_COUNT`
+//! writes down one connection and asserted `post >= 65% of PROBE_COUNT`,
+//! assuming most LRU-evicted probes land durably in a `heap-*.mpf` file. That
+//! assumption predates `disk_offload_spill_inert()` / PR #273 (`fix(storage):
+//! policy-aware eviction fail-close for disk-offload without a durability
+//! backstop`) and the write-path gate documented at
+//! `run_write_eviction_gate` (`src/server/conn/handler_monoio/mod.rs`): under
+//! `--appendonly no` (no AOF backstop) the PER-CONNECTION write-path eviction
+//! gate — the path every plain `SET`/`HSET` past `maxmemory` actually takes —
+//! has NO `ShardManifest` handle and therefore PLAIN-DROPS victims (Redis
+//! "pure cache, no durability" semantics for `allkeys-*`/`volatile-*`; see
+//! `config::disk_offload_spill_inert` and the boot-time WARN it drives, plus
+//! `docs/PRODUCTION-CONTRACT.md`'s CRASH-02 note on task #57, which made
+//! exactly this drop-not-OOM behavior the *documented fix*, not a bug). Only
+//! the periodic memory-pressure tick (`shard/persistence_tick.rs`, the one
+//! call site that DOES hold the manifest) durably spills under `appendonly
+//! no`, and a single busy connection's synchronous per-write eviction reacts
+//! before that tick ever observes a sustained over-budget shard — so a write
+//! burst like `write_filler` durably spills only a small, load-sensitive
+//! trickle of the evicted keys (observed 1-51/200 across runs), not a
+//! majority. That is intentional, tested (see
+//! `async_spill_no_aof_backstop_no_manifest_allkeys_lru_evicts_pure_cache` in
+//! `storage::eviction`), and orthogonal to the #22 recovery-gate bug this file
+//! guards.
+//!
+//! So instead of hoping eviction throughput clears a fixed floor, this test
+//! establishes GROUND TRUTH directly from the on-disk manifest + `heap-*.mpf`
+//! files right before the kill (whatever a shard's manifest marks `Active`
+//! KvLeaf at that instant is, by the disk-offload contract, durably spilled)
+//! and asserts recovery returns AT LEAST that many probes — i.e., "every key
+//! that really did reach durable cold storage survives the crash", which is
+//! the actual #22 regression signal, decoupled from how many probes eviction
+//! happened to spill instead of drop.
+//!
 //! Discriminating signal (RED vs GREEN):
-//!   * `heap-*.mpf` files on disk prove the probes were durably spilled to cold.
-//!   * POST-crash read-through proves recovery re-attached the cold index.
-//!   RED (pre-#22-fix binary): heap files present, POST == ~0 (recovery skipped).
-//!   GREEN (post-#22-fix):     heap files present, POST == ~PROBE_COUNT.
+//!   * `heap-*.mpf` files + manifest `Active` KvLeaf entries prove specific
+//!     probes were durably spilled to cold BEFORE the kill (ground truth,
+//!     read directly via `moon::persistence::{manifest,kv_page}`).
+//!   * POST-crash read-through must recover AT LEAST that many probes.
+//!   RED (pre-#22-fix binary): ground truth > 0, POST == ~0 (recovery skipped
+//!   entirely — the persistence_dir gate regressed).
+//!   GREEN (post-#22-fix): POST >= ground truth.
 //! Because there is NO AOF under `appendonly no`, a non-zero POST count can ONLY
 //! come from the cold-manifest recovery path the #22 fix enables.
 //!
@@ -42,9 +81,14 @@
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use moon::persistence::kv_page::read_datafile;
+use moon::persistence::manifest::{FileStatus, ShardManifest};
+use moon::persistence::page::PageType;
 
 const PROBE_COUNT: usize = 200;
 const PROBE_VALUE_LEN: usize = 500;
@@ -56,24 +100,12 @@ const FILLER_VALUE_LEN: usize = 600;
 /// 0.85 × maxmemory; probes (~100 KiB) + filler (~9.6 MiB) >> threshold.
 const MAXMEMORY_BYTES: usize = 8 * 1024 * 1024;
 const SHARDS: usize = 4;
-/// Post-crash recovery floor. This test catches the *categorical* #22
-/// regression: when recovery is skipped the cold tier recovers a hard 0; when
-/// it fires it recovers most of the cold probes. The spread is intrinsic to
-/// crashing under `appendonly no`, where a cold key only survives once its
-/// eviction-tick manifest commit has landed (no per-write durability without
-/// AOF) — and it WIDENS under CPU contention (4 shards on a 6-core CI box
-/// running the filler load + harness), where the spill/manifest threads drain
-/// fewer ticks before the kill. Observed tail under that contention dipped to
-/// 143/200 (still 143× above the RED 0 — recovery plainly fired). So the floor
-/// is 65%: robustly inside the legitimate GREEN band, 130× above the RED 0, and
-/// no longer clipping the load-induced lower tail. The `settle` sleep before the
-/// kill is sized in tandem (see SETTLE_BEFORE_KILL) to drain most ticks first.
-const RECOVERY_FLOOR: usize = (PROBE_COUNT * 65) / 100;
 /// Seconds to let the async spill/manifest ticks drain before the SIGKILL. Under
-/// `appendonly no` only tick-committed cold keys survive a crash; a longer settle
-/// lands more commits and tightens the recovery distribution upward. Sized for
-/// the contended multishard case (8s) — raising it trades test time for a higher,
-/// tighter GREEN band.
+/// `appendonly no` only tick-committed cold keys are durable — a longer settle
+/// gives the periodic memory-pressure cascade (`shard/persistence_tick.rs`, the
+/// one call site with a `ShardManifest` handle under no-AOF; see the module
+/// doc's task #44 section) more chances to catch a transient over-budget shard
+/// before it's kept in ground truth by `count_durable_probe_entries` below.
 const SETTLE_BEFORE_KILL: u64 = 8;
 
 fn unique_port() -> u16 {
@@ -266,36 +298,65 @@ fn redis_get(port: u16, key: &str) -> Option<String> {
     }
 }
 
-/// Write `FILLER_COUNT` distinct keys via pipelined TCP SETs to push memory
-/// past the disk-offload threshold and evict the (older) probe keys to cold.
+/// Push `FILLER_COUNT` keys past the disk-offload threshold via ONE `MSET`
+/// (task #44).
+///
+/// The old version pipelined `FILLER_COUNT` individual `SET`s. Under the
+/// current write-path eviction gate (see the module doc's task #44 section)
+/// EVERY individual write command re-checks `maxmemory` and evicts
+/// synchronously through the manifest-less, plain-drop fallback — so a
+/// pipelined-`SET` burst never lets a shard's memory sit over budget long
+/// enough for the periodic, manifest-backed memory-pressure tick
+/// (`persistence_tick.rs`) to be the one that reclaims it, and since LRU
+/// always picks the OLDEST key (the probes, written first) that plain-drop
+/// path reliably erases the very keys this test needs to end up durably on
+/// disk (ground truth was empirically 0/200 with the old design).
+///
+/// `MSET`'s handler (`string::mset`) inserts all pairs directly with no
+/// per-key eviction check, and the write-path gate that DOES run checks
+/// memory exactly ONCE, using the PRE-`MSET` total — so a single giant
+/// `MSET` can leave a shard far over budget with no further write command
+/// pending to re-trigger the plain-drop gate. As long as this connection
+/// sends no more writes after the `MSET` returns, the ONLY thing left to
+/// reclaim that overshoot is the periodic tick — which reaches
+/// `evict_batch_durable_no_aof` (the manifest-backed, actually-durable path)
+/// and, being the same LRU policy, sheds the probes (globally the oldest
+/// keys, written and settled well before this `MSET`) before it ever reaches
+/// into the filler.
 fn write_filler(port: u16) {
+    use std::io::{BufRead, BufReader};
+
     let mut stream =
         std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for filler");
-    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(60))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
     let val = "F".repeat(FILLER_VALUE_LEN);
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    let total_args = 1 + 2 * FILLER_COUNT;
+    let mut buf: Vec<u8> = Vec::with_capacity(FILLER_COUNT * (FILLER_VALUE_LEN + 32));
+    buf.extend_from_slice(format!("*{}\r\n$4\r\nMSET\r\n", total_args).as_bytes());
     for i in 0..FILLER_COUNT {
         let key = format!("filler:{}", i);
-        let cmd = format!(
-            "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-            key.len(),
-            key,
-            val.len(),
-            val
+        buf.extend_from_slice(
+            format!("${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, val.len(), val).as_bytes(),
         );
-        buf.extend_from_slice(cmd.as_bytes());
-        // Flush in ~64 KiB chunks so the server applies eviction incrementally
-        // rather than receiving one giant burst that overruns the spill queue.
-        if buf.len() >= 64 * 1024 {
-            stream.write_all(&buf).expect("filler write");
-            buf.clear();
-        }
     }
-    if !buf.is_empty() {
-        stream.write_all(&buf).expect("filler tail write");
-    }
-    stream.flush().ok();
-    // Drain is unnecessary for correctness here; closing the stream is fine.
+    stream.write_all(&buf).expect("filler MSET write");
+
+    // Read the `+OK\r\n` reply so the caller's subsequent settle-sleep starts
+    // only once the server has actually finished applying every key (all
+    // shard legs of `coordinate_mset` completed) — otherwise the settle
+    // window could start before the write even lands.
+    let mut reply = String::new();
+    let mut reader = BufReader::new(&stream);
+    reader
+        .read_line(&mut reply)
+        .expect("filler MSET reply read");
+    assert!(
+        reply.starts_with('+'),
+        "filler MSET must succeed, got: {}",
+        reply
+    );
 }
 
 fn count_heap_files(dir: &std::path::Path) -> usize {
@@ -326,6 +387,61 @@ fn count_probes_readable(port: u16) -> usize {
     (0..PROBE_COUNT)
         .filter(|&i| redis_get(port, &probe_key(i)).is_some())
         .count()
+}
+
+/// Ground truth (task #44): read each shard's `ShardManifest` + `Active`
+/// `KvLeaf` `heap-*.mpf` DataFiles directly (best-effort, exactly the way
+/// `persistence::recovery::recover_shard_v3_pitr` reads them at boot) and
+/// count the DISTINCT `probe:*` keys that were durably on disk at the moment
+/// this is called. Call it right before the SIGKILL — nothing else writes
+/// after `SETTLE_BEFORE_KILL`, so this is a faithful snapshot of what the
+/// crash lands on. Errors (a manifest/DataFile caught mid-write) are
+/// swallowed and simply under-count — safe, since under-counting only makes
+/// the recovery assertion easier to satisfy, never harder.
+fn count_durable_probe_entries(dir: &std::path::Path) -> usize {
+    let off = dir.join("off");
+    let mut probe_keys: HashSet<Vec<u8>> = HashSet::new();
+    let Ok(shard_dirs) = std::fs::read_dir(&off) else {
+        return 0;
+    };
+    for shard_entry in shard_dirs.flatten() {
+        let shard_dir = shard_entry.path();
+        if !shard_dir.is_dir() {
+            continue;
+        }
+        let Some(shard_name) = shard_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let manifest_path = shard_dir.join(format!("{shard_name}.manifest"));
+        if !manifest_path.exists() {
+            continue;
+        }
+        let Ok(manifest) = ShardManifest::open(&manifest_path) else {
+            continue;
+        };
+        let data_dir = shard_dir.join("data");
+        for file_entry in manifest.files() {
+            if file_entry.status != FileStatus::Active
+                || file_entry.file_type != PageType::KvLeaf as u8
+            {
+                continue;
+            }
+            let heap_path = data_dir.join(format!("heap-{:06}.mpf", file_entry.file_id));
+            let Ok(pages) = read_datafile(&heap_path) else {
+                continue;
+            };
+            for page in &pages {
+                for slot_idx in 0..page.slot_count() {
+                    if let Some(kv_entry) = page.get(slot_idx)
+                        && kv_entry.key.starts_with(b"probe:")
+                    {
+                        probe_keys.insert(kv_entry.key);
+                    }
+                }
+            }
+        }
+    }
+    probe_keys.len()
 }
 
 #[cfg(unix)]
@@ -371,6 +487,13 @@ fn cold_keys_recover_after_crash_without_aof() {
     // hot, and hot is not durable under `appendonly no`, which would corrupt
     // the POST measurement. `heap_files > 0` is the spill-happened proof.
     let heap_files = count_heap_files(&dir);
+    // Ground truth (task #44): exactly which probes are durably on disk RIGHT
+    // NOW, read the same way `restore_from_persistence`'s v3 path will read
+    // them after the kill. See the module doc's task #44 section for why this
+    // replaces the old fixed `RECOVERY_FLOOR` — eviction throughput under
+    // `--appendonly no` is a separate, already-fixed concern (PR #273 /
+    // task #57's intentional plain-drop), not this file's regression signal.
+    let durable_probes = count_durable_probe_entries(&dir);
 
     // SIGKILL — hard crash, no graceful drain.
     sigkill(&mut child);
@@ -394,31 +517,42 @@ fn cold_keys_recover_after_crash_without_aof() {
 
     sigkill(&mut child2);
 
-    // Setup sanity: if nothing spilled, the test exercised nothing — fail loud
-    // (a maxmemory/eviction misconfig, not a recovery pass).
+    eprintln!(
+        "cold_keys_recover_after_crash_without_aof: heap_files={} durable_probes(ground truth)={} \
+         post(recovered)={} probe_count={}",
+        heap_files, durable_probes, post, PROBE_COUNT
+    );
+
+    // Setup sanity: if no probe ever reached durable cold storage, the test
+    // exercised nothing — fail loud (a maxmemory/eviction misconfig or a
+    // pathologically unlucky tick timing, not a recovery pass/fail signal).
     assert!(
-        heap_files > 0,
-        "test setup: expected cold spill (heap-*.mpf) but found 0 — eviction never fired \
-         (maxmemory/threshold too high). post={}",
+        durable_probes > 0,
+        "test setup: expected at least one probe durably spilled (heap-*.mpf, manifest \
+         Active KvLeaf) but found 0 — either eviction never fired (maxmemory/threshold too \
+         high) or the periodic memory-pressure tick (persistence_tick.rs) never got a chance \
+         to run before write_filler finished. heap_files={}. post={}",
+        heap_files,
         post
     );
 
-    // The actual #22 assertion: cold keys recovered WITHOUT AOF.
-    // Clean up ONLY on success so a failure keeps moon.std*.log for diagnosis
-    // (matches the crash_matrix convention: cleanup after the assert).
-    let recovered = post >= RECOVERY_FLOOR;
+    // The actual #22 assertion: every durably-spilled probe recovers WITHOUT
+    // AOF. Clean up ONLY on success so a failure keeps moon.std*.log for
+    // diagnosis (matches the crash_matrix convention: cleanup after the assert).
+    let recovered = post >= durable_probes;
     if recovered {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(
         recovered,
-        "#22 REGRESSION: post-crash cold read-through {}/{} (floor {}). heap_files={}. \
-         Logs kept at {} for diagnosis. A POST near 0 with cold files on disk means \
-         restore_from_persistence was skipped under `appendonly no` — the persistence_dir \
-         gate regressed (recovery must fire on disk_offload_base.is_some()).",
+        "#22 REGRESSION: post-crash cold read-through {}/{} (ground truth: {} probes were \
+         durably on disk before the kill). heap_files={}. Logs kept at {} for diagnosis. A \
+         POST below the durably-spilled ground truth means restore_from_persistence was \
+         skipped (or lossy) under `appendonly no` — the persistence_dir gate regressed \
+         (recovery must fire on disk_offload_base.is_some()).",
         post,
         PROBE_COUNT,
-        RECOVERY_FLOOR,
+        durable_probes,
         heap_files,
         dir.display()
     );

@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `crash_recovery_disk_offload_no_aof` harness assumed eviction-throughput durability the write path no longer provides (task #44)
+
+`cold_keys_recover_after_crash_without_aof` forced LRU eviction with a
+16,000-key pipelined `SET` burst and asserted `post >= 65% of PROBE_COUNT`,
+assuming most evicted probes land durably in a `heap-*.mpf` file. That
+predates `disk_offload_spill_inert()` / PR #273 (policy-aware eviction
+fail-close): under `--appendonly no`, the per-connection write-path eviction
+gate (`run_write_eviction_gate`, `src/server/conn/handler_monoio/mod.rs`) —
+the path every ordinary `SET`/`HSET` past `maxmemory` actually takes — has no
+`ShardManifest` handle and PLAIN-DROPS victims (documented Redis "pure cache,
+no durability" semantics; see `docs/PRODUCTION-CONTRACT.md`'s CRASH-02 note
+on task #57, which made this drop-not-OOM behavior the intended fix). Only
+the periodic memory-pressure tick (`shard/persistence_tick.rs`) durably
+spills under `appendonly no`, and a busy connection's synchronous per-write
+eviction always wins the race before that tick observes a sustained
+over-budget shard — so the pipelined-`SET` burst durably spilled 0-1/200
+probes (ground-truth-verified via direct manifest/`heap-*.mpf` inspection),
+making the 65% floor permanently unreachable. Not a data-loss regression:
+the dropped keys were never claimed durable (the boot-time WARN says so
+explicitly for this exact config).
+
+Two changes, no `src/` change: (1) `write_filler` now sends the filler as
+ONE `MSET` instead of 16,000 pipelined `SET`s — `MSET`'s handler applies all
+pairs with no per-key eviction check, and the write-path gate that does run
+checks memory once, pre-`MSET`, so a shard can end up far over budget with no
+further write pending to re-trigger the plain-drop path; the periodic tick is
+then the only thing left to reclaim it, durably spilling the LRU-oldest keys
+(the probes) via the manifest. (2) The fixed `RECOVERY_FLOOR` is replaced by
+`count_durable_probe_entries`, which reads each shard's manifest + `Active`
+`KvLeaf` DataFiles directly (the same way `recover_shard_v3_pitr` does at
+boot) right before the kill to establish ground truth, and asserts recovery
+returns AT LEAST that many probes — the actual #22 regression signal,
+decoupled from eviction throughput. Verified the rewritten test still
+red-flags a reintroduced #22 regression (manually reverted the
+`persistence_dir.is_some() || disk_offload_base.is_some()` gate in
+`main.rs`, confirmed RED, reverted back). Green 10×+ consecutive on macOS
+(monoio + tokio runtimes); `crash_recovery_cold_del_resurrection` and the
+`crash_matrix_cross_plane` no-durability-contract spot check show no
+regression.
+
 ### Fixed — `crash_recovery_graph_durability` g1/g2/g3 harness polled the deleted WAL v2 flat file (task #31)
 
 The G1–G3 legacy-mode graph crash tests never actually ran their kill -9
