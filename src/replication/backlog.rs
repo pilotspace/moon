@@ -83,6 +83,35 @@ impl ReplicationBacklog {
         offset >= self.start_offset && offset <= self.end_offset
     }
 
+    /// Reset the backlog to empty, seeded at `offset` — the same state as
+    /// `new_at(capacity, offset)`. No-op if already aligned
+    /// (`end_offset == offset`).
+    ///
+    /// Task #70 correctness fix: an allocated-but-idle backlog (seeded by a
+    /// bare `REPLCONF` via `ensure_backlogs_allocated`) can sit at a stale
+    /// offset X while the shard's real offset counter keeps advancing to Y
+    /// via `issue_lsn` — the FANOUT_HINT gate being false means those writes
+    /// take the bare-LSN branch with NO backlog append. Once activation
+    /// happens (an actual PSYNC, or a shard's own RegisterReplica /
+    /// PrepareReplicaSync arm), the backlog must be realigned to the shard's
+    /// CURRENT offset before any snapshot/cut offset is captured from it —
+    /// otherwise `bytes_from`/`contains_offset` answer against the wrong
+    /// byte positions (skew Y−X), corrupting partial-resync and live-fanout
+    /// cut math. A skewed buffer's contents are already useless (they cover
+    /// bytes that were never appended for the real offset range), so
+    /// dropping them is correct: any partial-resync request for an offset
+    /// below the new `start_offset` falls below the window and
+    /// `bytes_from` returns `None` — the caller's existing fail-safe is a
+    /// full resync, never wrong bytes.
+    pub fn realign_to(&mut self, offset: u64) {
+        if self.end_offset == offset {
+            return;
+        }
+        self.buf.clear();
+        self.start_offset = offset;
+        self.end_offset = offset;
+    }
+
     pub fn start_offset(&self) -> u64 {
         self.start_offset
     }
@@ -198,5 +227,40 @@ mod tests {
         let e3 = bl.end_offset();
         assert!(s3 >= s2, "start_offset must be monotonic");
         assert!(e3 > e2, "end_offset must be strictly increasing on append");
+    }
+
+    /// Task #70 correctness fix: `realign_to` must reset a skewed backlog
+    /// to a clean, empty state seeded at the given offset — matching
+    /// `new_at(capacity, offset)` exactly.
+    #[test]
+    fn test_realign_to_resets_skewed_backlog() {
+        let mut bl = ReplicationBacklog::new_at(1024, 100);
+        bl.append(b"stale bytes nobody wants");
+        assert_ne!(bl.end_offset(), 500);
+
+        bl.realign_to(500);
+        assert_eq!(bl.start_offset(), 500);
+        assert_eq!(bl.end_offset(), 500);
+        // The stale bytes are gone: bytes_from(the old start) must not
+        // return them.
+        assert_eq!(bl.bytes_from(500), Some(vec![]));
+
+        // A fresh append after realign lands at the NEW offset, not the old one.
+        bl.append(b"fresh");
+        assert_eq!(bl.start_offset(), 500);
+        assert_eq!(bl.end_offset(), 505);
+        assert_eq!(bl.bytes_from(500), Some(b"fresh".to_vec()));
+    }
+
+    /// Realigning to the CURRENT end_offset (no skew) must be a true no-op:
+    /// existing buffered bytes are preserved, not dropped.
+    #[test]
+    fn test_realign_to_noop_when_already_aligned() {
+        let mut bl = ReplicationBacklog::new(1024);
+        bl.append(b"hello");
+        bl.realign_to(5); // end_offset is already 5
+        assert_eq!(bl.start_offset(), 0);
+        assert_eq!(bl.end_offset(), 5);
+        assert_eq!(bl.bytes_from(0), Some(b"hello".to_vec()));
     }
 }

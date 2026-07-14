@@ -83,6 +83,31 @@ since both touch `ReplicationState` locking on the per-write hot path.
 4. Added `#[inline]` to `record_local_write`, `record_local_write_db`, and
    `replication_fanout_active`, matching the sibling `try_handle_*`
    convention in `dispatch.rs`.
+5. **Correctness follow-up (review-caught regression on #2):** splitting
+   backlog allocation from hint activation opened a REPLCONF→PSYNC window
+   where a bare `REPLCONF` could allocate + seed a shard's
+   `ReplicationBacklog` at its offset at that instant, then — with
+   `FANOUT_HINT` still false — every subsequent local write advanced the
+   shard's real offset counter via the bare-`issue_lsn` branch with NO
+   matching backlog append. The backlog's `end_offset` silently skewed stale
+   relative to the real counter for as long as the window stayed open (an
+   AOF-enabled master under continuous write load with periodic replica
+   kill-9/reconnect — exactly the v0.7.0 24h soak's shape). Any
+   snapshot/cut/push-offset captured from that backlog after activation
+   would then be range-inconsistent with it, corrupting partial-resync
+   catch-up reads (wrong bytes or a silently-skipped catch-up) and
+   acked-write accounting. Fixed by adding
+   `ReplicationBacklog::realign_to(offset)` (resets the buffer to empty,
+   reseeded at `offset` — a skewed buffer's contents are already useless, so
+   dropping them is correct; an offset request that falls below the new
+   `start_offset` fails safe into a full resync) and
+   `ReplicationState::realign_backlog(shard_id)`, called at every activation
+   site — `try_handle_psync` (dispatch.rs, right after `mark_fanout_active`)
+   and the `RegisterReplica`/`PrepareReplicaSync` arms
+   (`shard/spsc_handler.rs`) — BEFORE any snapshot/cut/push offset is
+   captured. All three sites run on the shard thread that owns that shard's
+   own offset advances, so the offset read + realign is race-free with the
+   shard's own append/advance sequence.
 
 **Task #72:** `handle_psync_on_master` (both `runtime-tokio` and
 `runtime-monoio` variants) and `register_replica_with_shards` in
@@ -101,7 +126,19 @@ with delta-based assertions (robust against shared-binary test-order
 contamination): `test_ensure_backlogs_allocated_does_not_activate_fanout_hint`
 (RED on the pre-fix code — verified by temporarily reintroducing the bare
 `mark_fanout_active()` call and observing the assertion fail) and
-`test_mark_fanout_active_sets_hint`.
+`test_mark_fanout_active_sets_hint`. Four more cover the backlog-realign
+correctness fix (#70.5): `test_realign_to_resets_skewed_backlog` and
+`test_realign_to_noop_when_already_aligned` (`replication::backlog::tests`,
+the low-level buffer reset behavior) plus
+`test_realign_backlog_fixes_skew_after_hint_false_window` and
+`test_realign_backlog_then_append_reads_back_exact_record`
+(`replication::state::tests`, reproducing the exact skew scenario — allocate,
+advance the offset via `issue_lsn` with no append, then activate — and
+proving the post-fix backlog is byte-position-consistent with the real
+offset again). RED verified by temporarily neutering `realign_backlog`'s
+body and observing both `state::tests` cases fail (`end_offset` stuck at 0
+instead of matching the real offset 300; the post-append record unreadable
+at its own pre-append offset), then reverting.
 
 No wire-protocol or observable behavior change beyond the hint gating: the
 REPLCONF → PSYNC handshake sequence is unchanged and covered end-to-end by

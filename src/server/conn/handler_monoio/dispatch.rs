@@ -595,6 +595,16 @@ pub(super) fn try_handle_psync(
         // handshake that reaches PSYNC is a genuine replica attaching; a
         // REPLCONF-only probe never reaches this line.
         crate::replication::state::mark_fanout_active();
+        // Correctness fix (orchestrator-caught regression on the above):
+        // a bare REPLCONF may have already allocated this shard's backlog
+        // and left it skewed stale during the FANOUT_HINT-false window (see
+        // `ReplicationState::realign_backlog` doc comment). Realign BEFORE
+        // any snapshot/cut offset is captured below — this function runs on
+        // the connection task, which at shards=1 (the only case this
+        // single-shard inline leg handles) IS the owning shard's own
+        // event-loop thread, so the offset read inside `realign_backlog`
+        // and this shard's own append/advance sequence cannot interleave.
+        g.realign_backlog(ctx.shard_id);
     }
     let repl_id = match &cmd_args[0] {
         Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).into_owned(),
