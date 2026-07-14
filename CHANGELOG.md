@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `segment_plane_scan` missed v0.6.0's nested-Command plane framing, risking WS/MQ/temporal data loss on upgrade (task #69)
+
+`WalWriterV3::recycle_aggressive`/`recycle_segments_before` gate deletion of
+sealed WAL v3 segments on `segment_plane_scan`'s `blocks_recycle` verdict,
+which — until this fix — classified a segment purely from its OUTER
+record-type byte. v0.6.0's shard event-loop `wal_append` drain hardcoded
+`WalRecordType::Command` as the outer wrapper for EVERY plane record
+(`WorkspaceCreate`/`Drop`, `MqCreate`/`Push`/`Pop`/`Ack`/`Trigger`/`Drop`,
+`TemporalUpsert`, `GraphTemporal`) — verified against the v0.6.0 tag's
+`event_loop.rs` (lines 1452/2070). So on a v0.6.0→v0.7.0 upgrade, every
+plane record in a pre-upgrade segment was invisible to the scan: it saw only
+`Command` at the outer level and classified the whole segment as
+recyclable pure-KV history. WS/MQ/temporal-upsert have no snapshot or
+checkpoint format in ANY mode — their replay is WAL-only (task #43) — so
+recycling one of these segments permanently destroyed that history, with no
+way to recover it.
+
+`segment_plane_scan` now peeks a `Command` record's payload for a nested v3
+record frame (length-prefix + CRC32C validated, matching
+`read_wal_v3_record`'s own framing) and classifies the INNER type against
+the same blocking set, mirroring the unwrap
+`shared_databases.rs::replay_workspace_wal`/`replay_mq_wal`/
+`replay_temporal_wal` already perform via `read_wal_v3_record(&record.payload)`
+at replay time — scan and replay now agree on what counts as a nested
+record. Fails closed: a structurally valid nested frame with an
+unrecognized inner type byte (a future plane type this build predates)
+still blocks recycling. An ordinary (non-nested) `Command` payload — the
+overwhelmingly common case — is unaffected and stays recyclable.
+
+Byte-slice peek only, no allocation and no LZ4 decompression (`Command`
+payloads are never LZ4-compressed by `write_wal_v3_record`) — off the hot
+path (recycle passes only) but kept allocation-free per repo convention.
+
 ### Fixed — `crash_recovery_disk_offload_no_aof` harness assumed eviction-throughput durability the write path no longer provides (task #44)
 
 `cold_keys_recover_after_crash_without_aof` forced LRU eviction with a
