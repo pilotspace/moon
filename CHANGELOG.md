@@ -2556,7 +2556,8 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   node in the features mindmap. `redis://` / `rediss://` remain fully supported;
   the native scheme adds a `?workspace=<tenant>` selector and a fail-fast,
   no-opportunistic-downgrade TLS contract.
-### Docs — `moon://` / `moons://` connection URI scheme spec (H-7, PR #TBD)
+
+### Docs — `moon://` / `moons://` connection URI scheme spec (H-7, PR #261)
 
 - New `docs/protocol/moon-uri.md`: the authoritative, doc-only spec for Moon's native
   `moon://` / `moons://` connection URI scheme — ABNF grammar, a field-by-field
@@ -2574,6 +2575,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   implementer as an open decision instead of assuming it away.
 - `mkdocs.yml`: adds a "Protocol" nav section for the new page so `mkdocs build
   --strict` doesn't fail on an orphan doc.
+
 ### Fixed — Cold-tier proactive TTL reclaim (H-2, R1: tmp/OFFLOAD-COMPRESSION-REVIEW.md)
 
 - **TTL-expired disk-offload cold entries that are never re-read no longer
@@ -2600,6 +2602,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   `reclamation_cold_expired_bytes_reclaimed_total` (distinct from the
   existing orphan counters, which count any zero-ref file unlink regardless
   of cause).
+
 ### Docs — H-4 doc reconciliation (ROADMAP §8.1)
 
 - **`docs/redis-compat.md`**: `FT.AGGREGATE` was listed as "Not implemented"; it is
@@ -2622,6 +2625,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   v0.6.0). Updated to the current v0.6.x line, with an explicit pre-1.0 support
   policy (latest-minor-only; no LTS/backport promise until the v1.0.0 GA tag, per
   `docs/roadmap/ROADMAP.md`'s stated 18-month LTS policy).
+
 ### Docs — Production contract refresh + CI gate (ROADMAP H-5)
 
 - **`docs/PRODUCTION-CONTRACT.md` refreshed from its stale v0.1.3-era draft to
@@ -2693,6 +2697,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   (`cold`, DiskANN serve-from-disk, inert behind `MOON_VEC_COLD_TIER`); the
   dead knobs are marked `[reserved: M3/M5]`. Keep-vs-delete is decided at the
   M3 exit-review on real per-index query-frequency telemetry.
+
 ### Security — ACL now covers the early-intercepted command families (H-3) (PR #258)
 
 - **CDC.READ bypassed ACL entirely on the monoio runtime (the default build).**
@@ -2750,6 +2755,71 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   HOT-immutable memory still has no standalone byte budget (only idle/pressure
   demotion bounds it).
 
+### Fixed — Disk-offload: crash recovery no longer resurrects deleted cold keys, nor drops the AOF after a spill (PR #257)
+
+- **Deleted/flushed cold keys stayed deleted only until the next crash.** A
+  DEL/UNLINK/FLUSHALL/FLUSHDB of a spilled key tombstones the in-memory
+  ColdIndex, but the manifest entry stays `Active` until the orphan sweep. A
+  kill-9 inside that window lost the tombstone, and boot-time replay could not
+  re-apply it: the replayed DEL ran against databases whose `cold_index` was
+  `None` — a silent cold-plane no-op — so the key resurrected via cold
+  read-through (measured 85–97/200 probes under `--appendonly yes` +
+  `--disk-offload`). Two detach points fixed: (a) `recover_shard_v3_pitr` now
+  attaches the Phase-3-rebuilt ColdIndex to the databases BEFORE Phase 4 WAL
+  replay (was: stashed on `RecoveryResult`, merged only after recovery
+  returned); (b) the per-shard/multi-part AOF replay now keeps cold wiring
+  live during incr replay — main.rs re-attaches it after the pre-replay hot
+  wipe, and `replay_per_shard`/`replay_multi_part` bridge it across
+  `rdb::load`'s wholesale database swap (which silently dropped it). New
+  crash suite `tests/crash_recovery_cold_del_resurrection.rs` (DEL + FLUSHALL
+  scenarios, kill-9 inside the pre-sweep window).
+- **Any disk-offload spill silently discarded the AOF on the next restart.**
+  The "WAL replayed 0 commands → fall back to the AOF" gate counted vector +
+  file-lifecycle records: after a spill wrote `FileCreate` records into the
+  shard WAL, the gate saw a "non-empty" WAL, skipped `appendonly.aof` (the
+  only complete KV history — `--wal-kv-log` is auto-off when the AOF is the
+  authority), and every KV write since the last snapshot was lost. The gate
+  now keys on KV `Command` records only.
+
+## [0.6.0] — 2026-07-08
+
+**Release highlights** (full detail in the sections below; "PR #TBD" entries
+below all shipped together in this release's PR):
+
+- **Multi-db isolation is now a first-class, enforced boundary**: FT.*/graph/
+  full-text indexes are scoped to the db that created them (`SELECT 1`'s
+  indexes are invisible to db 0, verified across shards, restarts, and the
+  recovery path); per-db memory quotas (`--db-maxmemory <db>:<bytes>`,
+  `CONFIG SET db-maxmemory`) enforce noeviction/evicting policies per db slot
+  with Redis-style deny-OOM semantics (shrink commands always pass, so a
+  tenant can never wedge itself); named workspaces harden the prefix layer.
+- **Memory accounting is now truthful under container growth**: HSET/LPUSH/
+  SADD/ZADD growth into existing keys is charged to `used_memory` in O(1)
+  (previously invisible to `--maxmemory` — an unbounded single-key hash could
+  never trigger eviction).
+- **Engines offload when idle**: vector segments demote HOT→WARM (mmap)→COLD
+  (unloaded stub, reload-on-search) on configurable idle/age thresholds
+  (`--engine-offload-idle-secs`, `--segment-warm-after`), with DEL/HDEL
+  tombstone correctness across all tiers — measured −26% process RSS on a
+  40K×768d corpus with search results identical after reload.
+- **Single-node tuning preset**: `--profile standalone` fills in the measured
+  best flags for a shard-1 deployment (the p=1 busy-poll configuration that
+  beats Redis on both GCE arches).
+- **Command parity widened**: SORT_RO / BITFIELD_RO / GEORADIUS_RO /
+  GEORADIUSBYMEMBER_RO plus subcommand gaps; the compat matrix is regenerated.
+  PFDEBUG/PFSELFTEST/FAILOVER/MODULE/SENTINEL are documented non-goals.
+
+> **Operator callout — historical `WS DROP` key leak.** Before this release,
+> `WS DROP`'s cleanup sweep was hardcoded to logical db 0: any workspace whose
+> connection ever `SELECT`ed a non-zero db before writing leaked those keys
+> permanently on drop. v0.6.0 fixes the sweep (all dbs on the owning shard),
+> but keys leaked by PAST drops are still resident. To detect/clean on an
+> upgraded instance: `SELECT <n>` each non-zero db and `SCAN 0 MATCH <ws-uuid>:*`
+> for workspace prefixes that no longer appear in `WS LIST`, then `DEL` the
+> matches (or `FLUSHDB` if the db held nothing else).
+
+> **Absorbed post-release-PR merges.** The following sections merged after the v0.6.0 release PR but before the tag was cut (2026-07-10) and are part of the tagged v0.6.0 binary.
+
 ### Performance — Vector: COLD-segment reload moved off the shard event loop (PR #251)
 
 - Under `--disk-offload`, an idle vector segment is demoted to the COLD tier
@@ -2779,6 +2849,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   `promote_unloaded`, preserving exact pre-#18 behavior. Non-yielding sync search
   paths are unchanged (still block); HYBRID/SPARSE/RANGE/non-default-field
   queries do not take the off-loop path (accepted follow-up).
+
 ### Ops — v0.6.0 release-ledger closure + hygiene (PR #256)
 
 - `RELEASES.md` gains the missing v0.6.0 entry (shipped 2026-07-08, ledger
@@ -2804,31 +2875,6 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   wall-clock timeout with zero actual test failures. Bumped to 30m to match
   the Windows Test step's headroom; removes recurring false-negative reds on
   rebased branches.
-### Fixed — Disk-offload: crash recovery no longer resurrects deleted cold keys, nor drops the AOF after a spill (PR #TBD)
-
-- **Deleted/flushed cold keys stayed deleted only until the next crash.** A
-  DEL/UNLINK/FLUSHALL/FLUSHDB of a spilled key tombstones the in-memory
-  ColdIndex, but the manifest entry stays `Active` until the orphan sweep. A
-  kill-9 inside that window lost the tombstone, and boot-time replay could not
-  re-apply it: the replayed DEL ran against databases whose `cold_index` was
-  `None` — a silent cold-plane no-op — so the key resurrected via cold
-  read-through (measured 85–97/200 probes under `--appendonly yes` +
-  `--disk-offload`). Two detach points fixed: (a) `recover_shard_v3_pitr` now
-  attaches the Phase-3-rebuilt ColdIndex to the databases BEFORE Phase 4 WAL
-  replay (was: stashed on `RecoveryResult`, merged only after recovery
-  returned); (b) the per-shard/multi-part AOF replay now keeps cold wiring
-  live during incr replay — main.rs re-attaches it after the pre-replay hot
-  wipe, and `replay_per_shard`/`replay_multi_part` bridge it across
-  `rdb::load`'s wholesale database swap (which silently dropped it). New
-  crash suite `tests/crash_recovery_cold_del_resurrection.rs` (DEL + FLUSHALL
-  scenarios, kill-9 inside the pre-sweep window).
-- **Any disk-offload spill silently discarded the AOF on the next restart.**
-  The "WAL replayed 0 commands → fall back to the AOF" gate counted vector +
-  file-lifecycle records: after a spill wrote `FileCreate` records into the
-  shard WAL, the gate saw a "non-empty" WAL, skipped `appendonly.aof` (the
-  only complete KV history — `--wal-kv-log` is auto-off when the AOF is the
-  authority), and every KV write since the last snapshot was lost. The gate
-  now keys on KV `Command` records only.
 
 ### Fixed — Conn-plane: monoio central listener joins the SO_REUSEPORT group (PR #250)
 
@@ -3035,7 +3081,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   the backoff window, the retry deadline was already in the past and the next
   1ms tick retried immediately — exactly the flood the backoff exists to stop.
 
-### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #TBD)
+### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #248)
 
 - **`--vector-ef-runtime` / `--vector-rerank-mult` / `--vector-exact-beam`**
   set the server-wide starting values every NEW vector index is created with
@@ -3049,7 +3095,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   binary entry and `run_embedded`; unit tests and library embedders that
   never install defaults keep the exact pre-flag behavior.
 
-### Added — Recall knobs: FT.CONFIG RERANK_MULT + EXACT_BEAM (PR #TBD)
+### Added — Recall knobs: FT.CONFIG RERANK_MULT + EXACT_BEAM (PR #248)
 
 - **`FT.CONFIG SET <idx> RERANK_MULT <n>`** (1-64, default 4) deepens the HQ-1
   exact-rerank stage: the top `n·k` beam candidates are re-scored with true f16
@@ -3067,7 +3113,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   shards, and persist across restarts via a new v4 index-meta sidecar format
   (v1-v3 sidecars load with defaults).
 
-### Added — Runtime-tunable EF_RUNTIME via FT.CONFIG (PR #TBD)
+### Added — Runtime-tunable EF_RUNTIME via FT.CONFIG (PR #248)
 
 - **`FT.CONFIG SET <idx> EF_RUNTIME <n>`** adjusts the HNSW search beam width at
   runtime without rebuilding the index (RediSearch parity). Range matches
@@ -3079,7 +3125,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   COMPACTION_WEIGHT, MERGE_RECALL_TOLERANCE were equally affected). SET now
   broadcasts to all shards like FT.CREATE; GET stays local.
 
-### Fixed — TQ ADC estimator is now metric-faithful on raw L2 (PR #TBD)
+### Fixed — TQ ADC estimator is now metric-faithful on raw L2 (PR #248)
 
 - **TQ quantization ranked L2 queries by `sphere_dist·‖a‖²`** — the unit-sphere
   distance between normalized directions scaled by the document norm. On
@@ -3094,7 +3140,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   recall@10 0.784/0.942/0.986 at ef 16/64/256 vs 0.002-0.003 pre-fix (~350x),
   within ~0.03 of SQ8.
 
-### Changed — FT.CREATE L2 indexes default to SQ8 quantization (PR #TBD)
+### Changed — FT.CREATE L2 indexes default to SQ8 quantization (PR #248)
 
 - **`FT.CREATE ... DISTANCE_METRIC L2` without an explicit `QUANTIZATION` now
   defaults to SQ8** instead of TQ4. TQ's norm-scaled ADC estimator assumes
@@ -3107,7 +3153,7 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
   glove-100K). Tuning guide gains bulk-load (`--max-unflushed-immutable-segments
   0`), settle (`VACUUM VECTOR`), and runtime-`EF_RUNTIME` recipes.
 
-### Added — FastScan SIMD vector scan: NEON TBL kernel + live-path integration (PR #TBD)
+### Added — FastScan SIMD vector scan: NEON TBL kernel + live-path integration (PR #248)
 
 - **NEON TBL FastScan kernel** (`src/vector/distance/fastscan.rs`): register-resident
   4-bit LUT accumulation via `vqtbl1q_u8` for aarch64 — the primary platform previously
@@ -3136,43 +3182,6 @@ run for the R1 WAIT/ACK work (all reproduced on `main` before the fix):
 - New criterion bench `benches/fastscan_bench.rs` (block kernels, LUT build, end-to-end
   mutable scan A/B); shadow-layout + FastScan-vs-plain equality tests (full scan,
   chunked scan, MVCC visibility + bitmap-filter paths).
-
-## [0.6.0] — 2026-07-08
-
-**Release highlights** (full detail in the sections below; "PR #TBD" entries
-below all shipped together in this release's PR):
-
-- **Multi-db isolation is now a first-class, enforced boundary**: FT.*/graph/
-  full-text indexes are scoped to the db that created them (`SELECT 1`'s
-  indexes are invisible to db 0, verified across shards, restarts, and the
-  recovery path); per-db memory quotas (`--db-maxmemory <db>:<bytes>`,
-  `CONFIG SET db-maxmemory`) enforce noeviction/evicting policies per db slot
-  with Redis-style deny-OOM semantics (shrink commands always pass, so a
-  tenant can never wedge itself); named workspaces harden the prefix layer.
-- **Memory accounting is now truthful under container growth**: HSET/LPUSH/
-  SADD/ZADD growth into existing keys is charged to `used_memory` in O(1)
-  (previously invisible to `--maxmemory` — an unbounded single-key hash could
-  never trigger eviction).
-- **Engines offload when idle**: vector segments demote HOT→WARM (mmap)→COLD
-  (unloaded stub, reload-on-search) on configurable idle/age thresholds
-  (`--engine-offload-idle-secs`, `--segment-warm-after`), with DEL/HDEL
-  tombstone correctness across all tiers — measured −26% process RSS on a
-  40K×768d corpus with search results identical after reload.
-- **Single-node tuning preset**: `--profile standalone` fills in the measured
-  best flags for a shard-1 deployment (the p=1 busy-poll configuration that
-  beats Redis on both GCE arches).
-- **Command parity widened**: SORT_RO / BITFIELD_RO / GEORADIUS_RO /
-  GEORADIUSBYMEMBER_RO plus subcommand gaps; the compat matrix is regenerated.
-  PFDEBUG/PFSELFTEST/FAILOVER/MODULE/SENTINEL are documented non-goals.
-
-> **Operator callout — historical `WS DROP` key leak.** Before this release,
-> `WS DROP`'s cleanup sweep was hardcoded to logical db 0: any workspace whose
-> connection ever `SELECT`ed a non-zero db before writing leaked those keys
-> permanently on drop. v0.6.0 fixes the sweep (all dbs on the owning shard),
-> but keys leaked by PAST drops are still resident. To detect/clean on an
-> upgraded instance: `SELECT <n>` each non-zero db and `SCAN 0 MATCH <ws-uuid>:*`
-> for workspace prefixes that no longer appear in `WS LIST`, then `DEL` the
-> matches (or `FLUSHDB` if the db held nothing else).
 
 ### Fixed — WS3 COLD/WARM tier adversarial-review fixes (round 2 follow-up, PR #TBD)
 
