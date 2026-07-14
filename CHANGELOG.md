@@ -80,6 +80,28 @@ exits 1 immediately; a full-ledger sweep runs at soak end. Hourly progress:
 24h. Builds from a VM-local clone (`~/moon-soak/repo`) per the OrbStack
 diskfull-guard/tmpfs rules; kill/restart is strictly PID-targeted `kill -9`
 (never a broad `pkill` pattern) per the SO_REUSEPORT hang trap.
+### Fixed — `WAIT` wedged forever on a restarted multi-shard master after kill-9 (task #67)
+
+After a multi-shard master (`--shards >= 2`) was `kill -9`'d and restarted
+with prior write history, the surviving replica kept streaming and applying
+writes correctly, but `WAIT 1 <timeout>` on the restarted master timed out
+indefinitely — the replica's periodic `REPLCONF ACK` never registered as
+"caught up" even though it was arriving every second. Root cause: AOF
+recovery's `ReplicationState::seed_master_offset` seeded ONLY the
+process-wide `master_repl_offset` (`total_offset()`) from the recovered
+max LSN, leaving every per-shard `shard_offsets[i]` at the fresh-boot 0.
+`handle_psync_inline_multi_shard`'s full-resync handshake advertises
+`Σ shard_offset(i)` — not `total_offset()` — as a reconnecting replica's new
+baseline (each shard captures its own offset atomically with its RDB body,
+which the exactly-once live-fanout `cut` gate depends on), so a replica
+reconnecting after the restart adopted a near-zero baseline while
+`wait_for_replicas` kept comparing ACKs against the correctly-seeded (large)
+`total_offset()` — a gap the replica could never close. `seed_master_offset`
+now also seeds shard 0 to the same recovered value, restoring the
+`Σ shard_offsets == total_offset()` invariant every write already
+maintains going forward. Reproduced 2x by the v0.7.0 replication soak
+(`scripts/soak-replication-24h.sh`); regression test:
+`tests/replication_hardening.rs::master_kill_restart_wait_acks`.
 
 ### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
 
