@@ -58,6 +58,28 @@ pending a `rustls-pki-types::PemObject` migration) are explicitly
 ignore-listed with reasons in `deny.toml` / `.cargo/audit.toml` rather
 than left to silently pass — an always-red gate is worse than none, but a
 silently-permissive one is worse still.
+### Added — 24h replication kill-9 soak harness gating the v0.7.0 release tag (task #61)
+
+`scripts/soak-replication-24h.sh` + `scripts/soak_replication_driver.py`: a
+machine-verifiable zero-data-loss soak for the "Replication GA for
+multi-shard masters" headline. A master (`--shards 4 --appendonly yes
+--appendfsync always`) and replica (`--shards 2`) run under continuous
+`SET soak:{seq} {seq}:{ts}` + `WAIT 1 <timeout>` load; only a `WAIT>=1`
+reply appends the seq to an fsync'd acked-write ledger (a `WAIT` timeout is
+recorded separately as "in-flight" — allowed to be lost or present, never a
+failure). Every ~12 minutes the harness alternates `kill -9` on
+master/replica, restarts the killed side, waits for a *data-driven* resync
+gate (polls the last few acked seqs back from the replica — `INFO
+replication`'s `master_link_status:up` only proves the TCP link is back, not
+that the backlog/RDB replay has landed), then samples ≥1000 random + the
+last 200 acked seqs and asserts exact value parity on **both** master and
+replica. Any mismatch prints `SOAK-FAIL seq=<n> side=<m|r> cycle=<k>` and
+exits 1 immediately; a full-ledger sweep runs at soak end. Hourly progress:
+`SOAK-OK hour=<h> acked=<n> cycles=<k> master_kills=<a> replica_kills=<b>`.
+`--smoke` runs a 30-minute validation (3 chaos cycles) instead of the full
+24h. Builds from a VM-local clone (`~/moon-soak/repo`) per the OrbStack
+diskfull-guard/tmpfs rules; kill/restart is strictly PID-targeted `kill -9`
+(never a broad `pkill` pattern) per the SO_REUSEPORT hang trap.
 
 ### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
 
