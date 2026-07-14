@@ -1,0 +1,36 @@
+# cargo-audit configuration for Moon.
+# Run: cargo audit
+#
+# CI: wired into .github/workflows/supply-chain.yml (job `audit`), a
+# blocking check for SUPPLY-01. cargo-audit only fails the build on
+# `Warning::Vulnerability`-class advisories by default (unmaintained /
+# unsound / yanked print but do not fail) — deliberately NOT overridden
+# with `--deny warnings` here, matching the design that a real CVE hard
+# fails while informational advisories stay visible-but-non-blocking. The
+# entries below are additionally silenced via `ignore` (same three
+# unmaintained crates as deny.toml, plus one unsound-but-inapplicable
+# advisory not caught by cargo-deny's older rustsec matcher) purely to
+# keep CI logs clean; each has a reason and a re-check trigger.
+
+[advisories]
+ignore = [
+    # fxhash 0.2.1: unmaintained, no safe upgrade; pinned transitively by
+    # monoio 0.2.4 (vendor/monoio). Revisit when monoio drops it.
+    "RUSTSEC-2025-0057",
+    # paste 1.0.15: unmaintained (archived upstream), no safe upgrade;
+    # pinned transitively by tikv-jemalloc-ctl 0.6.1. Revisit on next
+    # jemalloc-ctl major bump.
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile 2.2.0: unmaintained; migrating to
+    # rustls-pki-types::PemObject is a source-code change (src/tls*) out
+    # of scope for this CI-wiring change. Tracked as a follow-up.
+    "RUSTSEC-2025-0134",
+    # rand 0.9.2 (transitive via metrics-util 0.20.4 -> metrics -> moon):
+    # RUSTSEC-2026-0097 is a narrow unsoundness that only triggers when a
+    # *custom log::Log implementation* calls rand::rng() reentrantly from
+    # inside a log callback while ThreadRng reseeds — moon uses
+    # tracing-subscriber, not a custom `log` logger, so the trigger path
+    # is not reachable. No newer metrics-util is published yet that pulls
+    # rand >=0.9.3. Revisit on the next metrics-util bump.
+    "RUSTSEC-2026-0097",
+]

@@ -34,6 +34,30 @@ task #44). New rows for shipped-but-untracked guarantees: `CRASH-02`
 (37-cell cross-plane kill-9 matrix), `MEM-10X-01` (10× RAM G2 acceptance),
 `REPL-PLANES-01` (all-plane replication); new `REPL-SOAK-01` row gates the
 v0.7.0 tag on the 24h replication soak. GA-blocking gap now 17 rows.
+### Added — supply-chain security CI gate: `cargo audit` + `cargo deny check` (task #63, SUPPLY-01)
+
+`deny.toml` existed in the tree but was never wired into CI (its own header
+comment said so). Added `.github/workflows/supply-chain.yml`: two
+`ubuntu-latest` jobs, `audit` (`cargo audit`, blocking on RUSTSEC
+vulnerability-class advisories) and `deny` (`cargo deny check advisories
+licenses bans sources`, blocking on any deny.toml violation), triggered on
+PRs touching `Cargo.toml`/`Cargo.lock`/`deny.toml`/`.cargo/audit.toml`,
+push to `main`, and a weekly schedule (advisories publish independent of
+code changes). Runs on the hosted runner, not the self-hosted `moon-dev`
+box — no build is required, just dependency-graph inspection.
+
+Fixed three real advisories to get to green: `memmap2` 0.9.10 → 0.9.11
+(RUSTSEC-2026-0186, unsound pointer-offset validation),
+`crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204, invalid pointer
+dereference in `Display`), `spin` 0.9.8 → 0.9.9 (yanked), and dropped the
+`core2`/`proc-macro-error2` unmaintained transitives by bumping
+`rust-embed` 8.11.0 → 8.12.0 (console feature). Three unmaintained
+transitive advisories with no available safe upgrade
+(`fxhash` via monoio, `paste` via tikv-jemalloc-ctl, `rustls-pemfile`
+pending a `rustls-pki-types::PemObject` migration) are explicitly
+ignore-listed with reasons in `deny.toml` / `.cargo/audit.toml` rather
+than left to silently pass — an always-red gate is worse than none, but a
+silently-permissive one is worse still.
 
 ### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
 

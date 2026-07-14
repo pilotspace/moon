@@ -1,13 +1,18 @@
 # cargo-deny configuration for Moon (v2 format).
-# Run: cargo deny check
+# Run: cargo deny check advisories licenses bans sources
 #
-# CI: this config is NOT currently wired into any GitHub Actions job — run
-# it locally / ad hoc. The "Lint" job in .github/workflows/ci.yml runs
-# scripts/audit-unsafe.sh + scripts/audit-unwrap.sh (SAFETY-comment coverage
-# and an unwrap ratchet), which is a different check and does not invoke
-# `cargo deny` or `cargo audit`.
-# TODO(ci): wire `cargo deny check` into a blocking CI job (tracked
-# separately — not part of this change).
+# CI: wired into .github/workflows/supply-chain.yml (job `deny`), which runs
+# `cargo deny check advisories licenses bans sources` on every PR touching
+# Cargo.toml/Cargo.lock/deny.toml, on push to main, and weekly. Companion
+# job `audit` runs `cargo audit` against the same lockfile. Both are
+# blocking (SUPPLY-01).
+#
+# advisories `ignore` entries below: cargo-deny 2.x has no separate
+# severity knob for vulnerability/unmaintained/unsound/notice — every
+# matched advisory is a hard error unless explicitly ignored here. Real
+# vulnerabilities get fixed in the lockfile (see git log for `cargo update`
+# commits); only advisories with genuinely no available upgrade are
+# ignored, each with a reason and a re-check-by note.
 
 [graph]
 targets = []
@@ -18,7 +23,22 @@ no-default-features = false
 version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # fxhash 0.2.1 (transitive via monoio 0.2.4 -> monoio-io-wrapper /
+    # monoio-rustls): unmaintained, no safe upgrade published upstream.
+    # monoio owns the fxhash pin; revisit when monoio bumps past it.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained with no safe replacement; pinned transitively by monoio 0.2.4 (vendor/monoio) — revisit when monoio drops it" },
+    # paste 1.0.15 (transitive via tikv-jemalloc-ctl 0.6.1): unmaintained,
+    # archived by upstream, no safe upgrade (the suggested forks — pastey /
+    # with_builtin_macros — are not drop-in without a tikv-jemalloc-ctl bump).
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (archived upstream) with no safe upgrade; pinned transitively by tikv-jemalloc-ctl 0.6.1 — revisit on next jemalloc-ctl major bump" },
+    # rustls-pemfile 2.2.0 (direct, optional dep behind runtime-tokio /
+    # runtime-monoio for TLS PEM loading): unmaintained, no safe drop-in
+    # upgrade in the 2.x line. Migrating to rustls-pki-types' PemObject API
+    # is a real code change (src/tls*), tracked separately — not done here
+    # to keep this CI-wiring change infra-only.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; migrating callers to rustls-pki-types::PemObject is a source-code change out of scope for CI wiring — tracked as a follow-up" },
+]
 
 [licenses]
 version = 2
