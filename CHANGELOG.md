@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `crash_recovery_graph_durability` g1/g2/g3 harness polled the deleted WAL v2 flat file (task #31)
+
+The G1–G3 legacy-mode graph crash tests never actually ran their kill -9
+scenario: `wait_for_wal_bytes` (the "my last write reached the WAL fd"
+probe that makes the crash point deterministic) and G3's replay-idempotency
+length check still read the flat `<dir>/shard-0.wal` WAL v2 file, which
+was removed in PR #236 — one day before this test file was added (#237).
+The probe waited 20s for a file that is never created and panicked, on
+every platform (verified identical on the Linux dev VM — not a macOS
+durability gap). Masked because the suite is `#[ignore]`d. Both helpers
+now scan the real `<dir>/shard-0/wal-v3/*.wal` segment directory; the G3
+length check excludes each segment's fixed 64-byte header so normal
+per-boot segment rotation isn't misread as replay double-append. With the
+task #60 replay fix already on main, g1–g5 are green 3× consecutively on
+macOS. The underlying `replay_graph_wal` RESP-parse bug these tests expose
+was fixed separately in PR #322.
+
 ### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
 
 `replay_graph_wal` (`src/shard/shared_databases.rs`, the legacy-mode-only

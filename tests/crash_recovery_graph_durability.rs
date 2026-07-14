@@ -4,8 +4,8 @@
 //! command replay: `save_graph_store` (CSR segments + metadata + manifest)
 //! runs only on graceful shutdown (`src/shard/event_loop.rs` shutdown branch),
 //! so a crashed server boots with `recover_graph_store → Ok(None)` and
-//! rebuilds every graph by re-executing `shard-<N>.wal` records through
-//! `DispatchReplayEngine::replay_graph_commands`. These tests prove that path
+//! rebuilds every graph by re-executing `shard-<N>/wal-v3/*.wal` records
+//! through `DispatchReplayEngine::replay_graph_commands`. These tests prove that path
 //! end to end against REAL server processes (model: the vector engine's B4
 //! suite, `tests/crash_recovery_vector_durability.rs`).
 //!
@@ -239,27 +239,66 @@ fn crash(mut guard: ServerGuard, port: u16) {
     wait_for_port_down(port);
 }
 
-/// Poll `<dir>/shard-0.wal` until `needle` appears in its bytes — the
-/// bounded, condition-based "my last write reached the WAL fd" wait that
-/// makes the kill -9 point deterministic (see module doc).
+/// Poll every segment under `<dir>/shard-0/wal-v3/` until `needle` appears
+/// in its bytes — the bounded, condition-based "my last write reached the
+/// WAL fd" wait that makes the kill -9 point deterministic (see module
+/// doc).
+///
+/// Historical note: this originally polled a flat `<dir>/shard-0.wal`
+/// file, the WAL v2 on-disk layout. WAL v2 was removed in
+/// `refactor(persistence)!: remove WAL v2` (#236) the day before this test
+/// file was added (#237) — every graph (and KV) record has been written
+/// through the segmented v3 WAL directory ever since, on every platform.
+/// The flat-file probe never matched anything post-#236, so g1/g2/g3
+/// always timed out waiting for a file that is never created; this was
+/// masked because the tests are `#[ignore]`d and no CI job runs them with
+/// `--ignored`. Not a macOS-specific durability bug — verified identical
+/// on the Linux dev VM.
 fn wait_for_wal_bytes(dir: &Path, needle: &[u8]) {
-    let wal = dir.join("shard-0.wal");
+    let wal_dir = dir.join("shard-0").join("wal-v3");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(bytes) = std::fs::read(&wal) {
-            if bytes.windows(needle.len()).any(|w| w == needle) {
-                return;
+        if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if bytes.windows(needle.len()).any(|w| w == needle) {
+                        return;
+                    }
+                }
             }
         }
         assert!(
             Instant::now() < deadline,
-            "WAL at {} never contained marker {:?} — graph writes are not \
-             reaching the shard WAL",
-            wal.display(),
+            "WAL v3 dir {} never contained marker {:?} — graph writes are \
+             not reaching the shard WAL",
+            wal_dir.display(),
             String::from_utf8_lossy(needle),
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Total *record* bytes (excluding each segment's fixed 64-byte
+/// `WAL_V3_HEADER_SIZE`) across every segment under `<dir>/shard-0/wal-v3/`
+/// — the v3 analogue of reading a single flat WAL file's length. Used by
+/// G3 to prove idempotent replay does not re-append already-replayed
+/// records.
+///
+/// Every boot opens a fresh active segment for future writes (unlike WAL
+/// v2's single reused flat file), so a raw directory byte-total grows by
+/// exactly one header on every restart even with zero new records — that
+/// would make this assertion flag normal segment rotation as a replay
+/// defect. Subtracting the header isolates actual command-record growth.
+fn wal_dir_total_bytes(dir: &Path) -> u64 {
+    const WAL_V3_HEADER_SIZE: u64 = 64;
+    let wal_dir = dir.join("shard-0").join("wal-v3");
+    std::fs::read_dir(&wal_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|m| m.len().saturating_sub(WAL_V3_HEADER_SIZE))
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -735,9 +774,7 @@ fn g3_double_crash_recovery_is_idempotent() {
     assert_eq!(first_ids, (0..4).collect(), "first recovery id set");
     let first_rank = int_set(&mut c, "MATCH (n:N {id: 0}) RETURN n.rank");
     assert_eq!(first_rank, BTreeSet::from([7]), "first recovery rank");
-    let wal_len_after_first = std::fs::metadata(dir.join("shard-0.wal"))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let wal_len_after_first = wal_dir_total_bytes(&dir);
     crash(guard, port);
 
     // Second recovery: identical answers, and replay must not have grown the
@@ -760,9 +797,7 @@ fn g3_double_crash_recovery_is_idempotent() {
         1,
         "no duplicated nodes after double recovery"
     );
-    let wal_len_after_second = std::fs::metadata(dir.join("shard-0.wal"))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let wal_len_after_second = wal_dir_total_bytes(&dir);
     assert_eq!(
         wal_len_after_second, wal_len_after_first,
         "recovery with no new writes must not append to the graph WAL"
@@ -774,13 +809,15 @@ fn g3_double_crash_recovery_is_idempotent() {
 // ---------------------------------------------------------------------------
 // G4/G5: DEFAULT-config durability (v3 disk-offload path)
 //
-// G1-G3 pass `--disk-offload disable`, so they only validate the legacy v2
-// WAL replay path. Production runs the v3 disk-offload protocol by default,
-// where graph durability was found broken twice over (GCP soak, 2026-07-07):
+// G1-G3 pass `--disk-offload disable`, exercising `replay_graph_wal` (the
+// non-offload boot pass). Production runs with disk-offload enabled by
+// default, where graph durability was found broken twice over (GCP soak,
+// 2026-07-07):
 //   Bug A — `Shard::restore_from_persistence` replays WAL v3 through a
 //     TEMPORARY DispatchReplayEngine whose collected graph commands are
-//     dropped; `shared_databases::replay_graph_wal` only reads the v2 file.
-//     Graph WAL replay is a complete no-op in v3 mode.
+//     dropped; only a dedicated `replay_graph_wal_v3` boot pass applies
+//     them under disk-offload. Graph WAL replay was a complete no-op in
+//     that mode until Bug A was fixed.
 //   Bug B — the checkpoint (periodic / BGSAVE / WAL-overflow) advances
 //     `control.last_checkpoint_lsn` and recycles WAL segments WITHOUT any
 //     graph snapshot (`save_graph_store` runs only on graceful shutdown and
