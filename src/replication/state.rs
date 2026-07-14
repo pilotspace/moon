@@ -167,8 +167,11 @@ impl ReplicationState {
     /// Returns the PER-SHARD offset after the advance — the record's
     /// `end_offset` on the live-fanout wire, compared against each replica's
     /// per-shard snapshot cut (`ReplicaFanout::cut`). Deliberately NOT the
-    /// master offset: `seed_master_offset` (AOF recovery) advances only the
-    /// master counter, so the two axes diverge and must never be mixed.
+    /// master offset: on a multi-shard (`num_shards > 1`) master,
+    /// `seed_master_offset` (AOF recovery) only puts its whole seed on shard
+    /// 0 (task #67) — shards 1..N-1 boot at 0 while `total_offset()` starts
+    /// at the recovered lsn, so those shards' axes still diverge from the
+    /// master axis after a restart and must never be mixed with it.
     pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) -> u64 {
         if shard_id >= self.shard_offsets.len() {
             return 0;
@@ -210,7 +213,13 @@ impl ReplicationState {
         self.master_repl_offset.load(Ordering::Relaxed)
     }
 
-    /// Seed `master_repl_offset` to at least `lsn` after AOF recovery.
+    /// Seed `master_repl_offset` to at least `lsn` after AOF recovery, and
+    /// seed shard 0's per-shard offset to the same value so the
+    /// `Σ shard_offsets == total_offset()` invariant — the one every write
+    /// maintains going forward via `increment_shard_offset`/`issue_lsn`,
+    /// which bump both axes by the same delta in lockstep — already holds
+    /// the instant recovery finishes, instead of only after enough live
+    /// traffic has flowed to close the gap (never, if the master idles).
     ///
     /// Per-shard AOF RFC § 2 Rule 3: after recovery reads the per-shard AOFs,
     /// `master_repl_offset` MUST be at least the max LSN observed across all
@@ -218,13 +227,41 @@ impl ReplicationState {
     /// write would issue an LSN already present on disk, breaking the
     /// `lsn → entry` uniqueness invariant the backlog merge depends on.
     ///
-    /// Uses `fetch_max` so a concurrent in-flight increment (extremely
-    /// unlikely at boot, but free to guard against) cannot regress the value.
-    /// Per-shard offsets are intentionally NOT touched here — at boot they
-    /// are still 0, and seeding shard offsets to the per-shard AOF max would
-    /// double-count once the first write advances them via `issue_lsn`.
+    /// task #67 (P0, v0.7.0 soak): a restarted PerShard-AOF master
+    /// (`--shards >= 2`) that skipped the shard-axis seed left
+    /// `shard_offsets` at the fresh-boot 0 while `master_repl_offset` jumped
+    /// straight to the recovered `lsn`. The multi-shard PSYNC full-resync
+    /// handshake (`handle_psync_inline_multi_shard`) advertises
+    /// `Σ shard_offset(i)` — not `total_offset()` — as the reconnecting
+    /// replica's new baseline, since each shard's PrepareReplicaSync leg
+    /// captures its own offset atomically with its RDB body (the exactly-once
+    /// invariant `ReplicaFanout::cut` depends on). A replica adopting a
+    /// near-zero baseline can never ACK up to `total_offset()`'s old-history
+    /// value: `wait_for_replicas` compares against `total_offset()` and
+    /// blocks forever, even though the data stream itself is correct and
+    /// live (reproduced 2× by `scripts/soak-replication-24h.sh`).
+    ///
+    /// The exact per-shard SPLIT of the seed does not affect correctness:
+    /// each shard's offset is compared only against ITSELF — the live-fanout
+    /// `cut` gate and the lazily-allocated backlog are both scoped to one
+    /// shard and never cross-reference another shard's counter. Concentrating
+    /// the whole seed on shard 0 is therefore sufficient. (Splitting it
+    /// proportionally by each shard's own historical byte count is not
+    /// possible from the data AOF replay retains — `replay_per_shard` tracks
+    /// each shard's max GLOBAL lsn *tag*, not its cumulative local byte
+    /// length, and seeding N shards each to a value near the shared global
+    /// max would sum to roughly `N × lsn` — a real double-count, which is
+    /// what the original single-axis version of this function's doc avoided
+    /// by not touching `shard_offsets` at all.)
+    ///
+    /// Uses `fetch_max` on both counters so a concurrent in-flight increment
+    /// (extremely unlikely at boot, but free to guard against) cannot
+    /// regress either value.
     pub fn seed_master_offset(&self, lsn: u64) {
         self.master_repl_offset.fetch_max(lsn, Ordering::Relaxed);
+        if let Some(shard0) = self.shard_offsets.first() {
+            shard0.fetch_max(lsn, Ordering::Relaxed);
+        }
     }
 
     /// Returns the per-shard offset for a specific shard.
@@ -504,6 +541,57 @@ mod tests {
         state.increment_shard_offset(1, 75);
         state.increment_shard_offset(2, 25);
         assert_eq!(state.total_offset(), 150);
+    }
+
+    /// task #67: `seed_master_offset` (PerShard AOF recovery) must seed shard
+    /// 0's per-shard offset alongside `master_repl_offset`, so
+    /// `Σ shard_offsets == total_offset()` holds immediately after boot —
+    /// not just after enough live writes have flowed to close the gap.
+    /// `handle_psync_inline_multi_shard` advertises `Σ shard_offset(i)` (not
+    /// `total_offset()`) as a reconnecting replica's new baseline; leaving
+    /// shard_offsets at 0 while total_offset jumps to the recovered lsn wedges
+    /// `WAIT` forever on a restarted multi-shard master (reproduced by
+    /// `tests/replication_hardening.rs::master_kill_restart_wait_acks`).
+    #[test]
+    fn test_seed_master_offset_seeds_shard_zero_to_match_total() {
+        let state = ReplicationState::new(4, generate_repl_id(), ZEROED_ID.to_string());
+        state.seed_master_offset(5_000);
+
+        assert_eq!(state.total_offset(), 5_000);
+        let sum: u64 = (0..state.num_shards()).map(|i| state.shard_offset(i)).sum();
+        assert_eq!(
+            sum,
+            state.total_offset(),
+            "sum of per-shard offsets must equal total_offset() right after seeding"
+        );
+        assert_eq!(state.shard_offset(0), 5_000, "seed lands on shard 0");
+        for i in 1..state.num_shards() {
+            assert_eq!(state.shard_offset(i), 0, "non-zero shards stay at 0");
+        }
+
+        // The invariant must survive subsequent live writes on any shard —
+        // increment_shard_offset bumps both axes by the same delta, so the
+        // sum-equals-total property is preserved, not just true at t=0.
+        state.increment_shard_offset(1, 42);
+        state.increment_shard_offset(0, 8);
+        let sum_after: u64 = (0..state.num_shards()).map(|i| state.shard_offset(i)).sum();
+        assert_eq!(sum_after, state.total_offset());
+        assert_eq!(state.total_offset(), 5_050);
+    }
+
+    /// `fetch_max` semantics: a concurrent in-flight increment before the
+    /// seed call must not be clobbered backwards on either axis.
+    #[test]
+    fn test_seed_master_offset_never_regresses() {
+        let state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
+        state.increment_shard_offset(0, 9_000);
+        assert_eq!(state.total_offset(), 9_000);
+
+        // A seed lower than the current live offset (e.g. a stale/short AOF
+        // max-lsn) must not regress either counter.
+        state.seed_master_offset(100);
+        assert_eq!(state.total_offset(), 9_000);
+        assert_eq!(state.shard_offset(0), 9_000);
     }
 
     #[test]

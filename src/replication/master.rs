@@ -1257,10 +1257,14 @@ fn push_register_replica_inline(
             .read()
             .map_err(|_| anyhow::anyhow!("replication state lock poisoned"))?;
         // Master-axis offset for the catch-up reply protocol, PER-SHARD-axis
-        // offset for the fan-out cut — the two counters diverge after
-        // `seed_master_offset` (AOF recovery) and must never be mixed. This
-        // path only runs at shards=1 (multi-shard PSYNC routes through
-        // `handle_psync_inline_multi_shard`), so shard 0 is THE shard.
+        // offset for the fan-out cut. This path only runs at shards=1
+        // (multi-shard PSYNC routes through `handle_psync_inline_multi_shard`),
+        // so shard 0 is THE shard — and `seed_master_offset` (AOF recovery,
+        // task #67) seeds shard 0 to the same value as the master axis, so
+        // the two stay equal here even across a restart with prior write
+        // history. Still read as two separate values (not asserted equal):
+        // this function is generic over shard count and the invariant is
+        // shard-0-specific.
         (g.total_offset(), g.shard_offset(0))
     };
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::RegisterReplica(

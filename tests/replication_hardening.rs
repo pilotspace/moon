@@ -19,11 +19,28 @@ fn moon_bin() -> String {
 }
 
 fn start_moon(port: u16, dir: &str, extra: &[&str]) -> Guard {
+    start_moon_shards(port, dir, 1, extra)
+}
+
+/// Same as [`start_moon`] but with a caller-supplied `--shards` count — the
+/// soak harness (scripts/soak-replication-24h.sh) runs a MULTI-shard master
+/// (`--master-shards 4` default) against a single-shard replica (replica-side
+/// streaming replication is single-shard only; see
+/// `src/replication/replica.rs`), so a master-restart repro needs to match
+/// that shard topology, not the single-shard default `start_moon` uses.
+fn start_moon_shards(port: u16, dir: &str, shards: u32, extra: &[&str]) -> Guard {
     Guard(
         Command::new(moon_bin())
             .args(
                 [
-                    &["--port", &port.to_string(), "--shards", "1", "--dir", dir][..],
+                    &[
+                        "--port",
+                        &port.to_string(),
+                        "--shards",
+                        &shards.to_string(),
+                        "--dir",
+                        dir,
+                    ][..],
                     extra,
                 ]
                 .concat(),
@@ -53,10 +70,18 @@ impl Drop for Guard {
 }
 
 fn send_cmd(addr: &str, cmd: &str) -> String {
+    send_cmd_with_timeout(addr, cmd, Duration::from_secs(5))
+}
+
+/// Same as [`send_cmd`] but with a caller-supplied read timeout. Needed for
+/// commands like `WAIT <n> <timeout_ms>` that legitimately block server-side
+/// for up to `timeout_ms` — the client-side read timeout must exceed that or
+/// we time out locally before the server ever replies.
+fn send_cmd_with_timeout(addr: &str, cmd: &str, read_timeout: Duration) -> String {
     let Ok(mut stream) = TcpStream::connect(addr) else {
         return String::new();
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(read_timeout)).ok();
     stream
         .write_all(format!("{}\r\n", cmd).as_bytes())
         .expect("write");
@@ -113,6 +138,36 @@ fn write_keys(addr: &str, prefix: &str, n: usize) {
     for i in 0..n {
         send_cmd(addr, &format!("SET {}_{} value_{}", prefix, i, i));
     }
+}
+
+/// Issue `WAIT <num_required> <timeout_ms>` against `addr` and return the
+/// acked replica count. The client-side read timeout is `timeout_ms` plus a
+/// generous buffer so we never race the server's own WAIT deadline.
+fn wait_cmd(addr: &str, num_required: u64, timeout_ms: u64) -> i64 {
+    let resp = send_cmd_with_timeout(
+        addr,
+        &format!("WAIT {} {}", num_required, timeout_ms),
+        Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+    );
+    resp.trim()
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap_or(-1)
+}
+
+/// Poll `INFO` on a replica until `master_link_status:up` appears (data-plane
+/// PSYNC streaming established) or `deadline` elapses. Returns whether it came up.
+fn wait_link_up(replica_addr: &str, deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        let info = send_cmd(replica_addr, "INFO replication");
+        if info.contains("master_link_status:up") {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -359,5 +414,109 @@ mod tests {
             "Replica should catch up after partition: replica={}, master={}",
             replica_size, master_size
         );
+    }
+
+    /// task #67 (P0, v0.7.0 soak): master kill-9 + restart must not wedge
+    /// `REPLCONF ACK` registration on the master side. The soak harness
+    /// (PR #327, `scripts/soak-replication-24h.sh`) reproduced this twice:
+    /// after killing and restarting the master on the same port/dir, the
+    /// replica's reconnect + data-plane streaming recovers fine, but
+    /// `WAIT 1 <timeout>` on the restarted master times out for minutes —
+    /// the replica keeps sending `REPLCONF ACK`, but the master stops
+    /// recording them — until the *replica* process itself is restarted.
+    ///
+    /// Matches the soak's shard topology: a MULTI-shard master
+    /// (`--master-shards 4` default) against a single-shard replica —
+    /// `handle_psync_inline_multi_shard` is a materially different code path
+    /// from the single-shard `handle_psync_inline_single_shard` (always full
+    /// resync; per-shard offset capture instead of the seeded master-axis
+    /// total), so a single-shard repro does not exercise the same code.
+    ///
+    /// This test asserts the CONTROL plane (WAIT/ACK) specifically, not just
+    /// data parity: a data-only assertion (as in `replica_kill_restart_parity`)
+    /// would pass even with this bug, since the write still arrives — WAIT is
+    /// what actually wedges.
+    #[test]
+    #[ignore]
+    fn master_kill_restart_wait_acks() {
+        let master_dir = tempfile::tempdir().unwrap();
+        let replica_dir = tempfile::tempdir().unwrap();
+        let master_port = 16650u16;
+        let replica_port = 16651u16;
+        let master_addr = format!("127.0.0.1:{master_port}");
+        let replica_addr = format!("127.0.0.1:{replica_port}");
+
+        let mut master =
+            start_moon_shards(master_port, master_dir.path().to_str().unwrap(), 4, &[]);
+        thread::sleep(Duration::from_millis(500));
+
+        // Some pre-crash write history so the restarted master's AOF replay
+        // seeds a non-trivial master_repl_offset (RFC §2 Rule 3) — the
+        // realistic soak scenario, not a freshly-booted empty master.
+        write_keys(&master_addr, "pre_kill", 50);
+
+        let _replica = start_moon(replica_port, replica_dir.path().to_str().unwrap(), &[]);
+        thread::sleep(Duration::from_millis(500));
+        send_cmd(&replica_addr, &format!("REPLICAOF 127.0.0.1 {master_port}"));
+        assert!(
+            wait_link_up(&replica_addr, Duration::from_secs(15)),
+            "initial sync must complete before the test proceeds"
+        );
+
+        // Sanity: WAIT resolves before any restart.
+        send_cmd(&master_addr, "SET sanity_key sanity_value");
+        let acked = wait_cmd(&master_addr, 1, 2000);
+        assert_eq!(acked, 1, "WAIT must succeed before master restart (sanity)");
+
+        // Kill -9 the MASTER, then restart it on the SAME port + SAME dir
+        // (AOF-backed recovery — appendonly defaults to yes).
+        // SAFETY: `child.id()` returns a valid PID for a process we just
+        // spawned; SIGKILL is always a valid signal.
+        let ret = unsafe { libc::kill(master.0.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0, "libc::kill failed");
+        let _ = master.0.wait();
+
+        let mut master2 =
+            start_moon_shards(master_port, master_dir.path().to_str().unwrap(), 4, &[]);
+        thread::sleep(Duration::from_millis(700));
+
+        // Data plane: the replica's reconnect loop must re-establish PSYNC
+        // streaming against the restarted master.
+        assert!(
+            wait_link_up(&replica_addr, Duration::from_secs(30)),
+            "replica must reconnect to the restarted master"
+        );
+
+        // Confirm the data plane is actually flowing post-restart.
+        send_cmd(&master_addr, "SET post_restart_key post_restart_value");
+        let mut replicated = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let v = send_cmd(&replica_addr, "GET post_restart_key");
+            if v.contains("post_restart_value") {
+                replicated = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            replicated,
+            "data plane must keep replicating after master restart"
+        );
+
+        // Control plane: WAIT must resolve to 1 within a bounded timeout —
+        // this is what task #67 says wedges for minutes.
+        let acked = wait_cmd(&master_addr, 1, 5000);
+        assert_eq!(
+            acked,
+            1,
+            "task #67: WAIT 1 must succeed after master kill-9+restart — \
+             REPLCONF ACK stopped registering on the restarted master \
+             (replica ACKs: {:?})",
+            send_cmd(&master_addr, "INFO replication")
+        );
+
+        let _ = master2.0.kill();
+        let _ = master2.0.wait();
     }
 }
