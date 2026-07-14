@@ -22,6 +22,18 @@ per-boot segment rotation isn't misread as replay double-append. With the
 task #60 replay fix already on main, g1–g5 are green 3× consecutively on
 macOS. The underlying `replay_graph_wal` RESP-parse bug these tests expose
 was fixed separately in PR #322.
+### Changed — PRODUCTION-CONTRACT.md reconciled to post-replication-GA main (v0.7.0 prep)
+
+2026-07-14 owner reconciliation of the GA Exit Ledger against the tree: re-ticked
+`FUZZ-01` (12th fuzz target restored), `ACL-REG-01` (PR #258), `COLD-TTL-01`
+(`ColdIndex::sweep_expired` + reclaim counters), `SEC-07` (release-agnostic
+supported-versions policy); `FT-PARITY-01` updated (FT.AGGREGATE shipped,
+FT.ALTER open). `CRASH-01` gained honesty caveats (g1–g3 harness never ran
+before PRs #322/#324; `crash_recovery_disk_offload_no_aof` residual red,
+task #44). New rows for shipped-but-untracked guarantees: `CRASH-02`
+(37-cell cross-plane kill-9 matrix), `MEM-10X-01` (10× RAM G2 acceptance),
+`REPL-PLANES-01` (all-plane replication); new `REPL-SOAK-01` row gates the
+v0.7.0 tag on the 24h replication soak. GA-blocking gap now 17 rows.
 
 ### Fixed — legacy-mode (`--disk-offload disable`) graph WAL replay silently dropped the entire graph plane on kill-9 restart (task #60)
 

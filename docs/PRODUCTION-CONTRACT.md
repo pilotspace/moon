@@ -5,11 +5,13 @@ description: "Moon's v1.0 promises: SLOs, durability modes, supported platforms,
 
 # Moon Production Contract
 
-**Status:** living document — refreshed to v0.6.0 reality (ROADMAP §8.1 `H-5`); the ledger below is
-what the `v1.0` release gate checks.
-**Last updated:** 2026-07-10
-**Milestone:** v0.6.1 Hygiene & reliability hotfix
-**Current release:** v0.6.0 (2026-07-08, PR #249) — see [`RELEASES.md`](https://github.com/pilotspace/moon/blob/main/RELEASES.md)
+**Status:** living document — refreshed to post-replication-GA main (v0.7.0 release prep); the ledger
+below is what the `v1.0` release gate checks.
+**Last updated:** 2026-07-14
+**Milestone:** v0.7.0 Replication GA for multi-shard masters (tag gated on the 24h replication soak)
+**Current release:** v0.6.0 (2026-07-08, PR #249) — see [`RELEASES.md`](https://github.com/pilotspace/moon/blob/main/RELEASES.md).
+Main additionally carries the full v0.6.1 hygiene scope (H-1…H-7) and the v0.7 replication
+workstreams (R0/R0.5/R1/R2 + plane replication Waves A/B), untagged pending the soak gate.
 **Roadmap:** [`docs/roadmap/ROADMAP.md`](roadmap/ROADMAP.md) §1 (proven strengths / reality check) is the
 authoritative source this ledger was verified against.
 
@@ -87,29 +89,31 @@ per the CI gate · Blocking `—` = tracked but never blocks a tag (see Out of S
 | ✅ | CHANGELOG-01 | CHANGELOG.md CI gate on every PR (skip-changelog label escape hatch) | `ci.yml` step `CHANGELOG check` | GA |
 | ✅ | REL-LEDGER-01 | Release tag requires a matching `RELEASES.md` entry | `release.yml` step `Require RELEASES.md entry for this tag` | GA |
 | ✅ | CONTRACT-01 | This document is a checked ledger with a CI-wired gate | `scripts/check-production-contract.sh`, `release.yml` | GA |
-| ⬜ | SUPPLY-01 | `cargo audit` + `cargo deny` CI-blocking | `deny.toml` exists and is correctly configured, but its own header comment ("CI: `ci.yml` safety-audit job") is **stale** — no such job exists in `ci.yml` today; `cargo audit`/`cargo deny` do not run in CI | GA |
+| ⬜ | SUPPLY-01 | `cargo audit` + `cargo deny` CI-blocking | `deny.toml` exists but no CI job runs the tools. Dedicated `supply-chain.yml` workflow in flight (task #63, 2026-07-14) — tick when merged and green. | GA |
 
 ### B. Correctness Hardening
 
 | Status | ID | Item | Evidence | Blocking |
 |---|---|---|---|---|
-| ⬜ | FUZZ-01 | cargo-fuzz targets, 15 min/target on PR (`ci-fuzz` label) + nightly, 24h cumulative clean | `fuzz/fuzz_targets/` has **11** working targets (resp_parse, resp_parse_differential, inline_parse, wal_v3_record, rdb_load, gossip_deser, acl_rule, cypher_parse, conf_parse, csr_from_bytes, fts_query_parse) wired in `.github/workflows/fuzz.yml`. **Defect found during this audit:** `fuzz/Cargo.toml` and `fuzz.yml`'s matrix both declare a 12th target, `graph_props_record`, whose source file `fuzz_targets/graph_props_record.rs` does not exist in the tree — that matrix shard fails on every nightly run. Not ticked until fixed. | GA |
+| ✅ | FUZZ-01 | cargo-fuzz targets, 15 min/target on PR (`ci-fuzz` label) + nightly, 24h cumulative clean | `fuzz/fuzz_targets/` has all **12** declared targets wired in `.github/workflows/fuzz.yml` — the missing 12th target found by the 2026-07-10 audit (`graph_props_record.rs`) was restored (task #10) and the nightly matrix shard is green again. | GA |
 | ✅ | LOOM-01 | Loom model tests for lock-free/atomic state machines | `tests/loom_response_slot.rs`, `tests/loom_wal_sync_agent.rs` | GA |
 | ✅ | SEC-08 | ACL glob-pattern fuzzing | `fuzz/fuzz_targets/acl_rule.rs`, wired in `fuzz.yml` | GA |
 | ✅ | UNSAFE-01 | 100% `// SAFETY:` comment coverage, CI-enforced | `scripts/audit-unsafe.sh`, called from `ci.yml` `Lint` job | GA |
 | ✅ | UNWRAP-01 | `unwrap`/`expect` ratchet (no new unannotated unwraps on hot paths) | `scripts/audit-unwrap.sh`, called from `ci.yml` `Lint` job | GA |
 | ✅ | SEC-05 | `docs/security/unsafe-audit.md` published | `docs/security/unsafe-audit.md` | GA |
-| ⬜ | ACL-REG-01 | `TXN.*`/`WS.*`/`MQ.*`/`TEMPORAL.*`/`CDC.*` command families registered in the phf ACL/metadata table (early-intercept bypass) | `src/workspace/mod.rs:145`, `src/command/metadata.rs` — gap tracked as ROADMAP `H-3`, v0.6.1 | GA |
+| ✅ | ACL-REG-01 | `TXN.*`/`WS.*`/`MQ.*`/`TEMPORAL.*`/`CDC.*` command families registered in the phf ACL/metadata table (early-intercept bypass) | Fixed by ROADMAP `H-3` (PR #258): families registered in `src/command/metadata.rs` with ACL categories, monoio early-intercept reordered behind the ACL check (the original bypass let `CDC.READ` skip ACL entirely on the production runtime), pubsub check added; denied-user tests included. | GA |
 
 ### C. Durability Proof
 
 | Status | ID | Item | Evidence | Blocking |
 |---|---|---|---|---|
 | ✅ | WAL-01 | WAL v3 unified log, per-shard group commit, checksum-guarded records | `src/persistence/page.rs`, `kv_page.rs`, `clog.rs`, `manifest.rs`; `fuzz/fuzz_targets/wal_v3_record.rs` | GA |
-| ✅ | CRASH-01 | Scripted crash-injection matrix (per-shard AOF, cold-tier DEL resurrection, disk-offload, graph, vacuum, vector durability) | `tests/crash_matrix_per_shard_aof.rs`, `crash_matrix_per_shard_bgrewriteaof.rs`, `crash_recovery_cold_del_resurrection.rs`, `crash_recovery_disk_offload_no_aof.rs`, `crash_recovery_graph_durability.rs`, `crash_recovery_vacuum.rs`, `crash_recovery_vector_durability.rs`; run by `.github/workflows/integration-tests.yml` jobs `Durability Tests` + `Crash Matrix (per-shard AOF)` | GA |
+| ✅ | CRASH-01 | Scripted crash-injection matrix (per-shard AOF, cold-tier DEL resurrection, disk-offload, graph, vacuum, vector durability) | `tests/crash_matrix_per_shard_aof.rs`, `crash_matrix_per_shard_bgrewriteaof.rs`, `crash_recovery_cold_del_resurrection.rs`, `crash_recovery_disk_offload_no_aof.rs`, `crash_recovery_graph_durability.rs`, `crash_recovery_vacuum.rs`, `crash_recovery_vector_durability.rs`; run by `.github/workflows/integration-tests.yml` jobs `Durability Tests` + `Crash Matrix (per-shard AOF)`. **2026-07-14 audit caveats:** the graph-durability suite's g1–g3 never actually ran until PRs #322/#324 (harness polled the deleted WAL v2 flat file AND the legacy-mode replay it guards was a silent no-op — both fixed, g1–g5 green 3× macOS / 5× Linux); `crash_recovery_disk_offload_no_aof` is currently red on main (task #44, open). | GA |
+| ✅ | CRASH-02 | Cross-plane kill-9 crash matrix — every plane pair (KV/vector/graph/FTS/WS/MQ/temporal/txn) survives kill -9 with zero synced-write loss, both legacy and disk-offload modes | `tests/crash_matrix_cross_plane/` (37 cells, PR #298, v0.8 storage-kernel G1 gate). The matrix's 4 RED root-cause groups were each fixed with the cell as regression proof: cross-store MULTI/EXEC graph leg (task #52), checkpoint-Finalize graph total-loss window (task #53), eviction plain-drop under write pressure (task #57), legacy graph WAL replay no-op (task #60, PR #322). | GA |
+| ✅ | MEM-10X-01 | 10× RAM datasets under disk-offload: bounded resident set, startup readiness not O(spilled-keys) | v0.8 storage-kernel G2 acceptance run (2026-07-13): all 3 criteria PASS — restart readiness 157s → 3.7s at 236K spilled files (PR #319 crash-orphan sweep off the critical path), unified resident-bytes accounting + elastic budget (PR #297), allocator-overhead + PageCache observability (PR #320). Known follow-up: spill-file batching (tracked, non-blocking). | GA |
 | ✅ | JEPSEN-01 | Jepsen-lite linearizability suite | `tests/jepsen_lite.rs`, run by `integration-tests.yml` job `Durability Tests` | GA |
 | ✅ | BACKUP-01 | BGSAVE → restore correctness tests | `tests/durability/backup_restore.rs` | GA |
-| ⬜ | COLD-TTL-01 | Cold-tier TTL reclaim (expired ColdIndex entries never swept — unbounded RAM+disk growth) | `tmp/OFFLOAD-COMPRESSION-REVIEW.md` R1; fix tracked as ROADMAP `H-2`, v0.6.1, not yet landed | GA |
+| ✅ | COLD-TTL-01 | Cold-tier TTL reclaim (expired ColdIndex entries never swept — unbounded RAM+disk growth) | Fixed by ROADMAP `H-2`: `ColdIndex::sweep_expired` (bounded per-tick reclaim, `src/storage/tiered/cold_index.rs`) + expired-on-read reclaim, observable via `src/command/info_reclamation.rs` counters (`cold_expired_reclaimed`) and `src/admin/reclamation_schedule.rs`. | GA |
 | ✅ | RSS-01 | Memory steady-state regression gate (per-kind RSS vs baseline, ±5%, self-test injects +6% to prove the gate catches it) | `ci.yml` job `Memory steady-state gate`, `scripts/bench-memory-steady-state.sh` | GA |
 | ⬜ | PERF-01 | Criterion regression gate blocking PRs on >5% hot-path regression | not found — no Criterion CI job exists; `benches/*.rs` are run manually only | GA |
 | ⬜ | PERF-02 | 24h HDR histogram rig on reference hardware, numbers promoted from provisional | not found | GA |
@@ -121,7 +125,9 @@ per the CI gate · Blocking `—` = tracked but never blocks a tag (see Out of S
 | ✅ | REPL-01 | Single-shard-master PSYNC2 (full + partial resync), replica promotion | `src/replication/`, `tests/replication_hardening.rs`, `tests/replication_test.rs`, run by `integration-tests.yml` job `Replication Tests` | GA |
 | ✅ | REPL-MULTISHARD-01 | Multi-shard master replication (a `--shards N>1` master can be replicated at all) | R2 (task #20): `ShardMessage::PrepareReplicaSync` per-shard atomic snapshot legs + merged Redis-format RDB + per-record SELECT framing on the merged wire. monoio only; replicas run `--shards 1`; partial resync degrades to full at N>1. `tests/replication_multishard.rs` (2/4/8-shard resync, interleaved multi-db parity, graph, partial→full). | GA |
 | ✅ | WAIT-01 | `WAIT` reflects real replica ACK state | R1 (task #19, PR #282): replica 1s `REPLCONF ACK` ticker on the split PSYNC socket; master `ack_read_loop` + `drain_ack_offsets` record into `ReplicaInfo.ack_offsets`; connection-layer `try_handle_wait` blocks until ACK ≥ target or timeout. `wait_returns_acked_replica_count` e2e; exact on multi-shard masters too (summed snapshot offset). | GA |
-| ⬜ | KEYSPACE-NOTIF-01 | `notify-keyspace-events` keyspace notifications | No implementation found in `src/`. ROADMAP v0.7.0 workstream R5. | GA |
+| ✅ | REPL-PLANES-01 | Every write plane replicates, not just KV: eviction/expiry DELs, Lua effects, graph, vector/text index defs+contents, WS.*, MQ.*, TEMPORAL.* | Wave A (PR #285): eviction/expiry DELs + Lua effects to both planes (EVAL was previously durable in neither). Wave B (PR #294 + task #34): WS/MQ deterministic records + replica apply + PSYNC registry blob. Graph plane (task #25): live GRAPH.* streaming + snapshot backfill. Suites: `tests/replication_planes.rs`, `replication_graph.rs`, `replication_mq.rs`, `replication_readonly_ws_mq.rs`. Unified poison-record policy for replica apply (task #48). | GA |
+| ⬜ | REPL-SOAK-01 | 24h replication soak: kill -9 either side under WAIT-confirmed load, zero acked-write loss | Harness in flight (task #61: `scripts/soak-replication-24h.sh`); the run (task #62) gates the v0.7.0 tag. | GA |
+| ⬜ | KEYSPACE-NOTIF-01 | `notify-keyspace-events` keyspace notifications | No implementation found in `src/`. ROADMAP v0.7.0 workstream R5 — deferred to v0.7.1 (one-headline rule). | GA |
 | ⬜ | MONITOR-01 | `MONITOR` command | No implementation found in `src/command/`. ROADMAP v0.7.0 workstream R5. | GA |
 | ⬜ | XSHARD-READ-01 | Lock-free cross-shard read path (retire the shardslice waiver) | Waiver **expires 2026-08-01** per `RELEASES.md` v0.6.0 entry and ROADMAP §5; L4 redesign (`tmp/MULTISHARD-REDESIGN.md`) unstarted. ROADMAP v0.7.0 workstream R4. | GA |
 
@@ -143,7 +149,7 @@ per the CI gate · Blocking `—` = tracked but never blocks a tag (see Out of S
 | ✅ | SEC-04 | `docs/security/lua-sandbox.md` published | `docs/security/lua-sandbox.md` | GA |
 | ✅ | SEC-02 | SBOM (CycloneDX) generated per release; artifacts signed via cosign (keyless, Fulcio cert) | `release.yml` jobs `sign`: `cargo cyclonedx` (3 variant SBOMs), `cosign sign-blob --output-certificate` over every artifact + `SHA256SUMS.txt` | GA |
 | ✅ | THREAT-01 | `docs/THREAT-MODEL.md` published | `docs/THREAT-MODEL.md` | GA |
-| ⬜ | SEC-07 | `SECURITY.md` disclosure policy is accurate | File exists (`SECURITY.md`) but its Supported Versions table still says `0.1.x` — stale by 5 minor releases (current: v0.6.0). Tracked as ROADMAP `H-4` doc reconciliation, v0.6.1. | GA |
+| ✅ | SEC-07 | `SECURITY.md` disclosure policy is accurate | Fixed by ROADMAP `H-4`: `SECURITY.md` now states the release-agnostic policy — only the latest released minor line gets security fixes pre-1.0; 18-month LTS begins at v1.0.0. No per-release staleness possible anymore. | GA |
 | ⬜ | ENCRYPT-01 | Encryption at rest (WAL/AOF/RDB) | No `encryption`/`AES` feature or config surface found. ROADMAP v0.9.0 task `E-1`. | GA |
 
 `SUPPLY-01` (`cargo audit`/`cargo deny` not CI-wired) also belongs here conceptually — tracked once,
@@ -166,7 +172,7 @@ in the Toolchain & Release Hygiene table above, to avoid double-counting the sam
 |---|---|---|---|---|
 | ✅ | COMPAT-03 | `docs/redis-compat.md` published | `docs/redis-compat.md` | GA |
 | ⬜ | COMPAT-01 | Broad client-library CI matrix | Only redis-py (`.github/workflows/console-integration.yml`) and the Rust-native `redis`/internal test clients are CI-exercised today; Java (jedis/lettuce), Node (ioredis), .NET (StackExchange.Redis) are not. ROADMAP v0.9.0 task `E-4`. | GA |
-| ⬜ | FT-PARITY-01 | `FT.ALTER` + `FT.AGGREGATE` parity closure | Open per ROADMAP §3 mindmap ("Planned: FT.ALTER, FT.AGGREGATE parity") and §8.4 task `E-6` | GA |
+| ⬜ | FT-PARITY-01 | `FT.ALTER` + `FT.AGGREGATE` parity closure | Half closed: `FT.AGGREGATE` is implemented (`src/command/vector_search/ft_aggregate.rs`). `FT.ALTER` still has no implementation in `src/command/`. Remainder is ROADMAP §8.4 task `E-6`. | GA |
 | ⬜ | VEC-384-01 | 384d recall/QPS parity with RediSearch (TQ⁺ low-d calibration) | Diagnosed gap, ~16× QPS trail at 384d; fix candidate not yet implemented. ROADMAP v0.9.0 task `E-6`. | GA |
 
 ### I. Release Engineering
@@ -205,3 +211,4 @@ Never blocks any tag (deliberate, standing non-goals — see ROADMAP §7):
 |---|---|
 | 2026-04-08 | Initial publication — provisional SLO numbers from v0.1.2 benchmark memory; full checklist structure locked (Phase 87) |
 | 2026-07-10 | Full refresh to v0.6.0 reality (ROADMAP `H-5`): converted to an evidence-linked checked ledger, dropped the defunct Phase-87..100 numbering in favor of the v0.6.1→v1.0 release train, added `scripts/check-production-contract.sh` as a CI gate (soft-report pre-v1.0, hard-fail at `v1.0*` tags). Verification pass found two undocumented defects: `SUPPLY-01` (`deny.toml` claims a CI job that does not exist) and a broken 12th fuzz target (`graph_props_record`, `FUZZ-01`) — both left unticked rather than assumed. |
+| 2026-07-14 | v0.7.0-prep reconciliation: re-ticked `FUZZ-01` (12th target restored), `ACL-REG-01` (PR #258), `COLD-TTL-01` (`ColdIndex::sweep_expired`), `SEC-07` (release-agnostic policy); updated `FT-PARITY-01` (AGGREGATE shipped, ALTER open). Added honesty caveats to `CRASH-01` (g1–g3 harness never ran pre-#322/#324; task #44 residual red). New rows for shipped-but-previously-untracked guarantees: `CRASH-02` (37-cell cross-plane kill-9 matrix, v0.8 G1), `MEM-10X-01` (10× RAM acceptance, v0.8 G2), `REPL-PLANES-01` (all-plane replication, Waves A/B), and the pending `REPL-SOAK-01` gate for the v0.7.0 tag. |
