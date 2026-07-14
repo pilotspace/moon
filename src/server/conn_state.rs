@@ -45,7 +45,7 @@ pub struct ConnectionContext {
     /// to construct PerShard pools when the on-disk manifest demands it.
     pub aof_pool: Option<Arc<AofWriterPool>>,
     pub tracking_table: Rc<RefCell<TrackingTable>>,
-    pub repl_state: Option<Arc<RwLock<ReplicationState>>>,
+    pub repl_state: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
     pub cluster_state: Option<Arc<RwLock<ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<ScriptCache>>,

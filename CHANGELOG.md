@@ -38,6 +38,78 @@ overwhelmingly common case — is unaffected and stays recyclable.
 Byte-slice peek only, no allocation and no LZ4 decompression (`Command`
 payloads are never LZ4-compressed by `write_wal_v3_record`) — off the hot
 path (recycle passes only) but kept allocation-free per repo convention.
+### Fixed — Replication fanout gate perf debt: `parking_lot` migration, FANOUT_HINT mis-activation, single-guard write path (task #70); deleted dead master-side PSYNC path (task #72)
+
+Two pre-soak perf/hygiene defects blocking the v0.7.0 tag, fixed together
+since both touch `ReplicationState` locking on the per-write hot path.
+
+**Task #70 (4 sub-fixes):**
+
+1. `ReplicationState`'s outer lock (`ConnectionContext::repl_state` and every
+   `Arc<RwLock<ReplicationState>>` holder — 27 call sites across
+   `admin/metrics_setup.rs`, `cluster/gossip.rs`, `command/server_admin.rs`,
+   `main.rs`, `persistence/aof/pool.rs`, `replication/{reason_del,replica,
+   master,state}.rs`, `scripting/bridge.rs`, `server/conn/*`, `shard/*`) was
+   `std::sync::RwLock` while the inner `per_shard_backlogs` was already
+   `parking_lot::Mutex` — an inconsistent locking policy and a source of
+   `.read().unwrap()` / `if let Ok(g) = rs.read()` poisoning dances on the
+   write path. Migrated the outer lock to `parking_lot::RwLock` throughout;
+   removed all poisoning-related `Result` unwrapping (parking_lot's
+   `read()`/`write()` return the guard directly, `try_read()`/`try_write()`
+   return `Option`, not `Result`).
+2. `ensure_backlogs_allocated()` (called from `try_handle_replconf` on ANY
+   bare `REPLCONF`, including monitoring probes and failed handshakes) used
+   to call `mark_fanout_active()` unconditionally. Since `FANOUT_HINT` is a
+   sticky, never-cleared process-global flag, a single stray `REPLCONF`
+   permanently taxed every subsequent write with the fanout-active gate
+   check — even on a server that never completes a PSYNC. Split allocation
+   from hint-activation: `ensure_backlogs_allocated()` still allocates
+   backlogs (load-bearing for the handshake) but no longer touches
+   `FANOUT_HINT`; `mark_fanout_active()` now fires only from
+   `try_handle_psync`, on an actual PSYNC/replica registration.
+3. `record_local_write` / `record_local_write_db` took up to 3-4 separate
+   `repl_state.read()` acquisitions per write (SELECT-needed check, backlog
+   append, offset advance, ...). Collapsed the internal chain to ONE guard
+   acquired at the top of `record_local_write_db` and threaded through to
+   `record_local_write` (now `fn record_local_write(g: &ReplicationState,
+   shard_id, bytes)`, no longer self-locking). `replication_fanout_active`
+   stays a separate, short-lived gate lock — deliberately NOT folded into the
+   same guard, because some external call sites (`handler_monoio/mod.rs`'s
+   MOVE/COPY handling) reach an `.await` between the gate check and the next
+   repl-state touch, and Rust drops lock guards at end of lexical scope, not
+   at last use — holding one guard across that span would violate the
+   never-lock-across-`.await` rule. Net effect: at most 2 lock acquisitions
+   per replicated write (1 gate + 1 write guard), down from up to 4-5.
+4. Added `#[inline]` to `record_local_write`, `record_local_write_db`, and
+   `replication_fanout_active`, matching the sibling `try_handle_*`
+   convention in `dispatch.rs`.
+
+**Task #72:** `handle_psync_on_master` (both `runtime-tokio` and
+`runtime-monoio` variants) and `register_replica_with_shards` in
+`src/replication/master.rs` were unreachable — every PSYNC handler actually
+wired from `shard/conn_accept.rs` goes through
+`handle_psync_inline_single_shard` / `handle_psync_inline_multi_shard`
+instead. The dead pair also carried a latent broken WAIT implementation: it
+initialized `ack_offsets` but never spawned the `ack_read_loop` that drains
+replica ACKs into them, so `wait_for_replicas` against a registration made
+through that path would have blocked forever. Deleted both variants plus
+`evaluate_psync_shared` (only reachable from the deleted code); kept
+`backlog_bytes_from`, still used by the live `send_backlog_range`.
+
+Two new unit tests (`replication::state::tests`) cover the FANOUT_HINT fix
+with delta-based assertions (robust against shared-binary test-order
+contamination): `test_ensure_backlogs_allocated_does_not_activate_fanout_hint`
+(RED on the pre-fix code — verified by temporarily reintroducing the bare
+`mark_fanout_active()` call and observing the assertion fail) and
+`test_mark_fanout_active_sets_hint`.
+
+No wire-protocol or observable behavior change beyond the hint gating: the
+REPLCONF → PSYNC handshake sequence is unchanged and covered end-to-end by
+the `replication_hardening` / `replication_multishard` / `replication_planes`
+integration suites (all green, monoio — master-side PSYNC is monoio-only by
+pre-existing design, `try_handle_psync_unsupported` under tokio, untouched
+by this change) plus the full `replication::` unit-test module under both
+`runtime-monoio` (default) and `runtime-tokio,jemalloc`.
 
 ### Fixed — `crash_recovery_disk_offload_no_aof` harness assumed eviction-throughput durability the write path no longer provides (task #44)
 

@@ -192,7 +192,7 @@ pub async fn run_with_shutdown(
             repl_id, repl_id2,
         );
         rs.set_backlog_capacity(config.repl_backlog_size);
-        Arc::new(RwLock::new(rs))
+        Arc::new(parking_lot::RwLock::new(rs))
     };
 
     // Register repl_state globally for INFO command queries.

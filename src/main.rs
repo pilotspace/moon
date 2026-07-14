@@ -894,7 +894,7 @@ fn main() -> anyhow::Result<()> {
     let repl_state = {
         let mut rs = moon::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2);
         rs.set_backlog_capacity(config.repl_backlog_size);
-        std::sync::Arc::new(std::sync::RwLock::new(rs))
+        std::sync::Arc::new(parking_lot::RwLock::new(rs))
     };
 
     // Register repl_state globally for INFO command queries.
@@ -1382,10 +1382,8 @@ fn main() -> anyhow::Result<()> {
                 // RFC § 2 Rule 3 — seed master_repl_offset before accepting
                 // client traffic so the next write doesn't reissue an LSN
                 // already on disk.
-                if global_max_lsn > 0
-                    && let Ok(state) = repl_state.read()
-                {
-                    state.seed_master_offset(global_max_lsn);
+                if global_max_lsn > 0 {
+                    repl_state.read().seed_master_offset(global_max_lsn);
                 }
 
                 // Retire any stray legacy top-level appendonly.aof so the

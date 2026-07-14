@@ -62,8 +62,9 @@ pub enum MonoioHandlerResult {
         target_shard: usize,
     },
     /// PSYNC arrived on this connection. Caller must hand the underlying
-    /// `monoio::net::TcpStream` to `crate::replication::master::handle_psync_on_master`
-    /// for snapshot transfer + live streaming.
+    /// `monoio::net::TcpStream` to
+    /// `crate::replication::master::handle_psync_inline_single_shard` /
+    /// `handle_psync_inline_multi_shard` for snapshot transfer + live streaming.
     HijackForPsync {
         client_repl_id: String,
         client_offset: i64,

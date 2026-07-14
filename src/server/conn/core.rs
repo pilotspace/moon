@@ -34,6 +34,9 @@ use crate::workspace::WorkspaceId;
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 
 /// Type alias for std::sync::RwLock to distinguish from parking_lot::RwLock.
+/// `ReplicationState` no longer uses this (task #70 — migrated to
+/// `parking_lot::RwLock`, see `repl_state` below); it remains in use for
+/// `acl_table` and `cluster_state`, which are out of scope for that migration.
 pub(crate) type StdRwLock<T> = std::sync::RwLock<T>;
 
 /// Immutable context shared across all connections on a shard.
@@ -55,7 +58,7 @@ pub(crate) struct ConnectionContext {
     /// PerShard until per-shard rewrite ships (step 6 of the RFC).
     pub aof_pool: Option<Arc<AofWriterPool>>,
     pub tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
-    pub repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+    pub repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
     /// Lock-free mirror of `repl_state.role == Replica { .. }`.
     /// Populated once in `new()` (from `repl_state.read()`), kept in sync
     /// thereafter by `ReplicationState::set_role()`. Read on every command
@@ -104,7 +107,7 @@ impl ConnectionContext {
         requirepass: Option<String>,
         aof_pool: Option<Arc<AofWriterPool>>,
         tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
-        repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+        repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
         cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
         lua: Rc<mlua::Lua>,
         script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -134,7 +137,7 @@ impl ConnectionContext {
         // ReplicationState::set_role() updates the same AtomicBool thereafter.
         let is_replica_mirror = repl_state
             .as_ref()
-            .and_then(|rs| rs.read().ok().map(|guard| guard.is_replica_mirror.clone()));
+            .map(|rs| rs.read().is_replica_mirror.clone());
         Self {
             shard_databases,
             shard_id,

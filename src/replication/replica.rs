@@ -6,8 +6,9 @@
 #![allow(unused_imports)]
 
 use bytes::{Bytes, BytesMut};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,7 +133,8 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
         }
 
         // Update handshake state to Disconnected in ReplicationState
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Disconnected;
             }
@@ -170,7 +172,8 @@ async fn run_handshake_and_stream(
     }
 
     // Step 1: PING
-    if let Ok(mut rs) = cfg.repl_state.write() {
+    {
+        let mut rs = cfg.repl_state.write();
         if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
             *state = ReplicaHandshakeState::PingSent;
         }
@@ -200,10 +203,7 @@ async fn run_handshake_and_stream(
 
     // Step 4: PSYNC <repl_id> <offset>
     let (repl_id, offset) = {
-        let rs = cfg
-            .repl_state
-            .read()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
         let id = if offset == 0 {
             "?".to_string()
@@ -217,7 +217,8 @@ async fn run_handshake_and_stream(
         };
         (id, off_str)
     };
-    if let Ok(mut rs) = cfg.repl_state.write() {
+    {
+        let mut rs = cfg.repl_state.write();
         if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
             *state = ReplicaHandshakeState::PsyncPending;
         }
@@ -240,7 +241,8 @@ async fn run_handshake_and_stream(
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
             // Update local replication state with master's repl_id
-            if let Ok(mut rs) = cfg.repl_state.write() {
+            {
+                let mut rs = cfg.repl_state.write();
                 rs.repl_id = master_id;
                 rs.master_repl_offset
                     .store(master_offset, Ordering::Relaxed);
@@ -290,7 +292,8 @@ async fn run_handshake_and_stream(
         }
 
         // Enter streaming mode
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Streaming;
             }
@@ -302,7 +305,8 @@ async fn run_handshake_and_stream(
         stream_commands(stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
         // Partial resync: stream from current offset
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Streaming;
             }
@@ -340,10 +344,7 @@ async fn stream_commands(stream: TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let offset = match repl_state.read() {
-                    Ok(rs) => rs.master_repl_offset.load(Ordering::Relaxed),
-                    Err(_) => break,
-                };
+                let offset = repl_state.read().master_repl_offset.load(Ordering::Relaxed);
                 if wr.write_all(&encode_replconf_ack(offset)).await.is_err() {
                     break; // socket dead — the read loop is exiting too
                 }
@@ -407,7 +408,8 @@ async fn stream_commands_read_loop(
             }
         }
         if outcome.consumed > 0 {
-            if let Ok(rs) = cfg.repl_state.read() {
+            {
+                let rs = cfg.repl_state.read();
                 rs.master_repl_offset
                     .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
             }
@@ -481,7 +483,8 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
             return;
         }
 
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Disconnected;
             }
@@ -522,7 +525,8 @@ async fn run_handshake_and_stream(
     }
 
     // Step 1: PING
-    if let Ok(mut rs) = cfg.repl_state.write() {
+    {
+        let mut rs = cfg.repl_state.write();
         if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
             *state = ReplicaHandshakeState::PingSent;
         }
@@ -552,10 +556,7 @@ async fn run_handshake_and_stream(
 
     // Step 4: PSYNC <repl_id> <offset>
     let (repl_id, offset) = {
-        let rs = cfg
-            .repl_state
-            .read()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
         let id = if offset == 0 {
             "?".to_string()
@@ -569,7 +570,8 @@ async fn run_handshake_and_stream(
         };
         (id, off_str)
     };
-    if let Ok(mut rs) = cfg.repl_state.write() {
+    {
+        let mut rs = cfg.repl_state.write();
         if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
             *state = ReplicaHandshakeState::PsyncPending;
         }
@@ -590,7 +592,8 @@ async fn run_handshake_and_stream(
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
-            if let Ok(mut rs) = cfg.repl_state.write() {
+            {
+                let mut rs = cfg.repl_state.write();
                 rs.repl_id = master_id;
                 rs.master_repl_offset
                     .store(master_offset, Ordering::Relaxed);
@@ -635,7 +638,8 @@ async fn run_handshake_and_stream(
             }
         }
 
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Streaming;
             }
@@ -646,7 +650,8 @@ async fn run_handshake_and_stream(
         cfg.stream_db.store(0, Ordering::Relaxed);
         stream_commands(stream, cfg).await?;
     } else if response.starts_with(b"+CONTINUE") {
-        if let Ok(mut rs) = cfg.repl_state.write() {
+        {
+            let mut rs = cfg.repl_state.write();
             if let ReplicationRole::Replica { ref mut state, .. } = rs.role {
                 *state = ReplicaHandshakeState::Streaming;
             }
@@ -686,10 +691,7 @@ async fn stream_commands(
                 if stop.get() {
                     break;
                 }
-                let offset = match repl_state.read() {
-                    Ok(rs) => rs.master_repl_offset.load(Ordering::Relaxed),
-                    Err(_) => break,
-                };
+                let offset = repl_state.read().master_repl_offset.load(Ordering::Relaxed);
                 let (res, _) = wr.write_all(encode_replconf_ack(offset)).await;
                 if res.is_err() {
                     break; // socket dead — the read loop is exiting too
@@ -762,7 +764,8 @@ async fn stream_commands_read_loop(
             }
         }
         if outcome.consumed > 0 {
-            if let Ok(rs) = cfg.repl_state.read() {
+            {
+                let rs = cfg.repl_state.read();
                 rs.master_repl_offset
                     .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
             }

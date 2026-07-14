@@ -204,7 +204,7 @@ pub async fn run_embedded(
         let mut rs =
             crate::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2);
         rs.set_backlog_capacity(config.repl_backlog_size);
-        Arc::new(std::sync::RwLock::new(rs))
+        Arc::new(RwLock::new(rs))
     };
     crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 

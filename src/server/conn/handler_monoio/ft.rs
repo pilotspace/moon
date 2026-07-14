@@ -32,6 +32,15 @@ fn is_replicated_ft_def_mutation(cmd: &[u8], cmd_args: &[Frame]) -> bool {
 /// snapshot is captured, so an FT.* mutation racing a first-ever attach still
 /// fans out). Gates the serialize+SPSC round trip so servers that never
 /// replicate pay nothing — mirrors `wal_fanout_has_work` on the KV path.
+///
+/// This is a deliberately SHORT-LIVED, independent lock from the one
+/// [`record_local_write_db`]/[`record_local_write`] take: several call sites
+/// reach an `.await` (e.g. the AOF `send_append_group` hop) between this gate
+/// check and their next `repl_state` touch, so the gate's guard must not
+/// outlive this function (task #70 — never hold a lock across `.await`).
+/// Only the WRITE itself — `record_local_write_db`'s own internal chain,
+/// entirely synchronous — collapses to one shared guard; see there.
+#[inline]
 pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
     // Cheap first gate: one Relaxed load; false until the first replica ever
     // begins attaching (REPLCONF/PSYNC → ensure_backlogs_allocated).
@@ -39,12 +48,11 @@ pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
         return false;
     }
     ctx.repl_state.as_ref().is_some_and(|rs| {
-        rs.read().is_ok_and(|g| {
-            !g.replicas.is_empty()
-                || g.per_shard_backlogs
-                    .first()
-                    .is_some_and(|slot| slot.lock().is_some())
-        })
+        let g = rs.read();
+        !g.replicas.is_empty()
+            || g.per_shard_backlogs
+                .first()
+                .is_some_and(|slot| slot.lock().is_some())
     })
 }
 
@@ -73,23 +81,28 @@ pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
 /// source of truth, and a later lazy allocation seeds the backlog at the
 /// current counter (`ReplicationBacklog::new_at`).
 ///
+/// Takes the `ReplicationState` guard by reference (task #70) instead of
+/// re-locking `ctx.repl_state` itself, so a caller writing both a `SELECT`
+/// prefix and a payload record (see [`record_local_write_db`]) pays for
+/// exactly one `.read()` acquisition, not one per record.
+///
 /// ⚠ Monoio shard threads only (pushes to `shard::self_msg`) — callers are
 /// all inside `handler_monoio`, which is `runtime-monoio`-gated.
-pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
+#[inline]
+pub(super) fn record_local_write(
+    g: &crate::replication::state::ReplicationState,
+    shard_id: usize,
+    bytes: Bytes,
+) {
     // Per-shard offset AFTER this record — the fan-out arm compares it
     // against each replica's snapshot cut (`ReplicaFanout::cut`) so a record
     // already inside a FULLRESYNC body is never live-delivered again.
-    let mut end_offset = u64::MAX;
-    if let Some(rs) = ctx.repl_state.as_ref() {
-        if let Ok(g) = rs.read() {
-            if let Some(slot) = g.per_shard_backlogs.get(ctx.shard_id) {
-                if let Some(backlog) = slot.lock().as_mut() {
-                    backlog.append(&bytes);
-                }
-            }
-            end_offset = g.increment_shard_offset(ctx.shard_id, bytes.len() as u64);
+    if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
+        if let Some(backlog) = slot.lock().as_mut() {
+            backlog.append(&bytes);
         }
     }
+    let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
         bytes,
         end_offset,
@@ -109,7 +122,20 @@ pub(super) fn record_local_write(ctx: &ConnectionContext, bytes: Bytes) {
 /// "stream db context == the writing connection's selected db", so a
 /// db-agnostic record can never silently strand a stale context for the next
 /// KV write.
+///
+/// Task #70: takes exactly ONE `ctx.repl_state.read()` guard for the whole
+/// call — shared by the `needs_select` decision and both potential
+/// `record_local_write` calls (SELECT prefix + payload) — collapsing what was
+/// previously up to 3 separate acquisitions (plus the caller's own
+/// `replication_fanout_active` gate check) down to 1 here. `None` (no
+/// `repl_state` configured) is a silent no-op, matching the prior behavior.
+#[inline]
 pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: Bytes) {
+    let Some(rs) = ctx.repl_state.as_ref() else {
+        return;
+    };
+    let g = rs.read();
+
     // R2 (task #20): multi-shard masters merge N shard streams onto one
     // replica wire, so the per-shard `stream_db` context tracking below is
     // meaningless there — another shard may have moved the wire's db context
@@ -126,28 +152,24 @@ pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: B
             let mut combined = Vec::with_capacity(select.len() + bytes.len());
             combined.extend_from_slice(&select);
             combined.extend_from_slice(&bytes);
-            record_local_write(ctx, Bytes::from(combined));
+            record_local_write(&g, ctx.shard_id, Bytes::from(combined));
         } else {
-            record_local_write(ctx, bytes);
+            record_local_write(&g, ctx.shard_id, bytes);
         }
         return;
     }
-    let needs_select = ctx.repl_state.as_ref().is_some_and(|rs| {
-        rs.read().is_ok_and(|g| {
-            g.stream_db.get(ctx.shard_id).is_some_and(|slot| {
-                if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
-                    slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
-            })
-        })
+    let needs_select = g.stream_db.get(ctx.shard_id).is_some_and(|slot| {
+        if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
+            slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     });
     if needs_select {
-        record_local_write(ctx, Bytes::from(serialize_select(db)));
+        record_local_write(&g, ctx.shard_id, Bytes::from(serialize_select(db)));
     }
-    record_local_write(ctx, bytes);
+    record_local_write(&g, ctx.shard_id, bytes);
 }
 
 /// RESP-serialize `SELECT <db>` for the replication stream.

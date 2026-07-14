@@ -1238,12 +1238,12 @@ pub fn get_cpu_usage() -> (f64, f64) {
 // ── Global replication state (for INFO) ────────────────────────────────
 
 static GLOBAL_REPL_STATE: once_cell::sync::OnceCell<
-    std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
 > = once_cell::sync::OnceCell::new();
 
 /// Register the global replication state for INFO queries.
 pub fn set_global_repl_state(
-    state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    state: std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
 ) {
     let _ = GLOBAL_REPL_STATE.set(state);
 }
@@ -1251,7 +1251,8 @@ pub fn set_global_repl_state(
 /// Get the raw global replication state Arc (for MEMORY DOCTOR backlog query).
 /// Returns None before replication is initialized.
 pub fn get_global_repl_state_arc()
--> Option<&'static std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>> {
+-> Option<&'static std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>
+{
     GLOBAL_REPL_STATE.get()
 }
 
@@ -1259,33 +1260,32 @@ pub fn get_global_repl_state_arc()
 /// Also updates the Prometheus replication lag gauge as a side-effect.
 pub fn get_replication_info() -> (&'static str, usize, u64, String) {
     if let Some(state) = GLOBAL_REPL_STATE.get() {
-        if let Ok(guard) = state.read() {
-            let role = match &guard.role {
-                crate::replication::state::ReplicationRole::Master => "master",
-                crate::replication::state::ReplicationRole::Replica { .. } => "slave",
-            };
-            let slaves = guard.replicas.len();
-            let offset = guard.master_repl_offset.load(Ordering::Relaxed);
-            let repl_id = guard.repl_id.clone();
-            // Update Prometheus lag gauge: max lag across all replicas.
-            if !guard.replicas.is_empty() {
-                let max_lag_bytes = guard
-                    .replicas
-                    .iter()
-                    .map(|r| {
-                        let ack: u64 = r
-                            .ack_offsets
-                            .iter()
-                            .map(|a| a.load(Ordering::Relaxed))
-                            .sum();
-                        offset.saturating_sub(ack)
-                    })
-                    .max()
-                    .unwrap_or(0);
-                record_replication_lag(max_lag_bytes, 0);
-            }
-            return (role, slaves, offset, repl_id);
+        let guard = state.read();
+        let role = match &guard.role {
+            crate::replication::state::ReplicationRole::Master => "master",
+            crate::replication::state::ReplicationRole::Replica { .. } => "slave",
+        };
+        let slaves = guard.replicas.len();
+        let offset = guard.master_repl_offset.load(Ordering::Relaxed);
+        let repl_id = guard.repl_id.clone();
+        // Update Prometheus lag gauge: max lag across all replicas.
+        if !guard.replicas.is_empty() {
+            let max_lag_bytes = guard
+                .replicas
+                .iter()
+                .map(|r| {
+                    let ack: u64 = r
+                        .ack_offsets
+                        .iter()
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .sum();
+                    offset.saturating_sub(ack)
+                })
+                .max()
+                .unwrap_or(0);
+            record_replication_lag(max_lag_bytes, 0);
         }
+        return (role, slaves, offset, repl_id);
     }
     ("master", 0, 0, "0".repeat(40))
 }
@@ -1456,9 +1456,7 @@ fn update_moon_memory_bytes() {
 
     // Replication backlog via global state.
     if let Some(state) = get_global_repl_state_arc() {
-        if let Ok(guard) = state.read() {
-            backlog = guard.backlog_resident_bytes();
-        }
+        backlog = state.read().backlog_resident_bytes();
     }
 
     // task #58 (LOW-1): read the allocator-overhead figure sampled by shard

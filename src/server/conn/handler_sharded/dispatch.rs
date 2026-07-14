@@ -272,14 +272,13 @@ pub(super) fn try_handle_replicaof(
         if let Some(ref rs) = ctx.repl_state {
             match action {
                 ReplicaofAction::StartReplication { host, port } => {
-                    if let Ok(mut rs_guard) = rs.write() {
-                        rs_guard.set_role(crate::replication::state::ReplicationRole::Replica {
+                    rs.write()
+                        .set_role(crate::replication::state::ReplicationRole::Replica {
                             host: host.clone(),
                             port,
                             state:
                                 crate::replication::handshake::ReplicaHandshakeState::PingPending,
                         });
-                    }
                     let rs_clone = Arc::clone(rs);
                     // Bump the task generation FIRST: any previously spawned
                     // replica task (old REPLICAOF target) sees itself
@@ -305,11 +304,10 @@ pub(super) fn try_handle_replicaof(
                     // left it streaming + applying forever (each NO ONE →
                     // re-attach cycle stacked one more live applier).
                     let _ = crate::replication::replica::bump_replica_task_epoch();
-                    if let Ok(mut rs_guard) = rs.write() {
-                        rs_guard.repl_id2 = rs_guard.repl_id.clone();
-                        rs_guard.repl_id = generate_repl_id();
-                        rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
-                    }
+                    let mut rs_guard = rs.write();
+                    rs_guard.repl_id2 = rs_guard.repl_id.clone();
+                    rs_guard.repl_id = generate_repl_id();
+                    rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
                 }
                 ReplicaofAction::NoOp => {}
             }
@@ -349,7 +347,7 @@ pub(super) async fn try_handle_info(
         }
     });
     if let Some(ref rs) = ctx.repl_state {
-        if let Ok(rs_guard) = rs.try_read() {
+        if let Some(rs_guard) = rs.try_read() {
             response_text.push_str(&crate::replication::handshake::build_info_replication(
                 &rs_guard,
             ));

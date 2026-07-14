@@ -408,7 +408,13 @@ pub(super) async fn try_handle_temporal_invalidate(
                             // stream's SELECT context untouched, which stays
                             // truthful: this record neither needs nor changes
                             // the db context.
-                            super::ft::record_local_write(ctx, Bytes::from(record));
+                            if let Some(rs) = ctx.repl_state.as_ref() {
+                                super::ft::record_local_write(
+                                    &rs.read(),
+                                    ctx.shard_id,
+                                    Bytes::from(record),
+                                );
+                            }
                         }
                         ctx.shard_databases.wal_append(
                             ctx.shard_id,

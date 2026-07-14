@@ -89,7 +89,7 @@ struct LuaEvictionInner {
     #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
     num_shards: usize,
     #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
-    repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+    repl_state: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
     #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
     aof_pool: Option<Arc<AofWriterPool>>,
     /// Task #38: lock-free snapshot of `ReplicationState::is_replica_mirror`,
@@ -128,7 +128,7 @@ impl LuaEvictionCtx {
         spill_file_id: Rc<Cell<u64>>,
         disk_offload_dir: Option<PathBuf>,
         num_shards: usize,
-        repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>>,
+        repl_state: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
         aof_pool: Option<Arc<AofWriterPool>>,
     ) -> Self {
         // Task #38: snapshot the lock-free mirror the same way
@@ -137,7 +137,7 @@ impl LuaEvictionCtx {
         // `ReplicationState::set_role()` writing the same `AtomicBool`.
         let is_replica_mirror = repl_state
             .as_ref()
-            .and_then(|rs| rs.read().ok().map(|guard| guard.is_replica_mirror.clone()));
+            .map(|rs| rs.read().is_replica_mirror.clone());
         LuaEvictionCtx(Some(LuaEvictionInner {
             shard_databases,
             runtime_config,
@@ -610,7 +610,7 @@ mod tests {
 
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "noeviction")));
-        let repl_state = Arc::new(std::sync::RwLock::new(ReplicationState::new(
+        let repl_state = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
             1,
             "a".repeat(40),
             "0".repeat(40),
@@ -633,23 +633,17 @@ mod tests {
             "fresh ReplicationState defaults to Master"
         );
 
-        repl_state
-            .write()
-            .unwrap()
-            .set_role(ReplicationRole::Replica {
-                host: "127.0.0.1".to_string(),
-                port: 6379,
-                state: ReplicaHandshakeState::PingPending,
-            });
+        repl_state.write().set_role(ReplicationRole::Replica {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::PingPending,
+        });
         assert!(
             ctx.is_replica(),
             "is_replica() must observe a role flip that happened after ctx construction"
         );
 
-        repl_state
-            .write()
-            .unwrap()
-            .set_role(ReplicationRole::Master);
+        repl_state.write().set_role(ReplicationRole::Master);
         assert!(
             !ctx.is_replica(),
             "REPLICAOF NO ONE must flip is_replica() back to false"

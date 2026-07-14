@@ -453,7 +453,7 @@ pub(crate) fn run_eviction_tick(
             pagecache_bytes += mem.pagecache.load(Ordering::Relaxed);
         }
         let repl_backlog_bytes = crate::admin::metrics_setup::get_global_repl_state_arc()
-            .and_then(|state| state.read().ok().map(|g| g.backlog_resident_bytes()))
+            .map(|state| state.read().backlog_resident_bytes())
             .unwrap_or(0);
         let allocator_overhead = compute_allocator_overhead(
             rss,

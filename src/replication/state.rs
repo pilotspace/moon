@@ -122,13 +122,19 @@ impl ReplicationState {
     /// subsequent writes on the shard's event loop start being captured for
     /// partial resync. Capacity comes from `self.backlog_capacity`
     /// (`--repl-backlog-size`, default 1 MiB per shard).
+    ///
+    /// Task #70: allocation is deliberately split from [`mark_fanout_active`]
+    /// — a bare `REPLCONF` (sent by any prober, or the first two steps of a
+    /// handshake that never reaches `PSYNC`) used to flip the process-global
+    /// `FANOUT_HINT` here, and the hint is never cleared, so a single failed
+    /// handshake permanently taxed every future write with the replication
+    /// serialize+SPSC round trip. Backlog allocation itself stays load-
+    /// bearing on `REPLCONF` (a real handshake's `REPLCONF` arrives before
+    /// `PSYNC`, so deferring allocation to `PSYNC` would buffer zero bytes
+    /// during the handshake window); only the hint activation moved to
+    /// `try_handle_psync` (dispatch.rs), which runs on an actual `PSYNC`
+    /// arrival — never on a `REPLCONF`-only probe.
     pub fn ensure_backlogs_allocated(&self) {
-        // Hint FIRST: any write racing this allocation that still sees the
-        // hint as false advances the offset without a backlog append, and the
-        // seed below (reading the offset AFTER that advance) re-aligns. At
-        // shards=1 both run on the same shard thread, so there is no race at
-        // all. (Multi-shard masters ride the R2 redesign.)
-        mark_fanout_active();
         for (shard_id, slot) in self.per_shard_backlogs.iter().enumerate() {
             let mut guard = slot.lock();
             if guard.is_none() {
@@ -387,9 +393,15 @@ pub fn save_replication_state(
 /// Write hot paths gate their replication-fanout serialization on this ONE
 /// Relaxed load instead of taking `repl_state.read()` per command (the same
 /// S3.5a rationale that gave READONLY its `is_replica_mirror` AtomicBool).
-/// Set by `ensure_backlogs_allocated` (REPLCONF/PSYNC arrival) and never
-/// cleared — once a replica has attached, the master keeps feeding the
-/// backlog so partial resync stays possible, exactly like Redis.
+///
+/// Set by an actual `PSYNC` arrival (`try_handle_psync` in
+/// `handler_monoio::dispatch`) or multi-shard replica registration — NOT by
+/// a bare `REPLCONF` (task #70: `REPLCONF` only allocates the backlog via
+/// [`ReplicationState::ensure_backlogs_allocated`], which does not touch this
+/// hint, so a prober or a handshake that never reaches `PSYNC` cannot flip it
+/// on). Never cleared once set — once a replica has genuinely begun
+/// attaching, the master keeps feeding the backlog so partial resync stays
+/// possible, exactly like Redis.
 static FANOUT_HINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mark the fanout hint (idempotent). See [`FANOUT_HINT`].
@@ -427,15 +439,14 @@ pub fn record_local_write_global(shard_id: usize, bytes: Bytes) {
     let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
         return;
     };
-    let mut end_offset = u64::MAX;
-    if let Ok(g) = repl_state_arc.read() {
-        if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
-            if let Some(backlog) = slot.lock().as_mut() {
-                backlog.append(&bytes);
-            }
+    let g = repl_state_arc.read();
+    if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
+        if let Some(backlog) = slot.lock().as_mut() {
+            backlog.append(&bytes);
         }
-        end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
     }
+    let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
+    drop(g);
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
         bytes,
         end_offset,
@@ -453,16 +464,18 @@ pub fn record_local_write_db_global(shard_id: usize, db: usize, bytes: Bytes) {
     let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
         return;
     };
-    let needs_select = repl_state_arc.read().is_ok_and(|g| {
-        g.stream_db.get(shard_id).is_some_and(|slot| {
+    let needs_select = repl_state_arc
+        .read()
+        .stream_db
+        .get(shard_id)
+        .is_some_and(|slot| {
             if slot.load(Ordering::Relaxed) != db as i64 {
                 slot.store(db as i64, Ordering::Relaxed);
                 true
             } else {
                 false
             }
-        })
-    });
+        });
     if needs_select {
         record_local_write_global(
             shard_id,
@@ -689,6 +702,60 @@ mod tests {
         backlog.append(&data);
         assert_eq!(backlog.start_offset(), 100, "evicts past configured cap");
         assert_eq!(backlog.end_offset(), (MIN_REPL_BACKLOG_SIZE + 100) as u64);
+    }
+
+    /// Task #70 RED/GREEN: `ensure_backlogs_allocated` — the side effect of a
+    /// bare REPLCONF (`try_handle_replconf`, dispatch.rs) — must NOT flip the
+    /// sticky, process-global `FANOUT_HINT`. Only an actual PSYNC arrival
+    /// (`try_handle_psync`) or replica registration (`RegisterReplica`/
+    /// `PrepareReplicaSync` in `spsc_handler.rs`) may.
+    ///
+    /// RED on the pre-fix code: the old `ensure_backlogs_allocated` called
+    /// `mark_fanout_active()` unconditionally as its first line, so this
+    /// delta assertion (`before == after`) fails — `after` flips to `true`
+    /// regardless of `before` — proving a probe/failed handshake that only
+    /// ever sends REPLCONF (never PSYNC) permanently taxed every future
+    /// write. GREEN on the fix: `ensure_backlogs_allocated` only allocates
+    /// the backlog (still load-bearing, asserted below), the hint is
+    /// untouched.
+    ///
+    /// `FANOUT_HINT` is a process-global `static` shared by every test in
+    /// this binary; the delta form (`before == after`) is deliberately
+    /// robust to whatever the ambient value already is — no test in this
+    /// codebase's unit-test-reachable surface calls `mark_fanout_active`
+    /// outside a real `ConnectionContext`/`RegisterReplica` path, so `before`
+    /// is `false` in practice, but the assertion does not depend on that.
+    #[test]
+    fn test_ensure_backlogs_allocated_does_not_activate_fanout_hint() {
+        let before = fanout_hint_active();
+        let state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
+        state.ensure_backlogs_allocated();
+        let after = fanout_hint_active();
+        assert_eq!(
+            before, after,
+            "ensure_backlogs_allocated (bare-REPLCONF path) must not change \
+             the sticky process-global fanout hint — task #70"
+        );
+        // Allocation itself is unchanged, still load-bearing: writes between
+        // REPLCONF and PSYNC are captured once PSYNC actually flips the hint.
+        assert!(
+            state.per_shard_backlogs[0].lock().is_some(),
+            "backlog allocation must still happen on REPLCONF"
+        );
+        assert!(state.per_shard_backlogs[1].lock().is_some());
+    }
+
+    /// Task #70 companion: the actual activation path (`mark_fanout_active`,
+    /// called from `try_handle_psync` on a genuine PSYNC arrival and from the
+    /// `RegisterReplica`/`PrepareReplicaSync` shard-message arms) still sets
+    /// the hint — monotonic, so this holds regardless of the ambient value.
+    #[test]
+    fn test_mark_fanout_active_sets_hint() {
+        mark_fanout_active();
+        assert!(
+            fanout_hint_active(),
+            "mark_fanout_active (actual PSYNC/replica registration) must set the hint"
+        );
     }
 
     #[test]
