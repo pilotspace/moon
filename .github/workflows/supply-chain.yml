@@ -1,0 +1,69 @@
+name: Supply Chain
+
+# SUPPLY-01 (docs/PRODUCTION-CONTRACT.md, section A): `cargo audit` (RUSTSEC
+# advisories) + `cargo deny check` (advisories/licenses/bans/sources) as a
+# blocking CI gate. Runs on ubuntu-latest, NOT the self-hosted moon-dev
+# runner -- this job only inspects Cargo.lock/dependency metadata, no build
+# is required, so the hosted runner's queue time is a non-issue and it
+# keeps the self-hosted VM free for the Check job.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.cargo/audit.toml'
+      - '.github/workflows/supply-chain.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.cargo/audit.toml'
+      - '.github/workflows/supply-chain.yml'
+  schedule:
+    # Weekly, independent of code changes -- RUSTSEC advisories are
+    # published continuously, so even an untouched lockfile can go from
+    # green to red.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # -- cargo audit: RUSTSEC vulnerability advisories --------------------
+  # Fails only on Vulnerability-class advisories by default (see
+  # .cargo/audit.toml for the rationale -- unmaintained/unsound/yanked are
+  # visible-but-non-blocking, matching cargo-audit's own default lint
+  # levels; nothing here overrides that with --deny warnings).
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-audit@0.22.2
+      - run: cargo audit
+
+  # -- cargo deny: advisories + license allowlist + ban rules + sources -
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-deny@0.19.6
+      - run: cargo deny check advisories licenses bans sources
