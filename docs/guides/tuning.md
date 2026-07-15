@@ -163,11 +163,16 @@ AOF durability protects a **single node** against a crash. Replication (v0.7 GA)
 adds a **second node** so a write survives losing the master's disk entirely. The
 two combine on a latency/RPO ladder — pick the rung your workload needs:
 
-| Goal | Master | Client | RPO | Cost |
-|------|--------|--------|-----|------|
-| Fast, replica for read-scaling/DR | `--appendfsync everysec` | fire-and-forget | ≤1 s on master crash; replica lag on failover | lowest latency |
-| Durable on the master | `--appendfsync always` | — | 0 on master crash (disk-bound) | fsync per write |
-| **Zero-RPO across nodes** | `--appendfsync always` | `WAIT 1 <timeout>` after the write | 0 even if the master's disk is lost | fsync + one replica round-trip |
+| Goal | Master | Replica | Client | RPO | Cost |
+|------|--------|---------|--------|-----|------|
+| Fast, replica for read-scaling/DR | `--appendfsync everysec` | `--appendfsync everysec` | fire-and-forget | ≤1 s on master crash; replica lag on failover | lowest latency |
+| Durable on the master | `--appendfsync always` | — | — | 0 on master crash (disk-bound) | fsync per write |
+| **Zero-RPO across nodes** | `--appendfsync always` | `--appendfsync always` | `WAIT 1 <timeout>` after the write | 0 even if the master's disk is lost | fsync (both nodes) + one replica round-trip |
+
+The replica column matters for the zero-RPO rung: a replica ACKs a write when it
+**applies** it, not when it fsyncs, so a replica running `everysec` (or `no`) can ACK
+a write — satisfying `WAIT` — and then lose it on its own crash. Zero-RPO requires
+`--appendfsync always` on **both** nodes.
 
 `WAIT numreplicas timeout` blocks until `numreplicas` replicas have ACKed the
 write (replicas ACK on a ~1 s cadence, so a `WAIT` timeout below ~1 s may return

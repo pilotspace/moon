@@ -69,7 +69,8 @@ topology and durability of the pair:
 | `--shards N` | master | Multi-core writer; the master merges all shards into one exactly-once replication feed |
 | `--shards 1` | replica | **Required** — replicas are single-shard; scale reads by adding replicas |
 | `--appendonly yes` | both | Persist the AOF so a restarted node recovers before re-syncing |
-| `--appendfsync always` | master | RPO 0 on the master; pair with `WAIT N` for zero-RPO cross-node durability |
+| `--appendfsync always` | master | RPO 0 on the master; pair with `WAIT N` for cross-node durability |
+| `--appendfsync always` | replica | **Required for zero-RPO** — a replica ACKs on apply, not on fsync, so it must persist durably or a `WAIT`-acked write can still be lost if the replica crashes |
 
 Replicas are read-only (`slave_read_only:1`; writes return `-READONLY`). `WAIT
 numreplicas timeout` reports real replica ACKs. Full setup, `WAIT` durability,

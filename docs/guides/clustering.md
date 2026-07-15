@@ -50,8 +50,14 @@ startup flag; operators script it after the replica is up (e.g. via an init hook
 #### 2. Start the replica (must be --shards 1)
 
 ```bash
-./target/release/moon --port 6380 --shards 1 --appendonly yes
+./target/release/moon --port 6380 --shards 1 --appendonly yes --appendfsync always
 ```
+
+`--appendfsync always` on the replica is what makes a `WAIT`-acknowledged write
+survive a **replica** crash: the replica ACKs when it *applies* a write, not when it
+fsyncs, so without durable replica persistence a replica can ACK and then lose the
+write on its own crash. Drop it to `everysec` only if the replica is read-scaling/DR
+and you accept ≤1 s of replica-side loss.
 
 #### 3. Attach the replica to the master
 
@@ -77,9 +83,17 @@ every write issued on the connection (replicas send `REPLCONF ACK` on a ~1 s
 cadence). Combine it with `appendfsync always` on both sides for a **zero-RPO,
 cross-node durable write**:
 
+`WAIT` counts ACKs only for writes issued on **its own connection**, so the `SET`
+and the `WAIT` must run on the *same* connection — two separate `redis-cli`
+invocations open two connections, and the `WAIT` would see no pending write. Use one
+interactive session (or pipe both commands into a single `redis-cli`):
+
 ```bash
-redis-cli -p 6379 SET k v
-redis-cli -p 6379 WAIT 1 1000     # returns the number of replicas that ACKed within 1000 ms
+redis-cli -p 6379 <<'EOF'
+SET k v
+WAIT 1 1000
+EOF
+# WAIT returns the number of replicas that ACKed the SET within 1000 ms
 ```
 
 On the master, `INFO replication` lists each replica's `offset` and `lag`; on the
@@ -144,9 +158,11 @@ or the proxy's health checks handle this; a static split does not.
 !!! warning "Replica TTL semantics (v0.7)"
     Relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`, `GETEX` with a relative
     TTL) replicate verbatim rather than being rewritten to absolute `PEXPIREAT`, and
-    replicas run their own active-expiry cycle. Under normal clock sync keys expire
-    correctly on both sides, but master/replica clock skew can shift a relative-TTL
-    key's expiry moment by up to that skew. For exact cross-node expiry parity, set
+    replicas run their own active-expiry cycle. Because the replica's countdown starts
+    when it **applies** the command — not when the master ran it — replication/apply
+    delay shifts a relative-TTL key's expiry moment by that delay **even with perfectly
+    synchronized clocks** (the replica holds the key slightly longer). Master/replica
+    clock skew adds a further offset on top. For exact cross-node expiry parity, set
     absolute deadlines with `PEXPIREAT`. Absolute-rewrite + role-gated expiry land in
     v0.7.1.
 
