@@ -1,5 +1,10 @@
 # Releases
 
+## v0.7.0 — 2026-07-15
+milestones: v0.7.0 "Replication GA for multi-shard masters" (soak-gated tag; v0.6.1 hardening folded in)
+waivers: none — the v0.6.0 `shardslice-migration` waiver (was: expires 2026-08-01) is **retired**; lock-free cross-shard read work is now tracked as an open GA gap (`XSHARD-READ-01`, ROADMAP R4), not a time-boxed waiver.
+evidence: Real async replication with WAIT/ACK across all six data planes (KV, vector/text, graph, WS, MQ, temporal); multi-shard master → single-shard streaming replica; every plane crash-durable under kill -9. Plus full v0.6.1 hardening (WAL v3 storage-kernel M1–M4) and a supply-chain CI gate (cargo audit + cargo deny). Release gate — 24h replication kill-9 soak (REPL-SOAK-01), zero acked-write loss: `SOAK-PASS duration=86400s cycles=114 acked=82044 inflight=7 master_kills=57 replica_kills=57` (2026-07-15; run dir moon-dev:~/moon-soak/runs/20260714-141946; RC main e2d87893; 114 alternating master/replica kill -9 cycles, 82,044 WAIT-acked writes preserved). Known limitation: streaming replica is single-shard only. Replica relative-TTL semantics: verbatim replication (no PEXPIREAT rewrite) + role-agnostic active expiry — absolute-rewrite lands in v0.7.1 (task #71b).
+
 ## v0.6.0 — 2026-07-08
 milestones: v0.6.0-release (PR #249, six workstreams)
 waivers: shardslice-migration (expires 2026-08-01; retirement planned with v0.7 L4 cross-shard-read work)
