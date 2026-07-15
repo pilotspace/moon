@@ -765,11 +765,12 @@ fn replica_applies_multi_db_stream() {
 }
 
 /// R1 (task #19): real WAIT/ACK plumbing. The replica sends
-/// `REPLCONF ACK <offset>` on the replication link (after each applied batch
-/// + a 1s idle tick); the master reads them off the hijacked PSYNC socket and
-/// records them per replica; `WAIT <n> <ms>` blocks until n replicas
-/// acknowledge the master's current offset. Previously WAIT returned 0
-/// unconditionally on the monoio runtime and no ACK was ever sent or read.
+/// `REPLCONF ACK <offset>` on the replication link (after each applied
+/// batch, plus a 1s idle tick); the master reads them off the hijacked
+/// PSYNC socket and records them per replica; `WAIT <n> <ms>` blocks until
+/// n replicas acknowledge the master's current offset. Previously WAIT
+/// returned 0 unconditionally on the monoio runtime and no ACK was ever
+/// sent or read.
 #[test]
 #[ignore]
 fn wait_returns_acked_replica_count() {
@@ -948,14 +949,10 @@ fn pipeline_burst(stream: &mut TcpStream, cmds: &[String]) {
     stream.write_all(payload.as_bytes()).expect("burst write");
     stream.flush().ok();
     let mut reader = BufReader::new(&*stream);
-    for i in 0..cmds.len() {
+    for (i, cmd) in cmds.iter().enumerate() {
         let mut line = String::new();
         reader.read_line(&mut line).expect("burst reply");
-        assert!(
-            line.starts_with("+OK"),
-            "burst cmd {i} ({}) got: {line}",
-            cmds[i]
-        );
+        assert!(line.starts_with("+OK"), "burst cmd {i} ({cmd}) got: {line}");
     }
 }
 

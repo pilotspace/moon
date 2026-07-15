@@ -287,10 +287,10 @@ fn wait_ready(guard: &mut ServerGuard, dir: &std::path::Path, port: u16) -> Clie
         }
         // Any I/O error (or a non-PONG answer, which would desync the
         // framing) drops this connection and probes again on a new one.
-        if let Some(mut c) = Client::try_connect(port, Duration::from_secs(1)) {
-            if let Ok(true) = c.try_ping() {
-                return c;
-            }
+        if let Some(mut c) = Client::try_connect(port, Duration::from_secs(1))
+            && let Ok(true) = c.try_ping()
+        {
+            return c;
         }
         assert!(
             start.elapsed() < deadline,

@@ -557,7 +557,7 @@ mod tests {
         let last_port_val = merged
             .windows(2)
             .filter(|w| w[0] == "--port")
-            .last()
+            .next_back()
             .map(|w| w[1].clone());
         assert_eq!(
             last_port_val.as_deref(),

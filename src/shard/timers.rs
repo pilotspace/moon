@@ -590,6 +590,7 @@ mod tests {
     ///  2. over-eviction — a vector term over budget independently drained
     ///     EVERY db on the shard (multi-tenant blast radius), instead of
     ///     evicting only until the aggregate is back under budget.
+    ///
     /// This test pins both: two dbs each individually under budget with the
     /// vector term, aggregate over — eviction must fire (kills mode 1) and
     /// must stop once the aggregate is satisfied, leaving db 1 untouched
@@ -614,10 +615,12 @@ mod tests {
             });
         }
 
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024; // 1 MiB budget, 1 shard
-        rt.num_shards = 1;
-        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let rt = RuntimeConfig {
+            maxmemory: 1024 * 1024, // 1 MiB budget, 1 shard
+            num_shards: 1,
+            maxmemory_policy: "allkeys-lru".to_string(),
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
 
         // 700 KiB vector term: each db alone is ~256K + 700K < 1 MiB (the
@@ -682,10 +685,12 @@ mod tests {
             }
         });
 
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024;
-        rt.num_shards = 1;
-        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let rt = RuntimeConfig {
+            maxmemory: 1024 * 1024,
+            num_shards: 1,
+            maxmemory_policy: "allkeys-lru".to_string(),
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
 
         // KV alone (~tens of KB) is far under the 1 MiB budget: no eviction.
@@ -768,10 +773,12 @@ mod tests {
             h.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         });
 
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1; // force eviction of the one key present
-        rt.num_shards = 1;
-        rt.maxmemory_policy = "allkeys-lru".to_string();
+        let rt = RuntimeConfig {
+            maxmemory: 1, // force eviction of the one key present
+            num_shards: 1,
+            maxmemory_policy: "allkeys-lru".to_string(),
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
 
         let tmp = tempfile::tempdir().unwrap();

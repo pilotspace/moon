@@ -129,11 +129,14 @@ mod monoio_yield {
         static FAILED: Cell<bool> = const { Cell::new(false) };
     }
 
-    #[cfg(test)]
+    // Only the Linux-gated `yield_costfree_tests` module (io_uring-only) calls
+    // this; keep the cfg in lockstep so non-Linux test builds don't carry a
+    // dead `set_force_fail`/`FORCE_FAIL` pair.
+    #[cfg(all(test, target_os = "linux"))]
     thread_local! {
         static FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_force_fail(on: bool) {
         FORCE_FAIL.with(|c| c.set(on));
     }
@@ -154,7 +157,7 @@ mod monoio_yield {
     }
 
     fn create_pipe() -> std::io::Result<YieldPipe> {
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         if FORCE_FAIL.with(Cell::get) {
             return Err(std::io::Error::other(
                 "forced yield-pipe init failure (test)",

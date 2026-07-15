@@ -286,12 +286,11 @@ fn extract_message_ids(value: &redis::Value) -> Vec<String> {
     let mut ids = Vec::new();
     if let redis::Value::Array(entries) = value {
         for entry in entries {
-            if let redis::Value::Array(parts) = entry {
-                if let Some(redis::Value::BulkString(id_bytes)) = parts.first() {
-                    if let Ok(id_str) = std::str::from_utf8(id_bytes) {
-                        ids.push(id_str.to_string());
-                    }
-                }
+            if let redis::Value::Array(parts) = entry
+                && let Some(redis::Value::BulkString(id_bytes)) = parts.first()
+                && let Ok(id_str) = std::str::from_utf8(id_bytes)
+            {
+                ids.push(id_str.to_string());
             }
         }
     }

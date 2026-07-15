@@ -99,7 +99,7 @@ mod counters {
         let before = spsc_drain_renotify();
         bump_spsc_drain_renotify();
         assert!(
-            spsc_drain_renotify() >= before + 1,
+            spsc_drain_renotify() > before,
             "spsc_drain_renotify must count every capped-drain self-notify"
         );
     }

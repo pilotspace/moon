@@ -3,6 +3,7 @@
 //! brute-force yield chunk (sweeps 256/512/1024, gates on the shipped knee 1024):
 //!   - treatment: MOON_FT_YIELD_CHUNK=1024    -> shipped cross-arch default (~20 yields/query)
 //!   - control:   MOON_FT_YIELD_CHUNK=1e9     -> one chunk = sync scan (no yield)
+//!
 //! 1024 is the cross-arch knee: 512 held on aarch64 but breached the 5% bound on x86
 //! (GCloud Sapphire Rapids +6–8%), so the default coarsened one step for x86 safety.
 //!
@@ -83,10 +84,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").unwrap();
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(start.elapsed() < Duration::from_secs(15), "no PING");
         std::thread::sleep(Duration::from_millis(100));

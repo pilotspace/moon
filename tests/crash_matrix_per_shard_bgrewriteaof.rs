@@ -171,12 +171,11 @@ fn compacted_base_exists(dir: &std::path::Path) -> bool {
         for f in files.flatten() {
             let name = f.file_name().to_string_lossy().to_string();
             // Base files look like `moon.aof.<seq>.base.rdb`. Extract <seq>.
-            if let Some(rest) = name.strip_prefix("moon.aof.") {
-                if let Some(seq_str) = rest.strip_suffix(".base.rdb") {
-                    if seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false) {
-                        return true;
-                    }
-                }
+            if let Some(rest) = name.strip_prefix("moon.aof.")
+                && let Some(seq_str) = rest.strip_suffix(".base.rdb")
+                && seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false)
+            {
+                return true;
             }
         }
     }

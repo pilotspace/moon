@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignore entries in `deny.toml` and `.cargo/audit.toml` are removed since the
   advisory no longer applies. `cargo deny check advisories licenses bans
   sources` and `cargo audit` both pass clean with no ignore needed.
+- **`cargo clippy --tests -- -D warnings` is now clean on both feature
+  configurations (task #39).** CI previously only gated non-test code;
+  ~170 test-target warnings (mostly `collapsible_if`, `doc_lazy_continuation`,
+  `field_reassign_with_default`, `needless_range_loop`) are fixed
+  mechanically, plus a handful of real bugs surfaced along the way: a
+  `#[deny]`-level `approx_constant` false positive that was silently
+  blocking `--tests` compilation entirely; three test-only helpers whose
+  `#[cfg]` was looser than their actual (feature-gated) callers, making
+  them dead code under `--no-default-features --features
+  runtime-tokio,jemalloc` (`src/runtime/mod.rs`, `src/text/store.rs`,
+  `tests/vector_db_isolation.rs`); and a `cargo clippy --fix` autofix that
+  would have deleted a `key_to_shard` import still required under the
+  default `graph` feature (`tests/sharded_multi_exec_locality.rs`) — caught
+  by cross-checking against a default-features build before committing.
+  `cargo clippy --all-targets -- -D warnings` (default features) is also
+  clean — no residue in benches. No test assertions were altered.
 
 ## [0.7.1] — 2026-07-15
 

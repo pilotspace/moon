@@ -4032,7 +4032,7 @@ mod bg_compact_tests {
             store.begin_background_compactions(&compactor);
             poll_until_installed(&mut store, 400);
             let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
-            if idx.segments.load().mutable.len() == 0 {
+            if idx.segments.load().mutable.is_empty() {
                 break;
             }
         }
@@ -4215,7 +4215,7 @@ mod bg_compact_tests {
         // Concurrency: a serial (1-worker) run would take ≈ K × single. A
         // K-worker pool should stay well under `K × single × 0.6`. Generous
         // margin avoids flakiness; only a genuinely non-parallel pool fails.
-        if cores >= K + 1 {
+        if cores > K {
             assert!(
                 parallel.as_secs_f64() < single.as_secs_f64() * (K as f64) * 0.6,
                 "K-worker pool not parallelizing: single={single:?}, parallel(K={K})={parallel:?}"

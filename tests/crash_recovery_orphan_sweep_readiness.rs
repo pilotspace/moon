@@ -112,14 +112,13 @@ fn wait_for_ping_within(port: u16, bound: Duration) -> Duration {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
-        if let Ok(out) = out {
-            if out.status.success()
-                && String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .eq_ignore_ascii_case("PONG")
-            {
-                return start.elapsed();
-            }
+        if let Ok(out) = out
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .eq_ignore_ascii_case("PONG")
+        {
+            return start.elapsed();
         }
         if start.elapsed() > bound {
             panic!(

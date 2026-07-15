@@ -38,10 +38,10 @@ fn connect_ready(port: u16) -> TcpStream {
                 .unwrap();
             if stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 16];
-                if let Ok(n) = stream.read(&mut buf) {
-                    if buf[..n].starts_with(b"+PONG") {
-                        return stream;
-                    }
+                if let Ok(n) = stream.read(&mut buf)
+                    && buf[..n].starts_with(b"+PONG")
+                {
+                    return stream;
                 }
             }
         }

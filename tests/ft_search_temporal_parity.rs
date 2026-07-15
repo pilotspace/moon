@@ -385,12 +385,11 @@ fn extract_doc_keys(v: &redis::Value) -> Vec<String> {
     let mut keys = Vec::new();
     if let redis::Value::Array(items) = v {
         for item in items {
-            if let redis::Value::BulkString(b) = item {
-                if let Ok(s) = std::str::from_utf8(b) {
-                    if s.starts_with("doc:") {
-                        keys.push(s.to_string());
-                    }
-                }
+            if let redis::Value::BulkString(b) = item
+                && let Ok(s) = std::str::from_utf8(b)
+                && s.starts_with("doc:")
+            {
+                keys.push(s.to_string());
             }
         }
     }

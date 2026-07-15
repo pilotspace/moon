@@ -2352,8 +2352,10 @@ mod tests {
 
     #[test]
     fn maxmemory_per_shard_unlimited_stays_zero() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 0;
+        let mut rt = RuntimeConfig {
+            maxmemory: 0,
+            ..Default::default()
+        };
         for n in [1, 2, 4, 16] {
             rt.num_shards = n;
             assert_eq!(
@@ -2366,26 +2368,32 @@ mod tests {
 
     #[test]
     fn maxmemory_per_shard_single_shard_is_whole_instance() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1_000;
-        rt.num_shards = 1;
+        let rt = RuntimeConfig {
+            maxmemory: 1_000,
+            num_shards: 1,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 1_000);
     }
 
     #[test]
     fn maxmemory_per_shard_divides_by_shard_count() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 400;
-        rt.num_shards = 4;
+        let rt = RuntimeConfig {
+            maxmemory: 400,
+            num_shards: 4,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 100);
     }
 
     #[test]
     fn maxmemory_per_shard_div_ceil_never_undershoots() {
         // 10 / 3 = 3.33 -> ceil 4 so the summed per-shard budgets (12) >= cap (10).
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 10;
-        rt.num_shards = 3;
+        let rt = RuntimeConfig {
+            maxmemory: 10,
+            num_shards: 3,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 4);
         assert!(rt.maxmemory_per_shard() * rt.num_shards >= rt.maxmemory);
     }
@@ -2393,9 +2401,11 @@ mod tests {
     #[test]
     fn maxmemory_per_shard_guards_zero_shard_count() {
         // A mis-set num_shards == 0 must not divide-by-zero; treat as 1 shard.
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 500;
-        rt.num_shards = 0;
+        let rt = RuntimeConfig {
+            maxmemory: 500,
+            num_shards: 0,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 500);
     }
 
@@ -2803,17 +2813,21 @@ mod tests {
 
     #[test]
     fn db_maxmemory_per_shard_divides_like_global_maxmemory() {
-        let mut rt = RuntimeConfig::default();
-        rt.db_maxmemory = vec![1000];
-        rt.num_shards = 4;
+        let rt = RuntimeConfig {
+            db_maxmemory: vec![1000],
+            num_shards: 4,
+            ..Default::default()
+        };
         assert_eq!(rt.db_maxmemory_per_shard(0), 250);
     }
 
     #[test]
     fn db_maxmemory_per_shard_zero_entry_is_unlimited() {
-        let mut rt = RuntimeConfig::default();
-        rt.db_maxmemory = vec![0, 500];
-        rt.num_shards = 1;
+        let rt = RuntimeConfig {
+            db_maxmemory: vec![0, 500],
+            num_shards: 1,
+            ..Default::default()
+        };
         assert_eq!(rt.db_maxmemory_per_shard(0), 0);
         assert_eq!(rt.db_maxmemory_per_shard(1), 500);
     }

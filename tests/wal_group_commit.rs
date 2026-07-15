@@ -9,6 +9,7 @@
 //!     `<W: Write>` + "flush()+sync_data()" — non-behavioral: the durability behavior is unchanged)
 //!   - `struct CommitOutcome { synced, write_failed, fsync_failed }`
 //!   - `fn commit_group_commit_batch(sink, batch, do_fsync) -> CommitOutcome`
+//!
 //! Before build the `use` below is UNRESOLVED → this crate fails to compile. That compile
 //! failure IS the red signal (the other test crates build independently).
 //!

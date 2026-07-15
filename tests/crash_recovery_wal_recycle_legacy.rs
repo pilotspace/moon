@@ -264,10 +264,10 @@ fn wait_for_wal_v3_bytes(dir: &Path, needle: &[u8]) {
     loop {
         if let Ok(entries) = std::fs::read_dir(&wal_dir) {
             for entry in entries.flatten() {
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    if bytes.windows(needle.len()).any(|w| w == needle) {
-                        return;
-                    }
+                if let Ok(bytes) = std::fs::read(entry.path())
+                    && bytes.windows(needle.len()).any(|w| w == needle)
+                {
+                    return;
                 }
             }
         }
@@ -302,10 +302,10 @@ fn wal_v3_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
     let wal_dir = dir.join("shard-0").join("wal-v3");
     if let Ok(entries) = std::fs::read_dir(&wal_dir) {
         for entry in entries.flatten() {
-            if let Ok(bytes) = std::fs::read(entry.path()) {
-                if bytes.windows(needle.len()).any(|w| w == needle) {
-                    return true;
-                }
+            if let Ok(bytes) = std::fs::read(entry.path())
+                && bytes.windows(needle.len()).any(|w| w == needle)
+            {
+                return true;
             }
         }
     }

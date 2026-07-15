@@ -119,17 +119,16 @@ impl Conn {
 
 fn wait_ready(addr: &str) {
     for _ in 0..100 {
-        if let Ok(stream) = TcpStream::connect(addr) {
-            if stream
+        if let Ok(stream) = TcpStream::connect(addr)
+            && stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .is_ok()
-            {
-                let mut c = Conn {
-                    reader: BufReader::new(stream),
-                };
-                if c.try_cmd("PING").as_deref() == Some("+PONG") {
-                    return;
-                }
+        {
+            let mut c = Conn {
+                reader: BufReader::new(stream),
+            };
+            if c.try_cmd("PING").as_deref() == Some("+PONG") {
+                return;
             }
         }
         std::thread::sleep(Duration::from_millis(200));

@@ -55,9 +55,11 @@
 //!     probes were durably spilled to cold BEFORE the kill (ground truth,
 //!     read directly via `moon::persistence::{manifest,kv_page}`).
 //!   * POST-crash read-through must recover AT LEAST that many probes.
+//!
 //!   RED (pre-#22-fix binary): ground truth > 0, POST == ~0 (recovery skipped
 //!   entirely — the persistence_dir gate regressed).
 //!   GREEN (post-#22-fix): POST >= ground truth.
+//!
 //! Because there is NO AOF under `appendonly no`, a non-zero POST count can ONLY
 //! come from the cold-manifest recovery path the #22 fix enables.
 //!

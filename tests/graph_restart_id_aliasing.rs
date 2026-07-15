@@ -56,6 +56,7 @@
 //!     `mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0)`
 //!     for every AddNode record (no `node_map.get(node_id)` dedup check, no
 //!     `add_node_with_id` identity preservation)
+//!
 //! reproduces exactly this failure: `test_restart_replay_does_not_alias_frozen_node`
 //! fails with
 //!   `assertion failed: replayed key must not equal the frozen node's key`

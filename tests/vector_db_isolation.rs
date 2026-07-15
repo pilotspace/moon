@@ -81,12 +81,12 @@ impl Drop for Moon {
 fn wait_ready(port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(client) = Client::open(format!("redis://127.0.0.1:{port}/0")) {
-            if let Ok(mut conn) = client.get_connection() {
-                let pong: Result<String, _> = redis::cmd("PING").query(&mut conn);
-                if pong.as_deref() == Ok("PONG") {
-                    return true;
-                }
+        if let Ok(client) = Client::open(format!("redis://127.0.0.1:{port}/0"))
+            && let Ok(mut conn) = client.get_connection()
+        {
+            let pong: Result<String, _> = redis::cmd("PING").query(&mut conn);
+            if pong.as_deref() == Ok("PONG") {
+                return true;
             }
         }
         thread::sleep(Duration::from_millis(100));
@@ -484,7 +484,9 @@ fn ft_create_text(conn: &mut Connection, idx: &str, prefix: &str) -> redis::Redi
 
 /// Bare (non-KNN) `FT.SEARCH` — the plain-text BM25 path that
 /// `scatter_text_search` implements, as distinct from `ft_search_knn`'s
-/// `*=>[KNN ...]` vector clause.
+/// `*=>[KNN ...]` vector clause. Only used by the `text-index`-gated test
+/// below.
+#[cfg(feature = "text-index")]
 fn ft_search_text(
     conn: &mut Connection,
     idx: &str,
@@ -675,13 +677,13 @@ fn ft_info_num_docs(conn: &mut Connection, idx: &str) -> i64 {
         panic!("FT.INFO must return an array, got {info:?}");
     };
     for pair in items.windows(2) {
-        if let redis::Value::BulkString(k) = &pair[0] {
-            if k == b"num_docs" {
-                return match &pair[1] {
-                    redis::Value::Int(n) => *n,
-                    other => panic!("num_docs must be an integer, got {other:?}"),
-                };
-            }
+        if let redis::Value::BulkString(k) = &pair[0]
+            && k == b"num_docs"
+        {
+            return match &pair[1] {
+                redis::Value::Int(n) => *n,
+                other => panic!("num_docs must be an integer, got {other:?}"),
+            };
         }
     }
     panic!("FT.INFO reply had no top-level num_docs field: {items:?}");

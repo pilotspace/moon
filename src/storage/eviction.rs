@@ -2428,9 +2428,11 @@ mod tests {
         // Multi-shard: per-shard budget = ceil(maxmemory / num_shards), as
         // published from `maxmemory_per_shard()` (its rounding has its own
         // tests in config.rs). 1000 across 4 shards → 250.
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1000;
-        rt.num_shards = 4;
+        let rt = RuntimeConfig {
+            maxmemory: 1000,
+            num_shards: 4,
+            ..Default::default()
+        };
         let per_shard = rt.maxmemory_per_shard();
         assert!(can_skip_eviction(1000, per_shard, 250, 0));
         assert!(!can_skip_eviction(1000, per_shard, 251, 0));

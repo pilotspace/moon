@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "graph")]
 use moon::shard::dispatch::graph_to_shard;
+#[cfg(feature = "graph")]
 use moon::shard::dispatch::key_to_shard;
 
 fn moon_binary() -> Option<std::path::PathBuf> {
@@ -94,10 +95,11 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
             let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
             if c.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 64];
-                if let Ok(n) = c.read(&mut buf) {
-                    if n > 0 && buf.starts_with(b"+PONG") {
-                        return Some(moon);
-                    }
+                if let Ok(n) = c.read(&mut buf)
+                    && n > 0
+                    && buf.starts_with(b"+PONG")
+                {
+                    return Some(moon);
                 }
             }
         }
