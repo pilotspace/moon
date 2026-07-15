@@ -463,18 +463,32 @@ fn memory_doctor() -> Frame {
         + lua_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
-    // Task #56 (used_memory truthfulness): the SAME logical ledger INFO's
-    // `used_memory` field and the `moon_used_memory_bytes` gauge report --
-    // KV (+ ColdIndex) + vector + text + graph, the exact terms
-    // `ShardDatabases::recompute_elastic_budget` gates `--maxmemory`
-    // eviction on. WAL writers, sealed segments, the replication backlog,
-    // the (intentionally unbounded) Lua script cache, and allocator
-    // overhead are real resident memory but are NOT gated by `--maxmemory`
-    // -- they legitimately live outside the cap. Called out here explicitly
-    // because conflating this figure with RSS is exactly what made a
-    // healthy disk-offload deployment look permanently over-budget.
-    let used_memory_gated = dashtable_bytes + hnsw_bytes + text_bytes + csr_bytes;
-    let outside_cap_bytes = rss.saturating_sub(used_memory_gated);
+    // Task #56 (used_memory truthfulness) + adversarial-review finding #3
+    // (parity delta): three figures, not two, now that `used_memory` and
+    // the eviction gate have deliberately diverged:
+    //
+    //   1. `elastic_budget_bytes` -- KV (+ ColdIndex) + vector + text +
+    //      graph, the EXACT terms `ShardDatabases::recompute_elastic_budget`
+    //      gates `--maxmemory` eviction on. Nothing else is ever evicted to
+    //      make room.
+    //   2. `used_memory_reported` -- what `INFO`'s `used_memory` field and
+    //      the `moon_used_memory_bytes` gauge actually report: the elastic
+    //      budget PLUS the Lua script cache and replication backlog, to
+    //      match real Redis's `used_memory` semantics (it also counts
+    //      script cache + backlog as allocator-attributed memory, even
+    //      though neither is evictable data). See
+    //      `admin::metrics_setup::logical_used_memory_bytes`'s doc comment
+    //      for the full reasoning.
+    //   3. `rss` -- true OS-level footprint: adds allocator overhead, page
+    //      cache, WAL writer buffers, sealed segments, the binary image,
+    //      and thread stacks on top of (2).
+    //
+    // Called out here explicitly because conflating (1)/(2) with (3) is
+    // exactly what made a healthy disk-offload deployment look permanently
+    // over-budget in the original G2 acceptance run.
+    let elastic_budget_bytes = dashtable_bytes + hnsw_bytes + text_bytes + csr_bytes;
+    let used_memory_reported = elastic_budget_bytes + lua_bytes + repl_bytes;
+    let outside_cap_bytes = rss.saturating_sub(used_memory_reported);
 
     // ── VSZ ratio recommendation ─────────────────────────────────────────
     let vsz_ratio = if rss > 0 { vsz / rss } else { 0 };
@@ -509,18 +523,25 @@ fn memory_doctor() -> Frame {
     let _ = writeln!(out, "Memory accounting (task #56):");
     let _ = writeln!(
         out,
-        "  used_memory (gated by --maxmemory): {}",
-        humanize_bytes(used_memory_gated)
+        "  used_memory (INFO / moon_used_memory_bytes): {}  -- elastic budget \
+         + Lua script cache + replication backlog (Redis parity)",
+        humanize_bytes(used_memory_reported)
     );
     let _ = writeln!(
         out,
-        "  used_memory_rss (process footprint): {}",
+        "  elastic budget (gated by --maxmemory):       {}  -- KV+ColdIndex+vector+text+graph \
+         only; the exact terms eviction acts on",
+        humanize_bytes(elastic_budget_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "  used_memory_rss (process footprint):         {}",
         humanize_bytes(rss)
     );
     let _ = writeln!(
         out,
-        "  outside the cap (RSS - used_memory):  {}  -- allocator overhead, \
-         page cache, WAL/replication buffers, Lua script cache, binary+stacks",
+        "  outside used_memory (RSS - used_memory):     {}  -- allocator overhead, \
+         page cache, WAL writer buffers, sealed segments, binary+stacks",
         humanize_bytes(outside_cap_bytes)
     );
     let _ = writeln!(out);

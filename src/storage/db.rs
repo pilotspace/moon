@@ -1134,6 +1134,38 @@ impl Database {
         match result {
             InsertOrUpdate::Updated(_) => {
                 self.used_memory = self.used_memory.saturating_sub(old_cost) + new_cost;
+                // Task #56 finding 1 (adversarial review, stale-data
+                // resurrection): a SECOND-OR-LATER write to a key that ALSO
+                // carries a cold-tier shadow proves that shadow is stale.
+                //
+                // Crash-consistency proof: AOF replay reconstructs a key's
+                // entire write history against an EMPTY DashTable (`db.clear()`
+                // runs in `main.rs` right before every replay branch), so the
+                // first replayed write to a given key is always `Inserted`
+                // (ambiguous -- it may be exactly the write whose later
+                // eviction produced this cold entry, so it's left alone) and
+                // every SUBSEQUENT write to the SAME key during that same
+                // replay is `Updated` -- which can only happen if the AOF
+                // recorded a write to this key AFTER the one that got
+                // spilled, i.e. the cold copy is provably stale relative to
+                // the value now hot. Clearing the shadow here, synchronously,
+                // the moment a second touch is observed (live traffic or
+                // replay -- same code path, same proof) closes the gap:
+                // without this, a crash between a live overwrite of a
+                // cold-shadowed key and the next eviction/orphan-sweep left
+                // the on-disk manifest's cold entry pointing at the OLD
+                // value; `demote_replayed_cold_shadows` (`src/main.rs`,
+                // running after replay finishes) would then treat that
+                // untouched-looking cold entry as "provably redundant" and
+                // use it to discard the newer hot value on restart --
+                // silently resurrecting stale data. See
+                // `tests/cold_shadow_overwrite_resurrection.rs` for the
+                // end-to-end regression guard and
+                // `storage::db::tests::test_second_write_invalidates_cold_shadow`
+                // for the unit-level proof.
+                if let Some(ci) = self.cold_index.as_mut() {
+                    ci.remove(&key);
+                }
             }
             InsertOrUpdate::Inserted(_) => {
                 self.used_memory += new_cost;
@@ -2640,6 +2672,89 @@ mod tests {
                 .is_some(),
             "cold-index entry must remain so the key is still cold-readable"
         );
+    }
+
+    /// Task #56 finding 1 (adversarial review) red/green: a key overwritten
+    /// AFTER its cold-tier copy was captured must never resurrect the stale
+    /// cold value. Models exactly what AOF replay does at restart: the
+    /// cold_index is rebuilt from the crash-consistent manifest BEFORE any
+    /// replay command runs (so it already "knows" about a key that was
+    /// spilled with an old value), and then replay reconstructs the key's
+    /// FULL write history against an empty DashTable -- here simulated as
+    /// two `db.set()` calls for the same key (the original SET whose later
+    /// eviction produced the cold copy, followed by a live overwrite issued
+    /// after that eviction, both still present in the AOF since eviction
+    /// never rewrites/deletes AOF records).
+    ///
+    /// This test FAILS on the pre-finding-1 HEAD: without the `Updated`-arm
+    /// invalidation in `Database::set`, the cold_index entry survives both
+    /// writes untouched, `demote_replayed_cold_shadows` wrongly treats it as
+    /// "provably redundant", drops the hot v2 copy, and the final `GET`
+    /// promotes the stale v1 from cold storage instead.
+    #[test]
+    fn test_second_write_invalidates_cold_shadow() {
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        let mut db = Database::new();
+        // Simulates `recover_shard_v3_pitr` rebuilding ColdIndex from the
+        // manifest BEFORE any replay command runs -- the key is cold-only,
+        // NOT hot, at this point.
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"k"),
+            ColdLocation {
+                file_id: 1,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+            },
+        );
+        db.cold_index = Some(ci);
+        assert!(!db.is_hot(b"k"), "precondition: key starts cold-only");
+
+        // Replay command #1: the ORIGINAL SET whose later eviction produced
+        // the cold copy above (v1). First touch since the DashTable was
+        // cleared -- ambiguous, left alone.
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string(Bytes::from_static(b"v1")),
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k").is_some(),
+            "first touch must not disturb the cold shadow (still ambiguous)"
+        );
+
+        // Replay command #2: a LATER overwrite issued after the eviction
+        // that produced the cold copy (still in the AOF -- eviction never
+        // deletes AOF records). Second touch -- provably proves the cold
+        // copy stale.
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string(Bytes::from_static(b"v2")),
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k").is_none(),
+            "second touch must invalidate the now-stale cold shadow"
+        );
+
+        // Reconciliation pass (what main.rs runs right after replay
+        // finishes, before the server accepts connections) must be a no-op
+        // for this key now -- there is nothing left in cold_index to
+        // wrongly "demote".
+        let demoted = db.demote_replayed_cold_shadows();
+        assert_eq!(
+            demoted, 0,
+            "nothing left to demote -- the shadow is already gone"
+        );
+
+        match db.get(b"k").unwrap().value.as_bytes_owned() {
+            Some(v) => assert_eq!(
+                &v[..],
+                b"v2",
+                "GET must return the LATER value, not the stale spilled v1"
+            ),
+            None => panic!("key must exist"),
+        }
     }
 
     #[test]

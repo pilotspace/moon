@@ -194,6 +194,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   steady state AND immediately post-restart. See `docs/guides/monitoring.md`
   for the updated operator story on what counts against `--maxmemory` and
   what doesn't.
+- **Adversarial-review follow-up on task #56 (three findings, all fixed on
+  the same branch):**
+  - **CRITICAL — stale cold-shadow resurrection on live overwrite.** The
+    `demote_replayed_cold_shadows` reconciliation above assumed any key
+    still present in the recovered `ColdIndex` after AOF replay must be
+    crash-time-cold and untouched. False whenever a key is spilled at v1
+    and then *live-overwritten* to v2 with no further eviction before a
+    crash: the manifest still shows it spilled at v1, so a restart
+    rebuilds `ColdIndex[key] = v1`, AOF replay reconstructs `hot[key] =
+    v2`, and the (pre-fix) demote pass wrongly dropped the hot v2,
+    resurrecting stale v1 on the next `GET`. `Database::set`
+    (`src/storage/db.rs`) now clears the key's `ColdIndex` shadow the
+    instant a SECOND write to that key is observed
+    (`InsertOrUpdate::Updated`, not `Inserted`) — provably safe because AOF
+    replay always starts from an empty DashTable (`db.clear()` runs before
+    every replay branch), so the first replayed write to a key is always
+    `Inserted` (left alone; it may be exactly the write that later got
+    spilled) and any subsequent write to the same key during that same
+    replay can only happen if the AOF recorded a write *after* the one
+    that got spilled — proving the cold copy stale. No new record type or
+    spill-file format change needed. Covered by the new unit test
+    `storage::db::tests::test_second_write_invalidates_cold_shadow` and
+    the new end-to-end kill-9 test
+    `tests/cold_shadow_overwrite_resurrection.rs`.
+  - **HIGH — demotion never wired into the no-manifest (tokio +
+    `--shards 1`) recovery branch.** `demote_replayed_cold_shadows` was
+    only invoked from the manifest-based AOF replay branches in
+    `src/main.rs`; under `runtime-tokio` + `--shards 1` no manifest is
+    ever created (`AofManifest::initialize` is monoio-only there), so the
+    only KV replay for that runtime/shard combination — the Phase 4b
+    `appendonly.aof` fallback inside `recover_shard_v3_pitr`
+    (`src/persistence/recovery.rs`) — never demoted anything, leaving that
+    config just as exposed to the AOF-replay-rehydration bug as the
+    manifest-based paths were before task #56. The demote call is now
+    also invoked at the end of Phase 4b. Covered by the new
+    tokio+jemalloc-feature integration test
+    `tests/cold_shadow_single_shard_tokio.rs`
+    (`single_shard_overwritten_cold_key_returns_new_value_after_crash`),
+    using `SETEX` rather than a bare `SET` per the documented
+    monoio-write-gate/inline-SET-path gotcha.
+  - **MEDIUM — `used_memory` parity gap: Lua script cache and replication
+    backlog.** Real Redis's `used_memory` is "total allocator-attributed
+    memory", not "memory eviction can reclaim" — it counts the Lua script
+    cache and replication backlog even though neither is evictable.
+    Decision: include both in the reported figure rather than document an
+    exclusion list, since both were already tracked as separate
+    `moon_memory_bytes{kind="lua_scripts"}` /
+    `{kind="replication_backlog"}` gauges — folding them into
+    `logical_used_memory_bytes()` (`src/admin/metrics_setup.rs`) and the
+    `moon_used_memory_bytes` gauge cost no new instrumentation. The actual
+    `--maxmemory` eviction gate (`ShardDatabases::recompute_elastic_budget`)
+    is deliberately left unchanged and narrower — eviction has no
+    mechanism to reclaim Lua bytecode or backlog bytes, so gating on them
+    would free nothing. `MEMORY DOCTOR` (`src/command/server_admin.rs`)
+    now prints three distinct figures (elastic budget / used_memory
+    reported / RSS) instead of conflating the first two; see the expanded
+    `docs/guides/monitoring.md` "`used_memory` vs RSS under disk-offload"
+    section.
 
 ### Documentation
 - **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
