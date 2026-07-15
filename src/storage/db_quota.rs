@@ -271,11 +271,12 @@ mod tests {
     }
 
     fn rt_with_quota(db_maxmemory: Vec<u64>, policy: &str) -> RuntimeConfig {
-        let mut rt = RuntimeConfig::default();
-        rt.db_maxmemory = db_maxmemory;
-        rt.maxmemory_policy = policy.to_string();
-        rt.num_shards = 1;
-        rt
+        RuntimeConfig {
+            db_maxmemory,
+            maxmemory_policy: policy.to_string(),
+            num_shards: 1,
+            ..Default::default()
+        }
     }
 
     #[test]

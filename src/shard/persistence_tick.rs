@@ -1790,9 +1790,11 @@ mod tests {
 
         // 1 shard, 1 MiB maxmemory => per-shard budget is the whole 1 MiB.
         // disk_offload_threshold defaults to 0.85 (see config.rs).
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024;
-        rt.num_shards = 1;
+        let rt = crate::config::RuntimeConfig {
+            maxmemory: 1024 * 1024,
+            num_shards: 1,
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
         let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
             [],
@@ -1818,9 +1820,11 @@ mod tests {
 
         // maxmemory == 0 (unset) must never trigger, regardless of usage.
         {
-            let mut rt2 = crate::config::RuntimeConfig::default();
-            rt2.maxmemory = 0;
-            rt2.num_shards = 1;
+            let rt2 = crate::config::RuntimeConfig {
+                maxmemory: 0,
+                num_shards: 1,
+                ..Default::default()
+            };
             let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
             shared.publish_memory(0, usize::MAX / 2);
             assert!(
@@ -1839,9 +1843,11 @@ mod tests {
         let dbs = vec![vec![Database::new()]];
         let (shared, _inits) = ShardDatabases::new(dbs);
 
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024; // 1 MiB per-shard budget (1 shard)
-        rt.num_shards = 1;
+        let rt = crate::config::RuntimeConfig {
+            maxmemory: 1024 * 1024, // 1 MiB per-shard budget (1 shard)
+            num_shards: 1,
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
         let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
             [],

@@ -1442,10 +1442,11 @@ mod tests {
     // ── GAP-1: elastic budget publish/recompute ──────────────────────────
 
     fn rt_config(maxmemory: usize, num_shards: usize) -> crate::config::RuntimeConfig {
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = maxmemory;
-        rt.num_shards = num_shards;
-        rt
+        crate::config::RuntimeConfig {
+            maxmemory,
+            num_shards,
+            ..Default::default()
+        }
     }
 
     #[test]
