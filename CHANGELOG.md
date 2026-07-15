@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
+  post-v0.7.1 actuals: v0.6.1/v0.7.0 marked shipped (with the R5/R6 slips and the
+  single-shard-replica disclosure recorded), v0.8 re-slotted to **One Storage
+  Kernel GA** (close-out of tasks #49/#56, spill-file batching, crash-matrix CI,
+  10×-RAM benchmark publication), cluster hardening + multi-shard replicas moved
+  to v0.9, enterprise foundation to v0.10; debt register refreshed.
+
 ## [0.7.1] — 2026-07-15
 
 Patch release closing the two follow-ups disclosed in the v0.7.0 tag notes: the

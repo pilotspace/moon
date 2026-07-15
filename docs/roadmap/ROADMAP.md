@@ -1,6 +1,6 @@
 # Moon Product Roadmap — v0.7 → v1.0 → Enterprise
 
-**Status:** Owner-approved draft · **Date:** 2026-07-09 · **Current release:** v0.6.0 (2026-07-08, PR #249)
+**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.7.1 (2026-07-15, PR #336)
 **Companion docs:** [Scale & HA architecture](scale-ha-architecture.md) · [Standalone horizontal scale](standalone-horizontal-scale.md)
 *(The commercial Enterprise Edition plan is maintained privately.)*
 
@@ -22,25 +22,31 @@ architecture with a unified WAL v3 log and 6-phase crash recovery.
 | Vector vs Qdrant | 8.9–10.9× ingest, 2.5–3.4× search QPS at iso-recall ≥0.999 | BENCHMARK.md §10.7–10.9 |
 | Graph vs FalkorDB | 21–26× build; wins/ties point queries after P1+P2 waves | BENCHMARK.md §11 |
 | Durability engineering | WAL v3 unified log, group commit, crash-matrix + jepsen-lite CI, kill-9 suites | integration-tests.yml |
+| Replication (v0.7 GA) | Multi-shard master → streaming replica across all 6 data planes, real WAIT/ACK; 24h kill-9 soak, zero acked-write loss | RELEASES.md v0.7.0 |
+| Storage kernel | Typed WAL plane, per-plane durable floors + min-across-planes recycle, atomic-write util, per-plane memory accounting; 42-cell cross-plane crash matrix | PRs #286–#301 (kernel M0–M3) |
+| Tiered storage (10× RAM) | 2.6GB dataset on 256MB cap: 95% hot-hit p99 1.84× in-RAM, kill-9 restart-to-PONG 3.7s | G2 acceptance 2026-07-13 |
 | Quality posture | ~4,980 tests, 11 fuzz targets, loom models, unsafe/unwrap ratchets, RSS-regression CI gate | ci.yml, fuzz/ |
 | Release engineering | Docker/musl/deb/rpm/systemd/Homebrew, CycloneDX SBOM, cosign signing | release.yml |
 | Hidden assets | React admin console (RedisInsight-class, embedded), CLIENT TRACKING fully wired, Debezium CDC (alpha) | console/, src/tracking/, src/cdc/ |
 
 ### Reality check — what is capped or missing
 
+*(Rev 2 note: the v0.6.1/v0.7.0 cycle closed the original top gaps — multi-shard master PSYNC,
+real WAIT/ACK, cold-tier TTL leak, ACL early-intercept hole, shardslice waiver (retired at
+v0.7.0), and the hygiene ledger. Remaining gaps below.)*
+
 | Gap | Detail | Impact |
 |---|---|---|
-| **Replication capped at `--shards 1` masters** | `PSYNC across multiple shards is not yet supported` (`handler_monoio/dispatch.rs:564`) | Moon's headline (thread-per-core) cannot be replicated for HA — the #1 roadmap item |
-| **WAIT is a stub** | Returns 0 always on the sharded path (`command/mod.rs:1461`); `REPLCONF ACK` parsed but discarded | No client-visible durable-replication confirmation |
-| **Cluster mode is alpha, tokio-only** | Bus/gossip spawn only in the tokio startup block (`main.rs:1655-1693`); monoio (production) startup omits it (`main.rs:1617`) | Cluster mode does not run on the production runtime |
-| Cold-tier TTL leak (R1) | TTL-expired cold entries never reclaimed — unbounded RAM+disk growth | Real reliability bug for the flagship cache/session use case (tmp/OFFLOAD-COMPRESSION-REVIEW.md) |
-| Cross-shard read residual | shardslice waiver **expires 2026-08-01**; L4 lock-free cross-shard reads unstarted | Hard near-term deadline |
-| No encryption at rest | WAL/AOF/RDB plaintext | Blocks regulated buyers |
-| No keyspace notifications, no MONITOR | Zero implementation found | Common SRE/integration expectations |
-| ACL coverage hole | `TXN.*`/`WS.*`/`MQ.*`/`TEMPORAL.*`/`CDC.*` bypass the phf metadata/ACL registry (`workspace/mod.rs:145`) | Must audit before any enterprise security claim |
-| Vector 384d recall/QPS | Trails RediSearch ~16× QPS at 384d (quantization codebook mis-fit at low d) | Diagnosed; TQ⁺ per-coordinate calibration is the candidate fix |
-| Client ecosystem | Only redis-py/go-redis/redis-rs CI-tested; Java/Node/.NET "planned" | Enterprise adoption friction |
-| Hygiene debt | v0.6.0 untagged + missing RELEASES.md entry; PRODUCTION-CONTRACT.md stale (v0.1.3-era); FT.AGGREGATE + hash-TTL doc contradictions; SECURITY.md says "0.1.x supported" | Credibility risk; cheap to fix |
+| **Streaming replica is single-shard only** | Multi-shard work in v0.7 is master-side (merged N-shard PSYNC feed); replicas run `--shards 1` | Disclosed v0.7 limitation; replica can't use thread-per-core — slotted v0.9 |
+| **Cluster mode is alpha, tokio-only** | Bus/gossip spawn only in the tokio startup block; monoio (production) startup omits it (`main.rs`) | Cluster mode does not run on the production runtime — slotted v0.9 |
+| Atomic-write stragglers (task #49) | 7 bare-write sites remain: **ACL SAVE has no atomicity**, nodes.conf, CONFIG REWRITE, repl state, native BGSAVE, clog/kv_page | Torn-file windows outside the kernel contract — v0.8 close-out |
+| `used_memory` accounting under offload (task #56) | Reports 406–762MB against a 256MB cap during 10×-RAM runs (worse post-restart) | Undermines the 10×-RAM claim's operator story — v0.8 close-out |
+| Spill format scale | One-file-per-key heap spill → O(keys) file counts; sweep/manifest scale with it | v0.8 close-out (batch into segments) |
+| No encryption at rest | WAL/AOF/RDB plaintext | Blocks regulated buyers — v0.10 |
+| No keyspace notifications, no MONITOR | Slipped from v0.7 (R5) | Common SRE/integration expectations — re-rank at v0.9 planning |
+| `moon://` URI implementation | Spec doc shipped (H-7); `src/uri.rs` implementation (R6) slipped | Re-rank at v0.9 planning |
+| Vector 384d recall/QPS | Trails RediSearch ~16× QPS at 384d (quantization codebook mis-fit at low d) | Diagnosed; TQ⁺ per-coordinate calibration is the candidate fix — v0.10 |
+| Client ecosystem | Only redis-py/go-redis/redis-rs CI-tested; Java/Node/.NET "planned" | Enterprise adoption friction — v0.10 |
 
 ---
 
@@ -102,20 +108,20 @@ mindmap
       Planned: encryption at rest
       Planned: PITR + backup CLI
     Replication & HA
-      PSYNC2 single-shard master GA
+      Multi-shard master PSYNC GA v0.7
+      Real WAIT + ACK v0.7
       Per-shard backlogs
       REPLICAOF / partial resync
-      v0.7: multi-shard master PSYNC
-      v0.7: real WAIT + ACK plumbing
-      v0.8: semi-sync quorum writes
-      v0.8: cascading replicas
+      v0.9: multi-shard replicas
+      Later: semi-sync quorum writes
+      Later: cascading replicas
     Cluster
       16384 slots + gossip bus alpha
       MOVED/ASK + slot migration
       Quorum failover election
-      v0.8: monoio wiring
-      v0.8: soak + jepsen hardening
-      v0.8: CLUSTER SHARDS
+      v0.9: monoio wiring
+      v0.9: soak + jepsen hardening
+      v0.9: CLUSTER SHARDS
     Multi-tenancy
       Workspaces WS.*
       Per-db index isolation v0.6
@@ -166,45 +172,51 @@ deliberately aggressive but each release has a **single headline** and hard exit
 
 | Release | Target | Headline | Theme |
 |---|---|---|---|
-| **v0.6.1** | 2026-07 (now) | Hygiene + reliability hotfix | Tag v0.6.0, RELEASES.md, cold-tier TTL leak, doc reconciliation |
-| **v0.7.0** | 2026-08 | **Replication GA for multi-shard masters** | The HA unblock |
-| **v0.8.0** | 2026-10 | **Cluster mode Beta→GA-hardened on monoio** | Horizontal scale |
-| **v0.9.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem |
+| ~~v0.6.1~~ | *folded into v0.7.0* | Hygiene + reliability hotfix | Shipped inside the v0.7.0 train (tag hygiene, TTL leak, ACL audit, doc reconciliation) |
+| **v0.7.0** | ✅ **shipped 2026-07-14** | **Replication GA for multi-shard masters** | The HA unblock; also absorbed storage-kernel M0–M4 |
+| **v0.7.1** | ✅ **shipped 2026-07-15** | SQ8 CPU-storm fix + deterministic replica TTL | Patch |
+| **v0.8.0** | 2026-08 | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
+| **v0.9.0** | 2026-10 | **Horizontal scale: cluster GA-hardened on monoio + multi-shard replicas** | Re-slotted from v0.8; adds the replica-side shard gap |
+| **v0.10.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem (re-slotted from v0.9) |
 | **v1.0.0** | 2027-Q1 | **GA / production contract fulfilled** | Stability promise, LTS |
 | **Moon EE 1.0** | 2027-Q2 | Commercial enterprise layer EA→GA | Planned privately (open-core: CE never loses features) |
 
-### v0.6.1 — Hygiene & reliability hotfix (1–2 weeks)
+### v0.6.1 + v0.7.0 — SHIPPED (2026-07-14) · v0.7.1 (2026-07-15)
 
-- Tag `v0.6.0`, write the RELEASES.md evidence entry (release ledger must never lag again — add a CI check).
-- **Fix R1: cold-tier TTL reclaim** (expired cold entries leak RAM in ColdIndex + disk forever).
-- Reconcile doc contradictions: FT.AGGREGATE status, hash-field TTL, SECURITY.md supported versions.
-- Refresh PRODUCTION-CONTRACT.md to v0.6.0 reality — tick what is actually done (Prometheus, SLOWLOG, SBOM, cosign, loom, fuzz); it becomes the living v1.0 gate.
-- ACL coverage audit for `TXN.*`/`WS.*`/`MQ.*`/`TEMPORAL.*`/`CDC.*` early-intercept commands; register them in the metadata table or document the enforcement path.
+The v0.6.1 hygiene scope was folded into the v0.7.0 train and shipped with it. v0.7.0's exit
+criterion was met with one disclosed narrowing: a `--shards N` master replicates to a
+**single-shard** streaming replica (multi-shard replicas re-slotted to v0.9), survives kill-9 on
+either side with zero `WAIT`-acked loss, validated by a 24h soak (run dir
+`moon-dev:~/moon-soak/runs/20260714-141946`). The cycle also absorbed the entire storage-kernel
+build-out (M0–M4, PRs #286–#301/#313/#319/#323) originally proposed for v0.8.
 
-### v0.7.0 — Replication GA (the HA unblock)
+Slipped from the v0.7 plan (unscheduled; re-rank at v0.9 planning): keyspace notifications +
+MONITOR (R5), `moon://` URI implementation (R6 — spec doc H-7 shipped). v0.7.1 added the
+master-side absolute-TTL rewrite + role-gated replica expiry (task #71b) and the SQ8/TQ
+CPU-error-storm fix (task #73).
 
-Exit criterion: *a `--shards N` master replicates to `--shards M` replicas, survives kill-9 on
-either side with zero acknowledged-write loss under `WAIT`-confirmed semantics, soaked 24h.*
+### v0.8.0 — One Storage Kernel GA (close-out + verification)
 
-1. **Multi-shard master PSYNC** — implement `.planning/rfcs/multi-shard-replication-design.md`
-   (per-shard WAL streams multiplexed behind one PSYNC2 wire view; `ShardMessage::PrepareReplicaSync`).
-   LSN space is already global (`master_repl_offset` = Σ per-shard offsets) — the gap is wire packaging.
-2. **Real WAIT/ACK plumbing** — consume `REPLCONF ACK` on the master's replica socket (today
-   write-only loop, `master.rs:728`), thread `replica_id` through `handler_monoio`/`handler_sharded`,
-   wire `wait_for_replicas` into the production dispatch path.
-3. **Replica promotion correctness** — `REPLICAOF NO ONE` must roll `repl_id`/`repl_id2` per PSYNC2
-   so demoted-master partial resync works after failover.
-4. **L4 cross-shard read redesign** (waiver expires 2026-08-01) — lock-free cross-shard reads;
-   retire the shardslice waiver or explicitly re-scope it with new evidence.
-5. Keyspace notifications (`notify-keyspace-events`) + MONITOR — both are replication-adjacent
-   observability the ecosystem expects; cheap wins with existing pub/sub + dispatch hooks.
-6. New CI job: replication crash matrix (master kill, replica kill, partial resync, promote) on
-   both runtimes.
-7. **Native `moon://` / `moons://` connection URI scheme** (parity with `redis://` / `rediss://`) —
-   land the client-facing scheme so replication (`REPLICAOF moons://…`), cluster redirects, and
-   `--announce-url` speak Moon's own TLS-aware URL. Full spec: [§8.5](#85-cross-cutting-native-moon--moons-connection-uri-scheme).
+Exit criterion: *the 42-cell cross-plane kill-9 crash matrix runs green in scheduled CI on both
+shard configs; the 10×-RAM acceptance re-passes on real disk with truthful `used_memory`; the
+benchmark report and PRODUCTION-CONTRACT rows are published.* The kernel itself is built — this
+release converts it into a verifiable public claim.
 
-### v0.8.0 — Cluster hardening (horizontal scale)
+1. **Task #49 — atomic-write straggler sweep**: adopt `atomic_write_durable` at the 7 remaining
+   bare-write sites (ACL SAVE — worst, no atomicity today —, nodes.conf, CONFIG REWRITE,
+   replication state, native BGSAVE, clog/kv_page).
+2. **Task #56 — `used_memory` truth under offload**: reconcile accounting so a 256MB-cap
+   10×-RAM run reports ≤ cap (or documents exactly what the overage is); fix the post-restart
+   regression.
+3. **Spill-file batching**: one-file-per-key heap spill → segment files (≤N keys/file already
+   exists for batches; make it the only shape), shrinking orphan-sweep and manifest scale.
+4. **Crash-matrix CI**: wire `tests/crash_matrix_cross_plane.rs` (+ `MOON_CRASH_MATRIX_ITERS`
+   soak) into a scheduled workflow; confirmation run proving all former RED cells stay green.
+5. **G2 re-run on real disk** (post-#323 async cold-read fix): re-measure the cold-GET-during-
+   spill tail that previously hit 1.91s; publish the 10×-RAM benchmark report.
+6. PRODUCTION-CONTRACT: tick CRASH-02 / MEM-10X rows with evidence links.
+
+### v0.9.0 — Horizontal scale: cluster hardening + multi-shard replicas
 
 Exit criterion: *3-master × 3-replica cluster on monoio survives node kill (auto-failover < node_timeout×2),
 live slot migration under load with zero lost acknowledged writes, 72h soak, jepsen-lite green.*
@@ -221,8 +233,13 @@ live slot migration under load with zero lost acknowledged writes, 72h soak, jep
    clusters get deployed.
 7. Graph/vector cluster semantics: a named graph migrates as one unit (hash-tag routed); FT
    indexes are keyspace-global — define and test their slot-migration story.
+8. **Multi-shard replicas** — close v0.7's disclosed limitation: a `--shards N` master
+   replicates to `--shards M` replicas (replica-side demux of the merged PSYNC feed through
+   `key_to_shard` routing); kill-9 matrix extended to s∈{1,4}×s∈{1,4}.
+9. Re-rank the v0.7 slips here: keyspace notifications + MONITOR (R5), `moon://` URI
+   implementation (R6).
 
-### v0.9.0 — Enterprise foundation
+### v0.10.0 — Enterprise foundation
 
 Exit criterion: *a security-conscious enterprise can run Moon and pass an infosec review.*
 
@@ -250,15 +267,17 @@ Exit criterion: *a security-conscious enterprise can run Moon and pass an infose
 
 | Item | Deadline / trigger | Owner action |
 |---|---|---|
-| shardslice cross-shard-read waiver | **2026-08-01** | Close via L4 in v0.7 or re-issue with evidence |
-| v0.6.0 tag + RELEASES.md | immediate | v0.6.1 |
-| PRODUCTION-CONTRACT refresh | immediate | v0.6.1, then living doc |
-| Cold-tier TTL leak (R1) | immediate | v0.6.1 |
-| ACL registry bypass (TXN/WS/MQ/TEMPORAL/CDC) | before any security claim | v0.6.1 audit |
-| Doc contradictions (FT.AGGREGATE, hash-TTL, SECURITY.md) | immediate | v0.6.1 |
-| `replication.state` file at repo root | next PR | gitignore or relocate |
-| BGREWRITEAOF multi-shard gate (`--experimental-per-shard-rewrite`) | v0.7 | promote to default after replication soak |
-| Offload perf deferrals (PageCache dormant, cold reads block event loop, <256B never compressed) | v0.8+ | re-rank after replication ships |
+| ~~shardslice cross-shard-read waiver~~ | ✅ retired at v0.7.0 (L4 validated, PR #325) | done |
+| ~~v0.6.0 tag + RELEASES.md · PRODUCTION-CONTRACT refresh · cold-tier TTL leak · ACL registry bypass · doc contradictions~~ | ✅ closed in the v0.6.1/v0.7.0 cycle | done |
+| Task #49 bare-write sites (ACL SAVE et al.) | v0.8 | atomic-write sweep (v0.8 item 1) |
+| Task #56 `used_memory` under offload | v0.8 | accounting reconcile (v0.8 item 2) |
+| Spill one-file-per-key scale | v0.8 | segment batching (v0.8 item 3) |
+| rustls-pemfile → rustls-pki-types (task #66, RUSTSEC ignore) | in flight 2026-07-15 | Wave-0 PR |
+| clippy `--tests` debt (task #39) | in flight 2026-07-15 | Wave-0 PR |
+| GitHub issue backlog (~40 open, Mar–Jun era) | in flight 2026-07-15 | Wave-0 triage sweep with commit evidence |
+| BGREWRITEAOF multi-shard gate (`--experimental-per-shard-rewrite`) | v0.8 | replication soak passed — promote to default |
+| Keyspace notifications + MONITOR (R5) · `moon://` impl (R6) | v0.9 planning | re-rank |
+| Offload perf deferrals (PageCache dormant, <256B never compressed; cold-read blocking ✅ fixed #323) | v0.9+ | re-rank after v0.8 |
 
 ---
 
@@ -290,7 +309,7 @@ Exit criterion: *a security-conscious enterprise can run Moon and pass an infose
 Sizing: S ≤ 1 day · M ≤ 1 week · L ≤ 3 weeks · XL = milestone-sized. Every task lands with its
 verification artifact (test/CI job/bench) in the same PR — no "tests later".
 
-### 8.1 v0.6.1 — Hygiene & reliability hotfix
+### 8.1 v0.6.1 — Hygiene & reliability hotfix *(✅ shipped inside the v0.7.0 train)*
 
 | ID | Task | Anchor | Verification | Size |
 |---|---|---|---|---|
@@ -302,7 +321,7 @@ verification artifact (test/CI job/bench) in the same PR — no "tests later".
 | H-6 | gitignore/relocate `replication.state` root artifact | repo root | clean `git status` | S |
 | H-7 | **`moon://` / `moons://` URI spec** (doc-only): write `docs/protocol/moon-uri.md` — ABNF grammar, `redis(s)://` parity table, TLS/downgrade failure semantics; implementation is v0.7.0 R6 | [§8.5](#85-cross-cutting-native-moon--moons-connection-uri-scheme) | Doc CI link check; grammar block present | S |
 
-### 8.2 v0.7.0 — Replication GA
+### 8.2 v0.7.0 — Replication GA *(✅ shipped 2026-07-14; R5 + R6 implementation slipped, replica side capped at `--shards 1` — both re-slotted to v0.9)*
 
 Workstream R1 — multi-shard PSYNC (XL, the release):
 - R1a: wire format — extend PSYNC2 payload frames with `(shard_id: u16, shard_lsn: u64)` header;
@@ -349,7 +368,7 @@ Workstream R6 — native `moon://` / `moons://` URI scheme (M): implement the sp
   diagnostic, never hangs, never downgrades), workspace-selection test (`?workspace=t1` lands the
   session in tenant `t1` pre-first-command).
 
-### 8.3 v0.8.0 — Cluster hardening
+### 8.3 v0.9.0 — Cluster hardening *(re-slotted from v0.8; add multi-shard replicas + R5/R6 slips at v0.9 planning)*
 
 | ID | Task | Anchor | Verification | Size |
 |---|---|---|---|---|
@@ -361,7 +380,7 @@ Workstream R6 — native `moon://` / `moons://` URI scheme (M): implement the sp
 | C-6 | Helm chart + StatefulSet, readiness = `/readyz` + `CLUSTER INFO ok` | new `deploy/helm/` | kind-based CI install test | M |
 | C-7 | Multi-engine slot semantics: graph-unit migration test (hash-tagged), FT index entries follow their hash's slot | `src/vector/`, `src/graph/` | migration test with live FT.SEARCH during move | L |
 
-### 8.4 v0.9.0 — Enterprise foundation
+### 8.4 v0.10.0 — Enterprise foundation *(re-slotted from v0.9)*
 
 | ID | Task | Verification | Size |
 |---|---|---|---|
