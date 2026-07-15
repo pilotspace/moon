@@ -32,12 +32,6 @@ ignore = [
     # archived by upstream, no safe upgrade (the suggested forks — pastey /
     # with_builtin_macros — are not drop-in without a tikv-jemalloc-ctl bump).
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (archived upstream) with no safe upgrade; pinned transitively by tikv-jemalloc-ctl 0.6.1 — revisit on next jemalloc-ctl major bump" },
-    # rustls-pemfile 2.2.0 (direct, optional dep behind runtime-tokio /
-    # runtime-monoio for TLS PEM loading): unmaintained, no safe drop-in
-    # upgrade in the 2.x line. Migrating to rustls-pki-types' PemObject API
-    # is a real code change (src/tls*), tracked separately — not done here
-    # to keep this CI-wiring change infra-only.
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; migrating callers to rustls-pki-types::PemObject is a source-code change out of scope for CI wiring — tracked as a follow-up" },
 ]
 
 [licenses]

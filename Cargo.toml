@@ -52,7 +52,7 @@ ctrlc = "3.4"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
-rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 aws-lc-rs = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 monoio-rustls = { version = "0.4", optional = true }
@@ -103,8 +103,8 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Usage:
 #   cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index
 mimalloc-alt = []
-runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
-runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
+runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pki-types"]
+runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pki-types"]
 gpu-cuda = ["dep:cudarc"]
 simd-avx512 = []
 # OpenTelemetry exporter: reserves feature namespace for OTLP trace export.

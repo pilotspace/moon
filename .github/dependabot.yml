@@ -11,7 +11,7 @@ updates:
       async-runtime:
         patterns: ["tokio*", "monoio*", "futures*"]
       crypto-tls:
-        patterns: ["rustls*", "aws-lc-rs*", "rustls-pemfile*"]
+        patterns: ["rustls*", "aws-lc-rs*"]
       tracing:
         patterns: ["tracing*"]
     ignore:

@@ -41,7 +41,7 @@ ctrlc
 metrics
 metrics-exporter-prometheus
 rustls
-rustls-pemfile
+rustls-pki-types
 aws-lc-rs
 tokio-rustls
 monoio-rustls
