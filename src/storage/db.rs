@@ -1255,6 +1255,62 @@ impl Database {
         }
     }
 
+    /// Task #56 (used_memory truthful under disk-offload + AOF restart):
+    /// drop hot DashTable copies that are redundant with an already-cold key.
+    ///
+    /// AOF replay has no knowledge of the disk-offload cold tier -- a key
+    /// evicted-and-spilled to cold storage BEFORE a crash gets no
+    /// corresponding DEL record in the AOF (a spilled entry stays
+    /// cold-readable, not deleted, so `record_reason_del` never fires for
+    /// it -- see its doc comment). Replaying the AOF's full command history
+    /// therefore unconditionally re-applies that key's original SET and
+    /// lands it back in hot RAM, inflating `used_memory` well past
+    /// `--maxmemory` immediately after every restart until later eviction
+    /// ticks claw it back down (task #56 diagnosis; observed ~6x the
+    /// steady-state ledger in a 40k-key repro, `tests/used_memory_offload_truthful.rs`).
+    ///
+    /// Call this ONCE per shard, after AOF replay finishes and before the
+    /// server starts accepting connections. Any key present in
+    /// `cold_index` at that point was cold-and-untouched as of the crash:
+    /// the index was rebuilt from the crash-consistent manifest *before*
+    /// AOF replay ran, and replay only ever writes hot -- it cannot
+    /// re-cold a key. If AOF replay *also* landed that key in the hot
+    /// DashTable, both copies hold the identical value. Proof sketch: the
+    /// AOF's last command touching a crash-time-cold key must be the same
+    /// SET the eviction path later spilled -- any *later* live write would
+    /// have made the key hot again and required a fresh eviction to become
+    /// cold once more, which the manifest (and thus `cold_index`) would
+    /// already reflect as its current entry. It is therefore always safe
+    /// to drop the redundant hot copy and let the existing cold-index
+    /// entry keep serving reads -- no cold-tier file is touched, only the
+    /// in-memory accounting is corrected.
+    ///
+    /// This is the mirror image of the live-traffic orphan sweeper
+    /// ([`crate::storage::tiered::cold_index::ColdIndex::orphan_sweep`]):
+    /// that one deletes a *stale cold* copy shadowed by a *newer hot*
+    /// write seen during live traffic (hot wins). This one deletes a
+    /// *redundant hot* copy manufactured by replaying an *old* write whose
+    /// crash-time fate was already cold (cold wins) -- the two precedences
+    /// only coexist because this method runs strictly before the server is
+    /// reachable; never call it once live traffic may have run.
+    pub fn demote_replayed_cold_shadows(&mut self) -> usize {
+        let Some(ci) = self.cold_index.as_ref() else {
+            return 0;
+        };
+        let shadow_keys: Vec<Bytes> = ci
+            .iter()
+            .filter(|(key, _)| self.is_hot(key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut demoted = 0usize;
+        for key in &shadow_keys {
+            if self.remove_hot(key).is_some() {
+                demoted += 1;
+            }
+        }
+        demoted
+    }
+
     /// Check if a key exists, performing lazy expiration.
     /// Optimized: single lookup via get instead of check_expired + contains_key.
     ///
@@ -2522,6 +2578,68 @@ mod tests {
         let removed = db.remove(b"key1");
         assert!(removed.is_some());
         assert!(db.get(b"key1").is_none());
+    }
+
+    /// Task #56 red/green: `demote_replayed_cold_shadows` must drop a hot
+    /// entry that AOF replay redundantly re-materialized for a key already
+    /// present in the (crash-consistent) cold index, correctly uncharging
+    /// `used_memory` -- and must leave the cold-index entry itself intact so
+    /// the key is still readable via cold read-through afterward. A key with
+    /// NO cold-index entry (never evicted) must be left completely alone.
+    #[test]
+    fn test_demote_replayed_cold_shadows() {
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        let mut db = Database::new();
+        // never-evicted key: no cold_index entry, must survive untouched.
+        db.set(
+            Bytes::from_static(b"never_evicted"),
+            Entry::new_string(Bytes::from_static(b"live_value")),
+        );
+        // AOF-replay-shadowed key: also present in cold_index (as recovery
+        // would have rebuilt it from the manifest before replay ran).
+        db.set(
+            Bytes::from_static(b"replayed_shadow"),
+            Entry::new_string(Bytes::from_static(b"same_value_replay_reconstructed")),
+        );
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"replayed_shadow"),
+            ColdLocation {
+                file_id: 1,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+            },
+        );
+        db.cold_index = Some(ci);
+
+        let used_memory_before = db.resident_bytes();
+        assert!(db.is_hot(b"replayed_shadow"));
+
+        let demoted = db.demote_replayed_cold_shadows();
+
+        assert_eq!(demoted, 1, "exactly the shadowed key must be demoted");
+        assert!(
+            !db.is_hot(b"replayed_shadow"),
+            "shadowed key must no longer be hot"
+        );
+        assert!(
+            db.is_hot(b"never_evicted"),
+            "never-evicted key must be untouched"
+        );
+        assert!(
+            db.resident_bytes() < used_memory_before,
+            "used_memory must drop once the redundant hot copy is dropped"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"replayed_shadow")
+                .is_some(),
+            "cold-index entry must remain so the key is still cold-readable"
+        );
     }
 
     #[test]

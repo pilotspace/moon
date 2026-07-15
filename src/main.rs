@@ -1223,6 +1223,36 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Task #56 (used_memory truthful under disk-offload + AOF restart):
+    // AOF replay has no cold-tier awareness -- a key evicted-and-spilled
+    // BEFORE a crash gets no AOF DEL record (a spilled entry stays
+    // cold-readable, never deleted, so `record_reason_del` never fires for
+    // it), so replaying the AOF's full command history unconditionally
+    // re-applies that key's original SET and lands it back in hot RAM.
+    // Call this immediately after each replay branch below finishes: any
+    // key still present in `cold_index` at that point was cold-and-
+    // untouched as of the crash (the index was rebuilt from the
+    // crash-consistent manifest by `restore_from_persistence`'s v3 path
+    // BEFORE this AOF replay ran), so a hot copy replay produced for it is
+    // provably redundant -- see `Database::demote_replayed_cold_shadows`
+    // for the full correctness proof. Cheap no-op per db when disk-offload
+    // isn't active (no `cold_index` to check).
+    fn demote_replay_cold_shadows(shards: &mut [moon::shard::Shard]) {
+        let mut total_demoted = 0usize;
+        for shard in shards.iter_mut() {
+            for db in shard.databases.iter_mut() {
+                total_demoted += db.demote_replayed_cold_shadows();
+            }
+        }
+        if total_demoted > 0 {
+            info!(
+                "Disk-offload: demoted {} AOF-replay hot shadow(s) back to cold-only \
+                 stubs (used_memory truthful after restart, task #56)",
+                total_demoted
+            );
+        }
+    }
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -1263,6 +1293,7 @@ fn main() -> anyhow::Result<()> {
                         "AOF multi-part loaded (seq {}): {} entries",
                         manifest.seq, loaded
                     );
+                    demote_replay_cold_shadows(&mut shards);
 
                     // Retire legacy appendonly.aof so future boots don't double-
                     // replay it via restore_from_persistence's fallback path.
@@ -1378,6 +1409,7 @@ fn main() -> anyhow::Result<()> {
                     global_max_lsn,
                     ordered_count
                 );
+                demote_replay_cold_shadows(&mut shards);
 
                 // RFC § 2 Rule 3 — seed master_repl_offset before accepting
                 // client traffic so the next write doesn't reissue an LSN

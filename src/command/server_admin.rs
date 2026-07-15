@@ -463,6 +463,19 @@ fn memory_doctor() -> Frame {
         + lua_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
+    // Task #56 (used_memory truthfulness): the SAME logical ledger INFO's
+    // `used_memory` field and the `moon_used_memory_bytes` gauge report --
+    // KV (+ ColdIndex) + vector + text + graph, the exact terms
+    // `ShardDatabases::recompute_elastic_budget` gates `--maxmemory`
+    // eviction on. WAL writers, sealed segments, the replication backlog,
+    // the (intentionally unbounded) Lua script cache, and allocator
+    // overhead are real resident memory but are NOT gated by `--maxmemory`
+    // -- they legitimately live outside the cap. Called out here explicitly
+    // because conflating this figure with RSS is exactly what made a
+    // healthy disk-offload deployment look permanently over-budget.
+    let used_memory_gated = dashtable_bytes + hnsw_bytes + text_bytes + csr_bytes;
+    let outside_cap_bytes = rss.saturating_sub(used_memory_gated);
+
     // ── VSZ ratio recommendation ─────────────────────────────────────────
     let vsz_ratio = if rss > 0 { vsz / rss } else { 0 };
     let vsz_recommendation = if vsz_ratio > 100 {
@@ -492,6 +505,24 @@ fn memory_doctor() -> Frame {
     let mut out = String::with_capacity(1024);
 
     let _ = writeln!(out, "Sample of Moon memory usage at {now}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Memory accounting (task #56):");
+    let _ = writeln!(
+        out,
+        "  used_memory (gated by --maxmemory): {}",
+        humanize_bytes(used_memory_gated)
+    );
+    let _ = writeln!(
+        out,
+        "  used_memory_rss (process footprint): {}",
+        humanize_bytes(rss)
+    );
+    let _ = writeln!(
+        out,
+        "  outside the cap (RSS - used_memory):  {}  -- allocator overhead, \
+         page cache, WAL/replication buffers, Lua script cache, binary+stacks",
+        humanize_bytes(outside_cap_bytes)
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Process:");
     let _ = writeln!(out, "  RSS:                    {}", humanize_bytes(rss));

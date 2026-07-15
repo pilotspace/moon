@@ -132,6 +132,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   iterations clean (`10 passed; 0 failed`, 40.3s) — these are the same cells that, pre-fix,
   failed at iteration 7/20 and 11/20 in the kernel M3 stage 2 investigation.
 
+### Fixed
+- **`used_memory` truthfulness under disk-offload (task #56).** The G2
+  acceptance run (4 shards, `--maxmemory 256MB`, 2.6GB dataset,
+  disk-offload enabled) reported `INFO` `used_memory` at 406-762MB against
+  the 256MB cap, and worse after a kill-9 restart. Three independent bugs,
+  found by instrumenting a 2-shard/8MB-cap/40k-key macOS repro
+  (`tests/used_memory_offload_truthful.rs`) at load, steady state, and
+  post-restart:
+  - **`used_memory` was literally process RSS** (`src/command/connection.rs`),
+    not the logical ledger `--maxmemory` eviction actually gates on. RSS
+    always carries allocator arena overhead, mmap'd cold-read page-cache
+    frames, thread stacks, the binary image, the (intentionally unbounded)
+    Lua script cache, and the replication backlog ring — none of which the
+    eviction system charges against the cap, so `used_memory` was
+    guaranteed to read high under any disk-offload workload even when
+    eviction was correctly holding the real ledger under budget. `INFO`'s
+    `used_memory` now reports the same KV(+ColdIndex)+vector+text+graph
+    "used-term" `ShardDatabases::recompute_elastic_budget` already gates on
+    (`admin::metrics_setup::logical_used_memory_bytes`); `used_memory_rss`
+    / `used_memory_peak` still report the true OS footprint alongside it, a
+    new `moon_used_memory_bytes` Prometheus gauge mirrors the ledger figure,
+    and `MEMORY DOCTOR` gained an explicit "gated vs RSS vs outside-the-cap"
+    header so the two numbers are never conflated again.
+  - **Restart double-loaded every spilled `String` key into hot RAM**
+    (`src/persistence/recovery.rs`): v3 recovery Phase 3 re-inserted each
+    previously-spilled `ValueType::String` entry directly into the hot
+    DashTable (`#79-04`, predating cold read-through) AND — two days later,
+    unrelated to the first change — rebuilt a `ColdIndex` stub for the same
+    key pointing at the same on-disk location (`#80-02`); nobody removed
+    the first loop when the second, correct mechanism landed. Every value
+    type now recovers as a cold-index-only stub, exactly like
+    Hash/List/Set/ZSet/Stream already did; the first `GET` lazily promotes
+    a key into hot RAM (and only then charges `used_memory`) via the same
+    `Database::promote_cold_if_present` path ordinary (non-restart) cold
+    read-through uses.
+  - **AOF replay re-hydrated already-cold keys back into hot RAM on every
+    restart** (`src/main.rs`, `src/storage/db.rs`): fixing the bug above
+    exposed a second, independent restart-time re-charge path that only
+    surfaces when `--appendonly yes` *and* disk-offload are both active.
+    An evicted-and-spilled key gets no AOF `DEL` record — a spilled entry
+    stays cold-readable, not deleted, so `record_reason_del` never fires
+    for it — so the AOF's incr log still holds that key's original `SET`.
+    AOF replay (`main.rs`'s per-shard and single-shard multi-part branches)
+    has no cold-tier awareness and blindly reapplies every historical `SET`
+    into the hot DashTable, so a restart transiently re-inflated
+    `used_memory` to ~6x the steady-state figure (self-healing over
+    several eviction ticks, but proportionally slower to catch up the
+    larger the disk-offloaded dataset — the "got WORSE after restart"
+    symptom on the real 2.6GB G2 dataset). `Database::demote_replayed_cold_shadows`
+    reconciles the two right after AOF replay finishes and before the
+    server accepts connections: any key still present in the (already
+    crash-consistent) `ColdIndex` at that point is provably redundant with
+    whatever AOF replay just wrote hot for it (replay cannot re-cold a key,
+    so the last AOF command touching a crash-time-cold key must be exactly
+    the SET the eviction path spilled), so the redundant hot copy is
+    dropped and `used_memory` no longer spikes at all post-restart.
+  `tests/used_memory_offload_truthful.rs` drives all three mechanisms
+  end-to-end (spill past `--maxmemory`, confirm real disk spill, SIGKILL,
+  restart) and asserts `used_memory` stays within 1.75x `--maxmemory` at
+  steady state AND immediately post-restart. See `docs/guides/monitoring.md`
+  for the updated operator story on what counts against `--maxmemory` and
+  what doesn't.
+
 ### Documentation
 - **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
   post-v0.7.1 actuals: v0.6.1/v0.7.0 marked shipped (with the R5/R6 slips and the

@@ -232,6 +232,17 @@ pub fn init_metrics(
             "Resident bytes per subsystem; sum approximates RSS"
         );
         prime_moon_memory_bytes();
+        // Task #56 (used_memory truthfulness): headline gauge matching
+        // INFO's `used_memory` field -- the logical ledger `--maxmemory`
+        // eviction gates on (KV + ColdIndex + vector/text/graph), NOT RSS.
+        // `moon_rss_bytes` (primed by the first `update_rss_bytes` call)
+        // remains the true OS-level footprint for comparison.
+        describe_gauge!(
+            "moon_used_memory_bytes",
+            Unit::Bytes,
+            "Logical used-memory ledger --maxmemory eviction gates on (KV+ColdIndex+vector+text+graph); compare against a configured maxmemory, NOT moon_rss_bytes"
+        );
+        gauge!("moon_used_memory_bytes").set(0.0);
 
         Some(ready)
     } else {
@@ -1311,6 +1322,50 @@ pub fn get_global_shard_databases()
     GLOBAL_SHARD_DBS.get().and_then(|w| w.upgrade())
 }
 
+/// The instance-wide logical memory ledger: the SAME "used-term" formula
+/// `ShardDatabases::recompute_elastic_budget` gates `--maxmemory` eviction
+/// on (KV DashTable + its ColdIndex overhead, plus vector/text/graph
+/// resident bytes), summed across every shard.
+///
+/// Task #56 (used_memory truthfulness): this is what `INFO`'s `used_memory`
+/// field reports. It deliberately is NOT process RSS -- RSS also contains
+/// the binary image, thread stacks, allocator arena fragmentation, mmap'd
+/// page-cache frames for cold-tier reads, the Lua script cache (unbounded
+/// by design, `SCRIPT FLUSH` is its only reclaim path), and the replication
+/// backlog ring, none of which `--maxmemory` gates on. Reporting RSS as
+/// `used_memory` made every disk-offload deployment look permanently
+/// over-budget (RSS-vs-ledger gap of 150-500MB+ was misread as a leak in
+/// the G2 acceptance run) even when the eviction system was correctly
+/// holding the real, gated ledger under the cap. `used_memory_rss` /
+/// `used_memory_peak` still report the true OS-level footprint alongside
+/// this field -- see `allocator_overhead_bytes` and `pagecache_bytes` for
+/// the two largest legitimately-outside-the-cap components, and `MEMORY
+/// DOCTOR` for the full per-subsystem breakdown (including Lua and
+/// replication backlog, which this ledger also excludes).
+///
+/// O(num_shards) Relaxed atomic loads -- no lock, no allocation. Every term
+/// is itself an O(1) accumulator maintained at its own mutation sites (the
+/// `#297` cached-total pattern): this function only sums already-published
+/// per-shard snapshots, exactly like `pagecache_bytes` already does at its
+/// INFO call site.
+#[must_use]
+pub fn logical_used_memory_bytes() -> usize {
+    let Some(shard_dbs) = get_global_shard_databases() else {
+        return 0;
+    };
+    let dashtable_and_cold_index = shard_dbs.read_memory_sum();
+    let store_total: usize = shard_dbs
+        .store_memory_per_shard
+        .iter()
+        .map(|mem| {
+            mem.vector.load(Ordering::Relaxed)
+                + mem.text.load(Ordering::Relaxed)
+                + mem.graph.load(Ordering::Relaxed)
+        })
+        .sum();
+    dashtable_and_cold_index.saturating_add(store_total)
+}
+
 // ── Global SLOWLOG ─────────────────────────────────────────────────────
 
 /// Global slowlog instance accessible from any handler thread.
@@ -1476,6 +1531,15 @@ fn update_moon_memory_bytes() {
     gauge!("moon_memory_bytes", "kind" => "lua_scripts").set(lua as f64);
     gauge!("moon_memory_bytes", "kind" => "pagecache").set(pagecache as f64);
     gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
+
+    // Task #56 (used_memory truthfulness): the same logical ledger INFO's
+    // `used_memory` reports (KV+ColdIndex + vector/text/graph), published as
+    // its own top-level gauge so `moon_used_memory_bytes / <maxmemory>` is a
+    // meaningful alert expression -- unlike `moon_rss_bytes`, which also
+    // carries allocator overhead, page cache, and the Lua/replication
+    // components this ledger intentionally excludes (see
+    // `logical_used_memory_bytes`'s doc comment).
+    gauge!("moon_used_memory_bytes").set((dashtable + hnsw + text + csr) as f64);
 
     // Update the existing RSS gauge in the same snapshot so the integration
     // test can compare moon_memory_bytes sum against moon_rss_bytes from the
