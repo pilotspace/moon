@@ -37,6 +37,17 @@ the two by up to that skew. Absolute-expiry rewrite + role-gated passive expiry 
 v0.7.1 (task #71b). Applications needing exact cross-node expiry parity should set
 absolute deadlines with `PEXPIREAT` until then.
 
+### Documentation — replication configuration & tuning
+
+Documented the v0.7 replication surface: corrected the stale `guides/clustering.md`
+replica walkthrough (it still showed the pre-GA topology — single-shard leader,
+multi-shard replica — the reverse of the shipped shape) and its outdated
+"WS/MQ not replicated yet" note (all six planes replicate as of Wave B). Added the
+`WAIT`-durability ladder, replica promotion (`REPLICAOF NO ONE`), `INFO replication`
+monitoring, and the replica-TTL caveat. New **Replication** section in
+`configuration.md` and a **Replication durability** section in `guides/tuning.md`
+(RPO/latency trade-offs, read-scaling, lag alerting).
+
 ### Fixed — `segment_plane_scan` missed v0.6.0's nested-Command plane framing, risking WS/MQ/temporal data loss on upgrade (task #69)
 
 `WalWriterV3::recycle_aggressive`/`recycle_segments_before` gate deletion of

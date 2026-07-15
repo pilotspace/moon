@@ -30,42 +30,88 @@ Moon implements PSYNC2-compatible replication with per-shard WAL streaming and p
     - `WAIT N timeout` reflects real replica ACKs (1s `REPLCONF ACK` cadence).
     - `master_link_status` in `INFO replication` reflects the handshake state — use it to detect a failed REPLICAOF.
     - `CLIENT LIST TYPE replica` has no predicate yet; returns all clients.
-    - WS.\*/MQ.\* planes are **not replicated yet** (the master logs one warning
-      when a replica is attached); vector/text/graph planes replicate fully.
+    - **All six data planes replicate** (v0.7 GA): KV, vector/text index, graph,
+      workspace (WS.\*), message-queue (MQ.\*), and temporal. A full resync ships
+      each plane's snapshot; the live stream carries every plane's effect records.
 
 ### Set up a replica
 
-### Start the leader (must be --shards 1 in v0.1.x)
+**Topology (v0.7):** the **master** runs any `--shards N` (multi-core writer); each
+**replica** runs `--shards 1`. Scale reads by adding replicas, not replica shards.
+Replication is initiated at runtime with the `REPLICAOF` command — there is no
+startup flag; operators script it after the replica is up (e.g. via an init hook).
+
+#### 1. Start the master (any shard count)
 
 ```bash
-./target/release/moon --port 6379 --shards 1
+./target/release/moon --port 6379 --shards 4 --appendonly yes --appendfsync always
 ```
 
-### Start the replica (any shard count)
+#### 2. Start the replica (must be --shards 1)
 
 ```bash
-./target/release/moon --port 6380 --shards 4
+./target/release/moon --port 6380 --shards 1 --appendonly yes
 ```
 
-### Connect the replica to the leader
+#### 3. Attach the replica to the master
 
 ```bash
 redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
 ```
 
-### Verify link status
+The replica performs a full resync (one merged Redis-format RDB across all planes),
+then applies the live stream. Replicas are **read-only**: writes return
+`-READONLY` (`INFO replication` reports `slave_read_only:1`).
+
+#### 4. Verify the link
 
 ```bash
 redis-cli -p 6380 INFO replication | grep master_link_status
-# Expect: master_link_status:up
+# Expect: master_link_status:up   (anything else = handshake not complete)
 ```
+
+### Acknowledged writes with WAIT
+
+`WAIT numreplicas timeout` blocks until at least `numreplicas` replicas have ACKed
+every write issued on the connection (replicas send `REPLCONF ACK` on a ~1 s
+cadence). Combine it with `appendfsync always` on both sides for a **zero-RPO,
+cross-node durable write**:
+
+```bash
+redis-cli -p 6379 SET k v
+redis-cli -p 6379 WAIT 1 1000     # returns the number of replicas that ACKed within 1000 ms
+```
+
+On the master, `INFO replication` lists each replica's `offset` and `lag`; on the
+replica it reports `slave_repl_offset`. See the [tuning guide](tuning.md#replication-durability)
+for the durability/latency trade-offs.
+
+### Promote a replica (failover)
+
+```bash
+redis-cli -p 6380 REPLICAOF NO ONE   # replica stops applying and becomes a writable master
+```
+
+Repoint surviving replicas at the new master with `REPLICAOF <new-host> <new-port>`.
+There is no automatic replication failover outside cluster mode (see below).
 
 ### Replication features
 
+- **All six data planes** — KV, vector/text index, graph, WS, MQ, temporal (v0.7 GA)
 - **PSYNC2 protocol** — compatible with Redis replication clients
-- **Per-shard WAL streaming** — each shard streams its own WAL independently (once connected)
-- **Partial resync** — reconnecting replicas resume from where they left off via the replication backlog
-- **Lazy backlog** — the replication backlog is only allocated when the first replica handshake begins (REPLCONF), saving ~12 MB baseline memory
+- **Per-shard WAL streaming** — each master shard streams its own WAL; a multi-shard master merges them into one exactly-once feed
+- **Partial resync** — single-shard masters resume reconnecting replicas from the backlog window; multi-shard masters answer every reconnect with a full resync
+- **Lazy backlog** — allocated only when the first replica handshake begins (REPLCONF), saving ~12 MB baseline memory
+- **Validated** — 24 h continuous-load kill-9 soak (alternating master/replica restarts), zero loss of any WAIT-acknowledged write
+
+!!! warning "Replica TTL semantics (v0.7)"
+    Relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`, `GETEX` with a relative
+    TTL) replicate verbatim rather than being rewritten to absolute `PEXPIREAT`, and
+    replicas run their own active-expiry cycle. Under normal clock sync keys expire
+    correctly on both sides, but master/replica clock skew can shift a relative-TTL
+    key's expiry moment by up to that skew. For exact cross-node expiry parity, set
+    absolute deadlines with `PEXPIREAT`. Absolute-rewrite + role-gated expiry land in
+    v0.7.1.
 
 ## Cluster mode
 

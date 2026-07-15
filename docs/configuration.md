@@ -58,6 +58,25 @@ All options are available as command-line flags. Run `moon --help` for the full 
 | `--cluster-enabled` | `false` | Enable cluster mode |
 | `--cluster-node-timeout` | `15000` | Node timeout in ms |
 
+## Replication
+
+Replication (v0.7 GA) is initiated at runtime with the `REPLICAOF <host> <port>`
+command — there is **no startup flag**. The relevant startup flags shape the
+topology and durability of the pair:
+
+| Flag | On | Effect for replication |
+|------|-----|------------------------|
+| `--shards N` | master | Multi-core writer; the master merges all shards into one exactly-once replication feed |
+| `--shards 1` | replica | **Required** — replicas are single-shard; scale reads by adding replicas |
+| `--appendonly yes` | both | Persist the AOF so a restarted node recovers before re-syncing |
+| `--appendfsync always` | master | RPO 0 on the master; pair with `WAIT N` for zero-RPO cross-node durability |
+
+Replicas are read-only (`slave_read_only:1`; writes return `-READONLY`). `WAIT
+numreplicas timeout` reports real replica ACKs. Full setup, `WAIT` durability,
+promotion (`REPLICAOF NO ONE`), and the replica TTL caveat: see the
+**[clustering & replication guide](guides/clustering.md#replication)** and the
+[tuning guide](guides/tuning.md#replication-durability).
+
 ## ACL
 
 | Flag | Default | Description |
