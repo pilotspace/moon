@@ -125,14 +125,31 @@ replica-read mode:
 ```bash
 # writes → master
 redis-cli -p 6379 SET session:42 '{"user":"alice"}'
-# reads → replica
+# reads → replica  (eventually consistent — may lag; see the caveat below)
 redis-cli -p 6380 GET session:42
 ```
 
-- **lettuce (Java):** `ReadFrom.REPLICA_PREFERRED`
-- **redis-py:** `Redis(..., )` with a replica connection, or `RedisCluster(read_from_replicas=True)`
-- **ioredis (Node):** a `scaleReads: "slave"` cluster client, or separate clients
-- **go-redis:** `ClusterOptions{ ReadOnly: true, RouteRandomly: true }`, or explicit master/replica clients
+!!! warning "Replica reads are eventually consistent"
+    Replication is **asynchronous**, so a `GET` on a replica issued right after a
+    `SET` on the master can return the **old value or a miss** until the write
+    streams across (the example above is exactly that race). Route
+    **read-after-write** and **session-critical** reads to the *master*; send only
+    staleness-tolerant reads (caches, analytics, browse traffic) to replicas. If you
+    must read your own writes from a replica, gate the read on catch-up: `WAIT 1
+    <timeout>` on the master, then confirm the replica's `slave_repl_offset` (from
+    `INFO replication`) has reached the master's `master_repl_offset`.
+
+Most clients expose a **non-cluster** replica-read mode, or you can simply hold
+separate master and replica clients:
+
+- **lettuce (Java):** a `MasterReplica` connection with `ReadFrom.REPLICA_PREFERRED`
+- **redis-py:** a dedicated replica `Redis(host=<replica>, port=6380)` client for reads
+- **ioredis (Node):** separate `Redis` clients for the master and the replica
+- **go-redis:** explicit master and replica `redis.NewClient(...)` instances
+
+The cluster-client read-routing modes — redis-py `RedisCluster(read_from_replicas=True)`,
+ioredis `scaleReads: "slave"`, go-redis `ClusterOptions{ReadOnly, RouteRandomly}` —
+apply only in **[Cluster mode](#cluster-mode)**, not to a standalone master/replica pair.
 
 Keep write-path connections pointed at the master so `WAIT`-based cross-node
 durability still works — `WAIT` only counts ACKs for writes issued on the master.
@@ -142,9 +159,15 @@ that routes by command flag (writes → master, reads → replica pool): e.g. En
 `redis_proxy` filter with a read policy, or a purpose-built RESP router. The trade-off
 is an extra network hop and another component to operate and fail over.
 
-**Failover note.** However you split, reads must re-point when a replica is promoted
-(`REPLICAOF NO ONE`) or a master is lost — client libraries with topology awareness
-or the proxy's health checks handle this; a static split does not.
+**Failover note.** However you split, reads and writes must re-point when a replica
+is promoted (`REPLICAOF NO ONE`) or a master is lost. In a standalone master/replica
+pair there is **no built-in topology discovery**: `REPLICAOF NO ONE` promotes a
+replica but does not notify clients, and health checks alone only detect
+liveness — they cannot tell a client *which* node is the new master. Repointing
+therefore requires **Moon's [Cluster mode](#cluster-mode)** (automatic promotion +
+`MOVED` redirection) or an **external orchestrator** (k8s/systemd health-managed
+endpoints) that rewrites the client's target; a static split does not self-heal.
+Moon does not implement the Redis Sentinel protocol.
 
 ### Replication features
 
