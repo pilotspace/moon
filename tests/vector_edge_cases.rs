@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use moon::command::vector_search::{
-    ft_create, ft_dropindex, ft_info, ft_search, quantize_f32_to_sq,
-};
+use moon::command::vector_search::{ft_create, ft_dropindex, ft_info, ft_search};
 use moon::protocol::Frame;
 use moon::vector::distance;
 use moon::vector::segment::mutable::MutableSegment;
@@ -80,12 +78,6 @@ fn make_test_collection(dim: u32) -> Arc<CollectionMetadata> {
         42,
         BuildMode::Light,
     ))
-}
-
-fn make_sq_vec(f32_vec: &[f32]) -> Vec<i8> {
-    let mut sq = vec![0i8; f32_vec.len()];
-    quantize_f32_to_sq(f32_vec, &mut sq);
-    sq
 }
 
 fn assert_is_error(frame: &Frame, context: &str) {
