@@ -169,11 +169,6 @@ pub async fn run_with_shutdown(
         }
     }
 
-    // Spawn active expiration background task
-    let exp_db = db.clone();
-    let exp_token = token.child_token();
-    tokio::spawn(expiration::run_active_expiration(exp_db, exp_token));
-
     // Create shared Pub/Sub registry
     let pubsub_registry = Arc::new(Mutex::new(PubSubRegistry::new()));
 
@@ -197,6 +192,20 @@ pub async fn run_with_shutdown(
 
     // Register repl_state globally for INFO command queries.
     crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
+
+    // Spawn active expiration background task (#71b: pass the replica-role
+    // mirror so a replica skips its own deletion sweep — spawned AFTER
+    // `repl_state` exists so the mirror is live from the first tick).
+    {
+        let exp_db = db.clone();
+        let exp_token = token.child_token();
+        let exp_mirror = repl_state.read().is_replica_mirror.clone();
+        tokio::spawn(expiration::run_active_expiration(
+            exp_db,
+            exp_token,
+            Some(exp_mirror),
+        ));
+    }
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
     let acl_table: Arc<RwLock<crate::acl::AclTable>> = {

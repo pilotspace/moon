@@ -513,6 +513,27 @@ pub fn serialize_command(frame: &Frame) -> Bytes {
     buf.freeze()
 }
 
+/// Serialize a write command for the durable log **and** the replication
+/// stream, rewriting relative-expiry forms to absolute deadlines first (#71a).
+///
+/// `EXPIRE`/`PEXPIRE` → `PEXPIREAT`, `SETEX`/`PSETEX` → `SET … PXAT`,
+/// `SET … EX/PX` → `SET … PXAT`, `GETEX … EX/PX` → `PEXPIREAT` — using the
+/// master's per-tick cached `current_time_ms()`, which is the exact value the
+/// command handler used to compute the stored deadline (same shard thread, same
+/// tick → same `TL_NOW_MS`). This makes expiry deterministic across nodes and
+/// across a master restart: a replica applying the stream (or an AOF replay
+/// hours later) reproduces the master's absolute expiry instant instead of
+/// restarting the relative countdown at apply/replay time. Non-expiry and
+/// already-absolute commands (`PEXPIREAT`, `EXPIREAT`, `EXAT`, `PXAT`,
+/// `PERSIST`, past-time deletes) serialize verbatim.
+pub fn serialize_command_for_log(frame: &Frame) -> Bytes {
+    let now_ms = crate::storage::entry::current_time_ms();
+    match crate::replication::expire_rewrite::rewrite_expire_for_propagation(frame, now_ms) {
+        Some(rewritten) => serialize_command(&rewritten),
+        None => serialize_command(frame),
+    }
+}
+
 /// Serialized `SELECT <db>` RESP record for AOF db-context injection
 /// (task #35). Same wire form the replay engines already execute
 /// (`replay_incr_resp` / `replay_incr_framed` / `DispatchReplayEngine`).

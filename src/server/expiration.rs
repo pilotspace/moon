@@ -20,12 +20,28 @@ type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 /// Every 100ms, iterates all databases and runs a probabilistic expiration
 /// cycle on each. Shuts down gracefully when the cancellation token fires.
 #[cfg(feature = "runtime-tokio")]
-pub async fn run_active_expiration(db: SharedDatabases, shutdown: CancellationToken) {
+pub async fn run_active_expiration(
+    db: SharedDatabases,
+    shutdown: CancellationToken,
+    // #71b: replica-role mirror. A tokio process CAN be a replica (tokio has a
+    // `stream_commands` apply path), and a replica must NOT run its own expiry
+    // deletion sweep — it waits for the master's authoritative expire/DEL
+    // record so both sides remove a key at the same point in the stream. When
+    // this is `Some(true)` the tick becomes a no-op; logical expiry on reads
+    // still applies. `None` (no replication configured) always sweeps.
+    is_replica_mirror: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let is_replica = is_replica_mirror
+                    .as_ref()
+                    .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
+                if is_replica {
+                    continue;
+                }
                 for lock in db.iter() {
                     let mut guard = lock.write();
                     // task #34 (Wave A): tokio's active-expiry sweep does not
