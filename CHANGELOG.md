@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Kernel GA** (close-out of tasks #49/#56, spill-file batching, crash-matrix CI,
   10×-RAM benchmark publication), cluster hardening + multi-shard replicas moved
   to v0.9, enterprise foundation to v0.10; debt register refreshed.
+- **Task #49 v0.8 close-out audit: no code change needed, roadmap corrected
+  instead.** Re-verified every bare-write persistence site named in the kernel
+  review (ACL SAVE, cluster `nodes.conf`, CONFIG REWRITE, replication state,
+  native BGSAVE/RDB, `clog`, `kv_page`) against current `HEAD`: all 7 already
+  route through `atomic_write_durable` (temp file → `sync_all` → `rename` →
+  dir-fsync), shipped in PR #304 (merged 2026-07-13) and released as part of
+  v0.7.0 — `git log 4e0688e6..HEAD` on every touched file confirms none of the
+  9 converted call sites (ACL SAVE has two: `acl::io::acl_save` + the command
+  handler routing through it; native BGSAVE has three: `rdb::save`,
+  `rdb::save_from_snapshot`, `redis_rdb::save`) were reverted or bypassed
+  since. The Rev 2 roadmap pass (task #68, above) had re-listed task #49 as an
+  open v0.8 gap without checking it against the already-shipped v0.7.0
+  CHANGELOG entry; `docs/roadmap/ROADMAP.md` §1 gap table, §4 v0.8.0 item 1,
+  and §5 debt register are corrected to reflect this (struck through /
+  removed, not deleted from history). Also audited adjacent hand-rolled
+  writers for regression risk: `storage/tiered/warm_tier.rs`'s staging-dir →
+  final-dir rename (own documented atomicity protocol, per-file `.mpf` writes
+  inside the staging dir are covered by the directory-level rename, not a
+  bare-write gap) and `storage/tiered/kv_spill.rs::write_kv_spill_batch`
+  (already hand-rolled tmp+fsync+rename+dir-fsync correctly; not one of the 7
+  named sites) both remain correctly out of scope — no change made.
 
 ### Changed
 - **TLS: migrated off the unmaintained `rustls-pemfile` onto `rustls-pki-types`'s
