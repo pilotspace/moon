@@ -511,11 +511,11 @@ fn test_reject_borrow_across_await() {
                 let mut span_end = i;
                 let mut found_close = false;
 
-                'outer: for j in i..lines.len() {
+                'outer: for (j, &line) in lines.iter().enumerate().skip(i) {
                     let scan_line = if j == i {
-                        &lines[j][call_start_col..]
+                        &line[call_start_col..]
                     } else {
-                        lines[j]
+                        line
                     };
                     for ch in scan_line.chars() {
                         match ch {
@@ -539,8 +539,8 @@ fn test_reject_borrow_across_await() {
                 }
 
                 // Check the span for .await
-                for j in span_start..=span_end {
-                    let span_line = lines[j];
+                for (j, &span_line) in lines.iter().enumerate().take(span_end + 1).skip(span_start)
+                {
                     let span_t = span_line.trim_start();
                     if !span_t.starts_with("//") && span_line.contains(".await") {
                         violations.push(format!(
