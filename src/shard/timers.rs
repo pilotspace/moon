@@ -32,24 +32,36 @@ pub(crate) fn run_active_expiry(
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
+    // #71b: when attached to a master, this node is a read-only replica and
+    // must NOT run its own expiry deletion sweep. Redis semantics: the replica
+    // keeps a logically-expired key resident (reads see it as gone via the
+    // read-path `is_key_expired` check) until the master streams the
+    // authoritative `DEL`/expire record, so both sides remove the key at the
+    // same point in the replication stream. A replica running its own sweep
+    // would delete early and diverge (and, on a promoted-then-demoted flap,
+    // could even resurrect ordering hazards). The RSS gauge update below still
+    // runs on either role.
+    is_replica: bool,
 ) {
-    let db_count = shard_databases.db_count();
-    for i in 0..db_count {
-        crate::shard::slice::with_shard_db(i, |db| {
-            crate::server::expiration::expire_cycle_direct(db, &mut |key| {
-                crate::replication::reason_del::record_reason_del(
-                    key,
-                    i,
-                    wal_writer,
-                    repl_backlog,
-                    replica_txs,
-                    repl_state,
-                    shard_id,
-                    aof_pool,
-                    wal_kv_log,
-                );
+    if !is_replica {
+        let db_count = shard_databases.db_count();
+        for i in 0..db_count {
+            crate::shard::slice::with_shard_db(i, |db| {
+                crate::server::expiration::expire_cycle_direct(db, &mut |key| {
+                    crate::replication::reason_del::record_reason_del(
+                        key,
+                        i,
+                        wal_writer,
+                        repl_backlog,
+                        replica_txs,
+                        repl_state,
+                        shard_id,
+                        aof_pool,
+                        wal_kv_log,
+                    );
+                });
             });
-        });
+        }
     }
     // Update RSS gauge on shard 0 only, once per second (not every 100ms tick).
     // Gated by a simple counter to reduce /proc/self/statm open/read/close churn.

@@ -1260,7 +1260,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     let is_write = if ctx.aof_pool.is_some() || conn.tracking_state.enabled { metadata::is_write(cmd) } else { false };
                     // `is_persisted_write`: never AOF a literal client SELECT
                     // (task #35 — poisons the stream db context).
-                    let aof_bytes = if is_write && ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) { Some(aof::serialize_command(&frame)) } else { None };
+                    let aof_bytes = if is_write && ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) { Some(aof::serialize_command_for_log(&frame)) } else { None };
 
                     if is_local {
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.

@@ -15,6 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and wrong resident-byte accounting for SQ8 indexes. Dispatch now computes the true SQ8
   layout (`dim` unpadded u8 codes + 8-byte affine `(min,scale)` trailer) directly, and the
   free-fn logs the unsupported-bit-width error at most once via an `AtomicBool` latch.
+- **Replica TTL semantics — deterministic cross-node expiry (#71).** Two changes
+  close the replica-TTL caveat disclosed in the v0.7.0 tag:
+  - **#71a — master-side absolute rewrite.** Relative-expiry commands are now
+    rewritten to absolute deadlines before they enter the durable log and the
+    replication stream: `EXPIRE`/`PEXPIRE` → `PEXPIREAT`, `SETEX`/`PSETEX` →
+    `SET … PXAT`, `SET … EX/PX` → `SET … PXAT`, `GETEX … EX/PX` → `PEXPIREAT`.
+    The absolute deadline is computed from the master's per-tick cached clock —
+    the exact value the command handler stored — so a replica (or an AOF replay
+    after a restart) reproduces the master's expiry *instant* instead of
+    restarting the countdown at apply/replay time. Already-absolute forms
+    (`PEXPIREAT`, `EXPIREAT`, `EXAT`, `PXAT`, `PERSIST`) and past-time deletes
+    propagate verbatim.
+  - **#71b — role-gated active expiry.** A replica no longer runs its own
+    active-expiry deletion sweep (both the monoio shard tick and the tokio
+    background task); it keeps a logically-expired key resident (reads still see
+    it as gone) until the master streams the authoritative removal, so both
+    nodes delete a key at the same point in the stream instead of racing
+    independent TTL sweeps.
 
 ## [0.7.0] — 2026-07-15
 

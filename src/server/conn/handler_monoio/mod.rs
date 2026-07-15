@@ -1423,7 +1423,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // the offset (lsn = 0).
                         let repl_active = ft::replication_fanout_active(ctx);
                         if repl_active || ctx.aof_pool.is_some() {
-                            let serialized = aof::serialize_command(&frame);
+                            let serialized = aof::serialize_command_for_log(&frame);
                             let lsn = if repl_active {
                                 ft::record_local_write_db(
                                     ctx,
@@ -1509,7 +1509,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // double-advance, lsn = 0).
                             let repl_active = ft::replication_fanout_active(ctx);
                             if repl_active || ctx.aof_pool.is_some() {
-                                let serialized = aof::serialize_command(&frame);
+                                let serialized = aof::serialize_command_for_log(&frame);
                                 let lsn = if repl_active {
                                     ft::record_local_write_db(
                                         ctx,
@@ -1831,7 +1831,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // legs).
                         let repl_active = ft::replication_fanout_active(ctx);
                         if repl_active || ctx.aof_pool.is_some() {
-                            let serialized = aof::serialize_command(&frame);
+                            let serialized = aof::serialize_command_for_log(&frame);
                             let lsn = if repl_active {
                                 ft::record_local_write_db(
                                     ctx,
@@ -2096,7 +2096,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // `is_persisted_write`: never AOF/replicate a literal client
                 // SELECT (task #35 — poisons the stream db context).
                 let aof_bytes = if ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) {
-                    Some(aof::serialize_command(&dispatch_frame))
+                    Some(aof::serialize_command_for_log(&dispatch_frame))
                 } else {
                     None
                 };

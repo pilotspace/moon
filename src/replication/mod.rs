@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod backlog;
+pub mod expire_rewrite;
 #[cfg(feature = "graph")]
 pub mod graph_sync;
 pub mod handshake;

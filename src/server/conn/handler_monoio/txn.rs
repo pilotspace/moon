@@ -189,7 +189,7 @@ pub(super) async fn try_handle_txn_commit(
                                         .into(),
                                     );
                                     let record_bytes =
-                                        crate::persistence::aof::serialize_command(&frame);
+                                        crate::persistence::aof::serialize_command_for_log(&frame);
                                     super::ft::record_local_write_db(ctx, db_index, record_bytes);
                                 }
                                 crate::shard::mq_exec::wal_append_on_slice(

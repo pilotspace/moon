@@ -744,6 +744,16 @@ impl super::Shard {
         // handle, so the surrounding RwLock is never read-locked per write.
         let repl_offsets: Option<crate::replication::state::OffsetHandle> =
             repl_state.as_ref().map(|rs| rs.read().offset_handle());
+        // #71b: lock-free replica-role mirror cloned ONCE at shard startup.
+        // A replica must NOT run its own active-expiry deletion sweep — it
+        // waits for the master's authoritative DEL (streamed via
+        // `record_reason_del`) so both sides remove a key at the same logical
+        // point in the stream. `run_active_expiry` reads this to skip its
+        // sweeps while attached to a master (logical expiry on reads still
+        // applies). Kept in sync by `ReplicationState::set_role`.
+        let is_replica_mirror: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = repl_state
+            .as_ref()
+            .map(|rs| rs.read().is_replica_mirror.clone());
 
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
@@ -1734,6 +1744,9 @@ impl super::Shard {
                                 !appendonly_enabled || !cdc_registry.is_empty()
                             }
                         },
+                        is_replica_mirror
+                            .as_ref()
+                            .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
                     );
                     // MQ trigger check: fire debounced triggers
                     timers::fire_pending_mq_triggers(
@@ -2269,6 +2282,9 @@ impl super::Shard {
                                 !appendonly_enabled || !cdc_registry.is_empty()
                             }
                         },
+                        is_replica_mirror
+                            .as_ref()
+                            .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
                     );
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
