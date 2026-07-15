@@ -108,10 +108,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -175,10 +176,10 @@ fn info(s: &mut TcpStream) -> String {
                 expected_total = Some(pos + 2 + len + 2);
             }
         }
-        if let Some(t) = expected_total {
-            if acc.len() >= t {
-                break;
-            }
+        if let Some(t) = expected_total
+            && acc.len() >= t
+        {
+            break;
         }
         assert!(Instant::now() < deadline, "INFO read timed out");
     }
@@ -460,10 +461,10 @@ fn swf2_burst_renotify() {
 /// one drain instant, which takes three ingredients (found empirically —
 /// recorded in TASK.md §7):
 ///   1. >256 clients with concurrent in-flight dispatches. Each connection
-///      pipelines one small SET per hash tag t0..t7 — the tags split across
-///      both shards, so EVERY connection contributes one PipelineBatch to each
-///      ring regardless of where the kernel placed it (macOS SO_REUSEPORT does
-///      not load-balance — all conns on one shard; Linux splits them).
+///      > pipelines one small SET per hash tag t0..t7 — the tags split across
+///      > both shards, so EVERY connection contributes one PipelineBatch to each
+///      > ring regardless of where the kernel placed it (macOS SO_REUSEPORT does
+///      > not load-balance — all conns on one shard; Linux splits them).
 ///   2. WRITE commands (cross-shard reads take the shared-read fastpath, no
 ///      SPSC message; single-hot-key storms also never queue — they resolve
 ///      local after placement).

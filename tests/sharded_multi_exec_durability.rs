@@ -86,10 +86,11 @@ fn wait_moon_ready(moon: Moon) -> Option<Moon> {
             let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
             if c.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 64];
-                if let Ok(n) = c.read(&mut buf) {
-                    if n > 0 && buf.starts_with(b"+PONG") {
-                        return Some(moon);
-                    }
+                if let Ok(n) = c.read(&mut buf)
+                    && n > 0
+                    && buf.starts_with(b"+PONG")
+                {
+                    return Some(moon);
                 }
             }
         }

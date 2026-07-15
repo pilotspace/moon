@@ -207,7 +207,7 @@ fn memory_doctor_returns_documented_schema() {
             .find(|l| l.contains(kind))
             .unwrap_or_else(|| panic!("Kind line not found: {kind}"));
         // Format: "  DashTable + entries:    1.23 MB  (45.6%)"
-        let after_colon = kind_line.split(':').last().unwrap().trim();
+        let after_colon = kind_line.split(':').next_back().unwrap().trim();
         // Extract just the bytes portion before the parenthesized percentage.
         let bytes_str = if let Some(paren_pos) = after_colon.find('(') {
             after_colon[..paren_pos].trim()
@@ -226,7 +226,7 @@ fn memory_doctor_returns_documented_schema() {
         .lines()
         .find(|l| l.contains("DashTable + entries:"))
         .unwrap();
-    let dt_after_colon = dashtable_line.split(':').last().unwrap().trim();
+    let dt_after_colon = dashtable_line.split(':').next_back().unwrap().trim();
     let dt_bytes_str = if let Some(pos) = dt_after_colon.find('(') {
         dt_after_colon[..pos].trim()
     } else {

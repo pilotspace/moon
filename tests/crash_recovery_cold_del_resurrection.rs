@@ -407,5 +407,5 @@ fn deleted_cold_keys_stay_deleted_after_crash() {
 #[test]
 #[ignore] // requires ./target/release/moon + redis-cli; run with -- --ignored
 fn flushed_cold_keys_stay_flushed_after_crash() {
-    run_scenario("flushall", |port| redis_flushall(port));
+    run_scenario("flushall", redis_flushall);
 }

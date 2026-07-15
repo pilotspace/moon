@@ -121,10 +121,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(15),

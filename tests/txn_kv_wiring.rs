@@ -302,13 +302,12 @@ fn spawn_txn_server_thread(config: ServerConfig, num_shards: usize, cancel: Canc
 async fn await_server_ready(port: u16, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}")) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let pong: redis::RedisResult<String> =
-                    redis::cmd("PING").query_async(&mut conn).await;
-                if pong.is_ok() {
-                    return true;
-                }
+        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}"))
+            && let Ok(mut conn) = client.get_multiplexed_async_connection().await
+        {
+            let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            if pong.is_ok() {
+                return true;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

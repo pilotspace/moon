@@ -240,62 +240,6 @@ mod poll_recv_tests {
     }
 }
 
-#[cfg(test)]
-mod idle_wait_tests {
-    use super::*;
-
-    #[test]
-    fn starts_at_fast_floor() {
-        let w = IdleWait::new();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
-    }
-
-    #[test]
-    fn timeouts_escalate_and_cap_at_max() {
-        let mut w = IdleWait::new();
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
-        // Capped: further timeouts stay at the max step.
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
-    }
-
-    #[test]
-    fn message_resets_to_floor_from_any_step() {
-        let mut w = IdleWait::new();
-        w.on_timeout();
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
-        w.on_message();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
-    }
-
-    #[test]
-    fn pending_deadline_blocks_escalation() {
-        let mut w = IdleWait::new();
-        w.mark_pending();
-        // Never escalates while a deadline is pending, no matter how many
-        // consecutive timeouts occur.
-        w.on_timeout();
-        w.on_timeout();
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
-    }
-
-    #[test]
-    fn clearing_pending_resumes_escalation() {
-        let mut w = IdleWait::new();
-        w.mark_pending();
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
-        w.clear_pending();
-        w.on_timeout();
-        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
-    }
-}
-
 /// A sync [`GroupCommitSink`] over a `std::fs::File` for the monoio writer
 /// loops. `write_all` appends raw bytes (an empty buffer — a zero-length
 /// H1-BARRIER `AppendSync` — is a no-op); `sync` does the single per-batch
@@ -1797,5 +1741,61 @@ pub async fn per_shard_aof_writer_task(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_wait_tests {
+    use super::*;
+
+    #[test]
+    fn starts_at_fast_floor() {
+        let w = IdleWait::new();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn timeouts_escalate_and_cap_at_max() {
+        let mut w = IdleWait::new();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+        // Capped: further timeouts stay at the max step.
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+    }
+
+    #[test]
+    fn message_resets_to_floor_from_any_step() {
+        let mut w = IdleWait::new();
+        w.on_timeout();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+        w.on_message();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn pending_deadline_blocks_escalation() {
+        let mut w = IdleWait::new();
+        w.mark_pending();
+        // Never escalates while a deadline is pending, no matter how many
+        // consecutive timeouts occur.
+        w.on_timeout();
+        w.on_timeout();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn clearing_pending_resumes_escalation() {
+        let mut w = IdleWait::new();
+        w.mark_pending();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+        w.clear_pending();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
     }
 }

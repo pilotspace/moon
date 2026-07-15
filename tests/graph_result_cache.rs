@@ -181,10 +181,10 @@ fn test_result_cache_invalidated_by_addnode() {
         is_miss(&after),
         "ADDNODE must invalidate the cache (write_gen bump), got {after:?}"
     );
-    if let Frame::Array(items) = &after {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(rows.len(), 2, "fresh result must reflect the new node");
-        }
+    if let Frame::Array(items) = &after
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(rows.len(), 2, "fresh result must reflect the new node");
     }
 }
 
@@ -239,10 +239,10 @@ fn test_result_cache_invalidated_by_cypher_create_via_query_path() {
         is_miss(&after),
         "Cypher CREATE must invalidate the cache, got {after:?}"
     );
-    if let Frame::Array(items) = &after {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(rows.len(), 2, "fresh result must include the CREATEd node");
-        }
+    if let Frame::Array(items) = &after
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(rows.len(), 2, "fresh result must include the CREATEd node");
     }
 }
 
@@ -336,14 +336,14 @@ fn test_result_cache_invalidated_by_cypher_delete() {
         is_miss(&after),
         "Cypher DELETE must invalidate the cache, got {after:?}"
     );
-    if let Frame::Array(items) = &after {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(
-                rows.len(),
-                1,
-                "deleted node must be gone from the fresh result"
-            );
-        }
+    if let Frame::Array(items) = &after
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(
+            rows.len(),
+            1,
+            "deleted node must be gone from the fresh result"
+        );
     }
 }
 
@@ -374,10 +374,10 @@ fn test_result_cache_invalidated_by_temporal_invalidate() {
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &args, Some(2));
     assert!(is_hit(&hit), "must be a hit before TEMPORAL.INVALIDATE");
-    if let Frame::Array(items) = &cold {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(rows.len(), 1, "node must be visible before invalidation");
-        }
+    if let Frame::Array(items) = &cold
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(rows.len(), 1, "node must be visible before invalidation");
     }
 
     let graph_name = Bytes::from_static(GRAPH.as_bytes());
@@ -390,14 +390,14 @@ fn test_result_cache_invalidated_by_temporal_invalidate() {
         is_miss(&after),
         "TEMPORAL.INVALIDATE must invalidate the result cache, got {after:?}"
     );
-    if let Frame::Array(items) = &after {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(
-                rows.len(),
-                0,
-                "node must no longer be visible at the far-future VALID_AT"
-            );
-        }
+    if let Frame::Array(items) = &after
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(
+            rows.len(),
+            0,
+            "node must no longer be visible at the far-future VALID_AT"
+        );
     }
 }
 
@@ -419,10 +419,10 @@ fn test_result_cache_invalidated_by_txn_abort_create_intent() {
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_hit(&hit));
-    if let Frame::Array(items) = &cold {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(rows.len(), 2);
-        }
+    if let Frame::Array(items) = &cold
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(rows.len(), 2);
     }
 
     // Simulate TXN.ABORT rolling back the second ADDNODE's create-intent.
@@ -438,10 +438,10 @@ fn test_result_cache_invalidated_by_txn_abort_create_intent() {
         is_miss(&after),
         "TXN.ABORT create-intent rollback must invalidate the cache, got {after:?}"
     );
-    if let Frame::Array(items) = &after {
-        if let Frame::Array(rows) = &items[1] {
-            assert_eq!(rows.len(), 1, "rolled-back node must be gone");
-        }
+    if let Frame::Array(items) = &after
+        && let Frame::Array(rows) = &items[1]
+    {
+        assert_eq!(rows.len(), 1, "rolled-back node must be gone");
     }
 }
 
