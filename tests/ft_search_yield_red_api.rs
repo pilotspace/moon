@@ -2,10 +2,10 @@
 //! cooperative-yield search seam (C1–C3 of the frozen §3 contract).
 //!
 //! RED until §5 BUILD defines the symbols in `moon::vector::segment::holder`:
-//!   - `SearchSnapshot`            — C1: the owned capture (Arc<SegmentList> + owned
-//!                                    SearchScratch + START-captured key map), `'static`.
+//!   - `SearchSnapshot` — C1: the owned capture (Arc<SegmentList> + owned
+//!     SearchScratch + START-captured key map), `'static`.
 //!   - `YieldBudget` + `FT_SEARCH_YIELD_BUDGET` — C3: the explicit bounded-yield cap.
-//!   - `SegmentHolder::search_mvcc_yielding`     — C2: the async yielding seam.
+//!   - `SegmentHolder::search_mvcc_yielding` — C2: the async yielding seam.
 //!
 //! Before build the imports below are UNRESOLVED → this test crate fails to
 //! compile. That compile failure IS the red signal for this file; every other
