@@ -8,6 +8,7 @@ use super::codebook::{
     CODEBOOK_VERSION, code_bytes_per_vector, scaled_boundaries_n, scaled_centroids_n,
 };
 use super::encoder::padded_dimension;
+use super::sq8::SQ8_PARAMS_BYTES;
 use super::sub_centroid::SubCentroidTable;
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::types::DistanceMetric;
@@ -301,11 +302,14 @@ impl CollectionMetadata {
     /// packed size is `padded_dim / 4` instead of the scalar TQ4's `padded_dim / 2`.
     #[inline]
     pub fn code_bytes_per_vector(&self) -> usize {
-        if self.quantization == QuantizationConfig::TurboQuant4A2 {
+        match self.quantization {
+            // SQ8 stores one u8 code per TRUE (unpadded) dimension — it does NOT
+            // FWHT-pad and its bits() is 8, outside the TurboQuant 1..=4 range the
+            // free `code_bytes_per_vector` supports. Mirror `MutableSegment::new`.
+            QuantizationConfig::Sq8 => self.dimension as usize,
             // A2: padded_dim/2 pairs, each pair → 4-bit index, nibble-packed → padded_dim/4 bytes
-            self.padded_dimension as usize / 4
-        } else {
-            code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
+            QuantizationConfig::TurboQuant4A2 => self.padded_dimension as usize / 4,
+            _ => code_bytes_per_vector(self.padded_dimension, self.quantization.bits()),
         }
     }
 
@@ -361,11 +365,19 @@ impl CollectionMetadata {
         }
     }
 
-    /// Bytes per TQ code including the 4-byte norm suffix.
-    /// = code_bytes_per_vector() + 4.
+    /// Full per-vector code slot size in bytes, including the trailer.
+    ///
+    /// TurboQuant configs append a 4-byte f32 norm (`code_bytes_per_vector() + 4`).
+    /// SQ8 instead appends an 8-byte `(min, scale)` trailer over `dim` u8 codes
+    /// (`dim + SQ8_PARAMS_BYTES`), matching `MutableSegment::new`'s SQ8 branch and
+    /// `sq8_code_bytes`. Getting this wrong for SQ8 under-sizes memory accounting
+    /// (`store.rs`) and compaction slots (`compaction.rs`).
     #[inline]
     pub fn bytes_per_code_per_vector(&self) -> usize {
-        self.code_bytes_per_vector() + 4
+        match self.quantization {
+            QuantizationConfig::Sq8 => self.dimension as usize + SQ8_PARAMS_BYTES,
+            _ => self.code_bytes_per_vector() + 4,
+        }
     }
 
     /// Try to return the codebook as a `&[f32; 16]`, returning None for non-4-bit configs.
@@ -669,6 +681,49 @@ mod tests {
         );
         // 4-bit: 1024/2 = 512
         assert_eq!(meta4.code_bytes_per_vector(), 512);
+    }
+
+    /// SQ8 uses `bits() == 8`, which is OUTSIDE the TurboQuant 1..=4 range that
+    /// the free `code_bytes_per_vector(padded, bits)` supports. Before the fix,
+    /// `CollectionMetadata::code_bytes_per_vector()` fell through to that free fn
+    /// with bits=8, which returned 0 and logged an error on EVERY call — a hot
+    /// accounting path (INFO memory / eviction checks) turned that into a
+    /// CPU-pegging error storm (observed on a lunaris-backed store). SQ8's real
+    /// code layout is `dim` u8 codes (true dimension, NOT padded) + an 8-byte
+    /// (min,scale) trailer — mirroring `MutableSegment::new`'s SQ8 branch.
+    #[test]
+    fn test_code_bytes_per_vector_sq8() {
+        use crate::vector::turbo_quant::sq8::SQ8_PARAMS_BYTES;
+        let meta = CollectionMetadata::new(
+            9,
+            768, // pads to 1024, but SQ8 sizes by TRUE dim
+            DistanceMetric::L2,
+            QuantizationConfig::Sq8,
+            42,
+        );
+        // SQ8: one u8 code per (unpadded) dimension.
+        assert_eq!(
+            meta.code_bytes_per_vector(),
+            768,
+            "SQ8 code bytes must equal true dimension, not 0 (unsupported-bits fallthrough)"
+        );
+        // Full slot = codes + 8-byte (min,scale) trailer (NOT the TQ 4-byte norm).
+        assert_eq!(
+            meta.bytes_per_code_per_vector(),
+            768 + SQ8_PARAMS_BYTES,
+            "SQ8 slot must be dim + 8-byte params trailer, not dim/… + 4"
+        );
+
+        // A non-square dimension exercises the true-vs-padded distinction.
+        let meta2 = CollectionMetadata::new(
+            10,
+            384, // pads to 512
+            DistanceMetric::InnerProduct,
+            QuantizationConfig::Sq8,
+            42,
+        );
+        assert_eq!(meta2.code_bytes_per_vector(), 384);
+        assert_eq!(meta2.bytes_per_code_per_vector(), 384 + SQ8_PARAMS_BYTES);
     }
 
     #[test]

@@ -191,7 +191,18 @@ pub fn code_bytes_per_vector(padded_dim: u32, bits: u8) -> usize {
         3 => (pd * 3 + 7) / 8,
         4 => pd / 2,
         _ => {
-            tracing::error!("unsupported bit width {bits} for code_bytes_per_vector");
+            // Unsupported width (e.g. SQ8's bits()==8) must never reach here: SQ8
+            // is sized via CollectionMetadata::code_bytes_per_vector's SQ8 branch.
+            // If a stray caller ever does, log ONCE — a per-call error here on a
+            // hot accounting path (INFO memory / eviction) pegs a core with an
+            // error storm (observed 2026-07 on a lunaris-backed SQ8 store).
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!(
+                    "unsupported bit width {bits} for code_bytes_per_vector (logged once)"
+                );
+            }
             0
         }
     }
