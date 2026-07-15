@@ -30,42 +30,164 @@ Moon implements PSYNC2-compatible replication with per-shard WAL streaming and p
     - `WAIT N timeout` reflects real replica ACKs (1s `REPLCONF ACK` cadence).
     - `master_link_status` in `INFO replication` reflects the handshake state — use it to detect a failed REPLICAOF.
     - `CLIENT LIST TYPE replica` has no predicate yet; returns all clients.
-    - WS.\*/MQ.\* planes are **not replicated yet** (the master logs one warning
-      when a replica is attached); vector/text/graph planes replicate fully.
+    - **All six data planes replicate** (v0.7 GA): KV, vector/text index, graph,
+      workspace (WS.\*), message-queue (MQ.\*), and temporal. A full resync ships
+      each plane's snapshot; the live stream carries every plane's effect records.
 
 ### Set up a replica
 
-### Start the leader (must be --shards 1 in v0.1.x)
+**Topology (v0.7):** the **master** runs any `--shards N` (multi-core writer); each
+**replica** runs `--shards 1`. Scale reads by adding replicas, not replica shards.
+Replication is initiated at runtime with the `REPLICAOF` command — there is no
+startup flag; operators script it after the replica is up (e.g. via an init hook).
+
+#### 1. Start the master (any shard count)
 
 ```bash
-./target/release/moon --port 6379 --shards 1
+./target/release/moon --port 6379 --shards 4 --appendonly yes --appendfsync always
 ```
 
-### Start the replica (any shard count)
+#### 2. Start the replica (must be --shards 1)
 
 ```bash
-./target/release/moon --port 6380 --shards 4
+./target/release/moon --port 6380 --shards 1 --appendonly yes --appendfsync always
 ```
 
-### Connect the replica to the leader
+`--appendfsync always` on the replica is what makes a `WAIT`-acknowledged write
+survive a **replica** crash: the replica ACKs when it *applies* a write, not when it
+fsyncs, so without durable replica persistence a replica can ACK and then lose the
+write on its own crash. Drop it to `everysec` only if the replica is read-scaling/DR
+and you accept ≤1 s of replica-side loss.
+
+#### 3. Attach the replica to the master
 
 ```bash
 redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
 ```
 
-### Verify link status
+The replica performs a full resync (one merged Redis-format RDB across all planes),
+then applies the live stream. Replicas are **read-only**: writes return
+`-READONLY` (`INFO replication` reports `slave_read_only:1`).
+
+#### 4. Verify the link
 
 ```bash
 redis-cli -p 6380 INFO replication | grep master_link_status
-# Expect: master_link_status:up
+# Expect: master_link_status:up   (anything else = handshake not complete)
 ```
+
+### Acknowledged writes with WAIT
+
+`WAIT numreplicas timeout` blocks until at least `numreplicas` replicas have ACKed
+every write issued on the connection (replicas send `REPLCONF ACK` on a ~1 s
+cadence). Combine it with `appendfsync always` on both sides for a **zero-RPO,
+cross-node durable write**:
+
+`WAIT` counts ACKs only for writes issued on **its own connection**, so the `SET`
+and the `WAIT` must run on the *same* connection — two separate `redis-cli`
+invocations open two connections, and the `WAIT` would see no pending write. Use one
+interactive session (or pipe both commands into a single `redis-cli`):
+
+```bash
+redis-cli -p 6379 <<'EOF'
+SET k v
+WAIT 1 1000
+EOF
+# WAIT returns the number of replicas that ACKed the SET within 1000 ms
+```
+
+On the master, `INFO replication` lists each replica's `offset` and `lag`; on the
+replica it reports `slave_repl_offset`. See the [tuning guide](tuning.md#replication-durability)
+for the durability/latency trade-offs.
+
+### Promote a replica (failover)
+
+```bash
+redis-cli -p 6380 REPLICAOF NO ONE   # replica stops applying and becomes a writable master
+```
+
+Repoint surviving replicas at the new master with `REPLICAOF <new-host> <new-port>`.
+There is no automatic replication failover outside cluster mode (see below).
+
+### Read/write splitting
+
+Moon has **no built-in read/write-splitting proxy** — each node is a single server,
+and a replica is read-only. Sending a write to a replica returns `-READONLY`. To
+serve writes from the master and reads from replicas behind one logical service,
+split at the client or with an external Redis-aware proxy. A plain L4/TCP load
+balancer **cannot** do this — it can't see commands, so it can't tell a read from a
+write; it only helps for failover.
+
+**Client-side (recommended, no extra hop).** Open one connection to the master for
+writes and one (or a pool) to the replicas for reads; most clients have a built-in
+replica-read mode:
+
+```bash
+# writes → master
+redis-cli -p 6379 SET session:42 '{"user":"alice"}'
+# reads → replica  (eventually consistent — may lag; see the caveat below)
+redis-cli -p 6380 GET session:42
+```
+
+!!! warning "Replica reads are eventually consistent"
+    Replication is **asynchronous**, so a `GET` on a replica issued right after a
+    `SET` on the master can return the **old value or a miss** until the write
+    streams across (the example above is exactly that race). Route
+    **read-after-write** and **session-critical** reads to the *master*; send only
+    staleness-tolerant reads (caches, analytics, browse traffic) to replicas. If you
+    must read your own writes from a replica, gate the read on catch-up: `WAIT 1
+    <timeout>` on the master, then confirm the replica's `slave_repl_offset` (from
+    `INFO replication`) has reached the master's `master_repl_offset`.
+
+Most clients expose a **non-cluster** replica-read mode, or you can simply hold
+separate master and replica clients:
+
+- **lettuce (Java):** a `MasterReplica` connection with `ReadFrom.REPLICA_PREFERRED`
+- **redis-py:** a dedicated replica `Redis(host=<replica>, port=6380)` client for reads
+- **ioredis (Node):** separate `Redis` clients for the master and the replica
+- **go-redis:** explicit master and replica `redis.NewClient(...)` instances
+
+The cluster-client read-routing modes — redis-py `RedisCluster(read_from_replicas=True)`,
+ioredis `scaleReads: "slave"`, go-redis `ClusterOptions{ReadOnly, RouteRandomly}` —
+apply only in **[Cluster mode](#cluster-mode)**, not to a standalone master/replica pair.
+
+Keep write-path connections pointed at the master so `WAIT`-based cross-node
+durability still works — `WAIT` only counts ACKs for writes issued on the master.
+
+**External proxy (one endpoint).** Front the pair with a **command-aware** RESP proxy
+that routes by command flag (writes → master, reads → replica pool): e.g. Envoy's
+`redis_proxy` filter with a read policy, or a purpose-built RESP router. The trade-off
+is an extra network hop and another component to operate and fail over.
+
+**Failover note.** However you split, reads and writes must re-point when a replica
+is promoted (`REPLICAOF NO ONE`) or a master is lost. In a standalone master/replica
+pair there is **no built-in topology discovery**: `REPLICAOF NO ONE` promotes a
+replica but does not notify clients, and health checks alone only detect
+liveness — they cannot tell a client *which* node is the new master. Repointing
+therefore requires **Moon's [Cluster mode](#cluster-mode)** (automatic promotion +
+`MOVED` redirection) or an **external orchestrator** (k8s/systemd health-managed
+endpoints) that rewrites the client's target; a static split does not self-heal.
+Moon does not implement the Redis Sentinel protocol.
 
 ### Replication features
 
+- **All six data planes** — KV, vector/text index, graph, WS, MQ, temporal (v0.7 GA)
 - **PSYNC2 protocol** — compatible with Redis replication clients
-- **Per-shard WAL streaming** — each shard streams its own WAL independently (once connected)
-- **Partial resync** — reconnecting replicas resume from where they left off via the replication backlog
-- **Lazy backlog** — the replication backlog is only allocated when the first replica handshake begins (REPLCONF), saving ~12 MB baseline memory
+- **Per-shard WAL streaming** — each master shard streams its own WAL; a multi-shard master merges them into one exactly-once feed
+- **Partial resync** — single-shard masters resume reconnecting replicas from the backlog window; multi-shard masters answer every reconnect with a full resync
+- **Lazy backlog** — allocated only when the first replica handshake begins (REPLCONF), saving ~12 MB baseline memory
+- **Validated** — 24 h continuous-load kill-9 soak (alternating master/replica restarts), zero loss of any WAIT-acknowledged write
+
+!!! warning "Replica TTL semantics (v0.7)"
+    Relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`, `GETEX` with a relative
+    TTL) replicate verbatim rather than being rewritten to absolute `PEXPIREAT`, and
+    replicas run their own active-expiry cycle. Because the replica's countdown starts
+    when it **applies** the command — not when the master ran it — replication/apply
+    delay shifts a relative-TTL key's expiry moment by that delay **even with perfectly
+    synchronized clocks** (the replica holds the key slightly longer). Master/replica
+    clock skew adds a further offset on top. For exact cross-node expiry parity, set
+    absolute deadlines with `PEXPIREAT`. Absolute-rewrite + role-gated expiry land in
+    v0.7.1.
 
 ## Cluster mode
 

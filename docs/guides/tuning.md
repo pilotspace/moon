@@ -157,6 +157,39 @@ data loss on a host crash; then use `always` and size expectations to your disk'
 rate (or provision faster storage). Both preserve their guarantee under SIGKILL —
 validated by the crash-recovery matrix (100% of acked writes recovered).
 
+## Replication durability
+
+AOF durability protects a **single node** against a crash. Replication (v0.7 GA)
+adds a **second node** so a write survives losing the master's disk entirely. The
+two combine on a latency/RPO ladder — pick the rung your workload needs:
+
+| Goal | Master | Replica | Client | RPO | Cost |
+|------|--------|---------|--------|-----|------|
+| Fast, replica for read-scaling/DR | `--appendfsync everysec` | `--appendfsync everysec` | fire-and-forget | ≤1 s on master crash; replica lag on failover | lowest latency |
+| Durable on the master | `--appendfsync always` | — | — | 0 on master crash (disk-bound) | fsync per write |
+| **Zero-RPO across nodes** | `--appendfsync always` | `--appendfsync always` | `WAIT 1 <timeout>` after the write | 0 even if the master's disk is lost | fsync (both nodes) + one replica round-trip |
+
+The replica column matters for the zero-RPO rung: a replica ACKs a write when it
+**applies** it, not when it fsyncs, so a replica running `everysec` (or `no`) can ACK
+a write — satisfying `WAIT` — and then lose it on its own crash. Zero-RPO requires
+`--appendfsync always` on **both** nodes.
+
+`WAIT numreplicas timeout` blocks until `numreplicas` replicas have ACKed the
+write (replicas ACK on a ~1 s cadence, so a `WAIT` timeout below ~1 s may return
+before an idle replica reports in — size the timeout accordingly, or keep the
+write stream busy). It reports the count that ACKed; it never rolls the write back.
+
+**Read scaling:** replicas are `--shards 1` and read-only. Add *more replicas* for
+read throughput and DR breadth — you cannot add shards to a replica. Route reads
+to replicas and writes to the master at the client/proxy layer.
+
+**Monitoring:** on the master, `INFO replication` lists each replica's `offset`
+and `lag` (bytes behind); alert on sustained lag growth. On a replica,
+`master_link_status:up` confirms a live stream — treat `down` as an outage even if
+TCP is connected (it means the PSYNC handshake has not completed).
+
+Full setup and failover: [clustering & replication guide](clustering.md#replication).
+
 ## Pub/sub fan-out
 
 Moon's subscriber delivery path **coalesces automatically** — when a publish burst queues

@@ -6,6 +6,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-15
+
+**Replication GA for multi-shard masters.** Moon now supports real Redis-compatible
+asynchronous replication with `WAIT`/`ACK` acknowledgement semantics: a multi-shard
+master (`--shards N`) streams a merged, exactly-once command feed to a single-shard
+streaming replica across all data planes — KV, vector/text index, graph, workspace (WS),
+message-queue (MQ), and temporal. Every write plane is crash-durable and survives
+`kill -9` on either side, validated by a 24h continuous-load kill-9 soak (alternating
+master/replica restarts every 12 min) that asserts zero loss of any `WAIT`-acknowledged
+write. Also folds in the full v0.6.1 hardening scope (WAL v3 storage-kernel M1–M4:
+cross-plane crash matrix, unified per-shard WAL-recycle floor, atomic durable writes,
+FTS term-dict durability) and a supply-chain CI gate (`cargo audit` + `cargo deny`).
+
+Soak evidence (release gate REPL-SOAK-01): `SOAK-PASS duration=86400s cycles=114
+acked=82044 inflight=7 master_kills=57 replica_kills=57` — 82,044 WAIT-acked writes
+preserved across 114 alternating kill-9 cycles, zero acked-write loss (2026-07-15,
+run dir `moon-soak/runs/20260714-141946`, RC `e2d87893`).
+
+Known limitation: the streaming replica is single-shard only (`--shards 1`) — the
+multi-shard work in this release is master-side (merged N-shard PSYNC feed). Multi-shard
+replicas are roadmapped for v0.8/v0.9.
+
+Replica TTL semantics (disclosure): relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`,
+`GETEX` with a relative TTL) currently replicate verbatim rather than being rewritten to
+absolute `PEXPIREAT` on the master, and replicas run their own active-expiry cycle
+regardless of role. In practice keys expire correctly on both sides under normal clock
+sync, but a master/replica clock skew can shift a relative-TTL key's expiry moment between
+the two by up to that skew. Absolute-expiry rewrite + role-gated passive expiry land in
+v0.7.1 (task #71b). Applications needing exact cross-node expiry parity should set
+absolute deadlines with `PEXPIREAT` until then.
+
+### Documentation — replication configuration & tuning
+
+Documented the v0.7 replication surface: corrected the stale `guides/clustering.md`
+replica walkthrough (it still showed the pre-GA topology — single-shard leader,
+multi-shard replica — the reverse of the shipped shape) and its outdated
+"WS/MQ not replicated yet" note (all six planes replicate as of Wave B). Added the
+`WAIT`-durability ladder, replica promotion (`REPLICAOF NO ONE`), `INFO replication`
+monitoring, a **Read/write splitting** subsection (Moon has no built-in R/W-split
+proxy — client-side vs command-aware external-proxy patterns), and the replica-TTL
+caveat. New **Replication** section in `configuration.md` and a **Replication
+durability** section in `guides/tuning.md` (RPO/latency trade-offs, read-scaling,
+lag alerting).
+
 ### Fixed — `segment_plane_scan` missed v0.6.0's nested-Command plane framing, risking WS/MQ/temporal data loss on upgrade (task #69)
 
 `WalWriterV3::recycle_aggressive`/`recycle_segments_before` gate deletion of
