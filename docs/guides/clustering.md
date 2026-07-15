@@ -95,6 +95,43 @@ redis-cli -p 6380 REPLICAOF NO ONE   # replica stops applying and becomes a writ
 Repoint surviving replicas at the new master with `REPLICAOF <new-host> <new-port>`.
 There is no automatic replication failover outside cluster mode (see below).
 
+### Read/write splitting
+
+Moon has **no built-in read/write-splitting proxy** — each node is a single server,
+and a replica is read-only. Sending a write to a replica returns `-READONLY`. To
+serve writes from the master and reads from replicas behind one logical service,
+split at the client or with an external Redis-aware proxy. A plain L4/TCP load
+balancer **cannot** do this — it can't see commands, so it can't tell a read from a
+write; it only helps for failover.
+
+**Client-side (recommended, no extra hop).** Open one connection to the master for
+writes and one (or a pool) to the replicas for reads; most clients have a built-in
+replica-read mode:
+
+```bash
+# writes → master
+redis-cli -p 6379 SET session:42 '{"user":"alice"}'
+# reads → replica
+redis-cli -p 6380 GET session:42
+```
+
+- **lettuce (Java):** `ReadFrom.REPLICA_PREFERRED`
+- **redis-py:** `Redis(..., )` with a replica connection, or `RedisCluster(read_from_replicas=True)`
+- **ioredis (Node):** a `scaleReads: "slave"` cluster client, or separate clients
+- **go-redis:** `ClusterOptions{ ReadOnly: true, RouteRandomly: true }`, or explicit master/replica clients
+
+Keep write-path connections pointed at the master so `WAIT`-based cross-node
+durability still works — `WAIT` only counts ACKs for writes issued on the master.
+
+**External proxy (one endpoint).** Front the pair with a **command-aware** RESP proxy
+that routes by command flag (writes → master, reads → replica pool): e.g. Envoy's
+`redis_proxy` filter with a read policy, or a purpose-built RESP router. The trade-off
+is an extra network hop and another component to operate and fail over.
+
+**Failover note.** However you split, reads must re-point when a replica is promoted
+(`REPLICAOF NO ONE`) or a master is lost — client libraries with topology awareness
+or the proxy's health checks handle this; a static split does not.
+
 ### Replication features
 
 - **All six data planes** — KV, vector/text index, graph, WS, MQ, temporal (v0.7 GA)

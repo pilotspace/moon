@@ -44,9 +44,11 @@ replica walkthrough (it still showed the pre-GA topology — single-shard leader
 multi-shard replica — the reverse of the shipped shape) and its outdated
 "WS/MQ not replicated yet" note (all six planes replicate as of Wave B). Added the
 `WAIT`-durability ladder, replica promotion (`REPLICAOF NO ONE`), `INFO replication`
-monitoring, and the replica-TTL caveat. New **Replication** section in
-`configuration.md` and a **Replication durability** section in `guides/tuning.md`
-(RPO/latency trade-offs, read-scaling, lag alerting).
+monitoring, a **Read/write splitting** subsection (Moon has no built-in R/W-split
+proxy — client-side vs command-aware external-proxy patterns), and the replica-TTL
+caveat. New **Replication** section in `configuration.md` and a **Replication
+durability** section in `guides/tuning.md` (RPO/latency trade-offs, read-scaling,
+lag alerting).
 
 ### Fixed — `segment_plane_scan` missed v0.6.0's nested-Command plane framing, risking WS/MQ/temporal data loss on upgrade (task #69)
 
