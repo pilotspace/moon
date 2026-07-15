@@ -422,6 +422,16 @@ pub fn build_kv_spill_batch(entries: &[SpillEntry], file_id: u64) -> io::Result<
 /// (`classify_orphan_heap_files`), which already recognizes `heap-*.tmp`.
 ///
 /// Returns the total byte size written.
+///
+/// Hand-rolls the temp+fsync+rename sequence instead of calling
+/// `persistence::atomic::atomic_write_durable` (which has the same crash
+/// contract) because that helper's signature takes one pre-materialized
+/// `&[u8]`: concatenating `batch.pages` into a single contiguous buffer first
+/// would undo the whole point of `BATCH_BYTES_CAP` (`spill_thread.rs`) —
+/// streaming each already-built 4KB page straight into the temp file via
+/// `write_all` in a loop is exactly what keeps this write's own working set
+/// at one page at a time, on top of (not doubling) the capped `batch.pages`
+/// already resident from `build_kv_spill_batch`.
 pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) -> io::Result<u64> {
     use std::io::Write as _;
 
@@ -1401,6 +1411,88 @@ mod tests {
                     entry.value_bytes.as_ref(),
                     "rebuilt index: oversized key {} resolved to the WRONG value",
                     String::from_utf8_lossy(&entry.key)
+                ),
+                other => panic!("expected String for {:?}, got {other:?}", entry.key),
+            }
+        }
+    }
+
+    /// review FIX 1 gap: neither `test_build_kv_spill_batch_mixed_inline_and_oversized`
+    /// (uses the BUILDER's own known `batch.locations`, never exercises the
+    /// manifest scan) nor `test_rebuild_from_manifest_oversized_batch_roundtrip`
+    /// (all-oversized, no inline entries in the file) proves that
+    /// `ColdIndex::rebuild_from_manifest`'s independent
+    /// `chunks_exact(PAGE_4K)` scan (`cold_index.rs`) correctly locates
+    /// INLINE entries interleaved with OVERFLOW entries in the SAME batch
+    /// file — i.e. the scan, not the builder's own bookkeeping, has to
+    /// re-derive page indices for a file shape only this fix's batching can
+    /// produce. This is exactly the gap the real-server integration test
+    /// (`tests/crash_recovery_spill_batch_kill9.rs`) caught.
+    #[test]
+    fn test_rebuild_from_manifest_mixed_inline_and_oversized_roundtrip() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+        use crate::storage::tiered::cold_read::cold_read_through;
+
+        let mut entries = make_inline_entries(20);
+        entries.extend(make_oversized_entries(20, 8000));
+        let mut interleaved = Vec::with_capacity(entries.len());
+        let (inline_part, oversized_part) = entries.split_at(20);
+        for i in 0..20 {
+            interleaved.push(clone_spill_entry(&inline_part[i]));
+            interleaved.push(clone_spill_entry(&oversized_part[i]));
+        }
+
+        let file_id = 903u64;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+
+        let batch = build_kv_spill_batch(&interleaved, file_id).expect("mixed batch build");
+        let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.add_file(FileEntry {
+            file_id,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            min_key_hash: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        manifest.commit().unwrap();
+
+        let rebuilt = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
+        assert_eq!(
+            rebuilt.len(),
+            interleaved.len(),
+            "rebuild must recover every entry (got {} of {})",
+            rebuilt.len(),
+            interleaved.len()
+        );
+
+        for entry in &interleaved {
+            let result = cold_read_through(&rebuilt, shard_dir, &entry.key, 0);
+            assert!(
+                result.is_some(),
+                "rebuilt index: key {} returned nil",
+                String::from_utf8_lossy(&entry.key)
+            );
+            let (value, _ttl) = result.unwrap();
+            match value {
+                crate::storage::entry::RedisValue::String(data) => assert_eq!(
+                    data.as_ref(),
+                    entry.value_bytes.as_ref(),
+                    "rebuilt index: key {} resolved to the WRONG value ({} bytes, expected {})",
+                    String::from_utf8_lossy(&entry.key),
+                    data.len(),
+                    entry.value_bytes.len(),
                 ),
                 other => panic!("expected String for {:?}, got {other:?}", entry.key),
             }

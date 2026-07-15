@@ -12,12 +12,10 @@
 
 use std::path::Path;
 
-use bytes::Bytes;
 use tracing::info;
 
 use crate::persistence::clog::{ClogPage, TxnStatus};
 use crate::persistence::control::{ShardControlFile, ShardState};
-use crate::persistence::kv_page::{ValueType, read_datafile};
 use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
@@ -41,7 +39,34 @@ pub struct RecoveryResult {
     /// Warm segment paths recovered from manifest, ready for VectorStore registration.
     /// Each tuple: (file_id, segment_dir_path).
     pub warm_segments: Vec<(u64, std::path::PathBuf)>,
-    /// Number of KV entries reloaded from heap DataFiles.
+    /// Number of KV entries recovered from heap DataFiles into the COLD
+    /// index (read-through on next access), NOT hot-loaded into RAM.
+    ///
+    /// Task #56 (used_memory truthfulness): this used to ALSO re-insert
+    /// every `ValueType::String` heap entry directly into `databases[0]`'s
+    /// hot DashTable (added by #79-04, predating ColdIndex read-through),
+    /// while the very next Phase-3 step (#80-02) independently rebuilds a
+    /// `ColdIndex` entry for the SAME key pointing at the SAME on-disk
+    /// location. That double-booked every previously-spilled String key:
+    /// once as a fully-charged hot RAM entry (defeating the entire point of
+    /// disk-offload -- the data it evicted specifically to stay under
+    /// `maxmemory` came right back) and again as a redundant cold-index
+    /// stub. This is the mechanism behind the observed "used_memory got
+    /// WORSE after a kill-9 restart" regression: a restart un-evicted
+    /// everything in one shot, with no re-application of eviction/maxmemory
+    /// gating during the reload. Non-string types were never affected by
+    /// the old bug (the pre-existing code explicitly skipped them), which is
+    /// how the asymmetry went unnoticed — Hash/List/Set/ZSet/Stream cold
+    /// entries were already recovered as cold-only stubs, exactly like every
+    /// other evicted key.
+    ///
+    /// Now every value type funnels through the same `ColdIndex` +
+    /// `cold_read_through` path recovery already relies on for non-string
+    /// types: a key surfaces to callers as a normal cold-index-backed miss,
+    /// and `Database::get`'s existing `promote_cold_if_present` fallback
+    /// lazily rehydrates it into hot RAM (and charges `used_memory`) only
+    /// when something actually reads it. Restart no longer moves the
+    /// maxmemory needle by itself.
     pub kv_heap_entries_loaded: usize,
     /// Paths of crash-orphaned `heap-*.mpf`/`.tmp` files classified during
     /// recovery (task #55) but NOT yet deleted. Classification is cheap
@@ -269,66 +294,28 @@ pub fn recover_shard_v3_pitr(
         }
     }
 
-    // Phase 3 continued: Reload KV heap entries from DataFiles.
-    // Scan manifest for status=Active, file_type=KvLeaf entries.
-    // These represent KV entries spilled to disk before the crash.
-    if manifest_path.exists() {
-        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let data_dir = shard_dir.join("data");
-            for entry in manifest.files() {
-                if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
-                    let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
-                    if heap_path.exists() {
-                        match read_datafile(&heap_path) {
-                            Ok(pages) => {
-                                let mut file_entries = 0usize;
-                                for page in &pages {
-                                    for slot_idx in 0..page.slot_count() {
-                                        if let Some(kv_entry) = page.get(slot_idx) {
-                                            if kv_entry.value_type == ValueType::String {
-                                                let key = Bytes::from(kv_entry.key);
-                                                let value = Bytes::from(kv_entry.value);
-                                                if let Some(ttl) = kv_entry.ttl_ms {
-                                                    // ttl_ms is absolute unix millis
-                                                    databases[0]
-                                                        .set_string_with_expiry(key, value, ttl);
-                                                } else {
-                                                    databases[0].set_string(key, value);
-                                                }
-                                                file_entries += 1;
-                                            }
-                                            // Non-string types: skip for now (future work)
-                                        }
-                                    }
-                                }
-                                result.kv_heap_entries_loaded += file_entries;
-                                info!(
-                                    "Shard {}: reloaded {} KV entries from heap-{:06}.mpf",
-                                    shard_id, file_entries, entry.file_id
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Shard {}: heap DataFile read failed for file {}: {}",
-                                    shard_id,
-                                    entry.file_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // Phase 3 continued: Build ColdIndex from manifest KvLeaf entries.
     // Used by Database::get() for read-through on DashTable miss.
+    //
+    // Task #56 (used_memory truthfulness): this used to run AFTER a separate
+    // loop that read every KvLeaf DataFile and re-inserted its
+    // `ValueType::String` entries directly into `databases[0]`'s hot
+    // DashTable (see `RecoveryResult::kv_heap_entries_loaded`'s doc comment
+    // for the full history). That loop is gone -- every spilled key,
+    // regardless of value type, now recovers as a cold-index-only stub and
+    // is promoted into hot RAM (and charged to `used_memory`) lazily, on
+    // first access, via the exact same `Database::promote_cold_if_present`
+    // path normal (non-restart) cold read-through already uses. This is the
+    // ONLY place a KvLeaf DataFile is read during recovery now.
     if manifest_path.exists() {
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
             let cold_idx = crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(
                 shard_dir, &manifest,
             );
+            // Observability parity with the removed hot-reload loop's
+            // counter: report how many keys the cold tier recovered, NOT
+            // how many were loaded into RAM (zero, by design).
+            result.kv_heap_entries_loaded = cold_idx.len();
             if cold_idx.len() > 0 {
                 info!(
                     "Shard {}: rebuilt cold index with {} entries",
@@ -1180,20 +1167,49 @@ mod tests {
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
+        // Cold index recovers all 3 keys -- same count as before the fix,
+        // just no longer synonymous with "loaded into hot RAM".
         assert_eq!(result.kv_heap_entries_loaded, 3);
 
-        // Verify entries exist in database
+        // Task #56 (used_memory truthfulness): recovery must NOT hot-load
+        // spilled String entries into the DashTable. Before the fix, this is
+        // exactly where a restart double-booked memory -- every spilled
+        // key came back fully charged to `used_memory` in one shot, with no
+        // eviction pass in between. `resident_bytes()` staying at the tiny
+        // ColdIndex-only overhead (not the full value payloads) is the
+        // regression guard.
+        assert!(
+            !databases[0].is_hot(b"key1"),
+            "key1 must recover as a cold-only stub, not a hot RAM entry"
+        );
+        assert!(!databases[0].is_hot(b"key2"), "key2 must recover cold-only");
+        assert!(!databases[0].is_hot(b"key3"), "key3 must recover cold-only");
+        let cold_only_bytes = databases[0].resident_bytes();
+        assert!(
+            cold_only_bytes < 200,
+            "resident_bytes() should reflect only the tiny ColdIndex overhead \
+             right after recovery (no hot entries yet), got {cold_only_bytes}"
+        );
+
+        // Cold read-through still serves every key transparently -- it's
+        // just lazy now: the first touch promotes it into hot RAM (and only
+        // then charges `used_memory`), exactly like ordinary (non-restart)
+        // eviction + read-through already works for every other value type.
         assert!(
             databases[0].get(b"key1").is_some(),
-            "key1 should be in database"
+            "key1 should be readable via cold read-through"
         );
         assert!(
             databases[0].get(b"key2").is_some(),
-            "key2 should be in database"
+            "key2 should be readable via cold read-through"
         );
         assert!(
             databases[0].get(b"key3").is_some(),
-            "key3 should be in database"
+            "key3 should be readable via cold read-through"
+        );
+        assert!(
+            databases[0].is_hot(b"key1"),
+            "key1 must be promoted to hot RAM after a GET"
         );
     }
 

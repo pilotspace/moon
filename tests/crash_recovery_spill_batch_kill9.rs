@@ -344,6 +344,237 @@ fn count_tmp_files(dir: &std::path::Path) -> usize {
     acc
 }
 
+// ---------------------------------------------------------------------------
+// Shared-batch-file cold-read regression (review FIX 1): the sibling test
+// only proves AOF-replay-derived recovery (every acked key ends up HOT via
+// `DispatchReplayEngine`, never touching `cold_read_through`). It cannot
+// distinguish "the leaf-offset + overflow-chain-with-start_page_id>1 read
+// path works" from "AOF replay papered over a broken cold layout" — the
+// exact path this fix's `build_kv_spill_batch` rewrite and the
+// `build_overflow_chain` fix touch.
+//
+// This test forces a GENUINE post-restart cold read two ways at once:
+// `--appendonly no` (no AOF backstop — the only way a key comes back after
+// kill -9 is `ColdIndex::rebuild_from_manifest` + `cold_read_through`
+// walking the on-disk batch file), AND by never issuing a live write for
+// the target keys at all — the shared batch file is constructed directly
+// via `build_kv_spill_batch`/`write_kv_spill_batch` (the exact production
+// functions this fix rewrote) and a matching `ShardManifest` entry is
+// committed BEFORE the server ever boots, so the target keys are cold at
+// rest from the very first instant the server sees them, and read-triggered
+// promotion cannot have happened before the kill.
+//
+// An earlier version of this test tried to reach this same shape by driving
+// LIVE `allkeys-lru` eviction (probe SETs + a filler MSET, matching
+// `crash_recovery_disk_offload_no_aof.rs`'s `write_filler` technique) and
+// scanning the live directory for a naturally-occurring qualifying file.
+// That was flaky and, worse, produced a false positive: under a pre-
+// existing, out-of-scope memory-accounting gap (adjacent to a sibling
+// worktree's in-flight `used_memory` fix), the periodic memory-pressure
+// tick kept re-evicting and re-spilling the SAME already-cold keys into a
+// steady stream of fresh batch files far faster than any poll-then-kill
+// reaction time could keep up with — by the time a GET landed, the target
+// key had already been re-spilled one or more times, sometimes losing its
+// overflow shape entirely. A dedicated library-level regression test,
+// `storage::tiered::kv_spill::tests::test_rebuild_from_manifest_mixed_inline_and_oversized_roundtrip`,
+// proves the underlying rebuild-from-manifest scan is correct in isolation;
+// this integration test needed a way to reach that same on-disk shape
+// through the real server WITHOUT depending on the flaky live-eviction
+// churn, hence the direct construction below.
+// ---------------------------------------------------------------------------
+
+/// Below the 256-byte LZ4 threshold and the 3500-byte overflow threshold —
+/// always takes the plain inline-leaf path, no compression, no chain.
+const SEED_INLINE_VALUE_LEN: usize = 200;
+/// Above `INLINE_MAX_VALUE_BYTES` (3500) — always takes the overflow-chain
+/// path. Matches `VALUE_LEN` above (G2's 10KB-value shape, scaled for a fast
+/// test).
+const SEED_OVERSIZED_VALUE_LEN: usize = VALUE_LEN;
+
+/// Deterministic, key-tagged, non-trivially-compressible seed value.
+fn seed_value_for(key: &str, len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    v.extend_from_slice(format!("seed-{key}-").as_bytes());
+    while v.len() < len {
+        let j = v.len();
+        v.push((j % 251) as u8);
+    }
+    v.truncate(len);
+    v
+}
+
+fn seed_spill_entry(key: &str, len: usize) -> moon::storage::tiered::kv_spill::SpillEntry {
+    moon::storage::tiered::kv_spill::SpillEntry {
+        key: bytes::Bytes::copy_from_slice(key.as_bytes()),
+        value_bytes: bytes::Bytes::from(seed_value_for(key, len)),
+        value_type: moon::persistence::kv_page::ValueType::String,
+        flags: 0,
+        ttl_ms: None,
+    }
+}
+
+/// review FIX 1: a shared batch file's 2nd/3rd oversized (overflow-chain,
+/// `start_page_id > 1`) entries AND one inline entry from the SAME file,
+/// read via a genuine post-restart COLD read (no AOF backstop, never
+/// promoted to hot before the kill — see the module doc's "Shared-batch-file
+/// cold-read regression" section), must return byte-exact values.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn spill_batch_shared_file_survives_cold_read_after_kill9() {
+    use moon::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+    use moon::persistence::page::PageType;
+    use moon::storage::tiered::kv_spill::{build_kv_spill_batch, write_kv_spill_batch};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_dir = dir.path().join("shard-0");
+    std::fs::create_dir_all(shard_dir.join("data")).expect("create shard data dir");
+
+    // Construction order matters: the FIRST entry's own leaf lands at page 0
+    // (matching every caller before this fix), so it alone would never
+    // exercise `start_page_id > 1`. Putting the inline entry between two
+    // oversized ones guarantees the second oversized entry's chain starts
+    // well past page 1 — exactly the shape that exposed the
+    // `build_overflow_chain` bug (chain-local `i+1`/`i+2` vs file-absolute
+    // `start_page_id + i`).
+    let inline_key = "spillkey:seed-inline";
+    let overflow_key_a = "spillkey:seed-overflow-a";
+    let overflow_key_b = "spillkey:seed-overflow-b";
+    let seed_entries = vec![
+        seed_spill_entry(overflow_key_a, SEED_OVERSIZED_VALUE_LEN),
+        seed_spill_entry(inline_key, SEED_INLINE_VALUE_LEN),
+        seed_spill_entry(overflow_key_b, SEED_OVERSIZED_VALUE_LEN),
+    ];
+    let expected: std::collections::HashMap<&str, Vec<u8>> = [
+        (
+            overflow_key_a,
+            seed_value_for(overflow_key_a, SEED_OVERSIZED_VALUE_LEN),
+        ),
+        (
+            inline_key,
+            seed_value_for(inline_key, SEED_INLINE_VALUE_LEN),
+        ),
+        (
+            overflow_key_b,
+            seed_value_for(overflow_key_b, SEED_OVERSIZED_VALUE_LEN),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let file_id = 1u64;
+    let batch = build_kv_spill_batch(&seed_entries, file_id).expect("seed batch build");
+    // Sanity: this really is a shared file with both shapes present (an
+    // inline leaf AND overflow-chain pages), not an accidental single-type
+    // batch — a self-check on the fixture, not the code under test.
+    let overflow_pages = batch
+        .pages
+        .iter()
+        .filter(|p| matches!(p, moon::storage::tiered::kv_spill::BatchSlot::Overflow(_)))
+        .count();
+    assert!(
+        overflow_pages >= 2,
+        "test fixture bug: expected >=2 overflow pages in the seed batch, got {overflow_pages}"
+    );
+    let byte_size = write_kv_spill_batch(&shard_dir, file_id, &batch).expect("seed batch write");
+
+    let manifest_path = shard_dir.join("shard-0.manifest");
+    let mut manifest = ShardManifest::create(&manifest_path).expect("create seed manifest");
+    manifest.add_file(FileEntry {
+        file_id,
+        file_type: PageType::KvLeaf as u8,
+        status: FileStatus::Active,
+        tier: StorageTier::Hot,
+        page_size_log2: 12,
+        page_count: batch.pages.len() as u32,
+        byte_size,
+        created_lsn: 0,
+        min_key_hash: 0,
+        max_key_hash: 0,
+        last_modified_lsn: 0,
+    });
+    manifest.commit().expect("commit seed manifest");
+
+    let extra: Vec<String> = vec![
+        "--maxmemory".into(),
+        MAXMEMORY_BYTES_ROUND2.to_string(), // generous — no live eviction needed at all
+        "--maxmemory-policy".into(),
+        "allkeys-lru".into(),
+        "--disk-offload".into(),
+        "enable".into(),
+        // No AOF backstop: the ONLY way a key survives the kill is a
+        // genuine cold read through the pre-seeded on-disk batch file.
+        "--appendonly".into(),
+        "no".into(),
+        "--disk-free-min-pct".into(),
+        "0".into(),
+    ];
+    let extra_refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+
+    // --- Round 1: boot onto the pre-seeded --dir, confirm clean recovery,
+    //     then kill WITHOUT ever reading the target keys (a pre-kill GET
+    //     would promote a key to hot, and hot is not durable under
+    //     `--appendonly no` — see `crash_recovery_disk_offload_no_aof.rs`'s
+    //     identical caution). ---
+    let (child, port) = spawn_moon(dir.path(), &extra_refs);
+    let mut guard = ServerGuard(child);
+    drop(wait_ready(port));
+    common::sigkill(&mut guard.0);
+    common::wait_for_port_down(port);
+    drop(guard);
+
+    // --- Round 2: restart on a fresh port, same --dir. Recovery must
+    //     rebuild the ColdIndex from the pre-seeded manifest + batch file;
+    //     the GETs below are the first time anything ever touches these
+    //     keys, so a hit can ONLY come from a genuine cold read. ---
+    let (child2, port2) = spawn_moon(dir.path(), &extra_refs);
+    let guard2 = ServerGuard(child2);
+    drop(wait_ready(port2));
+
+    let mut c2 = Conn::open(port2);
+    let mut mismatches: Vec<&str> = Vec::new();
+    for label in [inline_key, overflow_key_a, overflow_key_b] {
+        let want = &expected[label];
+        match c2.cmd(&[b"GET", label.as_bytes()]) {
+            Resp::Bulk(Some(got)) if &got == want => {}
+            Resp::Bulk(Some(got)) => {
+                eprintln!(
+                    "MISMATCH {label}: expected {} bytes, got {} bytes",
+                    want.len(),
+                    got.len()
+                );
+                mismatches.push(label);
+            }
+            other => {
+                eprintln!("MISS {label}: {other:?}");
+                mismatches.push(label);
+            }
+        }
+    }
+
+    let clean = mismatches.is_empty();
+    let kept_path = dir.path().to_path_buf();
+    if clean {
+        drop(guard2);
+        let _ = std::fs::remove_dir_all(&kept_path);
+    } else {
+        // `TempDir::drop` deletes unconditionally — forgetting the server
+        // guard alone does NOT stop the directory itself from being wiped
+        // when `dir` goes out of scope. `keep` consumes it and hands back a
+        // plain `PathBuf` that is never auto-deleted, so "logs kept at"
+        // below is actually true.
+        std::mem::forget(guard2);
+        let _ = dir.keep();
+    }
+
+    assert!(
+        clean,
+        "shared-batch-file cold read after kill -9 failed for {mismatches:?} — the leaf-offset \
+         + overflow-chain-with-start_page_id>1 read path is broken for entries sharing a batch \
+         file. Logs kept at {}.",
+        kept_path.display()
+    );
+}
+
 /// A live write burst large enough to force sustained `allkeys-lru`
 /// eviction + async disk-offload spill of oversized (overflow-chain)
 /// values, SIGKILLed with no settle window, must recover with zero
@@ -482,13 +713,19 @@ fn spill_batch_survives_kill9_with_zero_ack_loss() {
     );
 
     let clean = lost.is_empty() && corrupted.is_empty() && tmp_files_after_settle == 0;
+    let kept_path = dir.path().to_path_buf();
     if clean {
         drop(guard2);
-        let _ = std::fs::remove_dir_all(dir.path());
+        let _ = std::fs::remove_dir_all(&kept_path);
     } else {
         // Keep the guard alive (and the dir) for post-mortem diagnosis —
         // matches the crash-suite convention of only cleaning up on green.
+        // `TempDir::drop` deletes unconditionally, so `into_path` (which
+        // consumes `dir` and returns a plain `PathBuf` that is never
+        // auto-deleted) is required too — forgetting the guard alone does
+        // not stop the directory itself from being wiped.
         std::mem::forget(guard2);
+        let _ = dir.keep();
     }
 
     assert!(
@@ -498,7 +735,7 @@ fn spill_batch_survives_kill9_with_zero_ack_loss() {
         lost.len(),
         &lost[..lost.len().min(20)],
         if lost.len() > 20 { ", ..." } else { "" },
-        dir.path().display()
+        kept_path.display()
     );
     assert!(
         corrupted.is_empty(),
@@ -507,13 +744,13 @@ fn spill_batch_survives_kill9_with_zero_ack_loss() {
         corrupted.len(),
         &corrupted[..corrupted.len().min(20)],
         if corrupted.len() > 20 { ", ..." } else { "" },
-        dir.path().display()
+        kept_path.display()
     );
     assert_eq!(
         tmp_files_after_settle,
         0,
         "leftover `.tmp` spill-staging files after the orphan-sweep settle window — the \
          atomic write or the crash-orphan sweep regressed. Logs kept at {}.",
-        dir.path().display()
+        kept_path.display()
     );
 }

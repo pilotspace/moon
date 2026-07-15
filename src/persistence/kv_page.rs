@@ -75,7 +75,10 @@ pub mod entry_flags {
     pub const HAS_TTL: u8 = 0x01;
     /// Value payload is LZ4-compressed.
     pub const COMPRESSED: u8 = 0x02;
-    /// Value is an overflow pointer (file_id:u64 + page_id:u32 = 12 bytes).
+    /// Value is an overflow pointer: a raw 4-byte LE `u32` file-absolute
+    /// `start_page_idx` (the overflow chain always lives in the SAME
+    /// physical file as this leaf's stub entry, so no `file_id` needs to be
+    /// stored alongside it — see `read_overflow_chain` / `build_overflow_chain`).
     pub const OVERFLOW: u8 = 0x04;
     /// Entry is a tombstone (pending compaction). value_len = 0.
     pub const TOMBSTONE: u8 = 0x08;
