@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Disk-offload spill files now batch effectively — file count scales as
+  ~keys/batch, not ~keys (v0.8 item 3, task #57 follow-up).** The G2
+  acceptance run (260K × 10KB keys, 256MB cap) produced ~236K `heap-*.mpf`
+  files despite the format nominally supporting ≤256 keys/file batching.
+  Root cause: `SpillThread::flush_buffer` (`src/storage/tiered/spill_thread.rs`)
+  already coalesced up to 256 requests per flush, but partitioned them by
+  value size before writing — every entry over `INLINE_MAX_VALUE_BYTES`
+  (3500B, e.g. all of G2's 10KB values) was routed to its own dedicated
+  single-entry file via `spill_single_entry`, defeating the batch entirely.
+  `build_kv_spill_batch` / `write_kv_spill_batch`
+  (`src/storage/tiered/kv_spill.rs`) are rewritten to pack inline AND
+  oversized entries into ONE shared batch file per flush: each oversized
+  entry gets a dedicated leaf (holding an overflow pointer) plus its
+  overflow-page chain placed inline in the same page stream, with the
+  atomic temp-file+`sync_all`+rename+`fsync_directory` write sequence
+  unchanged (payload-before-reference durability ordering preserved — a
+  key is only considered cold after its containing segment is durable).
+  Empirical measurement (macOS, matching G2's shape): RED (pre-fix)
+  3742 files / ~34,908 evicted 10KB keys; GREEN (post-fix) 29 files for
+  the same eviction load — a ~129× reduction, `spill_batches_flushed`
+  now matches file count 1:1 as designed.
+  Fixing this also uncovered and repaired a latent bug in
+  `build_overflow_chain` (`src/persistence/kv_page.rs`): its prev/next
+  link computation silently assumed every chain's `start_page_id == 1`
+  (true of every caller before this change, since a single-entry file
+  always put its one leaf at page 0) — a chain-local `i+1`/`i+2` formula
+  that produced dangling/wrong links the moment a caller (this new
+  batching code) passed a variable `start_page_id > 1` for the second,
+  third, etc. oversized entry sharing a file. Links are now computed as
+  file-absolute (`start_page_id + i`), which is also what
+  `read_overflow_chain` already expected. New unit tests cover
+  oversized-entries-share-one-file, mixed inline/oversized batches, and
+  the recovery-scan/builder agreement for oversized batches
+  (`kv_spill.rs::tests`); a new end-to-end integration test,
+  `tests/crash_recovery_spill_batch_kill9.rs`, drives a real server
+  through a sustained eviction+spill burst of 8000-byte values and
+  SIGKILLs it with no settle window, asserting zero acknowledged-write
+  loss and a batched (not ~1-file-per-key) heap-file count survive the
+  crash and restart under both the monoio and tokio runtimes.
+
 ### Documentation
 - **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
   post-v0.7.1 actuals: v0.6.1/v0.7.0 marked shipped (with the R5/R6 slips and the
