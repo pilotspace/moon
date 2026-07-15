@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-07-15
+
+Patch release closing the two follow-ups disclosed in the v0.7.0 tag notes: the
+SQ8 vector CPU error-storm and replica TTL determinism.
+
 ### Fixed
 - **Vector: SQ8/TQ code-size mis-dispatch CPU error-storm.** SQ8's `bits()` returns 8,
   which falls outside TurboQuant's supported `1..=4` range; the free

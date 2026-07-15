@@ -178,16 +178,19 @@ Moon does not implement the Redis Sentinel protocol.
 - **Lazy backlog** — allocated only when the first replica handshake begins (REPLCONF), saving ~12 MB baseline memory
 - **Validated** — 24 h continuous-load kill-9 soak (alternating master/replica restarts), zero loss of any WAIT-acknowledged write
 
-!!! warning "Replica TTL semantics (v0.7)"
-    Relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`, `GETEX` with a relative
-    TTL) replicate verbatim rather than being rewritten to absolute `PEXPIREAT`, and
-    replicas run their own active-expiry cycle. Because the replica's countdown starts
-    when it **applies** the command — not when the master ran it — replication/apply
-    delay shifts a relative-TTL key's expiry moment by that delay **even with perfectly
-    synchronized clocks** (the replica holds the key slightly longer). Master/replica
-    clock skew adds a further offset on top. For exact cross-node expiry parity, set
-    absolute deadlines with `PEXPIREAT`. Absolute-rewrite + role-gated expiry land in
-    v0.7.1.
+!!! note "Replica TTL semantics (deterministic since v0.7.1)"
+    Relative-expire commands (`EXPIRE`, `SETEX`, `PEXPIRE`, `SET … EX/PX`, `GETEX`
+    with a relative TTL) are rewritten to absolute deadlines on the master
+    (`PEXPIREAT`/`SET … PXAT`) **before** they enter the durable log and replication
+    stream, using the master's per-tick cached clock — the exact value its command
+    handler stored. The replica (and an AOF replay after a restart) therefore
+    reproduces the master's expiry **instant**, not a countdown restarted at apply
+    time, so apply delay no longer shifts a key's expiry moment. A replica also no
+    longer runs its own active-expiry deletion sweep: it holds a logically-expired
+    key resident (reads still see it as gone) until the master streams the
+    authoritative removal, so both nodes delete at the same point in the stream.
+    Master/replica clock skew is thus the only remaining source of divergence, and it
+    affects only the wall-clock instant of deletion, not which node deletes first.
 
 ## Cluster mode
 

@@ -1,5 +1,10 @@
 # Releases
 
+## v0.7.1 — 2026-07-15
+milestones: none (patch release folding in the two v0.7.0-tag-disclosed follow-ups)
+waivers: none new — `XSHARD-READ-01` remains the open GA gap (ROADMAP R4), unchanged from v0.7.0.
+evidence: Two correctness fixes shipped under one patch. (1) **Vector SQ8/TQ CPU error-storm (task #73, #334):** SQ8's `bits()=8` fell outside TurboQuant's `1..=4` range, so `code_bytes_per_vector` hit its `_ =>` arm returning `0` while emitting a `tracing::error!` on **every** call on the hot memory-accounting path — a CPU-pegging storm plus wrong resident-byte accounting for SQ8 indexes; dispatch now computes the true SQ8 layout directly and the free-fn warns at most once via an `AtomicBool` latch. (2) **Deterministic replica TTL (task #71, #335):** relative-expiry commands (`EXPIRE`/`PEXPIRE`/`SETEX`/`PSETEX`/`SET … EX/PX`/`GETEX … EX/PX`) are rewritten to absolute deadlines (`PEXPIREAT`/`SET … PXAT`) on the master before entering the durable log and replication stream, computed from the per-tick cached clock the handler used — so replicas and AOF replay reproduce the master's expiry *instant* (#71a); and a replica no longer runs its own active-expiry sweep, converging on the master's authoritative removal instead of racing an independent TTL cycle (#71b). This closes the replica relative-TTL caveat disclosed in the v0.7.0 tag. Both PRs green on the self-hosted CI matrix (Lint + Check + MSRV + Memory gate) and admin-squash-merged to `main` (f5641707, 389acb61). New unit coverage: 16 `expire_rewrite` transform tests + 2 black-box two-node replication TTL integration tests (`tests/replication_ttl_semantics.rs`).
+
 ## v0.7.0 — 2026-07-15
 milestones: v0.7.0 "Replication GA for multi-shard masters" (soak-gated tag; v0.6.1 hardening folded in)
 waivers: none — the v0.6.0 `shardslice-migration` waiver (was: expires 2026-08-01) is **retired**; lock-free cross-shard read work is now tracked as an open GA gap (`XSHARD-READ-01`, ROADMAP R4), not a time-boxed waiver.
