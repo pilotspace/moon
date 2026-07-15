@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10×-RAM benchmark publication), cluster hardening + multi-shard replicas moved
   to v0.9, enterprise foundation to v0.10; debt register refreshed.
 
+### Changed
+- **TLS: migrated off the unmaintained `rustls-pemfile` onto `rustls-pki-types`'s
+  `PemObject` trait (task #66).** `build_tls_config` (`src/tls.rs`) now parses
+  certificate chains via `CertificateDer::pem_reader_iter` and private keys via
+  `PrivateKeyDer::from_pem_reader` — both provided directly by `rustls-pki-types`
+  (already in the dependency graph as rustls's own `pki_types` re-export), so no
+  new supply-chain surface is added. Behavior is unchanged: same fail-loud
+  `io::Error` wrapping per stage (`TLS cert file` / `TLS cert parse` / `TLS key
+  file` / `TLS key parse` / `CA cert parse`), same SIGHUP hot-reload path. Two
+  new unit tests (`test_build_tls_config_garbage_cert_parse_error`,
+  `test_build_tls_config_garbage_key_parse_error`) exercise the parser seam
+  directly with corrupt-but-well-formed PEM bodies — the existing suite only
+  covered missing-file paths, not actual DER decode failures. `rustls-pemfile`
+  is fully removed from `Cargo.toml`/`Cargo.lock`; the RUSTSEC-2025-0134
+  ignore entries in `deny.toml` and `.cargo/audit.toml` are removed since the
+  advisory no longer applies. `cargo deny check advisories licenses bans
+  sources` and `cargo audit` both pass clean with no ignore needed.
+
 ## [0.7.1] — 2026-07-15
 
 Patch release closing the two follow-ups disclosed in the v0.7.0 tag notes: the

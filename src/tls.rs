@@ -2,6 +2,8 @@ use std::io;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
 
 /// Map cipher suite name strings to rustls cipher suite constants.
@@ -73,26 +75,17 @@ pub fn build_tls_config(
     // Load certificate chain
     let cert_file = std::fs::File::open(cert_path)
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("TLS cert file: {}", e)))?;
-    let mut cert_reader = io::BufReader::new(cert_file);
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("TLS cert parse: {}", e))
-            })?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_file)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("TLS cert parse: {}", e))
+        })?;
 
     // Load private key
     let key_file = std::fs::File::open(key_path)
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("TLS key file: {}", e)))?;
-    let mut key_reader = io::BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS key parse: {}", e)))?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "No private key found in TLS key file",
-            )
-        })?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_file)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS key parse: {}", e)))?;
 
     // Explicit default cipher suite allowlist.
     //
@@ -135,13 +128,11 @@ pub fn build_tls_config(
         let ca_file = std::fs::File::open(ca_path).map_err(|e| {
             io::Error::new(io::ErrorKind::NotFound, format!("TLS CA cert file: {}", e))
         })?;
-        let mut ca_reader = io::BufReader::new(ca_file);
-        let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut ca_reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("CA cert parse: {}", e))
-                })?;
+        let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(ca_file)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("CA cert parse: {}", e))
+            })?;
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in ca_certs {
@@ -332,6 +323,95 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    /// Exercises the rustls-pki-types `CertificateDer::pem_reader_iter` parse
+    /// seam directly: a file with well-formed PEM boundary markers but a
+    /// corrupt base64 body must surface as a "TLS cert parse" error, not a
+    /// panic or a silently-empty cert chain.
+    #[test]
+    fn test_build_tls_config_garbage_cert_parse_error() {
+        let dir = std::env::temp_dir().join("moon-tls-garbage-cert-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cert_path = dir.join("garbage.crt");
+        let key_path = dir.join("unused.key");
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\n!!!not valid base64!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let result = build_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("TLS cert parse"),
+            "corrupt PEM body must be reported as a cert parse error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same seam as above for the private key: `PrivateKeyDer::from_pem_reader`
+    /// must fail loud on a corrupt PKCS8 body rather than panicking or
+    /// returning a bogus key.
+    #[test]
+    fn test_build_tls_config_garbage_key_parse_error() {
+        let dir = std::env::temp_dir().join("moon-tls-garbage-key-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cert_path = dir.join("valid.crt");
+        let key_path = dir.join("garbage.key");
+
+        // Generate a real cert so we reach key parsing.
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-keyout",
+                dir.join("throwaway.key").to_str().unwrap(),
+                "-out",
+                cert_path.to_str().unwrap(),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=moon-garbage-key-test",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("openssl not available, skipping TLS garbage key test");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        std::fs::write(
+            &key_path,
+            "-----BEGIN PRIVATE KEY-----\n!!!not valid base64!!!\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let result = build_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("TLS key parse"),
+            "corrupt PEM body must be reported as a key parse error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
