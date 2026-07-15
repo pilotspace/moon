@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Vector: SQ8/TQ code-size mis-dispatch CPU error-storm.** SQ8's `bits()` returns 8,
+  which falls outside TurboQuant's supported `1..=4` range; the free
+  `code_bytes_per_vector(padded, bits)` helper hit its `_ =>` arm and returned `0` while
+  logging a `tracing::error!` on **every** call. On the hot memory-accounting path
+  (`store.rs` via `bytes_per_code_per_vector()`) this produced a CPU-pegging error storm
+  and wrong resident-byte accounting for SQ8 indexes. Dispatch now computes the true SQ8
+  layout (`dim` unpadded u8 codes + 8-byte affine `(min,scale)` trailer) directly, and the
+  free-fn logs the unsupported-bit-width error at most once via an `AtomicBool` latch.
+
 ## [0.7.0] — 2026-07-15
 
 **Replication GA for multi-shard masters.** Moon now supports real Redis-compatible
