@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Crash-matrix CI (v0.8 exit-criterion item 4).** New `.github/workflows/crash-matrix.yml`
+  wires `tests/crash_matrix_cross_plane.rs` (the 46-cell kernel M3/G1 kill-9 durability suite —
+  KV/graph/vector/WS/MQ/cross-store-TXN across appendonly x disk-offload x shards) into scheduled
+  CI on the self-hosted `moon-dev` runner: a nightly job (03:17 UTC) runs the full matrix at the
+  default single iteration, and a weekly soak job (Saturday 04:41 UTC) runs
+  `MOON_CRASH_MATRIX_ITERS=20` on the 10 cells with a probabilistic kill point
+  (`mid_checkpoint`, `graph_drop_survives_repeated_checkpoints`, `txn_isolated_*`) — the cells
+  kernel M3 stage 2 (task #53) proved need repeated sampling, not a single pass, to catch a
+  timing-window regression. Both jobs support `workflow_dispatch` for on-demand runs. Not
+  wired into the per-PR gate: the self-hosted runner is a single machine and PR-time is already
+  tight (same rationale as `integration-tests.yml`'s `ci-full` label gate).
+
+  Confirmation run on the moon-dev Linux VM (fresh ELF release binary, main @ `ec084556`,
+  `MOON_BIN` pinned, `--test-threads=1`): the full 46-cell matrix passed **2/2 consecutive runs**
+  (`46 passed; 0 failed`, ~79s each), including all former RED cells — the 6 legacy-mode graph
+  cells (task #60 / PR #322) and the MQ generic-DEL resurrection cell (task #46 / PR #301) all
+  now run ungated (no `harness::red_guard` call sites remain in the suite). A
+  `MOON_CRASH_MATRIX_ITERS=5` soak of the 10 probabilistic-kill-point cells also passed 5/5
+  iterations clean (`10 passed; 0 failed`, 40.3s) — these are the same cells that, pre-fix,
+  failed at iteration 7/20 and 11/20 in the kernel M3 stage 2 investigation.
+
 ### Documentation
 - **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
   post-v0.7.1 actuals: v0.6.1/v0.7.0 marked shipped (with the R5/R6 slips and the
