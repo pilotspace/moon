@@ -115,6 +115,13 @@ pub async fn read_cold_entry_async(
 }
 
 #[cfg(test)]
+// `test_lock()` below is a `std::sync::Mutex<()>` held deliberately across
+// `.await` points: it serializes tests that mutate the process-global
+// `TEST_INJECT_DELAY_MS` knob so concurrent `cargo test` runs don't race on
+// it (see the doc comment on `test_lock`). It is never touched by production
+// code and never contended outside this test module, so the usual deadlock
+// concern the lint guards against doesn't apply here.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::persistence::manifest::ShardManifest;
