@@ -1,5 +1,10 @@
 # Releases
 
+## v0.8.0 — 2026-07-16
+milestones: v0.8.0 "One Storage Kernel GA" (close-out + verification of the kernel built during the v0.7.0 cycle)
+waivers: none new — `XSHARD-READ-01` remains the open GA gap (ROADMAP R4), unchanged.
+evidence: The kernel becomes a verifiable public claim. (1) **Cross-plane kill-9 crash matrix (CRASH-02):** grown to 46 cells (KV/vector/graph/FTS/WS/MQ/temporal/txn × appendonly × disk-offload × shards), all green **ungated** (zero `red_guard` sites); wired into scheduled CI — nightly full matrix + Saturday `ITERS=20` probabilistic-cell soak (`.github/workflows/crash-matrix.yml`, PR #352) — and both modes re-run green on the RC `82752af5` as this tag's gate. (2) **10×-RAM acceptance re-passed on real disk (MEM-10X-01):** `docs/perf/2026-07-16-g2-10x-ram-rerun.md` — 2.6GB/10KB-values against a 256MB cap: truthful `used_memory` at 1.00× cap steady-state with a ≤5s post-restart drain (task #56, PR #349: logical ledger replaces RSS, stub-only recovery, AOF-replay demote); spill files 236K → **840** for the same dataset (PR #350 segment batching + file-absolute overflow-chain fix); cold-GET-during-spill worst tail 1,910ms → **205ms**; restart AOF-replay-bound (file count out of the boot path); 500/500 kill-9 integrity. (3) Task #49 atomic-write sweep audit-closed (already shipped in v0.7.0 via PR #304; PR #347 corrects the stale roadmap listing). Also in this release: vector auto-merge CPU-livelock fix (fingerprinted exponential backoff for gate-rejected GraphUnion merges, PR #353, found live in production) and CI hygiene (heavy recall canaries → nightly release-profile job, Test step 220s→88s, PR #354). Disclosed non-blocking follow-ups: task #59 read-vs-spill fairness (205ms tail, target <10ms), issue #355 (`DBSIZE` counts only resident keys under offload), restart time bounded by AOF-rewrite cadence.
+
 ## v0.7.1 — 2026-07-15
 milestones: none (patch release folding in the two v0.7.0-tag-disclosed follow-ups)
 waivers: none new — `XSHARD-READ-01` remains the open GA gap (ROADMAP R4), unchanged from v0.7.0.
