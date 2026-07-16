@@ -14,100 +14,130 @@
 //! handle ([`ManifestIo`]) on a dedicated per-shard thread and performs the
 //! exact same ordered overflow→root→fsync sequence off-loop.
 //!
-//! Two commit flavors:
-//! - **Deferred** (`commit_deferred`): fire-and-forget snapshot send; the
-//!   spill-completion path uses this. Consecutive queued snapshots coalesce —
-//!   each is a complete root, so only the newest needs to reach disk.
-//! - **Durable** (`commit_durable`): send + block on ack. Paths where the
-//!   manifest IS the durability record (checkpoint protocol, no-AOF durable
-//!   batch spill) keep exactly their old blocking semantics through this.
+//! Two commit flavors, both handed over via a single latest-snapshot slot
+//! (never a queue — a bounded queue behind a stalled fsync would block the
+//! shard thread, re-creating the very stall this agent removes):
+//! - **Deferred** (`commit_deferred`): fire-and-forget slot replace + wake;
+//!   the spill-completion path uses this. Consecutive snapshots coalesce by
+//!   construction — each is a complete root, so only the newest needs to
+//!   reach disk.
+//! - **Durable** (`commit_durable`): slot replace + wake, then block on ack.
+//!   Paths where the manifest IS the durability record (checkpoint protocol,
+//!   no-AOF durable batch spill) keep exactly their old blocking semantics
+//!   through this.
 //!
-//! Coalescing + ack correctness: when several commits coalesce, every ack is
-//! fired after the NEWEST snapshot persists. A newer root strictly supersedes
-//! an older one (each snapshot is the full entry list at a higher epoch), so
-//! "your commit is durable" remains true for the older requester.
+//! Coalescing + ack correctness: every ack is fired after the NEWEST snapshot
+//! persists. A newer root strictly supersedes an older one (each snapshot is
+//! the full entry list at a higher epoch), so "your commit is durable"
+//! remains true for the older requester.
 
 use std::io;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use super::manifest::{ManifestIo, ManifestRoot};
 
-/// Queue depth for pending commit requests. Deferred sends block only if the
-/// agent falls this many complete snapshots behind (each bounded by one
-/// `persist`, i.e. ~2 fsyncs) — bounded, and still off the per-file cadence
-/// the loop used to pay.
-const QUEUE_CAP: usize = 64;
-
-pub(crate) enum SyncRequest {
-    Commit {
-        root: ManifestRoot,
-        ack: Option<flume::Sender<io::Result<()>>>,
-    },
-    Shutdown {
-        give_back: flume::Sender<ManifestIo>,
-    },
+/// State shared between callers and the sync thread. Commits REPLACE the
+/// `latest` slot instead of queueing — each snapshot is a complete root at a
+/// monotonically higher epoch, so only the newest must ever reach disk. The
+/// slot never fills up, so a deferred commit can never block the shard
+/// thread behind a slow persist (a saturated-disk fsync stall would have
+/// filled any bounded queue and re-created exactly the stall this agent
+/// exists to remove).
+struct SyncShared {
+    latest: Option<ManifestRoot>,
+    /// Durable waiters. Always pushed together with a `latest` write, and
+    /// taken together with it; firing after a NEWER snapshot persists is
+    /// correct because a newer root strictly supersedes the waiter's own.
+    acks: Vec<flume::Sender<io::Result<()>>>,
+    /// Set once by `shutdown()`; the thread gives back its [`ManifestIo`]
+    /// on this and exits after a final flush of the slot.
+    shutdown: Option<flume::Sender<ManifestIo>>,
 }
 
 /// Handle to the per-shard manifest-sync thread. Owned by `ShardManifest`
 /// while deferred sync is enabled; `shutdown()` reclaims the [`ManifestIo`]
 /// so post-shutdown commits can run inline again.
 pub(crate) struct ManifestSyncAgent {
-    tx: flume::Sender<SyncRequest>,
+    shared: Arc<Mutex<SyncShared>>,
+    /// Wake token, capacity 1. `Full` on send is fine: a token is already
+    /// pending and state was written before the send, so the thread's next
+    /// round observes it. `Disconnected` means the thread is gone — fail
+    /// loudly, never a silent no-op.
+    wake: flume::Sender<()>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ManifestSyncAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManifestSyncAgent")
-            .field("queued", &self.tx.len())
+            .field("pending", &self.shared.lock().latest.is_some())
             .finish()
     }
 }
 
 impl ManifestSyncAgent {
     pub(crate) fn spawn(io: ManifestIo, shard_id: usize) -> Self {
-        let (tx, rx) = flume::bounded(QUEUE_CAP);
+        let shared = Arc::new(Mutex::new(SyncShared {
+            latest: None,
+            acks: Vec::new(),
+            shutdown: None,
+        }));
+        let (wake, rx) = flume::bounded(1);
+        let thread_shared = Arc::clone(&shared);
         let join = match std::thread::Builder::new()
             .name(format!("manifest-sync-{shard_id}"))
-            .spawn(move || run(io, rx))
+            .spawn(move || run(io, thread_shared, rx))
         {
             Ok(j) => Some(j),
             Err(e) => {
-                // Receiver is dropped with the failed spawn, so every send
+                // Receiver is dropped with the failed spawn, so every wake
                 // fails loudly; durable callers surface the error, deferred
                 // callers warn. No silent no-op.
                 tracing::error!(shard_id, error = %e, "manifest-sync: thread spawn failed");
                 None
             }
         };
-        Self { tx, join }
+        Self { shared, wake, join }
     }
 
-    /// Fire-and-forget commit of a complete root snapshot.
+    fn notify(&self) -> io::Result<()> {
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => Ok(()),
+            Err(flume::TrySendError::Disconnected(())) => {
+                Err(io::Error::other("manifest-sync thread unavailable"))
+            }
+        }
+    }
+
+    /// Fire-and-forget commit of a complete root snapshot. Never blocks:
+    /// replaces the shared slot and posts a wake token.
     pub(crate) fn commit_deferred(&self, root: ManifestRoot) -> io::Result<()> {
-        self.tx
-            .send(SyncRequest::Commit { root, ack: None })
-            .map_err(|_| io::Error::other("manifest-sync thread unavailable"))
+        self.shared.lock().latest = Some(root);
+        self.notify()
     }
 
     /// Commit and block until the snapshot (or a newer one) is durable.
     pub(crate) fn commit_durable(&self, root: ManifestRoot) -> io::Result<()> {
         let (ack_tx, ack_rx) = flume::bounded::<io::Result<()>>(1);
-        self.tx
-            .send(SyncRequest::Commit {
-                root,
-                ack: Some(ack_tx),
-            })
-            .map_err(|_| io::Error::other("manifest-sync thread unavailable"))?;
+        {
+            let mut s = self.shared.lock();
+            s.latest = Some(root);
+            s.acks.push(ack_tx);
+        }
+        self.notify()?;
         ack_rx
             .recv()
             .map_err(|_| io::Error::other("manifest-sync thread died before ack"))?
     }
 
-    /// Flush all pending commits and reclaim the file-I/O state. Returns
+    /// Flush any pending commit and reclaim the file-I/O state. Returns
     /// `None` only if the thread died abnormally (its panic already logged).
     pub(crate) fn shutdown(mut self) -> Option<ManifestIo> {
         let (gb_tx, gb_rx) = flume::bounded::<ManifestIo>(1);
-        let _ = self.tx.send(SyncRequest::Shutdown { give_back: gb_tx });
+        self.shared.lock().shutdown = Some(gb_tx);
+        let _ = self.notify();
         let io = gb_rx.recv().ok();
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -116,37 +146,33 @@ impl ManifestSyncAgent {
     }
 }
 
-fn run(mut io: ManifestIo, rx: flume::Receiver<SyncRequest>) {
-    while let Ok(req) = rx.recv() {
-        let (mut latest, mut acks) = match req {
-            SyncRequest::Shutdown { give_back } => {
-                let _ = give_back.send(io);
-                return;
-            }
-            SyncRequest::Commit { root, ack } => (root, ack.into_iter().collect::<Vec<_>>()),
+fn run(mut io: ManifestIo, shared: Arc<Mutex<SyncShared>>, rx: flume::Receiver<()>) {
+    while rx.recv().is_ok() {
+        // Take the whole state atomically. Anything written after this take
+        // comes with its own wake token (writers post the token AFTER the
+        // state write; `Full` implies an unconsumed token), so it is handled
+        // in a later round — no lost updates.
+        let (latest, acks, shutdown) = {
+            let mut s = shared.lock();
+            (
+                s.latest.take(),
+                std::mem::take(&mut s.acks),
+                s.shutdown.take(),
+            )
         };
 
-        // Coalesce everything already queued: each snapshot is a complete
-        // root at a monotonically higher epoch, so only the newest must hit
-        // disk. Acks collected along the way fire after that newest persist.
-        let mut pending_shutdown: Option<flume::Sender<ManifestIo>> = None;
-        while let Ok(more) = rx.try_recv() {
-            match more {
-                SyncRequest::Commit { root, ack } => {
-                    latest = root;
-                    acks.extend(ack);
+        let res = match latest {
+            Some(root) => {
+                let r = io.persist(root);
+                if let Err(ref e) = r {
+                    tracing::warn!(error = %e, "manifest-sync: commit failed (placement metadata only; AOF replay + orphan sweep recover on restart)");
                 }
-                SyncRequest::Shutdown { give_back } => {
-                    pending_shutdown = Some(give_back);
-                    break;
-                }
+                r
             }
-        }
-
-        let res = io.persist(latest);
-        if let Err(ref e) = res {
-            tracing::warn!(error = %e, "manifest-sync: commit failed (placement metadata only; AOF replay + orphan sweep recover on restart)");
-        }
+            // Empty slot: a previous round already persisted a snapshot at
+            // least as new as anything these (necessarily-raced) wakes saw.
+            None => Ok(()),
+        };
         for ack in acks {
             let mirrored = match &res {
                 Ok(()) => Ok(()),
@@ -156,14 +182,15 @@ fn run(mut io: ManifestIo, rx: flume::Receiver<SyncRequest>) {
             let _ = ack.send(mirrored);
         }
 
-        if let Some(give_back) = pending_shutdown {
+        if let Some(give_back) = shutdown {
             let _ = give_back.send(io);
             return;
         }
     }
-    // Channel disconnected without an explicit Shutdown: `ShardManifest` was
-    // dropped. flume delivers everything already queued before reporting the
-    // disconnect, so no accepted commit is lost; `io` (and its fd) drop here.
+    // Wake channel disconnected without an explicit Shutdown: `ShardManifest`
+    // was dropped. Every accepted commit's token is delivered before the
+    // disconnect is reported (flume drains queued messages first), so the
+    // slot was flushed; `io` (and its fd) drop here.
 }
 
 #[cfg(test)]
@@ -282,6 +309,55 @@ mod tests {
             reopened.files().len(),
             20,
             "coalescing must still land the final (superset) snapshot"
+        );
+    }
+
+    /// The old bounded(64) request queue blocked the CALLER once a stalled
+    /// persist let 64 snapshots pile up — a saturated-disk fsync stall would
+    /// re-create on the shard thread exactly the stall the agent exists to
+    /// remove. The latest-slot handoff must absorb an arbitrarily large burst
+    /// without the caller ever waiting on the persist.
+    #[test]
+    fn burst_of_deferred_commits_never_blocks_the_caller() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("shard-4.manifest");
+        let mut m = ShardManifest::create(&path).expect("create");
+        m.enable_deferred_sync(4);
+
+        // Stall every persist and get the worker INSIDE one before bursting:
+        // a burst fired while the worker is still draining its queue gets
+        // consumed as fast as it is sent, which is why a plain burst never
+        // reproduced the block. Blocking needs commits to arrive while the
+        // worker is stuck in persist with no one draining.
+        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
+            .store(400, std::sync::atomic::Ordering::SeqCst);
+        m.add_file(make_entry(999));
+        m.commit_deferred().expect("priming deferred send");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let t0 = Instant::now();
+        for i in 0..100u64 {
+            m.add_file(make_entry(1000 + i));
+            m.commit_deferred().expect("deferred send");
+        }
+        let elapsed = t0.elapsed();
+        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a 100-commit burst against a stalled persist must not block the \
+             caller (took {elapsed:?})"
+        );
+
+        m.shutdown_deferred();
+        drop(m);
+        let reopened = ShardManifest::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.files().len(),
+            101,
+            "the final (superset) snapshot must land despite coalescing"
         );
     }
 
