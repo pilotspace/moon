@@ -130,6 +130,11 @@ pub(crate) fn read_cold_entry(
     now_ms: u64,
     page_cache: Option<&PageCache>,
 ) -> ColdReadOutcome {
+    // Task #59 lever 2: any cold read — including the synchronous MGET /
+    // MULTI / Lua paths that never go through the async pool — signals the
+    // spill writer to briefly yield the device. Double-counting with the
+    // async path's own guard is harmless (the signal is "readers > 0").
+    let _inflight = super::cold_read_pool::ColdReadInflightGuard::new();
     #[cfg(test)]
     {
         let delay_ms = TEST_INJECT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
