@@ -111,7 +111,10 @@ pub fn acquire(dir: &Path) -> Result<DirLock, DirLockError> {
     Ok(DirLock {})
 }
 
-#[cfg(all(test, unix))]
+// Stacked cfgs (not `all(test, unix)`): scripts/audit-unwrap.sh detects test
+// modules by the literal `#[cfg(test)]` attribute.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
