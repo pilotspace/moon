@@ -50,18 +50,26 @@ pub(crate) static COLD_READS_INFLIGHT: std::sync::atomic::AtomicUsize =
 
 /// RAII increment of [`COLD_READS_INFLIGHT`] — drop-based so the count stays
 /// correct when an awaiting connection task is cancelled mid-read.
-pub(crate) struct ColdReadInflightGuard;
+pub(crate) struct ColdReadInflightGuard(&'static std::sync::atomic::AtomicUsize);
 
 impl ColdReadInflightGuard {
     pub(crate) fn new() -> Self {
-        COLD_READS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
+        Self::on(&COLD_READS_INFLIGHT)
+    }
+
+    /// Guard an explicit counter. Exists so tests can verify the RAII
+    /// mechanics on a private counter — the global one is shared with every
+    /// concurrently running test that touches the cold-read path, so exact
+    /// assertions on it are inherently racy.
+    pub(crate) fn on(counter: &'static std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
     }
 }
 
 impl Drop for ColdReadInflightGuard {
     fn drop(&mut self) {
-        COLD_READS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

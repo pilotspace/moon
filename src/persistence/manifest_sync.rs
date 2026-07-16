@@ -78,28 +78,44 @@ impl std::fmt::Debug for ManifestSyncAgent {
 }
 
 impl ManifestSyncAgent {
-    pub(crate) fn spawn(io: ManifestIo, shard_id: usize) -> Self {
+    /// Spawn the sync thread. On failure (thread limit, EAGAIN) the caller
+    /// gets its [`ManifestIo`] BACK so it can keep committing inline — a
+    /// failed spawn must degrade to on-loop fsyncs, never to a manifest that
+    /// can no longer commit at all. The io is handed to the thread over a
+    /// channel (not moved into the closure) precisely so it survives the
+    /// failure path.
+    pub(crate) fn spawn(io: ManifestIo, shard_id: usize) -> Result<Self, (ManifestIo, io::Error)> {
         let shared = Arc::new(Mutex::new(SyncShared {
             latest: None,
             acks: Vec::new(),
             shutdown: None,
         }));
         let (wake, rx) = flume::bounded(1);
+        let (io_tx, io_rx) = flume::bounded::<ManifestIo>(1);
         let thread_shared = Arc::clone(&shared);
-        let join = match std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name(format!("manifest-sync-{shard_id}"))
-            .spawn(move || run(io, thread_shared, rx))
-        {
-            Ok(j) => Some(j),
-            Err(e) => {
-                // Receiver is dropped with the failed spawn, so every wake
-                // fails loudly; durable callers surface the error, deferred
-                // callers warn. No silent no-op.
-                tracing::error!(shard_id, error = %e, "manifest-sync: thread spawn failed");
-                None
-            }
-        };
-        Self { shared, wake, join }
+            .spawn(move || {
+                // The spawner sends the io immediately after a successful
+                // spawn; Err here means the agent was dropped first — exit.
+                let Ok(io) = io_rx.recv() else { return };
+                run(io, thread_shared, rx)
+            }) {
+            Ok(join) => match io_tx.send(io) {
+                Ok(()) => Ok(Self {
+                    shared,
+                    wake,
+                    join: Some(join),
+                }),
+                // Thread died before its recv (can only be a panic in thread
+                // start-up glue) — flume returns the unsent io in the error.
+                Err(flume::SendError(io)) => {
+                    let _ = join.join();
+                    Err((io, io::Error::other("manifest-sync thread died at startup")))
+                }
+            },
+            Err(e) => Err((io, e)),
+        }
     }
 
     fn notify(&self) -> io::Result<()> {
@@ -284,17 +300,22 @@ mod tests {
 
         let before =
             super::super::manifest::TEST_PERSIST_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        // Stall the agent on its first persist so the rest of the burst
-        // queues up behind it and coalesces.
+        // Get the worker INSIDE a stalled persist before the burst, and keep
+        // every persist stalled until after the shutdown flush — otherwise
+        // scheduling can let the worker race the burst commit-by-commit and
+        // weaken the coalescing bound into flakiness.
         super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
             .store(100, std::sync::atomic::Ordering::SeqCst);
+        m.add_file(make_entry(99));
+        m.commit_deferred().expect("priming deferred send");
+        std::thread::sleep(Duration::from_millis(50));
         for i in 0..20u64 {
             m.add_file(make_entry(100 + i));
             m.commit_deferred().expect("deferred send");
         }
+        m.shutdown_deferred();
         super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
             .store(0, std::sync::atomic::Ordering::SeqCst);
-        m.shutdown_deferred();
         let persists = super::super::manifest::TEST_PERSIST_COUNT
             .load(std::sync::atomic::Ordering::SeqCst)
             - before;
@@ -307,7 +328,7 @@ mod tests {
         let reopened = ShardManifest::open(&path).expect("reopen");
         assert_eq!(
             reopened.files().len(),
-            20,
+            21,
             "coalescing must still land the final (superset) snapshot"
         );
     }

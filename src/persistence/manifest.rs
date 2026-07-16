@@ -541,9 +541,22 @@ impl ShardManifest {
     pub fn enable_deferred_sync(&mut self, shard_id: usize) {
         let cur = std::mem::replace(&mut self.io, IoBackend::Poisoned);
         self.io = match cur {
-            IoBackend::Inline(io) => IoBackend::Deferred(
-                crate::persistence::manifest_sync::ManifestSyncAgent::spawn(io, shard_id),
-            ),
+            IoBackend::Inline(io) => {
+                match crate::persistence::manifest_sync::ManifestSyncAgent::spawn(io, shard_id) {
+                    Ok(agent) => IoBackend::Deferred(agent),
+                    // Degrade, don't destroy: a failed thread spawn keeps the
+                    // working inline backend (commits fsync on the shard
+                    // thread again — slow, but durable and loud about it).
+                    Err((io, e)) => {
+                        tracing::error!(
+                            shard_id, error = %e,
+                            "manifest-sync: thread spawn failed — staying inline \
+                             (manifest commits fsync on the shard thread)"
+                        );
+                        IoBackend::Inline(io)
+                    }
+                }
+            }
             other => other,
         };
     }

@@ -730,14 +730,18 @@ mod tests {
 
     #[test]
     fn reader_inflight_guard_counts_and_releases() {
-        use super::super::cold_read_pool::{COLD_READS_INFLIGHT, ColdReadInflightGuard};
-        let base = COLD_READS_INFLIGHT.load(Ordering::Relaxed);
+        use super::super::cold_read_pool::ColdReadInflightGuard;
+        // Own counter, NOT the global COLD_READS_INFLIGHT: sibling tests in
+        // this binary exercise the cold-read path concurrently, so exact
+        // assertions on the shared global are racy. The RAII mechanics are
+        // identical either way.
+        static LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         {
-            let _g1 = ColdReadInflightGuard::new();
-            let _g2 = ColdReadInflightGuard::new();
-            assert_eq!(COLD_READS_INFLIGHT.load(Ordering::Relaxed), base + 2);
+            let _g1 = ColdReadInflightGuard::on(&LOCAL);
+            let _g2 = ColdReadInflightGuard::on(&LOCAL);
+            assert_eq!(LOCAL.load(Ordering::Relaxed), 2);
         }
-        assert_eq!(COLD_READS_INFLIGHT.load(Ordering::Relaxed), base);
+        assert_eq!(LOCAL.load(Ordering::Relaxed), 0);
     }
 
     #[test]
