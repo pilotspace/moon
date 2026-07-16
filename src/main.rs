@@ -386,6 +386,34 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Instance lock: refuse a second moon on the same data dir BEFORE any
+    // listener binds or data file opens — two writers on the same WAL/AOF/
+    // manifests corrupt silently. flock-based, so kill -9 releases it (no
+    // stale-pidfile failure mode). Held for the life of the process. Also
+    // covers a custom --disk-offload-dir when it differs from --dir.
+    let _dir_lock = moon::persistence::dir_lock::acquire(std::path::Path::new(&config.dir))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _offload_dir_lock = if config.disk_offload_enabled() {
+        let offload_dir = config.effective_disk_offload_dir();
+        if offload_dir != std::path::Path::new(&config.dir) {
+            if let Err(e) = std::fs::create_dir_all(&offload_dir) {
+                return Err(anyhow::anyhow!(
+                    "failed to create disk-offload directory {:?}: {}",
+                    offload_dir,
+                    e
+                ));
+            }
+            Some(
+                moon::persistence::dir_lock::acquire(&offload_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
     // Build the auth + CORS policies BEFORE the admin listener binds so
     // misconfiguration (wildcard CORS + auth required, empty secret) fails
