@@ -429,38 +429,50 @@ impl<V> DashTable<CompactKey, V> {
                 InsertOrUpdate::Updated(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
             }
             SegmentInsertOrUpdate::NeedsSplit { update, make } => {
-                // Split the segment, then retry via the normal insert path.
-                // The closures were not consumed by the segment helper.
-                self.split_segment(dir_idx);
+                // Split and retry until the key's target segment has room,
+                // mirroring `insert`'s recursive retry. A single split does
+                // NOT guarantee room: when the overflowing segment's keys are
+                // skewed on the next directory bit they can all land in the
+                // same child, which is then still over LOAD_THRESHOLD.
+                // Each split raises the target's local depth, so the loop
+                // terminates once the colliding keys separate.
+                let mut update = update;
+                let mut make = make;
+                let mut split_dir_idx = dir_idx;
+                let (final_seg_idx, slot, inserted) = loop {
+                    self.split_segment(split_dir_idx);
 
-                // After split, the directory may have doubled and the key now
-                // routes to a different segment. Recompute.
-                let new_dir_idx = segment_index(hash, self.depth);
-                let new_seg_idx = self.directory[new_dir_idx];
-                let new_segment = self.segments.get_mut(new_seg_idx);
+                    // After split, the directory may have doubled and the key
+                    // now routes to a different segment. Recompute.
+                    split_dir_idx = segment_index(hash, self.depth);
+                    let new_seg_idx = self.directory[split_dir_idx];
+                    let new_segment = self.segments.get_mut(new_seg_idx);
 
-                let retry =
-                    new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make);
-
-                match retry {
-                    SegmentInsertOrUpdate::Inserted { slot } => {
-                        self.len += 1;
-                        // SAFETY: just-inserted (mirrors find at segment.rs:277).
-                        InsertOrUpdate::Inserted(unsafe {
-                            self.segments.get_mut(new_seg_idx).value_mut(slot)
-                        })
+                    match new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make)
+                    {
+                        SegmentInsertOrUpdate::Inserted { slot } => {
+                            break (new_seg_idx, slot, true);
+                        }
+                        SegmentInsertOrUpdate::Updated { slot } => {
+                            break (new_seg_idx, slot, false);
+                        }
+                        SegmentInsertOrUpdate::NeedsSplit { update: u, make: m } => {
+                            update = u;
+                            make = m;
+                        }
                     }
-                    SegmentInsertOrUpdate::Updated { slot } => {
-                        // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
-                        InsertOrUpdate::Updated(unsafe {
-                            self.segments.get_mut(new_seg_idx).value_mut(slot)
-                        })
-                    }
-                    SegmentInsertOrUpdate::NeedsSplit { .. } => {
-                        // A single split guarantees room (LOAD_THRESHOLD < TOTAL_SLOTS
-                        // and split halves the load). This path should be unreachable.
-                        unreachable!("double NeedsSplit after split_segment")
-                    }
+                };
+                if inserted {
+                    self.len += 1;
+                    // SAFETY: just-inserted (mirrors find at segment.rs:277).
+                    InsertOrUpdate::Inserted(unsafe {
+                        self.segments.get_mut(final_seg_idx).value_mut(slot)
+                    })
+                } else {
+                    // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
+                    InsertOrUpdate::Updated(unsafe {
+                        self.segments.get_mut(final_seg_idx).value_mut(slot)
+                    })
                 }
             }
         }
@@ -592,11 +604,53 @@ impl<'a, V> IntoIterator for &'a DashTable<CompactKey, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::segment::TOTAL_SLOTS;
+    use super::segment::{LOAD_THRESHOLD, TOTAL_SLOTS};
     use super::*;
 
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
+    }
+
+    #[test]
+    fn test_insert_or_update_survives_skewed_double_split() {
+        // Keys sharing the top 12 hash bits route to the same segment for
+        // every split up to depth 12, so one split cannot separate them.
+        // Filling a segment past LOAD_THRESHOLD with such keys makes the
+        // post-split retry inside insert_or_update hit NeedsSplit again —
+        // the old code declared that unreachable and panicked (reproduced
+        // live replaying a 219k-key WAL checkpoint on recovery).
+        const SKEW_BITS: u32 = 12;
+        let want = LOAD_THRESHOLD + 2;
+        let target = hash_key(b"skew_0") >> (64 - SKEW_BITS);
+        let mut keys = Vec::with_capacity(want);
+        let mut i = 0u64;
+        while keys.len() < want {
+            let k = format!("skew_{i}");
+            if hash_key(k.as_bytes()) >> (64 - SKEW_BITS) == target {
+                keys.push(k);
+            }
+            i += 1;
+        }
+
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for (n, k) in keys.iter().enumerate() {
+            let mut updated = false;
+            table.insert_or_update(
+                CompactKey::from(k.clone()),
+                |_| updated = true,
+                || format!("v{n}"),
+            );
+            assert!(!updated, "unexpected in-place update for fresh key {k}");
+        }
+
+        assert_eq!(table.len(), want);
+        for (n, k) in keys.iter().enumerate() {
+            assert_eq!(
+                table.get(k.as_bytes()),
+                Some(&format!("v{n}")),
+                "missing {k} after skewed splits"
+            );
+        }
     }
 
     #[test]
