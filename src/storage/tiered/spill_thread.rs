@@ -22,15 +22,62 @@
 //! Pattern: event loop builds `SpillRequest` (CPU-only, no I/O) -> sends via
 //! flume channel -> background thread buffers + writes -> sends `SpillCompletion`
 //! back -> event loop polls completions and updates manifest + ColdIndex.
+//!
+//! ## Batching is size-independent
+//!
+//! `flush_buffer` hands the WHOLE buffered batch to
+//! `kv_spill::build_kv_spill_batch` regardless of individual entry size —
+//! oversized (overflow-chained) entries get a dedicated leaf + overflow chain
+//! INSIDE the shared file, not a dedicated file of their own (see that
+//! function's doc). Before this, entries whose `value_bytes` exceeded
+//! `INLINE_MAX_VALUE_BYTES` were pre-screened out of the batch and each
+//! written to its own single-entry file — correct, but for a workload whose
+//! values are consistently above that threshold (e.g. 10KB), it silently
+//! degenerated `flush_buffer`'s otherwise-correct `FLUSH_ENTRY_CAP`-sized
+//! grouping into ~1 file per evicted key (measured: a 10KB-value repro
+//! produced ~1 file per completed spill, `spill_batches_flushed` staying in
+//! the tens while `heap-*.mpf` count tracked the key count 1:1 — the v0.8
+//! "spill-file batching" fix).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Maximum entries to buffer before forcing a flush.
-/// At ~200 B/entry this is ~50 KB of in-memory data — well under any
-/// reasonable memory budget and keeps file sizes manageable.
+///
+/// This bound alone no longer caps in-RAM batch size (stale pre-v0.8 "batching"
+/// claim — see `BATCH_BYTES_CAP` below): since the spill-file-batching fix,
+/// oversized (overflow-chained) entries share a batch with everything else in
+/// the flush instead of each getting their own dedicated file, so 256
+/// consistently-large values (e.g. near-`maxmemory`-sized strings) could
+/// still mean 256 * value_size resident in `build_kv_spill_batch`'s output
+/// before a single byte reaches disk. `FLUSH_ENTRY_CAP` still bounds manifest
+/// growth (#files ~ #keys/256, not #keys) and per-flush fsync count; it is
+/// `BATCH_BYTES_CAP` that now bounds peak batch-build RAM.
 const FLUSH_ENTRY_CAP: usize = 256;
+
+/// Bytes-based sub-batch cap (review FIX 2): `build_kv_spill_batch`
+/// materializes an entire sub-batch's physical pages in one `Vec<BatchSlot>`
+/// before `write_kv_spill_batch` streams them to disk — spills fire under
+/// memory pressure, so this is exactly the wrong place for an unbounded
+/// working set. `flush_buffer` below splits a `FLUSH_ENTRY_CAP`-sized buffer
+/// into sub-batches capped at this many cumulative `value_bytes`, each
+/// becoming its own file (reusing that sub-batch's own first request's
+/// pre-assigned `file_id` — see `SpillRequest::file_id`'s doc on why gaps in
+/// the file_id space are harmless).
+///
+/// 4 MiB chosen against the OLD per-entry path's peak: before batching,
+/// exactly one oversized entry's pages were ever materialized at a time (a
+/// leaf + its own overflow chain, bounded by that single value's size, no
+/// amplification across a flush). The new unconditional-batching path's worst
+/// case is `FLUSH_ENTRY_CAP * max_value_size` — unbounded in principle. 4 MiB
+/// keeps ordinary flushes (the G2 acceptance shape: 256 entries x ~10 KB =
+/// ~2.5 MiB) as ONE file — no behavior change for the workload that
+/// motivated this fix — while bounding the pathological case (256 large
+/// values in one buffer) to ~4 MiB resident per sub-batch instead of
+/// hundreds of MB, restoring a bound of the same order as the old per-entry
+/// path (one value's worth of pages) rather than a multiplicative one.
+const BATCH_BYTES_CAP: usize = 4 * 1024 * 1024;
 
 /// Cumulative count of `SpillCompletion`s dropped. Dropping is **data loss**:
 /// the `.mpf` file is on disk but its manifest `add_file` + `cold_index` insert
@@ -75,8 +122,8 @@ use crate::persistence::kv_page::ValueType;
 use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
 use crate::persistence::page::PageType;
 use crate::storage::tiered::kv_spill::{
-    INLINE_MAX_VALUE_BYTES, SpillEntry, build_kv_spill_batch, build_kv_spill_pages,
-    write_kv_spill_batch, write_kv_spill_pages,
+    SpillEntry, build_kv_spill_batch, build_kv_spill_pages, write_kv_spill_batch,
+    write_kv_spill_pages,
 };
 
 /// Request sent from event loop to background spill thread.
@@ -153,33 +200,36 @@ fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
     }
 }
 
-/// Flush the buffered requests.
+/// Flush the buffered requests as ONE shared multi-page `.mpf` file, holding
+/// every entry regardless of value size — `build_kv_spill_batch` gives
+/// oversized entries a dedicated leaf + overflow chain INSIDE the batch file
+/// instead of a dedicated file of their own (see that function's doc for why
+/// this is what makes batching effective for large-value workloads).
 ///
-/// ## Routing
+/// This keeps manifest entries == #files (not #keys), removing the
+/// ~70-entry cap — and, since v0.8, keeps it that way independent of value
+/// size: a workload of consistently-oversized values used to defeat the
+/// batching entirely (each such entry fell through to its own file, so
+/// `FLUSH_ENTRY_CAP`-sized flushes still produced ~1 file per key).
 ///
-/// Entries are pre-screened by `value_bytes.len()`:
+/// On a build or write failure for the whole batch (defensive — e.g. a
+/// pathologically large key that doesn't fit a leaf even with a 4-byte
+/// overflow pointer), every entry in the buffer is salvaged individually via
+/// [`spill_single_entry`] rather than dropped — the keys are already evicted
+/// from RAM by the time this runs, so losing the flush would be silent data
+/// loss.
 ///
-/// - **Inline** (`value_bytes.len() ≤ INLINE_MAX_VALUE_BYTES`): packed into ONE
-///   multi-page `.mpf` file using `build_kv_spill_batch` + `write_kv_spill_batch`.
-///   ONE `SpillCompletion` is emitted for the batch file.
-///
-/// - **Oversized** (`value_bytes.len() > INLINE_MAX_VALUE_BYTES`): each entry
-///   gets its own single-page file via `build_kv_spill_pages` + `write_kv_spill_pages`
-///   (the existing single-file path, same as `spill_to_datafile`).  ONE
-///   `SpillCompletion` is emitted per oversized entry; its `page_idx` is always 0.
-///
-/// This keeps manifest entries == #files (not #keys) for inline entries, removing
-/// the ~70-entry cap.  Oversized entries still cost one manifest entry each, but
-/// they are rare in typical workloads.
-///
-/// Returns a `Vec<SpillCompletion>` (one per file written).  Never panics.
+/// Returns a `Vec<SpillCompletion>` (one per file written — one for the
+/// common case, more when `BATCH_BYTES_CAP` splits an oversized-heavy flush
+/// into several sub-batch files, or one per salvaged entry on the defensive
+/// fallback). Never panics.
 ///
 /// `pub(crate)`: also called synchronously (no channel, no background
 /// thread) by `crate::storage::eviction`'s no-AOF-backstop durable spill path
-/// (`--appendonly no`), which needs this exact inline/oversized batching to
-/// keep per-eviction I/O at ~1 fsync per up-to-`FLUSH_ENTRY_CAP` keys instead
-/// of 1 fsync per key -- reusing this function (rather than re-deriving the
-/// routing logic) keeps the two paths' on-disk layout identical.
+/// (`--appendonly no`), which needs this exact batching to keep per-eviction
+/// I/O at ~1 fsync per up-to-`FLUSH_ENTRY_CAP` keys instead of 1 fsync per
+/// key -- reusing this function (rather than re-deriving the routing logic)
+/// keeps the two paths' on-disk layout identical.
 pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
     if buffer.is_empty() {
         return Vec::new();
@@ -187,52 +237,60 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
     SPILL_BATCHES_FLUSHED.fetch_add(1, Ordering::Relaxed);
 
     let mut completions: Vec<SpillCompletion> = Vec::new();
+    let shard_dir = buffer[0].shard_dir.clone();
 
-    // ── Partition into inline candidates and oversized entries ────────────────
-    // We use indices to avoid re-allocating keys.  `inline_indices` are the
-    // positions in `buffer` of entries that fit the inline threshold.
-    let mut inline_indices: Vec<usize> = Vec::with_capacity(buffer.len());
-    let mut oversized_indices: Vec<usize> = Vec::new();
-
-    for (i, req) in buffer.iter().enumerate() {
-        if req.value_bytes.len() <= INLINE_MAX_VALUE_BYTES {
-            inline_indices.push(i);
-        } else {
-            oversized_indices.push(i);
+    // Split the flush into `BATCH_BYTES_CAP`-bounded sub-batches (review
+    // FIX 2) so `build_kv_spill_batch` never materializes more than ~one
+    // cap's worth of pages in RAM at once, regardless of how many oversized
+    // entries landed in this `FLUSH_ENTRY_CAP`-sized buffer. Each sub-batch
+    // is a range `[start, end)`; a sub-batch always contains at least one
+    // entry (a single entry larger than the cap gets its own sub-batch
+    // rather than stalling progress).
+    let mut start = 0usize;
+    while start < buffer.len() {
+        let mut end = start + 1;
+        let mut chunk_bytes = buffer[start].value_bytes.len();
+        while end < buffer.len() {
+            let next_len = buffer[end].value_bytes.len();
+            if chunk_bytes + next_len > BATCH_BYTES_CAP {
+                break;
+            }
+            chunk_bytes += next_len;
+            end += 1;
         }
-    }
+        let chunk = &buffer[start..end];
 
-    // ── Write ONE batch file for all inline entries ───────────────────────────
-    if !inline_indices.is_empty() {
-        // Use the file_id of the first inline entry for the batch file.
-        let file_id = buffer[inline_indices[0]].file_id;
-        let shard_dir = buffer[inline_indices[0]].shard_dir.clone();
+        // Use the file_id of this sub-batch's own first request (see
+        // `SpillRequest::file_id` doc — every request already carries its
+        // own pre-assigned id; gaps left by unused ids elsewhere in the
+        // flush are harmless sparse gaps).
+        let file_id = chunk[0].file_id;
 
-        let spill_entries: Vec<SpillEntry> = inline_indices
+        let spill_entries: Vec<SpillEntry> = chunk
             .iter()
-            .map(|&i| SpillEntry {
-                key: buffer[i].key.clone(),
-                value_bytes: buffer[i].value_bytes.clone(),
-                value_type: buffer[i].value_type,
-                flags: buffer[i].flags,
-                ttl_ms: buffer[i].ttl_ms,
+            .map(|req| SpillEntry {
+                key: req.key.clone(),
+                value_bytes: req.value_bytes.clone(),
+                value_type: req.value_type,
+                flags: req.flags,
+                ttl_ms: req.ttl_ms,
             })
             .collect();
 
         match build_kv_spill_batch(&spill_entries, file_id) {
             Ok(batch) => {
-                let total_pages = batch.leaves.len() as u32; // overflow is always empty (inline-only)
+                let total_pages = batch.pages.len() as u32;
                 match write_kv_spill_batch(&shard_dir, file_id, &batch) {
                     Ok(byte_size) => {
-                        let entries = inline_indices
+                        let entries = chunk
                             .iter()
                             .zip(batch.locations.iter())
-                            .map(|(&buf_idx, &(page_idx, slot_idx))| SpillCompletionEntry {
-                                key: buffer[buf_idx].key.clone(),
-                                db_index: buffer[buf_idx].db_index,
+                            .map(|(req, &(page_idx, slot_idx))| SpillCompletionEntry {
+                                key: req.key.clone(),
+                                db_index: req.db_index,
                                 page_idx,
                                 slot_idx,
-                                ttl_ms: buffer[buf_idx].ttl_ms,
+                                ttl_ms: req.ttl_ms,
                             })
                             .collect();
                         completions.push(SpillCompletion {
@@ -245,13 +303,11 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                         warn!(
                             file_id,
                             error = %e,
-                            count = inline_indices.len(),
-                            "spill_thread: inline batch write failed; falling back to per-entry spill"
+                            count = chunk.len(),
+                            "spill_thread: batch write failed; falling back to per-entry spill"
                         );
-                        // Salvage each entry individually rather than dropping the
-                        // whole already-evicted flush.
-                        for &i in &inline_indices {
-                            completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
+                        for req in chunk.iter() {
+                            completions.push(spill_single_entry(req, req.file_id));
                         }
                     }
                 }
@@ -260,21 +316,16 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                 warn!(
                     file_id,
                     error = %e,
-                    count = inline_indices.len(),
-                    "spill_thread: inline batch build failed; falling back to per-entry spill"
+                    count = chunk.len(),
+                    "spill_thread: batch build failed; falling back to per-entry spill"
                 );
-                // One entry that does not fit a fresh inline leaf must not drop the
-                // whole batch — write each via the overflow path instead.
-                for &i in &inline_indices {
-                    completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
+                for req in chunk.iter() {
+                    completions.push(spill_single_entry(req, req.file_id));
                 }
             }
         }
-    }
 
-    // ── Write ONE single-page file per oversized entry ────────────────────────
-    for &i in &oversized_indices {
-        completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
+        start = end;
     }
 
     buffer.clear();
@@ -564,6 +615,7 @@ mod tests {
     use crate::persistence::kv_page::{ValueType, entry_flags};
     use crate::persistence::page::PAGE_4K;
     use crate::storage::entry::current_time_ms;
+    use crate::storage::tiered::kv_spill::INLINE_MAX_VALUE_BYTES;
 
     /// Helper: wait for at least `expected_entries` total entries across all
     /// completions, with a deadline.
@@ -834,6 +886,95 @@ mod tests {
             file_path.exists(),
             "fallback spill file should exist on disk"
         );
+    }
+
+    /// review FIX 2: a single flush whose entries sum well past `BATCH_BYTES_CAP`
+    /// must split into multiple sub-batch files rather than materializing every
+    /// page in one `build_kv_spill_batch` call. Every entry must still land
+    /// somewhere and be readable — splitting is a RAM-bounding measure, not a
+    /// data-loss one.
+    #[test]
+    fn oversized_flush_splits_into_byte_capped_sub_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 8 entries at ~1.5 MiB each = ~12 MiB total, comfortably more than
+        // one `BATCH_BYTES_CAP` (4 MiB) — must produce >= 3 file completions
+        // (ceil(12 / 4) = 3), never one.
+        const ENTRY_LEN: usize = 3 * 1024 * 1024 / 2; // 1.5 MiB
+        const ENTRY_COUNT: usize = 8;
+        let mut buffer: Vec<SpillRequest> = Vec::with_capacity(ENTRY_COUNT);
+        for i in 0..ENTRY_COUNT as u64 {
+            let mut value = Vec::with_capacity(ENTRY_LEN);
+            let mut s: u32 = 0x9E37_79B9_u32.wrapping_add(i as u32);
+            while value.len() < ENTRY_LEN {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                value.push((s >> 24) as u8);
+            }
+            buffer.push(SpillRequest {
+                key: Bytes::from(format!("bigkey_{i}")),
+                db_index: 0,
+                value_bytes: Bytes::from(value),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: i + 1,
+                shard_dir: tmp.path().to_path_buf(),
+            });
+        }
+
+        let completions = flush_buffer(&mut buffer);
+        assert!(
+            completions.len() >= 3,
+            "12 MiB of entries at a 4 MiB cap must split into >= 3 sub-batch files, got {}",
+            completions.len()
+        );
+        // No sub-batch may itself exceed the cap by more than one entry's
+        // worth (the single-oversized-entry escape hatch).
+        for c in &completions {
+            assert!(
+                c.success,
+                "every sub-batch must build+write successfully for this workload"
+            );
+        }
+
+        let total_entries: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(
+            total_entries, ENTRY_COUNT,
+            "every entry must be accounted for across the split sub-batches"
+        );
+
+        // Every entry must be independently readable back from its own
+        // sub-batch's file at the recorded location — splitting must not
+        // corrupt or drop any entry's page location.
+        for c in &completions {
+            for entry in &c.entries {
+                let loc = crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: c.file_entry.file_id,
+                    page_idx: entry.page_idx,
+                    slot_idx: entry.slot_idx,
+                    ttl_ms: entry.ttl_ms,
+                };
+                let outcome = crate::storage::tiered::cold_read::read_cold_entry_at(
+                    tmp.path(),
+                    loc,
+                    u64::MAX / 2,
+                );
+                match outcome {
+                    Some((crate::storage::entry::RedisValue::String(v), _ttl)) => {
+                        assert_eq!(
+                            v.len(),
+                            ENTRY_LEN,
+                            "key {:?} recovered with wrong length after split",
+                            entry.key
+                        );
+                    }
+                    other => panic!(
+                        "key {:?}: expected a String value, got {other:?}",
+                        entry.key
+                    ),
+                }
+            }
+        }
     }
 
     #[test]

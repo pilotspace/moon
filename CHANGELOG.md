@@ -6,6 +6,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Disk-offload spill files now batch effectively — file count scales as
+  ~keys/batch, not ~keys (v0.8 item 3, task #57 follow-up).** The G2
+  acceptance run (260K × 10KB keys, 256MB cap) produced ~236K `heap-*.mpf`
+  files despite the format nominally supporting ≤256 keys/file batching.
+  Root cause: `SpillThread::flush_buffer` (`src/storage/tiered/spill_thread.rs`)
+  already coalesced up to 256 requests per flush, but partitioned them by
+  value size before writing — every entry over `INLINE_MAX_VALUE_BYTES`
+  (3500B, e.g. all of G2's 10KB values) was routed to its own dedicated
+  single-entry file via `spill_single_entry`, defeating the batch entirely.
+  `build_kv_spill_batch` / `write_kv_spill_batch`
+  (`src/storage/tiered/kv_spill.rs`) are rewritten to pack inline AND
+  oversized entries into ONE shared batch file per flush: each oversized
+  entry gets a dedicated leaf (holding an overflow pointer) plus its
+  overflow-page chain placed inline in the same page stream, with the
+  atomic temp-file+`sync_all`+rename+`fsync_directory` write sequence
+  unchanged (payload-before-reference durability ordering preserved — a
+  key is only considered cold after its containing segment is durable).
+  Empirical measurement (macOS, matching G2's shape): RED (pre-fix)
+  3742 files / ~34,908 evicted 10KB keys; GREEN (post-fix) 29 files for
+  the same eviction load — a ~129× reduction, `spill_batches_flushed`
+  now matches file count 1:1 as designed.
+  Fixing this also uncovered and repaired a latent bug in
+  `build_overflow_chain` (`src/persistence/kv_page.rs`): its prev/next
+  link computation silently assumed every chain's `start_page_id == 1`
+  (true of every caller before this change, since a single-entry file
+  always put its one leaf at page 0) — a chain-local `i+1`/`i+2` formula
+  that produced dangling/wrong links the moment a caller (this new
+  batching code) passed a variable `start_page_id > 1` for the second,
+  third, etc. oversized entry sharing a file. Links are now computed as
+  file-absolute (`start_page_id + i`), which is also what
+  `read_overflow_chain` already expected. New unit tests cover
+  oversized-entries-share-one-file, mixed inline/oversized batches, and
+  the recovery-scan/builder agreement for oversized batches
+  (`kv_spill.rs::tests`); a new end-to-end integration test,
+  `tests/crash_recovery_spill_batch_kill9.rs`, drives a real server
+  through a sustained eviction+spill burst of 8000-byte values and
+  SIGKILLs it with no settle window, asserting zero acknowledged-write
+  loss and a batched (not ~1-file-per-key) heap-file count survive the
+  crash and restart under both the monoio and tokio runtimes.
+- **Adversarial-review follow-ups on the above (same task).** Three gaps
+  closed on `perf/spill-segment-batching` before merge:
+  - **Genuine post-restart cold-read coverage.** The kill-9 test above only
+    proves AOF-replay-derived recovery — every acked key ends up hot via
+    `DispatchReplayEngine`, never touching `cold_read_through`, so it cannot
+    tell "the leaf-offset + overflow-chain-with-`start_page_id>1` read path
+    works" apart from "AOF replay papered over a broken cold layout". A new
+    `spill_batch_shared_file_survives_cold_read_after_kill9` test
+    pre-seeds a 3-entry batch file (1 inline + 2 oversized, ordered so the
+    second oversized entry's chain starts at a file-absolute `page_idx > 1`)
+    directly via `build_kv_spill_batch`/`write_kv_spill_batch` +
+    `ShardManifest`, boots a real `--appendonly no` server on top of it,
+    kills it without ever touching the keys, restarts, and GETs all three —
+    the only way any of these bytes can reach the client is a genuine
+    `ColdIndex::rebuild_from_manifest` + `cold_read_through` read. Getting
+    this test to actually exercise that path (rather than a hot-RAM hit)
+    required also pulling in `src/persistence/recovery.rs`'s fix from the
+    concurrent task #56 effort (`fix/t56-used-memory-offload`, commit
+    `689c52e0`): v3 recovery Phase 3 used to re-insert every previously-
+    spilled `String` entry directly into the hot DashTable in ADDITION to
+    rebuilding the `ColdIndex` stub for the same key — for an
+    `entry_flags::OVERFLOW`-stubbed entry this hot-preload loop ignored the
+    flag and inserted the raw 4-byte page-pointer as if it were the literal
+    value, silently corrupting every oversized cold key on every restart
+    (independent of this batching fix — it affected the pre-existing
+    single-entry-per-file layout too). That recovery.rs hunk is a clean,
+    self-contained cherry-pick (verified: identical parent-state diff,
+    no dependency on task #56's other, out-of-scope-here, `used_memory`
+    ledger/RSS/AOF-replay-demotion changes) and is a hard prerequisite for
+    this test's premise, not something this task's rewrite could route
+    around. A companion library-level unit test,
+    `test_rebuild_from_manifest_mixed_inline_and_oversized_roundtrip`
+    (`kv_spill.rs`), independently proves the exact same read path correct
+    via direct calls to the production functions, without depending on
+    server boot sequencing.
+  - **Bounded batch-build memory (`BATCH_BYTES_CAP`, `spill_thread.rs`).**
+    `build_kv_spill_batch` materialized an entire flush's pages in RAM
+    before a single byte reached disk — fine for the 256-small-entries case
+    the old comment described (~50 KB), but the whole point of this fix is
+    that oversized entries now share that same unconditional batch, so 256
+    consistently-large (e.g. near-`maxmemory`-sized) values could resident
+    hundreds of MB at once, exactly when spills fire under memory pressure.
+    `flush_buffer` now splits each `FLUSH_ENTRY_CAP`-sized buffer into
+    sub-batches capped at 4 MiB of cumulative `value_bytes` (chosen against
+    the OLD per-entry path's peak — one value's pages at a time, no
+    cross-entry amplification — while leaving the G2 acceptance shape,
+    256 × ~10 KB ≈ 2.5 MiB, as a single file, unchanged), each becoming its
+    own file via that sub-batch's own already-pre-assigned `file_id` (no new
+    allocation needed — see `SpillRequest::file_id`'s doc on harmless id
+    gaps). New unit test: `oversized_flush_splits_into_byte_capped_sub_batches`.
+  - **Hygiene.** Fixed two stale comments caught in review: `FLUSH_ENTRY_CAP`
+    no longer claims to bound in-RAM size by itself (superseded by
+    `BATCH_BYTES_CAP` above), and `entry_flags::OVERFLOW`'s doc corrected
+    from a fictitious 12-byte `file_id:u64 + page_id:u32` layout to the
+    actual 4-byte file-absolute `start_page_idx` (no `file_id` is stored —
+    the chain always lives in the same physical file as its leaf stub).
+    Added a one-line comment at `write_kv_spill_batch` explaining why it
+    hand-rolls temp+fsync+rename instead of calling
+    `persistence::atomic::atomic_write_durable`: that helper takes one
+    pre-materialized `&[u8]`, and concatenating `batch.pages` into a single
+    buffer first would undo `BATCH_BYTES_CAP`'s whole point — streaming
+    each already-built page into the temp file keeps this write's own
+    working set at one page at a time.
+
 ### Documentation
 - **Roadmap Rev 2 (task #68, doc half).** `docs/roadmap/ROADMAP.md` updated to
   post-v0.7.1 actuals: v0.6.1/v0.7.0 marked shipped (with the R5/R6 slips and the
