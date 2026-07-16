@@ -35,11 +35,18 @@ architecture with a unified WAL v3 log and 6-phase crash recovery.
 real WAIT/ACK, cold-tier TTL leak, ACL early-intercept hole, shardslice waiver (retired at
 v0.7.0), and the hygiene ledger. Remaining gaps below.)*
 
+*(2026-07-16 correction: this Rev 2 pass had re-listed "atomic-write stragglers (task #49)" as
+an open v0.8 gap below and as v0.8 item 1 in §4. Verified against the code during v0.8 close-out
+work: all 7 sites (ACL SAVE, nodes.conf, CONFIG REWRITE, replication state, native BGSAVE,
+clog, kv_page) were already converted to `atomic_write_durable` in PR #304 — merged 2026-07-13,
+*before* this Rev 2 pass, and its CHANGELOG entry landed under the v0.7.0 release section, not
+Unreleased. Task #49 was never actually an open v0.8 item; the row below and the item in §4 have
+been removed/struck accordingly.)*
+
 | Gap | Detail | Impact |
 |---|---|---|
 | **Streaming replica is single-shard only** | Multi-shard work in v0.7 is master-side (merged N-shard PSYNC feed); replicas run `--shards 1` | Disclosed v0.7 limitation; replica can't use thread-per-core — slotted v0.9 |
 | **Cluster mode is alpha, tokio-only** | Bus/gossip spawn only in the tokio startup block; monoio (production) startup omits it (`main.rs`) | Cluster mode does not run on the production runtime — slotted v0.9 |
-| Atomic-write stragglers (task #49) | 7 bare-write sites remain: **ACL SAVE has no atomicity**, nodes.conf, CONFIG REWRITE, repl state, native BGSAVE, clog/kv_page | Torn-file windows outside the kernel contract — v0.8 close-out |
 | `used_memory` accounting under offload (task #56) | Reports 406–762MB against a 256MB cap during 10×-RAM runs (worse post-restart) | Undermines the 10×-RAM claim's operator story — v0.8 close-out |
 | Spill format scale | One-file-per-key heap spill → O(keys) file counts; sweep/manifest scale with it | v0.8 close-out (batch into segments) |
 | No encryption at rest | WAL/AOF/RDB plaintext | Blocks regulated buyers — v0.10 |
@@ -202,9 +209,11 @@ shard configs; the 10×-RAM acceptance re-passes on real disk with truthful `use
 benchmark report and PRODUCTION-CONTRACT rows are published.* The kernel itself is built — this
 release converts it into a verifiable public claim.
 
-1. **Task #49 — atomic-write straggler sweep**: adopt `atomic_write_durable` at the 7 remaining
-   bare-write sites (ACL SAVE — worst, no atomicity today —, nodes.conf, CONFIG REWRITE,
-   replication state, native BGSAVE, clog/kv_page).
+1. ~~**Task #49 — atomic-write straggler sweep**~~: ✅ already shipped (PR #304, merged
+   2026-07-13, released as part of v0.7.0) — all 7 bare-write sites (ACL SAVE, nodes.conf,
+   CONFIG REWRITE, replication state, native BGSAVE, clog, kv_page) route through
+   `atomic_write_durable`. Verified against HEAD during v0.8 close-out (2026-07-16): no
+   regression, no new bare-write site introduced since. No v0.8 action needed.
 2. **Task #56 — `used_memory` truth under offload**: reconcile accounting so a 256MB-cap
    10×-RAM run reports ≤ cap (or documents exactly what the overage is); fix the post-restart
    regression.
@@ -269,7 +278,7 @@ Exit criterion: *a security-conscious enterprise can run Moon and pass an infose
 |---|---|---|
 | ~~shardslice cross-shard-read waiver~~ | ✅ retired at v0.7.0 (L4 validated, PR #325) | done |
 | ~~v0.6.0 tag + RELEASES.md · PRODUCTION-CONTRACT refresh · cold-tier TTL leak · ACL registry bypass · doc contradictions~~ | ✅ closed in the v0.6.1/v0.7.0 cycle | done |
-| Task #49 bare-write sites (ACL SAVE et al.) | v0.8 | atomic-write sweep (v0.8 item 1) |
+| ~~Task #49 bare-write sites (ACL SAVE et al.)~~ | ✅ shipped v0.7.0 (PR #304, merged 2026-07-13) | done — mis-listed as open in Rev 2, corrected 2026-07-16 |
 | Task #56 `used_memory` under offload | v0.8 | accounting reconcile (v0.8 item 2) |
 | Spill one-file-per-key scale | v0.8 | segment batching (v0.8 item 3) |
 | rustls-pemfile → rustls-pki-types (task #66, RUSTSEC ignore) | in flight 2026-07-15 | Wave-0 PR |
