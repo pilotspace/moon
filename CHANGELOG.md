@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **G2 10×-RAM re-run report (v0.8 close-out evidence).** New
+  `docs/perf/2026-07-16-g2-10x-ram-rerun.md`: re-ran the G2 acceptance
+  benchmark on main @ `4dcfd533` with the full v0.8 storage batch merged.
+  Headlines vs the 2026-07-13 baseline: spill files 236K → **840** (~280×,
+  PR #350 confirmed at scale); `used_memory` truthful at **1.00× cap**
+  steady-state with a ≤5 s post-restart drain to under-cap (task #56,
+  PR #349; demote pass logged 83,788 shadows); cold-GET-during-spill worst
+  tail **1,910 ms → 205 ms** (task #59 still open for sub-10 ms); restart
+  now AOF-replay-bound (16.9 s at 3.3 GB unrewritten incr AOF — spill-file
+  count is out of the boot path entirely); 500/500 kill-9 integrity.
+  PRODUCTION-CONTRACT rows `CRASH-02` (37→46 cells + scheduled CI) and
+  `MEM-10X-01` refreshed with this evidence + audit-trail row. New finding
+  filed as #355: `DBSIZE` counts only resident keys under disk-offload
+  (~24K reported vs ~164K logical).
+
 ### Fixed
 - **Vector auto-merge CPU livelock: rejected GraphUnion merges now back off
   exponentially instead of retrying every autovacuum tick.** A background
