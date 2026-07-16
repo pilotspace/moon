@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Vector auto-merge CPU livelock: rejected GraphUnion merges now back off
+  exponentially instead of retrying every autovacuum tick.** A background
+  merge rejected by the recall gate (or the 512 MiB memory ceiling) keeps its
+  source segments, so every `needs_merge` trigger condition — segment count
+  > 16, dead fraction > 20% — remains true, and the next tick resubmitted the
+  *identical* doomed merge. Each recall-gate rejection discards a fully built
+  union HNSW graph (plus the AE-1 self-probe), so an index stuck below
+  tolerance pinned the `moon-vec-compact-*` worker pool at ~100%/core
+  indefinitely — observed in production at ~300% CPU sustained on an
+  embeddings workload, with no log signal (the rejection was `debug!`-level).
+  Fixes, all in `src/vector/store.rs`:
+  - `poll_install_merge`'s rejection path now records a `MergeBackoff`
+    (xxh64 fingerprint of the source-segment `Arc` identities, consecutive
+    failure count, exponential window 60s→1h) and logs at `warn!` with the
+    failure count and next-retry delay — naturally rate-limited to once per
+    window.
+  - `begin_background_merge_due` skips dispatch while the *same* segment set
+    is inside its window; any set change (new compaction, warm-tier
+    transition, installed merge) or a successful install clears the backoff
+    immediately. Manual `FT.COMPACT` (force-merge) is unaffected, and
+    `FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE` clears the backoff so
+    operator intervention retries at once.
+  - `needs_merge`'s segment-count trigger now honors the merge memory
+    ceiling (previously only the dead-fraction trigger did): an index whose
+    live vectors exceed 512 MiB was re-dispatching a merge that
+    `merge_immutable` deterministically refuses — a guaranteed livelock for
+    indexes past the ceiling. The store-level `needs_merge` now delegates to
+    the index-level check instead of duplicating (and diverging from) it.
+  New unit tests: `bg_merge_gate_failure_backs_off` (RED against the old
+  behavior), `bg_merge_backoff_clears_on_segment_set_change`,
+  `bg_merge_backoff_clears_on_tolerance_change`, `bg_merge_backoff_schedule`.
+
 ### Performance
 - **Disk-offload spill files now batch effectively — file count scales as
   ~keys/batch, not ~keys (v0.8 item 3, task #57 follow-up).** The G2
