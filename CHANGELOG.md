@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the checkpoint was quarantined (code identical back to v0.6.0). Now split-retries
   in a loop, mirroring `insert`'s recursion; regression test brute-forces 56 keys
   sharing the top 12 xxh64 bits to force the double split.
+- **Test harness: five latently broken integration suites unmasked by the
+  task #59 gate battery.** `cmd_flush_dbsize_debug_memory` still passed the
+  `--persistence-dir` flag removed in June (server exited 2 before accepting;
+  CI stayed green only because the suite self-skips without a release
+  binary); it and `memory_doctor_response` ignored `MOON_BIN` via hardcoded
+  `target/release/moon` finders (stale host Mach-O via OrbStack proxy → 30s
+  spawn timeouts). `mem_watchdog`, `oom_bypass_closure`, and `spsc_two_db`
+  now pass `--disk-free-min-pct 0` so a near-full dev volume's diskfull
+  write pause can't shadow the memory-guard/routing behavior they assert.
 
 ## [0.8.0] — 2026-07-16
 
