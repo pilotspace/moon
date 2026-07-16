@@ -164,6 +164,10 @@ fn ft_config_set(
             ));
         }
         idx.merge_recall_tolerance = parsed;
+        // The operator just changed the parameter the merge recall gate fires
+        // on — drop any rejected-merge backoff so the next autovacuum tick
+        // retries with the new tolerance instead of waiting out the window.
+        idx.clear_merge_backoff();
         Frame::SimpleString(Bytes::from_static(b"OK"))
     } else if param.eq_ignore_ascii_case(b"EF_RUNTIME") {
         // Runtime-tunable search beam width, same range as FT.CREATE's
