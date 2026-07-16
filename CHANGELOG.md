@@ -55,6 +55,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior), `bg_merge_backoff_clears_on_segment_set_change`,
   `bg_merge_backoff_clears_on_tolerance_change`, `bg_merge_backoff_schedule`.
 
+### Changed
+- **CI: heavy vector recall benchmarks moved out of the per-PR gate
+  (~6-24 min tail cut).** Duration data from a green main run (2026-07-16)
+  showed the recall family was ~half the whole suite's CPU, with the top
+  case (`test_f32_recall_10k_128d`) at 182-480s per attempt at the
+  unoptimized test profile — and the two biggest cases were the only tests
+  that flaked (480s nextest timeout × 3 retries = 24 wasted minutes) when
+  the runner VM shared a loaded host. Five recall-quality canaries
+  (`test_f32_recall_10k_128d`, `test_f32_recall_1k_768d`,
+  `recall_10k_128d_ef128`, `recall_1k_768d_ef128`,
+  `test_parallel_recall_parity_with_sequential`) are now `#[ignore]`d,
+  matching the pre-existing convention for the 768d/10K cases; a fast smoke
+  variant (1k/128d, both unit and integration) still runs per-PR, and 27
+  recall-adjacent tests remain in the PR gate. A new nightly
+  `recall-canaries` job (`.github/workflows/crash-matrix.yml`) runs the
+  FULL family — ignored and not — at release profile via
+  `--run-ignored all -E 'test(/recall/)'`, limited to the two binaries that
+  contain them. nextest `profile.ci` override: `test(/recall/)` gets
+  `retries = 0` (CPU-bound + seed-deterministic — retrying a timeout or a
+  threshold failure only multiplies the waste) and a 120s×5 slow-timeout.
+  Dependabot: new `cargo-minor-patch` catch-all group collapses the Monday
+  minor/patch flood into one PR — six near-simultaneous dependabot CI runs
+  starved the single self-hosted runner for >20 min on 2026-07-15.
+
 ### Performance
 - **Disk-offload spill files now batch effectively — file count scales as
   ~keys/batch, not ~keys (v0.8 item 3, task #57 follow-up).** The G2

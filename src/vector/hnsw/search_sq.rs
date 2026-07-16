@@ -220,7 +220,15 @@ mod tests {
         assert!(recall >= 0.95, "F32 recall {recall} below 0.95");
     }
 
+    // The two heavy variants are recall-quality canaries, not correctness
+    // gates: at CI's unoptimized test profile they run 3-8 MINUTES each
+    // (2026-07-16 measurement: 182-480s), dominating the per-PR Check job's
+    // tail and flaking whenever the runner VM shares a loaded host — while
+    // test_f32_recall_1k_128d above keeps per-PR recall smoke coverage at
+    // ~seconds. Nightly CI runs everything matching `test(/recall/)` with
+    // --run-ignored only (see .github/workflows/crash-matrix.yml).
     #[test]
+    #[ignore = "recall canary, minutes-long at test opt-level — nightly CI / --ignored"]
     fn test_f32_recall_10k_128d() {
         let recall = measure_recall(10000, 128, 50, 200, 10);
         println!("F32 HNSW Recall@10 (10K/128d ef=200): {recall:.4}");
@@ -228,6 +236,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "recall canary, minutes-long at test opt-level — nightly CI / --ignored"]
     fn test_f32_recall_1k_768d() {
         let recall = measure_recall(1000, 768, 50, 128, 10);
         println!("F32 HNSW Recall@10 (1K/768d ef=128): {recall:.4}");

@@ -14,6 +14,14 @@ updates:
         patterns: ["rustls*", "aws-lc-rs*"]
       tracing:
         patterns: ["tracing*"]
+      # Catch-all for every other patch/minor bump: one Monday PR instead
+      # of up to five. Six near-simultaneous dependabot CI runs starved the
+      # single self-hosted runner for >20 min on 2026-07-15 (a human PR sat
+      # QUEUED behind the batch). Major bumps still get individual PRs —
+      # they need individual review anyway.
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       # mlua vendored — major bumps need manual testing of Lua sandbox
       - dependency-name: mlua
