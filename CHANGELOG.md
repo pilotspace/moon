@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shutdown.
 
 ### Fixed
+- **BGSAVE issued during shard startup could hang forever (pre-existing,
+  reachable in v0.8.0 and earlier).** The listener answers clients as soon as
+  the fastest shard's event loop is up, but each shard seeded its snapshot
+  epoch cursor from the trigger watch channel's *current* value at loop
+  start — a BGSAVE (or auto-save) broadcast while a slower shard was still
+  initializing was silently swallowed by that shard: its snapshot never ran,
+  `BGSAVE_SHARDS_REMAINING` never reached zero, and `rdb_bgsave_in_progress`
+  stuck at `1` with every later BGSAVE refused as already-in-progress until
+  restart. Found as a ~15%/run crash-matrix flake under full-suite CPU
+  contention; reproduced deterministically with a delayed shard start (new
+  test-only `MOON_TEST_SLOW_SHARD_START_MS` fault injection) and pinned by
+  `tests/bgsave_startup_race.rs`. The cursor now starts at 0 (epochs are
+  per-process), so a trigger that arrives during startup is honored on the
+  shard's first tick.
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
   segment exactly once and declared a second `NeedsSplit` unreachable — false under

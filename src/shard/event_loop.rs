@@ -764,7 +764,28 @@ impl super::Shard {
             .map(|rs| rs.read().is_replica_mirror.clone());
 
         // Track last seen snapshot epoch to detect watch channel triggers
-        let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
+        // Test-only fault injection: delay every non-zero shard's loop start so
+        // integration tests can deterministically exercise the startup window
+        // where the listener already answers (fastest shard up) while other
+        // shards are still here. Used by tests/bgsave_startup_race.rs; never
+        // set in production.
+        if shard_id != 0
+            && let Ok(ms) = std::env::var("MOON_TEST_SLOW_SHARD_START_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        // Start the cursor at 0, NOT at the watch channel's current value: the
+        // listener accepts clients as soon as the fastest shard is up, so a
+        // BGSAVE (or auto-save) can broadcast epoch N while a slower shard is
+        // still in this setup code. Seeding the cursor with borrow() would
+        // swallow that pending trigger — this shard never snapshots, the
+        // BGSAVE_SHARDS_REMAINING counter never reaches zero, and every later
+        // BGSAVE reports "already in progress" forever (observed as the
+        // 20s-stuck `rdb_bgsave_in_progress:1` crash-matrix flake; the race
+        // reproduces deterministically with a delayed shard start). Epochs are
+        // per-process and start at 0, so 0 is always a safe "nothing seen yet".
+        let mut last_snapshot_epoch = 0u64;
 
         // Sub-timer intervals: tokio uses separate select! branches for each.
         // monoio uses counter-based dispatch from a single periodic tick to avoid
