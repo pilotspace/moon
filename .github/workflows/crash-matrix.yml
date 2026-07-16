@@ -102,6 +102,53 @@ jobs:
           path: /tmp/crash-matrix-artifacts
           retention-days: 14
 
+  # ── Recall canaries (nightly) ────────────────────────────────────────
+  # The heavy vector recall-quality benchmarks (`test(/recall/)` across
+  # src/vector/hnsw/{search_sq,parallel_build}.rs unit tests and
+  # tests/vector_recall_benchmark.rs) are #[ignore]d in the per-PR gate:
+  # at the unoptimized test profile they run 1.5-8 MINUTES each (2026-07-16
+  # measurement: the recall family was ~half the whole suite's CPU, and the
+  # two biggest cases were the only tests that flaked when the runner VM
+  # shared a loaded host). They are statistical quality canaries, not
+  # correctness gates — a fast smoke variant (1k/128d) still runs per-PR.
+  # This job runs the FULL family nightly, release-profile (realistic
+  # kernels, ~10x faster than the debug test profile), sharing the nightly
+  # cron with the crash matrix. Runs after it thanks to the shared
+  # single-machine runner queue; order does not matter.
+  recall-canaries:
+    name: Recall canaries (nightly)
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/crash-matrix
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@nextest
+      - name: Run all recall benchmarks (ignored + not) at release profile
+        # --run-ignored all: the per-PR smoke variants AND the #[ignore]d
+        # heavy ones — one nightly answer for the whole recall surface.
+        # Release profile: recall math at realistic speed; the assertions
+        # are profile-independent.
+        # --lib + --test vector_recall_benchmark: the recall family lives in
+        # exactly these two binaries — don't build the other ~40 integration
+        # test binaries at release profile for nothing.
+        run: |
+          cargo nextest run --cargo-profile release --profile ci \
+            --lib --test vector_recall_benchmark \
+            --run-ignored all -E 'test(/recall/)' \
+            2>&1 | tee recall-canaries.log
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-canaries-failure-${{ github.run_id }}
+          path: recall-canaries.log
+          retention-days: 14
+
   soak:
     name: Crash Matrix (weekly soak, probabilistic cells)
     if: github.event.schedule == '41 4 * * 6' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'soak')

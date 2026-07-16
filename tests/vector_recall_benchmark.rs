@@ -212,6 +212,7 @@ fn recall_1k_128d_ef128() {
 }
 
 #[test]
+#[ignore = "slow: 10K x 128d recall benchmark (1.5-8 min in CI) — nightly CI / --ignored"]
 fn recall_10k_128d_ef128() {
     distance::init();
     let recall = measure_recall(10_000, 128, 100, 128, 10);
@@ -220,6 +221,7 @@ fn recall_10k_128d_ef128() {
 }
 
 #[test]
+#[ignore = "slow: 1K x 768d recall benchmark (~1.5 min in CI) — nightly CI / --ignored"]
 fn recall_1k_768d_ef128() {
     distance::init();
     let recall = measure_recall(1_000, 768, 50, 128, 10);

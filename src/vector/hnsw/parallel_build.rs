@@ -800,9 +800,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "recall-parity canary, ~100s at CI's unoptimized test profile — nightly CI / --ignored"]
     fn test_parallel_recall_parity_with_sequential() {
         // Recall of the concurrently-built graph must match the sequential
-        // builder's within noise. 4K × 32d keeps the test under a second.
+        // builder's within noise. 4K × 32d keeps the test under a second
+        // in optimized builds (release/release-fast); CI's debug test
+        // profile runs it ~100× slower (98s measured 2026-07-16), which is
+        // why it is nightly-only there.
         let n = 4096usize;
         let vecs = lcg_vecs(n, 32, 12345);
         let dist = |a: u32, b: u32| l2(&vecs[a as usize], &vecs[b as usize]);

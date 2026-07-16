@@ -16,3 +16,15 @@ fail-fast = false
 # Integration tests spawn real servers; a hung server must fail the test,
 # not the 30-minute job budget.
 slow-timeout = { period = "60s", terminate-after = 8 }
+
+# Recall benchmarks are CPU-bound and seed-deterministic: a timeout means
+# the machine is slow (or the test is mis-homed in the per-PR gate), and a
+# recall-threshold failure reproduces identically — retrying either just
+# multiplies the waste (a retried 480s timeout burned 24 min/test in the
+# 2026-07-16 incident). Most are #[ignore]d out of per-PR runs entirely
+# (nightly `recall-canaries` job); this override covers the per-PR smoke
+# variants and the nightly job alike.
+[[profile.ci.overrides]]
+filter = 'test(/recall/)'
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 5 }
