@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Storage: recovery panic `double NeedsSplit after split_segment` in
+  `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
+  segment exactly once and declared a second `NeedsSplit` unreachable — false under
+  hash skew: when the overflowing segment's keys share the next directory bit, the
+  split routes all of them into the same child (still over `LOAD_THRESHOLD`) and the
+  retry panicked. Deterministically reproduced in production loading a 219k-key shard
+  checkpoint (`shard-0.rrdshard`) on 0.7.1 recovery — the server crash-looped until
+  the checkpoint was quarantined (code identical back to v0.6.0). Now split-retries
+  in a loop, mirroring `insert`'s recursion; regression test brute-forces 56 keys
+  sharing the top 12 xxh64 bits to force the double split.
+
 ## [0.8.0] — 2026-07-16
 
 ### Documentation
