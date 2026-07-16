@@ -161,3 +161,34 @@ fn second_instance_on_same_dir_is_refused_and_kill9_releases_the_lock() {
     let _ = a.wait();
     let _ = b.wait();
 }
+
+/// A `--disk-offload-dir` that spells the SAME directory as `--dir`
+/// differently (here via a `..` round-trip) must not self-conflict on the
+/// shared moon.lock: flock conflicts are per open-file-description, so a
+/// naive textual comparison would take a second lock on the same file and
+/// abort startup with a false "another instance" refusal.
+#[test]
+fn same_dir_offload_spelled_differently_does_not_self_conflict() {
+    let dir = test_tmpdir();
+    let base = dir.path();
+    let respelled = base.join("..").join(base.file_name().expect("tempdir has a basename"));
+
+    let port = common::reserve_port();
+    let mut a = moon_cmd(base, port, "moon-respell");
+    a.args([
+        "--disk-offload",
+        "enable",
+        "--disk-offload-dir",
+        &respelled.to_string_lossy(),
+    ]);
+    let mut a = a.spawn().expect("spawn with respelled offload dir");
+    assert!(
+        wait_ping(port, Duration::from_secs(30)),
+        "startup self-conflicted on its own lock — same-dir --disk-offload-dir \
+         via a different spelling must not be treated as a second instance; \
+         stderr:\n{}",
+        std::fs::read_to_string(base.join("moon-respell.stderr.log")).unwrap_or_default()
+    );
+    common::sigkill(&mut a);
+    let _ = a.wait();
+}

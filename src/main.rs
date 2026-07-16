@@ -395,14 +395,21 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let _offload_dir_lock = if config.disk_offload_enabled() {
         let offload_dir = config.effective_disk_offload_dir();
-        if offload_dir != std::path::Path::new(&config.dir) {
-            if let Err(e) = std::fs::create_dir_all(&offload_dir) {
-                return Err(anyhow::anyhow!(
-                    "failed to create disk-offload directory {:?}: {}",
-                    offload_dir,
-                    e
-                ));
-            }
+        if let Err(e) = std::fs::create_dir_all(&offload_dir) {
+            return Err(anyhow::anyhow!(
+                "failed to create disk-offload directory {:?}: {}",
+                offload_dir,
+                e
+            ));
+        }
+        // Compare CANONICAL paths: flock conflicts are per open-file-
+        // description, so a second acquire on the same directory reached via
+        // a different spelling (`.`, `..`, symlink) would self-conflict and
+        // falsely abort startup as "another instance". Canonicalization can
+        // only run after create_dir_all (both dirs exist now); a failure to
+        // canonicalize falls back to the textual path rather than erroring.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if canon(&offload_dir) != canon(std::path::Path::new(&config.dir)) {
             Some(
                 moon::persistence::dir_lock::acquire(&offload_dir)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,

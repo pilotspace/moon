@@ -84,7 +84,11 @@ pub fn acquire(dir: &Path) -> Result<DirLock, DirLockError> {
             let _ = lock.flush();
             Ok(DirLock { _lock: lock })
         }
-        Err((mut file, _errno)) => {
+        // Only contention (EWOULDBLOCK/EAGAIN — one constant on Linux and
+        // macOS) means "another instance holds it". Anything else (EBADF,
+        // ENOLCK, EINTR, ...) is a real I/O failure and must not tell the
+        // operator to stop a non-existent other instance.
+        Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
             let mut pid = String::new();
             let _ = file.read_to_string(&mut pid);
             let pid = pid.trim();
@@ -98,6 +102,10 @@ pub fn acquire(dir: &Path) -> Result<DirLock, DirLockError> {
                 holder,
             })
         }
+        Err((_file, errno)) => Err(DirLockError::Io {
+            dir: dir.to_path_buf(),
+            source: std::io::Error::from(errno),
+        }),
     }
 }
 
