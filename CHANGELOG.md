@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Disk-offload: shard event loop no longer pays manifest-commit fsyncs
+  (task #59 levers 1+2).** Under spill load, `apply_completion_vec` ran one
+  DURABLE manifest commit (up to 2 fsyncs) per spilled file **on the shard
+  event-loop thread** — strace-measured at 1.0–2.1s cumulative block time per
+  8s flood window per shard (single fsyncs up to 1.0s), stalling every
+  connection on the shard. `ShardManifest` now splits into loop-owned RAM
+  state + a per-shard `manifest-sync-{id}` thread owning the file handle:
+  spill-completion commits are deferred, coalescing snapshot sends (correct
+  because that path only runs under `--appendonly yes`, where AOF replay +
+  the orphan sweep reconstruct anything a lost manifest commit recorded);
+  `commit()` keeps its exact blocking durability for the checkpoint protocol
+  and the no-AOF durable batch spill path. The crash-safety write order
+  (overflow pages sync'd before the root that references them; dual-slot
+  atomic root flip) is preserved verbatim. Additionally the spill writer now
+  yields a 4ms quantum after each durable batch flush while a cold read is
+  in flight (`COLD_READS_INFLIGHT` RAII signal from both the async pool and
+  the synchronous MGET/MULTI/Lua read paths), never pacing when the request
+  backlog is deep (pacing must not push eviction into `-OOM`) or at
+  shutdown.
+
 ### Fixed
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
