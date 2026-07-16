@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-16
+
 ### Documentation
 - **G2 10×-RAM re-run report (v0.8 close-out evidence).** New
   `docs/perf/2026-07-16-g2-10x-ram-rerun.md`: re-ran the G2 acceptance
