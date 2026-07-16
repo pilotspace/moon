@@ -463,6 +463,33 @@ fn memory_doctor() -> Frame {
         + lua_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
+    // Task #56 (used_memory truthfulness) + adversarial-review finding #3
+    // (parity delta): three figures, not two, now that `used_memory` and
+    // the eviction gate have deliberately diverged:
+    //
+    //   1. `elastic_budget_bytes` -- KV (+ ColdIndex) + vector + text +
+    //      graph, the EXACT terms `ShardDatabases::recompute_elastic_budget`
+    //      gates `--maxmemory` eviction on. Nothing else is ever evicted to
+    //      make room.
+    //   2. `used_memory_reported` -- what `INFO`'s `used_memory` field and
+    //      the `moon_used_memory_bytes` gauge actually report: the elastic
+    //      budget PLUS the Lua script cache and replication backlog, to
+    //      match real Redis's `used_memory` semantics (it also counts
+    //      script cache + backlog as allocator-attributed memory, even
+    //      though neither is evictable data). See
+    //      `admin::metrics_setup::logical_used_memory_bytes`'s doc comment
+    //      for the full reasoning.
+    //   3. `rss` -- true OS-level footprint: adds allocator overhead, page
+    //      cache, WAL writer buffers, sealed segments, the binary image,
+    //      and thread stacks on top of (2).
+    //
+    // Called out here explicitly because conflating (1)/(2) with (3) is
+    // exactly what made a healthy disk-offload deployment look permanently
+    // over-budget in the original G2 acceptance run.
+    let elastic_budget_bytes = dashtable_bytes + hnsw_bytes + text_bytes + csr_bytes;
+    let used_memory_reported = elastic_budget_bytes + lua_bytes + repl_bytes;
+    let outside_cap_bytes = rss.saturating_sub(used_memory_reported);
+
     // ── VSZ ratio recommendation ─────────────────────────────────────────
     let vsz_ratio = if rss > 0 { vsz / rss } else { 0 };
     let vsz_recommendation = if vsz_ratio > 100 {
@@ -492,6 +519,31 @@ fn memory_doctor() -> Frame {
     let mut out = String::with_capacity(1024);
 
     let _ = writeln!(out, "Sample of Moon memory usage at {now}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Memory accounting (task #56):");
+    let _ = writeln!(
+        out,
+        "  used_memory (INFO / moon_used_memory_bytes): {}  -- elastic budget \
+         + Lua script cache + replication backlog (Redis parity)",
+        humanize_bytes(used_memory_reported)
+    );
+    let _ = writeln!(
+        out,
+        "  elastic budget (gated by --maxmemory):       {}  -- KV+ColdIndex+vector+text+graph \
+         only; the exact terms eviction acts on",
+        humanize_bytes(elastic_budget_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "  used_memory_rss (process footprint):         {}",
+        humanize_bytes(rss)
+    );
+    let _ = writeln!(
+        out,
+        "  outside used_memory (RSS - used_memory):     {}  -- allocator overhead, \
+         page cache, WAL writer buffers, sealed segments, binary+stacks",
+        humanize_bytes(outside_cap_bytes)
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Process:");
     let _ = writeln!(out, "  RSS:                    {}", humanize_bytes(rss));

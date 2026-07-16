@@ -189,6 +189,20 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
 
     sections.push_str("# Memory\r\n");
     let rss = crate::admin::metrics_setup::get_rss_bytes();
+    // Task #56 (used_memory truthfulness): `used_memory` reports the same
+    // logical ledger `--maxmemory` eviction actually gates on (KV + its
+    // ColdIndex overhead + vector/text/graph resident bytes) -- NOT raw
+    // process RSS. Before this fix `used_memory` was literally `rss`,
+    // which is why a disk-offload deployment at `--maxmemory 256MB` showed
+    // `used_memory` in the 400-700MB range: RSS also carries the binary
+    // image, thread stacks, allocator arena fragmentation, mmap'd cold-read
+    // page-cache frames, the (intentionally unbounded) Lua script cache, and
+    // the replication backlog ring -- none of which the eviction system
+    // ever charges against the cap. Those components still get their own
+    // truthful lines below (`used_memory_rss`, `allocator_overhead_bytes`,
+    // `pagecache_bytes`) plus a full breakdown in `MEMORY DOCTOR` -- they are
+    // not hidden, just no longer conflated with the gate-comparable figure.
+    let used_memory = crate::admin::metrics_setup::logical_used_memory_bytes() as u64;
     // task #58: allocator_overhead_bytes is sampled continuously by shard 0's
     // 100ms tick (persistence_tick::run_eviction_tick), not recomputed here.
     // pagecache_bytes sums each shard's published PageCache resident-buffer
@@ -205,14 +219,15 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         });
     let _ = write!(
         sections,
-        "used_memory:{rss}\r\n\
+        "used_memory:{used_memory}\r\n\
          used_memory_human:{human}\r\n\
          used_memory_rss:{rss}\r\n\
          used_memory_peak:{rss}\r\n\
          allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
          pagecache_bytes:{pagecache_bytes}\r\n",
+        used_memory = used_memory,
+        human = format_memory_human(used_memory),
         rss = rss,
-        human = format_memory_human(rss),
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
     );

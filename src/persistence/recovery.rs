@@ -700,6 +700,30 @@ pub fn recover_shard_v3_pitr(
         }
     }
 
+    // Task #56 finding 2 (adversarial review): the main.rs boot sequence
+    // only invokes `Database::demote_replayed_cold_shadows` after the LATER
+    // multi-part/per-shard manifest-based AOF replay branches -- but under
+    // `runtime-tokio` + `--shards 1`, no such manifest is ever created
+    // (`AofManifest::initialize` is monoio-only there), so the Phase 4b
+    // fallback immediately above is the ONLY place `appendonly.aof` (or the
+    // last-resort legacy WAL v3 dir) ever gets replayed for that config.
+    // Without this call, that config's disk-offload restarts were exactly
+    // as exposed to the AOF-replay-rehydrates-cold-shadows bug as the
+    // manifest-based paths were before task #56 fixed those -- silently
+    // inert for this one runtime/shard combination. Reconciling here, right
+    // after Phase 4b and before Phase 5, covers it the same way regardless
+    // of which fallback source (AOF or legacy WAL v3) supplied the replay.
+    if let Some(db0) = databases.first_mut() {
+        let demoted = db0.demote_replayed_cold_shadows();
+        if demoted > 0 {
+            info!(
+                "Shard {}: demoted {} AOF-replay hot shadow(s) back to cold-only \
+                 stubs (Phase 4b fallback path, used_memory truthful after restart, task #56)",
+                shard_id, demoted
+            );
+        }
+    }
+
     // ── Phase 5: CONSISTENCY ──────────────────────────────────────────
     // Cross-check: verify manifest files exist on disk.
     // (Lightweight for now -- full CRC verification is expensive at startup)
