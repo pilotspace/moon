@@ -9,6 +9,7 @@ pub mod control;
 pub mod fsync;
 pub mod kv_page;
 pub mod manifest;
+pub(crate) mod manifest_sync;
 pub mod migrate_aof;
 pub mod page;
 pub mod page_cache;

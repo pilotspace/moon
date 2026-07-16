@@ -629,6 +629,14 @@ impl super::Shard {
             } else {
                 None
             };
+        // Task #59: manifest commit fsyncs measured up to 1.0s each on this
+        // event-loop thread under spill flood (every connection on the shard
+        // stalls behind them). Move the file-I/O half onto the per-shard
+        // manifest-sync thread: durable commits keep their blocking ack,
+        // spill-completion commits become deferred sends.
+        if let Some(ref mut m) = shard_manifest {
+            m.enable_deferred_sync(shard_id);
+        }
         // Task #55: background reclaim of crash-orphaned heap files that
         // recovery only CLASSIFIED (see `Shard::restore_from_persistence` /
         // `persistence::recovery::recover_shard_v3_pitr`). Classification is
@@ -1854,6 +1862,11 @@ impl super::Shard {
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
+                    }
                     break;
                 }
             }
@@ -1993,6 +2006,11 @@ impl super::Shard {
                     }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
+                    }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
                     }
                     break;
                 }
