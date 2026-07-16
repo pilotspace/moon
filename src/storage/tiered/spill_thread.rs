@@ -697,7 +697,10 @@ mod tests {
             std::time::Duration::ZERO,
             "pacing must cost nothing when nobody is reading"
         );
-        assert_eq!(spill_pace_after_flush(0, REQUEST_QUEUE_CAP), std::time::Duration::ZERO);
+        assert_eq!(
+            spill_pace_after_flush(0, REQUEST_QUEUE_CAP),
+            std::time::Duration::ZERO
+        );
     }
 
     #[test]

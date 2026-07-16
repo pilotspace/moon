@@ -255,8 +255,8 @@ mod tests {
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(2);
 
-        let before = super::super::manifest::TEST_PERSIST_COUNT
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let before =
+            super::super::manifest::TEST_PERSIST_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         // Stall the agent on its first persist so the rest of the burst
         // queues up behind it and coalesces.
         super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
