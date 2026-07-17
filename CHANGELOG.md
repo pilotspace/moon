@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off-loop fsync agent).
 
 ### Fixed
+- **`tests/bgsave_startup_race.rs` can no longer orphan its server on a
+  mid-test panic** — the spawned child is now held by a kill-on-drop guard
+  (the pattern from `tests/dir_deleted_degraded.rs`). An orphan from this
+  exact suite, its tmpdir later swept, was the 667%-CPU incident behind
+  issue #366.
 - **Data-dir deleted under a running server now latches a degraded state
   instead of error-looping the persistence tick (#366).** When `--dir`
   vanishes (operator `rm -rf`, tmp-cleaner sweep, mount loss), the per-shard
