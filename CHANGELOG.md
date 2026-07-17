@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SCAN now honors the Redis stable-key guarantee under churn (#368).**
+  The cursor was a positional index into a keyspace snapshot re-collected
+  and re-sorted on every page, so any insert/delete (or cold-plane
+  spill/promotion/TTL churn) between pages shifted positions and could
+  skip a key that existed for the entire scan — directly affecting the
+  backup/migration-via-SCAN use case. SCAN pages now iterate in stable
+  48-bit key-hash order and the cursor is a position in hash space: a
+  key's hash never changes, so churn cannot displace it, and a key present
+  throughout the scan is returned exactly once. Cursors stay numeric
+  (48-bit, fitting the multi-shard composite cursor's per-shard slot
+  unchanged) and remain client-compatible. Page cost drops from
+  `collect + sort O(n log n)` plus a second full-table lookup pass (and,
+  on the write path, a full-keyspace lazy-expiry probe per page) to one
+  walk with a bounded COUNT-min selection heap. COUNT stays a hint (Redis
+  parity): a full page may defer a trailing equal-hash group to the next
+  page. Follow-up tracked in #368: O(COUNT)-per-page via a DashTable
+  bucket-order cursor.
+
 ### Testing
 - **`crash_matrix_cross_plane` flake diagnostics for the rare mid-scenario
   `ConnectionReset` (#365).** The harness's RESP connection now records the
