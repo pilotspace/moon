@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Testing
+- **`crash_matrix_cross_plane` flake diagnostics for the rare mid-scenario
+  `ConnectionReset` (#365).** The harness's RESP connection now records the
+  last command (or pipeline summary) sent, and includes it — plus the peer
+  address — in the panic when a read/write fails or the connection closes
+  mid-frame, answering "WHICH phase reset". `ServerGuard`'s `pkill -9 -f
+  <dir>` backstop now logs `pgrep -fl` survivors before firing (the child
+  is already reaped at that point, so any hit is a leaked respawn or a
+  marker-substring collision about to be collateral-killed — the issue's
+  unproven alternate hypothesis). No behavior change on green runs.
+
 ### Performance
 - **Idle-tick CPU trimmed (#373 phase 1).** Three per-tick costs on the
   shard event loop's 1ms/100ms cadences were removed without touching any
