@@ -958,12 +958,12 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SCAN");
     }
 
-    // Parse cursor
+    // Parse cursor (a position in 48-bit hash space — see `scan_core`)
     let cursor_str = match extract_key(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("SCAN"),
     };
-    let cursor: usize = match std::str::from_utf8(cursor_str)
+    let cursor: u64 = match std::str::from_utf8(cursor_str)
         .ok()
         .and_then(|s| s.parse().ok())
     {
@@ -1008,40 +1008,126 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration.
-    // Two planes, partitioned with no overlap (#364): hot = live in-RAM
-    // entries (exists() keeps its lazy-expiry reclamation side effect);
-    // cold = spilled keys with no live hot shadow (`cold_only_keys`, pure
-    // in-RAM index probe — no disk I/O). The `is_cold` tag lets the TYPE
-    // filter below avoid a promoting/disk-reading lookup on cold keys.
     let now_ms = db.now_ms();
-    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
-    let mut sorted_keys: Vec<(CompactKey, bool)> = Vec::new();
-    for key in all_keys {
-        let _ = db.exists(key.as_bytes());
-        if db.get_if_alive(key.as_bytes(), now_ms).is_some() {
-            sorted_keys.push((key, false));
+    scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
+}
+
+/// Stable 48-bit key hash for SCAN cursors (FNV-1a 64 truncated).
+///
+/// The cursor is a POSITION IN HASH SPACE, so this hash must be stable
+/// across pages and across the two planes — a fixed-seed hash, never the
+/// tables' randomized hashers. 48 bits because the multi-shard composite
+/// cursor reserves the upper 16 bits for the shard index
+/// (`coordinate_scan`).
+#[inline]
+fn scan_hash48(key: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h & 0x0000_FFFF_FFFF_FFFF
+}
+
+/// Shared SCAN page walk (#368): hash-ordered iteration with a real
+/// stable-key guarantee, replacing the old positional-index-over-a-
+/// per-call-re-sort design.
+///
+/// Keys are visited in `(hash48(key), key)` order; the cursor is the next
+/// unvisited hash. A key's hash never changes, so inserts/deletes/spills/
+/// promotions between pages cannot displace another key's position —
+/// Redis's contract ("a key present for the entire scan is returned at
+/// least once"; here exactly once) holds under churn. Per page this does
+/// ONE walk over both planes with a bounded `count`-min selection heap —
+/// no full-keyspace sort and no second lookup pass (the old design paid
+/// `collect + sort + exists() + get_if_alive()` over every key on every
+/// page).
+///
+/// Page-boundary rule: a full page never advances the cursor past a hash
+/// value whose key group might be only partially selected, so hash
+/// collisions (rare at 48 bits) can never skip a key. Trailing entries
+/// sharing the last hash are deferred to the next page; if an entire page
+/// shares one hash (pathological), the whole equal-hash group is emitted
+/// and the cursor steps past it.
+fn scan_core(
+    db: &Database,
+    cursor: u64,
+    count: usize,
+    match_pattern: Option<&[u8]>,
+    type_filter: Option<&[u8]>,
+    now_ms: u64,
+) -> Frame {
+    use std::collections::BinaryHeap;
+
+    // Bounded max-heap selection: the `count` smallest (hash, key) pairs
+    // at or after the cursor, in one pass over both planes.
+    let mut heap: BinaryHeap<(u64, CompactKey, bool)> = BinaryHeap::with_capacity(count + 1);
+    {
+        let mut consider = |h: u64, key_bytes: &[u8], is_cold: bool| {
+            if h < cursor {
+                return;
+            }
+            if heap.len() < count {
+                heap.push((h, CompactKey::from(key_bytes), is_cold));
+            } else if let Some(top) = heap.peek() {
+                if h < top.0 || (h == top.0 && key_bytes < top.1.as_bytes()) {
+                    heap.pop();
+                    heap.push((h, CompactKey::from(key_bytes), is_cold));
+                }
+            }
+        };
+        for key in db.iter_live_keys(now_ms) {
+            consider(scan_hash48(key.as_bytes()), key.as_bytes(), false);
+        }
+        // Cold plane: spilled keys with no live hot shadow (pure in-RAM
+        // index probe — no disk I/O). Partitioned from the hot walk, so no
+        // dedup pass (#364).
+        for key in db.cold_only_keys(now_ms) {
+            consider(scan_hash48(key.as_ref()), key.as_ref(), true);
         }
     }
-    let cold_keys: Vec<CompactKey> = db
-        .cold_only_keys(now_ms)
-        .map(|k| CompactKey::from(k.as_ref()))
-        .collect();
-    sorted_keys.extend(cold_keys.into_iter().map(|k| (k, true)));
-    sorted_keys.sort();
 
-    let total = sorted_keys.len();
+    let full_page = heap.len() == count;
+    let mut selected = heap.into_sorted_vec();
+    let mut next_cursor: u64 = 0;
+    if full_page {
+        #[allow(clippy::unwrap_used)] // full_page ⇒ count ≥ 1 entries
+        let h_last = selected.last().unwrap().0;
+        let h_first = selected.first().map(|e| e.0).unwrap_or(h_last);
+        if h_first == h_last {
+            // Whole page one hash value: emit the ENTIRE equal-hash group
+            // (second filtered pass; unreachable in practice at 48 bits)
+            // so the cursor may step past it.
+            let mut extra: Vec<(u64, CompactKey, bool)> = Vec::new();
+            for key in db.iter_live_keys(now_ms) {
+                if scan_hash48(key.as_bytes()) == h_last
+                    && !selected.iter().any(|(_, k, _)| k == key)
+                {
+                    extra.push((h_last, key.clone(), false));
+                }
+            }
+            for key in db.cold_only_keys(now_ms) {
+                if scan_hash48(key.as_ref()) == h_last
+                    && !selected
+                        .iter()
+                        .any(|(_, k, _)| k.as_bytes() == key.as_ref())
+                {
+                    extra.push((h_last, CompactKey::from(key.as_ref()), true));
+                }
+            }
+            selected.extend(extra);
+            next_cursor = h_last + 1;
+        } else {
+            // Defer the (possibly incomplete) trailing hash group to the
+            // next page; resume exactly at its hash.
+            selected.retain(|(h, _, _)| *h < h_last);
+            next_cursor = h_last;
+        }
+    }
+
     let mut results = Vec::new();
-    let mut pos = cursor;
-
-    // Iterate from cursor position, collect up to `count` matching keys
-    let mut checked = 0;
-    while pos < total && checked < count {
-        let (key, is_cold) = &sorted_keys[pos];
-        pos += 1;
-        checked += 1;
-
-        // TYPE filter
+    for (_, key, is_cold) in &selected {
+        // TYPE filter (`is_cold` avoids a promoting/disk-reading lookup)
         if let Some(tf) = type_filter {
             let matches = if *is_cold {
                 cold_type_matches(db, key.as_bytes(), tf)
@@ -1053,25 +1139,22 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
                 continue;
             }
         }
-
-        // MATCH filter
         if let Some(pattern) = match_pattern {
             if !glob_match(pattern, key.as_bytes()) {
                 continue;
             }
         }
-
         results.push(Frame::BulkString(key.to_bytes()));
     }
 
-    let next_cursor = if pos >= total {
+    let next_cursor_bytes = if next_cursor == 0 {
         Bytes::from_static(b"0")
     } else {
-        Bytes::from(pos.to_string())
+        Bytes::from(next_cursor.to_string())
     };
 
     Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
+        Frame::BulkString(next_cursor_bytes),
         Frame::Array(results.into()),
     ])
 }
@@ -1207,7 +1290,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SCAN"),
     };
-    let cursor: usize = match std::str::from_utf8(cursor_str)
+    let cursor: u64 = match std::str::from_utf8(cursor_str)
         .ok()
         .and_then(|s| s.parse().ok())
     {
@@ -1251,64 +1334,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration.
-    // Hot plane (live in-RAM entries) unioned with cold-only spilled keys —
-    // the two are partitioned by `cold_only_keys`, so no dedup pass (#364).
-    let mut sorted_keys: Vec<(CompactKey, bool)> = db
-        .keys()
-        .filter(|k| db.get_if_alive(k.as_bytes(), now_ms).is_some())
-        .cloned()
-        .map(|k| (k, false))
-        .collect();
-    sorted_keys.extend(
-        db.cold_only_keys(now_ms)
-            .map(|k| (CompactKey::from(k.as_ref()), true)),
-    );
-    sorted_keys.sort();
-
-    let total = sorted_keys.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-    let mut checked = 0;
-
-    while pos < total && checked < count {
-        let (key, is_cold) = &sorted_keys[pos];
-        pos += 1;
-        checked += 1;
-
-        // TYPE filter
-        if let Some(tf) = type_filter {
-            let matches = if *is_cold {
-                cold_type_matches(db, key.as_bytes(), tf)
-            } else {
-                db.get_if_alive(key.as_bytes(), now_ms)
-                    .is_some_and(|e| tf.eq_ignore_ascii_case(e.value.type_name().as_bytes()))
-            };
-            if !matches {
-                continue;
-            }
-        }
-
-        // MATCH filter
-        if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, key.as_bytes()) {
-                continue;
-            }
-        }
-
-        results.push(Frame::BulkString(key.to_bytes()));
-    }
-
-    let next_cursor = if pos >= total {
-        Bytes::from_static(b"0")
-    } else {
-        Bytes::from(pos.to_string())
-    };
-
-    Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
-        Frame::Array(results.into()),
-    ])
+    scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1446,162 @@ mod tests {
             Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms, base_ts),
         );
         db
+    }
+
+    // --- SCAN cursor tests (issue #368: hash-ordered stable-key cursor) ---
+
+    fn scan_page(db: &mut Database, cursor: u64, count: usize) -> (u64, Vec<Bytes>) {
+        let reply = scan(
+            db,
+            &[
+                bs(cursor.to_string().as_bytes()),
+                bs(b"COUNT"),
+                bs(count.to_string().as_bytes()),
+            ],
+        );
+        let Frame::Array(parts) = reply else {
+            panic!("SCAN must return an array");
+        };
+        let next: u64 = match &parts[0] {
+            Frame::BulkString(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+            other => panic!("cursor frame: {other:?}"),
+        };
+        let keys = match &parts[1] {
+            Frame::Array(items) => items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.clone(),
+                    other => panic!("key frame: {other:?}"),
+                })
+                .collect(),
+            other => panic!("keys frame: {other:?}"),
+        };
+        (next, keys)
+    }
+
+    /// Issue #368 red/green: the old positional cursor skipped stable keys
+    /// when deletions shifted positions between pages. The hash-ordered
+    /// cursor must return every key that exists for the entire scan.
+    #[test]
+    fn scan_returns_all_stable_keys_under_delete_and_insert_churn() {
+        let mut db = Database::new();
+        for i in 0..100 {
+            db.set(
+                Bytes::from(format!("stable:{i:03}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+
+        let mut returned: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut churn = 0;
+        loop {
+            let (next, keys) = scan_page(&mut db, cursor, 10);
+            for k in keys {
+                returned.insert(k.clone());
+                // Churn: delete a key we already got, insert a brand-new one.
+                if churn < 40 {
+                    db.remove(k.as_ref());
+                    db.set(
+                        Bytes::from(format!("churn:{churn:03}")),
+                        Entry::new_string(Bytes::from_static(b"v")),
+                    );
+                    churn += 1;
+                }
+            }
+            if next == 0 {
+                break;
+            }
+            assert!(next < 1 << 48, "cursor must fit the 48-bit composite slot");
+            cursor = next;
+        }
+
+        for i in 0..100 {
+            let key = format!("stable:{i:03}");
+            assert!(
+                returned.contains(key.as_bytes()),
+                "stable key {key} was skipped under churn — the SCAN \
+                 stable-key guarantee is broken"
+            );
+        }
+    }
+
+    /// Full no-churn drain: exact key-set equality and no duplicates.
+    #[test]
+    fn scan_full_drain_is_exact_and_duplicate_free() {
+        let mut db = Database::new();
+        for i in 0..57 {
+            db.set(
+                Bytes::from(format!("k:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        let mut seen: Vec<Bytes> = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next, keys) = scan_page(&mut db, cursor, 7);
+            seen.extend(keys);
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        let unique: std::collections::HashSet<&Bytes> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "no key may be returned twice");
+        assert_eq!(seen.len(), 57, "every live key exactly once");
+    }
+
+    /// MATCH + COUNT paging still terminates and honors the filter.
+    #[test]
+    fn scan_match_filter_pages_terminate() {
+        let mut db = Database::new();
+        for i in 0..30 {
+            db.set(
+                Bytes::from(format!("user:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+            db.set(
+                Bytes::from(format!("other:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        let mut matched = 0usize;
+        let mut cursor = 0u64;
+        let mut pages = 0;
+        loop {
+            let reply = scan(
+                &mut db,
+                &[
+                    bs(cursor.to_string().as_bytes()),
+                    bs(b"MATCH"),
+                    bs(b"user:*"),
+                    bs(b"COUNT"),
+                    bs(b"5"),
+                ],
+            );
+            let Frame::Array(parts) = reply else {
+                panic!("array")
+            };
+            let next: u64 = match &parts[0] {
+                Frame::BulkString(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+                _ => panic!("cursor"),
+            };
+            if let Frame::Array(items) = &parts[1] {
+                for f in items.iter() {
+                    if let Frame::BulkString(b) = f {
+                        assert!(b.starts_with(b"user:"), "MATCH must filter");
+                        matched += 1;
+                    }
+                }
+            }
+            pages += 1;
+            assert!(pages < 1000, "must terminate");
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(matched, 30, "every user:* key exactly once");
     }
 
     // --- DBSIZE tests (issue #355: logical count under disk-offload) ---
@@ -2143,7 +2325,16 @@ mod tests {
                     _ => panic!("Expected cursor"),
                 }
                 match &arr[1] {
-                    Frame::Array(keys) => assert_eq!(keys.len(), 5),
+                    // COUNT is a hint (Redis parity): the hash-ordered
+                    // cursor (#368) may defer the trailing hash group to
+                    // the next page, so a full page returns 1..=COUNT keys.
+                    Frame::Array(keys) => {
+                        assert!(
+                            !keys.is_empty() && keys.len() <= 5,
+                            "full page must return 1..=COUNT keys, got {}",
+                            keys.len()
+                        );
+                    }
                     _ => panic!("Expected keys array"),
                 }
             }

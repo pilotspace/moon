@@ -1424,6 +1424,22 @@ impl Database {
         self.data.keys()
     }
 
+    /// Live (non-expired at `now_ms`) hot-plane keys, judged from the entry
+    /// during iteration — no per-key hash lookup, no reclamation side
+    /// effect. SCAN's per-page walk (#368) uses this instead of
+    /// `keys()` + `get_if_alive()` per key, which paid a second full-table
+    /// lookup pass.
+    pub fn iter_live_keys(&self, now_ms: u64) -> impl Iterator<Item = &CompactKey> + '_ {
+        let base_ts = self.base_timestamp;
+        self.data.iter().filter_map(move |(k, e)| {
+            if e.is_expired_at(base_ts, now_ms) {
+                None
+            } else {
+                Some(k)
+            }
+        })
+    }
+
     /// Keys visible ONLY via the cold plane at `now_ms`: present in the
     /// in-RAM cold index, not TTL-expired (judged from the cached
     /// [`crate::storage::tiered::cold_index::ColdLocation::ttl_ms`] — no
