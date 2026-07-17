@@ -622,6 +622,7 @@ fn apply_completion_vec(
                 page_idx: entry.page_idx,
                 slot_idx: entry.slot_idx,
                 ttl_ms: entry.ttl_ms,
+                value_type: entry.value_type,
             };
 
             crate::shard::slice::with_shard_db(entry.db_index, |db| {

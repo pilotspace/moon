@@ -204,6 +204,10 @@ pub struct SpillCompletionEntry {
     /// `ColdLocation::ttl_ms` (R1, H-2: proactive TTL-expiry sweep) without
     /// re-reading the just-written file.
     pub ttl_ms: Option<u64>,
+    /// Value type, likewise carried through from the `SpillRequest` so the
+    /// event loop can populate `ColdLocation::value_type` (#364: SCAN TYPE
+    /// filter over cold keys) without re-reading the just-written file.
+    pub value_type: ValueType,
 }
 
 /// Completion sent from background thread back to event loop.
@@ -327,6 +331,7 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                                 page_idx,
                                 slot_idx,
                                 ttl_ms: req.ttl_ms,
+                                value_type: req.value_type,
                             })
                             .collect();
                         completions.push(SpillCompletion {
@@ -395,6 +400,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     page_idx: 0,
                     slot_idx: 0,
                     ttl_ms: req.ttl_ms,
+                    value_type: req.value_type,
                 }],
                 success: true,
             },
@@ -843,6 +849,7 @@ mod tests {
             page_idx: entry.page_idx,
             slot_idx: entry.slot_idx,
             ttl_ms: entry.ttl_ms,
+            value_type: ValueType::String,
         };
         let result = read_cold_entry_at(tmp.path(), loc, 0);
         assert!(result.is_some(), "should read entry back");
@@ -1058,6 +1065,7 @@ mod tests {
                     page_idx: entry.page_idx,
                     slot_idx: entry.slot_idx,
                     ttl_ms: entry.ttl_ms,
+                    value_type: ValueType::String,
                 };
                 let outcome = crate::storage::tiered::cold_read::read_cold_entry_at(
                     tmp.path(),
@@ -1163,6 +1171,7 @@ mod tests {
                     page_idx: entry.page_idx,
                     slot_idx: entry.slot_idx,
                     ttl_ms: entry.ttl_ms,
+                    value_type: ValueType::String,
                 };
                 let result =
                     crate::storage::tiered::cold_read::read_cold_entry_at(tmp.path(), loc, 0);

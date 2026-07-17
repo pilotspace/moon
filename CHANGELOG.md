@@ -77,6 +77,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatched real DBSIZE commands — the two definitions disagreed inside a
   single reply). Known remaining parity gap, tracked separately: SCAN /
   KEYS / RANDOMKEY still enumerate the hot plane only.
+- **Keyspace enumeration under disk-offload: SCAN/KEYS/RANDOMKEY now see
+  spilled keys (#364).** With disk-offload enabled, cold-only keys (spilled by
+  eviction, no in-RAM entry) were readable via GET/EXISTS but invisible to
+  enumeration — a 4-shard instance holding 400 logical keys returned only 116
+  from `redis-cli --scan`, silently losing spilled keys for any
+  migration/backup consumer. SCAN, KEYS, and RANDOMKEY (both dispatch tracks)
+  now enumerate the union of the hot plane and the in-RAM cold index,
+  partitioned so a key present in both planes is returned exactly once and
+  TTL-expired cold entries are skipped — pure in-RAM, no disk reads and no
+  promotion. SCAN's `TYPE` filter judges cold keys from a new
+  `ColdLocation::value_type` cache (same cached-copy contract as `ttl_ms`:
+  populated at spill time, re-derived from the on-disk pages by
+  `ColdIndex::rebuild_from_manifest` after restart; fits existing struct
+  padding, so the cold index does not grow; no on-disk format change).
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
   segment exactly once and declared a second `NeedsSplit` unreachable — false under
