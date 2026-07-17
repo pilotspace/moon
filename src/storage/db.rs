@@ -1458,6 +1458,14 @@ impl Database {
         want: usize,
         now_ms: u64,
     ) -> (Vec<(u64, CompactKey)>, bool) {
+        // The h64→h48 bridge (and the "equal-h48 group never straddles a
+        // page" guarantee) requires segment routing to use at most the top
+        // 48 hash bits. Depth > 48 needs a 2^48-entry directory —
+        // unreachable in practice, but the invariant is load-bearing.
+        debug_assert!(
+            self.data.directory_depth() <= 48,
+            "SCAN 48-bit cursor mapping requires directory depth <= 48"
+        );
         let base_ts = self.base_timestamp;
         let (page, more) = self.data.hash_page(from_h48 << 16, want, move |_, e| {
             !e.is_expired_at(base_ts, now_ms)

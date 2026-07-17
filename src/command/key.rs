@@ -970,6 +970,12 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
+    // Clamp to the 48-bit hash space. Legitimate resumed cursors always
+    // fit (multi-shard composites are unpacked by `coordinate_scan` before
+    // reaching here); an out-of-range client cursor would otherwise filter
+    // out every key (h48 < 2^48) and falsely report "scan complete" on a
+    // non-empty keyspace.
+    let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
     // Parse optional arguments
     let mut match_pattern: Option<&[u8]> = None;
@@ -1306,6 +1312,12 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
+    // Clamp to the 48-bit hash space. Legitimate resumed cursors always
+    // fit (multi-shard composites are unpacked by `coordinate_scan` before
+    // reaching here); an out-of-range client cursor would otherwise filter
+    // out every key (h48 < 2^48) and falsely report "scan complete" on a
+    // non-empty keyspace.
+    let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
     let mut match_pattern: Option<&[u8]> = None;
     let mut count: usize = 10;
@@ -1558,6 +1570,24 @@ mod tests {
         let unique: std::collections::HashSet<&Bytes> = seen.iter().collect();
         assert_eq!(unique.len(), seen.len(), "no key may be returned twice");
         assert_eq!(seen.len(), 57, "every live key exactly once");
+    }
+
+    /// An out-of-range client cursor (bits above the 48-bit hash space,
+    /// e.g. a composite cursor replayed against a single-shard server)
+    /// must be clamped, not silently filter out every key and report a
+    /// false "scan complete" on a non-empty keyspace.
+    #[test]
+    fn scan_out_of_range_cursor_clamps_to_hash_space() {
+        let mut db = Database::new();
+        for i in 0..20 {
+            db.set(
+                Bytes::from(format!("k:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        // 2^63: garbage in the shard-index bits, zero in the low 48.
+        let (_, keys) = scan_page(&mut db, 1u64 << 63, 50);
+        assert_eq!(keys.len(), 20, "clamped cursor must scan from position 0");
     }
 
     /// MATCH + COUNT paging still terminates and honors the filter.

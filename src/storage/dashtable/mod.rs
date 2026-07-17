@@ -276,6 +276,17 @@ impl<V> DashTable<CompactKey, V> {
         self.split_count
     }
 
+    /// Global directory depth (log2 of directory size).
+    ///
+    /// SCAN's 48-bit cursor mapping (`Database::scan_hot_page`) relies on
+    /// `depth <= 48` so that equal-top-48-bit hashes always route to the
+    /// same segment; a depth beyond 48 would need a 2^48-entry directory,
+    /// unreachable on real hardware.
+    #[inline]
+    pub fn directory_depth(&self) -> u32 {
+        self.depth
+    }
+
     /// Resident bytes used by the DashTable structural overhead (segments +
     /// directory + index map). Does NOT include per-entry key/value data --
     /// that is tracked separately by `Database::used_memory`.
