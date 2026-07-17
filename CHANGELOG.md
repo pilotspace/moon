@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Performance
+- **SCAN cold-plane pages now range-resume from the cursor — no full
+  cold-index filter per page (#368).** The in-RAM cold index (spilled
+  keys under disk-offload) is now ordered by the same `(hash48, key)`
+  SCAN order as the hot plane (`BTreeMap` keyed by the 48-bit cursor
+  hash), so each SCAN page seeks to the cursor in O(log n) and takes
+  the first COUNT live candidates instead of filtering every spilled
+  key on every page. Completes the two-plane O(COUNT)-per-page walk on
+  the hot-plane change below. Cold `lookup`/`remove` pay an O(log n)
+  tree descent instead of an O(1) hash probe — those sit on
+  disk-read-through, promotion, and sweep paths where the descent is
+  noise next to the I/O they front, and the ordered map replaces (not
+  duplicates) the hash map, so per-entry RAM stays comparable. Public
+  `ColdIndex` API and recovery/rebuild behavior are unchanged.
 - **SCAN hot-plane pages are now true O(COUNT) — no full-table walk per
   page (#368).** The SCAN cursor hash is now the DashTable's own
   fixed-seed key hash truncated to its top 48 bits, which makes cursor

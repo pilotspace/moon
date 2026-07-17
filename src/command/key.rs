@@ -1018,22 +1018,15 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
 }
 
-/// Stable 48-bit key hash for SCAN cursors.
-///
-/// The cursor is a POSITION IN HASH SPACE, so this hash must be stable
-/// across pages and across the two planes — a fixed-seed hash. This is the
-/// hot table's own fixed-seed key hash truncated to its TOP 48 bits, which
-/// makes the cursor range-compatible with the DashTable's extendible-
-/// hashing directory (indexed by top hash bits): `Database::scan_hot_page`
-/// walks only the segments covering `[cursor << 16, ..)` — O(COUNT) per
-/// page instead of a full-table walk (#368). The cold plane computes the
-/// same value from the key bytes, keeping both planes in one hash order.
-/// 48 bits because the multi-shard composite cursor reserves the upper
-/// 16 bits for the shard index (`coordinate_scan`).
-#[inline]
-fn scan_hash48(key: &[u8]) -> u64 {
-    crate::storage::dashtable::hash_key(key) >> 16
-}
+// The SCAN cursor is a POSITION IN 48-BIT HASH SPACE: the hot table's own
+// fixed-seed key hash truncated to its TOP 48 bits
+// (`storage::dashtable::hash_key(key) >> 16`). Neither plane computes it
+// here anymore — `Database::scan_hot_page` walks only the DashTable
+// segments covering `[cursor << 16, ..)` and the ordered cold index
+// (`Database::cold_only_keys_from`) range-resumes from the cursor — but
+// both derive the SAME value internally, keeping the two planes in one
+// merged hash order. 48 bits because the multi-shard composite cursor
+// reserves the upper 16 bits for the shard index (`coordinate_scan`).
 
 /// Shared SCAN page walk (#368): hash-ordered iteration with a real
 /// stable-key guarantee, replacing the old positional-index-over-a-
@@ -1096,9 +1089,11 @@ fn scan_core(
         }
         // Cold plane: spilled keys with no live hot shadow (pure in-RAM
         // index probe — no disk I/O). Partitioned from the hot walk, so no
-        // dedup pass (#364).
-        for key in db.cold_only_keys(now_ms) {
-            consider(scan_hash48(key.as_ref()), key.as_ref(), true);
+        // dedup pass (#364). Hash-ordered range resume: the first `count`
+        // live candidates at or after the cursor are exactly the smallest
+        // cold candidates — no full cold-index filter per page.
+        for (h, key) in db.cold_only_keys_from(cursor, now_ms).take(count) {
+            consider(h, key.as_ref(), true);
         }
     }
 
@@ -1121,11 +1116,13 @@ fn scan_core(
                     extra.push((h_last, key.clone(), false));
                 }
             }
-            for key in db.cold_only_keys(now_ms) {
-                if scan_hash48(key.as_ref()) == h_last
-                    && !selected
-                        .iter()
-                        .any(|(_, k, _)| k.as_bytes() == key.as_ref())
+            for (h, key) in db.cold_only_keys_from(h_last, now_ms) {
+                if h > h_last {
+                    break;
+                }
+                if !selected
+                    .iter()
+                    .any(|(_, k, _)| k.as_bytes() == key.as_ref())
                 {
                     extra.push((h_last, CompactKey::from(key.as_ref()), true));
                 }
@@ -2679,6 +2676,85 @@ mod tests {
                 }
                 cursor = next.clone();
             }
+        }
+
+        #[test]
+        fn scan_paged_drain_across_planes_exact_once() {
+            // 40 hot + 40 cold-only + 10 both-planes keys drained at
+            // COUNT 7: the ranged cold walk (#368 cold-plane resume) must
+            // merge with the hot page walk so every LOGICAL key appears
+            // exactly once across pages.
+            let hot_names: Vec<Vec<u8>> = (0..50).map(|i| format!("h:{i}").into_bytes()).collect();
+            let cold_names: Vec<Vec<u8>> = (0..40).map(|i| format!("c:{i}").into_bytes()).collect();
+            let hot_refs: Vec<&[u8]> = hot_names.iter().map(|v| v.as_slice()).collect();
+            let mut cold_refs: Vec<(&[u8], Option<u64>)> =
+                cold_names.iter().map(|v| (v.as_slice(), None)).collect();
+            // 10 both-planes keys: hot shadow over a stale cold entry.
+            for v in hot_names.iter().take(10) {
+                cold_refs.push((v.as_slice(), None));
+            }
+            let mut db = db_with_planes(&hot_refs, &cold_refs);
+            let keys = full_scan(&mut db, &[b"COUNT", b"7"]);
+            let unique: std::collections::HashSet<&Bytes> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "no key may be returned twice");
+            assert_eq!(keys.len(), 90, "every logical key exactly once");
+        }
+
+        #[test]
+        fn scan_cold_churn_between_pages_keeps_stable_keys() {
+            // New spills landing mid-scan must not displace pre-existing
+            // cold keys (hash-space cursor: churn can't shift positions).
+            let cold_names: Vec<Vec<u8>> =
+                (0..30).map(|i| format!("st:{i}").into_bytes()).collect();
+            let cold_refs: Vec<(&[u8], Option<u64>)> =
+                cold_names.iter().map(|v| (v.as_slice(), None)).collect();
+            let mut db = db_with_planes(&[], &cold_refs);
+            let mut cursor = Bytes::from_static(b"0");
+            let mut seen: Vec<Bytes> = Vec::new();
+            let mut churn = 0u32;
+            loop {
+                let args = [Frame::BulkString(cursor.clone()), bs(b"COUNT"), bs(b"5")];
+                let Frame::Array(parts) = scan(&mut db, &args) else {
+                    panic!("SCAN did not return an array");
+                };
+                let (Frame::BulkString(next), Frame::Array(batch)) = (&parts[0], &parts[1]) else {
+                    panic!("malformed SCAN reply");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        seen.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    break;
+                }
+                cursor = next.clone();
+                // Churn: spill 5 NEW cold keys between every page.
+                #[allow(clippy::unwrap_used)] // test-only: planes fabricated above
+                let ci = db.cold_index.as_mut().unwrap();
+                for _ in 0..5 {
+                    ci.insert(
+                        Bytes::from(format!("churn:{churn}")),
+                        ColdLocation {
+                            file_id: 2,
+                            page_idx: 0,
+                            slot_idx: 0,
+                            ttl_ms: None,
+                            value_type: crate::persistence::kv_page::ValueType::String,
+                        },
+                    );
+                    churn += 1;
+                }
+            }
+            for name in &cold_names {
+                assert!(
+                    seen.iter().any(|k| k.as_ref() == name.as_slice()),
+                    "stable cold key {} lost under mid-scan spill churn",
+                    String::from_utf8_lossy(name)
+                );
+            }
+            let unique: std::collections::HashSet<&Bytes> = seen.iter().collect();
+            assert_eq!(unique.len(), seen.len(), "no key may be returned twice");
         }
 
         #[test]
