@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wal-v3/` dir dead), and any tick-flush failure arms a 1s retry backoff so
   no flush error class can ever loop at the 1ms tick cadence again. The
   latch is unix-only by design (the non-unix statvfs stub never fails); the
-  latch-behavior unit test is `cfg(unix)`-gated accordingly.
+  latch-behavior unit test is `cfg(unix)`-gated accordingly, and the e2e
+  suite's latched-CPU check is relative to a pre-deletion baseline window so
+  shared-runner load cannot flake it.
 
 ### Performance
 - **Disk-offload: shard event loop no longer pays manifest-commit fsyncs
