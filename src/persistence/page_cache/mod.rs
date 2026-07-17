@@ -58,6 +58,16 @@ pub struct PageCache {
     sweep_4k: ClockSweep,
     /// Clock-sweep for 64KB pool.
     sweep_64k: ClockSweep,
+    /// Running total of bytes committed across all page buffers.
+    ///
+    /// Buffers are lazily grown from empty to exactly their pool's page size
+    /// on first use (`fetch_page` miss path) and NEVER shrink — eviction only
+    /// clears the VALID flag, keeping the allocation for reuse. That makes a
+    /// single monotonic counter, bumped at the one grow site, exactly
+    /// equivalent to walking every buffer — without the per-frame lock
+    /// acquisition that made `resident_buffer_bytes` the #1 idle-CPU consumer
+    /// (called every 100ms per shard from the eviction tick).
+    resident_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// Split a per-shard PageCache budget (bytes) into (4KB, 64KB) frame counts.
@@ -114,18 +124,18 @@ impl PageCache {
             page_table: DashMap::new(),
             sweep_4k: ClockSweep::new(num_frames_4k),
             sweep_64k: ClockSweep::new(num_frames_64k),
+            resident_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Total bytes currently committed across all page buffers.
     ///
     /// With lazy buffers this reflects the actual resident working set, not the
-    /// configured budget — a freshly constructed cache returns 0. Used by tests
-    /// and memory reporting; not a hot path (locks each buffer).
+    /// configured budget — a freshly constructed cache returns 0. O(1): a
+    /// relaxed load of the running counter maintained at the buffer grow site
+    /// (see `resident_bytes`); safe to call at eviction-tick cadence.
     pub fn resident_buffer_bytes(&self) -> usize {
-        let small: usize = self.buffers_4k.iter().map(|b| b.read().len()).sum();
-        let large: usize = self.buffers_64k.iter().map(|b| b.read().len()).sum();
-        small + large
+        self.resident_bytes.load(Ordering::Relaxed)
     }
 
     /// Fetch a page into the cache and return a pinned handle.
@@ -199,6 +209,10 @@ impl PageCache {
         {
             let mut buf = buffers[victim_idx].write();
             if buf.len() != page_size {
+                // Sole buffer grow site: count the newly committed bytes even
+                // if `read_fn` fails below — the allocation stays either way.
+                self.resident_bytes
+                    .fetch_add(page_size - buf.len(), Ordering::Relaxed);
                 buf.resize(page_size, 0);
             }
             read_fn(&mut buf)?;
@@ -1044,6 +1058,49 @@ mod tests {
             "one 4K + one 64K buffer resident; the other 1098 frames stay unallocated"
         );
         cache.unpin_page(h2);
+    }
+
+    #[test]
+    fn resident_counter_matches_buffer_walk_across_eviction_and_reuse() {
+        // The O(1) counter must stay equal to the ground truth (walking every
+        // buffer's committed length) through miss-grow, eviction, and frame
+        // REUSE — a reused frame keeps its buffer, so re-fetching through it
+        // must NOT double-count.
+        let walk = |c: &PageCache| -> usize {
+            let small: usize = c.buffers_4k.iter().map(|b| b.read().len()).sum();
+            let large: usize = c.buffers_64k.iter().map(|b| b.read().len()).sum();
+            small + large
+        };
+
+        let cache = PageCache::new(4, 2);
+        // Fill all four 4K frames.
+        for i in 0..4u64 {
+            let h = cache.fetch_page(1, i * 4096, false, |_| Ok(())).unwrap();
+            cache.unpin_page(h);
+        }
+        assert_eq!(cache.resident_buffer_bytes(), 4 * PAGE_4K);
+        assert_eq!(cache.resident_buffer_bytes(), walk(&cache));
+
+        // Evict two cold frames — buffers stay committed, counter unchanged.
+        let evicted = cache.evict_cold_frames(2);
+        assert!(evicted > 0, "unpinned clean frames must be evictable");
+        assert_eq!(cache.resident_buffer_bytes(), walk(&cache));
+        assert_eq!(cache.resident_buffer_bytes(), 4 * PAGE_4K);
+
+        // New pages through the reused frames: len already == PAGE_4K, so the
+        // grow site is skipped and the counter must not move.
+        for i in 10..(10 + evicted as u64) {
+            let h = cache.fetch_page(2, i * 4096, false, |_| Ok(())).unwrap();
+            cache.unpin_page(h);
+        }
+        assert_eq!(cache.resident_buffer_bytes(), 4 * PAGE_4K);
+        assert_eq!(cache.resident_buffer_bytes(), walk(&cache));
+
+        // A failed read_fn still commits the buffer — counter counts it.
+        let big = cache.fetch_page(3, 0, true, |_| Err(std::io::Error::other("boom")));
+        assert!(big.is_err());
+        assert_eq!(cache.resident_buffer_bytes(), 4 * PAGE_4K + PAGE_64K);
+        assert_eq!(cache.resident_buffer_bytes(), walk(&cache));
     }
 
     #[test]
