@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- Persistence guide and Valkey comparison no longer describe the removed
+  WAL v2 (`src/persistence/wal.rs`); both now document WAL v3
+  (`src/persistence/wal_v3/`: segmented files, per-record LSN, lz4 FPI,
+  off-loop fsync agent).
+
 ### Fixed
 - **Data-dir deleted under a running server now latches a degraded state
   instead of error-looping the persistence tick (#366).** When `--dir`
