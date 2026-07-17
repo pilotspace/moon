@@ -14,6 +14,13 @@
 //! Run with:
 //!   cargo test --release --test instance_lock
 
+// The contract under test is flock(2) semantics — POSIX-only by design.
+// On non-unix targets `dir_lock::acquire` is a documented warn-once no-op
+// (Windows is a compile target, not production; see CLAUDE.md), so the
+// refusal assertions below would fail there. Gate the whole file, or the
+// next push to main goes red on the Windows CI leg (PR-invisible: the
+// Windows Check job only runs on main pushes / workflow_dispatch).
+#![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
 mod common;

@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the synchronous MGET/MULTI/Lua read paths), never pacing when the request
   backlog is deep (pacing must not push eviction into `-OOM`) or at
   shutdown.
+
 ### Added
 - **Data-dir instance lock: a second moon on the same `--dir` is refused at
   startup.** Two servers writing one directory means two writers on the same
