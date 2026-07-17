@@ -94,7 +94,7 @@ fn bgsave_issued_during_shard_startup_still_completes() {
     // guard instead of orphaning the server. An orphan from THIS suite is
     // what produced the 667%-CPU incident behind issue #366 (leaked child,
     // tmpdir later cleaned, pre-fix binary error-looping its tick).
-    let mut child = MoonGuard(Some(child));
+    let child = MoonGuard(Some(child));
 
     let mut c = Conn::open(port);
     // PING to confirm command plane is up, then fire BGSAVE immediately —

@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off-loop fsync agent).
 
 ### Fixed
+- **Test-harness hygiene sweep: hardcoded `target/release/moon` paths and
+  unguarded child spawns across `tests/`.** 33 integration suites resolved
+  the moon server binary via a bare `./target/release/moon` default, a
+  `CARGO_MANIFEST_DIR`-relative guess, or a local `find_moon_binary()` copy
+  that never checked `CARGO_BIN_EXE_moon` — a stale binary of unknown
+  provenance on a shared checkout could silently run instead of the one
+  cargo actually built for the test; migrated to `common::find_moon_binary()`
+  (5 suites with a documented "skip gracefully when unbuilt" contract keep
+  their own `Option<PathBuf>` resolver, with the same `CARGO_BIN_EXE_moon`
+  tier added ahead of the stale-path fallback). Separately, 6 suites
+  (`console_gateway_test`, `scan_fanout_multishard`,
+  `allocator_mimalloc_smoke`, `perf_v0112_arenas_cap`,
+  `replication_readonly_eval`, `replication_readonly_ws_mq`) held a bare
+  `Child` across many `assert!`/`.expect()` calls with cleanup only at the
+  end of the function — a mid-test panic orphaned the server, the same
+  shape behind issue #366's 667%-CPU incident — and now use the
+  kill-on-drop `MoonGuard` pattern from `tests/bgsave_startup_race.rs`.
+  Complex multi-restart harnesses (crash-recovery kill-9 cycles, Jepsen,
+  instance-lock, SIGTERM) were left untouched by design.
 - **`tests/bgsave_startup_race.rs` can no longer orphan its server on a
   mid-test panic** — the spawned child is now held by a kill-on-drop guard
   (the pattern from `tests/dir_deleted_degraded.rs`). An orphan from this
