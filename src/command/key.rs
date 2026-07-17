@@ -1128,7 +1128,18 @@ fn scan_core(
                 }
             }
             selected.extend(extra);
-            next_cursor = h_last + 1;
+            // If the group sits at the very top of the 48-bit hash space,
+            // the scan is complete — nothing can hash above it, and
+            // `h_last + 1` (2^48) would be masked back to 0 by the cursor
+            // clamp on the next call, restarting the scan forever. Not
+            // practically constructible (needs a full page of keys at the
+            // exact max hash), hence no test — this is belt-and-braces
+            // against an infinite scan loop.
+            next_cursor = if h_last == 0x0000_FFFF_FFFF_FFFF {
+                0
+            } else {
+                h_last + 1
+            };
         } else {
             // Defer the (possibly incomplete) trailing hash group to the
             // next page; resume exactly at its hash.
