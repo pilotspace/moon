@@ -619,6 +619,14 @@ impl WalWriterV3 {
         self.buf.capacity()
     }
 
+    /// Bytes currently buffered and not yet written to the segment file.
+    /// Zero means the tick flush has nothing to do — one of the adaptive
+    /// idle park's eligibility conditions (#373).
+    #[inline]
+    pub fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Configure minimum and maximum WAL size bounds for recycling.
     ///
     /// - `min_bytes`: recycling stops when remaining WAL would drop below this.

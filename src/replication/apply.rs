@@ -284,6 +284,11 @@ pub(crate) fn apply_local(
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
         return ApplyOutcome::Applied; // not an array command — nothing to apply (defensive)
     };
+    // Redis parity (and #373 idle-park visibility): applied master-stream
+    // commands count toward total_commands_processed. The apply task runs
+    // on the target shard's OS thread, so this lands in the same counter
+    // slot the shard's idle gate reads.
+    crate::admin::metrics_setup::record_replica_apply();
     if cmd.eq_ignore_ascii_case(crate::workspace::repl::WS_CREATE_APPLY_CMD) {
         // Doesn't touch `ShardSlice`, but routes through `try_with_shard`
         // anyway so a replica task wired to a non-shard thread is caught
