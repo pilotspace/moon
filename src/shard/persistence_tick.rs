@@ -239,8 +239,17 @@ pub(crate) fn flush_wal_v3_if_needed(
         return;
     }
     if let Some(wal) = wal_v3 {
+        // Belt-and-suspenders for failure classes the latch can't see
+        // (EACCES, a shallow heal missing nested dirs, …): a failed flush
+        // arms a 1s backoff so no flush error can ever loop at tick cadence.
+        if wal.flush_backing_off() {
+            return;
+        }
         if let Err(e) = wal.flush_if_needed() {
-            tracing::error!("WAL v3 flush failed: {}", e);
+            wal.note_flush_failure();
+            tracing::error!("WAL v3 flush failed (retrying in 1s): {}", e);
+        } else {
+            wal.clear_flush_backoff();
         }
     }
 }
@@ -268,6 +277,11 @@ pub(crate) fn check_warm_transitions(
     shard_id: usize,
     wal: &mut Option<WalWriterV3>,
 ) {
+    // #366: warm-tier transitions write segment files under the offload dir
+    // — doomed while the data directory is missing; skip until it heals.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return;
+    }
     let count = vector_store.try_warm_transitions_all_idle(
         shard_dir,
         manifest,

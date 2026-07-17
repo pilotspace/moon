@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while latched. The latch self-heals: the next poll that sees the directory
   again resumes writes (with an explicit warning that data accepted since
   the deletion is not guaranteed durable until restart). Only engages when
-  persistence is configured, and works with `--disk-free-min-pct 0`.
+  persistence or disk-offload is configured, and works with
+  `--disk-free-min-pct 0`. Two hardening layers close the shallow-heal hole
+  (adversarial review): WAL segment rotation re-creates a missing parent
+  directory (`mkdir -p <dir>` after an incident no longer leaves the nested
+  `wal-v3/` dir dead), and any tick-flush failure arms a 1s retry backoff so
+  no flush error class can ever loop at the 1ms tick cadence again.
 
 ### Performance
 - **Disk-offload: shard event loop no longer pays manifest-commit fsyncs

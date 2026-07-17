@@ -20,7 +20,9 @@
 //! ## Dir-lost latch (issue #366)
 //!
 //! When the monitored path itself vanishes (`statvfs` → `ENOENT`/`ENOTDIR`:
-//! operator `rm -rf`, tmp-cleaner sweep, mount disappearing), a server with
+//! operator `rm -rf`, tmp-cleaner sweep; NOT a clean unmount — the mountpoint
+//! directory usually survives that, and catching it would need an `st_dev`
+//! comparison), a server with
 //! persistence configured must NOT keep retrying its per-tick WAL/checkpoint
 //! file operations — that is a 1ms syscall error loop that burned ~100% CPU
 //! per shard thread in the wild. Instead `poll` latches `dir_lost`:
@@ -336,6 +338,9 @@ pub fn global_free_bytes() -> u64 {
 /// caller distinguishes: it deterministically means the monitored path no
 /// longer exists (the issue #366 trigger), unlike transient I/O errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Non-unix: the stub `query_free_bytes` never fails, so the variants are
+// never constructed there — silence the dead-variant lint for that cfg only.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum QueryError {
     /// `ENOENT` / `ENOTDIR` — the monitored path is gone.
     PathMissing,
