@@ -193,7 +193,7 @@ pub fn spill_to_datafile(
         page_count: pages.total_pages,
         byte_size,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: 0,
         max_key_hash: 0,
         last_modified_lsn: 0,
     });
@@ -1135,6 +1135,77 @@ mod tests {
         }
     }
 
+    /// #139 recovery attribution: two spill files tagged with different
+    /// `FileEntry::db_index` values must rebuild into SEPARATE per-db cold
+    /// indexes, each holding exactly its own file's keys — the db0-only
+    /// attach used to make every SELECT >0 spilled key unreachable after
+    /// restart.
+    #[test]
+    fn test_rebuild_per_db_attributes_files_to_their_databases() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // One batch file per db, registered exactly as apply_spill_completions
+        // would (db attribution at file granularity).
+        for (db, file_id, prefix) in [(0u64, 201u64, "d0:"), (3u64, 202u64, "d3:")] {
+            let entries: Vec<SpillEntry> = (0..10)
+                .map(|i| SpillEntry {
+                    key: Bytes::from(format!("{prefix}{i}")),
+                    value_bytes: Bytes::from(format!("v{i}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+            manifest.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: db,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        manifest.commit().unwrap();
+
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        per_db.sort_by_key(|(db, _)| *db);
+        let dbs: Vec<usize> = per_db.iter().map(|(db, _)| *db).collect();
+        assert_eq!(dbs, vec![0, 3], "one index per db present in the manifest");
+        for (db, index) in &per_db {
+            assert_eq!(index.len(), 10, "db {db}: every entry recovered");
+            let prefix = if *db == 0 { "d0:" } else { "d3:" };
+            for i in 0..10 {
+                assert!(
+                    index.lookup(format!("{prefix}{i}").as_bytes()).is_some(),
+                    "db {db}: missing its own key {prefix}{i}"
+                );
+            }
+            let other = if *db == 0 { "d3:0" } else { "d0:0" };
+            assert!(
+                index.lookup(other.as_bytes()).is_none(),
+                "db {db}: must not contain the other db's keys"
+            );
+        }
+
+        // The merged wrapper still sees everything (single-db callers).
+        let merged = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
+        assert_eq!(merged.len(), 20);
+    }
+
     /// RECOVERY-PATH test: prove `ColdIndex::rebuild_from_manifest` reconstructs
     /// the SAME (page_idx, slot_idx) mapping the builder produced.
     ///
@@ -1181,7 +1252,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });
@@ -1397,7 +1468,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });
@@ -1476,7 +1547,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });

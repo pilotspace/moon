@@ -94,7 +94,7 @@ impl StorageTier {
 /// 12..16  4     page_count (u32 LE)
 /// 16..24  8     byte_size (u64 LE)
 /// 24..32  8     created_lsn (u64 LE)
-/// 32..40  8     min_key_hash (u64 LE)
+/// 32..40  8     db_index (u64 LE; formerly min_key_hash, always written 0 — see field doc)
 /// 40..48  8     max_key_hash (u64 LE)
 /// 48..56  8     last_modified_lsn (u64 LE)  -- v2 only
 /// ```
@@ -108,7 +108,18 @@ pub struct FileEntry {
     pub page_count: u32,
     pub byte_size: u64,
     pub created_lsn: u64,
-    pub min_key_hash: u64,
+    /// Logical database index every entry in this file belongs to (#139:
+    /// cold recovery must re-attach spilled keys to the database they were
+    /// evicted from, not unconditionally db 0).
+    ///
+    /// Byte-compatible repurpose of the former `min_key_hash` field, which
+    /// every writer in the codebase's history serialized as 0 — so v1/v2
+    /// manifests written before this field existed read back as db 0,
+    /// which is exactly correct for them (the spill buffer was db-blind
+    /// and recovery attached everything to db 0). The spill path
+    /// guarantees single-db files by cutting flush chunks at db
+    /// boundaries (`spill_thread::flush_buffer`).
+    pub db_index: u64,
     pub max_key_hash: u64,
     /// LSN of the last mutation to this file (v2). For files imported from
     /// a v1 manifest this is set equal to `created_lsn`. Used by PITR to
@@ -144,7 +155,7 @@ impl FileEntry {
         buf[12..16].copy_from_slice(&self.page_count.to_le_bytes());
         buf[16..24].copy_from_slice(&self.byte_size.to_le_bytes());
         buf[24..32].copy_from_slice(&self.created_lsn.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.min_key_hash.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.db_index.to_le_bytes());
         buf[40..48].copy_from_slice(&self.max_key_hash.to_le_bytes());
         buf[48..56].copy_from_slice(&self.last_modified_lsn.to_le_bytes());
     }
@@ -187,7 +198,7 @@ impl FileEntry {
         let created_lsn = u64::from_le_bytes([
             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
         ]);
-        let min_key_hash = u64::from_le_bytes([
+        let db_index = u64::from_le_bytes([
             buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
         ]);
         let max_key_hash = u64::from_le_bytes([
@@ -203,7 +214,7 @@ impl FileEntry {
             page_count,
             byte_size,
             created_lsn,
-            min_key_hash,
+            db_index,
             max_key_hash,
             // v1 fallback — synthesize from created_lsn so existing manifests
             // remain readable and PITR target_lsn comparisons stay sane.
@@ -1194,7 +1205,7 @@ mod tests {
             page_count: 1000,
             byte_size: 4_096_000,
             created_lsn: 42,
-            min_key_hash: 0x1111_2222_3333_4444,
+            db_index: 0x1111_2222_3333_4444,
             max_key_hash: 0xAAAA_BBBB_CCCC_DDDD,
             last_modified_lsn: 4242,
         };
@@ -1217,7 +1228,7 @@ mod tests {
             page_count: 500,
             byte_size: 32_768_000,
             created_lsn: 100,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 200,
         };
@@ -1242,7 +1253,7 @@ mod tests {
             page_count: 10,
             byte_size: 40960,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 99_999,
         };
@@ -1317,7 +1328,7 @@ mod tests {
             page_count: 100,
             byte_size: 409_600,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 1,
         };
@@ -1359,7 +1370,7 @@ mod tests {
             page_count: 100,
             byte_size: 409_600,
             created_lsn: id,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: id,
         }

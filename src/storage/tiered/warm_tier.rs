@@ -94,7 +94,7 @@ pub fn transition_to_warm(
         page_count: codes_pages as u32,
         byte_size: codes_data.len() as u64,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: 0,
         max_key_hash: u64::MAX,
         last_modified_lsn: 0,
     };

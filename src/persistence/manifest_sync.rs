@@ -224,7 +224,7 @@ mod tests {
             page_count: 1,
             byte_size: 4096,
             created_lsn: file_id,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: file_id,
         }

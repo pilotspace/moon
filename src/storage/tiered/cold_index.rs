@@ -660,14 +660,42 @@ impl ColdIndex {
         shard_dir: &Path,
         manifest: &crate::persistence::manifest::ShardManifest,
     ) -> Self {
+        let mut merged = Self::new();
+        for (_db, index) in Self::rebuild_from_manifest_per_db(shard_dir, manifest) {
+            merged.merge(index);
+        }
+        merged
+    }
+
+    /// Rebuild one cold index PER LOGICAL DATABASE from the manifest's
+    /// KvLeaf files (#139). Each spill file is attributed wholesale via
+    /// `FileEntry::db_index` — the spill path guarantees single-db files
+    /// (flush chunks cut at db boundaries), and manifests from before the
+    /// field existed read as db 0, matching their actual (db-blind,
+    /// attach-to-db0) provenance. Returns `(db_index, index)` pairs for
+    /// every db that has at least one recovered entry.
+    pub fn rebuild_from_manifest_per_db(
+        shard_dir: &Path,
+        manifest: &crate::persistence::manifest::ShardManifest,
+    ) -> Vec<(usize, Self)> {
         use crate::persistence::manifest::FileStatus;
         use crate::persistence::page::{PAGE_4K, PageType};
 
-        let mut index = Self::new();
+        let mut per_db: Vec<(usize, Self)> = Vec::new();
         let data_dir = shard_dir.join("data");
 
         for entry in manifest.files() {
             if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
+                let db = entry.db_index as usize;
+                let index = match per_db.iter_mut().find(|(d, _)| *d == db) {
+                    Some((_, idx)) => idx,
+                    None => {
+                        per_db.push((db, Self::new()));
+                        #[allow(clippy::unwrap_used)] // pushed on the previous line
+                        let last = per_db.last_mut().unwrap();
+                        &mut last.1
+                    }
+                };
                 let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
                 // Read raw bytes and iterate by absolute chunk index.
                 // `read_datafile` skips overflow pages (returns only KvLeaf pages),
@@ -699,7 +727,7 @@ impl ColdIndex {
                 }
             }
         }
-        index
+        per_db
     }
 }
 
