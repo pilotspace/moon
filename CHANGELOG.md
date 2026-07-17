@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Idle-tick CPU trimmed (#373 phase 1).** Three per-tick costs on the
+  shard event loop's 1ms/100ms cadences were removed without touching any
+  cadence or park timing: (1) `PageCache::resident_buffer_bytes` — the #1
+  consumer in an idle-server perf profile (~17% of samples; it walked every
+  frame buffer taking a `parking_lot` read lock each, every 100ms per
+  shard) — is now an O(1) relaxed atomic load, maintained at the single
+  buffer-grow site (buffers never shrink, so a monotonic counter is exactly
+  equivalent); (2) `CheckpointTrigger::should_checkpoint` no longer calls
+  `Instant::now()` every 1ms tick for its whole-seconds timeout — it reads
+  the shard's cached clock; (3) `CachedClock::update` (the one designated
+  clock read per tick) now makes one `SystemTime::now()` call instead of
+  two, deriving seconds from milliseconds.
+
 ### Documentation
 - Persistence guide and Valkey comparison no longer describe the removed
   WAL v2 (`src/persistence/wal.rs`); both now document WAL v3

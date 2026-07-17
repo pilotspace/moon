@@ -130,8 +130,11 @@ impl CachedClock {
     /// `current_time_ms` on the hot path.
     #[inline]
     pub fn update(&self) {
-        let s = current_secs_syscall();
+        // One clock read serves both granularities — this runs every 1ms per
+        // shard, so the second `SystemTime::now()` it used to make was a pure
+        // duplicate `clock_gettime` (issue #373 idle-CPU work).
         let m = current_time_ms_syscall();
+        let s = (m / 1000) as u32;
         self.secs
             .store(s as u64, std::sync::atomic::Ordering::Relaxed);
         self.ms.store(m, std::sync::atomic::Ordering::Relaxed);
