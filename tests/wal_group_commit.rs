@@ -21,6 +21,8 @@
 //!
 //! Running: cargo test --test wal_group_commit
 
+mod common;
+
 use bytes::Bytes;
 use moon::persistence::aof::group_commit::{
     AOF_GROUP_COMMIT_MAX_BATCH, AOF_GROUP_COMMIT_MAX_BYTES, CommitOutcome, GroupCommitBatch,
@@ -412,7 +414,7 @@ mod integration {
     }
 
     fn start_moon(port: u16, dir: &std::path::Path, shards: u16, fsync: &str) -> Child {
-        Command::new("./target/release/moon")
+        Command::new(super::common::find_moon_binary())
             .args([
                 "--port",
                 &port.to_string(),

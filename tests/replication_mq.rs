@@ -15,13 +15,15 @@
 //!
 //! Run: `MOON_BIN=./target/release/moon cargo test --test replication_mq -- --ignored`
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn moon_bin() -> String {
-    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+fn moon_bin() -> std::path::PathBuf {
+    common::find_moon_binary()
 }
 
 fn start_moon(port: u16, dir: &str, shards: usize) -> Child {

@@ -34,12 +34,7 @@ fn redis_cli_available() -> bool {
 /// 30s accept timeout with no obvious cause). See
 /// `gotcha_orbstack_macho_binary_trap`.
 fn release_binary() -> std::path::PathBuf {
-    if let Ok(bin) = std::env::var("MOON_BIN")
-        && !bin.trim().is_empty()
-    {
-        return std::path::PathBuf::from(bin);
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    common::find_moon_binary()
 }
 
 /// Running moon instance. Auto-killed on drop.

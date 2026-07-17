@@ -33,6 +33,8 @@
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -85,7 +87,7 @@ fn start_moon(port: u16, dir: &std::path::Path) -> Child {
 }
 
 fn start_moon_with_fsync(port: u16, dir: &std::path::Path, fsync: &str) -> Child {
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),

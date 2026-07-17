@@ -62,6 +62,21 @@ fn wait_ready(port: u16) {
     panic!("moon did not become ready on port {port}");
 }
 
+/// Kill-on-drop guard: `wait_ready` and the redis-cli `.expect()` calls below
+/// can all panic before the old manual `child.kill()` ran, orphaning the
+/// server (task: test/harness-hygiene-sweep). See
+/// tests/bgsave_startup_race.rs for the same pattern.
+struct MoonGuard(Option<std::process::Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[test]
 fn mimalloc_set_get_roundtrip() {
     if !redis_cli_available() {
@@ -69,7 +84,8 @@ fn mimalloc_set_get_roundtrip() {
         return;
     }
     let port = 16401;
-    let mut child = spawn_moon(port);
+    let child = spawn_moon(port);
+    let child = MoonGuard(Some(child));
     wait_ready(port);
 
     let set_out = Command::new("redis-cli")
@@ -84,8 +100,7 @@ fn mimalloc_set_get_roundtrip() {
         .expect("GET failed to spawn");
     let get_stdout = String::from_utf8_lossy(&get_out.stdout);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child); // MoonGuard SIGKILLs + reaps
 
     assert!(
         set_stdout.contains("OK"),

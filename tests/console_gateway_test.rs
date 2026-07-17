@@ -7,11 +7,13 @@
 
 #![cfg(feature = "console")]
 
+mod common;
+
 use std::process::{Child, Command};
 use std::time::Duration;
 
 fn start_server() -> Child {
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args(["--port", "16399", "--admin-port", "16400", "--shards", "2"])
         .spawn()
         .expect("Failed to start moon server (build with --release --features console,graph first)")
@@ -44,10 +46,26 @@ fn curl_json(method: &str, url: &str, body: Option<&str>) -> (u16, String) {
     (status, resp_body)
 }
 
+/// Kill-on-drop guard: every assert! below panics through the guard instead
+/// of orphaning the server (task: test/harness-hygiene-sweep — a leaked
+/// child from a suite exactly this shape produced the 667%-CPU incident
+/// behind issue #366). See tests/bgsave_startup_race.rs for the same
+/// pattern.
+struct MoonGuard(Option<Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            common::sigkill(&mut child);
+        }
+    }
+}
+
 #[test]
 #[ignore] // Requires a built release binary; run explicitly
 fn test_rest_api_endpoints() {
-    let mut server = start_server();
+    let server = start_server();
+    let server = MoonGuard(Some(server));
     wait_for_server(16400);
 
     // 1. POST /api/v1/command -- SET a key
@@ -135,7 +153,7 @@ fn test_rest_api_endpoints() {
         body
     );
 
-    // Cleanup
-    server.kill().ok();
-    server.wait().ok();
+    // MoonGuard SIGKILLs + reaps on drop (end of scope, or on an earlier
+    // panic from any assert! above).
+    drop(server);
 }

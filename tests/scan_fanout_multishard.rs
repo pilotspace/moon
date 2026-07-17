@@ -10,6 +10,8 @@
 
 #![cfg(feature = "console")]
 
+mod common;
+
 use std::collections::HashSet;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -19,7 +21,7 @@ const ADMIN_PORT: u16 = 16500;
 const KEY_COUNT: usize = 100;
 
 fn start_server() -> Child {
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &RESP_PORT.to_string(),
@@ -67,10 +69,26 @@ fn curl_get(url: &str) -> (u16, String) {
     (status, body)
 }
 
+/// Kill-on-drop guard: every assert!/expect! below panics through the guard
+/// instead of orphaning the server (task: test/harness-hygiene-sweep; the
+/// SCAN pagination loop below has several assert/expect points that used to
+/// run BEFORE the manual `server.kill()` at the end). See
+/// tests/bgsave_startup_race.rs for the same pattern.
+struct MoonGuard(Option<Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            common::sigkill(&mut child);
+        }
+    }
+}
+
 #[test]
 #[ignore] // Requires built release binary + redis-cli; run explicitly
 fn scan_fanout_returns_all_keys_across_shards() {
-    let mut server = start_server();
+    let server = start_server();
+    let server = MoonGuard(Some(server));
     wait_for_port(ADMIN_PORT);
     wait_for_port(RESP_PORT);
 
@@ -134,9 +152,9 @@ fn scan_fanout_returns_all_keys_across_shards() {
         }
     }
 
-    // Cleanup BEFORE asserting so we don't leak the server on failure.
-    server.kill().ok();
-    server.wait().ok();
+    // MoonGuard SIGKILLs + reaps on drop; explicit drop here keeps the old
+    // "cleanup before asserting" ordering for the assertions below.
+    drop(server);
 
     let missing: Vec<&String> = inserted.difference(&found).collect();
     assert!(
