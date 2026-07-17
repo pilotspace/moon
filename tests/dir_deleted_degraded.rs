@@ -129,6 +129,15 @@ fn dir_deleted_latches_write_refusal_stays_responsive_and_self_heals() {
         "healthy server must accept writes"
     );
 
+    // Healthy-baseline CPU window. The latched-CPU check below is RELATIVE
+    // to this: on a loaded CI runner the whole box thrashes and even an idle
+    // 4-shard tick legitimately reads 40-80% of a core, so an absolute
+    // threshold flakes (observed: 2-4s/5s on the self-hosted runner while
+    // the vector benches ran alongside). Both windows see the same box load.
+    let cpu_b0 = process_cpu_ms(pid);
+    std::thread::sleep(Duration::from_secs(5));
+    let baseline_cpu = process_cpu_ms(pid).saturating_sub(cpu_b0);
+
     // ── The incident trigger: data dir vanishes under the running server ──
     std::fs::remove_dir_all(&data_dir).unwrap();
 
@@ -166,17 +175,23 @@ fn dir_deleted_latches_write_refusal_stays_responsive_and_self_heals() {
         len_after - len_before
     );
 
-    // (3b) CPU stays near idle baseline (the 667%-spin regression pin). The
-    //      threshold is deliberately generous — 40% of ONE core across the
-    //      whole 4-shard process — so a loaded CI box cannot flake it, while
-    //      the incident state (≈6+ cores) fails it by an order of magnitude.
+    // (3b) CPU stays near the healthy baseline (the 667%-spin regression
+    //      pin). Fail only when BOTH hold, so shared-runner load can't flake
+    //      it while the incident state (≈6+ cores ≈ 30s CPU per 5s wall)
+    //      fails both by an order of magnitude:
+    //      - absolute: ≥90% of one core (4500ms/5s) — an idle 4-shard
+    //        server never legitimately needs that, even descheduled/thrashed;
+    //      - relative: >4× the pre-deletion baseline + 2.5s slack (Linux
+    //        `ps cputime` is whole-second granular; both windows see the
+    //        same box load, so uniform thrash cancels out).
     let cpu_before = process_cpu_ms(pid);
     std::thread::sleep(Duration::from_secs(5));
     let cpu_delta = process_cpu_ms(pid).saturating_sub(cpu_before);
     assert!(
-        cpu_delta < 2_000,
-        "process burned {cpu_delta}ms CPU in 5s wall while idle+latched — \
-         persistence tick is spinning"
+        cpu_delta < 4_500 || cpu_delta <= baseline_cpu * 4 + 2_500,
+        "process burned {cpu_delta}ms CPU in 5s wall while idle+latched \
+         (healthy baseline was {baseline_cpu}ms/5s) — persistence tick is \
+         spinning"
     );
 
     // (4) Self-heal: restore the directory, writes resume within one poll.
