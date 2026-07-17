@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Data-dir deleted under a running server now latches a degraded state
+  instead of error-looping the persistence tick (#366).** When `--dir`
+  vanishes (operator `rm -rf`, tmp-cleaner sweep, mount loss), the per-shard
+  1ms WAL/checkpoint tick used to retry its file operations on `ENOENT`
+  forever — observed in the wild at ~667% CPU on an idle 4-shard server,
+  with a wedged `PING`. The disk monitor's 5s poll now distinguishes
+  `statvfs` `ENOENT`/`ENOTDIR` on the monitored path and latches `dir_lost`
+  (one loud `ERROR` log): write commands are refused with `MOONERR
+  dirmissing` (reads and `PING` keep serving, mirroring the diskfull guard),
+  and the persistence tick skips WAL flush / checkpoint / WAL-overflow scan
+  / auto-save entirely — zero per-tick syscalls and zero per-tick log lines
+  while latched. The latch self-heals: the next poll that sees the directory
+  again resumes writes (with an explicit warning that data accepted since
+  the deletion is not guaranteed durable until restart). Only engages when
+  persistence or disk-offload is configured, and works with
+  `--disk-free-min-pct 0`. Two hardening layers close the shallow-heal hole
+  (adversarial review): WAL segment rotation re-creates a missing parent
+  directory (`mkdir -p <dir>` after an incident no longer leaves the nested
+  `wal-v3/` dir dead), and any tick-flush failure arms a 1s retry backoff so
+  no flush error class can ever loop at the 1ms tick cadence again.
+
 ### Performance
 - **Disk-offload: shard event loop no longer pays manifest-commit fsyncs
   (task #59 levers 1+2).** Under spill load, `apply_completion_vec` ran one

@@ -1025,10 +1025,19 @@ fn main() -> anyhow::Result<()> {
 
     // MA12: Initialise disk free-space monitor.
     // Monitors the WAL/persistence volume. When disk_free_min_pct == 0, the
-    // monitor is inactive (poll_global is a no-op, is_write_paused always false).
+    // free-space guard is inactive, but a persistence-enabled server still
+    // polls so the dir-lost latch (#366) can refuse writes and quiesce the
+    // persistence tick if the data directory is deleted out from under it.
     {
         let monitor_path = persistence_dir.as_deref().unwrap_or(&config.dir);
-        moon::shard::disk_monitor::init_global(config.disk_free_min_pct, monitor_path);
+        // Arm the dir-lost latch for any config that writes to the data dir:
+        // AOF/save persistence, OR disk-offload (spill + vector warm tier
+        // write there even with appendonly=no).
+        moon::shard::disk_monitor::init_global(
+            config.disk_free_min_pct,
+            monitor_path,
+            persistence_dir.is_some() || config.disk_offload_enabled(),
+        );
     }
 
     // Wave 3: Initialise proactive RSS memory watchdog ("mem-full guard").

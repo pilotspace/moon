@@ -779,8 +779,12 @@ pub(super) fn try_enforce_readonly(
 #[inline]
 pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
     if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
-        // Distinguish the stall source for operator clarity.
-        let msg: &'static [u8] = if crate::shard::disk_monitor::is_write_paused() {
+        // Distinguish the stall source for operator clarity. dir-lost first:
+        // it also sets `is_write_paused`, and "diskfull" would send the
+        // operator hunting free space instead of the missing data dir (#366).
+        let msg: &'static [u8] = if crate::shard::disk_monitor::is_dir_lost() {
+            b"MOONERR dirmissing: data directory was removed; writes refused until it is restored"
+        } else if crate::shard::disk_monitor::is_write_paused() {
             b"MOONERR diskfull: writes paused until free space recovers"
         } else if crate::shard::mem_monitor::is_write_paused() {
             b"MOONERR memfull: writes paused until memory pressure recovers"

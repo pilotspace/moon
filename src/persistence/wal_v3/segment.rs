@@ -353,6 +353,10 @@ pub struct WalWriterV3 {
     /// Set when agent spawn failed once — never retried (inline fsync
     /// fallback, logged once).
     sync_agent_unavailable: bool,
+    /// Backoff deadline after a tick-flush failure (#366): the 1ms tick must
+    /// never retry a failing flush at tick cadence (syscall+log error loop).
+    /// `None` while healthy.
+    flush_backoff_until: Option<std::time::Instant>,
 }
 
 /// Bound on every blocking durability wait (checkpoint ordering gates,
@@ -393,6 +397,7 @@ impl WalWriterV3 {
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
             sync_agent: None,
             sync_agent_unavailable: false,
+            flush_backoff_until: None,
         };
 
         writer.open_new_segment()?;
@@ -552,6 +557,31 @@ impl WalWriterV3 {
             self.flush_write()
         } else {
             Ok(())
+        }
+    }
+
+    /// True while the tick-flush is backing off after a failure (#366).
+    ///
+    /// Healthy path cost: one `Option` discriminant check — `Instant::now()`
+    /// only runs while a backoff is actually armed.
+    #[inline]
+    pub fn flush_backing_off(&self) -> bool {
+        self.flush_backoff_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Arm a 1s tick-flush backoff after a flush failure (#366): the 1ms
+    /// tick must never retry a failing flush at tick cadence.
+    pub fn note_flush_failure(&mut self) {
+        self.flush_backoff_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    }
+
+    /// Clear the backoff after a successful flush.
+    #[inline]
+    pub fn clear_flush_backoff(&mut self) {
+        if self.flush_backoff_until.is_some() {
+            self.flush_backoff_until = None;
         }
     }
 
@@ -808,6 +838,11 @@ impl WalWriterV3 {
 
     /// Open a new segment file and write its 64-byte header.
     fn open_new_segment(&mut self) -> std::io::Result<()> {
+        // Self-repair a vanished parent (#366 heal path): `create(true)`
+        // only creates the LEAF file, so a shallow `mkdir -p <dir>` after a
+        // dir-lost incident would leave this rotation failing ENOENT on
+        // every retry. Rotations are rare — one extra mkdir syscall is free.
+        fs::create_dir_all(&self.wal_dir)?;
         let path = WalSegment::segment_path(&self.wal_dir, self.current_sequence);
         let mut file = OpenOptions::new()
             .create(true)
@@ -1082,6 +1117,66 @@ mod tests {
             "999999999999.wal"
         );
         assert_eq!(WalSegment::segment_name(0), "000000000000.wal");
+    }
+
+    /// #366 review blocker B1: after a dir-lost incident an operator does a
+    /// shallow `mkdir -p <dir>` — the nested `wal-v3/` directory is still
+    /// gone. Segment rotation must self-repair the parent instead of failing
+    /// ENOENT on every retry (which would re-create the tick error loop the
+    /// dir-lost latch exists to kill, this time UNLATCHED because the
+    /// top-level path exists again).
+    #[test]
+    fn test_rotation_self_repairs_deleted_wal_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        // Tiny segment so a handful of appends forces rotation.
+        let mut writer = WalWriterV3::new(0, &wal_dir, 256).unwrap();
+
+        // The shallow-heal state: the whole wal dir vanishes while the
+        // writer's current-segment fd stays open (unlinked inode).
+        fs::remove_dir_all(&wal_dir).unwrap();
+
+        // Push enough bytes through append+flush to cross segment_size and
+        // force rotate_segment() -> open_new_segment().
+        for i in 0..16u32 {
+            writer.append(
+                WalRecordType::Command,
+                format!("SET key{i} {}", "v".repeat(64)).as_bytes(),
+            );
+        }
+        writer
+            .flush_write()
+            .expect("rotation must recreate the missing wal dir, not fail ENOENT");
+
+        assert!(wal_dir.exists(), "wal dir must have been re-created");
+        assert!(
+            writer.current_segment_sequence() > 1,
+            "rotation must actually have happened for this test to prove anything"
+        );
+        // And the new segment file is a real on-disk file.
+        let seg = WalSegment::segment_path(&wal_dir, writer.current_segment_sequence());
+        assert!(seg.exists(), "post-rotation segment must exist on disk");
+    }
+
+    /// #366: the tick flush must never retry a failing flush at 1ms tick
+    /// cadence — a failure arms a 1s backoff, success clears it.
+    #[test]
+    fn test_flush_backoff_arms_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        assert!(
+            !writer.flush_backing_off(),
+            "healthy writer never backs off"
+        );
+        writer.note_flush_failure();
+        assert!(writer.flush_backing_off(), "failure must arm the backoff");
+        writer.clear_flush_backoff();
+        assert!(
+            !writer.flush_backing_off(),
+            "success must clear the backoff"
+        );
     }
 
     #[test]
