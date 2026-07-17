@@ -41,6 +41,38 @@ use super::cold_read::{ColdReadOutcome, read_cold_entry};
 /// backlogged disk is bottlenecked on the disk itself, not on worker count.
 const DEFAULT_POOL_THREADS: usize = 2;
 
+/// Number of cold reads currently queued or executing (task #59 lever 2).
+/// The spill writer consults this after each durable batch flush and briefly
+/// yields the device to readers (`spill_thread::spill_pace_after_flush`).
+/// Relaxed ordering: a heuristic pacing signal, not a synchronization edge.
+pub(crate) static COLD_READS_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII increment of [`COLD_READS_INFLIGHT`] — drop-based so the count stays
+/// correct when an awaiting connection task is cancelled mid-read.
+pub(crate) struct ColdReadInflightGuard(&'static std::sync::atomic::AtomicUsize);
+
+impl ColdReadInflightGuard {
+    pub(crate) fn new() -> Self {
+        Self::on(&COLD_READS_INFLIGHT)
+    }
+
+    /// Guard an explicit counter. Exists so tests can verify the RAII
+    /// mechanics on a private counter — the global one is shared with every
+    /// concurrently running test that touches the cold-read path, so exact
+    /// assertions on it are inherently racy.
+    pub(crate) fn on(counter: &'static std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ColdReadInflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct ColdReadJob {
     shard_dir: PathBuf,
     location: ColdLocation,
@@ -98,6 +130,9 @@ pub async fn read_cold_entry_async(
     location: ColdLocation,
     now_ms: u64,
 ) -> ColdReadOutcome {
+    // Signal the spill writer that a reader is waiting on the device (task
+    // #59 lever 2). Held across the await: queue-wait counts as waiting.
+    let _inflight = ColdReadInflightGuard::new();
     let (reply_tx, reply_rx) = flume::bounded::<ColdReadOutcome>(1);
     let job = ColdReadJob {
         shard_dir: shard_dir.to_path_buf(),

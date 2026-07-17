@@ -6,7 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Disk-offload: shard event loop no longer pays manifest-commit fsyncs
+  (task #59 levers 1+2).** Under spill load, `apply_completion_vec` ran one
+  DURABLE manifest commit (up to 2 fsyncs) per spilled file **on the shard
+  event-loop thread** — strace-measured at 1.0–2.1s cumulative block time per
+  8s flood window per shard (single fsyncs up to 1.0s), stalling every
+  connection on the shard. `ShardManifest` now splits into loop-owned RAM
+  state + a per-shard `manifest-sync-{id}` thread owning the file handle:
+  spill-completion commits are deferred, coalescing snapshot sends (correct
+  because that path only runs under `--appendonly yes`, where AOF replay +
+  the orphan sweep reconstruct anything a lost manifest commit recorded);
+  `commit()` keeps its exact blocking durability for the checkpoint protocol
+  and the no-AOF durable batch spill path. The crash-safety write order
+  (overflow pages sync'd before the root that references them; dual-slot
+  atomic root flip) is preserved verbatim. Additionally the spill writer now
+  yields a 4ms quantum after each durable batch flush while a cold read is
+  in flight (`COLD_READS_INFLIGHT` RAII signal from both the async pool and
+  the synchronous MGET/MULTI/Lua read paths), never pacing when the request
+  backlog is deep (pacing must not push eviction into `-OOM`) or at
+  shutdown.
+
 ### Fixed
+- **BGSAVE issued during shard startup could hang forever (pre-existing,
+  reachable in v0.8.0 and earlier).** The listener answers clients as soon as
+  the fastest shard's event loop is up, but each shard seeded its snapshot
+  epoch cursor from the trigger watch channel's *current* value at loop
+  start — a BGSAVE (or auto-save) broadcast while a slower shard was still
+  initializing was silently swallowed by that shard: its snapshot never ran,
+  `BGSAVE_SHARDS_REMAINING` never reached zero, and `rdb_bgsave_in_progress`
+  stuck at `1` with every later BGSAVE refused as already-in-progress until
+  restart. Found as a ~15%/run crash-matrix flake under full-suite CPU
+  contention; reproduced deterministically with a delayed shard start (new
+  test-only `MOON_TEST_SLOW_SHARD_START_MS` fault injection) and pinned by
+  `tests/bgsave_startup_race.rs`. The cursor now starts at 0 (epochs are
+  per-process), so a trigger that arrives during startup is honored on the
+  shard's first tick. The same test exposed a second pre-existing gap: the
+  **tokio** shard loop never called `bgsave_shard_done` after finalizing its
+  snapshot (only the monoio arm did), so under `runtime-tokio` every sharded
+  BGSAVE left `rdb_bgsave_in_progress` stuck at 1 — now decremented in both
+  arms.
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
   segment exactly once and declared a second `NeedsSplit` unreachable — false under
@@ -17,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the checkpoint was quarantined (code identical back to v0.6.0). Now split-retries
   in a loop, mirroring `insert`'s recursion; regression test brute-forces 56 keys
   sharing the top 12 xxh64 bits to force the double split.
+- **Test harness: five latently broken integration suites unmasked by the
+  task #59 gate battery.** `cmd_flush_dbsize_debug_memory` still passed the
+  `--persistence-dir` flag removed in June (server exited 2 before accepting;
+  CI stayed green only because the suite self-skips without a release
+  binary); it and `memory_doctor_response` ignored `MOON_BIN` via hardcoded
+  `target/release/moon` finders (stale host Mach-O via OrbStack proxy → 30s
+  spawn timeouts). `mem_watchdog`, `oom_bypass_closure`, and `spsc_two_db`
+  now pass `--disk-free-min-pct 0` so a near-full dev volume's diskfull
+  write pause can't shadow the memory-guard/routing behavior they assert.
 
 ## [0.8.0] — 2026-07-16
 

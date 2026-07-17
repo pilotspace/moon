@@ -79,6 +79,42 @@ const FLUSH_ENTRY_CAP: usize = 256;
 /// path (one value's worth of pages) rather than a multiplicative one.
 const BATCH_BYTES_CAP: usize = 4 * 1024 * 1024;
 
+/// Request-channel depth (see `SpillThread::new`). Also referenced by the
+/// pacing cutoff below so "deep backlog" stays defined relative to capacity.
+const REQUEST_QUEUE_CAP: usize = 4096;
+
+/// Task #59 lever 2 — read/write device fairness, the pacing decision.
+///
+/// After each durable batch flush (a multi-MB pwrite + fsync), the spill
+/// thread asks whether to briefly YIELD the device before building the next
+/// batch. Under a sustained spill flood the device queue is otherwise
+/// permanently deep with writer traffic, and a cold reader's pread waits
+/// behind all of it (measured p99 208ms for a raw 64KB O_DIRECT read during
+/// the G2-shape flood, vs 6ms idle).
+///
+/// Rules, in priority order:
+/// - Nobody is reading → never pause (zero throughput cost when idle).
+/// - Request backlog ≥ half capacity → never pause: a paced spill thread
+///   must not push eviction into `try_send` failure, which surfaces as -OOM
+///   to write clients. Full-speed drain wins over read latency there.
+/// - Otherwise → one small fixed quantum. 4ms per flush caps the throughput
+///   tax at ~a few percent of a typical flush's own write+fsync time while
+///   giving a queued pread a window in which the device queue is empty.
+///
+/// Pure function of its inputs for unit-testability.
+pub(crate) fn spill_pace_after_flush(
+    reads_inflight: usize,
+    backlog_len: usize,
+) -> std::time::Duration {
+    const PACE_QUANTUM_MS: u64 = 4;
+    const BACKLOG_CUTOFF: usize = REQUEST_QUEUE_CAP / 2;
+    if reads_inflight == 0 || backlog_len >= BACKLOG_CUTOFF {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(PACE_QUANTUM_MS)
+    }
+}
+
 /// Cumulative count of `SpillCompletion`s dropped. Dropping is **data loss**:
 /// the `.mpf` file is on disk but its manifest `add_file` + `cold_index` insert
 /// happen only when the event loop consumes the completion, and the keys are
@@ -417,7 +453,7 @@ impl SpillThread {
     /// rebuilds `cold_index` from the manifest, so dropping is safe (though
     /// we count it for observability).
     pub fn new(shard_id: usize) -> Self {
-        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
+        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(REQUEST_QUEUE_CAP);
         let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
@@ -452,6 +488,19 @@ impl SpillThread {
     ) {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
 
+        // Task #59 lever 2: after a durable batch flush, briefly yield the
+        // device to any waiting cold reader. Never paces at shutdown or when
+        // the request backlog is deep (see `spill_pace_after_flush`).
+        let pace = |request_rx: &flume::Receiver<SpillRequest>| {
+            let pause = spill_pace_after_flush(
+                super::cold_read_pool::COLD_READS_INFLIGHT.load(Ordering::Relaxed),
+                request_rx.len(),
+            );
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+        };
+
         loop {
             // Liveness heartbeat (R5): stamped every loop tick so INFO can
             // surface a silently-dead spill thread. Relaxed max-store is
@@ -481,6 +530,7 @@ impl SpillThread {
                             flush_buffer(&mut buffer),
                             &stop_flag,
                         );
+                        pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Timeout) => {
@@ -491,6 +541,7 @@ impl SpillThread {
                             flush_buffer(&mut buffer),
                             &stop_flag,
                         );
+                        pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
@@ -637,6 +688,60 @@ mod tests {
             }
         }
         completions
+    }
+
+    #[test]
+    fn pace_is_zero_when_no_readers_waiting() {
+        assert_eq!(
+            spill_pace_after_flush(0, 0),
+            std::time::Duration::ZERO,
+            "pacing must cost nothing when nobody is reading"
+        );
+        assert_eq!(
+            spill_pace_after_flush(0, REQUEST_QUEUE_CAP),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pace_is_zero_under_deep_backlog_even_with_readers() {
+        // A paced spill thread must never push eviction into try_send
+        // failure (-OOM to write clients): deep backlog always wins.
+        assert_eq!(
+            spill_pace_after_flush(3, REQUEST_QUEUE_CAP / 2),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            spill_pace_after_flush(100, REQUEST_QUEUE_CAP),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pace_yields_a_quantum_when_reader_waits_and_backlog_shallow() {
+        let d = spill_pace_after_flush(1, 0);
+        assert!(d > std::time::Duration::ZERO);
+        assert!(
+            d <= std::time::Duration::from_millis(10),
+            "quantum must stay small — this is a yield, not a stall ({d:?})"
+        );
+        assert_eq!(d, spill_pace_after_flush(64, REQUEST_QUEUE_CAP / 2 - 1));
+    }
+
+    #[test]
+    fn reader_inflight_guard_counts_and_releases() {
+        use super::super::cold_read_pool::ColdReadInflightGuard;
+        // Own counter, NOT the global COLD_READS_INFLIGHT: sibling tests in
+        // this binary exercise the cold-read path concurrently, so exact
+        // assertions on the shared global are racy. The RAII mechanics are
+        // identical either way.
+        static LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let _g1 = ColdReadInflightGuard::on(&LOCAL);
+            let _g2 = ColdReadInflightGuard::on(&LOCAL);
+            assert_eq!(LOCAL.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(LOCAL.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -99,6 +99,11 @@ fn spawn_moon_oom(dir: &std::path::Path, shards: u32, maxmemory_bytes: u64) -> (
                 &maxmemory_bytes.to_string(),
                 "--maxmemory-policy",
                 "noeviction",
+                // Under test here is the -OOM eviction gate, not the disk
+                // guard; a near-full dev volume would otherwise shadow every
+                // write with MOONERR diskfull.
+                "--disk-free-min-pct",
+                "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
             .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
@@ -687,6 +692,10 @@ fn spawn_moon_no_maxmemory(dir: &std::path::Path, shards: u32) -> (ServerGuard, 
                 // explicit, Redis-compatible "unlimited" escape hatch — it
                 // starts the atomic definitively unset.
                 "--maxmemory",
+                "0",
+                // Same rationale as spawn_moon_oom: keep the disk guard from
+                // shadowing the maxmemory-publish behavior under test.
+                "--disk-free-min-pct",
                 "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))

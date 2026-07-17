@@ -629,6 +629,14 @@ impl super::Shard {
             } else {
                 None
             };
+        // Task #59: manifest commit fsyncs measured up to 1.0s each on this
+        // event-loop thread under spill flood (every connection on the shard
+        // stalls behind them). Move the file-I/O half onto the per-shard
+        // manifest-sync thread: durable commits keep their blocking ack,
+        // spill-completion commits become deferred sends.
+        if let Some(ref mut m) = shard_manifest {
+            m.enable_deferred_sync(shard_id);
+        }
         // Task #55: background reclaim of crash-orphaned heap files that
         // recovery only CLASSIFIED (see `Shard::restore_from_persistence` /
         // `persistence::recovery::recover_shard_v3_pitr`). Classification is
@@ -756,7 +764,28 @@ impl super::Shard {
             .map(|rs| rs.read().is_replica_mirror.clone());
 
         // Track last seen snapshot epoch to detect watch channel triggers
-        let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
+        // Test-only fault injection: delay every non-zero shard's loop start so
+        // integration tests can deterministically exercise the startup window
+        // where the listener already answers (fastest shard up) while other
+        // shards are still here. Used by tests/bgsave_startup_race.rs; never
+        // set in production.
+        if shard_id != 0
+            && let Ok(ms) = std::env::var("MOON_TEST_SLOW_SHARD_START_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        // Start the cursor at 0, NOT at the watch channel's current value: the
+        // listener accepts clients as soon as the fastest shard is up, so a
+        // BGSAVE (or auto-save) can broadcast epoch N while a slower shard is
+        // still in this setup code. Seeding the cursor with borrow() would
+        // swallow that pending trigger — this shard never snapshots, the
+        // BGSAVE_SHARDS_REMAINING counter never reaches zero, and every later
+        // BGSAVE reports "already in progress" forever (observed as the
+        // 20s-stuck `rdb_bgsave_in_progress:1` crash-matrix flake; the race
+        // reproduces deterministically with a delayed shard start). Epochs are
+        // per-process and start at 0, so 0 is always a safe "nothing seen yet".
+        let mut last_snapshot_epoch = 0u64;
 
         // Sub-timer intervals: tokio uses separate select! branches for each.
         // monoio uses counter-based dispatch from a single periodic tick to avoid
@@ -1558,10 +1587,17 @@ impl super::Shard {
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                     &e.to_string(),
                                 );
+                                // Decrement the BGSAVE fan-in counter (same as
+                                // the monoio arm below — this was missing here,
+                                // so tokio BGSAVE left rdb_bgsave_in_progress
+                                // stuck at 1 forever). Safe for auto-save
+                                // snapshots too: the counter ignores calls at 0.
+                                crate::command::persistence::bgsave_shard_done(false);
                             } else {
                                 persistence_tick::finalize_snapshot_success(
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                 );
+                                crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
                         }
@@ -1854,6 +1890,11 @@ impl super::Shard {
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
+                    }
                     break;
                 }
             }
@@ -1993,6 +2034,11 @@ impl super::Shard {
                     }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
+                    }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
                     }
                     break;
                 }

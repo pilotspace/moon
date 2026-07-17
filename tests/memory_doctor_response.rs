@@ -23,7 +23,10 @@ fn redis_cli_available() -> bool {
 }
 
 fn release_binary() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    // MOON_BIN-aware: the bare target/release/moon fallback is a stale-binary
+    // trap on shared checkouts (an OrbStack VM exec's a host Mach-O via proxy
+    // and the server never accepts in-VM — 30s spawn_listening timeout).
+    common::find_moon_binary()
 }
 
 /// Running moon instance. Auto-killed on drop.

@@ -587,6 +587,15 @@ fn apply_completion_vec(
         return;
     }
 
+    // Task #59: this runs on the shard event-loop thread, so it must not pay
+    // for manifest fsyncs — one DEFERRED commit for the whole batch (below),
+    // shipped to the manifest-sync thread. Correct because this path only
+    // runs under `--appendonly yes` (evict_one_async_spill bails otherwise):
+    // AOF replay + the orphan sweep reconstruct anything a lost manifest
+    // commit would have recorded. Previously: one durable commit (up to 2
+    // fsyncs) per flushed file, measured blocking the loop 1.0-2.1s per 8s
+    // window under spill flood, single calls up to 1.0s.
+    let mut manifest_dirty = false;
     for c in completions {
         if !c.success {
             tracing::warn!(
@@ -598,16 +607,10 @@ fn apply_completion_vec(
 
         let file_id = c.file_entry.file_id;
 
-        // ONE manifest add_file + commit per flushed file.
+        // RAM-only manifest update; durability handled once per batch below.
         if let Some(ref mut manifest) = *shard_manifest {
             manifest.add_file(c.file_entry);
-            if let Err(e) = manifest.commit() {
-                tracing::warn!(
-                    file_id,
-                    error = %e,
-                    "Manifest commit failed for spill completion"
-                );
-            }
+            manifest_dirty = true;
         }
 
         // Insert one ColdIndex entry per KV within this file. `ttl_ms` rides
@@ -626,6 +629,20 @@ fn apply_completion_vec(
                     ci.insert(entry.key.clone(), location);
                 }
             });
+        }
+    }
+
+    // ONE deferred commit for the whole drained batch (see the task #59 note
+    // at the top of this function). Non-blocking when the manifest-sync
+    // thread is attached; degrades to a synchronous persist otherwise.
+    if manifest_dirty {
+        if let Some(ref mut manifest) = *shard_manifest {
+            if let Err(e) = manifest.commit_deferred() {
+                tracing::warn!(
+                    error = %e,
+                    "Deferred manifest commit failed for spill completion batch"
+                );
+            }
         }
     }
 }
