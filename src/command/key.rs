@@ -2616,5 +2616,27 @@ mod tests {
                 other => panic!("expected a key, got {other:?}"),
             }
         }
+
+        #[test]
+        fn del_of_ttl_expired_cold_key_answers_zero_but_reclaims() {
+            // Redis parity: DEL of a logically-expired key deletes nothing
+            // (returns 0) — but the stale cold-index entry must still be
+            // reclaimed as a side effect, not left behind.
+            let now_ms = current_time_ms();
+            let mut db = db_with_planes(&[], &[(b"dead", Some(now_ms - 60_000))]);
+            assert_eq!(del(&mut db, &[bs(b"dead")]), Frame::Integer(0));
+            assert!(
+                db.cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.lookup(b"dead").is_none()),
+                "stale cold entry must be reclaimed by the DEL attempt"
+            );
+        }
+
+        #[test]
+        fn unlink_of_alive_cold_key_still_counts() {
+            let mut db = db_with_planes(&[], &[(b"alive", None)]);
+            assert_eq!(unlink(&mut db, &[bs(b"alive")]), Frame::Integer(1));
+        }
     }
 }

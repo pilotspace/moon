@@ -1264,12 +1264,21 @@ impl Database {
 
     /// Remove hot + cold copies; returns `true` when EITHER existed, so
     /// DEL/UNLINK count spilled keys as removed (Redis semantics: the key
-    /// logically exists). The removed hot entry, when present, is also
-    /// returned so UNLINK can size its async-drop decision.
+    /// logically exists). A cold entry that is already TTL-expired (judged
+    /// from the cached `ColdLocation::ttl_ms`, no disk read) is reclaimed
+    /// but NOT counted — DEL of a logically-expired key answers 0. The
+    /// removed hot entry, when present, is also returned so UNLINK can
+    /// size its async-drop decision.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
+        let now_ms = self.cached_now_ms;
+        let cold_alive = self
+            .cold_index
+            .as_ref()
+            .and_then(|ci| ci.lookup(key))
+            .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot(key);
-        (hot.is_some() || had_cold, hot)
+        (hot.is_some() || (had_cold && cold_alive), hot)
     }
 
     #[inline]
@@ -1449,22 +1458,36 @@ impl Database {
     /// Samples the LOGICAL keyspace: hot-alive entries plus cold-only
     /// spilled keys ([`Self::cold_only_keys`]) — an all-spilled database
     /// must not answer "empty" (#364).
+    ///
+    /// Two passes — count, then walk to the selected position — so only
+    /// the winning key is ever cloned (the previous single-pass version
+    /// materialized a `Bytes` copy of EVERY live key per call). Stable
+    /// across the passes: `&self` is held throughout and each shard's
+    /// database is single-threaded, so neither plane can mutate between
+    /// the count and the walk.
     pub fn random_key(&self) -> Option<Bytes> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
-        // Collect non-expired keys (iterator is already O(n))
-        let mut live: Vec<_> = self
+        let hot_live = self
             .data
             .iter()
             .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
-            .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
-            .collect();
-        live.extend(self.cold_only_keys(now_ms).cloned());
-        if live.is_empty() {
+            .count();
+        let cold_live = self.cold_only_keys(now_ms).count();
+        let total = hot_live + cold_live;
+        if total == 0 {
             return None;
         }
-        let idx = (current_time_ms() as usize) % live.len();
-        Some(live.swap_remove(idx))
+        let idx = (current_time_ms() as usize) % total;
+        if idx < hot_live {
+            self.data
+                .iter()
+                .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+                .nth(idx)
+                .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
+        } else {
+            self.cold_only_keys(now_ms).nth(idx - hot_live).cloned()
+        }
     }
 
     /// Set or remove expiration on an existing key.
