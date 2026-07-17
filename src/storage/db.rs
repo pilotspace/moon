@@ -1493,19 +1493,50 @@ impl Database {
     /// is classified hot; a hot entry that is TTL-expired above a live
     /// cold entry is classified cold.
     pub fn cold_only_keys(&self, now_ms: u64) -> impl Iterator<Item = &Bytes> + '_ {
-        let base_ts = self.base_timestamp;
         self.cold_index.as_ref().into_iter().flat_map(move |ci| {
-            ci.iter().filter_map(move |(key, loc)| {
-                let cold_alive = loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl);
-                if !cold_alive {
-                    return None;
-                }
-                let hot_alive = self
-                    .data
-                    .get(key.as_ref())
-                    .is_some_and(|e| !e.is_expired_at(base_ts, now_ms));
-                if hot_alive { None } else { Some(key) }
-            })
+            ci.iter()
+                .filter(move |(key, loc)| self.is_cold_only_alive(key, loc, now_ms))
+                .map(|(key, _)| key)
+        })
+    }
+
+    /// The cold-only liveness predicate shared by [`Self::cold_only_keys`]
+    /// and [`Self::cold_only_keys_from`]: cold entry not TTL-expired AND not
+    /// shadowed by a live hot entry. Keeping it in one place keeps the
+    /// two-plane partition invariant (#364) from diverging between the
+    /// full-walk and range-resume paths.
+    #[inline]
+    fn is_cold_only_alive(
+        &self,
+        key: &Bytes,
+        loc: &crate::storage::tiered::cold_index::ColdLocation,
+        now_ms: u64,
+    ) -> bool {
+        let cold_alive = loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl);
+        if !cold_alive {
+            return false;
+        }
+        !self
+            .data
+            .get(key.as_ref())
+            .is_some_and(|e| !e.is_expired_at(self.base_timestamp, now_ms))
+    }
+
+    /// Hash-ordered cold-only keys from `from_h48` in the SCAN cursor's
+    /// 48-bit hash space (#368): O(log n) seek into the ordered cold index,
+    /// then ascending `(hash48, key)` candidates filtered by
+    /// [`Self::is_cold_only_alive`]. SCAN takes the first COUNT — since the
+    /// order is ascending, those are exactly the smallest cold candidates —
+    /// instead of filtering the entire index on every page.
+    pub fn cold_only_keys_from(
+        &self,
+        from_h48: u64,
+        now_ms: u64,
+    ) -> impl Iterator<Item = (u64, &Bytes)> + '_ {
+        self.cold_index.as_ref().into_iter().flat_map(move |ci| {
+            ci.range_from(from_h48)
+                .filter(move |(_, key, loc)| self.is_cold_only_alive(key, loc, now_ms))
+                .map(|(h, key, _)| (h, key))
         })
     }
 
