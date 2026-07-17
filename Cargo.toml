@@ -143,10 +143,12 @@ io-uring = "0.7"
 # tuned setup flags (COOP_TASKRUN / SINGLE_ISSUER / DEFER_TASKRUN) to the
 # monoio runtime; must track monoio's own io-uring version.
 io-uring-06 = { package = "io-uring", version = "0.6" }
-nix = { version = "0.31", features = ["net", "socket"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# `net`/`socket` are used by Linux-only code (connection migration); `fs`
+# powers the cross-Unix data-dir instance lock (persistence::dir_lock).
+nix = { version = "0.31", features = ["net", "socket", "fs"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

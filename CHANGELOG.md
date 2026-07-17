@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backlog is deep (pacing must not push eviction into `-OOM`) or at
   shutdown.
 
+### Added
+- **Data-dir instance lock: a second moon on the same `--dir` is refused at
+  startup.** Two servers writing one directory means two writers on the same
+  per-shard WAL/AOF/spill manifests — silent corruption with no error at
+  either end (observed in dev as dozens of leaked instances accumulating
+  against shared folders). Moon now takes an exclusive non-blocking
+  `flock(2)` on `<dir>/moon.lock` before any listener binds or data file
+  opens, held for the process lifetime; a competing start exits fast with
+  the holder's pid. `kill -9` releases the lock instantly (kernel advisory
+  lock — no stale-pidfile failure mode; crash-restart is unaffected). A
+  custom `--disk-offload-dir` is locked too when it differs from `--dir`.
+  Unix only (Linux + macOS); Windows warns and proceeds. Operational note:
+  concurrent instances on one host must now use distinct `--dir` values —
+  which was already the only safe configuration.
+
 ### Fixed
 - **BGSAVE issued during shard startup could hang forever (pre-existing,
   reachable in v0.8.0 and earlier).** The listener answers clients as soon as
