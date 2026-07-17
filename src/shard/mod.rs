@@ -6,6 +6,8 @@ pub mod coordinator;
 pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
+#[cfg(feature = "runtime-monoio")]
+pub(crate) mod idle_park;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
 pub mod maintenance_schedule;
 /// Wave 3: proactive RSS memory watchdog ("mem-full guard") — analogue of

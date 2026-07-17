@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unproven alternate hypothesis). No behavior change on green runs.
 
 ### Performance
+- **Adaptive idle park (#373 phase 2, monoio runtime).** After 64
+  consecutive provably-no-op 1ms ticks, a shard's event loop stretches its
+  periodic park to 10ms, cutting idle timer wakeups ~10×. Zero chore-cadence
+  changes: every counter-based sub-timer (block-timeout 10ms, expiry/eviction
+  100ms, WAL-sync 1s, monitors 5s, warm/autovacuum/orphan-sweep) divides by
+  the stretched period and entry is gated on an aligned counter, so each
+  chore fires exactly when it did before — BLPOP timeout precision is
+  unchanged. Eligibility is conservative (no commands counted on the shard
+  thread since the last tick — local dispatch AND replica-applied commands
+  both bump the counter; no cross-shard SPSC message pending at the drain,
+  probed by queue occupancy; WAL buffer empty; no snapshot/checkpoint
+  active; `appendfsync != always`; no CDC subscribers); any SPSC notify
+  wake exits idle immediately, and the cached clock is refreshed before
+  draining pending cross-shard messages on BOTH race outcomes, so
+  cross-shard commands never observe stretched staleness. Documented
+  trade-off: a command arriving mid-park on an existing LOCAL connection
+  can read a cached clock up to 10ms stale (vs 1ms before) for lazy-expiry
+  checks, only after ≥64ms of complete shard quiet; active expiry keeps its
+  100ms cadence. Replica-applied commands additionally now count toward
+  `total_commands_processed` (Redis parity; previously uncounted). Escape hatch: `MOON_IDLE_PARK=0` pins the fixed 1ms period
+  (same-binary A/B knob). Tokio runtime unchanged.
 - **Idle-tick CPU trimmed (#373 phase 1).** Three per-tick costs on the
   shard event loop's 1ms/100ms cadences were removed without touching any
   cadence or park timing: (1) `PageCache::resident_buffer_bytes` — the #1

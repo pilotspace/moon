@@ -866,6 +866,12 @@ impl super::Shard {
         // Each sub-timer fires at its native interval via modular arithmetic.
         #[cfg(feature = "runtime-monoio")]
         let mut monoio_tick_counter: u64 = 0;
+        // #373 phase 2: adaptive idle park. After a proven-quiet streak the
+        // periodic park stretches 1ms -> IDLE_PARK_MS (10ms), stepping the
+        // counter by 10 from an aligned boundary so every counter-based
+        // cadence below (all multiples of 10) still fires exactly on time.
+        #[cfg(feature = "runtime-monoio")]
+        let mut idle_park = crate::shard::idle_park::IdleParkState::new();
         // Used by tokio select! for event-driven SPSC drain; monoio drains in periodic tick.
         let spsc_notify_local = spsc_notify;
         #[cfg(feature = "runtime-monoio")]
@@ -2054,7 +2060,20 @@ impl super::Shard {
                 // at runtime by tests/spsc_wake_floor_red.rs::swf0 on both drivers.
                 // A losing notified() arm re-queues an undelivered token on drop
                 // (swf_a3), so there is no lost-wake window.
-                let timer_fired = {
+                let timer_fired = if idle_park.is_idle() {
+                    // #373 phase 2: stretched park. A one-shot sleep replaces
+                    // the Interval while idle — the Interval is deliberately
+                    // NOT polled here and is reset on every idle exit, so its
+                    // accumulated missed ticks can never burst-fire chores.
+                    let tick = std::pin::pin!(monoio::time::sleep(Duration::from_millis(
+                        crate::shard::idle_park::IDLE_PARK_MS
+                    )));
+                    let notified = std::pin::pin!(spsc_notify_local.notified());
+                    matches!(
+                        crate::runtime::race::race2(tick, notified).await,
+                        crate::runtime::race::Arm::First(_)
+                    )
+                } else {
                     let tick = std::pin::pin!(periodic_interval.0.tick());
                     let notified = std::pin::pin!(spsc_notify_local.notified());
                     matches!(
@@ -2063,7 +2082,34 @@ impl super::Shard {
                     )
                 };
                 if !timer_fired {
+                    if idle_park.note_notify_wake() {
+                        // Woken out of an idle park by cross-shard work:
+                        // refresh the cached clock before draining (the
+                        // message must never see stretched staleness) and
+                        // reset the interval for the fast cadence.
+                        cached_clock.update();
+                        periodic_interval = TimerImpl::interval(Duration::from_millis(1));
+                    }
                     crate::admin::metrics_setup::bump_spsc_notify_wake();
+                }
+
+                // Adversarial-review fix (#378): cross-shard SPSC commands do
+                // not bump the per-thread command counter (the ORIGIN shard's
+                // handler records them; counting again here would double-count
+                // INFO stats), so the idle gate observes queue occupancy
+                // directly. Checked BEFORE the drain: any pending message —
+                // read or write — makes this tick non-quiet.
+                let spsc_had_work = {
+                    use ringbuf::traits::Observer as _;
+                    consumers.borrow().iter().any(|c| !c.is_empty())
+                };
+                // A timer-win race tie can reach the drain with pending
+                // cross-shard messages while still idle-parked (the notify
+                // token re-queues, but this iteration drains first): refresh
+                // the clock before draining so cross-shard commands never
+                // observe stretched staleness on EITHER race outcome.
+                if timer_fired && spsc_had_work && idle_park.is_idle() {
+                    cached_clock.update();
                 }
 
                 // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
@@ -2190,7 +2236,9 @@ impl super::Shard {
                 if !timer_fired {
                     continue;
                 }
-                monoio_tick_counter = monoio_tick_counter.wrapping_add(1);
+                // Step by the period of the park that just elapsed (1 fast,
+                // 10 idle) so the counter keeps counting nominal milliseconds.
+                monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
                 next_file_id = next_file_id.max(spill_file_id.get());
 
@@ -2491,6 +2539,36 @@ impl super::Shard {
                         shard_manifest.as_mut(),
                         cached_clock.ms(),
                     );
+                }
+
+                // #373 phase 2: decide the next park. Every counter-based
+                // cadence above is a multiple of IDLE_PARK_MS — 10 / 100 /
+                // 1000 / 5000 / warm_poll_ms (secs*1000, clamped ≥1000) /
+                // autovacuum & orphan (secs*1000) — so the 10ms-stepped
+                // counter hits each boundary exactly; entry is additionally
+                // gated on an aligned counter. Any new `% N` dispatch added
+                // here MUST keep N a multiple of IDLE_PARK_MS.
+                let quiet = wal_writer
+                    .as_ref()
+                    .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
+                    && wal_append_rx.is_empty()
+                    && snapshot_state.is_none()
+                    && !bgsave_checkpoint_requested
+                    && checkpoint_manager.as_ref().is_none_or(|m| !m.is_active())
+                    && server_config.appendfsync != "always"
+                    && cdc_registry.is_empty()
+                    && !hit_cap
+                    && !spsc_had_work;
+                let was_idle = idle_park.is_idle();
+                let now_idle = idle_park.on_timer_tick(
+                    crate::admin::metrics_setup::this_thread_commands(),
+                    quiet,
+                    monoio_tick_counter % crate::shard::idle_park::IDLE_PARK_MS == 0,
+                );
+                if was_idle && !now_idle {
+                    // Timer-path idle exit (a condition turned non-quiet):
+                    // reset the interval so its missed ticks can't burst.
+                    periodic_interval = TimerImpl::interval(Duration::from_millis(1));
                 }
             }
         }
