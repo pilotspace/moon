@@ -41,7 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test-only `MOON_TEST_SLOW_SHARD_START_MS` fault injection) and pinned by
   `tests/bgsave_startup_race.rs`. The cursor now starts at 0 (epochs are
   per-process), so a trigger that arrives during startup is honored on the
-  shard's first tick.
+  shard's first tick. The same test exposed a second pre-existing gap: the
+  **tokio** shard loop never called `bgsave_shard_done` after finalizing its
+  snapshot (only the monoio arm did), so under `runtime-tokio` every sharded
+  BGSAVE left `rdb_bgsave_in_progress` stuck at 1 — now decremented in both
+  arms.
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
   segment exactly once and declared a second `NeedsSplit` unreachable — false under

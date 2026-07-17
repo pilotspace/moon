@@ -1587,10 +1587,17 @@ impl super::Shard {
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                     &e.to_string(),
                                 );
+                                // Decrement the BGSAVE fan-in counter (same as
+                                // the monoio arm below — this was missing here,
+                                // so tokio BGSAVE left rdb_bgsave_in_progress
+                                // stuck at 1 forever). Safe for auto-save
+                                // snapshots too: the counter ignores calls at 0.
+                                crate::command::persistence::bgsave_shard_done(false);
                             } else {
                                 persistence_tick::finalize_snapshot_success(
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                 );
+                                crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
                         }
