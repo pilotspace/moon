@@ -171,7 +171,9 @@ fn second_instance_on_same_dir_is_refused_and_kill9_releases_the_lock() {
 fn same_dir_offload_spelled_differently_does_not_self_conflict() {
     let dir = test_tmpdir();
     let base = dir.path();
-    let respelled = base.join("..").join(base.file_name().expect("tempdir has a basename"));
+    let respelled = base
+        .join("..")
+        .join(base.file_name().expect("tempdir has a basename"));
 
     let port = common::reserve_port();
     let mut a = moon_cmd(base, port, "moon-respell");
