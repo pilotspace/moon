@@ -116,6 +116,17 @@ pub(crate) fn check_auto_save_trigger(
     let new_epoch = snapshot_trigger_rx.borrow();
     if new_epoch > *last_snapshot_epoch && snapshot_state.is_none() {
         *last_snapshot_epoch = new_epoch;
+        // #366: consume the epoch but skip the save while the data directory
+        // is missing — the snapshot temp file can't be created, and retrying
+        // per save-point trigger just spams one doomed attempt per epoch.
+        if crate::shard::disk_monitor::is_dir_lost() {
+            tracing::warn!(
+                "Shard {}: auto-save epoch {} skipped — data directory missing",
+                shard_id,
+                new_epoch
+            );
+            return;
+        }
         if let Some(dir) = persistence_dir {
             // When disk-offload is enabled, write snapshot to the offload shard directory
             // so v3 recovery can find it alongside WAL v3 segments and manifest.
@@ -220,6 +231,13 @@ pub(crate) fn finalize_snapshot_error(
 pub(crate) fn flush_wal_v3_if_needed(
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
 ) {
+    // #366: while the data directory is missing, every flush that needs a
+    // path operation (segment rotation) fails — at the 1ms tick cadence that
+    // is a hot syscall+log error loop. The dir-lost latch already logged
+    // loudly and refused new writes; skip until the directory heals.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return;
+    }
     if let Some(wal) = wal_v3 {
         if let Err(e) = wal.flush_if_needed() {
             tracing::error!("WAL v3 flush failed: {}", e);
@@ -1107,6 +1125,11 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     max_checkpoint_lag_ms: u64,
     graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
+    // #366: no overflow scan while the data directory is missing — the
+    // per-second directory read would warn-loop forever.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return false;
+    }
     // Condition 1: total on-disk WAL exceeds the configured ceiling.
     let total_wal = match wal.stats() {
         Ok(s) => {
@@ -1230,6 +1253,12 @@ pub(crate) fn handle_checkpoint_tick(
     tombstone_retain_secs: u64,
     graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
+    // #366: checkpoints are pure file work (page pwrite, manifest rename,
+    // WAL recycle) — all doomed while the data directory is missing. Skip;
+    // the CheckpointManager simply resumes when the latch clears.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return false;
+    }
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
