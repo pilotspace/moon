@@ -971,6 +971,7 @@ fn evict_batch_durable_no_aof(
                         page_idx: entry.page_idx,
                         slot_idx: entry.slot_idx,
                         ttl_ms: entry.ttl_ms,
+                        value_type: entry.value_type,
                     },
                 );
             }
@@ -1177,6 +1178,7 @@ pub(crate) fn evict_one_with_spill(
     let mut spilled = false;
     let mut spilled_file_id = 0u64;
     let mut spilled_ttl_ms: Option<u64> = None;
+    let mut spilled_value_type = crate::persistence::kv_page::ValueType::String;
     if let Some(ctx) = spill {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             let file_id = *ctx.next_file_id;
@@ -1208,6 +1210,7 @@ pub(crate) fn evict_one_with_spill(
             spilled = true;
             spilled_file_id = file_id;
             spilled_ttl_ms = ttl_ms;
+            spilled_value_type = kv_spill::value_type_of(&entry.as_redis_value());
         }
     }
 
@@ -1230,6 +1233,7 @@ pub(crate) fn evict_one_with_spill(
                     page_idx: 0,
                     slot_idx: 0,
                     ttl_ms: spilled_ttl_ms,
+                    value_type: spilled_value_type,
                 },
             );
         }

@@ -59,6 +59,19 @@ pub struct ColdLocation {
     /// index format to version and no old-format file that could ever fail to
     /// load because of it.
     pub ttl_ms: Option<u64>,
+    /// Redis value type of the on-disk entry, mirroring the on-disk
+    /// `KvEntry::value_type` this location points at.
+    ///
+    /// Same cached-copy contract as `ttl_ms` (#364): populated at insert
+    /// time (spill / recovery rebuild) purely so SCAN's TYPE filter can
+    /// judge a cold-only key from the in-RAM index alone — WITHOUT a pread
+    /// of the cold file and WITHOUT promoting the entry into hot RAM. The
+    /// on-disk `KvLeafPage` entry stays authoritative and
+    /// [`ColdIndex::rebuild_from_manifest`] re-derives this field from it
+    /// after a restart; no on-disk format changes. Fits the struct's
+    /// existing padding (after `slot_idx`), so the in-RAM index does not
+    /// grow.
+    pub value_type: crate::persistence::kv_page::ValueType,
 }
 
 /// In-memory index from key to cold disk location.
@@ -620,6 +633,7 @@ impl ColdIndex {
                                         page_idx: page_idx as u32,
                                         slot_idx,
                                         ttl_ms: kv.ttl_ms,
+                                        value_type: kv.value_type,
                                     },
                                 );
                             }
@@ -644,6 +658,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         assert_eq!(idx.len(), 1);
@@ -670,6 +685,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"a_reasonably_long_key"), loc);
         let after_one = idx.resident_bytes();
@@ -693,12 +709,14 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         let loc_b = ColdLocation {
             file_id: 2,
             page_idx: 0,
             slot_idx: 1,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc_a);
         let after_first = idx.resident_bytes();
@@ -717,6 +735,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         idx.insert(Bytes::from_static(b"key2"), loc);
@@ -763,6 +782,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -772,6 +792,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -816,6 +837,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -825,6 +847,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -862,6 +885,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         // Key re-spilled to a NEW file (re-eviction) -> file 10 orphaned.
@@ -872,6 +896,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -910,6 +935,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: Some(1_000), // expires at t=1000ms
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -960,6 +986,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -969,6 +996,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: Some(5_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -1002,6 +1030,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: Some(1_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -1011,6 +1040,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: Some(9_999_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -1059,6 +1089,7 @@ mod tests {
                     page_idx: 0,
                     slot_idx: i,
                     ttl_ms: Some(1_000),
+                    value_type: crate::persistence::kv_page::ValueType::String,
                 },
             );
         }
@@ -1106,6 +1137,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 

@@ -1264,12 +1264,21 @@ impl Database {
 
     /// Remove hot + cold copies; returns `true` when EITHER existed, so
     /// DEL/UNLINK count spilled keys as removed (Redis semantics: the key
-    /// logically exists). The removed hot entry, when present, is also
-    /// returned so UNLINK can size its async-drop decision.
+    /// logically exists). A cold entry that is already TTL-expired (judged
+    /// from the cached `ColdLocation::ttl_ms`, no disk read) is reclaimed
+    /// but NOT counted — DEL of a logically-expired key answers 0. The
+    /// removed hot entry, when present, is also returned so UNLINK can
+    /// size its async-drop decision.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
+        let now_ms = self.cached_now_ms;
+        let cold_alive = self
+            .cold_index
+            .as_ref()
+            .and_then(|ci| ci.lookup(key))
+            .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot(key);
-        (hot.is_some() || had_cold, hot)
+        (hot.is_some() || (had_cold && cold_alive), hot)
     }
 
     #[inline]
@@ -1406,29 +1415,79 @@ impl Database {
     }
 
     /// Iterator over all keys (caller does glob filtering).
+    ///
+    /// Hot plane only: under disk-offload, spilled keys have no in-RAM
+    /// `Entry` and are NOT yielded here — keyspace enumerators (SCAN /
+    /// KEYS / RANDOMKEY) must union this with [`Self::cold_only_keys`]
+    /// or spilled keys silently vanish from enumeration (#364).
     pub fn keys(&self) -> impl Iterator<Item = &CompactKey> {
         self.data.keys()
     }
 
+    /// Keys visible ONLY via the cold plane at `now_ms`: present in the
+    /// in-RAM cold index, not TTL-expired (judged from the cached
+    /// [`crate::storage::tiered::cold_index::ColdLocation::ttl_ms`] — no
+    /// disk I/O), and NOT shadowed by a live hot-plane entry.
+    ///
+    /// Together with the hot-alive subset of [`Self::keys`] this
+    /// partitions the logical keyspace with no overlap, so keyspace
+    /// enumerators (SCAN / KEYS / RANDOMKEY, #364) can take the union of
+    /// the two planes without any dedup pass. A key present in BOTH
+    /// planes (hot shadow over a stale cold entry, e.g. after AOF replay)
+    /// is classified hot; a hot entry that is TTL-expired above a live
+    /// cold entry is classified cold.
+    pub fn cold_only_keys(&self, now_ms: u64) -> impl Iterator<Item = &Bytes> + '_ {
+        let base_ts = self.base_timestamp;
+        self.cold_index.as_ref().into_iter().flat_map(move |ci| {
+            ci.iter().filter_map(move |(key, loc)| {
+                let cold_alive = loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl);
+                if !cold_alive {
+                    return None;
+                }
+                let hot_alive = self
+                    .data
+                    .get(key.as_ref())
+                    .is_some_and(|e| !e.is_expired_at(base_ts, now_ms));
+                if hot_alive { None } else { Some(key) }
+            })
+        })
+    }
+
     /// Return a random non-expired key from the database, or None if empty.
+    ///
+    /// Samples the LOGICAL keyspace: hot-alive entries plus cold-only
+    /// spilled keys ([`Self::cold_only_keys`]) — an all-spilled database
+    /// must not answer "empty" (#364).
+    ///
+    /// Two passes — count, then walk to the selected position — so only
+    /// the winning key is ever cloned (the previous single-pass version
+    /// materialized a `Bytes` copy of EVERY live key per call). Stable
+    /// across the passes: `&self` is held throughout and each shard's
+    /// database is single-threaded, so neither plane can mutate between
+    /// the count and the walk.
     pub fn random_key(&self) -> Option<Bytes> {
-        if self.data.is_empty() {
-            return None;
-        }
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
-        // Collect non-expired keys (iterator is already O(n))
-        let live: Vec<_> = self
+        let hot_live = self
             .data
             .iter()
             .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
-            .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
-            .collect();
-        if live.is_empty() {
+            .count();
+        let cold_live = self.cold_only_keys(now_ms).count();
+        let total = hot_live + cold_live;
+        if total == 0 {
             return None;
         }
-        let idx = (current_time_ms() as usize) % live.len();
-        Some(live.into_iter().nth(idx).unwrap_or_default())
+        let idx = (current_time_ms() as usize) % total;
+        if idx < hot_live {
+            self.data
+                .iter()
+                .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+                .nth(idx)
+                .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
+        } else {
+            self.cold_only_keys(now_ms).nth(idx - hot_live).cloned()
+        }
     }
 
     /// Set or remove expiration on an existing key.
@@ -2673,6 +2732,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         db.cold_index = Some(ci);
@@ -2738,6 +2798,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         db.cold_index = Some(ci);

@@ -787,12 +787,22 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Collect all keys first (need to release immutable borrow before calling db.get)
     let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
+    let now_ms = db.now_ms();
 
     let mut result = Vec::new();
     for key in all_keys {
-        // Trigger lazy expiry by calling exists
-        if db.exists(key.as_bytes()) && glob_match(pattern, key.as_bytes()) {
+        // Trigger lazy expiry by calling exists; membership below is strict
+        // hot-aliveness so cold-only keys enter exactly once, via the cold
+        // loop (#364 plane partition — see Database::cold_only_keys).
+        let _ = db.exists(key.as_bytes());
+        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        {
             result.push(Frame::BulkString(key.to_bytes()));
+        }
+    }
+    for key in db.cold_only_keys(now_ms) {
+        if glob_match(pattern, key.as_ref()) {
+            result.push(Frame::BulkString(key.clone()));
         }
     }
 
@@ -927,6 +937,19 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(count)
 }
 
+/// SCAN's TYPE-filter judgment for a cold-only (spilled) key.
+///
+/// Judged from the in-RAM `ColdLocation::value_type` cache — must never
+/// read the cold value from disk or promote it into RAM, or SCAN over a
+/// large offloaded keyspace turns into a disk crawl / memory-pressure
+/// storm on the shard thread (#364).
+fn cold_type_matches(db: &Database, key: &[u8], type_filter: &[u8]) -> bool {
+    db.cold_index
+        .as_ref()
+        .and_then(|ci| ci.lookup(key))
+        .is_some_and(|loc| type_filter.eq_ignore_ascii_case(loc.value_type.type_name().as_bytes()))
+}
+
 /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
 ///
 /// Incrementally iterates the key space. Returns a cursor and a batch of keys.
@@ -985,14 +1008,26 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration
+    // Collect all non-expired keys sorted for deterministic iteration.
+    // Two planes, partitioned with no overlap (#364): hot = live in-RAM
+    // entries (exists() keeps its lazy-expiry reclamation side effect);
+    // cold = spilled keys with no live hot shadow (`cold_only_keys`, pure
+    // in-RAM index probe — no disk I/O). The `is_cold` tag lets the TYPE
+    // filter below avoid a promoting/disk-reading lookup on cold keys.
+    let now_ms = db.now_ms();
     let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
-    let mut sorted_keys: Vec<CompactKey> = Vec::new();
+    let mut sorted_keys: Vec<(CompactKey, bool)> = Vec::new();
     for key in all_keys {
-        if db.exists(key.as_bytes()) {
-            sorted_keys.push(key);
+        let _ = db.exists(key.as_bytes());
+        if db.get_if_alive(key.as_bytes(), now_ms).is_some() {
+            sorted_keys.push((key, false));
         }
     }
+    let cold_keys: Vec<CompactKey> = db
+        .cold_only_keys(now_ms)
+        .map(|k| CompactKey::from(k.as_ref()))
+        .collect();
+    sorted_keys.extend(cold_keys.into_iter().map(|k| (k, true)));
     sorted_keys.sort();
 
     let total = sorted_keys.len();
@@ -1002,18 +1037,19 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     // Iterate from cursor position, collect up to `count` matching keys
     let mut checked = 0;
     while pos < total && checked < count {
-        let key = &sorted_keys[pos];
+        let (key, is_cold) = &sorted_keys[pos];
         pos += 1;
         checked += 1;
 
         // TYPE filter
         if let Some(tf) = type_filter {
-            if let Some(entry) = db.get(key.as_bytes()) {
-                let tn = entry.value.type_name().as_bytes();
-                if !tf.eq_ignore_ascii_case(tn) {
-                    continue;
-                }
+            let matches = if *is_cold {
+                cold_type_matches(db, key.as_bytes(), tf)
             } else {
+                db.get_if_alive(key.as_bytes(), now_ms)
+                    .is_some_and(|e| tf.eq_ignore_ascii_case(e.value.type_name().as_bytes()))
+            };
+            if !matches {
                 continue;
             }
         }
@@ -1146,8 +1182,16 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
     let mut result = Vec::new();
     for key in db.keys() {
-        if db.exists_if_alive(key.as_bytes(), now_ms) && glob_match(pattern, key.as_bytes()) {
+        // Strict hot-aliveness: cold-visible keys enter exactly once, via
+        // the cold loop below (#364 plane partition).
+        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        {
             result.push(Frame::BulkString(key.to_bytes()));
+        }
+    }
+    for key in db.cold_only_keys(now_ms) {
+        if glob_match(pattern, key.as_ref()) {
+            result.push(Frame::BulkString(key.clone()));
         }
     }
     Frame::Array(result.into())
@@ -1207,12 +1251,19 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration
-    let mut sorted_keys: Vec<CompactKey> = db
+    // Collect all non-expired keys sorted for deterministic iteration.
+    // Hot plane (live in-RAM entries) unioned with cold-only spilled keys —
+    // the two are partitioned by `cold_only_keys`, so no dedup pass (#364).
+    let mut sorted_keys: Vec<(CompactKey, bool)> = db
         .keys()
-        .filter(|k| db.exists_if_alive(k.as_bytes(), now_ms))
+        .filter(|k| db.get_if_alive(k.as_bytes(), now_ms).is_some())
         .cloned()
+        .map(|k| (k, false))
         .collect();
+    sorted_keys.extend(
+        db.cold_only_keys(now_ms)
+            .map(|k| (CompactKey::from(k.as_ref()), true)),
+    );
     sorted_keys.sort();
 
     let total = sorted_keys.len();
@@ -1221,18 +1272,19 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut checked = 0;
 
     while pos < total && checked < count {
-        let key = &sorted_keys[pos];
+        let (key, is_cold) = &sorted_keys[pos];
         pos += 1;
         checked += 1;
 
         // TYPE filter
         if let Some(tf) = type_filter {
-            if let Some(entry) = db.get_if_alive(key.as_bytes(), now_ms) {
-                let tn = entry.value.type_name().as_bytes();
-                if !tf.eq_ignore_ascii_case(tn) {
-                    continue;
-                }
+            let matches = if *is_cold {
+                cold_type_matches(db, key.as_bytes(), tf)
             } else {
+                db.get_if_alive(key.as_bytes(), now_ms)
+                    .is_some_and(|e| tf.eq_ignore_ascii_case(e.value.type_name().as_bytes()))
+            };
+            if !matches {
                 continue;
             }
         }
@@ -1378,6 +1430,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         }
     }
 
@@ -2301,5 +2354,289 @@ mod tests {
         let mut db = Database::new();
         let result = object(&mut db, &[bs(b"BOGUS")]);
         assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- Cold-plane enumeration tests (issue #364) ---
+    //
+    // Under disk-offload, keys spilled by eviction live ONLY in
+    // `Database::cold_index` (no in-RAM Entry). SCAN/KEYS/RANDOMKEY must
+    // enumerate them from the in-RAM index alone — no disk I/O.
+
+    mod cold_enumeration {
+        use super::*;
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        /// Db with `hot` resident string keys and `cold` cold-only keys.
+        fn db_with_planes(hot: &[&[u8]], cold: &[(&[u8], Option<u64>)]) -> Database {
+            let mut db = Database::new();
+            for k in hot {
+                db.set(
+                    Bytes::copy_from_slice(k),
+                    Entry::new_string(Bytes::from_static(b"v")),
+                );
+            }
+            let mut ci = ColdIndex::new();
+            for (i, (k, ttl_ms)) in cold.iter().enumerate() {
+                ci.insert(
+                    Bytes::copy_from_slice(k),
+                    ColdLocation {
+                        file_id: 1,
+                        page_idx: 0,
+                        slot_idx: i as u16,
+                        ttl_ms: *ttl_ms,
+                        value_type: crate::persistence::kv_page::ValueType::String,
+                    },
+                );
+            }
+            db.cold_index = Some(ci);
+            db
+        }
+
+        /// Drive SCAN (mutable track) to completion, collecting every key.
+        fn full_scan(db: &mut Database, extra: &[&[u8]]) -> Vec<Bytes> {
+            let mut cursor = Bytes::from_static(b"0");
+            let mut keys = Vec::new();
+            loop {
+                let mut args = vec![Frame::BulkString(cursor.clone())];
+                for e in extra {
+                    args.push(bs(e));
+                }
+                let Frame::Array(parts) = scan(db, &args) else {
+                    panic!("SCAN did not return an array");
+                };
+                let Frame::BulkString(next) = &parts[0] else {
+                    panic!("SCAN cursor not a bulk string");
+                };
+                let Frame::Array(batch) = &parts[1] else {
+                    panic!("SCAN batch not an array");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        keys.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    return keys;
+                }
+                cursor = next.clone();
+            }
+        }
+
+        fn full_scan_readonly(db: &Database, now_ms: u64, extra: &[&[u8]]) -> Vec<Bytes> {
+            let mut cursor = Bytes::from_static(b"0");
+            let mut keys = Vec::new();
+            loop {
+                let mut args = vec![Frame::BulkString(cursor.clone())];
+                for e in extra {
+                    args.push(bs(e));
+                }
+                let Frame::Array(parts) = scan_readonly(db, &args, now_ms) else {
+                    panic!("SCAN did not return an array");
+                };
+                let Frame::BulkString(next) = &parts[0] else {
+                    panic!("SCAN cursor not a bulk string");
+                };
+                let Frame::Array(batch) = &parts[1] else {
+                    panic!("SCAN batch not an array");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        keys.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    return keys;
+                }
+                cursor = next.clone();
+            }
+        }
+
+        #[test]
+        fn scan_includes_cold_only_keys() {
+            let mut db = db_with_planes(&[b"hot1", b"hot2"], &[(b"cold1", None), (b"cold2", None)]);
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["cold1", "cold2", "hot1", "hot2"]);
+        }
+
+        #[test]
+        fn scan_readonly_includes_cold_only_keys() {
+            let db = db_with_planes(&[b"hot1"], &[(b"cold1", None)]);
+            let now_ms = current_time_ms();
+            let mut keys = full_scan_readonly(&db, now_ms, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["cold1", "hot1"]);
+        }
+
+        #[test]
+        fn scan_returns_both_planes_key_exactly_once() {
+            // A key present in BOTH planes (hot shadow over a stale cold
+            // entry, e.g. after AOF-replay) must be returned exactly once.
+            let mut db = db_with_planes(&[b"both"], &[(b"both", None), (b"coldonly", None)]);
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["both", "coldonly"]);
+        }
+
+        #[test]
+        fn scan_skips_ttl_expired_cold_keys() {
+            let now_ms = current_time_ms();
+            let mut db = db_with_planes(
+                &[],
+                &[
+                    (b"alive", Some(now_ms + 60_000)),
+                    (b"dead", Some(now_ms - 60_000)),
+                ],
+            );
+            let keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            assert_eq!(keys, vec!["alive"]);
+        }
+
+        #[test]
+        fn scan_match_filter_applies_to_cold_keys() {
+            let mut db = db_with_planes(&[b"user:1"], &[(b"user:2", None), (b"other", None)]);
+            let mut keys = full_scan(&mut db, &[b"MATCH", b"user:*", b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["user:1", "user:2"]);
+        }
+
+        #[test]
+        fn scan_small_count_pages_through_cold_keys() {
+            let mut db = db_with_planes(
+                &[b"h1", b"h2", b"h3"],
+                &[(b"c1", None), (b"c2", None), (b"c3", None)],
+            );
+            // COUNT 1 forces one key per page — exercises cursor continuity
+            // across the hot/cold boundary.
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"1"]);
+            keys.sort();
+            assert_eq!(keys, vec!["c1", "c2", "c3", "h1", "h2", "h3"]);
+        }
+
+        #[test]
+        fn keys_includes_cold_only_keys() {
+            let mut db = db_with_planes(&[b"hot1"], &[(b"cold1", None), (b"both", None)]);
+            db.set(
+                Bytes::from_static(b"both"),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+            let Frame::Array(arr) = keys(&mut db, &[bs(b"*")]) else {
+                panic!("KEYS did not return an array");
+            };
+            let mut got: Vec<Bytes> = arr
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::BulkString(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, vec!["both", "cold1", "hot1"]);
+        }
+
+        #[test]
+        fn keys_readonly_includes_cold_only_keys() {
+            let db = db_with_planes(&[b"hot1"], &[(b"cold1", None)]);
+            let now_ms = current_time_ms();
+            let Frame::Array(arr) = keys_readonly(&db, &[bs(b"*")], now_ms) else {
+                panic!("KEYS did not return an array");
+            };
+            let mut got: Vec<Bytes> = arr
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::BulkString(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, vec!["cold1", "hot1"]);
+        }
+
+        #[test]
+        fn scan_type_filter_judges_cold_keys_from_index() {
+            use crate::persistence::kv_page::ValueType;
+            // One cold hash + one cold string + one hot string. TYPE hash
+            // must surface ONLY the cold hash — judged from the in-RAM
+            // ColdLocation::value_type cache, no disk read available here
+            // (no spill file exists behind these locations).
+            let mut db = db_with_planes(&[b"hotstr"], &[]);
+            let mut ci = ColdIndex::new();
+            ci.insert(
+                Bytes::from_static(b"coldhash"),
+                ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: 0,
+                    ttl_ms: None,
+                    value_type: ValueType::Hash,
+                },
+            );
+            ci.insert(
+                Bytes::from_static(b"coldstr"),
+                ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: 1,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                },
+            );
+            db.cold_index = Some(ci);
+
+            let hashes = full_scan(&mut db, &[b"TYPE", b"hash", b"COUNT", b"100"]);
+            assert_eq!(hashes, vec!["coldhash"]);
+
+            let mut strings = full_scan(&mut db, &[b"TYPE", b"string", b"COUNT", b"100"]);
+            strings.sort();
+            assert_eq!(strings, vec!["coldstr", "hotstr"]);
+
+            // Read-only twin must agree.
+            let now_ms = current_time_ms();
+            let ro_hashes = full_scan_readonly(&db, now_ms, &[b"TYPE", b"hash", b"COUNT", b"100"]);
+            assert_eq!(ro_hashes, vec!["coldhash"]);
+        }
+
+        #[test]
+        fn randomkey_sees_all_cold_database() {
+            // Every key spilled: RANDOMKEY must not report an empty db.
+            let mut db = db_with_planes(&[], &[(b"cold1", None), (b"cold2", None)]);
+            match randomkey(&mut db, &[]) {
+                Frame::BulkString(k) => {
+                    assert!(k.as_ref() == b"cold1" || k.as_ref() == b"cold2");
+                }
+                other => panic!("expected a key, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn randomkey_readonly_sees_all_cold_database() {
+            let db = db_with_planes(&[], &[(b"cold1", None)]);
+            match randomkey_readonly(&db, &[], current_time_ms()) {
+                Frame::BulkString(k) => assert_eq!(k.as_ref(), b"cold1"),
+                other => panic!("expected a key, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn del_of_ttl_expired_cold_key_answers_zero_but_reclaims() {
+            // Redis parity: DEL of a logically-expired key deletes nothing
+            // (returns 0) — but the stale cold-index entry must still be
+            // reclaimed as a side effect, not left behind.
+            let now_ms = current_time_ms();
+            let mut db = db_with_planes(&[], &[(b"dead", Some(now_ms - 60_000))]);
+            assert_eq!(del(&mut db, &[bs(b"dead")]), Frame::Integer(0));
+            assert!(
+                db.cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.lookup(b"dead").is_none()),
+                "stale cold entry must be reclaimed by the DEL attempt"
+            );
+        }
+
+        #[test]
+        fn unlink_of_alive_cold_key_still_counts() {
+            let mut db = db_with_planes(&[], &[(b"alive", None)]);
+            assert_eq!(unlink(&mut db, &[bs(b"alive")]), Frame::Integer(1));
+        }
     }
 }

@@ -105,6 +105,29 @@ pub fn write_kv_spill_pages(
     Ok((pages.total_pages as u64) * (PAGE_4K as u64))
 }
 
+/// On-disk [`ValueType`] tag for a hot value.
+///
+/// Exhaustive over `RedisValueRef` by design: adding a new value variant
+/// without a `ValueType` mapping must be a compile error, never a silent
+/// mis-typed spill. Used by every spill entry point and by the sync
+/// eviction path to populate `ColdLocation::value_type` (#364).
+pub fn value_type_of(val: &RedisValueRef) -> ValueType {
+    match val {
+        RedisValueRef::String(_) => ValueType::String,
+        RedisValueRef::Hash(_)
+        | RedisValueRef::HashListpack(_)
+        | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
+        RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
+        RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
+            ValueType::Set
+        }
+        RedisValueRef::SortedSet { .. }
+        | RedisValueRef::SortedSetBPTree { .. }
+        | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+        RedisValueRef::Stream(_) => ValueType::Stream,
+    }
+}
+
 /// Spill a single evicted KV entry to a DataFile on disk.
 ///
 /// Creates a single-page `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf`,
@@ -133,22 +156,8 @@ pub fn spill_to_datafile(
     let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
         RedisValueRef::String(s) => (ValueType::String, s),
         ref other => {
-            let vt = match other {
-                RedisValueRef::Hash(_)
-                | RedisValueRef::HashListpack(_)
-                | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
-                RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                RedisValueRef::Set(_)
-                | RedisValueRef::SetListpack(_)
-                | RedisValueRef::SetIntset(_) => ValueType::Set,
-                RedisValueRef::SortedSet { .. }
-                | RedisValueRef::SortedSetBPTree { .. }
-                | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
-                RedisValueRef::Stream(_) => ValueType::Stream,
-                RedisValueRef::String(_) => unreachable!(),
-            };
             collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
-            (vt, collection_buf.as_slice())
+            (value_type_of(other), collection_buf.as_slice())
         }
     };
 
@@ -201,6 +210,7 @@ pub fn spill_to_datafile(
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms,
+                value_type,
             },
         );
     }
@@ -1049,6 +1059,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1101,6 +1112,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1265,6 +1277,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1326,6 +1339,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
