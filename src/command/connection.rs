@@ -363,7 +363,11 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# Keyspace\r\n");
-    let key_count = db.len();
+    // Logical count (hot + cold), matching DBSIZE (issue #355). `expires`
+    // remains resident-only: cold TTLs live in ColdLocation.ttl_ms and are
+    // swept by the proactive expiry pass, but counting them here would need
+    // a second O(cold) scan for a field monitoring rarely consumes.
+    let key_count = db.logical_len();
     let expires_count = db.expires_count();
     if key_count > 0 {
         let _ = write!(

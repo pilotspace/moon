@@ -46,6 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot (only the monoio arm did), so under `runtime-tokio` every sharded
   BGSAVE left `rdb_bgsave_in_progress` stuck at 1 — now decremented in both
   arms.
+- **DBSIZE / INFO `# Keyspace` count logical keys under disk-offload
+  (issue #355).** Both previously reported the resident set only — the
+  2026-07-16 G2 re-run wrote ~164K distinct keys and DBSIZE answered 24,275
+  (~86% under-report), breaking operator capacity math. `Database::
+  logical_len()` now counts hot + cold keys with hot∩cold overlap (a fresh
+  SET over a cold-only key legitimately leaves its cold shadow until the
+  next touch) counted once via an O(cold) probe pass — same order as the
+  `expires_count` scan INFO already pays, zero hot-path cost, no
+  counter-drift risk. Wired through all six sites: `dbsize`,
+  `dbsize_readonly`, the INFO fallback keyspace section, the
+  `KeyspaceStats` scatter handler, the embedded/non-sharded
+  `handler_single` INFO keyspace vector, and `coordinate_dbsize`'s local leg
+  (which inlined a resident-only `db.len()` while its remote legs
+  dispatched real DBSIZE commands — the two definitions disagreed inside a
+  single reply). Known remaining parity gap, tracked separately: SCAN /
+  KEYS / RANDOMKEY still enumerate the hot plane only.
 - **Storage: recovery panic `double NeedsSplit after split_segment` in
   `DashTable::insert_or_update`.** The insert-or-update path split an overflowing
   segment exactly once and declared a second `NeedsSplit` unreachable — false under

@@ -755,9 +755,11 @@ fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
 
 /// DBSIZE
 ///
-/// Returns the number of keys in the currently selected database.
+/// Returns the number of LOGICAL keys in the currently selected database —
+/// hot entries plus disk-offloaded (cold) keys, overlap counted once
+/// (issue #355; Redis parity: a spilled-but-readable key is still a key).
 pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
-    Frame::Integer(db.len() as i64)
+    Frame::Integer(db.logical_len() as i64)
 }
 
 /// DBSIZE — read-only variant for `dispatch_read()`.
@@ -767,7 +769,7 @@ pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
 /// immutable `&Database` and returns the current key count, matching the
 /// mutable `dbsize` semantics exactly (neither variant lazily expires).
 pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
-    Frame::Integer(db.len() as i64)
+    Frame::Integer(db.logical_len() as i64)
 }
 
 /// KEYS pattern
@@ -1366,6 +1368,88 @@ mod tests {
             Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms, base_ts),
         );
         db
+    }
+
+    // --- DBSIZE tests (issue #355: logical count under disk-offload) ---
+
+    fn cold_loc(file_id: u64) -> crate::storage::tiered::cold_index::ColdLocation {
+        crate::storage::tiered::cold_index::ColdLocation {
+            file_id,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+        }
+    }
+
+    /// Issue #355 red/green: a spilled-but-readable key is still a key.
+    /// DBSIZE must count hot + cold, not the resident set only (observed
+    /// 24K reported vs ~164K logical in the 2026-07-16 G2 re-run).
+    #[test]
+    fn test_dbsize_counts_cold_entries() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut db = setup_db_with_key(b"hot1", b"v");
+        db.set(
+            Bytes::from_static(b"hot2"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"cold1"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"cold2"), cold_loc(2));
+        ci.insert(Bytes::from_static(b"cold3"), cold_loc(3));
+        db.cold_index = Some(ci);
+
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(5));
+        assert_eq!(dbsize_readonly(&db, &[]), Frame::Integer(5));
+    }
+
+    /// Issue #355: a key that is BOTH hot and cold-shadowed (fresh SET over a
+    /// cold-only key lands on the `Inserted` arm, which must leave the shadow
+    /// for the AOF-replay ambiguity proof — see `Database::set`) counts ONCE.
+    #[test]
+    fn test_dbsize_does_not_double_count_cold_shadowed_hot_key() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut ci = ColdIndex::new();
+        // Cold entries exist FIRST (rebuilt from manifest / spilled earlier)…
+        ci.insert(Bytes::from_static(b"shadowed"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"cold_only"), cold_loc(2));
+        let mut db = Database::new();
+        db.cold_index = Some(ci);
+        // …then a fresh SET over the cold-only key: `Inserted` arm, shadow
+        // intentionally survives.
+        db.set(
+            Bytes::from_static(b"shadowed"),
+            Entry::new_string(Bytes::from_static(b"new")),
+        );
+        assert!(db.is_hot(b"shadowed"));
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"shadowed")
+                .is_some(),
+            "precondition: the cold shadow must still exist for this test to bite"
+        );
+
+        // shadowed (1) + cold_only (1) = 2 logical keys, never 3.
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(2));
+        assert_eq!(dbsize_readonly(&db, &[]), Frame::Integer(2));
+    }
+
+    /// Control: without a cold index (disk-offload disabled) DBSIZE is the
+    /// plain hot count, and `clear()` zeroes both planes.
+    #[test]
+    fn test_dbsize_no_cold_index_and_clear() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut db = setup_db_with_key(b"k", b"v");
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(1));
+
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"cold"), cold_loc(1));
+        db.cold_index = Some(ci);
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(2));
+
+        db.clear();
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(0));
     }
 
     // --- DEL tests ---

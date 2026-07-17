@@ -2025,12 +2025,14 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(keys);
         }
         ShardMessage::KeyspaceStats { reply_tx } => {
-            // Per-db (keys, expires) for INFO # Keyspace. O(#dbs) counter
-            // reads — no key iteration.
+            // Per-db (keys, expires) for INFO # Keyspace. `logical_len`
+            // counts hot + cold keys (overlap once) so the section agrees
+            // with DBSIZE under disk-offload (issue #355); costs an O(cold)
+            // probe pass, same order as the `expires_count` scan beside it.
             let stats: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
                 s.databases
                     .iter()
-                    .map(|db| (db.len() as u64, db.expires_count() as u64))
+                    .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
                     .collect()
             });
             let _ = reply_tx.send(stats);

@@ -1374,6 +1374,37 @@ impl Database {
         self.data.len()
     }
 
+    /// Number of LOGICAL keys: hot entries plus disk-offloaded (cold) keys,
+    /// counting a key that exists in both planes exactly once (issue #355 —
+    /// a spilled-but-readable key is still a key; DBSIZE / INFO `# Keyspace`
+    /// previously reported the resident set only, an ~86% under-report in
+    /// the 2026-07-16 G2 re-run).
+    ///
+    /// Hot∩cold overlap is transient but real: a fresh SET over a cold-only
+    /// key lands on `set()`'s `Inserted` arm, which deliberately leaves the
+    /// cold shadow (removing it there would defeat restart-as-cold — every
+    /// first replayed write is `Inserted` — see the ambiguity proof in
+    /// [`Self::set`]). The overlap is therefore subtracted with an O(cold)
+    /// probe pass instead of a maintained counter: `cold_index` is a `pub`
+    /// field mutated directly by the spill-completion path, so an
+    /// incremental counter would have unfenceable drift risk, while INFO
+    /// already tolerates an O(hot) scan per call in
+    /// [`Self::expires_count`]. Like `len()`, potentially-expired entries
+    /// (hot or cold) are counted.
+    pub fn logical_len(&self) -> usize {
+        let hot = self.data.len();
+        match &self.cold_index {
+            None => hot,
+            Some(ci) => {
+                let overlap = ci
+                    .iter()
+                    .filter(|(key, _)| self.data.contains_key(key))
+                    .count();
+                hot + ci.len() - overlap
+            }
+        }
+    }
+
     /// Iterator over all keys (caller does glob filtering).
     pub fn keys(&self) -> impl Iterator<Item = &CompactKey> {
         self.data.keys()

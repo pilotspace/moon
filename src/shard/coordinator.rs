@@ -1748,9 +1748,12 @@ pub async fn coordinate_dbsize(
     let mut total: i64 = 0;
     let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
 
-    // Local shard
+    // Local shard. `logical_len`, NOT `len`: remote legs dispatch a real
+    // DBSIZE (which counts hot + cold since issue #355), so an inlined
+    // resident-only local count would under-report by exactly the local
+    // shard's cold plane — the aggregate must use one definition everywhere.
     {
-        let local_len = crate::shard::slice::with_shard_db(db_index, |db| db.len()) as i64;
+        let local_len = crate::shard::slice::with_shard_db(db_index, |db| db.logical_len()) as i64;
         total += local_len;
     }
 
@@ -1801,7 +1804,9 @@ pub async fn coordinate_keyspace_info(
     let mut totals: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
         s.databases
             .iter()
-            .map(|db| (db.len() as u64, db.expires_count() as u64))
+            // logical_len: hot + cold, overlap once — keeps INFO # Keyspace
+            // consistent with DBSIZE under disk-offload (issue #355).
+            .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
             .collect()
     });
     if num_shards <= 1 {
