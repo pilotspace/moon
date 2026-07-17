@@ -563,6 +563,11 @@ mod tests {
         d
     }
 
+    // unix-only: the non-unix `query_free_bytes` stub always returns `Ok`,
+    // so the latch (by design) never engages on Windows — this test would
+    // fail its `dir_lost()` assertion there. The Windows Check job runs on
+    // main pushes only, so a missing gate here is invisible on the PR.
+    #[cfg(unix)]
     #[test]
     fn test_dir_lost_latches_pauses_and_self_heals() {
         let d = scratch_dir("latch");
