@@ -938,7 +938,14 @@ pub async fn handle_connection(
                                     .iter()
                                     .map(|d| {
                                         let g = d.read();
-                                        (g.len() as u64, g.expires_count() as u64)
+                                        // logical_len, not len(): a spilled
+                                        // (cold-only) key is still a logical
+                                        // key — INFO must agree with DBSIZE
+                                        // (#355). Only the embedded /
+                                        // non-sharded server drives this
+                                        // handler; the sharded binary goes
+                                        // through coordinate_keyspace_info.
+                                        (g.logical_len() as u64, g.expires_count() as u64)
                                     })
                                     .collect();
                                 let guard = db[conn.selected_db].read();

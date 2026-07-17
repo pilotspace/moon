@@ -54,9 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SET over a cold-only key legitimately leaves its cold shadow until the
   next touch) counted once via an O(cold) probe pass — same order as the
   `expires_count` scan INFO already pays, zero hot-path cost, no
-  counter-drift risk. Wired through all five sites: `dbsize`,
+  counter-drift risk. Wired through all six sites: `dbsize`,
   `dbsize_readonly`, the INFO fallback keyspace section, the
-  `KeyspaceStats` scatter handler, and `coordinate_dbsize`'s local leg
+  `KeyspaceStats` scatter handler, the embedded/non-sharded
+  `handler_single` INFO keyspace vector, and `coordinate_dbsize`'s local leg
   (which inlined a resident-only `db.len()` while its remote legs
   dispatched real DBSIZE commands — the two definitions disagreed inside a
   single reply). Known remaining parity gap, tracked separately: SCAN /
