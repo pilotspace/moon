@@ -1440,6 +1440,46 @@ impl Database {
         })
     }
 
+    /// O(COUNT) hot-plane SCAN page (#368): entries with
+    /// `scan hash48 >= from_h48`, live at `now_ms`, ascending by
+    /// `(hash48, key)`, walking only the DashTable segments that cover the
+    /// requested hash range (see [`crate::storage::dashtable::DashTable::hash_page`]).
+    ///
+    /// Hash mapping: the cursor is the table's own key hash truncated to
+    /// its top 48 bits (`hash_key(key) >> 16`), so
+    /// `h64 >= from_h48 << 16  ⟺  (h64 >> 16) >= from_h48` — the segment
+    /// range walk and the 48-bit cursor agree exactly.
+    ///
+    /// Returns `(page, more)`; `more = true` means unvisited segments
+    /// (strictly larger hashes) remain.
+    pub fn scan_hot_page(
+        &self,
+        from_h48: u64,
+        want: usize,
+        now_ms: u64,
+    ) -> (Vec<(u64, CompactKey)>, bool) {
+        // The h64→h48 bridge (and the "equal-h48 group never straddles a
+        // page" guarantee) requires segment routing to use at most the top
+        // 48 hash bits. Depth > 48 needs a 2^48-entry directory —
+        // unreachable in practice, but the invariant is load-bearing.
+        debug_assert!(
+            self.data.directory_depth() <= 48,
+            "SCAN 48-bit cursor mapping requires directory depth <= 48"
+        );
+        let base_ts = self.base_timestamp;
+        let (page, more) = self.data.hash_page(from_h48 << 16, want, move |_, e| {
+            !e.is_expired_at(base_ts, now_ms)
+        });
+        let mut page: Vec<(u64, CompactKey)> =
+            page.into_iter().map(|(h, k)| (h >> 16, k)).collect();
+        // hash_page sorts by full (h64, key); truncation to 48 bits can
+        // reorder keys WITHIN an equal-h48 group, so re-establish
+        // (h48, key) order (groups never span pages: equal h48 ⇒ same
+        // segment, and pages are whole-segment granular).
+        page.sort_unstable_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        (page, more)
+    }
+
     /// Keys visible ONLY via the cold plane at `now_ms`: present in the
     /// in-RAM cold index, not TTL-expired (judged from the cached
     /// [`crate::storage::tiered::cold_index::ColdLocation::ttl_ms`] — no
