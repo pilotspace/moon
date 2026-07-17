@@ -89,7 +89,12 @@ fn bgsave_issued_during_shard_startup_still_completes() {
         .env("MOON_TEST_SLOW_SHARD_START_MS", "500")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let mut child = child.spawn().expect("spawn moon");
+    let child = child.spawn().expect("spawn moon");
+    // Kill-on-drop guard: every assert! below this line panics through the
+    // guard instead of orphaning the server. An orphan from THIS suite is
+    // what produced the 667%-CPU incident behind issue #366 (leaked child,
+    // tmpdir later cleaned, pre-fix binary error-looping its tick).
+    let mut child = MoonGuard(Some(child));
 
     let mut c = Conn::open(port);
     // PING to confirm command plane is up, then fire BGSAVE immediately —
@@ -117,6 +122,17 @@ fn bgsave_issued_during_shard_startup_still_completes() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    common::sigkill(&mut child);
-    let _ = child.wait();
+    drop(child); // MoonGuard SIGKILLs + reaps
+}
+
+/// Kill-on-drop guard so a mid-test panic can't orphan the server
+/// (see tests/dir_deleted_degraded.rs for the same pattern).
+struct MoonGuard(Option<std::process::Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            common::sigkill(&mut child);
+        }
+    }
 }
