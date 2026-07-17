@@ -1012,21 +1012,21 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
 }
 
-/// Stable 48-bit key hash for SCAN cursors (FNV-1a 64 truncated).
+/// Stable 48-bit key hash for SCAN cursors.
 ///
 /// The cursor is a POSITION IN HASH SPACE, so this hash must be stable
-/// across pages and across the two planes — a fixed-seed hash, never the
-/// tables' randomized hashers. 48 bits because the multi-shard composite
-/// cursor reserves the upper 16 bits for the shard index
-/// (`coordinate_scan`).
+/// across pages and across the two planes — a fixed-seed hash. This is the
+/// hot table's own fixed-seed key hash truncated to its TOP 48 bits, which
+/// makes the cursor range-compatible with the DashTable's extendible-
+/// hashing directory (indexed by top hash bits): `Database::scan_hot_page`
+/// walks only the segments covering `[cursor << 16, ..)` — O(COUNT) per
+/// page instead of a full-table walk (#368). The cold plane computes the
+/// same value from the key bytes, keeping both planes in one hash order.
+/// 48 bits because the multi-shard composite cursor reserves the upper
+/// 16 bits for the shard index (`coordinate_scan`).
 #[inline]
 fn scan_hash48(key: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in key {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h & 0x0000_FFFF_FFFF_FFFF
+    crate::storage::dashtable::hash_key(key) >> 16
 }
 
 /// Shared SCAN page walk (#368): hash-ordered iteration with a real
@@ -1037,11 +1037,13 @@ fn scan_hash48(key: &[u8]) -> u64 {
 /// unvisited hash. A key's hash never changes, so inserts/deletes/spills/
 /// promotions between pages cannot displace another key's position —
 /// Redis's contract ("a key present for the entire scan is returned at
-/// least once"; here exactly once) holds under churn. Per page this does
-/// ONE walk over both planes with a bounded `count`-min selection heap —
-/// no full-keyspace sort and no second lookup pass (the old design paid
-/// `collect + sort + exists() + get_if_alive()` over every key on every
-/// page).
+/// least once"; here exactly once) holds under churn. Per page the hot
+/// plane is a true O(COUNT) segment-range walk (`Database::scan_hot_page`
+/// visits only DashTable segments covering hashes ≥ cursor, #368); the
+/// cold plane is still a filtered in-RAM index walk. Both feed one bounded
+/// `count`-min selection heap — no full-keyspace sort and no second
+/// lookup pass (the old design paid `collect + sort + exists() +
+/// get_if_alive()` over every key on every page).
 ///
 /// Page-boundary rule: a full page never advances the cursor past a hash
 /// value whose key group might be only partially selected, so hash
@@ -1059,8 +1061,15 @@ fn scan_core(
 ) -> Frame {
     use std::collections::BinaryHeap;
 
+    // Hot plane: O(COUNT) hash-range page — only the DashTable segments
+    // covering hashes ≥ cursor are visited; entries arrive live-filtered
+    // with their hash48 precomputed. When `more`, the page holds ≥ count
+    // entries, all below anything in unvisited segments, so it always
+    // contains the count smallest hot candidates.
+    let (hot_page, _hot_more) = db.scan_hot_page(cursor, count, now_ms);
+
     // Bounded max-heap selection: the `count` smallest (hash, key) pairs
-    // at or after the cursor, in one pass over both planes.
+    // at or after the cursor, across both planes.
     let mut heap: BinaryHeap<(u64, CompactKey, bool)> = BinaryHeap::with_capacity(count + 1);
     {
         let mut consider = |h: u64, key_bytes: &[u8], is_cold: bool| {
@@ -1076,8 +1085,8 @@ fn scan_core(
                 }
             }
         };
-        for key in db.iter_live_keys(now_ms) {
-            consider(scan_hash48(key.as_bytes()), key.as_bytes(), false);
+        for (h, key) in &hot_page {
+            consider(*h, key.as_bytes(), false);
         }
         // Cold plane: spilled keys with no live hot shadow (pure in-RAM
         // index probe — no disk I/O). Partitioned from the hot walk, so no
@@ -1096,13 +1105,13 @@ fn scan_core(
         let h_first = selected.first().map(|e| e.0).unwrap_or(h_last);
         if h_first == h_last {
             // Whole page one hash value: emit the ENTIRE equal-hash group
-            // (second filtered pass; unreachable in practice at 48 bits)
-            // so the cursor may step past it.
+            // (unreachable in practice at 48 bits) so the cursor may step
+            // past it. Hot members all live in the already-fetched page:
+            // equal h48 ⇒ same DashTable segment, and pages are
+            // whole-segment granular.
             let mut extra: Vec<(u64, CompactKey, bool)> = Vec::new();
-            for key in db.iter_live_keys(now_ms) {
-                if scan_hash48(key.as_bytes()) == h_last
-                    && !selected.iter().any(|(_, k, _)| k == key)
-                {
+            for (h, key) in &hot_page {
+                if *h == h_last && !selected.iter().any(|(_, k, _)| k == key) {
                     extra.push((h_last, key.clone(), false));
                 }
             }

@@ -528,6 +528,68 @@ impl<V> DashTable<CompactKey, V> {
         Iter::new(self.segments.collect_refs(), self.len)
     }
 
+    /// Hash-ordered page collection for SCAN (#368 O(COUNT) walk).
+    ///
+    /// Because the extendible-hashing directory is indexed by the hash's
+    /// TOP `global_depth` bits (`segment_index`), ascending directory order
+    /// is ascending hash order, and directory entry `d` covers exactly the
+    /// hash range `[d << (64-D), (d+1) << (64-D))`. Segments are therefore
+    /// range-partitioned: every entry of the segment at a lower directory
+    /// index hashes below every entry at a higher one. This walk starts at
+    /// the segment covering `from_hash` and visits segments in ascending
+    /// range order, stopping as soon as `want` qualifying entries are
+    /// collected — later segments can only contain larger hashes, so the
+    /// result is complete without touching the rest of the table.
+    ///
+    /// A segment with `local_depth < global_depth` occupies a CONTIGUOUS
+    /// run of directory slots, so alias-dedup is a consecutive store-index
+    /// comparison.
+    ///
+    /// Returns entries with `hash_key(key) >= from_hash` passing `alive`,
+    /// sorted ascending by `(hash, key)`, plus `true` if the walk stopped
+    /// with unvisited segments remaining (i.e. more entries may exist).
+    ///
+    /// Split/merge/directory-doubling between calls is safe by
+    /// construction: the caller's cursor is a position in hash space, and
+    /// structural churn only changes WHICH segment covers that position,
+    /// never the set of keys at or above it.
+    pub fn hash_page<F: Fn(&CompactKey, &V) -> bool>(
+        &self,
+        from_hash: u64,
+        want: usize,
+        alive: F,
+    ) -> (Vec<(u64, CompactKey)>, bool) {
+        let mut out: Vec<(u64, CompactKey)> = Vec::with_capacity(want.min(1024));
+        let start = segment_index(from_hash, self.depth);
+        let mut last_store_idx = usize::MAX;
+        let mut dir_idx = start;
+        while dir_idx < self.directory.len() {
+            let store_idx = self.directory[dir_idx];
+            if store_idx != last_store_idx {
+                last_store_idx = store_idx;
+                if out.len() >= want {
+                    // Enough collected and at least one unvisited segment
+                    // remains; everything in it hashes above what we have.
+                    return (Self::finish_page(out), true);
+                }
+                let seg = self.segments.get(store_idx);
+                for (k, v) in seg.iter_occupied() {
+                    let h = hash_key(k.as_ref());
+                    if h >= from_hash && alive(k, v) {
+                        out.push((h, k.clone()));
+                    }
+                }
+            }
+            dir_idx += 1;
+        }
+        (Self::finish_page(out), false)
+    }
+
+    fn finish_page(mut out: Vec<(u64, CompactKey)>) -> Vec<(u64, CompactKey)> {
+        out.sort_unstable_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        out
+    }
+
     /// Return a mutable iterator over `(&Bytes, &mut V)` pairs.
     pub fn iter_mut(&mut self) -> IterMut<'_, CompactKey, V> {
         let total = self.len;
@@ -649,6 +711,105 @@ mod tests {
                 table.get(k.as_bytes()),
                 Some(&format!("v{n}")),
                 "missing {k} after skewed splits"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_page_empty_table_is_terminal() {
+        let table: DashTable<CompactKey, String> = DashTable::new();
+        let (page, more) = table.hash_page(0, 16, |_, _| true);
+        assert!(page.is_empty());
+        assert!(!more);
+    }
+
+    #[test]
+    fn hash_page_alive_filter_and_more_flag() {
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for i in 0..2000u32 {
+            table.insert(CompactKey::from(format!("af_{i}")), test_value(i));
+        }
+        // Filter out every odd value: only evens may appear.
+        let (page, _) = table.hash_page(0, 200, |_, v| {
+            let n: u32 = v.trim_start_matches("value_").parse().unwrap();
+            n % 2 == 0
+        });
+        assert!(!page.is_empty());
+        for (_, k) in &page {
+            let n: u32 = std::str::from_utf8(k.as_ref())
+                .unwrap()
+                .trim_start_matches("af_")
+                .parse()
+                .unwrap();
+            assert_eq!(n % 2, 0, "alive filter leaked odd key {n}");
+        }
+        // A want larger than the table drains everything in one page.
+        let (all, more) = table.hash_page(0, usize::MAX, |_, _| true);
+        assert_eq!(all.len(), 2000);
+        assert!(!more, "full drain must report no further segments");
+    }
+
+    #[test]
+    fn hash_page_drains_in_hash_order_under_split_churn() {
+        // 4000 keys force many segment splits + directory doublings; paging
+        // with concurrent inserts between pages exercises the split-safety
+        // claim (cursor is a hash-space position, not a structure position).
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        let mut original: Vec<String> = Vec::with_capacity(4000);
+        for i in 0..4000u32 {
+            let k = format!("hp_{i}");
+            table.insert(CompactKey::from(k.clone()), test_value(i));
+            original.push(k);
+        }
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut churn = 0u32;
+        loop {
+            let (page, more) = table.hash_page(cursor, 64, |_, _| true);
+            let mut prev: Option<(u64, &[u8])> = None;
+            for (h, k) in &page {
+                assert!(*h >= cursor, "entry below cursor");
+                assert_eq!(*h, hash_key(k.as_ref()), "stale hash in page");
+                if let Some((ph, pk)) = prev {
+                    assert!(
+                        (ph, pk) < (*h, k.as_ref()),
+                        "page not ascending by (hash, key)"
+                    );
+                }
+                prev = Some((*h, k.as_ref()));
+            }
+            if page.is_empty() {
+                assert!(!more, "empty page must be terminal");
+                break;
+            }
+            for (_, k) in &page {
+                assert!(
+                    seen.insert(k.as_ref().to_vec()),
+                    "duplicate key across pages: {:?}",
+                    String::from_utf8_lossy(k.as_ref())
+                );
+            }
+            #[allow(clippy::unwrap_used)] // page verified non-empty above
+            let last = page.last().unwrap().0;
+            cursor = last + 1;
+            if !more {
+                break;
+            }
+            // Structural churn between pages: force splits mid-walk.
+            for _ in 0..50 {
+                table.insert(
+                    CompactKey::from(format!("churn_{churn}")),
+                    test_value(churn),
+                );
+                churn += 1;
+            }
+        }
+
+        for k in &original {
+            assert!(
+                seen.contains(k.as_bytes()),
+                "stable key {k} lost during split churn"
             );
         }
     }

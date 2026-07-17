@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **SCAN hot-plane pages are now true O(COUNT) — no full-table walk per
+  page (#368).** The SCAN cursor hash is now the DashTable's own
+  fixed-seed key hash truncated to its top 48 bits, which makes cursor
+  ranges line up exactly with the extendible-hashing directory (indexed
+  by top hash bits): segments are range-partitioned in hash space, so a
+  page visits only the segments covering hashes at or after the cursor
+  and stops as soon as COUNT entries are collected
+  (`DashTable::hash_page` → `Database::scan_hot_page`). Per-page hot
+  cost is now independent of keyspace size (previously every page walked
+  and hashed all n live entries). Splits, merges, and directory doubling
+  between pages remain safe by construction — the cursor is a position
+  in hash space, and structural churn only changes which segment covers
+  that position, never the set of keys at or above it. The cold plane
+  keeps its filtered in-RAM index walk (bounded by spilled-key count;
+  ordered cold-side paging remains a follow-up in #368). SCAN cursors
+  from before this change are invalidated (cursors are documented as
+  ephemeral; restart scans at 0).
+
 ### Fixed
 - **SCAN now honors the Redis stable-key guarantee under churn (#368).**
   The cursor was a positional index into a keyspace snapshot re-collected
