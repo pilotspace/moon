@@ -1719,14 +1719,15 @@ impl super::Shard {
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.0.tick() => {
-                    if server_config.disk_offload_enabled() {
+                    // task/issue #45: `disk_offload_dir` (Some iff offload
+                    // enabled) is precomputed at shard init — no per-tick
+                    // format!/join.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config.effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
-                                    &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
@@ -1758,16 +1759,17 @@ impl super::Shard {
                         std::future::pending::<()>().await;
                     }
                 }, if orphan_sweep_interval.is_some() && server_config.disk_offload_enabled() => {
-                    let shard_dir = server_config
-                        .effective_disk_offload_dir()
-                        .join(format!("shard-{}", shard_id));
-                    timers::run_cold_orphan_sweep(
-                        &shard_databases,
-                        shard_id,
-                        &shard_dir,
-                        shard_manifest.as_mut(),
-                        cached_clock.ms(),
-                    );
+                    // task/issue #45: precomputed shard dir; the select guard
+                    // already requires disk-offload, so this is always Some.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
+                        timers::run_cold_orphan_sweep(
+                            &shard_databases,
+                            shard_id,
+                            shard_dir,
+                            shard_manifest.as_mut(),
+                            cached_clock.ms(),
+                        );
+                    }
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.0.tick() => {
@@ -1812,6 +1814,7 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        disk_offload_dir.as_deref(),
                         &repl_backlog, &mut replica_txs, &repl_offsets,
                         aof_pool.as_ref(),
                         match wal_kv_log_mode {
@@ -2392,6 +2395,7 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        disk_offload_dir.as_deref(),
                         &repl_backlog,
                         &mut replica_txs,
                         &repl_offsets,
@@ -2466,15 +2470,15 @@ impl super::Shard {
                 }
                 // Warm tier check: every warm_poll_ms ticks
                 if monoio_tick_counter % (warm_poll_ms as u64) == 0 {
-                    if server_config.disk_offload_enabled() {
+                    // task/issue #45: `disk_offload_dir` (Some iff offload
+                    // enabled) is precomputed at shard init — no per-tick
+                    // format!/join.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config
-                                .effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
-                                    &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
@@ -2527,15 +2531,12 @@ impl super::Shard {
                 // Matches the tokio select! branch above. Disabled when interval is 0.
                 if orphan_sweep_interval_secs > 0
                     && monoio_tick_counter % (orphan_sweep_interval_secs * 1000) == 0
-                    && server_config.disk_offload_enabled()
+                    && let Some(shard_dir) = disk_offload_dir.as_deref()
                 {
-                    let shard_dir = server_config
-                        .effective_disk_offload_dir()
-                        .join(format!("shard-{}", shard_id));
                     timers::run_cold_orphan_sweep(
                         &shard_databases,
                         shard_id,
-                        &shard_dir,
+                        shard_dir,
                         shard_manifest.as_mut(),
                         cached_clock.ms(),
                     );
