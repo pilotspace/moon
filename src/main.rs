@@ -62,12 +62,16 @@ use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh, create_aof_fold_channe
 use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
+mod malloc_respawn;
+
 fn main() -> anyhow::Result<()> {
-    // Re-spawn self with MALLOC_CONF if --memory-arenas-cap differs from the
-    // baked-in default (8). Sentinel env var prevents infinite recursion.
-    // Must run BEFORE tracing init and clap parse — jemalloc reads MALLOC_CONF
-    // at process start, so the env var must be set before exec.
-    maybe_respawn_with_arena_override()?;
+    // Re-spawn self with MALLOC_CONF if --memory-arenas-cap and/or
+    // --memory-thp differ from the baked-in default (narenas:8, no thp
+    // opt). Sentinel env var prevents infinite recursion. Must run BEFORE
+    // tracing init and clap parse — jemalloc reads MALLOC_CONF at process
+    // start, so the env var must be set before exec. Both flags compose
+    // into ONE re-spawn with ONE conf string (see `build_malloc_conf`).
+    malloc_respawn::maybe_respawn_with_memory_overrides()?;
 
     // Block SIGTERM in the main thread BEFORE any child threads are spawned
     // (TLS reload thread, Prometheus admin thread, ctrlc internal thread,
@@ -122,10 +126,13 @@ fn main() -> anyhow::Result<()> {
     // merged vector.  CLI args come *after* conf tokens so clap last-wins gives
     // CLI priority.
     //
-    // NOTE: `maybe_respawn_with_arena_override()` above only scans *raw*
-    // argv — it will NOT see a `memory-arenas-cap` value that comes from the
-    // conf file.  That setting must be given on the CLI if the jemalloc
-    // respawn is needed.  This is documented behaviour.
+    // NOTE: `malloc_respawn::maybe_respawn_with_memory_overrides()` above
+    // only scans *raw* argv — it will NOT see a `memory-arenas-cap` /
+    // `memory-thp` value that comes from the conf file, so conf-file values
+    // for those two options can never reach jemalloc (its config is read
+    // once, at process start). They are effectively CLI-only;
+    // `warn_if_conf_only_overrides` below turns a conf-file attempt into a
+    // loud startup warning instead of a silent no-op.
     let (mut config, arg_matches) = match merge_conf_argv(std::env::args_os()) {
         Ok(Some(merged)) => ServerConfig::parse_from_with_matches(merged),
         Ok(None) => ServerConfig::parse_from_with_matches(std::env::args_os()),
@@ -253,13 +260,29 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
+    // and/or --memory-thp -- both are jemalloc-only knobs (mimalloc has no
+    // equivalent narenas/THP tuning surface in this codebase).
     #[cfg(not(feature = "jemalloc"))]
-    if config.memory_arenas_cap != 8 {
-        tracing::warn!(
-            "--memory-arenas-cap={} is a no-op for non-jemalloc builds",
-            config.memory_arenas_cap
-        );
+    {
+        if config.memory_arenas_cap != 8 {
+            tracing::warn!(
+                "--memory-arenas-cap={} is a no-op for non-jemalloc builds",
+                config.memory_arenas_cap
+            );
+        }
+        if config.memory_thp {
+            tracing::warn!(
+                "--memory-thp is a no-op for non-jemalloc builds \
+                 (requires --features jemalloc)"
+            );
+        }
     }
+
+    // jemalloc builds: warn loudly if either allocator override came from the
+    // conf file only — jemalloc's config was read (and any re-spawn already
+    // happened) before the conf file was parsed, so such values silently
+    // never reach the allocator. CLI-only by design; see malloc_respawn.rs.
+    malloc_respawn::warn_if_conf_only_overrides(config.memory_arenas_cap, config.memory_thp);
 
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
@@ -1937,92 +1960,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-spawn the current process with `_RJEM_MALLOC_CONF=narenas:N` when the
-/// operator passes `--memory-arenas-cap N` and N differs from the baked-in
-/// default (8).
-///
-/// tikv-jemallocator uses prefixed symbols (`_rjem_malloc_conf`), so the env
-/// var that overrides the config is `_RJEM_MALLOC_CONF` (with `JEMALLOC_CPREFIX`
-/// = `_rjem_`). jemalloc reads `opt.narenas` exactly once at init from the
-/// symbol **or** the env var (env wins). Calling `mallctl` after init is a
-/// documented no-op. Re-spawning via `execve` is the only correct path for a
-/// CLI override.
-///
-/// Sentinel `MOON_ARENAS_CAP_APPLIED=1` prevents infinite re-spawn.
-#[cfg(all(feature = "jemalloc", unix))]
-fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
-    use std::env;
-    use std::os::unix::process::CommandExt;
-    const SENTINEL: &str = "MOON_ARENAS_CAP_APPLIED";
-    // tikv-jemalloc-sys builds with prefix "_rjem_", so the env var is prefixed.
-    const MALLOC_CONF_ENV: &str = "_RJEM_MALLOC_CONF";
-
-    if env::var_os(SENTINEL).is_some() {
-        return Ok(());
-    }
-
-    // Lightweight scan of argv for --memory-arenas-cap N or --memory-arenas-cap=N.
-    // We can't use clap here because clap::parse() requires the full struct, and
-    // we need to inject env vars BEFORE jemalloc reads the config.
-    // Use args_os() to avoid panicking on non-UTF-8 argv and to preserve the
-    // original OsString argv for the re-spawn below (CodeRabbit).
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStrExt;
-    let args: Vec<OsString> = env::args_os().collect();
-    let mut requested: Option<u32> = None;
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_os_str().as_bytes();
-        if let Some(rest) = a.strip_prefix(b"--memory-arenas-cap=") {
-            requested = std::str::from_utf8(rest).ok().and_then(|s| s.parse().ok());
-            break;
-        }
-        if a == b"--memory-arenas-cap" && i + 1 < args.len() {
-            requested = args[i + 1]
-                .as_os_str()
-                .to_str()
-                .and_then(|s| s.parse().ok());
-            break;
-        }
-        i += 1;
-    }
-
-    // No flag passed -> static _rjem_malloc_conf (narenas:8) is already in effect.
-    let Some(n) = requested else {
-        return Ok(());
-    };
-    if n == 8 {
-        return Ok(()); // matches default; no override required.
-    }
-
-    if env::var_os(MALLOC_CONF_ENV).is_some() {
-        // Operator-controlled env var wins; do not clobber.
-        eprintln!(
-            "WARN: --memory-arenas-cap ignored because {} is already set",
-            MALLOC_CONF_ENV
-        );
-        return Ok(());
-    }
-
-    // Rebuild the full config with the requested narenas override.
-    let conf_val = format!(
-        "narenas:{},background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true",
-        n,
-    );
-
-    let exe = env::current_exe()?;
-    // unix-only: replaces current process image via execve; never returns on success.
-    let err = std::process::Command::new(&exe)
-        .args(args.iter().skip(1))
-        .env(MALLOC_CONF_ENV, &conf_val)
-        .env(SENTINEL, "1")
-        .exec();
-    Err(anyhow::anyhow!(
-        "re-spawn for --memory-arenas-cap failed: {}",
-        err
-    ))
-}
-
 /// Resolve the automatic shard count, optionally capped to the empirical
 /// knee of 2 when `MOON_AUTO_SHARDS_CONSERVATIVE=1` is set.
 ///
@@ -2072,11 +2009,6 @@ pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Op
     } else {
         None
     }
-}
-
-#[cfg(not(all(feature = "jemalloc", unix)))]
-fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

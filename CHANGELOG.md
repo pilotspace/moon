@@ -28,6 +28,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too) is deliberately out of scope and tracked separately.
 
 ### Performance
+- **`--memory-thp` opts jemalloc's value heap into transparent huge pages
+  (O4).** New opt-in flag layers `thp:always` onto the baked-in
+  `_rjem_malloc_conf` (on top of the always-on `metadata_thp:auto`, which
+  only huge-pages jemalloc's own metadata, not application allocations).
+  Real-PMU measured on GCE vPMU (c4a Axion / c4 Emerald Rapids,
+  `tmp/GCE-PMU-RESULTS.md`): GET RPS +24.4% (ARM) / +12.1% (x86), dTLB
+  MPKI 7.2→4.7 (ARM, −35%) / 1.10→0.017 (x86, −98.4%), IPC +0.15/+0.09 —
+  ARM pays roughly 10× the x86 dTLB tax at baseline (smaller dTLB, 4K
+  pages) so THP is a disproportionately larger ARM win. Costs RSS +4.2%
+  on both architectures. Implemented via the same `_RJEM_MALLOC_CONF`
+  execve re-spawn as `--memory-arenas-cap` (PERF-10) — passing both flags
+  together composes into exactly one re-spawn carrying one conf string
+  (`narenas:N,...,thp:always`); an operator-set `_RJEM_MALLOC_CONF` still
+  wins over either flag (warns, no-op). No-op with a warning on
+  non-jemalloc builds, AND on non-Linux jemalloc builds (macOS) — THP is a
+  Linux kernel feature, and jemalloc does not silently ignore an
+  unsupported `thp:always` under the baked-in `abort_conf:true`; it aborts
+  the process at init instead (verified experimentally on macOS
+  2026-07-18). `--memory-arenas-cap` still composes normally when paired
+  with a downgraded `--memory-thp` on non-Linux hosts. VM-verified on
+  OrbStack Linux (madvise THP policy): `AnonHugePages` jumps from ~5% of
+  RSS (baked-in `metadata_thp:auto` only) to ~96% of RSS with the flag on
+  a 500MB SET load, confirming the opt actually engages. Shipped opt-in
+  only — an RSS-drift soak is still pending before any default flip.
+  Both flags are CLI-only: a `moon.conf` value cannot reach jemalloc
+  (its config is read at process start, before the conf file is parsed)
+  and now triggers a loud startup warning instead of a silent no-op.
 - **Shard offload paths are precomputed at shard init — the recurring
   tick paths no longer allocate (#45).** The 100ms eviction tick, the
   memory-pressure cascade, the 10s warm-transition check, and the

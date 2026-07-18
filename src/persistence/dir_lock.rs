@@ -15,11 +15,14 @@
 //! * Advisory means unrelated tools reading the directory are unaffected.
 //!
 //! The guard must stay alive until exit — dropping it unlocks. `main()`
-//! binds it for its full scope. Note `std::fs::File` opens with
-//! `O_CLOEXEC`, so the `--memory-arenas-cap` `execve` re-spawn releases and
-//! re-acquires the lock across the exec boundary (same pid, no window for a
-//! competing instance to corrupt: the re-exec'd image locks again before
-//! opening any data file).
+//! binds it for its full scope. The `--memory-arenas-cap` / `--memory-thp`
+//! `execve` re-spawn (see `malloc_respawn.rs`; one composed re-exec when
+//! both flags are set) is the FIRST statement of `main()` and always
+//! completes before this lock is ever acquired, so no lock is held across
+//! the exec boundary. (Were that ordering ever to change, `std::fs::File`
+//! opens with `O_CLOEXEC`: the fd — and with it the `flock` — would be
+//! dropped at exec and re-acquired by the re-exec'd image, same pid, before
+//! it opens any data file.)
 //!
 //! Windows: no `flock`; the guard is a warn-once no-op (Windows is a
 //! compile target, not a production one — see CLAUDE.md Target Platform).

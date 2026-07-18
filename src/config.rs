@@ -481,8 +481,32 @@ pub struct ServerConfig {
     /// Reduces VSZ on multi-core hosts (4*ncpus default -> 8). No-op for
     /// non-jemalloc builds. Implemented via MALLOC_CONF env-var injection
     /// at process start (re-spawn before jemalloc init).
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
     #[arg(long = "memory-arenas-cap", value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub memory_arenas_cap: u32,
+
+    /// Opt jemalloc into `thp:always` for the value heap (distinct from the
+    /// always-on `metadata_thp:auto`, which only huge-pages jemalloc's own
+    /// bookkeeping). Real-PMU measured on GCE (tmp/GCE-PMU-RESULTS.md,
+    /// 2026-07-18): GET +24.4% (ARM Axion) / +12.1% (x86 Emerald Rapids),
+    /// dTLB MPKI -35% / -98.4%, RSS +4.2% on both. No-op for non-jemalloc
+    /// builds (warns). Implemented via the same MALLOC_CONF env-var re-spawn
+    /// as `--memory-arenas-cap` -- passing both together produces exactly one
+    /// re-exec with one composed conf string. **Linux-only in effect**:
+    /// jemalloc has no THP support outside Linux, and with the baked-in
+    /// `abort_conf:true` it does not silently ignore `thp:always` on other
+    /// platforms -- it aborts at init (verified experimentally on macOS,
+    /// 2026-07-18). This flag warns and no-ops on non-Linux jemalloc builds
+    /// rather than risk that abort; `--memory-arenas-cap` still applies
+    /// normally if both flags are given together. Opt-in only: an
+    /// RSS-drift soak is still pending before any default flip.
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
+    #[arg(long = "memory-thp", default_value_t = false)]
+    pub memory_thp: bool,
 
     /// DEPRECATED, no-op: DiskANN beam width for the removed cold-tier
     /// disk-resident search path.
