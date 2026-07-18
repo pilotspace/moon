@@ -481,6 +481,9 @@ pub struct ServerConfig {
     /// Reduces VSZ on multi-core hosts (4*ncpus default -> 8). No-op for
     /// non-jemalloc builds. Implemented via MALLOC_CONF env-var injection
     /// at process start (re-spawn before jemalloc init).
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
     #[arg(long = "memory-arenas-cap", value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub memory_arenas_cap: u32,
 
@@ -499,6 +502,9 @@ pub struct ServerConfig {
     /// rather than risk that abort; `--memory-arenas-cap` still applies
     /// normally if both flags are given together. Opt-in only: an
     /// RSS-drift soak is still pending before any default flip.
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
     #[arg(long = "memory-thp", default_value_t = false)]
     pub memory_thp: bool,
 

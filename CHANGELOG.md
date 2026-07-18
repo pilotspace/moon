@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RSS (baked-in `metadata_thp:auto` only) to ~96% of RSS with the flag on
   a 500MB SET load, confirming the opt actually engages. Shipped opt-in
   only — an RSS-drift soak is still pending before any default flip.
+  Both flags are CLI-only: a `moon.conf` value cannot reach jemalloc
+  (its config is read at process start, before the conf file is parsed)
+  and now triggers a loud startup warning instead of a silent no-op.
 - **Shard offload paths are precomputed at shard init — the recurring
   tick paths no longer allocate (#45).** The 100ms eviction tick, the
   memory-pressure cascade, the 10s warm-transition check, and the
