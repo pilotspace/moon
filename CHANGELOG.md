@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ephemeral; restart scans at 0).
 
 ### Fixed
+- **Cold recovery re-attaches spilled keys to the logical database they
+  were evicted from (#139).** Under disk-offload with `SELECT N` (N>0),
+  the recovery rebuild used to merge every spilled key into db 0's cold
+  index: SELECT>0 keys answered nil after restart (their only durable
+  copy unreachable), and a same-named key could even serve the WRONG
+  database's value from db 0. Spill files are now attributed wholesale
+  via a `db_index` field in the manifest `FileEntry` (a byte-compatible
+  repurpose of the always-written-as-zero `min_key_hash` slot — old
+  manifests read as db 0, which matches their actual provenance), spill
+  flush chunks never cross a db boundary so each file is single-db, and
+  recovery attaches one rebuilt cold index per database before WAL/AOF
+  tail replay (so replayed DEL/FLUSH still tombstone the right plane). A
+  manifest referencing a db beyond the configured `--databases` count is
+  skipped with a loud warning instead of silently resurrecting keys into
+  a wrong database.
 - **SCAN now honors the Redis stable-key guarantee under churn (#368).**
   The cursor was a positional index into a keyspace snapshot re-collected
   and re-sorted on every page, so any insert/delete (or cold-plane

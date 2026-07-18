@@ -224,7 +224,7 @@ pub struct SpillCompletion {
 }
 
 /// Build a `FileEntry` skeleton for a spill file (fields not tracked by Moon are zero).
-fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
+fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64, db_index: usize) -> FileEntry {
     FileEntry {
         file_id,
         file_type: PageType::KvLeaf as u8,
@@ -234,7 +234,7 @@ fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
         page_count,
         byte_size,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: db_index as u64,
         max_key_hash: 0,
         last_modified_lsn: 0,
     }
@@ -290,9 +290,16 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
     while start < buffer.len() {
         let mut end = start + 1;
         let mut chunk_bytes = buffer[start].value_bytes.len();
+        // Chunks additionally never cross a logical-DB boundary: the
+        // manifest attributes a whole file to ONE `db_index` (#139 — cold
+        // recovery re-attaches each file to the database its keys were
+        // evicted from), so a flush holding requests from several DBs
+        // produces one file per contiguous same-DB run. Interleaved
+        // multi-DB eviction costs extra files, never correctness.
+        let chunk_db = buffer[start].db_index;
         while end < buffer.len() {
             let next_len = buffer[end].value_bytes.len();
-            if chunk_bytes + next_len > BATCH_BYTES_CAP {
+            if chunk_bytes + next_len > BATCH_BYTES_CAP || buffer[end].db_index != chunk_db {
                 break;
             }
             chunk_bytes += next_len;
@@ -335,7 +342,7 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                             })
                             .collect();
                         completions.push(SpillCompletion {
-                            file_entry: make_file_entry(file_id, total_pages, byte_size),
+                            file_entry: make_file_entry(file_id, total_pages, byte_size, chunk_db),
                             entries,
                             success: true,
                         });
@@ -393,7 +400,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
     ) {
         Ok(pages) => match write_kv_spill_pages(&req.shard_dir, file_id, &pages) {
             Ok(byte_size) => SpillCompletion {
-                file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
+                file_entry: make_file_entry(file_id, pages.total_pages, byte_size, req.db_index),
                 entries: vec![SpillCompletionEntry {
                     key: req.key.clone(),
                     db_index: req.db_index,
@@ -412,7 +419,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     "spill_thread: single-file write failed"
                 );
                 SpillCompletion {
-                    file_entry: make_file_entry(file_id, 0, 0),
+                    file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                     entries: Vec::new(),
                     success: false,
                 }
@@ -426,7 +433,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                 "spill_thread: single-file build failed (key too large)"
             );
             SpillCompletion {
-                file_entry: make_file_entry(file_id, 0, 0),
+                file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                 entries: Vec::new(),
                 success: false,
             }
@@ -873,7 +880,7 @@ mod tests {
         let (tx, rx) = flume::bounded::<SpillCompletion>(1);
         let stop = Arc::new(AtomicBool::new(false));
         let dummy = || SpillCompletion {
-            file_entry: make_file_entry(7, 1, PAGE_4K as u64),
+            file_entry: make_file_entry(7, 1, PAGE_4K as u64, 0),
             entries: Vec::new(),
             success: true,
         };
@@ -941,6 +948,50 @@ mod tests {
             total, 1,
             "shutdown must return the unapplied completion, not drop it"
         );
+    }
+
+    /// Flush chunks must never cross a logical-DB boundary (#139): each
+    /// spill file is attributed wholesale to ONE `FileEntry::db_index`, so
+    /// a buffer interleaving dbs must produce one file per contiguous
+    /// same-db run, each completion carrying its db and only its keys.
+    #[test]
+    fn flush_buffer_cuts_chunks_at_db_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |key: &str, db: usize, file_id: u64| SpillRequest {
+            key: Bytes::from(key.to_owned()),
+            db_index: db,
+            value_bytes: Bytes::from_static(b"v"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id,
+            shard_dir: tmp.path().to_path_buf(),
+        };
+        let mut buffer = vec![
+            mk("a0", 0, 1),
+            mk("a1", 0, 2),
+            mk("b0", 1, 3),
+            mk("c0", 0, 4),
+        ];
+        let completions = flush_buffer(&mut buffer);
+        assert!(completions.iter().all(|c| c.success));
+        let summary: Vec<(u64, usize)> = completions
+            .iter()
+            .map(|c| (c.file_entry.db_index, c.entries.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(0, 2), (1, 1), (0, 1)],
+            "expected one file per contiguous same-db run: {summary:?}"
+        );
+        for c in &completions {
+            for e in &c.entries {
+                assert_eq!(
+                    e.db_index as u64, c.file_entry.db_index,
+                    "entry db must match its file's manifest attribution"
+                );
+            }
+        }
     }
 
     /// An entry that passes the `INLINE_MAX_VALUE_BYTES` pre-screen but does not

@@ -70,7 +70,7 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
         page_count: 100,
         byte_size: 409_600,
         created_lsn: id,
-        min_key_hash: 0,
+        db_index: 0,
         max_key_hash: u64::MAX,
         last_modified_lsn: id,
     };

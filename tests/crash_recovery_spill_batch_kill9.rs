@@ -488,7 +488,7 @@ fn spill_batch_shared_file_survives_cold_read_after_kill9() {
         page_count: batch.pages.len() as u32,
         byte_size,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: 0,
         max_key_hash: 0,
         last_modified_lsn: 0,
     });

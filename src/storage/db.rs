@@ -3203,6 +3203,7 @@ mod tests {
             900,
             key,
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
