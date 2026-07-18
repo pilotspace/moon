@@ -2027,6 +2027,9 @@ impl VectorStore {
         let spawned = std::thread::Builder::new()
             .name("moon-vec-idx-gc".to_owned())
             .spawn(move || {
+                // O5: spawned from the owning (pinned) shard thread —
+                // escape the inherited single-core mask.
+                crate::shard::numa::pin_current_aux_thread("moon-vec-idx-gc");
                 if let Err(e) = std::fs::remove_dir_all(&idx_dir) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(

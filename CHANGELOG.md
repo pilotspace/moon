@@ -55,6 +55,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both flags are CLI-only: a `moon.conf` value cannot reach jemalloc
   (its config is read at process start, before the conf file is parsed)
   and now triggers a loud startup warning instead of a silent no-op.
+- **Auxiliary threads no longer contend with pinned shard cores (O5).**
+  `manifest-sync-N`, `spill-N`, and `moon-wal-sync-N` are spawned from
+  inside the shard's own (pinned) event-loop thread and, on Linux,
+  inherit that thread's exact single-core affinity mask at
+  `pthread_create` time — they weren't merely sharing the shard's core,
+  they were born wearing its mask and could never leave it (confirmed via
+  `ps -eLo psr`: `manifest-sync-N`/`spill-N` co-located on shard N's
+  core; the main accept/dispatch thread also floated onto a shard core,
+  ~12% CPU steal observed under load). When `--shards` leaves a
+  remainder of un-pinned cores, every auxiliary thread (main
+  accept/dispatch, `manifest-sync-N`, `spill-N`, `moon-wal-sync-N`,
+  the AOF writer(s), auto-save) now re-pins itself to that non-shard
+  core set (round-robin) as the first act of its closure — except the
+  main thread itself, which re-pins at the LAST moment before entering
+  the accept loop, because children spawned from main inherit its mask
+  and the vector pools must keep the full-machine mask. Adversarial
+  review widened coverage to every OTHER pinned-parent spawn site in
+  the tree: `moon-heap-orphan-sweep-N` (a ~40s crash-recovery I/O burst
+  previously confined to its shard's own core), the lazily-spawned
+  `moon-cold-read-N` pool (previously born on whichever ONE shard core
+  served the first cold read and stuck there for the process lifetime,
+  serving all shards), `moon-vec-snapshot-N`, `moon-vec-idx-gc`, and
+  the `moon-vec-compact-N` pool (its old last-core-downward heuristic
+  landed workers on shard cores whenever shards ≈ cores; it now prefers
+  the non-shard set via `aux_core_at`, keeping the heuristic as
+  fallback). cpuset caveat: core IDs come from the machine-wide online
+  list, so under a restrictive cgroup cpuset the pin can fail — the
+  thread then keeps its inherited mask (debug-logged), never worse than
+  before. No-op when
+  `--shards >= cores` (no remainder to place them on) or on non-Linux.
+  `MOON_NO_AUX_PIN=1` disables it. The vector segment-reload pool
+  (`moon-vec-reload-N`) is deliberately left scheduler-placed — reloads
+  are latency-critical and the cold-start/crash-recovery reload storm
+  wants every core while shard threads are idle; confining it to the
+  small non-shard remainder risks 3x worse cold-reload latency, the
+  regression PR #237 fixed. jemalloc's background-reclaim threads are
+  unaffected — jemalloc spawns them internally with no Rust-side
+  affinity hook. A/B on GCE t2a-standard-8 (8 dedicated ARM vCPUs,
+  shards=4, AOF on, 4 interleaved rounds vs `MOON_NO_AUX_PIN=1`):
+  SET median +1.5%, GET median −1.9% (inside noise; GET run-to-run
+  spread tightened 23%→7% under pinning), with `ps -eLo psr` placement
+  proof — pinned legs show all 12 aux threads on the non-shard cores
+  4-7, unpinned legs show `manifest-sync-N`/`spill-N` sitting exactly
+  on shard cores 0-3.
 - **Shard offload paths are precomputed at shard init — the recurring
   tick paths no longer allocate (#45).** The 100ms eviction tick, the
   memory-pressure cascade, the 10s warm-transition check, and the

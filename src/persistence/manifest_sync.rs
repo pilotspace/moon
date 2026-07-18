@@ -96,6 +96,11 @@ impl ManifestSyncAgent {
         match std::thread::Builder::new()
             .name(format!("manifest-sync-{shard_id}"))
             .spawn(move || {
+                // O5: this thread is spawned from the shard's own (pinned)
+                // event-loop thread and would otherwise inherit its exact
+                // single-core mask — re-pin to the non-shard core set as the
+                // first act, before anything else runs.
+                crate::shard::numa::pin_current_aux_thread(&format!("manifest-sync-{shard_id}"));
                 // The spawner sends the io immediately after a successful
                 // spawn; Err here means the agent was dropped first — exit.
                 let Ok(io) = io_rx.recv() else { return };

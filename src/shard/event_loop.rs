@@ -666,6 +666,13 @@ impl super::Shard {
                 std::thread::Builder::new()
                     .name(format!("moon-heap-orphan-sweep-{shard_id}"))
                     .spawn(move || {
+                        // O5: spawned from the pinned shard thread — escape
+                        // the inherited single-core mask (this sweep can run
+                        // ~40s of I/O; on the shard's own core it would
+                        // contend with command processing the whole time).
+                        crate::shard::numa::pin_current_aux_thread(&format!(
+                            "moon-heap-orphan-sweep-{shard_id}"
+                        ));
                         for path in &pending_heap_orphans {
                             crate::storage::tiered::kv_spill::remove_orphan_heap_file(path);
                         }

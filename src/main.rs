@@ -543,6 +543,19 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // O5: record the non-shard core set BEFORE any auxiliary thread spawns
+    // (AOF writers, the vector pools below, and — indirectly — the
+    // manifest-sync/spill/wal-sync threads each shard spawns internally).
+    //
+    // Deliberately NOT re-pinning the main thread here: threads spawned from
+    // main inherit its affinity mask at spawn time, and the vector
+    // search/reload pools just below must stay scheduler-placed across ALL
+    // cores (see src/vector/reload_pool.rs) — pinning main first would have
+    // them born wearing one aux core's mask with no escape. Main re-pins
+    // itself as "main-listener" at the LAST moment instead, right before it
+    // enters the accept loop, after every child thread has been spawned.
+    moon::shard::numa::init_aux_pinning(num_shards);
+
     // FT.SEARCH intra-query worker pool: fan per-segment HNSW searches of one
     // query across workers (threads spawn eagerly here — the pool is tiny and
     // parks on its channel when vector search is unused). Default OFF: each
@@ -820,6 +833,9 @@ fn main() -> anyhow::Result<()> {
                 std::thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
+                        // O5: escape the shard-core mask this thread would
+                        // otherwise inherit from its spawning thread.
+                        moon::shard::numa::pin_current_aux_thread(&thread_name_inner);
                         RuntimeFactoryImpl::block_on_local(
                             thread_name_inner,
                             aof::per_shard_aof_writer_task(
@@ -866,6 +882,9 @@ fn main() -> anyhow::Result<()> {
             std::thread::Builder::new()
                 .name("aof-writer".to_string())
                 .spawn(move || {
+                    // O5: escape the shard-core mask this thread would
+                    // otherwise inherit from its spawning thread.
+                    moon::shard::numa::pin_current_aux_thread("aof-writer");
                     RuntimeFactoryImpl::block_on_local(
                         "aof-writer".to_string(),
                         aof::aof_writer_task(
@@ -1792,6 +1811,12 @@ fn main() -> anyhow::Result<()> {
             .build()
             .expect("failed to build listener runtime");
 
+        // O5: every child thread is spawned by now — safe to confine the
+        // accept/dispatch loop (this thread) to the non-shard core set. The
+        // tokio::spawn calls inside the block_on run on this same
+        // current-thread runtime, not on new OS threads.
+        moon::shard::numa::pin_current_aux_thread("main-listener");
+
         listener_rt.block_on(async {
             // Set up auto-save timer if save rules are configured (sharded mode)
             if config.save.is_some() {
@@ -1903,6 +1928,9 @@ fn main() -> anyhow::Result<()> {
                 std::thread::Builder::new()
                     .name("auto-save".to_string())
                     .spawn(move || {
+                        // O5: escape the shard-core mask this thread would
+                        // otherwise inherit from its spawning thread.
+                        moon::shard::numa::pin_current_aux_thread("auto-save");
                         RuntimeFactoryImpl::block_on_local(
                             "auto-save".to_string(),
                             moon::persistence::auto_save::run_auto_save_sharded(
@@ -1925,6 +1953,9 @@ fn main() -> anyhow::Result<()> {
         // kernel distributes connections across all bound sockets, per-shard handles some
         // directly (no MPSC hop), central forwards the rest via conn_txs.
         let per_shard_accept = false;
+        // O5: every child thread is spawned by now — safe to confine the
+        // accept/dispatch loop (this thread) to the non-shard core set.
+        moon::shard::numa::pin_current_aux_thread("main-listener");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
             if let Err(e) = server::listener::run_sharded(
                 config,
