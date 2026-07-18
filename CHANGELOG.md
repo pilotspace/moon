@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Multi-shard SWAPDB is now durable and replica-visible before `+OK`
+  (#133).** Two defects in `coordinate_swapdb`: (1) no fsync rendezvous —
+  under `--appendfsync always` the client saw `+OK` before any shard had
+  fsynced its SWAPDB record; (2) the coordinator shard's own record was
+  written to WAL v3 only, never the per-shard AOF — and for
+  `--shards ≥ 2 --appendonly yes` the per-shard AOF manifest is the sole
+  recovery authority, so a kill-9 after `+OK` permanently lost the LOCAL
+  shard's half of the swap while remote shards' halves survived
+  (cross-shard keyspace divergence; reproduced empirically). The local leg
+  now performs a durable AOF group-commit append + fsync barrier BEFORE
+  swapping (abort-with-no-mutation on failure) and records the swap on the
+  replication plane (backlog + offset + live fan-out, `SELECT 0` framing);
+  the coordinator confirms each remote shard's durability with one
+  post-ack `fsync_barrier` (H1-BARRIER ordering). A remote barrier failure
+  after the swap is applied is reported truthfully as
+  durability-unconfirmed rather than a false `+OK`.
+
 ### Performance
 - **Shard offload paths are precomputed at shard init — the recurring
   tick paths no longer allocate (#45).** The 100ms eviction tick, the

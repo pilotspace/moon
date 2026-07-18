@@ -651,6 +651,8 @@ pub(super) async fn try_handle_swapdb(
         &ctx.shard_databases,
         &ctx.dispatch_tx,
         &ctx.spsc_notifiers,
+        ctx.aof_pool.as_ref(),
+        &ctx.repl_state,
     )
     .await;
     responses.push(response);

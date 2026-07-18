@@ -169,6 +169,71 @@ fn redis_get(port: u16, key: &str) -> Option<String> {
     }
 }
 
+/// `SET` scoped to a specific logical db via `redis-cli -n <db>` (issue #133
+/// SWAPDB acceptance test needs distinct db0/db1 content to prove the swap).
+fn redis_set_db(port: u16, db: u8, key: &str, value: &str) {
+    let out = Command::new("redis-cli")
+        .args([
+            "-p",
+            &port.to_string(),
+            "-n",
+            &db.to_string(),
+            "SET",
+            key,
+            value,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("redis-cli SET -n");
+    let reply = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        reply.trim(),
+        "OK",
+        "redis-cli -n {} SET {} {} did not reply +OK: {:?} (stderr: {})",
+        db,
+        key,
+        value,
+        reply,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `GET` scoped to a specific logical db via `redis-cli -n <db>`.
+fn redis_get_db(port: u16, db: u8, key: &str) -> Option<String> {
+    let out = Command::new("redis-cli")
+        .args(["-p", &port.to_string(), "-n", &db.to_string(), "GET", key])
+        .output()
+        .expect("redis-cli GET -n");
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "(nil)" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Issue `SWAPDB a b` and return the raw trimmed reply text (so a failing
+/// caller can assert on the EXACT +OK / -ERR wording instead of just a bool).
+fn redis_swapdb(port: u16, a: u8, b: u8) -> String {
+    let out = Command::new("redis-cli")
+        .args([
+            "-p",
+            &port.to_string(),
+            "SWAPDB",
+            &a.to_string(),
+            &b.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("redis-cli SWAPDB");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Send N RPUSH commands to `key` in a single pipelined TCP write and drain
 /// all N integer responses.  Useful for double-write detection because
 /// RPUSH is non-idempotent: N pushes → LLEN N; double-replay → LLEN 2*N.
@@ -457,6 +522,105 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
         llen_b,
         N,
         2 * N as i64,
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SWAPDB-133: multi-shard SWAPDB durability acceptance test (issue #133).
+///
+/// `coordinate_swapdb` (src/shard/coordinator.rs) broadcasts SWAPDB to every
+/// shard. Two defects existed before this fix:
+///
+///   1. No fsync rendezvous: `+OK` was returned as soon as every shard
+///      ACKed the swap, without confirming any shard's AOF record was
+///      fsynced — a violation of `appendfsync=always`.
+///   2. The LOCAL shard's (the one that accepted the connection) SWAPDB
+///      record was enqueued ONLY into the generic WAL v3 channel
+///      (`ShardDatabases::try_wal_append_required`), never into the
+///      per-shard AOF writer. For `--shards 2 --appendonly yes`,
+///      `replay_per_shard` (main.rs) — not WAL v3 — is the recovery
+///      authority: it wipes every shard's databases and replays ONLY the
+///      per-shard AOF manifest. The local shard's half of the swap was
+///      therefore silently lost on any kill-9 restart, while the remote
+///      shard's half (logged via `wal_append_and_fanout` inside the SPSC
+///      arm) survived — permanent cross-shard keyspace divergence.
+///
+/// This test writes distinct, shard-spread content into db0 and db1 (`{a}`
+/// / `{b}` hash tags land on different shards — see the
+/// PIPELINE-DOUBLE-WRITE docstring above), issues `SWAPDB 0 1` under
+/// `--appendfsync always`, SIGKILLs with **no** quiescing sleep (the H1
+/// contract: every `+OK` already saw an fsync), restarts, and asserts the
+/// swap is visible on db0 AND db1 for keys owned by BOTH shards.
+///
+/// **Red state (commit before this fix):** whichever shard accepted the
+/// `SWAPDB` connection (non-deterministic — SO_REUSEPORT) shows the
+/// PRE-swap content on that shard's keys after restart (the local leg's
+/// record never reached the AOF); the other shard's keys show the swap
+/// correctly. Which pair of assertions fails is non-deterministic run to
+/// run, but at least one pair fails on every run given a real crash-window
+/// (no sleep before SIGKILL).
+/// **Green state (post-fix):** every key on every shard reflects the swap.
+#[test]
+#[ignore] // Requires built release binary + redis-cli; run explicitly.
+fn crash_133_swapdb_multishard_durability_after_sigkill() {
+    let _serial = serialize_server_test();
+    let port = unique_port().saturating_add(3);
+    let dir = unique_dir("swapdb-133");
+    std::fs::create_dir_all(&dir).expect("create test dir");
+
+    // -- Round 1 --------------------------------------------------------
+    let mut child = start_moon_with_fsync(port, &dir, "always");
+    wait_for_port(port);
+
+    // `{a}` and `{b}` hash-tag to different shards (CRC16 mod 2) — writing
+    // both in db0 and db1 guarantees the pre-swap content spans both
+    // shards in both logical databases.
+    redis_set_db(port, 0, "swap:{a}", "db0-a");
+    redis_set_db(port, 0, "swap:{b}", "db0-b");
+    redis_set_db(port, 1, "swap:{a}", "db1-a");
+    redis_set_db(port, 1, "swap:{b}", "db1-b");
+
+    let swap_reply = redis_swapdb(port, 0, 1);
+    assert_eq!(
+        swap_reply, "OK",
+        "SWAPDB 0 1 did not reply +OK before the crash: {:?}",
+        swap_reply
+    );
+
+    // NO quiescing sleep — appendfsync=always means the +OK we just saw
+    // MUST already be durable on disk for every shard.
+    sigkill(&mut child);
+
+    // -- Round 2 (recovery) ---------------------------------------------
+    let mut child2 = start_moon_with_fsync(port, &dir, "always");
+    wait_for_port(port);
+
+    let got_db0_a = redis_get_db(port, 0, "swap:{a}");
+    let got_db0_b = redis_get_db(port, 0, "swap:{b}");
+    let got_db1_a = redis_get_db(port, 1, "swap:{a}");
+    let got_db1_b = redis_get_db(port, 1, "swap:{b}");
+
+    sigkill(&mut child2);
+
+    let mut failures: Vec<String> = Vec::new();
+    if got_db0_a.as_deref() != Some("db1-a") {
+        failures.push(format!("db0 swap:{{a}} = {:?} (want \"db1-a\")", got_db0_a));
+    }
+    if got_db0_b.as_deref() != Some("db1-b") {
+        failures.push(format!("db0 swap:{{b}} = {:?} (want \"db1-b\")", got_db0_b));
+    }
+    if got_db1_a.as_deref() != Some("db0-a") {
+        failures.push(format!("db1 swap:{{a}} = {:?} (want \"db0-a\")", got_db1_a));
+    }
+    if got_db1_b.as_deref() != Some("db0-b") {
+        failures.push(format!("db1 swap:{{b}} = {:?} (want \"db0-b\")", got_db1_b));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "SWAPDB-133: swap not fully durable after kill-9 restart:\n  {}",
+        failures.join("\n  ")
     );
 
     let _ = std::fs::remove_dir_all(&dir);
