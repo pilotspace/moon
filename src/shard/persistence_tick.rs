@@ -357,6 +357,13 @@ pub(crate) fn run_eviction_tick(
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
+    // task/issue #45: `<offload>/shard-{id}`, precomputed ONCE at shard init
+    // (event_loop's `disk_offload_dir`) instead of a per-tick
+    // `format!` + `join` allocation pair on this 100ms path. `None` iff
+    // disk-offload is disabled — the same gate that nulls `spill_thread`
+    // and `shard_manifest`, so every consumer below is already
+    // Some-guarded.
+    offload_shard_dir: Option<&std::path::Path>,
     // task #34 (Wave A): `record_reason_del` handles for plain-dropped
     // eviction victims — threaded straight through to `timers::run_eviction`
     // and `handle_memory_pressure`'s sync-spill-fallback branch.
@@ -514,11 +521,11 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             runtime_config,
-            server_config,
             shard_manifest,
             next_file_id,
             wal_v3_writer,
             spill_thread,
+            offload_shard_dir,
             repl_backlog,
             replica_txs,
             repl_state,
@@ -537,15 +544,13 @@ pub(crate) fn run_eviction_tick(
         // its pre-existing fail-close plain-drop (policy-aware: `noeviction`
         // still OOMs, an evicting policy still frees RAM, just with no cold
         // copy -- matches PR #273's fail-close discipline).
-        let eviction_shard_dir = server_config
-            .effective_disk_offload_dir()
-            .join(format!("shard-{}", shard_id));
         let mut spill_ctx: Option<crate::storage::eviction::SpillContext<'_>> = None;
         if server_config.disk_offload_enabled()
+            && let Some(shard_dir) = offload_shard_dir
             && let Some(ref mut manifest) = *shard_manifest
         {
             spill_ctx = Some(crate::storage::eviction::SpillContext {
-                shard_dir: &eviction_shard_dir,
+                shard_dir,
                 manifest,
                 next_file_id,
                 // Placeholder — `run_eviction` restamps per database (#139).
@@ -750,11 +755,12 @@ pub(crate) fn handle_memory_pressure(
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
-    server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     spill_thread: Option<&crate::storage::tiered::spill_thread::SpillThread>,
+    // task/issue #45: see `run_eviction_tick`.
+    offload_shard_dir: Option<&std::path::Path>,
     // task #34 (Wave A): see `run_eviction_tick`.
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
@@ -786,13 +792,12 @@ pub(crate) fn handle_memory_pressure(
     // stub), which actually returns RAM — and stays reloadable-on-touch. We
     // pass `warm_after = u64::MAX` so the age-based HOT->WARM path stays
     // disabled here; only the idle->COLD path fires.
-    if let Some(ref mut manifest) = *shard_manifest {
-        let shard_dir = server_config
-            .effective_disk_offload_dir()
-            .join(format!("shard-{}", shard_id));
+    if let Some(ref mut manifest) = *shard_manifest
+        && let Some(shard_dir) = offload_shard_dir
+    {
         let count = crate::shard::slice::with_shard(|s| {
             s.vector_store.try_warm_transitions_all_idle(
-                &shard_dir,
+                shard_dir,
                 manifest,
                 u64::MAX,
                 PRESSURE_OFFLOAD_IDLE_SECS,
@@ -843,11 +848,12 @@ pub(crate) fn handle_memory_pressure(
             };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();
-                let shard_dir = server_config
-                    .effective_disk_offload_dir()
-                    .join(format!("shard-{}", shard_id));
+                // task/issue #45: `offload_shard_dir` is precomputed at shard
+                // init. `spill_thread` and `shard_manifest` share its
+                // disk-offload gate, so both branches below pair their
+                // existing Some-guard with the dir's.
 
-                if let Some(spill_t) = spill_thread {
+                if let (Some(spill_t), Some(shard_dir)) = (spill_thread, offload_shard_dir) {
                     // Async spill path: background thread does pwrite under
                     // `--appendonly yes` (AOF-backstopped fast path). Under
                     // `--appendonly no` there is no AOF backstop, so
@@ -865,7 +871,7 @@ pub(crate) fn handle_memory_pressure(
                                 db,
                                 &rt,
                                 &sender,
-                                &shard_dir,
+                                shard_dir,
                                 next_file_id,
                                 total_mem,
                                 i,
@@ -899,9 +905,11 @@ pub(crate) fn handle_memory_pressure(
                     // Sync spill fallback
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
-                            if let Some(ref mut manifest) = *shard_manifest {
+                            if let Some(ref mut manifest) = *shard_manifest
+                                && let Some(shard_dir) = offload_shard_dir
+                            {
                                 let mut ctx = crate::storage::eviction::SpillContext {
-                                    shard_dir: &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     next_file_id,
                                     // #139: this fallback runs inside the

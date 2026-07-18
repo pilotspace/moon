@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Performance
+- **Shard offload paths are precomputed at shard init — the recurring
+  tick paths no longer allocate (#45).** The 100ms eviction tick, the
+  memory-pressure cascade, the 10s warm-transition check, and the
+  cold-orphan sweep each rebuilt `<offload>/shard-{id}` via
+  `format!` + `PathBuf::join` (plus a `PathBuf` clone inside
+  `effective_disk_offload_dir()`) on every firing, per shard — a
+  CLAUDE.md hot-path-allocation violation. The event loop's existing
+  per-shard `disk_offload_dir` (built once at init, `Some` iff
+  disk-offload is enabled) is now threaded into `run_eviction_tick`
+  and `handle_memory_pressure` as `Option<&Path>` and used directly by
+  the warm/orphan tick arms. Cold event-gated builders (save trigger,
+  reclamation-schedule persist, startup/recovery) are unchanged.
 - **SCAN cold-plane pages now range-resume from the cursor — no full
   cold-index filter per page (#368).** The in-RAM cold index (spilled
   keys under disk-offload) is now ordered by the same `(hash48, key)`
