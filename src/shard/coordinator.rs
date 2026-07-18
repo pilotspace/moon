@@ -2759,22 +2759,93 @@ pub(crate) fn aggregate_doc_freq(
     (global_df, global_n)
 }
 
-/// Broadcast SWAPDB to all shards and await acknowledgement from each.
+/// Broadcast SWAPDB to all shards and await acknowledgement AND durability
+/// from each (issue #133).
 ///
 /// # Flow
 ///
-/// - Local shard: inline swap under ascending-index write locks (no SPSC round-trip).
-/// - Remote shards: send `ShardMessage::SwapDb` and collect oneshot replies.
+/// - Local shard FIRST: durable AOF append (v3-5 group-commit + barrier)
+///   BEFORE the swap AND before any remote dispatch — mirrors the
+///   single-shard `handler_single.rs` SWAPDB contract so the coordinator
+///   shard's own record survives a kill-9, and (adversarial-review fix)
+///   guarantees that every local abort point (WAL backpressure, AOF
+///   enqueue failure, fsync failure) fires while the CLUSTER is still
+///   untouched — no remote shard has been told to swap yet, so an aborted
+///   SWAPDB leaves all shards consistent.
 ///
-/// All-shard acks are awaited before returning `+OK`.  Between the first and
-/// last ack a brief window exists where a cross-shard GET may observe the
-/// pre-swap state on one shard and post-swap on another.  This matches Redis
-/// cluster relaxed semantics and is documented as the "brief-skew" acceptance.
+/// NOTE (replication): SWAPDB is deliberately NOT recorded on the live
+/// replication plane by this local leg. Replicas cannot currently execute
+/// a streamed SWAPDB at all — `replication::apply::apply_local` routes it
+/// into `cmd_dispatch`, which hard-errors ("SWAPDB must be issued at the
+/// connection handler level") and the record silently no-ops. Fanning the
+/// local record out would ship bytes the replica cannot apply, and doing
+/// the backlog/offset bookkeeping BEFORE the durability gate can diverge
+/// master/replica on an abort. Wiring replica-side SWAPDB application
+/// (both this local leg and the remote legs' pre-existing
+/// `wal_append_and_fanout` emission, which has the same no-op fate) is
+/// tracked as a separate issue.
+/// - Remote shards: send `ShardMessage::SwapDb` (its SPSC arm durably logs
+///   via `wal_append_and_fanout` — WAL v3 + repl backlog/offset/fan-out +
+///   AOF — BEFORE swapping and acking), then this function issues ONE
+///   `fsync_barrier(target)` per remote shard AFTER observing its ack,
+///   confirming the fsync the SPSC arm could not await inline (SPSC arms
+///   run synchronously inside the shard event loop — they cannot `.await`).
 ///
-/// # Consistency note
+/// All-shard acks AND (under `appendfsync=always`) all-shard fsync barriers
+/// are awaited before returning `+OK`. Between the first and last ack a
+/// brief window exists where a cross-shard GET may observe the pre-swap
+/// state on one shard and post-swap on another. This matches Redis cluster
+/// relaxed semantics and is documented as the "brief-skew" acceptance.
 ///
-/// WAL is emitted by each shard's SPSC handler *before* performing the swap,
-/// so crash-recovery replay applies them in the correct order.
+/// # Durability (defect 1: no fsync rendezvous)
+///
+/// `appendfsync=always` requires every shard's SWAPDB record to be fsynced
+/// to disk BEFORE the client observes `+OK`. This function:
+///   1. Appends the LOCAL shard's record via
+///      `AofWriterPool::send_append_group` (the same v3-5 group-commit
+///      primitive [`persist_local_leg`] uses for MSET/BITOP/COPY/DEL local
+///      legs) and, when `Always`, awaits ONE `fsync_barrier(my_shard)`
+///      BEFORE performing the swap — a failure aborts with NO mutation
+///      applied anywhere on this shard yet.
+///   2. Dispatches `ShardMessage::SwapDb` to every remote shard.
+///   3. After EACH remote ack, issues ONE `fsync_barrier(target)`. Because
+///      the remote's `Append` was enqueued into that shard's AOF writer
+///      channel strictly before its `reply_tx.send(())` — observed here via
+///      `rx.recv().await`, a happens-before edge — and the writer processes
+///      that channel in FIFO order regardless of which thread produced each
+///      message, the barrier's `AppendSync` is guaranteed to be queued
+///      AFTER the remote's `Append`: an acked barrier proves it durable.
+///      This is the identical ordering proof the existing H1-BARRIER
+///      cross-shard write path already relies on (see
+///      `handler_monoio/mod.rs`'s "call fsync_barrier once per target shard
+///      AFTER responses are collected").
+///
+/// A remote barrier failure occurs AFTER that shard's swap was already
+/// applied — there is no rollback path (SWAPDB has none). The response
+/// truthfully reports durability-unconfirmed (mirrors the F2 bounded-wait
+/// discipline documented on `try_send_append_durable`) rather than a false
+/// `+OK`; the swap itself is NOT undone. `fsync_barrier` internally no-ops
+/// under `EverySec`/`No`, so every barrier call below is unconditional and
+/// only actually awaits a disk fsync when the policy is `Always`.
+///
+/// # Local-leg AOF/recovery gap (defect 2)
+///
+/// Before this fix the local leg only wrote to the generic
+/// `wal_append_txs` channel (`ShardDatabases::try_wal_append_required`),
+/// which the event loop drains into WAL v3 ONLY — never the per-shard AOF
+/// writer (`AofWriterPool`). For `--shards >= 2 --appendonly yes`,
+/// `main.rs`'s `replay_per_shard` — NOT WAL v3 — is the recovery authority:
+/// it unconditionally wipes every shard's databases and replays ONLY from
+/// the per-shard AOF manifest (`appendonlydir/shard-N/`). The coordinator
+/// shard's own SWAPDB record therefore never reached the plane recovery
+/// actually reads: a kill-9 right after `+OK` permanently lost the LOCAL
+/// shard's half of the swap on restart while remote shards' halves
+/// survived — cross-shard keyspace divergence, worse than a mere fsync
+/// gap. The WAL v3 write below is KEPT (harmless — other record types on
+/// this channel need it, and it is a documented non-authority for this
+/// deployment shape) but is no longer the only durability plane the local
+/// leg touches.
+#[allow(clippy::too_many_arguments)]
 pub async fn coordinate_swapdb(
     a: usize,
     b: usize,
@@ -2783,27 +2854,18 @@ pub async fn coordinate_swapdb(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
 ) -> Frame {
-    // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
-    // Skip self in the SPSC loop; handle the local shard inline below.
-    let remote_count = num_shards.saturating_sub(1);
-    let mut receivers: Vec<channel::OneshotReceiver<()>> = Vec::with_capacity(remote_count);
-
-    for target in 0..num_shards {
-        if target == my_shard {
-            continue; // handled inline below
-        }
-        let (reply_tx, reply_rx) = channel::oneshot();
-        let msg = ShardMessage::SwapDb { a, b, reply_tx };
-        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        receivers.push(reply_rx);
-    }
-
-    // Local shard: emit WAL via the per-shard append channel, then swap databases.
-    // This mirrors the spsc_handler SwapDb arm — WAL record BEFORE the swap.
-    // SWAPDB has no command-level rollback; if persistence is configured and
-    // the WAL channel rejects the enqueue (full / closed), we MUST NOT perform
-    // the local swap, otherwise the cluster state diverges from the on-disk log.
+    debug_assert!(
+        num_shards > 1,
+        "coordinate_swapdb is the multi-shard path (single-shard SWAPDB lives in handler_single.rs)"
+    );
+    // Local shard first: durable append BEFORE the swap AND before any
+    // remote dispatch. SWAPDB has no command-level rollback; anything that
+    // can fail must fail while NOTHING in the cluster has mutated —
+    // dispatching remotes first (the pre-fix order) meant a local abort
+    // left N-1 shards swapped and this one not.
     {
         let mut a_buf = itoa::Buffer::new();
         let mut b_buf = itoa::Buffer::new();
@@ -2813,15 +2875,48 @@ pub async fn coordinate_swapdb(
             Frame::BulkString(Bytes::copy_from_slice(b_buf.format(b).as_bytes())),
         ]);
         let serialized = crate::persistence::aof::serialize_command(&wal_frame);
+
+        // WAL v3 — see "Local-leg AOF/recovery gap" doc above: kept for
+        // parity with other record types on this channel, but no longer the
+        // sole durability plane.
         if !shard_databases.try_wal_append_required(
             my_shard,
             crate::persistence::wal_v3::record::WalRecordType::Command,
-            serialized,
+            serialized.clone(),
         ) {
             return Frame::Error(bytes::Bytes::from_static(
                 b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
             ));
         }
+
+        // AOF pool — the actual multi-shard recovery authority (defect 2).
+        // Same v3-5 group-commit contract `persist_local_leg` uses for
+        // MSET/BITOP/COPY/DEL: enqueue fire-and-forget, then ONE barrier
+        // under `Always` instead of a per-write awaited fsync.
+        if let Some(pool) = aof_pool {
+            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+                repl_state,
+                my_shard,
+                serialized.len(),
+            );
+            match pool.send_append_group(my_shard, lsn, 0, serialized).await {
+                Ok(needs_barrier) => {
+                    if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
+                        return Frame::Error(bytes::Bytes::from_static(
+                            crate::persistence::aof::AOF_FSYNC_ERR,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Frame::Error(bytes::Bytes::from_static(
+                        crate::persistence::aof::AOF_FSYNC_ERR,
+                    ));
+                }
+            }
+        }
+
+        // Local durability confirmed (or persistence disabled) — apply the
+        // swap.
         crate::shard::slice::with_shard(|s| {
             if a != b {
                 s.databases.swap(a, b);
@@ -2829,16 +2924,55 @@ pub async fn coordinate_swapdb(
         });
     }
 
-    // Await all-remote-shard acks before returning +OK.
-    for rx in receivers {
+    // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
+    // Skip self in the SPSC loop; handle the local shard inline below.
+    let remote_count = num_shards.saturating_sub(1);
+    let mut targets: Vec<usize> = Vec::with_capacity(remote_count);
+    let mut receivers: Vec<channel::OneshotReceiver<()>> = Vec::with_capacity(remote_count);
+
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue; // handled inline below
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::SwapDb { a, b, reply_tx };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        targets.push(target);
+        receivers.push(reply_rx);
+    }
+
+    // Await every remote shard's ack, then confirm ITS durability with one
+    // fsync_barrier (H1-BARRIER pattern) — the SwapDb SPSC arm cannot
+    // `.await` a barrier itself, so the coordinator closes that gap here,
+    // after observing the ack (ordering proof in the doc comment above).
+    // Every leg is drained even after a failure (mirrors `coordinate_mset`):
+    // a timed-out/closed/unconfirmed leg must not collapse into a false OK,
+    // but it also must not skip confirming the OTHER shards.
+    let mut leg_err: Option<Frame> = None;
+    for (target, rx) in targets.into_iter().zip(receivers) {
         match rx.recv().await {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(pool) = aof_pool
+                    && pool.fsync_barrier(target).await.is_err()
+                    && leg_err.is_none()
+                {
+                    leg_err = Some(Frame::Error(bytes::Bytes::from_static(
+                        b"ERR SWAPDB durability unconfirmed on a remote shard \
+                          (fsync barrier failed after the swap was already applied)",
+                    )));
+                }
+            }
             Err(_) => {
-                return Frame::Error(bytes::Bytes::from_static(
-                    b"ERR cross-shard reply channel closed during SWAPDB",
-                ));
+                if leg_err.is_none() {
+                    leg_err = Some(Frame::Error(bytes::Bytes::from_static(
+                        b"ERR cross-shard reply channel closed during SWAPDB",
+                    )));
+                }
             }
         }
+    }
+    if let Some(err) = leg_err {
+        return err;
     }
 
     Frame::SimpleString(bytes::Bytes::from_static(b"OK"))
