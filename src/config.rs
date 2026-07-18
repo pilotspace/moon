@@ -500,8 +500,14 @@ pub struct ServerConfig {
     /// platforms -- it aborts at init (verified experimentally on macOS,
     /// 2026-07-18). This flag warns and no-ops on non-Linux jemalloc builds
     /// rather than risk that abort; `--memory-arenas-cap` still applies
-    /// normally if both flags are given together. Opt-in only: an
-    /// RSS-drift soak is still pending before any default flip.
+    /// normally if both flags are given together. Permanently opt-in: the
+    /// RSS-drift soak (2026-07-19) disqualified a default flip -- after
+    /// mixed-size churn goes idle, khugepaged collapses the heap into 2M
+    /// pages and re-materializes jemalloc's purged 4K holes, settling RSS
+    /// ~+31% above the non-THP baseline at identical used_memory (bounded,
+    /// but permanent -- jemalloc never re-purges those ranges), which also
+    /// erodes maxmemory eviction headroom. Best for uniform-value-size
+    /// fleets with RSS headroom; avoid under mixed-size churn.
     /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
     /// read at process start, before the conf file is parsed) and triggers a
     /// startup warning instead of taking effect.
