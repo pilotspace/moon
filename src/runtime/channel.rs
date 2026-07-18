@@ -165,17 +165,87 @@ impl<T: Clone> WatchReceiver<T> {
 }
 
 // --- Notify ---
-// Simple async notify using flume bounded(1) for signal coalescing.
+// Async notify with token coalescing (at most one pending signal).
+//
+// O2 (tmp/CPU-CACHE-DIGEST.md finding 2): the default implementation is a
+// single AtomicBool token + AtomicWaker. The flume bounded(1) it replaces
+// showed as `pull_pending` LL-misses in the shards=4 cachegrind profile —
+// every cross-shard dispatch's notify_one took flume's internal lock and
+// walked its shared pending-waker structure, and every event-loop select
+// iteration re-registered through the same heap allocation. The token
+// protocol touches one cache line and never locks. AtomicWaker's
+// cross-thread wake is the same primitive `ResponseSlot` has shipped on
+// the xshard-read fast path since the C2 work (monoio delivers foreign
+// wakes via its waker relay + eventfd) — this is NOT the pre-swf0
+// "event loop drains registered wakers" design; the waker here is woken
+// directly by the producer thread.
+//
+// `MOON_NOTIFY_FLUME=1` restores the flume implementation process-wide:
+// same-binary A/B knob + operator escape hatch for the historical
+// cross-thread-wake hang class (swf0).
 pub struct Notify {
-    tx: flume::Sender<()>,
-    rx: flume::Receiver<()>,
+    inner: NotifyInner,
     // Busy-poll skip-notify handshake: while the owning shard's epoll driver
     // spin-polls (probing its SPSC ringbufs itself — see the vendored monoio
     // legacy driver "moon patch" and the hook registration in event_loop),
     // it advertises `true` here and senders elide the entire cross-thread
-    // wake: the flume send, the foreign-waker relay, and the eventfd syscall.
-    // Always false unless the owning shard registered spin hooks.
+    // wake: the token deposit, the foreign-waker relay, and the eventfd
+    // syscall. Always false unless the owning shard registered spin hooks.
     skip_wake: std::sync::atomic::AtomicBool,
+}
+
+enum NotifyInner {
+    /// Lock-free default: `token` holds the coalesced pending signal;
+    /// `waker` is registered by the single consumer (the owning shard's
+    /// event loop) and woken by any producer on a false→true deposit.
+    Atomic {
+        token: std::sync::atomic::AtomicBool,
+        waker: atomic_waker::AtomicWaker,
+    },
+    /// Legacy flume bounded(1) path (`MOON_NOTIFY_FLUME=1`).
+    Flume {
+        tx: flume::Sender<()>,
+        rx: flume::Receiver<()>,
+    },
+}
+
+/// Process-wide impl selector, read once (env lookups are not hot-path safe).
+fn notify_flume_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("MOON_NOTIFY_FLUME").is_some_and(|v| v == "1"))
+}
+
+/// Future returned by [`Notify::notified`] on the Atomic path.
+///
+/// Cancel-safe: the token is only consumed (`swap(false)`) on the poll that
+/// returns `Ready`, so a future dropped by a losing `select!` arm leaves a
+/// deposited token for the next `notified()` call. A stale waker left in
+/// `AtomicWaker` after cancellation is overwritten on the next registration;
+/// a producer waking it early is a spurious event-loop wake, not a lost one.
+struct Notified<'a> {
+    token: &'a std::sync::atomic::AtomicBool,
+    waker: &'a atomic_waker::AtomicWaker,
+}
+
+impl Future for Notified<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        use std::sync::atomic::Ordering;
+        // Fast path: token already deposited.
+        if self.token.swap(false, Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        self.waker.register(cx.waker());
+        // Re-check after registration: closes the race where a producer
+        // deposits between the first swap and the register (its wake() saw
+        // no waker, but its token store is visible to this Acquire swap).
+        if self.token.swap(false, Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 // Process-global gate for the skip-wake fast path: flipped once at shard
@@ -197,11 +267,59 @@ fn notify_skip_wake_enabled() -> bool {
 
 impl Notify {
     pub fn new() -> Self {
+        let inner = if notify_flume_forced() {
+            let (tx, rx) = flume::bounded(1);
+            NotifyInner::Flume { tx, rx }
+        } else {
+            NotifyInner::Atomic {
+                token: std::sync::atomic::AtomicBool::new(false),
+                waker: atomic_waker::AtomicWaker::new(),
+            }
+        };
+        Self {
+            inner,
+            skip_wake: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Test-only constructors pinning the implementation (the env-driven
+    /// selector is process-global, so tests exercise both paths explicitly).
+    #[cfg(test)]
+    fn new_atomic() -> Self {
+        Self {
+            inner: NotifyInner::Atomic {
+                token: std::sync::atomic::AtomicBool::new(false),
+                waker: atomic_waker::AtomicWaker::new(),
+            },
+            skip_wake: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_flume() -> Self {
         let (tx, rx) = flume::bounded(1);
         Self {
-            tx,
-            rx,
+            inner: NotifyInner::Flume { tx, rx },
             skip_wake: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Deposit the coalesced token and wake the consumer if needed.
+    #[inline]
+    fn deliver(&self) {
+        match &self.inner {
+            NotifyInner::Atomic { token, waker } => {
+                // Only the false→true transition needs a wake: a true token
+                // means an earlier deliver already woke (or the consumer
+                // will see the token on its pre-register check). Release
+                // pairs with the consumer's Acquire swap in `Notified`.
+                if !token.swap(true, std::sync::atomic::Ordering::Release) {
+                    waker.wake();
+                }
+            }
+            NotifyInner::Flume { tx, .. } => {
+                let _ = tx.try_send(());
+            }
         }
     }
 
@@ -218,14 +336,14 @@ impl Notify {
                 return;
             }
         }
-        let _ = self.tx.try_send(());
+        self.deliver();
     }
 
     /// Deliver the token from the owning shard's own thread, bypassing the
     /// skip-wake gate. Used by the driver spin probe: the registered waker is
     /// task-local there, so the wake is a run-queue push, not a syscall.
     pub fn notify_local(&self) {
-        let _ = self.tx.try_send(());
+        self.deliver();
     }
 
     /// Advertise (or retract) that the owning shard's driver is busy-polling
@@ -240,7 +358,24 @@ impl Notify {
     }
 
     pub async fn notified(&self) {
-        let _ = self.rx.recv_async().await;
+        match &self.inner {
+            NotifyInner::Atomic { token, waker } => Notified { token, waker }.await,
+            NotifyInner::Flume { rx, .. } => {
+                let _ = rx.recv_async().await;
+            }
+        }
+    }
+
+    /// Non-async token consume: `true` if a signal was pending (test helper +
+    /// symmetric with the old `rx.try_recv().is_ok()` probes).
+    #[cfg(test)]
+    fn try_consume(&self) -> bool {
+        match &self.inner {
+            NotifyInner::Atomic { token, .. } => {
+                token.swap(false, std::sync::atomic::Ordering::Acquire)
+            }
+            NotifyInner::Flume { rx, .. } => rx.try_recv().is_ok(),
+        }
     }
 }
 
@@ -259,27 +394,70 @@ mod tests {
 
     #[test]
     fn test_notify_skip_wake_gates_sender_but_not_local() {
-        let n = Notify::new();
-        // Gate off (default): notify_one delivers even if the flag is set.
-        n.set_skip_wake(true);
-        n.notify_one();
-        assert!(n.rx.try_recv().is_ok(), "gate off: token must deliver");
+        let instances = [Notify::new_atomic(), Notify::new_flume()];
+        // Phase 1 — gate off (default): notify_one delivers even if the
+        // per-instance flag is set. Must run for BOTH instances before
+        // enable_notify_skip_wake(), which is sticky process-global.
+        for n in &instances {
+            n.set_skip_wake(true);
+            n.notify_one();
+            assert!(n.try_consume(), "gate off: token must deliver");
+        }
 
         enable_notify_skip_wake();
-        // Gate on + flag set: sender-side notify is elided entirely.
-        n.notify_one();
-        assert!(
-            n.rx.try_recv().is_err(),
-            "gate on + spinning: notify_one must be skipped"
-        );
-        // The driver probe's local delivery bypasses the flag.
-        n.notify_local();
-        assert!(n.rx.try_recv().is_ok(), "notify_local must bypass the gate");
+        for n in &instances {
+            // Gate on + flag set: sender-side notify is elided entirely.
+            n.notify_one();
+            assert!(
+                !n.try_consume(),
+                "gate on + spinning: notify_one must be skipped"
+            );
+            // The driver probe's local delivery bypasses the flag.
+            n.notify_local();
+            assert!(n.try_consume(), "notify_local must bypass the gate");
 
-        // Flag retracted: normal delivery resumes.
-        n.set_skip_wake(false);
+            // Flag retracted: normal delivery resumes.
+            n.set_skip_wake(false);
+            n.notify_one();
+            assert!(n.try_consume(), "flag clear: token must deliver");
+        }
+    }
+
+    #[test]
+    fn test_notify_atomic_wakes_pending_consumer_cross_thread() {
+        // The swf0-class regression test: a consumer parked in notified()
+        // must be woken by a producer on ANOTHER OS thread (this is the
+        // cross-shard SPSC wake path). block_on parks the calling thread on
+        // the future's waker, so a lost wake hangs this test.
+        for n in [Notify::new_atomic(), Notify::new_flume()] {
+            let n = Arc::new(n);
+            let producer = {
+                let n = n.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    n.notify_one();
+                })
+            };
+            block_on(n.notified());
+            producer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_notify_atomic_cancel_leaves_token() {
+        // A notified() future dropped before completion (losing select! arm)
+        // must not consume a token deposited afterwards.
+        let n = Notify::new_atomic();
+        {
+            let mut fut = Box::pin(n.notified());
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            // Dropped here with a registered (stale) waker.
+        }
         n.notify_one();
-        assert!(n.rx.try_recv().is_ok(), "flag clear: token must deliver");
+        // Token survives the cancelled future; next notified() is immediate.
+        block_on(n.notified());
     }
 
     #[test]
@@ -424,19 +602,20 @@ mod tests {
 
     #[test]
     fn test_notify_signal() {
-        let notify = Notify::new();
-        notify.notify_one();
-        // Signal was sent, try_recv should succeed
-        assert!(notify.rx.try_recv().is_ok());
+        for notify in [Notify::new_atomic(), Notify::new_flume()] {
+            notify.notify_one();
+            assert!(notify.try_consume());
+        }
     }
 
     #[test]
     fn test_notify_coalescing() {
-        let notify = Notify::new();
-        // Multiple notify_one calls coalesce (bounded(1))
-        notify.notify_one();
-        notify.notify_one(); // Should not block, just drops
-        assert!(notify.rx.try_recv().is_ok());
-        assert!(notify.rx.try_recv().is_err()); // Only one signal
+        for notify in [Notify::new_atomic(), Notify::new_flume()] {
+            // Multiple notify_one calls coalesce (one pending token max).
+            notify.notify_one();
+            notify.notify_one(); // Should not block, just coalesces
+            assert!(notify.try_consume());
+            assert!(!notify.try_consume()); // Only one signal
+        }
     }
 }

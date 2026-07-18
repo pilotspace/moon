@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Cross-shard SPSC wakes no longer go through flume (O2).** `Notify` —
+  the per-dispatch wake every cross-shard message sends and every shard
+  event-loop iteration re-arms — is now an AtomicBool token +
+  `AtomicWaker` (single cache line, lock-free, allocation-free) instead
+  of a flume bounded(1) whose internal lock + shared pending-waker walk
+  (`pull_pending`) showed directly in the shards=4 cachegrind profile.
+  Coalescing, cancel-safety under `select!`, and the busy-poll skip-wake
+  Dekker handshake are preserved exactly; the cross-thread wake uses the
+  same producer-wakes-AtomicWaker primitive the xshard-read
+  `ResponseSlot` already ships. `MOON_NOTIFY_FLUME=1` restores the flume
+  path (same-binary A/B knob + escape hatch). New `tests/loom_notify.rs`
+  models the lost-wake race; all Notify unit tests run against both
+  implementations.
+
 ### Documentation
 - **`--memory-thp` is permanently opt-in — the RSS-drift soak disqualified
   a default flip.** 45min mixed-size-churn + idle-decay soak (moon-dev VM,
