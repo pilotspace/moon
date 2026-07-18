@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Documentation
+- **SPSC-wake `Notify` stays on flume — the lock-free replacement was
+  rejected by measurement (O2).** A fully-validated AtomicBool token +
+  `AtomicWaker` implementation (loom lost-wake model, 209/209 consistency
+  at 1/4/12 shards, monoio busy-poll smoke; branch
+  `perf/o2-notify-atomic-waker`) measured NEUTRAL on GCE t2a shards=4
+  (SET p1 +0.08%, GET p1 +1.6% across 5 leg-order-alternating rounds):
+  the cachegrind-attributed flume misses are dwarfed by the eventfd+epoll
+  wake delivery, and busy-poll deployments elide flume via the skip-wake
+  gate anyway. A NOTE at the `Notify` definition records the verdict and
+  the re-attempt bar.
 - **`--memory-thp` is permanently opt-in — the RSS-drift soak disqualified
   a default flip.** 45min mixed-size-churn + idle-decay soak (moon-dev VM,
   THP leg vs control, AnonHugePages-verified): RSS is flat while hot, but
