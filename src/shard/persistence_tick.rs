@@ -548,6 +548,8 @@ pub(crate) fn run_eviction_tick(
                 shard_dir: &eviction_shard_dir,
                 manifest,
                 next_file_id,
+                // Placeholder — `run_eviction` restamps per database (#139).
+                db_index: 0,
             });
         }
         super::timers::run_eviction(
@@ -902,6 +904,9 @@ pub(crate) fn handle_memory_pressure(
                                     shard_dir: &shard_dir,
                                     manifest,
                                     next_file_id,
+                                    // #139: this fallback runs inside the
+                                    // per-db loop — attribute to db `i`.
+                                    db_index: i,
                                 };
                                 // Durable spill (manifest reachable): a
                                 // STRING victim stays cold-readable, never a

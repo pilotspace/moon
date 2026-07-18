@@ -265,6 +265,7 @@ mod tests {
             20,
             b"myhash",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -314,6 +315,7 @@ mod tests {
             21,
             b"cachekey",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -394,6 +396,7 @@ mod tests {
             40,
             key,
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -586,6 +589,7 @@ mod tests {
             30,
             b"big_key",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )

@@ -159,6 +159,12 @@ pub(crate) fn run_eviction(
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 let before = db.estimated_memory();
+                // #139: the shared SpillContext must carry THIS iteration's
+                // db so every spill file's manifest entry attributes its
+                // victim to the database it actually came from.
+                if let Some(ctx) = spill.as_deref_mut() {
+                    ctx.db_index = i;
+                }
                 let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
                     db, &rt, spill.as_deref_mut(), remaining, budget,
                     &mut |key| {
@@ -792,6 +798,7 @@ mod tests {
             shard_dir: &shard_dir,
             manifest: &mut manifest,
             next_file_id: &mut next_file_id,
+            db_index: 0,
         };
 
         let mut h = NoOpReasonDelHandles::new();

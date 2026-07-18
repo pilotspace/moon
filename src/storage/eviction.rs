@@ -268,6 +268,13 @@ pub struct SpillContext<'a> {
     pub shard_dir: &'a Path,
     pub manifest: &'a mut ShardManifest,
     pub next_file_id: &'a mut u64,
+    /// Logical database the CURRENT victim belongs to — stamped into each
+    /// spill file's manifest `FileEntry` so per-db recovery attribution
+    /// (#139) survives the sync path too. Callers that loop over databases
+    /// with one shared context (`run_eviction`, the memory-pressure sync
+    /// fallback) MUST restamp this per iteration; the async batch path
+    /// carries the equivalent on `SpillRequest.db_index`.
+    pub db_index: usize,
 }
 
 /// Compute a shard's elastic memory budget from a snapshot of every shard's
@@ -1192,6 +1199,7 @@ pub(crate) fn evict_one_with_spill(
                 file_id,
                 key.as_bytes(),
                 entry,
+                ctx.db_index,
                 ctx.manifest,
                 None,
             ) {
@@ -1816,6 +1824,7 @@ mod tests {
             shard_dir,
             manifest: &mut manifest,
             next_file_id: &mut next_file_id,
+            db_index: 0,
         };
 
         let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
@@ -1835,6 +1844,51 @@ mod tests {
 
         // file_id should have been incremented
         assert_eq!(next_file_id, 2);
+    }
+
+    /// RED for the #139 follow-up (PR #383 adversarial review, confirmed
+    /// defect): the SYNC spill path — `run_eviction`'s non-cascade branch →
+    /// `evict_one_with_spill` → `kv_spill::spill_to_datafile` — hardcoded
+    /// `db_index: 0` in the manifest `FileEntry`, so an ordinary maxmemory
+    /// eviction of a db>0 victim produced a spill file that recovery's
+    /// `rebuild_from_manifest_per_db` re-attached to db 0: exactly the #139
+    /// wrong-database corruption, reintroduced through a path the async-spill
+    /// fix didn't cover. GREEN: `SpillContext.db_index` (restamped per
+    /// database by the `run_eviction` loop) is threaded through to the
+    /// manifest entry.
+    #[test]
+    fn sync_spill_stamps_victims_database_into_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(
+            Bytes::from_static(b"db2_key"),
+            Bytes::from_static(b"db2_val"),
+        );
+
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 2,
+        };
+
+        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0, "victim must have been evicted");
+
+        let files = manifest.files();
+        assert_eq!(files.len(), 1, "exactly one spill file registered");
+        assert_eq!(
+            files[0].db_index, 2,
+            "sync spill must attribute the file to the database the victim \
+             was evicted from, not db 0 (#139 recovery corruption otherwise)"
+        );
     }
 
     /// Fail-safe send-before-remove: when the async-spill request channel is
@@ -2256,6 +2310,7 @@ mod tests {
             shard_dir,
             manifest: &mut manifest,
             next_file_id: &mut next_file_id,
+            db_index: 0,
         };
 
         let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
@@ -2310,6 +2365,7 @@ mod tests {
             shard_dir,
             manifest: &mut manifest,
             next_file_id: &mut next_file_id,
+            db_index: 0,
         };
 
         let mut reported: Vec<Vec<u8>> = Vec::new();

@@ -165,14 +165,13 @@ impl Drop for ServerGuard {
             .args(["-fl"])
             .arg(&self.dir_marker)
             .output()
+            && !out.stdout.is_empty()
         {
-            if !out.stdout.is_empty() {
-                eprintln!(
-                    "[ServerGuard] pkill backstop for marker {:?} will hit:\n{}",
-                    self.dir_marker,
-                    String::from_utf8_lossy(&out.stdout).trim_end()
-                );
-            }
+            eprintln!(
+                "[ServerGuard] pkill backstop for marker {:?} will hit:\n{}",
+                self.dir_marker,
+                String::from_utf8_lossy(&out.stdout).trim_end()
+            );
         }
         let _ = Command::new("pkill")
             .args(["-9", "-f"])
