@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too) is deliberately out of scope and tracked separately.
 
 ### Performance
+- **New `benches/dashtable_probe.rs`: DashTable point-lookup benchmark at
+  cache-exceeding sizes (O1), and a recorded dead end for value-line
+  prefetch.** The existing 10K-key bench is cache-resident and cannot see
+  probe miss latency (18.65%/11.09% of cycles on ARM/x86 per real-PMU GCE
+  measurement); the new bench builds 100K/1M-key tables and looks up in
+  fixed-seed shuffled order, with the hit path forcing a real load
+  through the returned entry — `black_box` alone does not read through a
+  reference (disassembly-verified), a harness trap that initially
+  produced a phantom "3-6% x86 win" for prefetching `values[slot]` at the
+  first H2 tag match. With the forced load, that prefetch measured ~1-2%
+  SLOWER or noise on pinned x86 (c3) at 1M keys and a consistent
+  regression on aarch64 (t2a `prfm` variant: get_hit/100K +14%) — so no
+  prefetch ships; the negative result and methodology requirement are
+  documented in `segment/mod.rs` next to the earlier aarch64 key-prefetch
+  verdict. The probe path keeps its existing one-cache-line ctrl
+  verdicts, directory-level segment prefetch, and x86 key prefetch.
 - **`--memory-thp` opts jemalloc's value heap into transparent huge pages
   (O4).** New opt-in flag layers `thp:always` onto the baked-in
   `_rjem_malloc_conf` (on top of the always-on `metadata_thp:auto`, which
