@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **`--memory-thp` is permanently opt-in — the RSS-drift soak disqualified
+  a default flip.** 45min mixed-size-churn + idle-decay soak (moon-dev VM,
+  THP leg vs control, AnonHugePages-verified): RSS is flat while hot, but
+  once the workload quiets khugepaged collapses the heap into 2M pages and
+  re-materializes every 4K hole jemalloc had purged — RSS climbed
+  699→890MB at constant used_memory 539MB, plateaued, and never returned
+  (control: 680MB flat). Same-data RSS settles ~+31% over non-THP,
+  eroding maxmemory eviction headroom. The classic Redis fork-CoW
+  objection does not apply to moon (BGSAVE is an in-process per-shard
+  epoch snapshot; no `fork()` in the tree). Flag/CLAUDE.md docs updated
+  with the verdict and the enable-when guidance (uniform value sizes +
+  RSS headroom); full data in `tmp/THP-SOAK-RESULTS.md`.
+
 ### Fixed
 - **Multi-shard SWAPDB is now durable before `+OK` (#133).** Two defects
   in `coordinate_swapdb`: (1) no fsync rendezvous — under
