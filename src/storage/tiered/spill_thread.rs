@@ -476,6 +476,11 @@ impl SpillThread {
         let join_handle = std::thread::Builder::new()
             .name(format!("spill-{shard_id}"))
             .spawn(move || {
+                // O5: this thread is spawned from the shard's own (pinned)
+                // event-loop thread and would otherwise inherit its exact
+                // single-core mask — re-pin to the non-shard core set as the
+                // first act, before anything else runs.
+                crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
                 Self::run(request_rx, completion_tx, stop_flag_bg);
             })
             .expect("failed to spawn spill thread");

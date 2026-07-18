@@ -109,12 +109,17 @@ impl BackgroundCompactor {
                         // SINGLE-core affinity mask on Linux — concurrent
                         // small (sequential) builds then time-slice one core
                         // (measured: 3 × 1K builds at ~1s each vs ~0.6s
-                        // alone). Spread workers round-robin from the LAST
-                        // core downward, away from shard 0. No-op on macOS.
-                        let cores = crate::shard::numa::system_parallelism();
-                        crate::shard::numa::pin_worker_to_core(
-                            cores.saturating_sub(1 + (i % cores)),
-                        );
+                        // alone). O5: prefer the process's non-shard core
+                        // set when aux pinning is initialized (the old
+                        // last-core-downward heuristic lands on SHARD cores
+                        // whenever shards ≈ cores, e.g. shards=6/cores=8 put
+                        // workers 2-3 on shard cores 4-5); fall back to that
+                        // heuristic when aux pinning is off. No-op on macOS.
+                        let core = crate::shard::numa::aux_core_at(i).unwrap_or_else(|| {
+                            let cores = crate::shard::numa::system_parallelism();
+                            cores.saturating_sub(1 + (i % cores))
+                        });
+                        crate::shard::numa::pin_worker_to_core(core);
                         while let Ok(job) = rx.recv() {
                             let result = match job.op {
                                 BuildOp::Compact {

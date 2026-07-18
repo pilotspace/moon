@@ -100,6 +100,13 @@ fn job_sender() -> &'static flume::Sender<ColdReadJob> {
             // `read_cold_entry_async`'s send-failure branch) -- slow, but
             // still correct. Not worth propagating a spawn error here.
             let _ = build.spawn(move || {
+                // O5: this pool is lazily created on the FIRST cold read,
+                // from a pinned shard thread — without a re-pin every worker
+                // inherits that one shard's single-core mask and serves cold
+                // reads for ALL shards from it, forever. The non-shard
+                // remainder is a strict improvement; scheduler placement is
+                // not reachable from here (the inherited mask IS one core).
+                crate::shard::numa::pin_current_aux_thread(&format!("moon-cold-read-{i}"));
                 for job in rx.iter() {
                     let outcome = read_cold_entry(&job.shard_dir, job.location, job.now_ms, None);
                     // If the requester's task was cancelled/dropped, this
