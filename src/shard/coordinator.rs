@@ -2759,73 +2759,31 @@ pub(crate) fn aggregate_doc_freq(
     (global_df, global_n)
 }
 
-/// Cheap precondition for [`record_local_swapdb_repl`]: skip replication
-/// bookkeeping entirely when no replica has ever attached. Ctx-free mirror
-/// of `handler_monoio::ft::replication_fanout_active` — the coordinator has
-/// no `ConnectionContext` in scope.
-fn swapdb_repl_active(repl_state: ReplStateRef<'_>) -> bool {
-    if !crate::replication::state::fanout_hint_active() {
-        return false;
-    }
-    repl_state.as_ref().is_some_and(|rs| {
-        let g = rs.read();
-        !g.replicas.is_empty()
-            || g.per_shard_backlogs
-                .first()
-                .is_some_and(|slot| slot.lock().is_some())
-    })
-}
-
-/// Record the coordinator LOCAL leg's SWAPDB record on the replication
-/// plane: backlog append + per-shard/master offset advance, synchronously
-/// (before any `.await`), then defer the live-replica send onto the shard's
-/// self-queue (`ShardMessage::ReplicaLiveFanout`) — the same
-/// backlog-then-defer contract `wal_append_and_fanout` uses for remote legs
-/// and `record_local_write_db` uses for ordinary local single-key writes.
-///
-/// `coordinate_swapdb` only runs when `num_shards > 1` (single-shard SWAPDB
-/// never reaches this module — see `handler_single.rs`), so every record is
-/// framed with its own `SELECT 0` prefix (R2, task #20): a multi-shard
-/// master merges N shard streams onto one replica wire, so no shared
-/// "current db" context can exist. `db=0` mirrors the remote legs'
-/// `wal_append_and_fanout(serialized, 0, ...)` call (task #35: SWAPDB
-/// touches both `a` and `b` — no single db context applies).
-///
-/// Caller MUST be running on `my_shard`'s own OS thread (pushes to
-/// `shard::self_msg`, a `thread_local!` queue) — guaranteed here since
-/// `coordinate_swapdb` always executes on the connection's own shard.
-fn record_local_swapdb_repl(repl_state: ReplStateRef<'_>, my_shard: usize, data: &Bytes) {
-    let Some(rs) = repl_state.as_ref() else {
-        return;
-    };
-    let select = crate::persistence::aof::serialize_select_record(0);
-    let mut combined = Vec::with_capacity(select.len() + data.len());
-    combined.extend_from_slice(&select);
-    combined.extend_from_slice(data);
-    let combined = Bytes::from(combined);
-
-    let g = rs.read();
-    if let Some(slot) = g.per_shard_backlogs.get(my_shard) {
-        if let Some(backlog) = slot.lock().as_mut() {
-            backlog.append(&combined);
-        }
-    }
-    let end_offset = g.increment_shard_offset(my_shard, combined.len() as u64);
-    drop(g);
-    crate::shard::self_msg::push(ShardMessage::ReplicaLiveFanout {
-        bytes: combined,
-        end_offset,
-    });
-}
-
 /// Broadcast SWAPDB to all shards and await acknowledgement AND durability
 /// from each (issue #133).
 ///
 /// # Flow
 ///
-/// - Local shard: durable AOF append (v3-5 group-commit + barrier) BEFORE
-///   the swap — mirrors the single-shard `handler_single.rs` SWAPDB
-///   contract so the coordinator shard's own record survives a kill-9.
+/// - Local shard FIRST: durable AOF append (v3-5 group-commit + barrier)
+///   BEFORE the swap AND before any remote dispatch — mirrors the
+///   single-shard `handler_single.rs` SWAPDB contract so the coordinator
+///   shard's own record survives a kill-9, and (adversarial-review fix)
+///   guarantees that every local abort point (WAL backpressure, AOF
+///   enqueue failure, fsync failure) fires while the CLUSTER is still
+///   untouched — no remote shard has been told to swap yet, so an aborted
+///   SWAPDB leaves all shards consistent.
+///
+/// NOTE (replication): SWAPDB is deliberately NOT recorded on the live
+/// replication plane by this local leg. Replicas cannot currently execute
+/// a streamed SWAPDB at all — `replication::apply::apply_local` routes it
+/// into `cmd_dispatch`, which hard-errors ("SWAPDB must be issued at the
+/// connection handler level") and the record silently no-ops. Fanning the
+/// local record out would ship bytes the replica cannot apply, and doing
+/// the backlog/offset bookkeeping BEFORE the durability gate can diverge
+/// master/replica on an abort. Wiring replica-side SWAPDB application
+/// (both this local leg and the remote legs' pre-existing
+/// `wal_append_and_fanout` emission, which has the same no-op fate) is
+/// tracked as a separate issue.
 /// - Remote shards: send `ShardMessage::SwapDb` (its SPSC arm durably logs
 ///   via `wal_append_and_fanout` — WAL v3 + repl backlog/offset/fan-out +
 ///   AOF — BEFORE swapping and acking), then this function issues ONE
@@ -2903,27 +2861,11 @@ pub async fn coordinate_swapdb(
         num_shards > 1,
         "coordinate_swapdb is the multi-shard path (single-shard SWAPDB lives in handler_single.rs)"
     );
-    // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
-    // Skip self in the SPSC loop; handle the local shard inline below.
-    let remote_count = num_shards.saturating_sub(1);
-    let mut targets: Vec<usize> = Vec::with_capacity(remote_count);
-    let mut receivers: Vec<channel::OneshotReceiver<()>> = Vec::with_capacity(remote_count);
-
-    for target in 0..num_shards {
-        if target == my_shard {
-            continue; // handled inline below
-        }
-        let (reply_tx, reply_rx) = channel::oneshot();
-        let msg = ShardMessage::SwapDb { a, b, reply_tx };
-        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        targets.push(target);
-        receivers.push(reply_rx);
-    }
-
-    // Local shard: durable append BEFORE the swap. SWAPDB has no
-    // command-level rollback; anything that can fail must fail BEFORE
-    // mutating this shard's state, otherwise the cluster state diverges
-    // from the on-disk log.
+    // Local shard first: durable append BEFORE the swap AND before any
+    // remote dispatch. SWAPDB has no command-level rollback; anything that
+    // can fail must fail while NOTHING in the cluster has mutated —
+    // dispatching remotes first (the pre-fix order) meant a local abort
+    // left N-1 shards swapped and this one not.
     {
         let mut a_buf = itoa::Buffer::new();
         let mut b_buf = itoa::Buffer::new();
@@ -2952,22 +2894,11 @@ pub async fn coordinate_swapdb(
         // MSET/BITOP/COPY/DEL: enqueue fire-and-forget, then ONE barrier
         // under `Always` instead of a per-write awaited fsync.
         if let Some(pool) = aof_pool {
-            let repl_active = swapdb_repl_active(repl_state);
-            let lsn = if repl_active {
-                // Records backlog + offset synchronously (before any
-                // .await) and defers only the live-replica send — matches
-                // the local single-key write contract
-                // (`record_local_write_db`). lsn=0: the AOF leg must not
-                // double-advance the offset this already advanced.
-                record_local_swapdb_repl(repl_state, my_shard, &serialized);
-                0
-            } else {
-                crate::persistence::aof::AofWriterPool::issue_append_lsn(
-                    repl_state,
-                    my_shard,
-                    serialized.len(),
-                )
-            };
+            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+                repl_state,
+                my_shard,
+                serialized.len(),
+            );
             match pool.send_append_group(my_shard, lsn, 0, serialized).await {
                 Ok(needs_barrier) => {
                     if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
@@ -2991,6 +2922,23 @@ pub async fn coordinate_swapdb(
                 s.databases.swap(a, b);
             }
         });
+    }
+
+    // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
+    // Skip self in the SPSC loop; handle the local shard inline below.
+    let remote_count = num_shards.saturating_sub(1);
+    let mut targets: Vec<usize> = Vec::with_capacity(remote_count);
+    let mut receivers: Vec<channel::OneshotReceiver<()>> = Vec::with_capacity(remote_count);
+
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue; // handled inline below
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::SwapDb { a, b, reply_tx };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        targets.push(target);
+        receivers.push(reply_rx);
     }
 
     // Await every remote shard's ack, then confirm ITS durability with one
@@ -3073,99 +3021,6 @@ mod tests {
             1,
             "all keys with same hash tag should map to one shard"
         );
-    }
-
-    // ── issue #133: SWAPDB local-leg replication plane ──────────────────
-    //
-    // `record_local_swapdb_repl` is the coordinator's ctx-free equivalent of
-    // `record_local_write_db` for the SWAPDB local leg. These tests exercise
-    // it directly (no shard mesh / event loop needed) to prove EXACTLY-ONCE
-    // backlog append + offset advance per call — a double-count here would
-    // desync `master_repl_offset` from the sum of bytes actually delivered,
-    // and SWAPDB is explicitly non-idempotent (double-logging `a b` nets a
-    // no-op swap on replay).
-    #[test]
-    fn test_record_local_swapdb_repl_appends_exactly_once_with_select_prefix() {
-        use crate::replication::state::ReplicationState;
-
-        let repl_state = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
-            2,
-            "a".repeat(40),
-            "0".repeat(40),
-        )));
-        // Simulate a replica already attached on shard 0 (lazy backlog alloc).
-        repl_state.read().ensure_backlogs_allocated();
-        let repl_state_opt: Option<Arc<parking_lot::RwLock<ReplicationState>>> =
-            Some(repl_state.clone());
-
-        let data = Bytes::from_static(b"*3\r\n$6\r\nSWAPDB\r\n$1\r\n0\r\n$1\r\n1\r\n");
-        record_local_swapdb_repl(&repl_state_opt, 0, &data);
-
-        let select = crate::persistence::aof::serialize_select_record(0);
-        let expected_len = (select.len() + data.len()) as u64;
-
-        let g = repl_state.read();
-        // Offset advanced by EXACTLY one SELECT+payload's worth of bytes —
-        // not zero (would mean the call was a no-op) and not double
-        // (would mean two advances for one record).
-        assert_eq!(
-            g.shard_offset(0),
-            expected_len,
-            "shard 0 offset must advance by exactly one SELECT+SWAPDB record"
-        );
-        assert_eq!(
-            g.total_offset(),
-            expected_len,
-            "master_repl_offset must track the single shard-0 advance exactly"
-        );
-        // Shard 1 (not the local leg's shard) must be untouched.
-        assert_eq!(g.shard_offset(1), 0, "shard 1 offset must be untouched");
-
-        // Backlog content is SELECT 0 immediately followed by the SWAPDB
-        // payload, exactly once (no duplication).
-        let backlog_bytes = g.per_shard_backlogs[0]
-            .lock()
-            .as_ref()
-            .expect("backlog allocated")
-            .bytes_from(0)
-            .expect("offset 0 not evicted");
-        let mut expected = select.to_vec();
-        expected.extend_from_slice(&data);
-        assert_eq!(
-            backlog_bytes, expected,
-            "backlog must contain exactly one SELECT-prefixed SWAPDB record"
-        );
-    }
-
-    #[test]
-    fn test_record_local_swapdb_repl_noop_when_repl_state_none() {
-        let repl_state_opt: ReplStateRef<'_> = &None;
-        let data = Bytes::from_static(b"*3\r\n$6\r\nSWAPDB\r\n$1\r\n0\r\n$1\r\n1\r\n");
-        // Must not panic when persistence/replication is fully disabled.
-        record_local_swapdb_repl(repl_state_opt, 0, &data);
-    }
-
-    #[test]
-    fn test_swapdb_repl_active_false_before_any_replica_attaches() {
-        use crate::replication::state::ReplicationState;
-
-        // A fresh ReplicationState with no backlog allocated and no replicas
-        // registered must report inactive regardless of the process-global
-        // fanout hint (which other tests in this binary may have already
-        // flipped — this assertion only depends on THIS instance's state).
-        let repl_state = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
-            2,
-            "b".repeat(40),
-            "0".repeat(40),
-        )));
-        let repl_state_opt: Option<Arc<parking_lot::RwLock<ReplicationState>>> =
-            Some(repl_state.clone());
-        if !crate::replication::state::fanout_hint_active() {
-            assert!(
-                !swapdb_repl_active(&repl_state_opt),
-                "must be inactive: fanout hint never set AND no backlog allocated"
-            );
-        }
     }
 
     // ── R-1: bounded spsc_send backpressure ──
