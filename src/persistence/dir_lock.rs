@@ -16,7 +16,9 @@
 //!
 //! The guard must stay alive until exit — dropping it unlocks. `main()`
 //! binds it for its full scope. Note `std::fs::File` opens with
-//! `O_CLOEXEC`, so the `--memory-arenas-cap` `execve` re-spawn releases and
+//! `O_CLOEXEC`, so the `--memory-arenas-cap` / `--memory-thp` `execve`
+//! re-spawn (composed into one re-exec when both flags are set — see
+//! `maybe_respawn_with_memory_overrides` in `main.rs`) releases and
 //! re-acquires the lock across the exec boundary (same pid, no window for a
 //! competing instance to corrupt: the re-exec'd image locks again before
 //! opening any data file).
