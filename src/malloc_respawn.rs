@@ -60,17 +60,19 @@ fn scan_argv(args: &[std::ffi::OsString]) -> ScannedOverrides {
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_encoded_bytes();
+        // Out-of-range values (clap enforces 1..=256) are treated as absent:
+        // jemalloc's own abort_conf:true would ABORT the process on e.g.
+        // narenas:0 before clap ever prints its friendly range error, so the
+        // scan must never let such a value reach the conf string.
+        let parse_narenas = |s: &str| s.parse::<u32>().ok().filter(|n| (1..=256).contains(n));
         if let Some(rest) = a.strip_prefix(b"--memory-arenas-cap=") {
-            scanned.narenas = std::str::from_utf8(rest).ok().and_then(|s| s.parse().ok());
+            scanned.narenas = std::str::from_utf8(rest).ok().and_then(parse_narenas);
             i += 1;
             continue;
         }
         if a == b"--memory-arenas-cap" {
             if i + 1 < args.len() {
-                scanned.narenas = args[i + 1]
-                    .as_os_str()
-                    .to_str()
-                    .and_then(|s| s.parse().ok());
+                scanned.narenas = args[i + 1].as_os_str().to_str().and_then(parse_narenas);
             }
             i += 2;
             continue;
@@ -328,6 +330,26 @@ mod tests {
         );
         // Flag at end of argv with no value -> None, no panic.
         assert_eq!(scan_argv(&argv(&["--memory-arenas-cap"])).narenas, None);
+    }
+
+    #[test]
+    fn scan_rejects_out_of_range_narenas() {
+        // clap enforces 1..=256; the pre-clap scan must too, or narenas:0
+        // reaches jemalloc which ABORTS under abort_conf:true before clap
+        // can print its friendly range error (PR #387 review).
+        assert_eq!(
+            scan_argv(&argv(&["--memory-arenas-cap", "0"])).narenas,
+            None
+        );
+        assert_eq!(scan_argv(&argv(&["--memory-arenas-cap=257"])).narenas, None);
+        assert_eq!(
+            scan_argv(&argv(&["--memory-arenas-cap", "256"])).narenas,
+            Some(256)
+        );
+        assert_eq!(
+            scan_argv(&argv(&["--memory-arenas-cap=1"])).narenas,
+            Some(1)
+        );
     }
 
     // ── conf-string builder ───────────────────────────────────────────────
