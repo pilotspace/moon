@@ -215,6 +215,10 @@ name = "get_hotpath"
 harness = false
 
 [[bench]]
+name = "dashtable_probe"
+harness = false
+
+[[bench]]
 name = "compact_key"
 harness = false
 
