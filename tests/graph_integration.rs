@@ -72,6 +72,7 @@ async fn start_graph_server() -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
