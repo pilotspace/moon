@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **`--io-busy-poll-us` is now deploy-safe: a per-shard contention governor
+  gates the spin on shared cores (O3).** The p=1 busy-poll win (GCE pinned:
+  ARM 0.95→1.21×, x86 1.06→1.66× vs Redis) previously inverted into a
+  regression whenever the shard's core was shared (OrbStack/laptop), making
+  the flag pinned-cores-only operator judgment. Each shard thread's 1s
+  chore now samples its own `nonvoluntary_ctxt_switches` from
+  `/proc/thread-self/status` — the kernel's direct "someone else needed
+  this core" signal — and flips a per-thread gate in the vendored monoio
+  legacy driver: one window over 25 preempts/s stops the spin immediately;
+  five consecutive quiet windows re-enable it (asymmetric hysteresis, no
+  flapping). Startup state is ungated, so pinned-core deployments see the
+  win from the first request and a shared-core host pays at most ~one
+  window of spin. Idle cost is unchanged (the existing 10ms idle-disengage
+  already covers quiet threads). `MOON_SPIN_ADAPTIVE=0` restores
+  unconditional spinning (same-binary A/B knob);
+  `MOON_SPIN_MAX_PREEMPTS_PER_SEC` tunes the threshold. Non-Linux has no
+  preemption signal — the governor is inert there (pre-O3 behavior). This
+  also makes `--profile standalone` (which presets busy-poll 40) safe on
+  non-dedicated hosts.
+
 ### Documentation
 - **SPSC-wake `Notify` stays on flume — the lock-free replacement was
   rejected by measurement (O2).** A fully-validated AtomicBool token +

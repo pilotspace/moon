@@ -28,6 +28,10 @@ pub mod segment_stall;
 pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
+/// O3 adaptive busy-poll governor — the spin it gates exists only in the
+/// vendored monoio legacy driver, so the module is monoio-only.
+#[cfg(feature = "runtime-monoio")]
+pub(crate) mod spin_governor;
 pub mod spsc_handler;
 /// Shared MOVE/COPY-DB two-database intercept for every `ShardMessage` SPSC
 /// arm (Gap A). Split out of `spsc_handler.rs` per the repo's file-size
