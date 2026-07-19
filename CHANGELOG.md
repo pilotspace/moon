@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **New "The Moon Journey" page (`docs/journey.md`) — the development story
+  toward a production-efficient database, grounded in real evidence.** Traces
+  the milestone arc (v0.4 → v0.8.1) and the measured efficiency achievements —
+  throughput (GET 5.11M/s 1.72×, SET 3.50M/s 1.92×, ARM64 2.20×; 1.71× at p=64
+  on 23× less CPU), the single-connection p=1 conquest, memory (27% less at
+  1KB values), latency (p50 8–10× lower), the durability write-path campaign
+  (`always` p16 0.12×→0.91×, `everysec` p16 1.32×), AI-native vector/graph
+  (12.7K QPS; beats Qdrant 1.6–2.3×, FalkorDB 23×), and the storage-kernel
+  production hardening (46-cell kill-9 matrix, 10× RAM datasets, 24 h
+  replication soak with zero acked-write loss). Includes a "what we measured
+  and threw away" section (prefetch, lock-free `Notify`, THP-by-default,
+  `ef/√G` beam split — all rejected on the evidence). Linked from the README
+  (refreshed roadmap table + journey callout) and the mkdocs nav.
+- **Visual performance timeline** — a step-line chart
+  (`docs/assets/journey-efficiency.png`) tracing the three efficiency curves
+  that each crossed Redis parity (p=1 latency x86 1.06→1.66×, ARM 0.95→1.21×,
+  `fsync=always` durable throughput 0.12→0.91×), plus a mermaid milestone
+  timeline (v0.4.x → v0.8.1). Embedded in the journey page and the README.
+
 ## [0.8.1] — 2026-07-19
 
 ### Added
@@ -19,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocator re-spawn scan (the only path that reaches jemalloc before init), so
   it is CLI-only — `--profile standalone` on the command line folds it in; a
   conf-file `profile standalone` still sets the other three. The new annotated
-  [`conf/moon-standalone.conf`](conf/moon-standalone.conf) ships the same tuning
+  [`conf/moon-standalone.conf`](https://github.com/pilotspace/moon/blob/main/conf/moon-standalone.conf) ships the same tuning
   (durability on) as an editable config file. Paired with the O3 contention
   governor below, the preset no longer requires pinned cores — the tuning and
   configuration guides drop the pinned-cores-only caveat throughout and the

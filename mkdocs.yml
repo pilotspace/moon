@@ -130,6 +130,7 @@ nav:
       - Getting started guide: guides/getting-started.md
       - Migrating from Redis: guides/migration.md
   - Concepts:
+      - The Moon journey: journey.md
       - Architecture: architecture.md
       - Design advantages: design-advantages.md
       - Command reference: commands.md
