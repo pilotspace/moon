@@ -311,6 +311,14 @@ pub struct ServerConfig {
     /// low-pipeline request/response workloads on dedicated cores; costs up to
     /// ~N µs of CPU per idle park. Measured (GCE c1 GET p=1, 2026-07):
     /// ARM c4a 0.95→1.21× vs Redis, x86 c3 1.06→1.66×. monoio runtime only.
+    ///
+    /// Deploy-safe by default (O3): each shard thread watches its own
+    /// involuntary-preemption rate (Linux) and self-gates the spin while its
+    /// core is shared with other runnable threads — the shared-core
+    /// regression that previously made this flag pinned-cores-only judgment
+    /// no longer applies (one >25-preempts/s window gates the spin; 5
+    /// consecutive quiet windows re-enable it). `MOON_SPIN_ADAPTIVE=0`
+    /// restores unconditional spinning (bench A/B knob).
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
 

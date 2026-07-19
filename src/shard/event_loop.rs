@@ -879,6 +879,14 @@ impl super::Shard {
         // cadence below (all multiples of 10) still fires exactly on time.
         #[cfg(feature = "runtime-monoio")]
         let mut idle_park = crate::shard::idle_park::IdleParkState::new();
+        // O3: adaptive busy-poll contention governor. Only constructed when a
+        // spin budget is actually configured — otherwise there is nothing to
+        // gate and the 1s /proc read would be pure waste.
+        #[cfg(feature = "runtime-monoio")]
+        let mut spin_governor: Option<crate::shard::spin_governor::SpinGovernor> =
+            (crate::runtime::epoll_spin_configured(server_config.io_busy_poll_us)
+                && crate::shard::spin_governor::adaptive_enabled())
+            .then(crate::shard::spin_governor::SpinGovernor::new);
         // Used by tokio select! for event-driven SPSC drain; monoio drains in periodic tick.
         let spsc_notify_local = spsc_notify;
         #[cfg(feature = "runtime-monoio")]
@@ -2427,6 +2435,24 @@ impl super::Shard {
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
+                    // O3: sample this shard thread's involuntary-preemption
+                    // rate and gate the driver spin while the core is shared.
+                    // The gate is thread-local in the vendored driver, so the
+                    // flip below affects exactly this shard's parks.
+                    if let Some(gov) = spin_governor.as_mut() {
+                        if let Some(contended) = gov.tick() {
+                            monoio::set_legacy_spin_contended(contended);
+                            tracing::info!(
+                                "Shard {}: busy-poll spin {} (involuntary-preemption governor)",
+                                shard_id,
+                                if contended {
+                                    "GATED — core contended"
+                                } else {
+                                    "re-enabled — core quiet"
+                                }
+                            );
+                        }
+                    }
                     timers::sync_wal_v3(&mut wal_writer);
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
