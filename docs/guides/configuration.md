@@ -34,8 +34,9 @@ costs ~10µs), keeps every key co-located (no `{hash-tag}` planning), and — wi
 `--appendonly yes` + `--wal-kv-log auto` — writes each KV record to disk exactly
 **once** (the AOF). Reach for more shards only with 8+ concurrent connections or
 deep pipelines (measured 1.3–2.5× Redis at 8–64 conns on 4 shards), and see
-[Tuning](tuning.md) for `--io-busy-poll-us` (a p=1 latency win **only** on
-pinned/dedicated cores).
+[Tuning](tuning.md) for `--io-busy-poll-us` (a p=1 latency win on dedicated
+cores that now auto-gates on shared ones, so it's safe on any host — or use
+`--profile standalone` to fold it in).
 
 ## Persistence
 

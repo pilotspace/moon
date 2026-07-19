@@ -223,9 +223,12 @@ classic gaps too:
 
 - **Unpipelined (p=1) single-connection** — historically Redis's best case —
   now a Moon **win on both GCE architectures** with the shipped
-  `--io-busy-poll-us 40` poll-mode park (`--profile standalone` sets it for
-  you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86 (c3),
-  same-instance A/Bs, n=3.
+  `--io-busy-poll-us 40` poll-mode park (`--profile standalone`, or the
+  annotated [`conf/moon-standalone.conf`](conf/moon-standalone.conf), sets it
+  for you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86
+  (c3), same-instance A/Bs, n=3. As of v0.8.1 the busy-poll **auto-gates on
+  shared cores** (per-shard contention governor), so the preset is safe on any
+  host — not just pinned ones.
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
   **0.91× Redis** via per-batch group commit + coalesced writes, while
   `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.

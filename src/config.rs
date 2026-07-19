@@ -328,11 +328,15 @@ pub struct ServerConfig {
     ///
     /// Currently supported: `standalone` — single dedicated instance, tuned
     /// for the "beat Redis at p=1" latency path (`--shards 1`,
-    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). REQUIRES
-    /// pinned/dedicated CPU cores: the busy-poll park REGRESSES throughput on
-    /// shared or unpinned cores (OrbStack default, laptops, noisy-neighbor
-    /// cloud VMs) — see docs/guides/tuning.md#profiles. Unknown profile names
-    /// are a startup error.
+    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`; on jemalloc builds
+    /// also `--memory-arenas-cap 2` for the single-shard allocator footprint).
+    /// Safe on any host as of the O3 contention governor: `--io-busy-poll-us`
+    /// now auto-gates the busy-poll on shared/oversubscribed cores (per-shard
+    /// involuntary-preemption sampling), so the preset no longer requires
+    /// pinned CPUs — it simply delivers its full win on dedicated cores and
+    /// costs at most ~one window of spin on a contended one. See
+    /// docs/guides/tuning.md#profiles. Unknown profile names are a startup
+    /// error.
     #[arg(long)]
     pub profile: Option<String>,
 
@@ -1340,6 +1344,20 @@ impl ServerConfig {
             self.io_driver = "epoll".to_string();
             fields.push("--io-driver=epoll (implied by io-busy-poll-us)");
         }
+        // jemalloc only: a single-shard instance has one hot allocator thread,
+        // so the baked-in narenas:8 (sized for the multi-shard thread-per-core
+        // layout) is oversized. The actual allocator override happens in the
+        // pre-clap re-spawn scan (`malloc_respawn::scan_argv`, which sees
+        // `--profile standalone` directly because it runs before jemalloc init
+        // — long before this method); this fill only keeps the config struct
+        // and the startup transparency log in sync with that. Non-jemalloc
+        // builds ignore the arena cap entirely, so we leave the field at its
+        // default there and the profile makes no misleading claim about it.
+        #[cfg(feature = "jemalloc")]
+        if !Self::flag_was_explicit(matches, "memory_arenas_cap") {
+            self.memory_arenas_cap = 2;
+            fields.push("--memory-arenas-cap=2 (single-shard allocator footprint)");
+        }
         Ok(ProfileOutcome::Applied {
             profile: name,
             fields,
@@ -2019,6 +2037,11 @@ mod tests {
         assert_eq!(config.shards, 1);
         assert_eq!(config.io_busy_poll_us, 40);
         assert_eq!(config.io_driver, "epoll");
+        // jemalloc builds also drop the arena cap to the single-shard value;
+        // non-jemalloc builds leave it at the default (the cap is a no-op
+        // there, so the profile makes no claim about it).
+        #[cfg(feature = "jemalloc")]
+        assert_eq!(config.memory_arenas_cap, 2);
         match outcome {
             ProfileOutcome::Applied { profile, fields } => {
                 assert_eq!(profile, "standalone");
@@ -2026,6 +2049,26 @@ mod tests {
             }
             ProfileOutcome::None => panic!("expected Applied outcome"),
         }
+    }
+
+    /// On jemalloc builds, an explicit `--memory-arenas-cap` beats the
+    /// `standalone` profile's single-shard arena fill (matches the pre-clap
+    /// re-spawn scan's precedence).
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn test_profile_standalone_explicit_arenas_cap_wins() {
+        let (mut config, matches) = ServerConfig::parse_from_with_matches([
+            "moon",
+            "--profile",
+            "standalone",
+            "--memory-arenas-cap",
+            "16",
+        ]);
+        config.apply_profile(&matches).expect("known profile");
+        assert_eq!(
+            config.memory_arenas_cap, 16,
+            "explicit --memory-arenas-cap must beat the profile"
+        );
     }
 
     /// An explicitly-passed flag ALWAYS overrides the profile's value — the

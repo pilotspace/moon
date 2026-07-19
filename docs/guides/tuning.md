@@ -16,8 +16,8 @@ recommendation here is backed by measurements on dedicated-vCPU GCE instances
 | Workload | Recipe |
 |---|---|
 | Pure cache (no durability) | `--appendonly no --maxmemory <bytes> --maxmemory-policy allkeys-lru` |
-| Sessions / rate limiting (few conns, latency-sensitive) | defaults; add `--io-busy-poll-us 40` on dedicated cores, or `--profile standalone` (see [Profiles](#profiles) — **pinned cores only**) |
-| High-concurrency API backend (8+ conns) | `--shards 4` (+ busy-poll on dedicated cores) |
+| Sessions / rate limiting (few conns, latency-sensitive) | `--profile standalone` (or `--config conf/moon-standalone.conf`) — safe on any host; see [Profiles](#profiles) |
+| High-concurrency API backend (8+ conns) | `--shards 4 --io-busy-poll-us 40` |
 | Pipelined / batch ingest | `--shards 4` or more; pipeline depth ≥ 16 |
 | Durable primary store | defaults (`--appendonly yes --appendfsync everysec`, ~1.32× Redis at depth); `always` for RPO 0 — disk-fsync-bound, pipelines fine |
 | Pub/sub fan-out (many subscribers) | defaults; delivery coalesces automatically — no tuning |
@@ -61,12 +61,34 @@ throughput +25% on top of the shard win).
 
 The trade-offs are explicit:
 
-- Costs up to the budget in CPU per idle park (~4%/core at 40 µs) — you are trading
-  idle CPU for latency.
-- **Only enable it on pinned, dedicated cores** (bare metal, dedicated-vCPU cloud
-  instances). On shared/oversubscribed hosts (laptops, burstable VMs, busy Kubernetes
-  nodes) it *regresses* performance — the spin fights neighbors for the core.
+- Costs up to the budget in CPU per idle park (~4%/core at 40 µs) on a genuinely idle
+  dedicated core — you are trading idle CPU for latency.
+- **Safe on any host as of the O3 contention governor** (see below). It used to regress
+  throughput on shared/oversubscribed cores because the spin fought neighbours for the
+  core; the governor now detects that and disables the spin automatically, so the flag is
+  no longer a pinned-cores-only judgement call.
 - Values 20–100 µs behave similarly; 40 is a good default. `0` (default) disables it.
+
+### The contention governor (auto-gating)
+
+Each shard thread samples its own involuntary-preemption rate once per second
+(`nonvoluntary_ctxt_switches` from `/proc/thread-self/status` on Linux — the kernel's
+direct "another runnable thread needed this core" signal) and gates the busy-poll
+accordingly:
+
+- **One window over 25 preempts/s → the spin stops immediately** on that shard. A
+  contended core stops burning the budget within a second.
+- **Five consecutive quiet windows → the spin re-enables** (asymmetric hysteresis, so a
+  briefly-quiet neighbour doesn't cause flapping).
+- **Startup is ungated**, so a pinned-core deployment gets the full win from the first
+  request, and a shared-core host pays at most ~one window of spin before backing off.
+
+The net effect: `--io-busy-poll-us 40` delivers its full latency win on dedicated cores
+and degrades gracefully — not catastrophically — on contended ones. Knobs (diagnostics,
+not for production tuning): `MOON_SPIN_ADAPTIVE=0` restores unconditional spinning (the
+same-binary A/B knob), `MOON_SPIN_MAX_PREEMPTS_PER_SEC` overrides the 25/s threshold.
+Non-Linux hosts have no preemption signal, so the governor is inert there and the flag
+behaves as it did before (enable only on dedicated cores).
 
 ## Profiles
 
@@ -80,8 +102,9 @@ behavior change:
 
 ```text
 INFO --profile standalone: set --shards=1, --io-busy-poll-us=40, --io-driver=epoll
-     (implied by io-busy-poll-us) (unset flags only; pass a flag explicitly on the
-     CLI to override the preset)
+     (implied by io-busy-poll-us), --memory-arenas-cap=2 (single-shard allocator
+     footprint) (unset flags only; pass a flag explicitly on the CLI to override
+     the preset)
 ```
 
 ### `standalone`
@@ -101,19 +124,27 @@ Expands to (only for flags left unset):
 | `--shards` | `1` | best per-op latency for low-concurrency, non-pipelined traffic |
 | `--io-busy-poll-us` | `40` | deletes scheduler sleep/wake latency from the request path |
 | `--io-driver` | `epoll` | implied by busy-poll (legacy driver only; io_uring CQEs aren't observable this way) |
+| `--memory-arenas-cap` | `2` | jemalloc builds only — a single-shard instance has one hot allocator thread, so the default 8 arenas are oversized; 2 lowers the RSS baseline with no contention cost |
 
-> **⚠ Pinned/dedicated cores required.** `--io-busy-poll-us` busy-loops the shard thread
-> for up to the budget before parking. On a host with genuinely idle, pinned cores this
-> deletes wakeup latency and is the single biggest lever behind Moon's p=1 win over Redis
-> (measured 1.19–1.21× ARM, 1.65–1.66× x86 on GCE, 2026-07). On **shared or oversubscribed
-> cores** — OrbStack's default VM, laptops, burstable/noisy-neighbor cloud instances,
-> busy Kubernetes nodes — the same spin **regresses** throughput: it fights every other
-> tenant for the core instead of yielding it. **Do not** reach for `--profile standalone`
-> on such hosts; run without it (or with `--io-busy-poll-us 0`, the plain default) and
-> rely on shard count alone.
+> **Safe on any host.** As of the O3 [contention governor](#the-contention-governor-auto-gating),
+> `--io-busy-poll-us` auto-disables its spin on shared or oversubscribed cores (OrbStack's
+> default VM, laptops, burstable/noisy-neighbour cloud instances, busy Kubernetes nodes)
+> and re-enables it once the core is quiet. `--profile standalone` therefore delivers its
+> full p=1 win on dedicated cores (measured 1.19–1.21× ARM, 1.65–1.66× x86 vs Redis on
+> GCE, 2026-07) and costs at most ~one sampling window of spin on a contended one — it is
+> no longer a pinned-cores-only preset.
 >
-> There is currently no automatic pinned-core detection — this is an operator judgment
-> call, not something Moon can safely default on for you.
+> **jemalloc arena cap is CLI-only.** `--memory-arenas-cap` is read before the config
+> file is parsed (the allocator initialises first), so the profile can only fill it when
+> you pass `--profile standalone` on the **command line**. A conf-file `profile standalone`
+> still sets shards / busy-poll / driver, but for the arena cap add `--memory-arenas-cap 2`
+> to the CLI (or use the one-flag CLI form). Non-jemalloc (default mimalloc) builds ignore
+> the arena cap entirely.
+
+The [`conf/moon-standalone.conf`](https://github.com/pilotspace/moon/blob/main/conf/moon-standalone.conf)
+example ships the same tuning as an annotated, editable config file — a good starting
+point when you want to keep other settings (port, `maxmemory`, persistence) alongside the
+preset.
 
 An unrecognized profile name is a startup error (exit code 2), not a silent no-op:
 
