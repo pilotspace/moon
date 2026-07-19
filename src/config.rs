@@ -328,11 +328,18 @@ pub struct ServerConfig {
     ///
     /// Currently supported: `standalone` — single dedicated instance, tuned
     /// for the "beat Redis at p=1" latency path (`--shards 1`,
-    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). REQUIRES
-    /// pinned/dedicated CPU cores: the busy-poll park REGRESSES throughput on
-    /// shared or unpinned cores (OrbStack default, laptops, noisy-neighbor
-    /// cloud VMs) — see docs/guides/tuning.md#profiles. Unknown profile names
-    /// are a startup error.
+    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). On jemalloc
+    /// builds, passing `--profile standalone` on the **command line** also
+    /// drops the arena cap to `2` (single-shard allocator footprint); that
+    /// happens in the pre-clap allocator re-spawn, not here, so a conf-file
+    /// `profile standalone` sets only the three flags above.
+    /// Safe on any host as of the O3 contention governor: `--io-busy-poll-us`
+    /// now auto-gates the busy-poll on shared/oversubscribed cores (per-shard
+    /// involuntary-preemption sampling), so the preset no longer requires
+    /// pinned CPUs — it simply delivers its full win on dedicated cores and
+    /// costs at most ~one window of spin on a contended one. See
+    /// docs/guides/tuning.md#profiles. Unknown profile names are a startup
+    /// error.
     #[arg(long)]
     pub profile: Option<String>,
 
@@ -1340,6 +1347,19 @@ impl ServerConfig {
             self.io_driver = "epoll".to_string();
             fields.push("--io-driver=epoll (implied by io-busy-poll-us)");
         }
+        // NOTE: the standalone profile ALSO drops the jemalloc arena cap to 2
+        // on jemalloc builds, but that is applied entirely in the pre-clap
+        // allocator re-spawn (`malloc_respawn::scan_argv` sees `--profile
+        // standalone` in the raw CLI argv and re-execs with narenas:2, long
+        // before this method runs). It is deliberately NOT mirrored into
+        // `self.memory_arenas_cap` here: this method cannot tell a CLI-sourced
+        // `--profile` from a conf-file-sourced one (clap reports both as
+        // `CommandLine` on the merged argv), but the re-spawn — which only sees
+        // raw pre-merge argv — only honors the CLI form. Mirroring it here
+        // would falsely claim "arena cap applied" for the conf-file form, where
+        // jemalloc actually stays at 8 (and would even trip
+        // `warn_if_conf_only_overrides`). The re-spawn is the single source of
+        // truth for the arena cap; we stay out of it.
         Ok(ProfileOutcome::Applied {
             profile: name,
             fields,
@@ -2019,10 +2039,20 @@ mod tests {
         assert_eq!(config.shards, 1);
         assert_eq!(config.io_busy_poll_us, 40);
         assert_eq!(config.io_driver, "epoll");
+        // The jemalloc arena cap is NOT filled here (it is applied by the
+        // pre-clap allocator re-spawn, not this method — see apply_profile's
+        // NOTE and malloc_respawn::scan_argv coverage). apply_profile must
+        // leave memory_arenas_cap at its parsed default so it never falsely
+        // claims a cap that a conf-file-sourced profile can't actually apply.
+        assert_eq!(config.memory_arenas_cap, 8);
         match outcome {
             ProfileOutcome::Applied { profile, fields } => {
                 assert_eq!(profile, "standalone");
                 assert!(!fields.is_empty(), "must report what it set");
+                assert!(
+                    !fields.iter().any(|f| f.contains("arenas-cap")),
+                    "arena cap is owned by the re-spawn, not the profile fields log"
+                );
             }
             ProfileOutcome::None => panic!("expected Applied outcome"),
         }

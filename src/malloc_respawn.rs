@@ -41,12 +41,35 @@ struct ScannedOverrides {
     thp: bool,
 }
 
-/// Lightweight scan of raw argv for `--memory-arenas-cap N` (or `=N`) and
-/// `--memory-thp`. We can't use clap here because `clap::parse()` requires
-/// the full config struct, and the caller needs the answer BEFORE jemalloc
-/// reads its config. Scans the FULL argv (no early break) so both flags are
-/// found regardless of order. Malformed values resolve to `None`/absent —
-/// clap rejects those command lines later anyway, before the server starts.
+/// Arena cap the `standalone` profile fills when the operator did not pass
+/// `--memory-arenas-cap` explicitly. A single-shard instance has one hot
+/// allocator thread, so jemalloc's baked-in `narenas:8` (sized for the
+/// multi-shard thread-per-core layout) is oversized — 2 arenas cut the
+/// allocator's per-arena metadata and dirty-page cache RSS baseline with no
+/// contention cost at this concurrency. Kept in lockstep with
+/// `ServerConfig::apply_profile` (config.rs), which fills the same value into
+/// the config struct for the startup transparency log.
+#[cfg(any(feature = "jemalloc", test))]
+const STANDALONE_PROFILE_ARENAS: u32 = 2;
+
+/// Lightweight scan of raw argv for `--memory-arenas-cap N` (or `=N`),
+/// `--memory-thp`, and `--profile standalone` (which fills an arena cap when
+/// none was passed explicitly). We can't use clap here because `clap::parse()`
+/// requires the full config struct, and the caller needs the answer BEFORE
+/// jemalloc reads its config — the same reason the `standalone` profile's
+/// arena cap must be resolved here rather than in `apply_profile` (which runs
+/// long after allocator init). Scans the FULL argv (no early break) so every
+/// flag is found regardless of order. Malformed values resolve to
+/// `None`/absent — clap rejects those command lines later anyway, before the
+/// server starts.
+///
+/// Precedence: an explicit `--memory-arenas-cap` (even malformed) always wins
+/// over the profile's fill — `arenas_flag_seen` gates the fill, so the profile
+/// only supplies a default when no cap flag appeared at all. This mirrors
+/// `apply_profile`'s "explicit flag wins over preset" rule. A conf-file
+/// `profile standalone` cannot reach this scan (conf merge happens after the
+/// re-spawn decision), exactly like conf-file `memory-arenas-cap` — pass
+/// `--profile standalone` on the CLI for the arena tuning to take effect.
 ///
 /// Operates on `OsString` argv (via `as_encoded_bytes`) so non-UTF-8 argv
 /// never panics, and so [`maybe_respawn_with_memory_overrides`] can re-exec
@@ -57,6 +80,8 @@ fn scan_argv(args: &[std::ffi::OsString]) -> ScannedOverrides {
         narenas: None,
         thp: false,
     };
+    let mut arenas_flag_seen = false;
+    let mut profile_standalone = false;
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_encoded_bytes();
@@ -67,6 +92,7 @@ fn scan_argv(args: &[std::ffi::OsString]) -> ScannedOverrides {
         let parse_narenas = |s: &str| s.parse::<u32>().ok().filter(|n| (1..=256).contains(n));
         if let Some(rest) = a.strip_prefix(b"--memory-arenas-cap=") {
             scanned.narenas = std::str::from_utf8(rest).ok().and_then(parse_narenas);
+            arenas_flag_seen = true;
             i += 1;
             continue;
         }
@@ -74,6 +100,7 @@ fn scan_argv(args: &[std::ffi::OsString]) -> ScannedOverrides {
             if i + 1 < args.len() {
                 scanned.narenas = args[i + 1].as_os_str().to_str().and_then(parse_narenas);
             }
+            arenas_flag_seen = true;
             i += 2;
             continue;
         }
@@ -82,7 +109,23 @@ fn scan_argv(args: &[std::ffi::OsString]) -> ScannedOverrides {
             i += 1;
             continue;
         }
+        if let Some(rest) = a.strip_prefix(b"--profile=") {
+            profile_standalone |= rest == b"standalone";
+            i += 1;
+            continue;
+        }
+        if a == b"--profile" {
+            profile_standalone |=
+                i + 1 < args.len() && args[i + 1].as_encoded_bytes() == b"standalone";
+            i += 2;
+            continue;
+        }
         i += 1;
+    }
+    // Fill the profile's arena cap only when the operator left it unset —
+    // explicit `--memory-arenas-cap` (seen above) always wins.
+    if profile_standalone && !arenas_flag_seen {
+        scanned.narenas = Some(STANDALONE_PROFILE_ARENAS);
     }
     scanned
 }
@@ -349,6 +392,56 @@ mod tests {
         assert_eq!(
             scan_argv(&argv(&["--memory-arenas-cap=1"])).narenas,
             Some(1)
+        );
+    }
+
+    #[test]
+    fn scan_standalone_profile_fills_arena_cap() {
+        // --profile standalone (both spellings) fills the single-shard arena
+        // cap when the operator did not pass --memory-arenas-cap.
+        assert_eq!(
+            scan_argv(&argv(&["--profile", "standalone"])).narenas,
+            Some(STANDALONE_PROFILE_ARENAS)
+        );
+        assert_eq!(
+            scan_argv(&argv(&["--profile=standalone"])).narenas,
+            Some(STANDALONE_PROFILE_ARENAS)
+        );
+        // Unrelated / unknown profiles do not fill.
+        assert_eq!(scan_argv(&argv(&["--profile", "bogus"])).narenas, None);
+        assert_eq!(scan_argv(&argv(&["--profile=bogus"])).narenas, None);
+    }
+
+    #[test]
+    fn scan_explicit_arenas_cap_wins_over_standalone_profile() {
+        // Explicit --memory-arenas-cap always beats the profile's fill,
+        // regardless of flag order (mirrors apply_profile precedence).
+        assert_eq!(
+            scan_argv(&argv(&[
+                "--profile",
+                "standalone",
+                "--memory-arenas-cap",
+                "16"
+            ]))
+            .narenas,
+            Some(16)
+        );
+        assert_eq!(
+            scan_argv(&argv(&["--memory-arenas-cap=16", "--profile=standalone"])).narenas,
+            Some(16)
+        );
+        // A malformed explicit cap still suppresses the profile fill (the flag
+        // "was seen"); clap rejects the bad value before the server starts, so
+        // silently substituting the profile default would mask the operator's
+        // typo behind a working start.
+        assert_eq!(
+            scan_argv(&argv(&[
+                "--profile",
+                "standalone",
+                "--memory-arenas-cap=bad"
+            ]))
+            .narenas,
+            None
         );
     }
 
