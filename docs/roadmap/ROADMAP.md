@@ -1,6 +1,6 @@
 # Moon Product Roadmap — v0.7 → v1.0 → Enterprise
 
-**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.8.0 (2026-07-16)
+**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.8.1 (2026-07-19)
 **Companion docs:** [Scale & HA architecture](scale-ha-architecture.md) · [Standalone horizontal scale](standalone-horizontal-scale.md)
 *(The commercial Enterprise Edition plan is maintained privately.)*
 
@@ -183,6 +183,7 @@ deliberately aggressive but each release has a **single headline** and hard exit
 | **v0.7.0** | ✅ **shipped 2026-07-14** | **Replication GA for multi-shard masters** | The HA unblock; also absorbed storage-kernel M0–M4 |
 | **v0.7.1** | ✅ **shipped 2026-07-15** | SQ8 CPU-storm fix + deterministic replica TTL | Patch |
 | **v0.8.0** | ✅ **shipped 2026-07-16** | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
+| **v0.8.1** | ✅ **shipped 2026-07-19** | Deploy-safe busy-poll (O3 governor) + single-shard tuning preset; CPU-cache digest closed | Patch — folds the post-v0.8.0 perf/correctness train (#361–#392) + `conf/moon-standalone.conf` |
 | **v0.9.0** | 2026-10 | **Horizontal scale: cluster GA-hardened on monoio + multi-shard replicas** | Re-slotted from v0.8; adds the replica-side shard gap |
 | **v0.10.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem (re-slotted from v0.9) |
 | **v1.0.0** | 2027-Q1 | **GA / production contract fulfilled** | Stability promise, LTS |

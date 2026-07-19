@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-07-19
+
+### Added
+- **`conf/moon-standalone.conf` + a broadened `--profile standalone`: the
+  best single-shard tuning as one flag or one file, now safe on any host.**
+  `--profile standalone` still fills `--shards 1`, `--io-busy-poll-us 40`, and
+  `--io-driver epoll`, and now additionally drops the jemalloc arena cap to `2`
+  on `--features jemalloc` builds — a single-shard instance has one hot
+  allocator thread, so the baked-in 8 arenas are oversized and 2 lowers the RSS
+  baseline with no contention cost. The arena cap is resolved in the pre-clap
+  allocator re-spawn scan (the only path that reaches jemalloc before init), so
+  it is CLI-only — `--profile standalone` on the command line folds it in; a
+  conf-file `profile standalone` still sets the other three. The new annotated
+  [`conf/moon-standalone.conf`](conf/moon-standalone.conf) ships the same tuning
+  (durability on) as an editable config file. Paired with the O3 contention
+  governor below, the preset no longer requires pinned cores — the tuning and
+  configuration guides drop the pinned-cores-only caveat throughout and the
+  README/architecture docs are updated to match.
+
 ### Performance
 - **`--io-busy-poll-us` is now deploy-safe: a per-shard contention governor
   gates the spin on shared cores (O3).** The p=1 busy-poll win (GCE pinned:
