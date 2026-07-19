@@ -102,10 +102,13 @@ behavior change:
 
 ```text
 INFO --profile standalone: set --shards=1, --io-busy-poll-us=40, --io-driver=epoll
-     (implied by io-busy-poll-us), --memory-arenas-cap=2 (single-shard allocator
-     footprint) (unset flags only; pass a flag explicitly on the CLI to override
-     the preset)
+     (implied by io-busy-poll-us) (unset flags only; pass a flag explicitly on the
+     CLI to override the preset)
 ```
+
+(On jemalloc builds, a CLI `--profile standalone` also drops the arena cap to `2` —
+applied by the allocator before this log line, so it isn't listed among the fields
+above. See the arena-cap note below.)
 
 ### `standalone`
 
