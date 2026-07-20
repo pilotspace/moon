@@ -9,7 +9,7 @@ use crate::util::parse_cache_search_results;
 ///
 /// Obtain via [`MoonClient::cache`](crate::MoonClient::cache).
 pub struct CacheClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl CacheClient {

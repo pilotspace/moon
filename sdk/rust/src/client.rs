@@ -30,7 +30,7 @@ macro_rules! cmd {
 /// use moondb::MoonClient;
 ///
 /// #[tokio::main]
-/// async fn main() -> moon::Result<()> {
+/// async fn main() -> moondb::Result<()> {
 ///     let mut client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     client.set("hello", "world").await?;
 ///     let v: String = client.get("hello").await?;
@@ -38,9 +38,19 @@ macro_rules! cmd {
 ///     Ok(())
 /// }
 /// ```
+/// The connection is a [`redis::aio::ConnectionManager`], NOT a bare
+/// `MultiplexedConnection`: the manager transparently RECONNECTS (with
+/// backoff) when the underlying socket drops — a server restart, an
+/// idle-timeout reap, a transient network blip. A `MultiplexedConnection`
+/// opens one socket at connect time and never rebuilds it, so after any drop
+/// every later command fails with `broken pipe` forever until the whole
+/// client is reconstructed. That wedged Lunaris in production after a live
+/// Moon daemon flip; see `sdk/rust/tests/reconnect.rs`. `ConnectionManager`
+/// is `Clone` and shares its reconnect state across clones via `Arc`, so a
+/// heal on any handle repairs every sub-client.
 #[derive(Clone)]
 pub struct MoonClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl MoonClient {
@@ -52,7 +62,7 @@ impl MoonClient {
     /// - `rediss://127.0.0.1:6399` — TLS (requires `tls-rustls` or `tls-native-tls` feature)
     pub async fn connect(url: impl redis::IntoConnectionInfo) -> Result<Self> {
         let client = redis::Client::open(url)?;
-        let conn = client.get_multiplexed_async_connection().await?;
+        let conn = client.get_connection_manager().await?;
         Ok(Self { conn })
     }
 
@@ -65,16 +75,21 @@ impl MoonClient {
         response_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = redis::Client::open(url)?;
-        let config = redis::AsyncConnectionConfig::new().set_response_timeout(Some(response_timeout));
-        let conn = client
-            .get_multiplexed_async_connection_with_config(&config)
-            .await?;
+        // `ConnectionManagerConfig` carries the same per-command response
+        // timeout as the old `AsyncConnectionConfig` path, so the io-failsafe
+        // contract (every command is response-bounded) is preserved — while
+        // ALSO gaining transparent reconnect on a dropped socket.
+        let config =
+            redis::aio::ConnectionManagerConfig::new().set_response_timeout(Some(response_timeout));
+        let conn = client.get_connection_manager_with_config(config).await?;
         Ok(Self { conn })
     }
 
-    /// Access the raw underlying multiplexed connection for operations not covered
-    /// by the typed API.
-    pub fn inner_mut(&mut self) -> &mut redis::aio::MultiplexedConnection {
+    /// Access the raw underlying reconnecting connection for operations not
+    /// covered by the typed API. `ConnectionManager` implements `ConnectionLike`,
+    /// so `redis::cmd(..).query_async(client.inner_mut())` works exactly as it
+    /// did against the old `MultiplexedConnection`.
+    pub fn inner_mut(&mut self) -> &mut redis::aio::ConnectionManager {
         &mut self.conn
     }
 
