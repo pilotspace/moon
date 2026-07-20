@@ -22,7 +22,7 @@ use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
-use crate::storage::eviction::try_evict_if_needed;
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::shared::resolve_ft_search_as_of_lsn;
@@ -1024,7 +1024,7 @@ pub async fn handle_connection(
                                                 d_cmd,
                                             );
                                         let evict_result =
-                                            try_evict_if_needed(&mut *guard, &rt);
+                                            evict_to_budget(&mut *guard, &rt, EvictionRun::plain());
                                         if !shrink_only {
                                             if let Err(oom_frame) = evict_result {
                                                 responses[resp_idx] = oom_frame;
@@ -2251,7 +2251,7 @@ pub async fn handle_connection(
                                 // See `db_quota::is_shrink_only_command`.
                                 let shrink_only =
                                     crate::storage::db_quota::is_shrink_only_command(d_cmd);
-                                let evict_result = try_evict_if_needed(&mut *guard, &rt);
+                                let evict_result = evict_to_budget(&mut *guard, &rt, EvictionRun::plain());
                                 if !shrink_only {
                                     if let Err(oom_frame) = evict_result {
                                         responses[resp_idx] = oom_frame;

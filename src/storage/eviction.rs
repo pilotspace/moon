@@ -75,7 +75,7 @@ pub fn publish_maxmemory_hints(config: &RuntimeConfig) {
 }
 
 /// Lock-free pre-gate for the inline write path: `true` iff the slow path
-/// (`try_evict_if_needed_*`) would PROVABLY no-op, i.e. `maxmemory == 0` or
+/// (`evict_to_budget`) would PROVABLY no-op, i.e. `maxmemory == 0` or
 /// `estimated_memory <= budget` with the budget computed exactly as the slow
 /// path does (`elastic_budget.min(maxmemory)`, else per-shard split). Any
 /// uncertainty (unpublished hints) returns `false` → caller takes the lock
@@ -217,7 +217,7 @@ pub enum EvictionPolicy {
 impl EvictionPolicy {
     /// Parse a policy name string (case-insensitive) into an EvictionPolicy.
     ///
-    /// Allocation-free: called per `try_evict_if_needed` invocation (i.e. per
+    /// Allocation-free: called per `evict_to_budget` invocation (i.e. per
     /// write command under memory pressure), so it must not build a lowercase
     /// `String` on every call.
     pub fn from_str(s: &str) -> Self {
@@ -262,8 +262,9 @@ fn oom_error() -> Frame {
 
 /// Context for spilling evicted entries to disk instead of deleting them.
 ///
-/// When provided to `try_evict_if_needed_with_spill`, evicted entries are
-/// serialized to KvLeafPage DataFiles before being removed from RAM.
+/// When provided to [`evict_to_budget`] via [`EvictionRun::sync_spill`],
+/// evicted entries are serialized to KvLeafPage DataFiles before being
+/// removed from RAM.
 pub struct SpillContext<'a> {
     pub shard_dir: &'a Path,
     pub manifest: &'a mut ShardManifest,
@@ -275,6 +276,255 @@ pub struct SpillContext<'a> {
     /// fallback) MUST restamp this per iteration; the async batch path
     /// carries the equivalent on `SpillRequest.db_index`.
     pub db_index: usize,
+}
+
+/// Where eviction victims go (W4: the one eviction entry point).
+///
+/// The former `try_evict_if_needed*` family encoded this choice — plus every
+/// optional parameter — in 13 function names. The choice is now data.
+pub enum EvictionSink<'s, 'm> {
+    /// Drop victims with no tiering. An evicting policy (`allkeys-*` /
+    /// `volatile-*`) still honors Redis semantics and reclaims the budget by
+    /// DELETING victims; only `noeviction` rejects with OOM. Each dropped key
+    /// is reported to [`EvictionRun::report`]'s sink (dual-plane DEL
+    /// emission, task #34).
+    Plain,
+    /// Durable batched sync spill: pwrite + fsync + manifest commit BEFORE
+    /// any hot value is dropped (`evict_batch_durable` — shared multi-entry
+    /// files, one manifest commit per file). `None` behaves as `Plain`
+    /// (kept as an `Option` because several call sites decide at runtime).
+    SyncSpill(Option<&'s mut SpillContext<'m>>),
+    /// AOF-backstopped async spill via the background `SpillThread`.
+    ///
+    /// ## Durability ordering (crash-window fix)
+    ///
+    /// Under `--appendonly yes`: queue the `SpillRequest`, then immediately
+    /// free RAM — safe ONLY because the AOF durably records the original
+    /// write, so a crash between "dropped from RAM" and "spilled to disk" is
+    /// recovered by AOF replay.
+    ///
+    /// Under `--appendonly no` there is no second copy once a value leaves
+    /// RAM, so with a `manifest` available this batches victims through
+    /// [`evict_batch_durable`] (fully durable before drop); with no manifest
+    /// reachable it falls back to plain-drop (cap still enforced, Redis
+    /// semantics, `noeviction` OOMs) — the tick-driven memory-pressure
+    /// cascade with its manifest picks up durable spilling within 100ms.
+    AsyncSpill {
+        sender: &'s flume::Sender<SpillRequest>,
+        shard_dir: &'s Path,
+        next_file_id: &'s mut u64,
+        db_index: usize,
+        manifest: Option<&'s mut ShardManifest>,
+    },
+}
+
+/// Options for [`evict_to_budget`] (W4).
+///
+/// Construct with [`EvictionRun::plain`] / [`EvictionRun::sync_spill`] /
+/// [`EvictionRun::async_spill`], then chain the optional knobs:
+///
+/// ```ignore
+/// evict_to_budget(db, config, EvictionRun::plain().budget(elastic).report(&mut sink))?;
+/// ```
+pub struct EvictionRun<'s, 'm, 'r> {
+    /// Memory usage to reclaim against. `None` = `db.estimated_memory()`
+    /// (single-DB, Redis-compatible). The memory-pressure cascade passes the
+    /// aggregate across all databases.
+    total_memory: Option<usize>,
+    /// Elastic per-shard budget override (GAP-1). `0` keeps the static
+    /// `maxmemory / num_shards`; a non-zero value (from
+    /// `ShardDatabases::recompute_elastic_budget`) lets a hot shard borrow
+    /// headroom donated by under-budget siblings. Always capped at the
+    /// instance `maxmemory`.
+    budget_override: usize,
+    sink: EvictionSink<'s, 'm>,
+    /// Sink for every plain-dropped (non-spill) victim key — task #34: write
+    /// paths emit a dual-plane DEL record for keys eviction deleted with no
+    /// cold-tier copy. Fires ONLY for plain drops — a spilled entry stays
+    /// cold-readable, not deleted, so it is never reported here.
+    on_plain_drop: Option<&'r mut dyn FnMut(&[u8])>,
+}
+
+impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
+    /// Victims are dropped (no tiering).
+    pub fn plain() -> Self {
+        Self {
+            total_memory: None,
+            budget_override: 0,
+            sink: EvictionSink::Plain,
+            on_plain_drop: None,
+        }
+    }
+
+    /// Victims spill durably via the batch writer; `None` = plain drop.
+    pub fn sync_spill(spill: Option<&'s mut SpillContext<'m>>) -> Self {
+        Self {
+            total_memory: None,
+            budget_override: 0,
+            sink: EvictionSink::SyncSpill(spill),
+            on_plain_drop: None,
+        }
+    }
+
+    /// Victims spill via the background `SpillThread` (AOF-backstopped) —
+    /// see [`EvictionSink::AsyncSpill`] for the `--appendonly no` fallbacks.
+    pub fn async_spill(
+        sender: &'s flume::Sender<SpillRequest>,
+        shard_dir: &'s Path,
+        next_file_id: &'s mut u64,
+        db_index: usize,
+        manifest: Option<&'s mut ShardManifest>,
+    ) -> Self {
+        Self {
+            total_memory: None,
+            budget_override: 0,
+            sink: EvictionSink::AsyncSpill {
+                sender,
+                shard_dir,
+                next_file_id,
+                db_index,
+                manifest,
+            },
+            on_plain_drop: None,
+        }
+    }
+
+    /// Reclaim against this total instead of `db.estimated_memory()`
+    /// (aggregate checking from the memory-pressure cascade).
+    #[must_use]
+    pub fn total(mut self, total_memory: usize) -> Self {
+        self.total_memory = Some(total_memory);
+        self
+    }
+
+    /// Elastic per-shard budget override (`0` = static per-shard split).
+    #[must_use]
+    pub fn budget(mut self, budget_override: usize) -> Self {
+        self.budget_override = budget_override;
+        self
+    }
+
+    /// Report every plain-dropped victim key (dual-plane DEL, task #34).
+    #[must_use]
+    pub fn report(mut self, on_plain_drop: &'r mut dyn FnMut(&[u8])) -> Self {
+        self.on_plain_drop = Some(on_plain_drop);
+        self
+    }
+}
+
+/// Evict until memory is back under the shard budget (W4: the single
+/// eviction entry point — replaces the 13-name `try_evict_if_needed*`
+/// family; the victim destination and optional knobs are [`EvictionRun`]
+/// data instead of name suffixes).
+///
+/// Returns `Ok(())` once within budget (or when `maxmemory` is 0);
+/// `Err(Frame)` with an OOM error when eviction cannot free enough memory
+/// (`noeviction` policy, no evictable victims, or a sink that cannot make
+/// progress).
+///
+/// The budget compared against is PER-SHARD (`maxmemory / num_shards`, or
+/// the elastic override capped at instance `maxmemory`) — `maxmemory` is a
+/// whole-instance cap that each shard enforces independently.
+pub fn evict_to_budget(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    run: EvictionRun<'_, '_, '_>,
+) -> Result<(), Frame> {
+    if config.maxmemory == 0 {
+        return Ok(());
+    }
+
+    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+
+    let budget = if run.budget_override > 0 {
+        run.budget_override.min(config.maxmemory)
+    } else {
+        config.maxmemory_per_shard()
+    };
+
+    let mut sink = run.sink;
+    let mut noop = |_: &[u8]| {};
+    let on_plain_drop: &mut dyn FnMut(&[u8]) = match run.on_plain_drop {
+        Some(f) => f,
+        None => &mut noop,
+    };
+
+    let mut current_total = run.total_memory.unwrap_or_else(|| db.estimated_memory());
+    while current_total > budget {
+        if policy == EvictionPolicy::NoEviction {
+            return Err(oom_error());
+        }
+        let before = db.estimated_memory();
+        let deficit = current_total.saturating_sub(budget);
+        let progressed = match &mut sink {
+            EvictionSink::Plain | EvictionSink::SyncSpill(None) => {
+                evict_one_with_spill(db, config, &policy, None, on_plain_drop)
+            }
+            EvictionSink::SyncSpill(Some(ctx)) => {
+                // W2: reclaim the whole deficit as durable batches (shared
+                // multi-entry files, ONE manifest commit per file) instead of
+                // one single-entry file + one blocking manifest fsync
+                // round-trip per victim.
+                evict_batch_durable(
+                    db,
+                    config,
+                    &policy,
+                    ctx.shard_dir,
+                    ctx.next_file_id,
+                    ctx.manifest,
+                    ctx.db_index,
+                    deficit,
+                ) > 0
+            }
+            EvictionSink::AsyncSpill {
+                sender,
+                shard_dir,
+                next_file_id,
+                db_index,
+                manifest,
+            } => {
+                if config.appendonly != "yes" {
+                    match manifest.as_deref_mut() {
+                        // No AOF backstop but a manifest is reachable:
+                        // durable batched spill before any drop.
+                        Some(m) => {
+                            evict_batch_durable(
+                                db,
+                                config,
+                                &policy,
+                                shard_dir,
+                                next_file_id,
+                                m,
+                                *db_index,
+                                deficit,
+                            ) > 0
+                        }
+                        // No manifest and no AOF backstop: durable spill is
+                        // impossible here, but the cap is still enforced —
+                        // evicting policies plain-drop, `noeviction` OOMs.
+                        None => evict_one_with_spill(db, config, &policy, None, on_plain_drop),
+                    }
+                } else {
+                    evict_one_async_spill(
+                        db,
+                        config,
+                        &policy,
+                        sender,
+                        shard_dir,
+                        next_file_id,
+                        *db_index,
+                    )
+                }
+            }
+        };
+        if !progressed {
+            return Err(oom_error());
+        }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
+    }
+
+    Ok(())
 }
 
 /// Compute a shard's elastic memory budget from a snapshot of every shard's
@@ -313,170 +563,6 @@ pub fn compute_elastic_budget(shard_id: usize, base: usize, used: &[usize]) -> u
         return base;
     }
     base.saturating_add(surplus / hot)
-}
-
-/// Check if eviction is needed and attempt to free memory.
-///
-/// Returns Ok(()) if memory is within limits (or maxmemory is 0).
-/// Returns Err(Frame) with OOM error if eviction fails to free enough memory.
-pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill(db, config, None)
-}
-
-/// Like [`try_evict_if_needed`] but enforcing an elastic per-shard budget
-/// (`0` falls back to the static `maxmemory / num_shards`).
-pub fn try_evict_if_needed_budget(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    budget_override: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_budget_reporting(db, config, budget_override, &mut |_| {})
-}
-
-/// Like [`try_evict_if_needed_budget`], but reports every plain-dropped
-/// (non-spill) victim key to `on_plain_drop` — task #34 (Wave A):
-/// connection-handler-context write-eviction gates (inline SET fast path,
-/// generic per-command write path, SPSC cross-shard write path) use this to
-/// emit a dual-plane DEL record for keys the caller's eviction just deleted
-/// with no cold-tier copy. Callers that don't care (Lua bridge, the tokio
-/// handlers, unit tests) keep calling [`try_evict_if_needed_budget`], which
-/// forwards here with a no-op sink — behavior-identical to before this
-/// parameter existed.
-pub fn try_evict_if_needed_budget_reporting(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    budget_override: usize,
-    on_plain_drop: &mut dyn FnMut(&[u8]),
-) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill_and_total_budget_reporting(
-        db,
-        config,
-        None,
-        db.estimated_memory(),
-        budget_override,
-        on_plain_drop,
-    )
-}
-
-/// Check if eviction is needed, optionally spilling evicted entries to disk.
-///
-/// When `spill` is `Some`, evicted entries are written to a DataFile before
-/// being removed from RAM. When `None`, behaves identically to
-/// `try_evict_if_needed` (entries are simply deleted).
-///
-/// Spill failures are best-effort: if I/O fails, a warning is logged and the
-/// entry is still removed from RAM.
-pub fn try_evict_if_needed_with_spill(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    spill: Option<&mut SpillContext<'_>>,
-) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill_and_total(db, config, spill, db.estimated_memory())
-}
-
-/// Eviction with explicit total_memory parameter (for aggregate checking).
-///
-/// When called from the memory pressure cascade, `total_memory` should be the
-/// aggregate across all databases. When called from the connection handler,
-/// pass `db.estimated_memory()` for single-DB behavior (Redis-compatible).
-pub fn try_evict_if_needed_with_spill_and_total(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    spill: Option<&mut SpillContext<'_>>,
-    total_memory: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill_and_total_budget(db, config, spill, total_memory, 0)
-}
-
-/// Core sync eviction loop with an elastic budget override (GAP-1).
-///
-/// `budget_override == 0` keeps the static `maxmemory / num_shards`
-/// threshold; a non-zero value (from
-/// `ShardDatabases::recompute_elastic_budget`) lets a hot shard borrow
-/// headroom donated by under-budget siblings before evicting.
-pub fn try_evict_if_needed_with_spill_and_total_budget(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    spill: Option<&mut SpillContext<'_>>,
-    total_memory: usize,
-    budget_override: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_with_spill_and_total_budget_reporting(
-        db,
-        config,
-        spill,
-        total_memory,
-        budget_override,
-        &mut |_| {},
-    )
-}
-
-/// Like [`try_evict_if_needed_with_spill_and_total_budget`], but reports
-/// every plain-dropped (non-spill) victim key to `on_plain_drop` — task #34
-/// (Wave A): background-tick callers (active-expiry-adjacent eviction sweep,
-/// memory-pressure-cascade sync-spill fallback) use this to emit a
-/// dual-plane DEL record. `on_plain_drop` fires ONLY when `spill` was `None`
-/// for that victim — a spilled entry stays cold-readable, not deleted, so it
-/// must never be reported here (see `storage::eviction`'s spill-vs-plain-drop
-/// distinction, module docs of `replication::reason_del`).
-pub fn try_evict_if_needed_with_spill_and_total_budget_reporting(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    mut spill: Option<&mut SpillContext<'_>>,
-    total_memory: usize,
-    budget_override: usize,
-    on_plain_drop: &mut dyn FnMut(&[u8]),
-) -> Result<(), Frame> {
-    if config.maxmemory == 0 {
-        return Ok(());
-    }
-
-    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
-
-    // Compare against the PER-SHARD budget, not the whole-instance maxmemory.
-    // `maxmemory` is a whole-instance cap; each shard enforces independently, so
-    // the threshold is `maxmemory / num_shards` (single shard ⇒ unchanged). This
-    // is what bounds aggregate RSS in multishard mode. An elastic override
-    // (capped at the instance maxmemory) widens the threshold for hot shards.
-    let budget = if budget_override > 0 {
-        budget_override.min(config.maxmemory)
-    } else {
-        config.maxmemory_per_shard()
-    };
-    let mut current_total = total_memory;
-    while current_total > budget {
-        if policy == EvictionPolicy::NoEviction {
-            return Err(oom_error());
-        }
-        let before = db.estimated_memory();
-        // W2: with a SpillContext, reclaim the whole deficit as durable
-        // batches (shared multi-entry files, ONE manifest commit per file)
-        // instead of one single-entry file + one blocking manifest fsync
-        // round-trip per victim. Without one, plain-drop one victim at a
-        // time (unchanged).
-        let progressed = match spill.as_deref_mut() {
-            Some(ctx) => {
-                evict_batch_durable(
-                    db,
-                    config,
-                    &policy,
-                    ctx.shard_dir,
-                    ctx.next_file_id,
-                    ctx.manifest,
-                    ctx.db_index,
-                    current_total.saturating_sub(budget),
-                ) > 0
-            }
-            None => evict_one_with_spill(db, config, &policy, None, on_plain_drop),
-        };
-        if !progressed {
-            return Err(oom_error());
-        }
-        let after = db.estimated_memory();
-        current_total = current_total.saturating_sub(before.saturating_sub(after));
-    }
-
-    Ok(())
 }
 
 /// Seed value for a shard's spill `file_id` counter after recovery.
@@ -536,295 +622,6 @@ pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
         Some(m) => m + 1,
         None => 1,
     }
-}
-
-/// Evict over-budget entries, spilling them to disk asynchronously via a
-/// background `SpillThread` instead of doing a synchronous pwrite on the event
-/// loop.
-///
-/// Per victim (`evict_one_async_spill`): under `--appendonly yes`, serialize
-/// the key/value into a `SpillRequest`, **`try_send` it to the spill channel
-/// BEFORE removing the entry from the hot tier, and only remove from RAM
-/// once the send succeeds.** This ordering is fail-safe under an AOF
-/// backstop: if the channel is full or disconnected the send fails, the key
-/// stays in RAM, and the eviction loop bails out to retry on the next tick —
-/// no acknowledged data is lost, and a crash before the spill lands on disk
-/// is covered by AOF replay. The worst case under sustained backpressure is
-/// keys remaining resident (eventually an OOM write-rejection once at
-/// budget), which is correct behaviour, not data loss.
-///
-/// This family of wrappers has no `ShardManifest` available (only the
-/// tick-driven memory-pressure cascade does — see
-/// `try_evict_if_needed_async_spill_with_total_budget`'s `manifest`
-/// parameter), so under `--appendonly no` `evict_one_async_spill` bails
-/// rather than risk the crash window described on its doc comment.
-///
-/// Callers must poll `SpillThread::drain_completions()` to apply the manifest
-/// and `ColdIndex` updates produced by completed spills.
-pub fn try_evict_if_needed_async_spill(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    db_index: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_with_total(
-        db,
-        config,
-        sender,
-        shard_dir,
-        next_file_id,
-        db.estimated_memory(),
-        db_index,
-    )
-}
-
-/// Async spill eviction with explicit total_memory parameter.
-pub fn try_evict_if_needed_async_spill_with_total(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    total_memory: usize,
-    db_index: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_with_total_budget(
-        db,
-        config,
-        sender,
-        shard_dir,
-        next_file_id,
-        total_memory,
-        db_index,
-        0,
-        None,
-    )
-}
-
-/// Like [`try_evict_if_needed_async_spill`] but enforcing an elastic
-/// per-shard budget (`0` falls back to the static `maxmemory / num_shards`).
-pub fn try_evict_if_needed_async_spill_budget(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    db_index: usize,
-    budget_override: usize,
-) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_budget_reporting(
-        db,
-        config,
-        sender,
-        shard_dir,
-        next_file_id,
-        db_index,
-        budget_override,
-        &mut |_| {},
-    )
-}
-
-/// Like [`try_evict_if_needed_async_spill_budget`], but reports every
-/// plain-dropped (non-spill) victim key to `on_plain_drop` — task #34 review
-/// (defect 3): wires the Lua bystander-eviction gate
-/// (`scripting::bridge::LuaEvictionCtx::gate`) to the same dual-plane DEL
-/// emission every other write-path eviction call site already has. No
-/// `ShardManifest` is ever available to this call site (the Lua ctx only
-/// caches a `spill_sender`), so `manifest` is always `None` here — meaning a
-/// non-string victim (or ANY victim under `--appendonly no`) reliably takes
-/// the "no manifest reachable" plain-drop fallback inside
-/// `try_evict_if_needed_async_spill_with_total_budget_reporting`, not the
-/// durable-batch branch. Only that fallback ever calls `on_plain_drop`.
-pub fn try_evict_if_needed_async_spill_budget_reporting(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    db_index: usize,
-    budget_override: usize,
-    on_plain_drop: &mut dyn FnMut(&[u8]),
-) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_with_total_budget_reporting(
-        db,
-        config,
-        sender,
-        shard_dir,
-        next_file_id,
-        db.estimated_memory(),
-        db_index,
-        budget_override,
-        None,
-        on_plain_drop,
-    )
-}
-
-/// Async spill eviction with an elastic budget override (GAP-1; see
-/// `try_evict_if_needed_with_spill_and_total_budget`).
-///
-/// ## Durability ordering (crash-window fix)
-///
-/// Under `--appendonly yes` this uses the AOF-backstopped fast path
-/// (`evict_one_async_spill`): queue the `SpillRequest` on the background
-/// `SpillThread`'s channel, then immediately free RAM. That ordering is safe
-/// ONLY because the AOF already durably records the original write — a
-/// crash between "dropped from RAM" and "spilled to disk" is fully
-/// recoverable by AOF replay on restart. This is a deliberate trade-off
-/// (RAM relief now, disk durability shortly after) that keeps pwrite I/O off
-/// the event loop.
-///
-/// Under `--appendonly no` there is no second copy of the value anywhere
-/// once it leaves RAM, so the fast path would be unconditional, unrecoverable
-/// data loss on a crash. This function instead batches victims into
-/// [`evict_batch_durable`], which performs a **fully synchronous,
-/// durable spill (pwrite + fsync + manifest commit) before dropping any hot
-/// value**, provided a `ShardManifest` is available (today only the
-/// tick-driven memory-pressure cascade threads one through — see
-/// `crate::shard::persistence_tick::handle_memory_pressure`). Batching (up to
-/// `NO_AOF_BATCH_CAP` keys per fsync, mirroring the async path's own
-/// `FLUSH_ENTRY_CAP`) is required, not optional: an earlier version of this
-/// fix did one fsync per evicted key and stalled the single-threaded shard
-/// event loop under sustained eviction pressure (thousands of individual
-/// fsyncs serialized against a write-heavy workload). Callers with no
-/// manifest access (e.g. the inline per-connection write-path eviction gate)
-/// cannot safely spill durably under `--appendonly no` and bail (no
-/// eviction, hot values retained) rather than manufacture a crash-loss
-/// window; the next 100ms memory-pressure tick picks up the slack via the
-/// durable batched path.
-#[allow(clippy::too_many_arguments)]
-pub fn try_evict_if_needed_async_spill_with_total_budget(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    total_memory: usize,
-    db_index: usize,
-    budget_override: usize,
-    manifest: Option<&mut ShardManifest>,
-) -> Result<(), Frame> {
-    try_evict_if_needed_async_spill_with_total_budget_reporting(
-        db,
-        config,
-        sender,
-        shard_dir,
-        next_file_id,
-        total_memory,
-        db_index,
-        budget_override,
-        manifest,
-        &mut |_| {},
-    )
-}
-
-/// Like [`try_evict_if_needed_async_spill_with_total_budget`], but reports
-/// every plain-dropped (non-spill) victim key to `on_plain_drop` — task #34
-/// (Wave A). Only the `config.appendonly != "yes"` + no-manifest fallback
-/// branch below ever plain-drops; the durable-batch and async-spill branches
-/// never call `on_plain_drop` (both leave a cold-tier/AOF-recoverable copy).
-#[allow(clippy::too_many_arguments)]
-pub fn try_evict_if_needed_async_spill_with_total_budget_reporting(
-    db: &mut Database,
-    config: &RuntimeConfig,
-    sender: &flume::Sender<SpillRequest>,
-    shard_dir: &Path,
-    next_file_id: &mut u64,
-    total_memory: usize,
-    db_index: usize,
-    budget_override: usize,
-    manifest: Option<&mut ShardManifest>,
-    on_plain_drop: &mut dyn FnMut(&[u8]),
-) -> Result<(), Frame> {
-    if config.maxmemory == 0 {
-        return Ok(());
-    }
-
-    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
-
-    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total_budget`).
-    let budget = if budget_override > 0 {
-        budget_override.min(config.maxmemory)
-    } else {
-        config.maxmemory_per_shard()
-    };
-
-    if config.appendonly != "yes" {
-        let Some(manifest) = manifest else {
-            // No manifest reachable from this call site and no AOF backstop:
-            // durable spill (evict_batch_durable, below) is impossible
-            // here. That does NOT mean the cap goes unenforced, though: an
-            // evicting policy (AllKeys*/Volatile*) must still honor Redis
-            // semantics and reclaim the budget by DROPPING victims with no
-            // tiering (`evict_one_with_spill` with `spill: None`, the exact
-            // plain-drop helper the disk-offload-disabled write path already
-            // uses) -- only `noeviction` rejects with OOM. A durable spill
-            // still happens whenever a manifest IS reachable (the
-            // tick-driven memory-pressure cascade, handled below) or once
-            // `--appendonly yes` / `--save` gives this call site a backstop.
-            let mut current_total = total_memory;
-            while current_total > budget {
-                if policy == EvictionPolicy::NoEviction {
-                    return Err(oom_error());
-                }
-                let before = db.estimated_memory();
-                if !evict_one_with_spill(db, config, &policy, None, on_plain_drop) {
-                    return Err(oom_error());
-                }
-                let after = db.estimated_memory();
-                current_total = current_total.saturating_sub(before.saturating_sub(after));
-            }
-            return Ok(());
-        };
-        let mut current_total = total_memory;
-        while current_total > budget {
-            if policy == EvictionPolicy::NoEviction {
-                return Err(oom_error());
-            }
-            let before = db.estimated_memory();
-            let deficit = current_total.saturating_sub(budget);
-            let reclaimed_keys = evict_batch_durable(
-                db,
-                config,
-                &policy,
-                shard_dir,
-                next_file_id,
-                manifest,
-                db_index,
-                deficit,
-            );
-            if reclaimed_keys == 0 {
-                return Err(oom_error());
-            }
-            let after = db.estimated_memory();
-            current_total = current_total.saturating_sub(before.saturating_sub(after));
-        }
-        return Ok(());
-    }
-
-    let mut current_total = total_memory;
-    while current_total > budget {
-        if policy == EvictionPolicy::NoEviction {
-            return Err(oom_error());
-        }
-        let before = db.estimated_memory();
-        if !evict_one_async_spill(
-            db,
-            config,
-            &policy,
-            sender,
-            shard_dir,
-            next_file_id,
-            db_index,
-        ) {
-            return Err(oom_error());
-        }
-        let after = db.estimated_memory();
-        current_total = current_total.saturating_sub(before.saturating_sub(after));
-    }
-
-    Ok(())
 }
 
 /// Maximum victims collected into a single durable batch by
@@ -1042,7 +839,7 @@ fn evict_batch_durable(
 /// Evict a single key via the async spill path.
 ///
 /// AOF-backstopped fast path only (see the durability-ordering doc comment
-/// on [`try_evict_if_needed_async_spill_with_total_budget`], which routes to
+/// on [`EvictionSink::AsyncSpill`], which routes to
 /// [`evict_batch_durable`] instead when `--appendonly no`). Extracts
 /// the entry, removes it from DashTable (immediate RAM relief), then sends a
 /// `SpillRequest` to the background thread for pwrite.
@@ -1414,14 +1211,24 @@ mod tests {
 
         // Elastic override above current usage: no eviction.
         let keys_before = db.len();
-        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used, used + 1024)
-            .expect("within elastic budget must not OOM");
+        evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::sync_spill(None)
+                .total(used)
+                .budget(used + 1024),
+        )
+        .expect("within elastic budget must not OOM");
         assert_eq!(db.len(), keys_before, "no eviction under elastic budget");
 
         // Static budget (override 0): must evict below 5000 bytes.
         let used_now = db.estimated_memory();
-        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used_now, 0)
-            .expect("eviction should succeed");
+        evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::sync_spill(None).total(used_now).budget(0),
+        )
+        .expect("eviction should succeed");
         assert!(
             db.estimated_memory() <= 5_000,
             "static budget must evict down to maxmemory/num_shards"
@@ -1441,8 +1248,12 @@ mod tests {
         }
         let used = db.estimated_memory();
         assert!(used > 500);
-        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used, usize::MAX)
-            .expect("eviction should succeed");
+        evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::sync_spill(None).total(used).budget(usize::MAX),
+        )
+        .expect("eviction should succeed");
         assert!(
             db.estimated_memory() <= 500,
             "override must clamp at instance maxmemory"
@@ -1492,7 +1303,7 @@ mod tests {
         // equals `total`, so nothing is evicted.
         let mut cfg1 = make_config(total, "allkeys-lru");
         cfg1.num_shards = 1;
-        assert!(try_evict_if_needed(&mut db, &cfg1).is_ok());
+        assert!(evict_to_budget(&mut db, &cfg1, EvictionRun::plain()).is_ok());
         assert_eq!(
             db.len(),
             4,
@@ -1504,7 +1315,7 @@ mod tests {
         // budget. Pre-fix (comparison vs raw maxmemory) this evicted nothing.
         let mut cfg4 = make_config(total, "allkeys-lru");
         cfg4.num_shards = 4;
-        assert!(try_evict_if_needed(&mut db, &cfg4).is_ok());
+        assert!(evict_to_budget(&mut db, &cfg4, EvictionRun::plain()).is_ok());
         assert!(
             db.len() < 4,
             "4 shards: per-shard budget must force eviction (got len {})",
@@ -1565,7 +1376,7 @@ mod tests {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
         let config = make_config(1, "noeviction");
-        let result = try_evict_if_needed(&mut db, &config);
+        let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
         assert!(result.is_err());
         match result.unwrap_err() {
             Frame::Error(msg) => {
@@ -1580,7 +1391,7 @@ mod tests {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
         let config = make_config(0, "allkeys-lru");
-        assert!(try_evict_if_needed(&mut db, &config).is_ok());
+        assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
     }
 
     #[test]
@@ -1588,7 +1399,7 @@ mod tests {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
         let config = make_config(1_000_000, "allkeys-lru");
-        assert!(try_evict_if_needed(&mut db, &config).is_ok());
+        assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
         assert_eq!(db.len(), 1);
     }
 
@@ -1626,7 +1437,7 @@ mod tests {
                 break;
             }
             let config = make_config(mem.saturating_sub(1), "allkeys-lru");
-            let result = try_evict_if_needed(&mut db, &config);
+            let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
             assert!(result.is_ok());
         }
         assert!(
@@ -1643,7 +1454,7 @@ mod tests {
         db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
 
         let config = make_config(1, "allkeys-random");
-        let result = try_evict_if_needed(&mut db, &config);
+        let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
     }
@@ -1746,7 +1557,7 @@ mod tests {
             db_index: 0,
         };
 
-        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
 
@@ -1797,7 +1608,7 @@ mod tests {
             db_index: 2,
         };
 
-        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
         assert!(result.is_ok());
         assert_eq!(db.len(), 0, "victim must have been evicted");
 
@@ -1853,8 +1664,11 @@ mod tests {
         })
         .expect("filler occupies the single channel slot");
 
-        let result =
-            try_evict_if_needed_async_spill(&mut db, &config, &tx, shard_dir, &mut next_file_id, 0);
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None),
+        );
 
         // Could not enqueue the spill → OOM surfaced, never a false success.
         assert!(
@@ -1909,16 +1723,12 @@ mod tests {
         // empty below to prove the queue was never used.
         let (tx, rx) = flume::bounded::<SpillRequest>(4096);
 
-        let result = try_evict_if_needed_async_spill_with_total_budget(
+        let result = evict_to_budget(
             &mut db,
             &config,
-            &tx,
-            shard_dir,
-            &mut next_file_id,
-            total,
-            0,
-            0,
-            Some(&mut manifest),
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, Some(&mut manifest))
+                .total(total)
+                .budget(0),
         );
         assert!(
             result.is_ok(),
@@ -2003,16 +1813,12 @@ mod tests {
 
         let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
 
-        let result = try_evict_if_needed_async_spill_with_total_budget(
+        let result = evict_to_budget(
             &mut db,
             &config,
-            &tx,
-            shard_dir,
-            &mut next_file_id,
-            total,
-            0,
-            0,
-            None,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None)
+                .total(total)
+                .budget(0),
         );
 
         assert!(
@@ -2053,8 +1859,11 @@ mod tests {
 
         let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
 
-        let result =
-            try_evict_if_needed_async_spill(&mut db, &config, &tx, shard_dir, &mut next_file_id, 0);
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None),
+        );
 
         assert!(
             result.is_err(),
@@ -2108,16 +1917,12 @@ mod tests {
 
         let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
 
-        let result = try_evict_if_needed_async_spill_with_total_budget(
+        let result = evict_to_budget(
             &mut db,
             &config,
-            &tx,
-            shard_dir,
-            &mut next_file_id,
-            total_with_both,
-            0,
-            0,
-            None,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None)
+                .total(total_with_both)
+                .budget(0),
         );
 
         assert!(result.is_ok(), "{result:?}");
@@ -2135,16 +1940,10 @@ mod tests {
         let mut config2 = make_config(1, "volatile-lru");
         config2.appendonly = "no".to_string();
         let current = db.estimated_memory();
-        let result2 = try_evict_if_needed_async_spill_with_total_budget(
+        let result2 = evict_to_budget(
             &mut db,
             &config2,
-            &tx,
-            shard_dir,
-            &mut next_file_id,
-            current,
-            0,
-            0,
-            None,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None).total(current),
         );
         assert!(
             result2.is_err(),
@@ -2179,16 +1978,12 @@ mod tests {
 
         let (tx, _rx) = flume::bounded::<SpillRequest>(4096);
 
-        let result = try_evict_if_needed_async_spill_with_total_budget(
+        let result = evict_to_budget(
             &mut db,
             &config,
-            &tx,
-            shard_dir,
-            &mut next_file_id,
-            total,
-            0,
-            0,
-            Some(&mut manifest),
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, Some(&mut manifest))
+                .total(total)
+                .budget(0),
         );
 
         assert!(
@@ -2232,7 +2027,7 @@ mod tests {
             db_index: 0,
         };
 
-        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
         assert!(
             result.is_err(),
             "spill I/O failure must surface OOM, never a false success"
@@ -2322,7 +2117,7 @@ mod tests {
     /// RED→GREEN (W2): the sync-spill eviction path must batch victims into
     /// shared multi-entry files (one manifest commit per file), not one
     /// single-entry file + one blocking manifest commit per key. Before W2,
-    /// evicting 40 keys through `try_evict_if_needed_with_spill` produced 40
+    /// evicting 40 keys through the sync spill path produced 40
     /// `heap-*.mpf` files and 40 shard-thread-blocking manifest fsync
     /// round-trips; the async path had already solved this (FLUSH_ENTRY_CAP
     /// batching) — the sync path re-derived its own per-key layout, the exact
@@ -2353,7 +2148,7 @@ mod tests {
             db_index: 0,
         };
 
-        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
         assert!(result.is_ok(), "eviction must succeed: {result:?}");
         assert_eq!(db.len(), 0, "all victims must be evicted from RAM");
 
@@ -2456,7 +2251,7 @@ mod tests {
         db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
 
         let config = make_config(1, "allkeys-random");
-        let result = try_evict_if_needed_with_spill(&mut db, &config, None);
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(None));
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
     }
@@ -2503,7 +2298,7 @@ mod tests {
     }
 
     /// The lock-free inline-write pre-gate must skip the runtime-config lock
-    /// ONLY when the slow path (`try_evict_if_needed_*`, no-op iff
+    /// ONLY when the slow path (`evict_to_budget`, no-op iff
     /// `total <= budget`) would provably do nothing. Tests the pure decision
     /// core — the public wrapper only adds two Relaxed loads of the
     /// process-global hints, which race with `CONFIG SET maxmemory` tests in
@@ -2545,5 +2340,122 @@ mod tests {
         let per_shard = rt.maxmemory_per_shard();
         assert!(can_skip_eviction(1000, per_shard, 250, 0));
         assert!(!can_skip_eviction(1000, per_shard, 251, 0));
+    }
+
+    // ── W4: evict_to_budget (single entry point) behavior pins ────────────
+
+    /// Plain sink: noeviction rejects with OOM; an evicting policy drops
+    /// victims to budget and reports every plain-dropped key.
+    #[test]
+    fn evict_to_budget_plain_honors_policy_and_reports() {
+        // noeviction: OOM, nothing removed.
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        let config = make_config(1, "noeviction");
+        let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
+        assert!(result.is_err(), "noeviction over budget must OOM");
+        assert_eq!(db.len(), 1, "noeviction must not remove keys");
+
+        // allkeys-lru: drops to budget, reporting each plain-dropped key.
+        let mut db = Database::new();
+        for i in 0..8u8 {
+            db.set_string(
+                Bytes::copy_from_slice(format!("pk{i}").as_bytes()),
+                Bytes::from_static(b"value_payload"),
+            );
+        }
+        let config = make_config(1, "allkeys-lru");
+        let mut dropped: Vec<Vec<u8>> = Vec::new();
+        let mut sink = |k: &[u8]| dropped.push(k.to_vec());
+        let result = evict_to_budget(&mut db, &config, EvictionRun::plain().report(&mut sink));
+        assert!(result.is_ok(), "evicting policy must reclaim: {result:?}");
+        assert_eq!(db.len(), 0, "budget 1 byte: everything must go");
+        assert_eq!(dropped.len(), 8, "every plain-dropped victim reported");
+    }
+
+    /// Sync-spill sink: delegates to the durable batch writer — victims land
+    /// in shared spill files and stay cold-readable (same pin as the W2
+    /// `sync_spill_batches_victims_into_shared_files` test, but through the
+    /// single entry point).
+    #[test]
+    fn evict_to_budget_sync_spill_delegates_to_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        for i in 0..40u8 {
+            db.set_string(
+                Bytes::copy_from_slice(format!("w4_key_{i:02}").as_bytes()),
+                Bytes::from_static(b"batch_value_payload"),
+            );
+        }
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
+        assert!(result.is_ok(), "sync spill must succeed: {result:?}");
+        assert_eq!(db.len(), 0, "all victims evicted from RAM");
+        let ci = db.cold_index.as_ref().unwrap();
+        for i in 0..40u8 {
+            let key = format!("w4_key_{i:02}");
+            assert!(
+                ci.lookup(key.as_bytes()).is_some(),
+                "{key} must be cold-readable after spill"
+            );
+        }
+        let spill_files = std::fs::read_dir(shard_dir.join("data"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "mpf")
+            })
+            .count();
+        assert!(
+            spill_files <= 4,
+            "40 victims must batch into shared files, got {spill_files}"
+        );
+    }
+
+    /// An elastic budget override wider than usage suppresses eviction; the
+    /// override is capped at the instance maxmemory.
+    #[test]
+    fn evict_to_budget_budget_override_respected() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"bk"), Bytes::from_static(b"bv"));
+        let used = db.estimated_memory();
+
+        // Override comfortably above usage: nothing evicted.
+        let config = make_config(used * 4, "allkeys-lru");
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::plain().total(used).budget(used * 2),
+        );
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 1, "override above usage must not evict");
+
+        // Override is capped at maxmemory: an override far above the
+        // instance cap cannot widen the budget beyond maxmemory.
+        let config = make_config(1, "noeviction");
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::plain().total(used).budget(usize::MAX),
+        );
+        assert!(
+            result.is_err(),
+            "override must clamp to maxmemory (1 byte) and OOM under noeviction"
+        );
     }
 }

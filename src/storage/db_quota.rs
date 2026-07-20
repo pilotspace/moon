@@ -28,7 +28,7 @@
 //!   common (unconfigured) case never even indexes the `Vec` under lock.
 //! - **Known limitation — no disk-offload spill integration**: unlike the
 //!   global maxmemory gate's spill-aware variants
-//!   (`eviction::try_evict_if_needed_async_spill_budget`), db-quota eviction
+//!   (`eviction::evict_to_budget`, async-spill sink), db-quota eviction
 //!   always deletes the victim outright. A db-quota'd instance running
 //!   `--disk-offload` still spills for the *global* gate, but a purely
 //!   db-quota-triggered eviction is NOT spilled to the cold tier. This keeps
@@ -218,7 +218,7 @@ pub fn check_db_maxmemory_for_command(
 /// read guard the caller already holds for the global gate.
 ///
 /// Call this from the SAME write-path chokepoints as the global maxmemory
-/// gate (`eviction::try_evict_if_needed_budget` and friends), after the
+/// gate (`eviction::evict_to_budget`), after the
 /// global gate — a write that survives the whole-instance cap must still
 /// clear its own db's finer-grained cap. Prefer
 /// [`check_db_maxmemory_for_command`] at chokepoints that can see `SELECT`.

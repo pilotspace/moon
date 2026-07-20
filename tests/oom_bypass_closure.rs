@@ -505,7 +505,7 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
 // same-db copy, a data-correctness bug, not an eviction one; see the CHANGELOG
 // and the Gap A commit body). Moon's eviction gate is per-DATABASE (whichever
 // db a write targets — `db.estimated_memory()` alone, not a shard-wide
-// aggregate across all 16 dbs; see `try_evict_if_needed_budget`'s doc
+// aggregate across all 16 dbs; see `evict_to_budget`'s doc
 // comment), consistently across every write path including this one — so
 // db 1 (the COPY destination) needs its OWN pre-existing memory pressure to
 // demonstrate the gate; ballast keys below give it that.

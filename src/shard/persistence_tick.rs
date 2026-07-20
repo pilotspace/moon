@@ -443,7 +443,7 @@ pub(crate) fn run_eviction_tick(
         // change this tick's cost -- and it is intentionally NOT folded into
         // Database::estimated_memory()/resident_bytes() themselves, which
         // stay untouched O(1) hot-path reads for the per-write eviction
-        // pre-gate (inline_write_can_skip_eviction / try_evict_if_needed).
+        // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
         let used = crate::shard::slice::with_shard(|s| {
             s.databases
                 .iter()
@@ -859,35 +859,39 @@ pub(crate) fn handle_memory_pressure(
                     let sender = spill_t.sender();
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
-                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget_reporting(
+                            let _ = crate::storage::eviction::evict_to_budget(
                                 db,
                                 &rt,
-                                &sender,
-                                shard_dir,
-                                next_file_id,
-                                total_mem,
-                                i,
-                                budget,
-                                shard_manifest.as_mut(),
-                                // task #34 (Wave A): only the no-manifest,
-                                // `--appendonly no` plain-drop fallback
-                                // inside this function ever calls this sink
-                                // (the async-spill and durable-batch
-                                // branches leave a cold/AOF-recoverable
-                                // copy and never invoke it).
-                                &mut |key| {
-                                    crate::replication::reason_del::record_reason_del(
-                                        key,
-                                        i,
-                                        wal_v3,
-                                        repl_backlog,
-                                        replica_txs,
-                                        repl_state,
-                                        shard_id,
-                                        aof_pool,
-                                        wal_kv_log,
-                                    );
-                                },
+                                crate::storage::eviction::EvictionRun::async_spill(
+                                    &sender,
+                                    shard_dir,
+                                    next_file_id,
+                                    i,
+                                    shard_manifest.as_mut(),
+                                )
+                                .total(total_mem)
+                                .budget(budget)
+                                .report(
+                                    // task #34 (Wave A): only the no-manifest,
+                                    // `--appendonly no` plain-drop fallback
+                                    // inside this function ever calls this sink
+                                    // (the async-spill and durable-batch
+                                    // branches leave a cold/AOF-recoverable
+                                    // copy and never invoke it).
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            i,
+                                            wal_v3,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                        );
+                                    },
+                                ),
                             );
                         });
                     }
@@ -919,13 +923,15 @@ pub(crate) fn handle_memory_pressure(
                                 // reporting sink (previously a hardcoded
                                 // no-op here, which silently swallowed those
                                 // emissions).
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
+                                let _ = crate::storage::eviction::evict_to_budget(
                                     db,
                                     &rt,
-                                    Some(&mut ctx),
-                                    total_mem,
-                                    budget,
-                                    &mut |key| {
+                                    crate::storage::eviction::EvictionRun::sync_spill(Some(
+                                        &mut ctx,
+                                    ))
+                                    .total(total_mem)
+                                    .budget(budget)
+                                    .report(&mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
                                             i,
@@ -937,26 +943,30 @@ pub(crate) fn handle_memory_pressure(
                                             aof_pool,
                                             wal_kv_log,
                                         );
-                                    },
+                                    }),
                                 );
                             } else {
                                 // No manifest reachable: this IS the plain
                                 // -drop path (task #34, Wave A) — emit.
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
-                                    db, &rt, None, total_mem, budget,
-                                    &mut |key| {
-                                        crate::replication::reason_del::record_reason_del(
-                                            key,
-                                            i,
-                                            wal_v3,
-                                            repl_backlog,
-                                            replica_txs,
-                                            repl_state,
-                                            shard_id,
-                                            aof_pool,
-                                            wal_kv_log,
-                                        );
-                                    },
+                                let _ = crate::storage::eviction::evict_to_budget(
+                                    db,
+                                    &rt,
+                                    crate::storage::eviction::EvictionRun::plain()
+                                        .total(total_mem)
+                                        .budget(budget)
+                                        .report(&mut |key| {
+                                            crate::replication::reason_del::record_reason_del(
+                                                key,
+                                                i,
+                                                wal_v3,
+                                                repl_backlog,
+                                                replica_txs,
+                                                repl_state,
+                                                shard_id,
+                                                aof_pool,
+                                                wal_kv_log,
+                                            );
+                                        }),
                                 );
                             }
                         });
@@ -967,7 +977,7 @@ pub(crate) fn handle_memory_pressure(
     }
 
     // Step 4: NoEviction policy check -- if we reached here with noeviction,
-    // log a warning. The actual OOM rejection is handled inside try_evict_if_needed.
+    // log a warning. The actual OOM rejection is handled inside evict_to_budget.
     {
         let rt = runtime_config.read();
         if rt.maxmemory_policy == "noeviction" {
