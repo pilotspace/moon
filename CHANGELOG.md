@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-07-20
+
 ### Fixed
 - **Millisecond-TTL keys no longer expire up to 999 ms early (W3).**
   `CompactEntry` stored expiry as *seconds* (`ms / 1000` floor) even though
