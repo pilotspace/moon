@@ -112,19 +112,19 @@ pub fn write_kv_spill_pages(
 /// `ColdLocation::value_type` (#364).
 pub use crate::storage::value_codec::value_type_of;
 
-/// Spill a single evicted KV entry to a DataFile on disk.
+/// Spill a single KV entry to its own DataFile on disk.
 ///
-/// Creates a single-page `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf`,
-/// writes a `KvLeafPage` containing the entry, and registers the file in the
-/// shard manifest.
+/// Creates a `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf` (leaf
+/// page + overflow chain for oversized values), writes the entry, and
+/// registers the file in the shard manifest with a blocking durable commit.
 ///
-/// String entries are fully supported. Non-string types (hash, list, set, zset,
-/// stream) are skipped with a warning -- overflow serialization is future work.
-///
-/// If the entry does not fit in a single 4KB page, it is skipped (oversized
-/// entries require overflow pages, also future work).
-///
-/// Returns `Ok(())` on success, skip, or best-effort failure logging.
+/// **No longer a production eviction path (W2).** Every eviction spill —
+/// sync and async — now routes through `spill_thread::flush_buffer` batches
+/// (shared multi-entry files, one manifest commit per file). This helper
+/// remains as the single-entry primitive: test fixtures use it to place one
+/// key cold deterministically (same `build_kv_spill_pages` +
+/// `write_kv_spill_pages` layout the batch salvage path emits, so the format
+/// stays production-exercised via `spill_single_entry`).
 ///
 /// `db_index` is the logical database the entry was evicted FROM — it is
 /// stamped into the manifest `FileEntry` so `rebuild_from_manifest_per_db`

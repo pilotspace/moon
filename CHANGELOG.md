@@ -6,7 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Sync eviction spill now batches like the async path (W2).** The
+  tick-driven sync spill paths (`run_eviction`, the memory-pressure cascade's
+  sync fallback) previously wrote **one single-entry `.mpf` file and did one
+  shard-thread-blocking durable manifest commit per victim key**; they now
+  route through the same `flush_buffer` batch writer the background
+  `SpillThread` and the no-AOF durable path use — shared multi-entry files
+  (up to 256 keys), one manifest commit per file. Evicting N keys under
+  memory pressure costs ~N/256 manifest fsync round-trips instead of N.
+
 ### Changed
+- **One spill pipeline (W2).** Victim policy dispatch (`select_victim`) and
+  victim serialization (`build_spill_payload`) now exist once instead of
+  being copy-pasted at all three spill entry points; the sync
+  `SpillContext` path delegates to the one durable batch spiller
+  (`evict_batch_durable`, formerly `evict_batch_durable_no_aof` — no longer
+  no-AOF-only). The sync/async divergence class behind the task #34
+  plain-drop misclassification, the task #45 `is_string` gate, and the #139
+  test blindness is structurally gone. `kv_spill::spill_to_datafile` is no
+  longer a production eviction path (kept as the single-entry primitive test
+  fixtures use).
+
+### Fixed
+- **Unserializable eviction victims are retained, fail-closed.** All three
+  spill sites previously did `serialize_collection(..).unwrap_or_default()`:
+  a victim whose value failed to serialize (in-memory corruption) was
+  "spilled" as an EMPTY value body and evicted — silent durable data loss on
+  reload. Such victims are now retained hot and skipped, loudly logged.
+- **Batch-durable evictions now count in the eviction metric.** The durable
+  batch path (`--appendonly no` cascade) removed keys without calling
+  `record_eviction()`; single-victim paths did. Both now record.
 - **One value codec for RDB snapshots and KV disk-offload spill (W1).** The
   ~150-line value-body encoder/decoder that existed twice — `rdb::write_entry`'s
   value section and `kv_serde::serialize_collection` — kept bit-compatible only

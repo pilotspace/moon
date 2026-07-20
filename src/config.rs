@@ -988,7 +988,7 @@ impl ServerConfig {
     /// (`--appendonly yes`) nor RDB (`--save`) durability is on (GCP
     /// benchmark finding, 2026-07-10).
     ///
-    /// The durable-spill eviction path (`evict_batch_durable_no_aof`) needs
+    /// The durable-spill eviction path (`evict_batch_durable`) needs
     /// a `ShardManifest`, which today is only threaded through the
     /// tick-driven memory-pressure cascade
     /// (`shard::persistence_tick::handle_memory_pressure`) — itself gated on

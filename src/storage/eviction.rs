@@ -449,7 +449,27 @@ pub fn try_evict_if_needed_with_spill_and_total_budget_reporting(
             return Err(oom_error());
         }
         let before = db.estimated_memory();
-        if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut(), on_plain_drop) {
+        // W2: with a SpillContext, reclaim the whole deficit as durable
+        // batches (shared multi-entry files, ONE manifest commit per file)
+        // instead of one single-entry file + one blocking manifest fsync
+        // round-trip per victim. Without one, plain-drop one victim at a
+        // time (unchanged).
+        let progressed = match spill.as_deref_mut() {
+            Some(ctx) => {
+                evict_batch_durable(
+                    db,
+                    config,
+                    &policy,
+                    ctx.shard_dir,
+                    ctx.next_file_id,
+                    ctx.manifest,
+                    ctx.db_index,
+                    current_total.saturating_sub(budget),
+                ) > 0
+            }
+            None => evict_one_with_spill(db, config, &policy, None, on_plain_drop),
+        };
+        if !progressed {
             return Err(oom_error());
         }
         let after = db.estimated_memory();
@@ -658,7 +678,7 @@ pub fn try_evict_if_needed_async_spill_budget_reporting(
 /// Under `--appendonly no` there is no second copy of the value anywhere
 /// once it leaves RAM, so the fast path would be unconditional, unrecoverable
 /// data loss on a crash. This function instead batches victims into
-/// [`evict_batch_durable_no_aof`], which performs a **fully synchronous,
+/// [`evict_batch_durable`], which performs a **fully synchronous,
 /// durable spill (pwrite + fsync + manifest commit) before dropping any hot
 /// value**, provided a `ShardManifest` is available (today only the
 /// tick-driven memory-pressure cascade threads one through — see
@@ -733,7 +753,7 @@ pub fn try_evict_if_needed_async_spill_with_total_budget_reporting(
     if config.appendonly != "yes" {
         let Some(manifest) = manifest else {
             // No manifest reachable from this call site and no AOF backstop:
-            // durable spill (evict_batch_durable_no_aof, below) is impossible
+            // durable spill (evict_batch_durable, below) is impossible
             // here. That does NOT mean the cap goes unenforced, though: an
             // evicting policy (AllKeys*/Volatile*) must still honor Redis
             // semantics and reclaim the budget by DROPPING victims with no
@@ -764,7 +784,7 @@ pub fn try_evict_if_needed_async_spill_with_total_budget_reporting(
             }
             let before = db.estimated_memory();
             let deficit = current_total.saturating_sub(budget);
-            let reclaimed_keys = evict_batch_durable_no_aof(
+            let reclaimed_keys = evict_batch_durable(
                 db,
                 config,
                 &policy,
@@ -808,7 +828,7 @@ pub fn try_evict_if_needed_async_spill_with_total_budget_reporting(
 }
 
 /// Maximum victims collected into a single durable batch by
-/// [`evict_batch_durable_no_aof`], mirroring `SpillThread`'s own
+/// [`evict_batch_durable`], mirroring `SpillThread`'s own
 /// `FLUSH_ENTRY_CAP` (256) so the no-AOF-backstop path's on-disk batch size
 /// matches the async path's.
 const NO_AOF_BATCH_CAP: usize = 256;
@@ -821,7 +841,70 @@ const NO_AOF_BATCH_CAP: usize = 256;
 /// only guards a pathological near-empty or heavily-duplicate keyspace.
 const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
 
-/// Batch-durable spill for the no-AOF-backstop case (`--appendonly no`).
+/// Pick one eviction victim according to `policy` (W2: the single
+/// implementation of the policy dispatch — previously copy-pasted in
+/// `evict_batch_durable`, `evict_one_async_spill`, and
+/// `evict_one_with_spill`).
+fn select_victim(
+    db: &Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+) -> Option<CompactKey> {
+    match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::AllKeysLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+        }
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::VolatileLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+        }
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+    }
+}
+
+/// Serialize a victim entry's value for spill (W2: the single implementation
+/// — previously copy-pasted at all three spill entry points).
+///
+/// Returns `(value_type, value_bytes, flags, ttl_ms)`, or `None` when the
+/// value cannot be faithfully serialized (in-memory corruption, e.g. an
+/// unparseable sorted-set listpack score). **`None` is fail-closed**: the
+/// caller must retain the hot value and skip the victim — the pre-W2
+/// `unwrap_or_default()` at every call site durably spilled an EMPTY value
+/// body and evicted the key (silent data loss on reload).
+fn build_spill_payload(
+    entry: &crate::storage::Entry,
+) -> Option<(ValueType, Bytes, u8, Option<u64>)> {
+    let val_ref = entry.as_redis_value();
+    let (value_type, value_bytes): (ValueType, Bytes) = match val_ref {
+        RedisValueRef::String(s) => (ValueType::String, Bytes::copy_from_slice(s)),
+        ref other => {
+            let vt = kv_spill::value_type_of(other);
+            // `None` = corrupt value (serialize_collection logs it loudly).
+            let buf = kv_serde::serialize_collection(other)?;
+            (vt, Bytes::from(buf))
+        }
+    };
+    let mut flags: u8 = 0;
+    let ttl_ms = if entry.has_expiry() {
+        flags |= entry_flags::HAS_TTL;
+        Some(entry.expires_at_ms(0))
+    } else {
+        None
+    };
+    Some((value_type, value_bytes, flags, ttl_ms))
+}
+
+/// Batch-durable synchronous spill (W2: the ONE sync spill implementation).
+///
+/// Originally built for the no-AOF-backstop case (`--appendonly no`); since
+/// W2 it also backs every `SpillContext` sync path (`evict_one_with_spill`,
+/// the tick-driven `run_eviction`, the memory-pressure cascade's sync
+/// fallback), which previously wrote one single-entry file + one blocking
+/// manifest commit per victim through `kv_spill::spill_to_datafile`.
 ///
 /// Collects up to [`NO_AOF_BATCH_CAP`] distinct victims (or until the
 /// estimated bytes staged cover `deficit`, whichever comes first) WITHOUT
@@ -838,7 +921,7 @@ const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
 /// Returns the number of keys durably evicted (0 if nothing could be
 /// evicted -- the caller surfaces OOM).
 #[allow(clippy::too_many_arguments)]
-fn evict_batch_durable_no_aof(
+fn evict_batch_durable(
     db: &mut Database,
     config: &RuntimeConfig,
     policy: &EvictionPolicy,
@@ -854,21 +937,7 @@ fn evict_batch_durable_no_aof(
     let mut stall = 0usize;
 
     while buffer.len() < NO_AOF_BATCH_CAP && staged_bytes < deficit {
-        let victim = match policy {
-            EvictionPolicy::NoEviction => None,
-            EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
-            EvictionPolicy::AllKeysLfu => {
-                find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
-            }
-            EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-            EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
-            EvictionPolicy::VolatileLfu => {
-                find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
-            }
-            EvictionPolicy::VolatileRandom => find_victim_random(db, true),
-            EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
-        };
-        let key = match victim {
+        let key = match select_victim(db, config, policy) {
             Some(k) => k,
             None => break,
         };
@@ -887,22 +956,16 @@ fn evict_batch_durable_no_aof(
             // already gone, so keep sampling for more victims.
             continue;
         };
-        let val_ref = entry.as_redis_value();
-        let collection_buf: Vec<u8>;
-        let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
-            RedisValueRef::String(s) => (ValueType::String, s),
-            ref other => {
-                let vt = kv_spill::value_type_of(other);
-                collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
-                (vt, collection_buf.as_slice())
-            }
-        };
-        let mut flags: u8 = 0;
-        let ttl_ms = if entry.has_expiry() {
-            flags |= entry_flags::HAS_TTL;
-            Some(entry.expires_at_ms(0))
-        } else {
-            None
+        // Fail-closed: an unserializable (corrupt) value is retained hot and
+        // skipped — its `seen` entry stops the sampler from re-picking it
+        // into this batch, and staging continues with other victims.
+        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry) else {
+            warn!(
+                key = %String::from_utf8_lossy(key.as_bytes()),
+                "kv_spill: victim value cannot be serialized; retaining hot \
+                 value and skipping it (fail-closed, no empty-body spill)"
+            );
+            continue;
         };
 
         staged_bytes += key.as_bytes().len() + value_bytes.len();
@@ -911,7 +974,7 @@ fn evict_batch_durable_no_aof(
         buffer.push(SpillRequest {
             key: Bytes::copy_from_slice(key.as_bytes()),
             db_index,
-            value_bytes: Bytes::copy_from_slice(value_bytes),
+            value_bytes,
             value_type,
             flags,
             ttl_ms,
@@ -957,6 +1020,7 @@ fn evict_batch_durable_no_aof(
             // so the ColdIndex insert MUST come AFTER remove, never before,
             // or `remove` wipes out the very entry being added.
             db.remove(&entry.key);
+            crate::admin::metrics_setup::record_eviction();
             if let Some(ref mut ci) = db.cold_index {
                 ci.insert(
                     entry.key,
@@ -979,7 +1043,7 @@ fn evict_batch_durable_no_aof(
 ///
 /// AOF-backstopped fast path only (see the durability-ordering doc comment
 /// on [`try_evict_if_needed_async_spill_with_total_budget`], which routes to
-/// [`evict_batch_durable_no_aof`] instead when `--appendonly no`). Extracts
+/// [`evict_batch_durable`] instead when `--appendonly no`). Extracts
 /// the entry, removes it from DashTable (immediate RAM relief), then sends a
 /// `SpillRequest` to the background thread for pwrite.
 fn evict_one_async_spill(
@@ -991,23 +1055,8 @@ fn evict_one_async_spill(
     next_file_id: &mut u64,
     db_index: usize,
 ) -> bool {
-    // Find victim key using same policy logic as sync path
-    let victim = match policy {
-        EvictionPolicy::NoEviction => None,
-        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
-        EvictionPolicy::AllKeysLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
-        }
-        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
-        EvictionPolicy::VolatileLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
-        }
-        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
-        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
-    };
-
-    let key = match victim {
+    // Find victim key using the shared policy dispatch (same as sync path)
+    let key = match select_victim(db, config, policy) {
         Some(k) => k,
         None => return false,
     };
@@ -1015,26 +1064,16 @@ fn evict_one_async_spill(
     // Build SpillRequest from the entry BEFORE removing it from DashTable.
     // This is CPU work only -- no I/O on the event loop.
     if let Some(entry) = db.data().get(key.as_bytes()) {
-        let val_ref = entry.as_redis_value();
-
-        // Determine value_type and serialize value bytes
-        let collection_buf: Vec<u8>;
-        let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
-            RedisValueRef::String(s) => (ValueType::String, s),
-            ref other => {
-                let vt = kv_spill::value_type_of(other);
-                collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
-                (vt, collection_buf.as_slice())
-            }
-        };
-
-        // Determine flags and TTL
-        let mut flags: u8 = 0;
-        let ttl_ms = if entry.has_expiry() {
-            flags |= entry_flags::HAS_TTL;
-            Some(entry.expires_at_ms(0))
-        } else {
-            None
+        // Fail-closed: a value that cannot be faithfully serialized must not
+        // be evicted (pre-W2 this spilled an EMPTY body and dropped the key).
+        // Bail; the caller surfaces OOM rather than losing data.
+        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry) else {
+            warn!(
+                key = %String::from_utf8_lossy(key.as_bytes()),
+                "kv_spill: async-spill victim cannot be serialized; retaining \
+                 hot value (fail-closed, no empty-body spill)"
+            );
+            return false;
         };
 
         let file_id = *next_file_id;
@@ -1043,7 +1082,7 @@ fn evict_one_async_spill(
         let req = SpillRequest {
             key: Bytes::copy_from_slice(key.as_bytes()),
             db_index,
-            value_bytes: Bytes::copy_from_slice(value_bytes),
+            value_bytes,
             value_type,
             flags,
             ttl_ms,
@@ -1100,128 +1139,34 @@ pub(crate) fn evict_one_with_spill(
     spill: Option<&mut SpillContext<'_>>,
     on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
-    // Find victim key using policy-specific sampling
-    let victim = match policy {
-        EvictionPolicy::NoEviction => None,
-        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
-        EvictionPolicy::AllKeysLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
-        }
-        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
-        EvictionPolicy::VolatileLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
-        }
-        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
-        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
-    };
+    // W2: the SpillContext arm delegates to the ONE durable batch spiller
+    // (deficit 1 byte stages exactly one victim). Everything the per-victim
+    // path used to hand-roll — write-then-durable-then-drop ordering, the
+    // task #34/#45 every-type spill guarantees, fail-closed retention on
+    // I/O error, D1 remove-before-cold-index ordering — is inherited from
+    // `evict_batch_durable` instead of being a second implementation that
+    // can drift (the drift is exactly what caused #34 defect 1 and #45).
+    if let Some(ctx) = spill {
+        return evict_batch_durable(
+            db,
+            config,
+            policy,
+            ctx.shard_dir,
+            ctx.next_file_id,
+            ctx.manifest,
+            ctx.db_index,
+            1,
+        ) > 0;
+    }
 
-    let key = match victim {
+    // Plain-drop path (no spill context): pick one victim and delete it.
+    let key = match select_victim(db, config, policy) {
         Some(k) => k,
         None => return false,
     };
-
-    // Spill to disk before removing, if context provided. `spilled` tracks
-    // whether a durable cold copy was ACTUALLY written for this specific
-    // victim -- not merely whether a `SpillContext` was passed in. Task #34
-    // review (defect 1): the previous `is_plain_drop = spill.is_none()`
-    // snapshot, taken before this block ran, mis-classified any non-string
-    // victim (Hash/List/Set/ZSet/Stream) under a live `SpillContext` as
-    // "spilled" even though the `is_string` gate below never touches them --
-    // they fell through to the unconditional `db.remove` with no cold copy
-    // AND no plain-drop report: silent data loss with no AOF/replication DEL
-    // record. Tying the flag to the branch that actually performs the write
-    // makes the two cases (no `SpillContext` vs. a `SpillContext` that
-    // couldn't spill this value type) equivalent by construction.
-    // task #45: `kv_spill::spill_to_datafile` has fully supported collection
-    // types (Hash/List/Set/ZSet/Stream, serialized via `kv_serde`) since the
-    // async write-path eviction gate started using it -- but this synchronous
-    // path (background tick `timers::run_eviction`, the memory-pressure
-    // cascade's sync-spill fallback, and `db_quota`) still gated the call
-    // behind an `is_string` check left over from before that support existed.
-    // A Hash/List/Set/ZSet/Stream victim picked here while a `SpillContext`
-    // WAS present therefore never got a byte written to `shard_dir`, yet fell
-    // through to the same unconditional `db.remove` a genuine plain-drop
-    // takes -- but WITHOUT the `on_plain_drop` accounting (the old
-    // `is_plain_drop = spill.is_none()` snapshot read `false` even though
-    // nothing durable exists anywhere for that key). Spilling every type here
-    // closes that gap; `spill_to_datafile`'s own type match is exhaustive
-    // (compile error if a new `RedisValueRef` variant is ever added without a
-    // `ValueType` mapping).
-    //
-    // `file_id`/`ttl_for_cold` are captured from the immutable `entry`
-    // borrow BEFORE `db.remove` (which also clears any pre-existing cold
-    // copy of this key, D1: DEL-before-spill ordering) and the index insert
-    // into `db.cold_index` (a different field of `db`, taken as `&mut` only
-    // AFTER the `entry` borrow has ended) -- same split-borrow shape as
-    // `evict_batch_durable_no_aof`'s `db.remove` -> `ci.insert` ordering
-    // above.
-    let mut spilled = false;
-    let mut spilled_file_id = 0u64;
-    let mut spilled_ttl_ms: Option<u64> = None;
-    let mut spilled_value_type = crate::persistence::kv_page::ValueType::String;
-    if let Some(ctx) = spill {
-        if let Some(entry) = db.data().get(key.as_bytes()) {
-            let file_id = *ctx.next_file_id;
-            let ttl_ms = if entry.has_expiry() {
-                Some(entry.expires_at_ms(0))
-            } else {
-                None
-            };
-            if let Err(e) = kv_spill::spill_to_datafile(
-                ctx.shard_dir,
-                file_id,
-                key.as_bytes(),
-                entry,
-                ctx.db_index,
-                ctx.manifest,
-                None,
-            ) {
-                warn!(
-                    key = %String::from_utf8_lossy(key.as_bytes()),
-                    error = %e,
-                    "kv_spill: I/O error during spill; retaining hot value, \
-                     aborting this eviction attempt (no silent drop)"
-                );
-                // Spill failed: the value has no durable copy anywhere.
-                // Do NOT evict -- keep the hot value resident and let the
-                // caller retry (or surface OOM) instead of losing data.
-                return false;
-            }
-            *ctx.next_file_id += 1;
-            spilled = true;
-            spilled_file_id = file_id;
-            spilled_ttl_ms = ttl_ms;
-            spilled_value_type = kv_spill::value_type_of(&entry.as_redis_value());
-        }
-    }
-
     db.remove(key.as_bytes());
     crate::admin::metrics_setup::record_eviction();
-    if spilled {
-        // Register the cold location so `Database::exists`/`get`/the
-        // type-specific accessors' `promote_cold_if_present` can find this
-        // key again -- `spill_to_datafile` itself only inserts into a
-        // `ColdIndex` it is explicitly handed (`None` here, split-borrow
-        // constraint above), so the caller owns the insert. Single-page spill
-        // only (no overflow-chain support in this path, same limitation
-        // `spill_to_datafile`'s single-file layout has), so `page_idx`/
-        // `slot_idx` are always the entry's sole slot: 0/0.
-        if let Some(ref mut ci) = db.cold_index {
-            ci.insert(
-                Bytes::copy_from_slice(key.as_bytes()),
-                crate::storage::tiered::cold_index::ColdLocation {
-                    file_id: spilled_file_id,
-                    page_idx: 0,
-                    slot_idx: 0,
-                    ttl_ms: spilled_ttl_ms,
-                    value_type: spilled_value_type,
-                },
-            );
-        }
-    } else {
-        on_plain_drop(key.as_bytes());
-    }
+    on_plain_drop(key.as_bytes());
     true
 }
 
@@ -2030,7 +1975,7 @@ mod tests {
     /// RED→GREEN (GCP benchmark finding, 2026-07-10 -- policy-aware
     /// fail-close): when no `ShardManifest` is reachable (e.g. the inline
     /// per-connection write-path eviction gate) AND there is no AOF
-    /// backstop, durable spill (`evict_batch_durable_no_aof`) is impossible.
+    /// backstop, durable spill (`evict_batch_durable`) is impossible.
     /// That must NOT mean the cap goes unenforced for an evicting policy,
     /// though -- Redis semantics require `allkeys-lru` (and friends) to
     /// honor `--maxmemory` by DROPPING victims (no tiering) when no durable
@@ -2371,6 +2316,136 @@ mod tests {
                 .is_some(),
             "the spilled Hash key must be registered in ColdIndex so EXISTS/ \
              promote_cold_if_present can find it again"
+        );
+    }
+
+    /// RED→GREEN (W2): the sync-spill eviction path must batch victims into
+    /// shared multi-entry files (one manifest commit per file), not one
+    /// single-entry file + one blocking manifest commit per key. Before W2,
+    /// evicting 40 keys through `try_evict_if_needed_with_spill` produced 40
+    /// `heap-*.mpf` files and 40 shard-thread-blocking manifest fsync
+    /// round-trips; the async path had already solved this (FLUSH_ENTRY_CAP
+    /// batching) — the sync path re-derived its own per-key layout, the exact
+    /// divergence class behind tasks #34/#45/#139.
+    #[test]
+    fn sync_spill_batches_victims_into_shared_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        for i in 0..40u8 {
+            db.set_string(
+                Bytes::copy_from_slice(format!("batch_key_{i:02}").as_bytes()),
+                Bytes::from_static(b"batch_value_payload"),
+            );
+        }
+        assert_eq!(db.len(), 40);
+
+        let config = make_config(1, "allkeys-lru"); // budget 1 byte: evict all
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+
+        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        assert!(result.is_ok(), "eviction must succeed: {result:?}");
+        assert_eq!(db.len(), 0, "all victims must be evicted from RAM");
+
+        // Every key must remain cold-readable.
+        let ci = db.cold_index.as_ref().unwrap();
+        for i in 0..40u8 {
+            let key = format!("batch_key_{i:02}");
+            assert!(
+                ci.lookup(key.as_bytes()).is_some(),
+                "{key} must be registered in ColdIndex after sync spill"
+            );
+        }
+
+        // The batching claim itself: 40 small same-db victims must share
+        // files (the async path packs ~256/file; assert a generous bound so
+        // the test pins "batched", not an exact packing constant).
+        let file_count = std::fs::read_dir(shard_dir.join("data"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".mpf"))
+            .count();
+        assert!(
+            file_count <= 4,
+            "sync spill must batch victims into shared files: \
+             40 keys produced {file_count} .mpf files (pre-W2: 40)"
+        );
+    }
+
+    /// RED→GREEN (W2): a victim whose value cannot be faithfully serialized
+    /// (in-memory corruption, e.g. a sorted-set listpack score that does not
+    /// parse — see `ValueCodecError::CorruptScore`) must be retained hot,
+    /// fail-closed. Before W2 all three spill sites did
+    /// `serialize_collection(..).unwrap_or_default()`: the victim was
+    /// "spilled" as an EMPTY value body and evicted — silent, durable data
+    /// loss (reload of the empty body yields a decode miss).
+    #[test]
+    fn sync_spill_unserializable_victim_retained_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = tmp.path().join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        // Inject a corrupt SortedSetListpack (unparseable score) the way a
+        // memory-corruption event would leave it — unreachable via ZADD.
+        let mut lp = crate::storage::listpack::Listpack::new();
+        lp.push_back(b"member");
+        lp.push_back(b"not-a-number");
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::RedisValue::SortedSetListpack(lp),
+        );
+        db.insert_for_load(Bytes::from_static(b"corrupt_zset"), entry);
+        db.recalculate_memory();
+        assert_eq!(db.len(), 1);
+
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+
+        let mut reported: Vec<Vec<u8>> = Vec::new();
+        let evicted = evict_one_with_spill(
+            &mut db,
+            &config,
+            &EvictionPolicy::AllKeysLru,
+            Some(&mut ctx),
+            &mut |key| reported.push(key.to_vec()),
+        );
+
+        assert!(
+            !evicted,
+            "an unserializable victim must NOT be evicted (fail-closed): \
+             pre-W2 it was spilled as an EMPTY value body and dropped from RAM"
+        );
+        assert_eq!(
+            db.len(),
+            1,
+            "the corrupt value must be retained hot — no durable copy exists"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"corrupt_zset")
+                .is_none(),
+            "no ColdIndex entry may point at an empty/absent spill body"
         );
     }
 
