@@ -107,26 +107,10 @@ pub fn write_kv_spill_pages(
 
 /// On-disk [`ValueType`] tag for a hot value.
 ///
-/// Exhaustive over `RedisValueRef` by design: adding a new value variant
-/// without a `ValueType` mapping must be a compile error, never a silent
-/// mis-typed spill. Used by every spill entry point and by the sync
-/// eviction path to populate `ColdLocation::value_type` (#364).
-pub fn value_type_of(val: &RedisValueRef) -> ValueType {
-    match val {
-        RedisValueRef::String(_) => ValueType::String,
-        RedisValueRef::Hash(_)
-        | RedisValueRef::HashListpack(_)
-        | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
-        RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-        RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
-            ValueType::Set
-        }
-        RedisValueRef::SortedSet { .. }
-        | RedisValueRef::SortedSetBPTree { .. }
-        | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
-        RedisValueRef::Stream(_) => ValueType::Stream,
-    }
-}
+/// Re-exported from the shared value codec (W1 unification) — used by every
+/// spill entry point and by the sync eviction path to populate
+/// `ColdLocation::value_type` (#364).
+pub use crate::storage::value_codec::value_type_of;
 
 /// Spill a single evicted KV entry to a DataFile on disk.
 ///

@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **One value codec for RDB snapshots and KV disk-offload spill (W1).** The
+  ~150-line value-body encoder/decoder that existed twice — `rdb::write_entry`'s
+  value section and `kv_serde::serialize_collection` — kept bit-compatible only
+  by discipline, is now a single spec-documented module
+  (`src/storage/value_codec.rs`) that both call sites delegate to; the
+  `RedisValueRef → ValueType` mapping likewise exists once (the former inline
+  copies in `eviction.rs` and `kv_spill.rs` delegate). Wire format is
+  byte-identical (pinned by hand-built golden byte-spec tests + legacy
+  pre-trailer decode tests); existing RDB files and spill pages load unchanged.
+
+### Fixed
+- **Spill decode allocation-DoS hardening.** The spill value decoder missed the
+  RDB count-validation fix and fed corrupt length fields straight into
+  `Vec::with_capacity`; the unified codec validates every count against
+  remaining input before allocating, on both planes.
+- **Corrupt sorted-set listpack scores are fail-closed.** Both former encoder
+  copies silently wrote `0.0` for a listpack zset score that failed to parse;
+  the codec now refuses to encode (`ValueCodecError::CorruptScore`) — an RDB
+  save fails loudly and a spill aborts instead of persisting a corrupted score.
+
 ### Documentation
 - **New "The Moon Journey" page (`docs/journey.md`) — the development story
   toward a production-efficient database, grounded in real evidence.** Traces

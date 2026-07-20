@@ -892,20 +892,7 @@ fn evict_batch_durable_no_aof(
         let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
             RedisValueRef::String(s) => (ValueType::String, s),
             ref other => {
-                let vt = match other {
-                    RedisValueRef::Hash(_)
-                    | RedisValueRef::HashListpack(_)
-                    | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
-                    RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                    RedisValueRef::Set(_)
-                    | RedisValueRef::SetListpack(_)
-                    | RedisValueRef::SetIntset(_) => ValueType::Set,
-                    RedisValueRef::SortedSet { .. }
-                    | RedisValueRef::SortedSetBPTree { .. }
-                    | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
-                    RedisValueRef::Stream(_) => ValueType::Stream,
-                    RedisValueRef::String(_) => unreachable!(),
-                };
+                let vt = kv_spill::value_type_of(other);
                 collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
                 (vt, collection_buf.as_slice())
             }
@@ -1035,20 +1022,7 @@ fn evict_one_async_spill(
         let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
             RedisValueRef::String(s) => (ValueType::String, s),
             ref other => {
-                let vt = match other {
-                    RedisValueRef::Hash(_)
-                    | RedisValueRef::HashListpack(_)
-                    | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
-                    RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                    RedisValueRef::Set(_)
-                    | RedisValueRef::SetListpack(_)
-                    | RedisValueRef::SetIntset(_) => ValueType::Set,
-                    RedisValueRef::SortedSet { .. }
-                    | RedisValueRef::SortedSetBPTree { .. }
-                    | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
-                    RedisValueRef::Stream(_) => ValueType::Stream,
-                    RedisValueRef::String(_) => unreachable!(),
-                };
+                let vt = kv_spill::value_type_of(other);
                 collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
                 (vt, collection_buf.as_slice())
             }
