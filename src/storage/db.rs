@@ -5,8 +5,9 @@ pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 
 use super::bptree::BPTree;
 use super::compact_key::CompactKey;
-use super::compact_value::{CompactValue, RedisValueRef};
+use super::compact_value::RedisValueRef;
 use super::dashtable::{DashTable, InsertOrUpdate};
+use super::db_kind::{self, OwnedKind, ValueKind};
 use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms};
 use super::intset::Intset;
 use super::stream::Stream as StreamData;
@@ -1649,68 +1650,130 @@ impl Database {
         }
     }
 
-    /// Get or create a hash entry. Returns mutable ref to inner HashMap.
-    /// Returns Err(WRONGTYPE) if key exists with wrong type.
-    ///
-    /// New keys start with compact listpack encoding and are upgraded to
-    /// full HashMap on first mutable access (eager upgrade).
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
-    pub fn get_or_create_hash(&mut self, key: &[u8]) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
-        let now_ms = self.cached_now_ms;
-        // Expire check
+    // ── W5: generic typed accessors ─────────────────────────────────────
+    //
+    // The per-type accessor skeleton (expiry check → cold promote/
+    // read-through → compact-encoding upgrade → variant projection) exists
+    // once per access shape below; everything genuinely per-type lives in
+    // `storage::db_kind` as a `ValueKind`/`OwnedKind` marker impl. The
+    // public `get_hash`/`get_or_create_set`/`get_list_ref_if_alive`/…
+    // methods are thin delegators, so command-layer call sites are
+    // unchanged and dispatch is fully static.
+
+    /// Remove `key` if it is expired at `now_ms`, crediting its memory.
+    fn drop_if_expired(&mut self, key: &[u8], now_ms: u64) {
         if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
+    }
+
+    /// Read-only typed access via the kind's `*Ref` view.
+    ///
+    /// Takes `&self` because this backs BOTH the exclusive-dispatch path
+    /// (`&mut Database`, reborrowed) AND the RwLock-shared-read dispatch
+    /// path (`&Database` only). The latter cannot promote a cold hit into
+    /// hot RAM, so a hot miss falls back to a non-promoting cold
+    /// read-through returning the view's `Owned` variant (P0
+    /// cold-collection-visibility fix) — the fast path (key present hot)
+    /// still costs exactly one probe. Expiry is checked against the
+    /// caller's `now_ms` without removing the key or touching LRU.
+    pub fn get_ref_if_alive<K: ValueKind>(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<K::Ref<'_>>, Frame> {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(now_ms) {
+                return Ok(None);
+            }
+            return match K::classify_hot(entry.value.as_redis_value(), now_ms) {
+                Ok(r) => Ok(Some(r)),
+                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
+            };
+        }
+        match self.cold_read_only(key, now_ms) {
+            Some(v) => match K::classify_cold(v, now_ms) {
+                Ok(r) => Ok(Some(r)),
+                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Get-or-create typed access to the full (non-compact) encoding.
+    ///
+    /// Promotes a cold-spilled value back to hot RAM before fabricating an
+    /// empty container (P0 fix: a write on an evicted key must not silently
+    /// shadow the cold copy — see `Self::promote_cold_if_present`), then
+    /// upgrades the kind's compact encoding(s) in place.
+    pub fn get_or_create<K: OwnedKind>(&mut self, key: &[u8]) -> Result<K::Mut<'_>, Frame> {
+        let now_ms = self.cached_now_ms;
+        self.drop_if_expired(key, now_ms);
         if !self.data.contains_key(key) {
-            // P0 fix: a hash may have been spilled to the cold tier by
-            // eviction. Promote it back to hot RAM before fabricating an
-            // empty container, or HSET on an evicted hash would silently
-            // destroy the cold copy (see `Self::promote_cold_if_present`).
             self.promote_cold_if_present(key, now_ms);
             if !self.data.contains_key(key) {
-                let entry = Entry::new_hash();
+                let entry = K::new_entry();
                 let k = CompactKey::from(key);
                 self.used_memory += entry_overhead(key, &entry);
                 self.data.insert(k, entry);
             }
         }
-        let entry = match self.data.get_mut(key) {
-            Some(e) => e,
-            None => {
-                // This should not happen — insert was just called above.
-                // Log and return an error instead of panicking.
-                tracing::error!(
-                    "get_or_create_hash: get_mut returned None after insert for key len={}",
-                    key.len()
-                );
-                return Err(Frame::Error(bytes::Bytes::from_static(
-                    b"ERR internal: hash lookup failed after insert",
-                )));
-            }
+        let Some(entry) = self.data.get_mut(key) else {
+            // Should not happen — insert was just called above. Log and
+            // return an error instead of panicking.
+            tracing::error!(
+                "get_or_create: get_mut returned None after insert for key len={}",
+                key.len()
+            );
+            return Err(Frame::Error(bytes::Bytes::from_static(
+                b"ERR internal: lookup failed after insert",
+            )));
         };
-        // Upgrade compact listpack to full HashMap if needed
-        let needs_upgrade = matches!(
-            entry.value.as_redis_value_mut(),
-            Some(RedisValue::HashListpack(_))
-        );
-        if needs_upgrade {
-            if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
-                let map = lp.to_hash_map();
-                if let Some(v) = entry.value.as_redis_value_mut() {
-                    *v = RedisValue::Hash(map);
-                }
-            }
-        }
+        K::upgrade(entry);
         match entry.value.as_redis_value_mut() {
-            Some(RedisValue::Hash(map)) => Ok(map),
-            // HashWithTtl: the fields sub-map is a plain HashMap<Bytes, Bytes>.
-            // HSET/HMSET/HINCRBY must be able to mutate it directly; they never
-            // touch the ttls sidecar, which is managed by the HEXPIRE family.
-            Some(RedisValue::HashWithTtl { fields, .. }) => Ok(fields),
-            _ => Err(Self::wrongtype_error()),
+            Some(v) => match K::project_mut(v) {
+                Ok(m) => Ok(m),
+                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
+            },
+            None => Err(Self::wrongtype_error()),
         }
+    }
+
+    /// Read typed access to the full (non-compact) encoding, promoting a
+    /// cold-spilled value back to hot RAM on miss (this accessor takes
+    /// `&mut self` — unlike the enum-based `get_ref_if_alive` it can
+    /// promote directly instead of decoding a throwaway copy per call) and
+    /// upgrading the kind's compact encoding(s) in place when present.
+    pub fn get_promoted<K: OwnedKind>(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<K::Shared<'_>>, Frame> {
+        let now_ms = self.cached_now_ms;
+        self.drop_if_expired(key, now_ms);
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
+        }
+        if let Some(entry) = self.data.get_mut(key) {
+            K::upgrade(entry);
+        }
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) => match K::project_ref(entry.value.as_redis_value()) {
+                Ok(r) => Ok(Some(r)),
+                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
+    /// Get or create a hash entry. Returns mutable ref to inner HashMap.
+    /// Returns Err(WRONGTYPE) if key exists with wrong type.
+    ///
+    /// New keys start with compact listpack encoding and are upgraded to
+    /// full HashMap on first mutable access (eager upgrade).
+    pub fn get_or_create_hash(&mut self, key: &[u8]) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
+        self.get_or_create::<db_kind::HashKind>(key)
     }
 
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
@@ -1720,69 +1783,14 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`, so
     /// unlike the enum-based `get_hash_ref_if_alive` it can promote directly
     /// instead of decoding a throwaway copy on every call.
-    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-        }
-        // Upgrade compact encoding if present
-        if let Some(entry) = self.data.get_mut(key) {
-            if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
-                let map = lp.to_hash_map();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
-            }
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Hash(map) => Ok(Some(map)),
-                // HashWithTtl: expose the fields sub-map for reads.  Callers
-                // (HGET, HMGET, HKEYS, HVALS, HGETALL, etc.) see the HashMap
-                // directly; expired-field filtering happens in hash_field_state
-                // or via the active-expiry tick, not on every read.
-                RedisValueRef::HashWithTtl { fields, .. } => Ok(Some(fields)),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
+        self.get_promoted::<db_kind::HashKind>(key)
     }
 
     /// Get or create a list entry. Returns mutable ref to inner VecDeque.
     /// New keys start with full encoding. Upgrades compact listpack on access.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_list(&mut self, key: &[u8]) -> Result<&mut VecDeque<Bytes>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled list before fabricating an empty
-            // one (see `Self::promote_cold_if_present`).
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let entry = Entry::new_list();
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
-        }
-        let entry = self.data.get_mut(key).unwrap();
-        // Upgrade compact listpack to full VecDeque if needed
-        if let Some(RedisValue::ListListpack(lp)) = entry.value.as_redis_value_mut() {
-            let list = lp.to_vec_deque();
-            *entry.value.as_redis_value_mut().unwrap() = RedisValue::List(list);
-        }
-        match entry.value.as_redis_value_mut() {
-            Some(RedisValue::List(list)) => Ok(list),
-            _ => Err(Self::wrongtype_error()),
-        }
+        self.get_or_create::<db_kind::ListKind>(key)
     }
 
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
@@ -1790,71 +1798,14 @@ impl Database {
     ///
     /// Promotes a cold-spilled list back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
-    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-        }
-        // Upgrade compact encoding if present
-        if let Some(entry) = self.data.get_mut(key) {
-            if let Some(RedisValue::ListListpack(lp)) = entry.value.as_redis_value_mut() {
-                let list = lp.to_vec_deque();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::List(list);
-            }
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::List(list) => Ok(Some(list)),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
+        self.get_promoted::<db_kind::ListKind>(key)
     }
 
     /// Get or create a set entry. Returns mutable ref to inner HashSet.
     /// New keys start with full encoding. Upgrades compact encodings on access.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_set(&mut self, key: &[u8]) -> Result<&mut HashSet<Bytes>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled set before fabricating an empty
-            // one (see `Self::promote_cold_if_present`).
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let entry = Entry::new_set();
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
-        }
-        let entry = self.data.get_mut(key).unwrap();
-        // Upgrade compact encodings to full HashSet
-        match entry.value.as_redis_value_mut() {
-            Some(RedisValue::SetListpack(lp)) => {
-                let set = lp.to_hash_set();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
-            }
-            Some(RedisValue::SetIntset(is)) => {
-                let set = is.to_hash_set();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
-            }
-            _ => {}
-        }
-        match entry.value.as_redis_value_mut() {
-            Some(RedisValue::Set(set)) => Ok(set),
-            _ => Err(Self::wrongtype_error()),
-        }
+        self.get_or_create::<db_kind::SetKind>(key)
     }
 
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
@@ -1862,38 +1813,8 @@ impl Database {
     ///
     /// Promotes a cold-spilled set back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
-    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-        }
-        // Upgrade compact encodings if present
-        if let Some(entry) = self.data.get_mut(key) {
-            match entry.value.as_redis_value_mut() {
-                Some(RedisValue::SetListpack(lp)) => {
-                    let set = lp.to_hash_set();
-                    *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
-                }
-                Some(RedisValue::SetIntset(is)) => {
-                    let set = is.to_hash_set();
-                    *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
-                }
-                _ => {}
-            }
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Set(set) => Ok(Some(set)),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
+        self.get_promoted::<db_kind::SetKind>(key)
     }
 
     /// Get or create an intset entry. Creates a new SetIntset if the key doesn't exist.
@@ -2070,97 +1991,22 @@ impl Database {
     ///
     /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
     /// entries are upgraded to SortedSetBPTree on access for backward compatibility.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; legacy upgrade is infallible
     pub fn get_or_create_sorted_set(
         &mut self,
         key: &[u8],
     ) -> Result<(&mut HashMap<Bytes, f64>, &mut BPTree), Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled sorted set before fabricating
-            // an empty one (see `Self::promote_cold_if_present`).
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let entry = Entry::new_sorted_set_bptree();
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
-        }
-        // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
-        let entry = self.data.get_mut(key).unwrap();
-        if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
-            let mut tree = BPTree::new();
-            let new_members = std::mem::take(members);
-            let old_scores = std::mem::take(scores);
-            for ((score, member), ()) in old_scores {
-                tree.insert(score, member);
-            }
-            entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
-                tree,
-                members: new_members,
-            });
-        }
-        match entry.value.as_redis_value_mut() {
-            Some(RedisValue::SortedSetBPTree { members, tree }) => Ok((members, tree)),
-            _ => Err(Self::wrongtype_error()),
-        }
+        self.get_or_create::<db_kind::SortedSetKind>(key)
     }
 
     /// Get a sorted set entry (read-only). Returns None if key missing, Err if wrong type.
     ///
     /// Promotes a cold-spilled sorted set back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
-    #[allow(clippy::unwrap_used)] // get_mut() after confirmed existence; legacy BTreeMap upgrade is infallible
     pub fn get_sorted_set(
         &mut self,
         key: &[u8],
     ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-        }
-        // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
-        if let Some(entry) = self.data.get(key) {
-            if matches!(
-                entry.value.as_redis_value(),
-                RedisValueRef::SortedSet { .. }
-            ) {
-                let entry = self.data.get_mut(key).unwrap();
-                if let Some(RedisValue::SortedSet { members, scores }) =
-                    entry.value.as_redis_value_mut()
-                {
-                    let mut tree = BPTree::new();
-                    let new_members = std::mem::take(members);
-                    let old_scores = std::mem::take(scores);
-                    for ((score, member), ()) in old_scores {
-                        tree.insert(score, member);
-                    }
-                    entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
-                        tree,
-                        members: new_members,
-                    });
-                }
-            }
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
-                RedisValueRef::SortedSet { .. } => unreachable!("should have been upgraded"),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
+        self.get_promoted::<db_kind::SortedSetKind>(key)
     }
 
     /// Collect keys that have an expiration set.
@@ -2282,82 +2128,6 @@ impl Database {
         }
     }
 
-    /// Read-only hash access. Returns None if key missing or expired, Err if wrong type.
-    /// Compact encodings return None (caller falls through to mutable upgrade path).
-    #[allow(dead_code)]
-    pub fn get_hash_if_alive(
-        &self,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Hash(map) => Ok(Some(map)),
-                RedisValueRef::HashListpack(_) => Ok(None),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
-    }
-
-    /// Read-only list access. Returns None if key missing or expired, Err if wrong type.
-    /// Compact encodings return None (caller falls through to mutable upgrade path).
-    #[allow(dead_code)]
-    pub fn get_list_if_alive(
-        &self,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<Option<&VecDeque<Bytes>>, Frame> {
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::List(list) => Ok(Some(list)),
-                RedisValueRef::ListListpack(_) => Ok(None),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
-    }
-
-    /// Read-only set access. Returns None if key missing or expired, Err if wrong type.
-    /// Compact encodings return None (caller falls through to mutable upgrade path).
-    #[allow(dead_code)]
-    pub fn get_set_if_alive(
-        &self,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<Option<&HashSet<Bytes>>, Frame> {
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Set(set) => Ok(Some(set)),
-                RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => Ok(None),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
-    }
-
-    /// Read-only sorted set access. Returns None if key missing or expired, Err if wrong type.
-    /// Compact encodings return None (caller falls through to mutable upgrade path).
-    #[allow(dead_code)]
-    pub fn get_sorted_set_if_alive(
-        &self,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
-                RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetListpack(_) => Ok(None),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
-    }
-
     // ---- Enum-based readonly accessors that handle compact encodings ----
 
     /// Read-only hash access via HashRef enum.
@@ -2379,41 +2149,7 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<HashRef<'_>>, Frame> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
-                return Ok(None);
-            }
-            return match entry.value.as_redis_value() {
-                RedisValueRef::Hash(map) => Ok(Some(HashRef::Map(map))),
-                RedisValueRef::HashListpack(lp) => Ok(Some(HashRef::Listpack(lp))),
-                RedisValueRef::HashWithTtl {
-                    fields,
-                    ttls,
-                    min_expiry_ms,
-                } => Ok(Some(HashRef::WithTtl {
-                    fields,
-                    ttls,
-                    now_ms,
-                    min_expiry_ms,
-                })),
-                _ => Err(Self::wrongtype_error()),
-            };
-        }
-        match self.cold_read_only(key, now_ms) {
-            Some(RedisValue::Hash(map)) => Ok(Some(HashRef::Owned(map))),
-            Some(RedisValue::HashWithTtl {
-                fields,
-                ttls,
-                min_expiry_ms,
-            }) => Ok(Some(HashRef::OwnedWithTtl {
-                fields,
-                ttls,
-                now_ms,
-                min_expiry_ms,
-            })),
-            Some(_) => Err(Self::wrongtype_error()),
-            None => Ok(None),
-        }
+        self.get_ref_if_alive::<db_kind::HashKind>(key, now_ms)
     }
 
     /// Read-only list access via ListRef enum. Handles both VecDeque and Listpack.
@@ -2426,21 +2162,7 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
-                return Ok(None);
-            }
-            return match entry.value.as_redis_value() {
-                RedisValueRef::List(list) => Ok(Some(ListRef::Deque(list))),
-                RedisValueRef::ListListpack(lp) => Ok(Some(ListRef::Listpack(lp))),
-                _ => Err(Self::wrongtype_error()),
-            };
-        }
-        match self.cold_read_only(key, now_ms) {
-            Some(RedisValue::List(list)) => Ok(Some(ListRef::Owned(list))),
-            Some(_) => Err(Self::wrongtype_error()),
-            None => Ok(None),
-        }
+        self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms)
     }
 
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
@@ -2453,22 +2175,7 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SetRef<'_>>, Frame> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
-                return Ok(None);
-            }
-            return match entry.value.as_redis_value() {
-                RedisValueRef::Set(set) => Ok(Some(SetRef::Hash(set))),
-                RedisValueRef::SetListpack(lp) => Ok(Some(SetRef::Listpack(lp))),
-                RedisValueRef::SetIntset(is) => Ok(Some(SetRef::Intset(is))),
-                _ => Err(Self::wrongtype_error()),
-            };
-        }
-        match self.cold_read_only(key, now_ms) {
-            Some(RedisValue::Set(set)) => Ok(Some(SetRef::Owned(set))),
-            Some(_) => Err(Self::wrongtype_error()),
-            None => Ok(None),
-        }
+        self.get_ref_if_alive::<db_kind::SetKind>(key, now_ms)
     }
 
     /// Read-only sorted set access via SortedSetRef enum. Handles BPTree, Listpack, and Legacy.
@@ -2481,28 +2188,7 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SortedSetRef<'_>>, Frame> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
-                return Ok(None);
-            }
-            return match entry.value.as_redis_value() {
-                RedisValueRef::SortedSetBPTree { tree, members } => {
-                    Ok(Some(SortedSetRef::BPTree { tree, members }))
-                }
-                RedisValueRef::SortedSetListpack(lp) => Ok(Some(SortedSetRef::Listpack(lp))),
-                RedisValueRef::SortedSet { members, scores } => {
-                    Ok(Some(SortedSetRef::Legacy { members, scores }))
-                }
-                _ => Err(Self::wrongtype_error()),
-            };
-        }
-        match self.cold_read_only(key, now_ms) {
-            Some(RedisValue::SortedSetBPTree { tree, members }) => {
-                Ok(Some(SortedSetRef::Owned { tree, members }))
-            }
-            Some(_) => Err(Self::wrongtype_error()),
-            None => Ok(None),
-        }
+        self.get_ref_if_alive::<db_kind::SortedSetKind>(key, now_ms)
     }
 
     // ---- Low-level helpers for blocking wakeup hooks ----
@@ -2589,30 +2275,8 @@ impl Database {
     }
 
     /// Get or create a stream at the given key. Returns WRONGTYPE if key holds another type.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_stream(&mut self, key: &[u8]) -> Result<&mut StreamData, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled stream before fabricating an
-            // empty one (see `Self::promote_cold_if_present`).
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let entry = Entry::new_stream();
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
-        }
-        let entry = self.data.get_mut(key).unwrap();
-        match entry.value.as_redis_value_mut() {
-            Some(RedisValue::Stream(s)) => Ok(s.as_mut()),
-            _ => Err(Self::wrongtype_error()),
-        }
+        self.get_or_create::<db_kind::StreamKind>(key)
     }
 
     /// Read-only stream access for the shared-lock read path.
@@ -2633,20 +2297,7 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<StreamRef<'_>>, Frame> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
-                return Ok(None);
-            }
-            return match entry.value.as_redis_value() {
-                RedisValueRef::Stream(s) => Ok(Some(StreamRef::Borrowed(s))),
-                _ => Err(Self::wrongtype_error()),
-            };
-        }
-        match self.cold_read_only(key, now_ms) {
-            Some(RedisValue::Stream(s)) => Ok(Some(StreamRef::Owned(s))),
-            Some(_) => Err(Self::wrongtype_error()),
-            None => Ok(None),
-        }
+        self.get_ref_if_alive::<db_kind::StreamKind>(key, now_ms)
     }
 
     /// Get a read-only reference to a stream. Returns Ok(None) if key doesn't exist.
@@ -2655,22 +2306,7 @@ impl Database {
     /// Promotes a cold-spilled stream back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream(&mut self, key: &[u8]) -> Result<Option<&StreamData>, Frame> {
-        let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::Stream(s) => Ok(Some(s)),
-                _ => Err(Self::wrongtype_error()),
-            },
-        }
+        self.get_promoted::<db_kind::StreamKind>(key)
     }
 
     /// Get a mutable reference to an existing stream. Returns Ok(None) if key doesn't exist.
@@ -3246,6 +2882,50 @@ mod tests {
         assert!(
             db.cold_index.as_ref().unwrap().lookup(b"h").is_some(),
             "cold index entry must remain untouched by a non-promoting read"
+        );
+    }
+
+    /// W5 pin: the ref accessor's WRONGTYPE leg on a live hot key.
+    #[test]
+    fn test_ref_accessors_wrongtype_on_hot_string() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"v"));
+        assert!(db.get_hash_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_list_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_set_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_sorted_set_ref_if_alive(b"s", 0).is_err());
+    }
+
+    /// W5 pin: `get_hash_ref_if_alive` must map a hot `HashWithTtl` entry to
+    /// `HashRef::WithTtl` carrying the CALLER's `now_ms` — an expired field
+    /// filters out, a live one reads through.
+    #[test]
+    fn test_hash_ref_with_ttl_leg_filters_expired_fields() {
+        let mut db = Database::new();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"dead"), Bytes::from_static(b"x"));
+        fields.insert(Bytes::from_static(b"live"), Bytes::from_static(b"y"));
+        let mut ttls = HashMap::new();
+        ttls.insert(Bytes::from_static(b"dead"), 1_000u64);
+        ttls.insert(Bytes::from_static(b"live"), 5_000u64);
+        let mut entry = Entry::new_hash();
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms: 1_000,
+            },
+        );
+        db.set(Bytes::from_static(b"h"), entry);
+
+        // now_ms between the two field deadlines: "dead" filtered, "live" seen.
+        let href = db.get_hash_ref_if_alive(b"h", 2_000).unwrap().unwrap();
+        assert!(matches!(href, HashRef::WithTtl { .. }));
+        assert_eq!(href.get_field(b"dead"), None, "expired field must filter");
+        assert_eq!(
+            href.get_field(b"live").unwrap(),
+            Bytes::from_static(b"y"),
+            "live field must read through"
         );
     }
 

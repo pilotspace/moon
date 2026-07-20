@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance is now an exact equality).
 
 ### Changed
+- **One typed-accessor skeleton in `Database` (W5).** The ~20-method
+  accessor matrix (`get_X` / `get_or_create_X` / `get_X_ref_if_alive` per
+  container type) copy-pasted the same skeleton — expiry check → cold
+  promote/read-through → compact-encoding upgrade → variant projection —
+  once per type. The skeleton now exists once per access shape
+  (`get_ref_if_alive::<K>` / `get_or_create::<K>` / `get_promoted::<K>`);
+  everything genuinely per-type lives in the new `storage::db_kind` module
+  as `ValueKind`/`OwnedKind` marker impls (static dispatch — generated code
+  identical to the hand-written originals). The public per-type methods
+  remain as thin delegators, so command-layer call sites are unchanged.
+  The four caller-less `get_X_if_alive` variants (compact encodings
+  returned `None`; superseded by the `_ref_if_alive` family) are deleted.
+  Pure refactor — behavior pinned by two new tests (hot-WRONGTYPE through
+  the ref accessors; `HashWithTtl` → `HashRef::WithTtl` wiring incl.
+  caller-`now_ms` propagation) plus the existing cold-visibility pins.
+
 - **One eviction entry point (W4).** The 13-name `try_evict_if_needed*`
   family (every combination of spill-sink / explicit-total / elastic-budget /
   plain-drop-reporting encoded as a function-name suffix) is replaced by a
