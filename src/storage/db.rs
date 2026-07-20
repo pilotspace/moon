@@ -3163,7 +3163,7 @@ mod tests {
     // (.planning/reviews/storage-audit-2026-07-12-kv.md)
     //
     // Disk-offload spills Hash/List/Set/ZSet/Stream via
-    // `evict_one_async_spill` / `evict_batch_durable_no_aof` (production
+    // `evict_one_async_spill` / `evict_batch_durable` (production
     // paths, `kv_serde::serialize_collection` handles every type), but the
     // type-specific accessors used to consult only `self.data`, never the
     // `ColdIndex` — so a spilled collection read as absent, and a write
