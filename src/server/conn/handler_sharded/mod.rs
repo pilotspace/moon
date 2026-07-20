@@ -19,9 +19,7 @@ use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
-};
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
@@ -1452,19 +1450,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         .disk_offload_dir
                                         .as_deref()
                                         .unwrap_or(std::path::Path::new("."));
-                                    let res = try_evict_if_needed_async_spill_budget(
+                                    let res = evict_to_budget(
                                         db,
                                         &rt,
-                                        sender,
-                                        dir,
-                                        &mut fid,
-                                        conn.selected_db,
-                                        budget,
+                                        EvictionRun::async_spill(
+                                            sender,
+                                            dir,
+                                            &mut fid,
+                                            conn.selected_db,
+                                            None,
+                                        )
+                                        .budget(budget),
                                     );
                                     ctx.spill_file_id.set(fid);
                                     res
                                 } else {
-                                    try_evict_if_needed_budget(db, &rt, budget)
+                                    evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))
                                 };
                                 // WS6 fix (HIGH, adversarial review 2026-07-08): a
                                 // command that can only shrink memory (HDEL, SREM,

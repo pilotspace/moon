@@ -165,21 +165,25 @@ pub(crate) fn run_eviction(
                 if let Some(ctx) = spill.as_deref_mut() {
                     ctx.db_index = i;
                 }
-                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
-                    db, &rt, spill.as_deref_mut(), remaining, budget,
-                    &mut |key| {
-                        crate::replication::reason_del::record_reason_del(
-                            key,
-                            i,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool,
-                            wal_kv_log,
-                        );
-                    },
+                let _ = crate::storage::eviction::evict_to_budget(
+                    db,
+                    &rt,
+                    crate::storage::eviction::EvictionRun::sync_spill(spill.as_deref_mut())
+                        .total(remaining)
+                        .budget(budget)
+                        .report(&mut |key| {
+                            crate::replication::reason_del::record_reason_del(
+                                key,
+                                i,
+                                wal_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool,
+                                wal_kv_log,
+                            );
+                        }),
                 );
                 let freed = before.saturating_sub(db.estimated_memory());
                 remaining = remaining.saturating_sub(freed);

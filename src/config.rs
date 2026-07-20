@@ -999,7 +999,7 @@ impl ServerConfig {
     /// cannot durably spill — cold data is NOT tiered to disk regardless of
     /// policy. What happens to the *write* itself is now policy-aware
     /// (`src/storage/eviction.rs`, the `manifest is None` branch of
-    /// `try_evict_if_needed_async_spill_with_total_budget`): an evicting
+    /// `storage::eviction::EvictionSink::AsyncSpill`): an evicting
     /// policy (`allkeys-*`/`volatile-*`) still honors `--maxmemory` by
     /// DROPPING victims outright (Redis cache semantics, no tiering, no
     /// crash-durability claim needed since nothing needs to survive a

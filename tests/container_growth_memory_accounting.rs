@@ -111,7 +111,7 @@ fn spawn_moon_maxmemory(dir: &std::path::Path, maxmemory_bytes: u64) -> (ServerG
 /// a single per-db `--db-maxmemory <db>:<bytes>` quota instead, `noeviction`
 /// policy, AOF/disk-offload disabled. Isolates the db-quota gate
 /// (`db_quota::check_db_maxmemory_for_command`) from the global gate
-/// (`eviction::try_evict_if_needed_budget`) so the shrink-only bypass is
+/// (`eviction::evict_to_budget`) so the shrink-only bypass is
 /// exercised on each independently.
 fn spawn_moon_db_maxmemory(dir: &std::path::Path, db_maxmemory_bytes: u64) -> (ServerGuard, u16) {
     let (child, port) = common::spawn_listening(|port| {

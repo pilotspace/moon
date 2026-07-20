@@ -23,9 +23,7 @@ use crate::replication::backlog::ReplicationBacklog;
 use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
-};
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::storage::tiered::spill_thread::SpillRequest;
 
 use crate::command::vector_search;
@@ -78,20 +76,21 @@ pub(super) fn spsc_eviction_gate(
         // non-reporting wrapper (hardcoded no-op sink), silently dropping
         // `on_plain_drop` on the floor for this branch even though the
         // caller already threads a real one for the sibling branch below.
-        let res = try_evict_if_needed_async_spill_budget_reporting(
+        let res = evict_to_budget(
             db,
             &rt,
-            sender,
-            dir,
-            &mut fid,
-            db_idx,
-            budget,
-            on_plain_drop,
+            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, None)
+                .budget(budget)
+                .report(on_plain_drop),
         );
         spill_file_id.set(fid);
         res
     } else {
-        try_evict_if_needed_budget_reporting(db, &rt, budget, on_plain_drop)
+        evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::plain().budget(budget).report(on_plain_drop),
+        )
     };
     global_result?;
     // WS5b: per-db quota, additive and finer-grained than the whole-instance

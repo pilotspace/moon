@@ -1122,7 +1122,7 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 ///
 /// **SET:** plain `SET key value` only (exactly `*3` args, no NX/XX/EX/PX options).
 ///   Side-effects handled by this path:
-///   - maxmemory eviction (`try_evict_if_needed`)
+///   - maxmemory eviction (`evict_to_budget`)
 ///   - AOF append (raw RESP bytes, zero re-serialization)
 ///
 ///   Side-effects intentionally skipped (caller gates via `can_inline_writes`):
@@ -1398,30 +1398,33 @@ pub(crate) fn try_inline_dispatch(
         if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
             let rt = runtime_config.read();
             let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
-                crate::storage::eviction::try_evict_if_needed_budget_reporting(
+                crate::storage::eviction::evict_to_budget(
                     db,
                     &rt,
-                    budget,
-                    // task #34 (Wave A): the inline SET fast path is the
-                    // ONLY write-eviction gate that can plain-drop a key
-                    // with zero AOF/replication visibility today — the
-                    // key vanishes from RAM but the client's `+OK` and any
-                    // attached replica/AOF replay never learn it happened.
-                    // `can_inline_writes` (this path's caller) already
-                    // forces the generic dispatch path once a replica has
-                    // ever attached (`fanout_hint_active`), so this sink's
-                    // replication leg is a cheap no-op in that case; the
-                    // AOF leg still fires unconditionally.
-                    &mut |key| {
-                        crate::replication::reason_del::record_reason_del_conn(
-                            repl_state,
-                            shard_id,
-                            num_shards,
-                            aof_pool.as_ref(),
-                            selected_db,
-                            key,
-                        );
-                    },
+                    crate::storage::eviction::EvictionRun::plain()
+                        .budget(budget)
+                        .report(
+                            // task #34 (Wave A): the inline SET fast path is the
+                            // ONLY write-eviction gate that can plain-drop a key
+                            // with zero AOF/replication visibility today — the
+                            // key vanishes from RAM but the client's `+OK` and any
+                            // attached replica/AOF replay never learn it happened.
+                            // `can_inline_writes` (this path's caller) already
+                            // forces the generic dispatch path once a replica has
+                            // ever attached (`fanout_hint_active`), so this sink's
+                            // replication leg is a cheap no-op in that case; the
+                            // AOF leg still fires unconditionally.
+                            &mut |key| {
+                                crate::replication::reason_del::record_reason_del_conn(
+                                    repl_state,
+                                    shard_id,
+                                    num_shards,
+                                    aof_pool.as_ref(),
+                                    selected_db,
+                                    key,
+                                );
+                            },
+                        ),
                 )
                 .is_err()
             });

@@ -212,7 +212,7 @@ const FILLER_BATCH_SIZE: usize = 400;
 /// pushes its filler via ONE giant MSET, which works there because that test
 /// runs `--appendonly no` -- the write-path eviction gate takes the
 /// synchronous, in-process "no manifest reachable, no AOF backstop"
-/// plain-drop branch (`try_evict_if_needed_with_spill`, no channel
+/// plain-drop branch (`evict_to_budget` sync-spill sink, no channel
 /// involved). This test needs REAL durable disk spill (`--appendonly yes`
 /// is required or `disk_offload_spill_inert()` makes eviction plain-drop
 /// instead of spilling -- see `start_moon`'s comment), which routes each

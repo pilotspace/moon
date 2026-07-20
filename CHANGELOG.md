@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance is now an exact equality).
 
 ### Changed
+- **One eviction entry point (W4).** The 13-name `try_evict_if_needed*`
+  family (every combination of spill-sink / explicit-total / elastic-budget /
+  plain-drop-reporting encoded as a function-name suffix) is replaced by a
+  single `evict_to_budget(db, config, EvictionRun)` — the victim destination
+  (`Plain` / `SyncSpill` / `AsyncSpill`) and the optional knobs are data on
+  the `EvictionRun` options struct. The two former core loops (sync + async,
+  five near-identical reclaim-loop copies in total) are now one loop with a
+  per-iteration sink dispatch; the `--appendonly` durability-ordering
+  branches are unchanged and documented on `EvictionSink::AsyncSpill`.
+  Pure refactor — no behavior change; behavior pinned by three new
+  entry-point tests plus the full existing eviction suite.
+
 - **Fossil `base_ts` plumbing removed (W3).** `is_expired_at` /
   `expires_at_ms` / `set_expires_at_ms` / `new_string_with_expiry` carried a
   `base_ts: u32` parameter that has been ignored since expiry became

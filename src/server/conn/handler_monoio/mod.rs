@@ -23,9 +23,7 @@ use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
-};
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
@@ -83,7 +81,7 @@ pub enum MonoioHandlerResult {
 /// `persistence_tick.rs` does), so under `--disk-offload enable` the
 /// spill-sender branch below reliably takes the "no manifest reachable"
 /// plain-drop fallback inside
-/// `try_evict_if_needed_async_spill_with_total_budget_reporting` for EVERY
+/// `evict_to_budget` for EVERY
 /// write past `maxmemory` — this is, empirically, the actual eviction path a
 /// live server hits on ordinary writes (HSET, SET, ...) under disk-offload,
 /// not the sync `SpillContext` path. It previously called the non-reporting
@@ -106,24 +104,21 @@ fn run_write_eviction_gate(
             .disk_offload_dir
             .as_deref()
             .unwrap_or(std::path::Path::new("."));
-        let res = try_evict_if_needed_async_spill_budget_reporting(
+        let res = evict_to_budget(
             db,
             &rt,
-            sender,
-            dir,
-            &mut fid,
-            sel_db,
-            budget,
-            &mut |key| {
-                crate::replication::reason_del::record_reason_del_conn(
-                    &ctx.repl_state,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    ctx.aof_pool.as_ref(),
-                    sel_db,
-                    key,
-                );
-            },
+            EvictionRun::async_spill(sender, dir, &mut fid, sel_db, None)
+                .budget(budget)
+                .report(&mut |key| {
+                    crate::replication::reason_del::record_reason_del_conn(
+                        &ctx.repl_state,
+                        ctx.shard_id,
+                        ctx.num_shards,
+                        ctx.aof_pool.as_ref(),
+                        sel_db,
+                        key,
+                    );
+                }),
         );
         ctx.spill_file_id.set(fid);
         res
@@ -133,16 +128,20 @@ fn run_write_eviction_gate(
         // off/unwired) — emit a dual-plane DEL for every victim so an
         // attached replica and the AOF replay converge with the master's
         // own eviction decision.
-        try_evict_if_needed_budget_reporting(db, &rt, budget, &mut |key| {
-            crate::replication::reason_del::record_reason_del_conn(
-                &ctx.repl_state,
-                ctx.shard_id,
-                ctx.num_shards,
-                ctx.aof_pool.as_ref(),
-                sel_db,
-                key,
-            );
-        })
+        evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::plain().budget(budget).report(&mut |key| {
+                crate::replication::reason_del::record_reason_del_conn(
+                    &ctx.repl_state,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    ctx.aof_pool.as_ref(),
+                    sel_db,
+                    key,
+                );
+            }),
+        )
     };
     // WS6 fix (HIGH, adversarial review 2026-07-08): a command that can only
     // shrink memory (HDEL, SREM, LPOP, ...) must never be REJECTED by either
@@ -771,7 +770,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // (and cache the spill-sender presence check). When neither is set —
         // the common non-memory-bound benchmark path — the per-command write
         // branch can skip the `runtime_config.read()` lock acquire + the
-        // `try_evict_if_needed` call entirely. Saves a small RwLock lock
+        // `evict_to_budget` call entirely. Saves a small RwLock lock
         // pair per write command in a pipelined batch.
         //
         // Safety: `maxmemory` changes via `CONFIG SET maxmemory N` are picked
