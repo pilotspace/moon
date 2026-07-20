@@ -389,7 +389,7 @@ mod tests {
 
         let mut entry = Entry::new_string(Bytes::copy_from_slice(value));
         if let Some(ttl) = ttl_ms {
-            entry.set_expires_at_ms(0, ttl);
+            entry.set_expires_at_ms(ttl);
         }
         spill_to_datafile(
             shard_dir,
@@ -526,11 +526,9 @@ mod tests {
         assert!(file_path.exists(), "precondition: spill file must exist");
 
         // Sweep at a time strictly after expiry, WITHOUT ever reading the key.
-        // NOTE: `Entry::set_expires_at_ms` quantizes to whole seconds
-        // (`ttl_secs = (ms / 1000).max(1)`), so the `Some(1)` passed to
-        // `db_with_spilled_key` above round-trips through the on-disk
-        // `KvEntry` as an absolute `ttl_ms` of 1000, not 1 — sweep strictly
-        // after that.
+        // The `Some(1)` passed to `db_with_spilled_key` above round-trips
+        // through the on-disk `KvEntry` as an absolute `ttl_ms` of 1 (exact
+        // since W3 ms fidelity) — sweeping at 1_001 is strictly after it.
         let stats = db
             .cold_index
             .as_mut()

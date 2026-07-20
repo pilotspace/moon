@@ -70,14 +70,11 @@ pub(crate) fn handle_pending_snapshot(
             } else {
                 snap_dir.join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
-                let mut seg_counts = Vec::with_capacity(s.databases.len());
-                let mut base_ts = Vec::with_capacity(s.databases.len());
-                for db in s.databases.iter() {
-                    seg_counts.push(db.data().segment_count());
-                    base_ts.push(db.base_timestamp());
-                }
-                (seg_counts, base_ts)
+            let segment_counts = crate::shard::slice::with_shard(|s| {
+                s.databases
+                    .iter()
+                    .map(|db| db.data().segment_count())
+                    .collect::<Vec<_>>()
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -85,7 +82,6 @@ pub(crate) fn handle_pending_snapshot(
                 epoch,
                 db_count,
                 segment_counts,
-                base_timestamps,
                 snap_path,
             );
             // P3c — stamp the WAL LSN so PITR can pick this snapshot as a
@@ -137,14 +133,11 @@ pub(crate) fn check_auto_save_trigger(
             } else {
                 std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
-                let mut seg_counts = Vec::with_capacity(s.databases.len());
-                let mut base_ts = Vec::with_capacity(s.databases.len());
-                for db in s.databases.iter() {
-                    seg_counts.push(db.data().segment_count());
-                    base_ts.push(db.base_timestamp());
-                }
-                (seg_counts, base_ts)
+            let segment_counts = crate::shard::slice::with_shard(|s| {
+                s.databases
+                    .iter()
+                    .map(|db| db.data().segment_count())
+                    .collect::<Vec<_>>()
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -152,7 +145,6 @@ pub(crate) fn check_auto_save_trigger(
                 new_epoch,
                 db_count,
                 segment_counts,
-                base_timestamps,
                 snap_path,
             );
             // P3c — stamp the WAL LSN before the header is written.

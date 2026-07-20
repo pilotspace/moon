@@ -71,11 +71,10 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
 
     // Databases
     for (db_idx, db) in databases.iter().enumerate() {
-        let base_ts = db.base_timestamp();
         let data = db.data();
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
+            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -85,7 +84,7 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -117,9 +116,9 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
 
 /// Save from pre-cloned snapshot data (used by BGSAVE to avoid holding the lock).
 ///
-/// Each element in `snapshot` is a Vec of (key, entry, base_ts) for a database index.
+/// Each element in `snapshot` is a Vec of (key, entry) for a database index.
 pub fn save_from_snapshot(
-    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
+    snapshot: &[Vec<(CompactKey, Entry)>],
     path: &Path,
 ) -> Result<(), MoonError> {
     let mut buf = Vec::new();
@@ -130,11 +129,11 @@ pub fn save_from_snapshot(
 
     let now_ms = current_time_ms();
 
-    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+    for (db_idx, entries) in snapshot.iter().enumerate() {
         // Filter expired and skip empty
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .filter(|(_, e)| !e.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -144,7 +143,7 @@ pub fn save_from_snapshot(
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -166,12 +165,9 @@ pub fn save_from_snapshot(
 
 /// Serialize snapshot data (with correct base_ts per database) to RDB bytes in memory.
 ///
-/// Unlike `save_to_bytes(&[Database])` which reads base_ts from each Database,
-/// this takes explicit (entries, base_ts) tuples — critical for AOF rewrite where
-/// entries are cloned into temporary storage and the original base_ts must be preserved.
-pub fn save_snapshot_to_bytes(
-    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
-) -> Result<Vec<u8>, MoonError> {
+/// Unlike `save_to_bytes(&[Database])`, this takes pre-cloned entry Vecs —
+/// used by AOF rewrite where entries are cloned into temporary storage.
+pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     buf.write_all(RDB_MAGIC)?;
@@ -179,10 +175,10 @@ pub fn save_snapshot_to_bytes(
 
     let now_ms = current_time_ms();
 
-    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+    for (db_idx, entries) in snapshot.iter().enumerate() {
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .filter(|(_, e)| !e.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -192,7 +188,7 @@ pub fn save_snapshot_to_bytes(
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -327,7 +323,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
                             continue;
                         }
                         if current_db < db_count {
@@ -592,7 +588,7 @@ fn read_entry_zero_copy(
             let mut entry = Entry::new_string(Bytes::new());
             entry.value = cv;
             if expires_at_ms > 0 {
-                entry.set_expires_at_ms(cached_secs, expires_at_ms);
+                entry.set_expires_at_ms(expires_at_ms);
             }
             entry.set_last_access(cached_secs);
             entry.set_access_counter(5);
@@ -795,7 +791,7 @@ fn read_entry_zero_copy(
     let mut entry = Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
     if expires_at_ms > 0 {
-        entry.set_expires_at_ms(cached_secs, expires_at_ms);
+        entry.set_expires_at_ms(expires_at_ms);
     }
     entry.set_last_access(cached_secs);
     entry.set_access_counter(5);
@@ -940,7 +936,7 @@ pub fn load_from_bytes(
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
                             continue;
                         }
                         if current_db < db_count {
@@ -998,38 +994,7 @@ pub fn distribute_loaded_to_shards(
     }
 }
 
-/// Merge per-shard snapshots into a single snapshot suitable for `save_from_snapshot()`.
-///
-/// Each shard provides `Vec<(Vec<(Bytes, Entry)>, u32)>` -- one entry per database.
-/// This function merges all shards' data for each database index into a combined snapshot.
-pub fn merge_shard_snapshots(
-    shard_snapshots: Vec<Vec<(Vec<(Bytes, Entry)>, u32)>>,
-    num_databases: usize,
-) -> Vec<(Vec<(Bytes, Entry)>, u32)> {
-    let mut merged: Vec<(Vec<(Bytes, Entry)>, u32)> =
-        (0..num_databases).map(|_| (Vec::new(), 0u32)).collect();
-
-    for shard_snap in shard_snapshots {
-        for (db_idx, (entries, base_ts)) in shard_snap.into_iter().enumerate() {
-            if db_idx < merged.len() {
-                // Use the base_ts from the first shard that provides data for this db
-                if merged[db_idx].0.is_empty() {
-                    merged[db_idx].1 = base_ts;
-                }
-                merged[db_idx].0.extend(entries);
-            }
-        }
-    }
-
-    merged
-}
-
-pub(crate) fn write_entry(
-    buf: &mut Vec<u8>,
-    key: &[u8],
-    entry: &Entry,
-    base_ts: u32,
-) -> Result<(), MoonError> {
+pub(crate) fn write_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) -> Result<(), MoonError> {
     let val_ref = entry.value.as_redis_value();
 
     // Type tag -- compact variants serialize as the same type as their full-size counterparts
@@ -1048,7 +1013,7 @@ pub(crate) fn write_entry(
 
     // TTL as unix millis (0 = no expiry)
     let ttl_ms: i64 = if entry.has_expiry() {
-        entry.expires_at_ms(base_ts) as i64
+        entry.expires_at_ms() as i64
     } else {
         0
     };
@@ -1117,9 +1082,6 @@ pub(crate) fn read_entry(
             })?
         }
     };
-
-    // Use current_secs() as base_ts for loaded entries (matches Database::new())
-    let base_ts = current_secs();
     let mut entry = if expires_at_ms > 0 {
         Entry::new_string(Bytes::new()) // placeholder, we'll replace value below
     } else {
@@ -1128,7 +1090,7 @@ pub(crate) fn read_entry(
     // Replace value with the correct one via CompactValue
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
     if expires_at_ms > 0 {
-        entry.set_expires_at_ms(base_ts, expires_at_ms);
+        entry.set_expires_at_ms(expires_at_ms);
     }
     entry.set_last_access(current_secs());
     entry.set_access_counter(5);
@@ -1258,13 +1220,15 @@ mod tests {
         let mut loaded = vec![Database::new()];
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
-        let base_ts = loaded[0].base_timestamp();
         let entry = loaded[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
-        // TTL should be approximately 3600 seconds in the future (allow 5s tolerance)
-        let now_ms = current_time_ms();
-        let remaining_secs = (entry.expires_at_ms(base_ts) - now_ms) / 1000;
-        assert!(remaining_secs > 3580 && remaining_secs <= 3600);
+        // W3: expiry round-trips with full millisecond fidelity — the old
+        // seconds-truncated storage needed a 5s tolerance here.
+        assert_eq!(
+            entry.expires_at_ms(),
+            future_ms,
+            "RDB round-trip must preserve the exact millisecond expiry"
+        );
     }
 
     #[test]
@@ -1438,10 +1402,9 @@ mod tests {
         dbs[0].set_string(Bytes::from_static(b"live"), Bytes::from_static(b"yes"));
         // Expired key
         let past_ms = current_time_ms() - 1000;
-        let base_ts = dbs[0].base_timestamp();
         dbs[0].set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
         save(&dbs, &path).unwrap();

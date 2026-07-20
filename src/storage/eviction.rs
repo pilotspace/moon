@@ -891,7 +891,7 @@ fn build_spill_payload(
     let mut flags: u8 = 0;
     let ttl_ms = if entry.has_expiry() {
         flags |= entry_flags::HAS_TTL;
-        Some(entry.expires_at_ms(0))
+        Some(entry.expires_at_ms())
     } else {
         None
     };
@@ -1263,7 +1263,7 @@ fn find_victim_volatile_ttl(db: &Database, samples: usize) -> Option<CompactKey>
     for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             if entry.has_expiry() {
-                let exp = entry.expires_at_ms(db.base_timestamp());
+                let exp = entry.expires_at_ms();
                 let should_evict = match soonest_expiry {
                     None => true,
                     Some(soonest) => exp < soonest,

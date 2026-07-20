@@ -184,7 +184,6 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -192,7 +191,7 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now_ms >= exp_ms {
                     // Edge case: expired between get and now
                     Frame::Integer(-2)
@@ -215,7 +214,6 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -223,7 +221,7 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now_ms >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -362,14 +360,13 @@ pub fn expiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+                Frame::Integer((entry.expires_at_ms() / 1000) as i64)
             }
         }
     }
@@ -386,14 +383,13 @@ pub fn pexpiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+                Frame::Integer(entry.expires_at_ms() as i64)
             }
         }
     }
@@ -1211,7 +1207,6 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -1219,7 +1214,7 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -1239,7 +1234,6 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -1247,7 +1241,7 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -1381,14 +1375,13 @@ pub fn expiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+                Frame::Integer((entry.expires_at_ms() / 1000) as i64)
             }
         }
     }
@@ -1405,14 +1398,13 @@ pub fn pexpiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+                Frame::Integer(entry.expires_at_ms() as i64)
             }
         }
     }
@@ -1469,10 +1461,9 @@ mod tests {
 
     fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::copy_from_slice(key),
-            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
         );
         db
     }
@@ -2145,10 +2136,9 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"1")),
         );
         let past_ms = current_time_ms() - 1000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
         );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {

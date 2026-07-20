@@ -238,14 +238,13 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Parse options using zero-alloc case-insensitive comparison
     if args.len() > 1 {
-        let base_ts = db.base_timestamp();
         let opt = match extract_bytes(&args[1]) {
             Some(b) => b.as_ref(),
             None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
         };
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             if let Some(entry) = db.get_mut(&key) {
-                entry.set_expires_at_ms(base_ts, 0);
+                entry.set_expires_at_ms(0);
             }
         } else if opt.eq_ignore_ascii_case(b"EX") {
             if args.len() < 3 {
@@ -254,7 +253,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(secs) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.set_expires_at_ms(base_ts, current_time_ms() + (secs as u64) * 1000);
+                        entry.set_expires_at_ms(current_time_ms() + (secs as u64) * 1000);
                     }
                 }
                 None => {
@@ -270,7 +269,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.set_expires_at_ms(base_ts, current_time_ms() + ms as u64);
+                        entry.set_expires_at_ms(current_time_ms() + ms as u64);
                     }
                 }
                 None => {
@@ -286,7 +285,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.set_expires_at_ms(base_ts, (ts as u64) * 1000);
+                        entry.set_expires_at_ms((ts as u64) * 1000);
                     }
                 }
                 None => {
@@ -302,7 +301,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts_ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.set_expires_at_ms(base_ts, ts_ms as u64);
+                        entry.set_expires_at_ms(ts_ms as u64);
                     }
                 }
                 None => {

@@ -959,19 +959,18 @@ pub struct TxnExecReply {
 ///
 /// Produced by the shard thread and consumed by the AOF rewrite writer thread.
 /// Shape mirrors the per-shard snapshot that `do_rewrite_per_shard` phase 4
-/// builds today: `(entries, base_timestamp)` per db index. The writer feeds
+/// builds today: live entries per db index. The writer feeds
 /// this directly to `rdb::save_snapshot_to_bytes` unchanged.
 pub struct AofFoldSnapshot {
-    /// One element per db: `(live_entries, base_timestamp)`.
+    /// One element per db: the live entries.
     /// Entries are pre-filtered — expired entries (per `is_expired_at`) are
     /// excluded at snapshot time by the shard thread.
-    pub dbs: Vec<(
+    pub dbs: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )>,
+    >,
     /// Number of messages in the AOF channel at the instant the shard read
     /// this value — BEFORE building the snapshot and BEFORE sending this reply.
     ///
