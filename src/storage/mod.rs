@@ -5,6 +5,7 @@ pub mod compact_value;
 pub mod dashtable;
 pub mod db;
 pub mod db_hash_ttl;
+pub mod db_kind;
 pub mod db_quota;
 pub mod db_read;
 pub mod engine;
