@@ -9,7 +9,7 @@ use crate::util::value_to_string;
 ///
 /// Obtain via [`MoonClient::mq`](crate::MoonClient::mq).
 pub struct MqClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl MqClient {
