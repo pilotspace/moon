@@ -155,7 +155,7 @@ pub fn spill_to_datafile(
     let mut flags: u8 = 0;
     let ttl_ms = if entry.has_expiry() {
         flags |= entry_flags::HAS_TTL;
-        Some(entry.expires_at_ms(0))
+        Some(entry.expires_at_ms())
     } else {
         None
     };
@@ -728,7 +728,7 @@ mod tests {
 
         let mut entry = Entry::new_string(Bytes::from_static(b"expiring"));
         let future_ms = current_time_ms() + 60_000;
-        entry.set_expires_at_ms(0, future_ms);
+        entry.set_expires_at_ms(future_ms);
 
         spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, 0, &mut manifest, None).unwrap();
 

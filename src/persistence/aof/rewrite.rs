@@ -30,7 +30,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         for (key, entry) in data {
             // Skip expired entries
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 continue;
             }
 
@@ -224,7 +224,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
             // Generate PEXPIRE for keys with TTL
             if entry.has_expiry() {
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if exp_ms > now_ms {
                     let remaining_ms = exp_ms - now_ms;
                     let pexpire_frame = Frame::Array(framevec![
@@ -246,22 +246,21 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Shared by both the async (tokio) and sync (monoio) rewrite paths.
 #[allow(dead_code)]
 fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
-    let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
+    let snapshot: Vec<Vec<(CompactKey, Entry)>> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            let base_ts = guard.base_timestamp();
             let entries = guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            (entries, base_ts)
+            entries
         })
         .collect();
 
     let mut temp_dbs: Vec<Database> = Vec::with_capacity(snapshot.len());
-    for (entries, _base_ts) in &snapshot {
+    for entries in &snapshot {
         let mut db = Database::new();
         for (key, entry) in entries {
             db.set(key.to_bytes(), entry.clone());
@@ -876,23 +875,21 @@ pub(crate) fn do_rewrite_single(
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
     let now_ms = current_time_ms();
-    let snapshot: Vec<(
+    let snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> = guards
+    > = guards
         .iter()
         .map(|guard| {
-            let base_ts = guard.base_timestamp();
             let entries: Vec<_> = guard
                 .data()
                 .iter()
-                .filter(|(_, v)| !v.is_expired_at(base_ts, now_ms))
+                .filter(|(_, v)| !v.is_expired_at(now_ms))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            (entries, base_ts)
+            entries
         })
         .collect();
 
@@ -1116,7 +1113,7 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
             let mut temp = Database::new();
             let now_ms = current_time_ms();
             for (k, v) in guard.data().iter() {
-                if !v.is_expired_at(guard.base_timestamp(), now_ms) {
+                if !v.is_expired_at(now_ms) {
                     temp.set(k.to_bytes(), v.clone());
                 }
             }

@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Millisecond-TTL keys no longer expire up to 999 ms early (W3).**
+  `CompactEntry` stored expiry as *seconds* (`ms / 1000` floor) even though
+  the field was a full `u64`: a `PEXPIRE key 1500` died at the 1000 ms
+  boundary, and `PTTL` reported the truncated value. Expiry is now stored
+  as absolute Unix **milliseconds** end-to-end (same 32-byte entry layout),
+  `PTTL` reads back the exact deadline, and RDB/snapshot round-trips
+  preserve millisecond fidelity (the round-trip test's old 5-second
+  tolerance is now an exact equality).
+
+### Changed
+- **Fossil `base_ts` plumbing removed (W3).** `is_expired_at` /
+  `expires_at_ms` / `set_expires_at_ms` / `new_string_with_expiry` carried a
+  `base_ts: u32` parameter that has been ignored since expiry became
+  absolute; the parameter, ~60 dead call-site arguments, dead
+  `let base_ts = …` bindings, the never-read
+  `SnapshotState.base_timestamps` field, the dead `u32` element in the
+  AOF-rewrite/BGSAVE snapshot tuple (`AofFoldSnapshot.dbs` and the
+  `save_from_snapshot`/`save_snapshot_to_bytes` signatures), and the
+  caller-less `merge_shard_snapshots` are gone.
+
 ### Performance
 - **Sync eviction spill now batches like the async path (W2).** The
   tick-driven sync spill paths (`run_eviction`, the memory-pressure cascade's

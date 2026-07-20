@@ -985,7 +985,7 @@ mod tests {
         let base_ts = dbs[0].base_timestamp();
         let entry = dbs[0].get(b"mykey").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
         assert!(remaining_secs >= 50); // Allow some tolerance
     }
 
@@ -1125,7 +1125,7 @@ mod tests {
         let base_ts = loaded_dbs[0].base_timestamp();
         let entry = loaded_dbs[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
         assert!(remaining_secs > 3500);
     }
 
@@ -1134,24 +1134,20 @@ mod tests {
     /// tests exercise the exact same production path.
     fn db_slice_to_snapshot(
         dbs: &[Database],
-    ) -> Vec<(
+    ) -> Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> {
+    > {
         let now_ms = crate::storage::entry::current_time_ms();
         dbs.iter()
             .map(|db| {
-                let base_ts = db.base_timestamp();
-                let entries: Vec<_> = db
-                    .data()
+                db.data()
                     .iter()
-                    .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+                    .filter(|(_, e)| !e.is_expired_at(now_ms))
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                (entries, base_ts)
+                    .collect()
             })
             .collect()
     }

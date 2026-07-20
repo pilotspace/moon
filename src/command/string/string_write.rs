@@ -193,18 +193,17 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Determine final expiry
-    let base_ts = db.base_timestamp();
     let final_expires_at_ms = if expires_at_ms > 0 {
         expires_at_ms
     } else if keepttl {
         // Preserve existing TTL
-        db.get(&key).map(|e| e.expires_at_ms(base_ts)).unwrap_or(0)
+        db.get(&key).map(|e| e.expires_at_ms()).unwrap_or(0)
     } else {
         0
     };
 
     let mut entry = if final_expires_at_ms > 0 {
-        Entry::new_string_with_expiry(value, final_expires_at_ms, base_ts)
+        Entry::new_string_with_expiry(value, final_expires_at_ms)
     } else {
         Entry::new_string(value)
     };
@@ -350,11 +349,10 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
-    let base_ts = db.base_timestamp();
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
                 Some(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -395,11 +393,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
 
     // Store new value preserving existing TTL
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(
-            Bytes::from(new_val.to_string()),
-            existing_expiry_ms,
-            base_ts,
-        )
+        Entry::new_string_with_expiry(Bytes::from(new_val.to_string()), existing_expiry_ms)
     } else {
         Entry::new_string(Bytes::from(new_val.to_string()))
     };
@@ -429,11 +423,10 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         ));
     }
 
-    let base_ts = db.base_timestamp();
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
                 Some(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -473,7 +466,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     let formatted = format_float(result);
 
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms, base_ts)
+        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms)
     } else {
         Entry::new_string(Bytes::from(formatted.clone()))
     };
@@ -498,11 +491,10 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("APPEND"),
     };
 
-    let base_ts = db.base_timestamp();
     // Check if key exists, get existing data + expiry
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes_owned() {
                 Some(v) => (Some(v), expiry),
                 None => {
@@ -536,7 +528,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
 
     let new_len = new_val.len() as i64;
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
     } else {
         Entry::new_string(new_val)
     };
@@ -590,10 +582,9 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    let base_ts = db.base_timestamp();
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
                 Some(v) => (Some(v.to_vec()), expiry),
                 None => {
@@ -617,7 +608,7 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
     let new_len = buf.len() as i64;
     let new_val = Bytes::from(buf);
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
     } else {
         Entry::new_string(new_val)
     };

@@ -2672,14 +2672,13 @@ pub(crate) fn handle_shard_message_shared(
             let snapshot = crate::shard::slice::with_shard(|s| {
                 let mut dbs = Vec::with_capacity(s.databases.len());
                 for db in s.databases.iter() {
-                    let base_ts = db.base_timestamp();
                     let mut entries = Vec::new();
                     for (key, entry) in db.data().iter() {
-                        if !entry.is_expired_at(base_ts, now_ms) {
+                        if !entry.is_expired_at(now_ms) {
                             entries.push((key.clone(), entry.clone()));
                         }
                     }
-                    dbs.push((entries, base_ts));
+                    dbs.push(entries);
                 }
                 crate::shard::dispatch::AofFoldSnapshot {
                     dbs,

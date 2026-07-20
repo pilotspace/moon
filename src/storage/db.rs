@@ -843,14 +843,13 @@ impl Database {
     /// No LRU touch on reads (callers requiring LRU updates use `get_mut()`).
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
         enum KeyState {
             Live,
             Expired,
             Absent,
         }
         let state = match self.data.get(key) {
-            Some(e) if e.is_expired_at(base_ts, now_ms) => KeyState::Expired,
+            Some(e) if e.is_expired_at(now_ms) => KeyState::Expired,
             Some(_) => KeyState::Live,
             None => KeyState::Absent,
         };
@@ -1002,7 +1001,7 @@ impl Database {
                 entry.value =
                     crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
                 if let Some(ttl) = ttl_ms {
-                    entry.set_expires_at_ms(self.base_timestamp, ttl);
+                    entry.set_expires_at_ms(ttl);
                 }
                 self.set(key_bytes, entry);
                 if let Some(ref mut ci) = self.cold_index {
@@ -1077,12 +1076,8 @@ impl Database {
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
         // Immutable check for expiry (avoids get_mut + remove + get_mut triple lookup)
-        let expired = self
-            .data
-            .get(key)
-            .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
+        let expired = self.data.get(key).is_some_and(|e| e.is_expired_at(now_ms));
         if expired {
             let removed = self.data.remove(key)?;
             self.used_memory = self
@@ -1361,11 +1356,10 @@ impl Database {
     #[allow(clippy::unwrap_used)] // remove() after get() returned Some — key guaranteed present
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => self.cold_contains_alive(key, now_ms),
             Some(entry) => {
-                if entry.is_expired_at(base_ts, now_ms) {
+                if entry.is_expired_at(now_ms) {
                     let removed = self.data.remove(key).unwrap();
                     self.used_memory = self
                         .used_memory
@@ -1430,9 +1424,8 @@ impl Database {
     /// `keys()` + `get_if_alive()` per key, which paid a second full-table
     /// lookup pass.
     pub fn iter_live_keys(&self, now_ms: u64) -> impl Iterator<Item = &CompactKey> + '_ {
-        let base_ts = self.base_timestamp;
         self.data.iter().filter_map(move |(k, e)| {
-            if e.is_expired_at(base_ts, now_ms) {
+            if e.is_expired_at(now_ms) {
                 None
             } else {
                 Some(k)
@@ -1466,10 +1459,9 @@ impl Database {
             self.data.directory_depth() <= 48,
             "SCAN 48-bit cursor mapping requires directory depth <= 48"
         );
-        let base_ts = self.base_timestamp;
-        let (page, more) = self.data.hash_page(from_h48 << 16, want, move |_, e| {
-            !e.is_expired_at(base_ts, now_ms)
-        });
+        let (page, more) = self
+            .data
+            .hash_page(from_h48 << 16, want, move |_, e| !e.is_expired_at(now_ms));
         let mut page: Vec<(u64, CompactKey)> =
             page.into_iter().map(|(h, k)| (h >> 16, k)).collect();
         // hash_page sorts by full (h64, key); truncation to 48 bits can
@@ -1519,7 +1511,7 @@ impl Database {
         !self
             .data
             .get(key.as_ref())
-            .is_some_and(|e| !e.is_expired_at(self.base_timestamp, now_ms))
+            .is_some_and(|e| !e.is_expired_at(now_ms))
     }
 
     /// Hash-ordered cold-only keys from `from_h48` in the SCAN cursor's
@@ -1554,11 +1546,10 @@ impl Database {
     /// the count and the walk.
     pub fn random_key(&self) -> Option<Bytes> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
         let hot_live = self
             .data
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+            .filter(|(_, e)| !e.is_expired_at(now_ms))
             .count();
         let cold_live = self.cold_only_keys(now_ms).count();
         let total = hot_live + cold_live;
@@ -1569,7 +1560,7 @@ impl Database {
         if idx < hot_live {
             self.data
                 .iter()
-                .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+                .filter(|(_, e)| !e.is_expired_at(now_ms))
                 .nth(idx)
                 .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
         } else {
@@ -1583,8 +1574,7 @@ impl Database {
     /// exist (or has already expired). Pass 0 to remove expiry.
     pub fn set_expiry(&mut self, key: &[u8], expires_at_ms: u64) -> bool {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1592,7 +1582,7 @@ impl Database {
         }
         match self.data.get_mut(key) {
             Some(entry) => {
-                entry.set_expires_at_ms(base_ts, expires_at_ms);
+                entry.set_expires_at_ms(expires_at_ms);
                 // Latch the fast-path flag once a TTL is set. Persist (0) may
                 // clear the per-entry bit but we don't flip the DB-level flag
                 // down — the active-expiry scan's self-reset gate is the only
@@ -1612,14 +1602,8 @@ impl Database {
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(
-        data: &DashTable<CompactKey, Entry>,
-        key: &[u8],
-        base_ts: u32,
-        now_ms: u64,
-    ) -> bool {
-        data.get(key)
-            .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
+    fn check_expired(data: &DashTable<CompactKey, Entry>, key: &[u8], now_ms: u64) -> bool {
+        data.get(key).is_some_and(|e| e.is_expired_at(now_ms))
     }
 
     /// Convenience: set a string value with no expiry.
@@ -1629,17 +1613,13 @@ impl Database {
 
     /// Convenience: set a string value with an expiry (unix millis).
     pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at_ms: u64) {
-        let base_ts = self.base_timestamp;
-        self.set(
-            key,
-            Entry::new_string_with_expiry(value, expires_at_ms, base_ts),
-        );
+        self.set(key, Entry::new_string_with_expiry(value, expires_at_ms));
     }
 
     /// Check if a single entry is expired.
     #[allow(dead_code)]
-    fn is_expired(entry: &Entry, base_ts: u32) -> bool {
-        entry.is_expired_at(base_ts, current_time_ms())
+    fn is_expired(entry: &Entry) -> bool {
+        entry.is_expired_at(current_time_ms())
     }
 
     /// WRONGTYPE error frame.
@@ -1677,9 +1657,8 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_hash(&mut self, key: &[u8]) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
         // Expire check
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1744,8 +1723,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1779,8 +1757,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_list(&mut self, key: &[u8]) -> Result<&mut VecDeque<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1816,8 +1793,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1846,8 +1822,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_set(&mut self, key: &[u8]) -> Result<&mut HashSet<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1890,8 +1865,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1929,8 +1903,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -1987,8 +1960,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut super::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2047,8 +2019,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut super::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2105,8 +2076,7 @@ impl Database {
         key: &[u8],
     ) -> Result<(&mut HashMap<Bytes, f64>, &mut BPTree), Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2152,8 +2122,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2224,10 +2193,7 @@ impl Database {
     /// Check if a key exists and its expiry is in the past.
     pub fn is_key_expired(&self, key: &[u8]) -> bool {
         let now_ms = current_time_ms();
-        let base_ts = self.base_timestamp;
-        self.data
-            .get(key)
-            .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
+        self.data.get(key).is_some_and(|e| e.is_expired_at(now_ms))
     }
 
     /// Read-only access to the data map (for SCAN iteration).
@@ -2242,9 +2208,8 @@ impl Database {
     /// Read-only get: checks expiry, returns None if expired, but does NOT
     /// remove expired keys or touch LRU. Used with RwLock read path.
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
-        let base_ts = self.base_timestamp;
         let entry = self.data.get(key)?;
-        if entry.is_expired_at(base_ts, now_ms) {
+        if entry.is_expired_at(now_ms) {
             return None;
         }
         Some(entry)
@@ -2311,9 +2276,8 @@ impl Database {
     /// Used by the RwLock-shared-read `EXISTS` dispatch path, which cannot
     /// mutate `self` to promote.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
-            Some(e) if !e.is_expired_at(base_ts, now_ms) => true,
+            Some(e) if !e.is_expired_at(now_ms) => true,
             _ => self.cold_contains_alive(key, now_ms),
         }
     }
@@ -2326,10 +2290,9 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(map)),
                 RedisValueRef::HashListpack(_) => Ok(None),
@@ -2346,10 +2309,9 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&VecDeque<Bytes>>, Frame> {
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::List(list) => Ok(Some(list)),
                 RedisValueRef::ListListpack(_) => Ok(None),
@@ -2366,10 +2328,9 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&HashSet<Bytes>>, Frame> {
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Set(set) => Ok(Some(set)),
                 RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => Ok(None),
@@ -2386,10 +2347,9 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
-        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
                 RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetListpack(_) => Ok(None),
@@ -2419,9 +2379,8 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<HashRef<'_>>, Frame> {
-        let base_ts = self.base_timestamp;
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
             return match entry.value.as_redis_value() {
@@ -2467,9 +2426,8 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        let base_ts = self.base_timestamp;
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
             return match entry.value.as_redis_value() {
@@ -2495,9 +2453,8 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SetRef<'_>>, Frame> {
-        let base_ts = self.base_timestamp;
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
             return match entry.value.as_redis_value() {
@@ -2524,9 +2481,8 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<SortedSetRef<'_>>, Frame> {
-        let base_ts = self.base_timestamp;
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
             return match entry.value.as_redis_value() {
@@ -2636,8 +2592,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_stream(&mut self, key: &[u8]) -> Result<&mut StreamData, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2678,9 +2633,8 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<StreamRef<'_>>, Frame> {
-        let base_ts = self.base_timestamp;
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
             return match entry.value.as_redis_value() {
@@ -2702,8 +2656,7 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream(&mut self, key: &[u8]) -> Result<Option<&StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2726,8 +2679,7 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
-        let base_ts = self.base_timestamp;
-        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -2941,10 +2893,9 @@ mod tests {
         let mut db = Database::new();
         // Set key with an expiry in the past
         let past_ms = current_time_ms() - 1000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         // get should return None and remove the key
         assert!(db.get(b"expired").is_none());
@@ -2955,10 +2906,9 @@ mod tests {
     fn test_exists_with_expiry() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         assert!(!db.exists(b"expired"));
     }
@@ -2971,10 +2921,9 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"v1")),
         );
         let future_ms = current_time_ms() + 3_600_000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"k2"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
         );
         assert_eq!(db.len(), 2);
         assert_eq!(db.expires_count(), 1);
@@ -2982,17 +2931,16 @@ mod tests {
 
     #[test]
     fn test_is_expired() {
-        let base_ts = current_secs();
         let past_ms = current_time_ms() - 1000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts);
-        assert!(Database::is_expired(&entry, base_ts));
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
+        assert!(Database::is_expired(&entry));
 
         let future_ms = current_time_ms() + 3_600_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts);
-        assert!(!Database::is_expired(&entry, base_ts));
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
+        assert!(!Database::is_expired(&entry));
 
         let entry = Entry::new_string(Bytes::from_static(b"v"));
-        assert!(!Database::is_expired(&entry, base_ts));
+        assert!(!Database::is_expired(&entry));
     }
 
     #[test]
@@ -3089,10 +3037,9 @@ mod tests {
     fn test_is_key_expired() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
         );
         assert!(db.is_key_expired(b"expired"));
         assert!(!db.is_key_expired(b"missing"));
