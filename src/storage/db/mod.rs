@@ -1,0 +1,1152 @@
+use std::collections::HashMap;
+
+mod accessors;
+mod hash_ttl;
+mod kv_ops;
+
+pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
+
+use super::compact_key::CompactKey;
+use super::dashtable::DashTable;
+use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms};
+
+/// Maximum number of entries in a listpack before upgrading to full encoding.
+pub const LISTPACK_MAX_ENTRIES: usize = 128;
+/// Maximum element size in bytes before upgrading a listpack to full encoding.
+pub const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
+/// Maximum number of entries in an intset before upgrading to full encoding.
+#[allow(dead_code)]
+const INTSET_MAX_ENTRIES: usize = 512;
+
+/// Estimate per-entry overhead: key length + value memory + struct overhead.
+fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
+    key.len() + entry.value.estimate_memory() + 128
+}
+
+// ---------------------------------------------------------------------------
+// O(1) container-growth memory accounting (WS6).
+//
+// `get_or_create_hash`/`_list`/`_set`/`_sorted_set` charge `entry_overhead`
+// ONCE, at creation of the (empty) container, then hand out a raw `&mut`
+// reference into the map/deque/set/tree. Every subsequent mutation through
+// that reference (HSET adding fields, LPUSH growing the deque, ...) was
+// invisible to `used_memory` — a real memory-safety hole against both the
+// global `--maxmemory` gate and per-db quotas (adversarial review, 2026-07-08).
+//
+// The fix is per-mutation delta accounting rather than a full recompute:
+// `RedisValue::estimate_memory()` is O(n) for the expanded encodings (plain
+// `Hash`/`List`/`Set`/`SortedSetBPTree` all sum over every element), so
+// recomputing it after every single-field HSET on a million-field hash would
+// turn an O(1) command into O(n) — exactly the "periodic rescan on the hot
+// path" this design avoids. Instead, call sites that mutate a container
+// in-place compute the exact per-element byte delta using the same
+// constants baked into `RedisValue::estimate_memory`'s per-variant arms
+// (kept below so they can't silently drift out of sync with that function)
+// and apply it via `Database::charge_memory` / `credit_memory` — O(1), no
+// allocation, no rescan.
+//
+// The listpack/intset COMPACT encodings are the exception: their
+// `estimate_memory()` is already O(1) (`size_of::<Self>() + data.capacity()`,
+// a byte-buffer capacity read), so those call sites snapshot
+// `lp.estimate_memory()` before/after the mutation instead of tracking a
+// per-element formula — simpler and just as cheap.
+// ---------------------------------------------------------------------------
+
+/// Per-field byte cost for a `RedisValue::Hash` / `HashWithTtl.fields` entry.
+/// MUST mirror the `Hash` arm of `RedisValue::estimate_memory` exactly.
+#[inline]
+pub fn hash_field_cost(field: &[u8], value: &[u8]) -> usize {
+    hash_field_cost_len(field.len(), value.len())
+}
+
+/// Length-only variant of [`hash_field_cost`] for call sites where the field
+/// and/or value `Bytes` have already been moved (e.g. into `map.insert`) —
+/// `Bytes::len()` is captured beforehand since it doesn't consume the value.
+#[inline]
+pub fn hash_field_cost_len(field_len: usize, value_len: usize) -> usize {
+    field_len + value_len + 64
+}
+
+/// Per-field TTL sidecar byte cost (`HashWithTtl.ttls`). MUST mirror the
+/// `HashWithTtl` arm's `ttls` term in `RedisValue::estimate_memory`.
+#[inline]
+pub fn hash_ttl_field_cost(field: &[u8]) -> usize {
+    field.len() + 8 + 32
+}
+
+/// Per-element byte cost for `RedisValue::List`. MUST mirror the `List` arm
+/// of `RedisValue::estimate_memory`.
+#[inline]
+pub fn list_elem_cost(elem: &[u8]) -> usize {
+    elem.len() + 24
+}
+
+/// Per-member byte cost for `RedisValue::Set`. MUST mirror the `Set` arm of
+/// `RedisValue::estimate_memory`.
+#[inline]
+pub fn set_member_cost(member: &[u8]) -> usize {
+    member.len() + 24
+}
+
+/// Per-member byte cost for `RedisValue::SortedSetBPTree`: one fixed-size
+/// tree node (80B, `tree.len() * 80` in the estimator) plus one
+/// `members: HashMap<Bytes, f64>` entry (`member.len() + 40`). MUST mirror
+/// the `SortedSetBPTree` arm of `RedisValue::estimate_memory`.
+#[inline]
+pub fn zset_member_cost(member: &[u8]) -> usize {
+    member.len() + 40 + 80
+}
+
+// ---------------------------------------------------------------------------
+// HEXPIRE family — public type surface (phase 195 / issue #106).
+// ---------------------------------------------------------------------------
+
+/// Conditional gate for `Database::hash_set_field_ttl`.
+/// Mirrors Valkey 9.0 HEXPIRE NX/XX/GT/LT semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashTtlCond {
+    /// Always set the TTL (no condition).
+    Always,
+    /// Only set if no current TTL on the field.
+    Nx,
+    /// Only set if a TTL is already present.
+    Xx,
+    /// Only set if the new TTL is greater than current.
+    Gt,
+    /// Only set if the new TTL is less than current.
+    Lt,
+}
+
+/// Tri-state field lookup result for HTTL / HEXPIRETIME / HPERSIST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldState {
+    /// Field does not exist in the hash (HTTL → -2).
+    Missing,
+    /// Field exists but has no TTL (HTTL → -1).
+    NoTtl,
+    /// Field exists with the given absolute expiry (unix-ms).
+    Ttl(u64),
+}
+
+/// Returned by hash-mutation primitives when the key exists but is not a hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrongType;
+
+/// Convert a `RedisValue::Hash` or `RedisValue::HashListpack` in-place into a
+/// `RedisValue::HashWithTtl` carrying an empty `ttls` sidecar. No-op when the
+/// value is already `HashWithTtl`. Panics for non-hash variants — callers must
+/// type-check first.
+fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
+    match rv {
+        RedisValue::HashWithTtl { .. } => {}
+        RedisValue::Hash(_) => {
+            let placeholder = RedisValue::Hash(HashMap::new());
+            let owned = std::mem::replace(rv, placeholder);
+            let RedisValue::Hash(fields) = owned else {
+                unreachable!("matched Hash above");
+            };
+            // ttls starts empty; min_expiry_ms = u64::MAX (sentinel: "no TTLs
+            // yet").  hash_set_field_ttl will update min on the first insert.
+            *rv = RedisValue::HashWithTtl {
+                fields,
+                ttls: HashMap::new(),
+                min_expiry_ms: u64::MAX,
+            };
+        }
+        RedisValue::HashListpack(lp) => {
+            let fields = lp.to_hash_map();
+            *rv = RedisValue::HashWithTtl {
+                fields,
+                ttls: HashMap::new(),
+                min_expiry_ms: u64::MAX,
+            };
+        }
+        _ => panic!("promote_to_hash_with_ttl called on non-hash variant"),
+    }
+}
+
+/// An in-memory key-value database with lazy expiration.
+///
+/// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
+/// a `CompactValue`, optional expiration (TTL delta), and packed metadata.
+pub struct Database {
+    data: DashTable<CompactKey, Entry>,
+    used_memory: usize,
+    /// Cached current time in epoch seconds; set once per batch to avoid
+    /// repeated `SystemTime::now()` syscalls on every command.
+    cached_now: u32,
+    /// Cached current time in unix millis for expiry checks.
+    cached_now_ms: u64,
+    /// Base timestamp (epoch seconds) for TTL delta computation.
+    /// Set once at database creation time and never changed, ensuring
+    /// TTL deltas remain stable across the database lifetime.
+    base_timestamp: u32,
+    /// Monotonic flag: true once an entry with has_expiry() has been inserted
+    /// (via set / set_expiry / insert_for_load). Reset to false only when the
+    /// active-expiry scan confirms zero expiring keys remain. Used by the
+    /// active-expiry tick to short-circuit the O(N) `keys_with_expiry()` scan
+    /// when no key has a TTL — the common case for cache workloads that never
+    /// call EXPIRE / SETEX. Safe under-reporting scenarios: flag stays true
+    /// longer than necessary (harmless: one extra scan); never flips false
+    /// while an expiring key is live (enforced by the three setters + the
+    /// self-reset gate in `expire_cycle`). The scan-based reset costs O(N)
+    /// but happens at most once per "expiring key drained" transition.
+    maybe_has_expiring_keys: bool,
+    /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
+    pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    /// Shard directory for cold reads (None when disk-offload disabled).
+    pub cold_shard_dir: Option<std::path::PathBuf>,
+    /// Hot-key detection sketch, fed by sampled dispatch observations.
+    hot_keys: crate::storage::hotkey::HotKeySketch,
+}
+
+impl Database {
+    /// Create a new empty database.
+    pub fn new() -> Self {
+        Database {
+            data: DashTable::new(),
+            used_memory: 0,
+            cached_now: current_secs(),
+            cached_now_ms: current_time_ms(),
+            base_timestamp: current_secs(),
+            maybe_has_expiring_keys: false,
+            cold_index: None,
+            cold_shard_dir: None,
+            hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+        }
+    }
+
+    /// Create a new empty database with the internal DashTable pre-sized for
+    /// approximately `cap` entries. Eliminates segment-split cost for
+    /// workloads whose key count does not exceed `cap`.
+    ///
+    /// `cap == 0` is equivalent to `Database::new()` (no pre-sizing).
+    pub fn with_capacity(cap: usize) -> Self {
+        let data = if cap == 0 {
+            DashTable::new()
+        } else {
+            DashTable::with_capacity(cap)
+        };
+        Database {
+            data,
+            used_memory: 0,
+            cached_now: current_secs(),
+            cached_now_ms: current_time_ms(),
+            base_timestamp: current_secs(),
+            maybe_has_expiring_keys: false,
+            cold_index: None,
+            cold_shard_dir: None,
+            hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+        }
+    }
+
+    /// Fast-path predicate for the active-expiry tick. Returns `false` only
+    /// when the database is known to have zero entries with a TTL. Callers
+    /// MUST treat `true` as "maybe has expiring keys" — the precise answer
+    /// requires `keys_with_expiry()`.
+    #[inline]
+    pub fn maybe_has_expiring_keys(&self) -> bool {
+        self.maybe_has_expiring_keys
+    }
+
+    /// Latch the flag to `false`. Called by `expire_cycle` once its
+    /// `keys_with_expiry()` scan returns empty — proof that zero expiring
+    /// keys remain, so the next tick can skip the scan.
+    #[inline]
+    pub fn clear_maybe_has_expiring_keys(&mut self) {
+        self.maybe_has_expiring_keys = false;
+    }
+
+    /// Update the cached timestamp from a shared [`CachedClock`].
+    ///
+    /// Reads two `AtomicU64` values (Relaxed) instead of issuing `clock_gettime`
+    /// syscalls.  The clock is updated once per shard event-loop tick (1 ms).
+    #[inline]
+    pub fn refresh_now_from_cache(&mut self, clock: &CachedClock) {
+        self.cached_now = clock.secs();
+        self.cached_now_ms = clock.ms();
+    }
+
+    /// Override the cached millisecond timestamp for unit tests only.
+    ///
+    /// Simulates the "expired but not yet reaped" transient state where a
+    /// field's absolute expiry has already passed but the active-expiry tick
+    /// has not yet run.  Without this, tests would need to wait for real wall
+    /// time to advance, making them slow and flaky.
+    #[cfg(test)]
+    pub fn set_cached_now_ms_for_test(&mut self, ms: u64) {
+        self.cached_now_ms = ms;
+    }
+
+    /// Return the cached `min_expiry_ms` for the `HashWithTtl` at `key`.
+    ///
+    /// Used by unit tests to assert that the fast-path invariant is maintained
+    /// after HEXPIRE, HPERSIST, HSET overwrite, and active-reap operations.
+    /// Returns `None` if the key does not exist or is not a `HashWithTtl`.
+    #[cfg(test)]
+    pub fn hash_min_expiry_ms_for_test(&self, key: &[u8]) -> Option<u64> {
+        use super::compact_value::RedisValueRef;
+        let entry = self.data.get(key)?;
+        match entry.value.as_redis_value() {
+            RedisValueRef::HashWithTtl { min_expiry_ms, .. } => Some(min_expiry_ms),
+            _ => None,
+        }
+    }
+
+    /// Fallback: update the cached timestamp via `SystemTime::now()` syscall.
+    ///
+    /// Kept for callers that do not yet have a `CachedClock` reference (e.g. the
+    /// non-sharded legacy handler).  Marked `#[cold]` to hint the compiler that
+    /// the fast path is `refresh_now_from_cache`.
+    #[cold]
+    pub fn refresh_now(&mut self) {
+        self.cached_now = current_secs();
+        self.cached_now_ms = current_time_ms();
+    }
+
+    /// Return the base timestamp for TTL delta computation.
+    #[inline]
+    pub fn base_timestamp(&self) -> u32 {
+        self.base_timestamp
+    }
+
+    /// Return the cached current time (epoch seconds).
+    #[inline]
+    pub fn now(&self) -> u32 {
+        self.cached_now
+    }
+
+    /// Return the cached current time (unix millis).
+    #[inline]
+    pub fn now_ms(&self) -> u64 {
+        self.cached_now_ms
+    }
+
+    /// Estimated memory usage of all entries in this database.
+    pub fn estimated_memory(&self) -> usize {
+        self.used_memory
+    }
+
+    /// Resident bytes attributed to this database (alias for `estimated_memory`,
+    /// kept distinct so observability call sites use the canonical name).
+    /// O(1), zero allocation -- reads the per-shard `used_memory` accumulator.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.used_memory
+    }
+
+    /// Charge `delta` bytes of container growth to this database's memory
+    /// accounting. O(1), saturating, no allocation.
+    ///
+    /// Used by command-layer call sites that hold a `&mut` reference into a
+    /// container obtained via `get_or_create_hash`/`_list`/`_set`/`_sorted_set`
+    /// (so they cannot route the mutation back through `Database::set`) —
+    /// see the WS6 container-growth accounting note above `entry_overhead`.
+    #[inline]
+    pub fn charge_memory(&mut self, delta: usize) {
+        self.used_memory = self.used_memory.saturating_add(delta);
+    }
+
+    /// Credit back `delta` bytes previously charged via [`Self::charge_memory`]
+    /// (e.g. a field/element removed, or an overwrite that shrank a value).
+    /// O(1), saturating, no allocation.
+    #[inline]
+    pub fn credit_memory(&mut self, delta: usize) {
+        self.used_memory = self.used_memory.saturating_sub(delta);
+    }
+
+    /// Apply a signed byte delta in one call — convenience wrapper around
+    /// [`Self::charge_memory`] / [`Self::credit_memory`] for call sites that
+    /// compute a net `old_cost` vs `new_cost` difference (e.g. HINCRBY
+    /// overwriting a field with a same-or-different-length value).
+    #[inline]
+    pub fn adjust_memory(&mut self, old_cost: usize, new_cost: usize) {
+        if new_cost >= old_cost {
+            self.charge_memory(new_cost - old_cost);
+        } else {
+            self.credit_memory(old_cost - new_cost);
+        }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::bptree::BPTree;
+    use crate::storage::compact_value::RedisValueRef;
+    use crate::storage::stream::Stream as StreamData;
+    use bytes::Bytes;
+    use ordered_float::OrderedFloat;
+    use std::collections::{HashSet, VecDeque};
+
+    #[test]
+    fn test_set_and_get() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"key1"),
+            Entry::new_string(Bytes::from_static(b"value1")),
+        );
+        let entry = db.get(b"key1").unwrap();
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"value1"),
+            _ => panic!("unexpected type"),
+        }
+    }
+
+    #[test]
+    fn test_get_missing_key() {
+        let mut db = Database::new();
+        assert!(db.get(b"nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_remove_key() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"key1"),
+            Entry::new_string(Bytes::from_static(b"value1")),
+        );
+        let removed = db.remove(b"key1");
+        assert!(removed.is_some());
+        assert!(db.get(b"key1").is_none());
+    }
+
+    /// Task #56 red/green: `demote_replayed_cold_shadows` must drop a hot
+    /// entry that AOF replay redundantly re-materialized for a key already
+    /// present in the (crash-consistent) cold index, correctly uncharging
+    /// `used_memory` -- and must leave the cold-index entry itself intact so
+    /// the key is still readable via cold read-through afterward. A key with
+    /// NO cold-index entry (never evicted) must be left completely alone.
+    #[test]
+    fn test_demote_replayed_cold_shadows() {
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        let mut db = Database::new();
+        // never-evicted key: no cold_index entry, must survive untouched.
+        db.set(
+            Bytes::from_static(b"never_evicted"),
+            Entry::new_string(Bytes::from_static(b"live_value")),
+        );
+        // AOF-replay-shadowed key: also present in cold_index (as recovery
+        // would have rebuilt it from the manifest before replay ran).
+        db.set(
+            Bytes::from_static(b"replayed_shadow"),
+            Entry::new_string(Bytes::from_static(b"same_value_replay_reconstructed")),
+        );
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"replayed_shadow"),
+            ColdLocation {
+                file_id: 1,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
+            },
+        );
+        db.cold_index = Some(ci);
+
+        let used_memory_before = db.resident_bytes();
+        assert!(db.is_hot(b"replayed_shadow"));
+
+        let demoted = db.demote_replayed_cold_shadows();
+
+        assert_eq!(demoted, 1, "exactly the shadowed key must be demoted");
+        assert!(
+            !db.is_hot(b"replayed_shadow"),
+            "shadowed key must no longer be hot"
+        );
+        assert!(
+            db.is_hot(b"never_evicted"),
+            "never-evicted key must be untouched"
+        );
+        assert!(
+            db.resident_bytes() < used_memory_before,
+            "used_memory must drop once the redundant hot copy is dropped"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"replayed_shadow")
+                .is_some(),
+            "cold-index entry must remain so the key is still cold-readable"
+        );
+    }
+
+    /// Task #56 finding 1 (adversarial review) red/green: a key overwritten
+    /// AFTER its cold-tier copy was captured must never resurrect the stale
+    /// cold value. Models exactly what AOF replay does at restart: the
+    /// cold_index is rebuilt from the crash-consistent manifest BEFORE any
+    /// replay command runs (so it already "knows" about a key that was
+    /// spilled with an old value), and then replay reconstructs the key's
+    /// FULL write history against an empty DashTable -- here simulated as
+    /// two `db.set()` calls for the same key (the original SET whose later
+    /// eviction produced the cold copy, followed by a live overwrite issued
+    /// after that eviction, both still present in the AOF since eviction
+    /// never rewrites/deletes AOF records).
+    ///
+    /// This test FAILS on the pre-finding-1 HEAD: without the `Updated`-arm
+    /// invalidation in `Database::set`, the cold_index entry survives both
+    /// writes untouched, `demote_replayed_cold_shadows` wrongly treats it as
+    /// "provably redundant", drops the hot v2 copy, and the final `GET`
+    /// promotes the stale v1 from cold storage instead.
+    #[test]
+    fn test_second_write_invalidates_cold_shadow() {
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        let mut db = Database::new();
+        // Simulates `recover_shard_v3_pitr` rebuilding ColdIndex from the
+        // manifest BEFORE any replay command runs -- the key is cold-only,
+        // NOT hot, at this point.
+        let mut ci = ColdIndex::new();
+        ci.insert(
+            Bytes::from_static(b"k"),
+            ColdLocation {
+                file_id: 1,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
+            },
+        );
+        db.cold_index = Some(ci);
+        assert!(!db.is_hot(b"k"), "precondition: key starts cold-only");
+
+        // Replay command #1: the ORIGINAL SET whose later eviction produced
+        // the cold copy above (v1). First touch since the DashTable was
+        // cleared -- ambiguous, left alone.
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string(Bytes::from_static(b"v1")),
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k").is_some(),
+            "first touch must not disturb the cold shadow (still ambiguous)"
+        );
+
+        // Replay command #2: a LATER overwrite issued after the eviction
+        // that produced the cold copy (still in the AOF -- eviction never
+        // deletes AOF records). Second touch -- provably proves the cold
+        // copy stale.
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string(Bytes::from_static(b"v2")),
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"k").is_none(),
+            "second touch must invalidate the now-stale cold shadow"
+        );
+
+        // Reconciliation pass (what main.rs runs right after replay
+        // finishes, before the server accepts connections) must be a no-op
+        // for this key now -- there is nothing left in cold_index to
+        // wrongly "demote".
+        let demoted = db.demote_replayed_cold_shadows();
+        assert_eq!(
+            demoted, 0,
+            "nothing left to demote -- the shadow is already gone"
+        );
+
+        match db.get(b"k").unwrap().value.as_bytes_owned() {
+            Some(v) => assert_eq!(
+                &v[..],
+                b"v2",
+                "GET must return the LATER value, not the stale spilled v1"
+            ),
+            None => panic!("key must exist"),
+        }
+    }
+
+    #[test]
+    fn test_lazy_expiry() {
+        let mut db = Database::new();
+        // Set key with an expiry in the past
+        let past_ms = current_time_ms() - 1000;
+        db.set(
+            Bytes::from_static(b"expired"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+        );
+        // get should return None and remove the key
+        assert!(db.get(b"expired").is_none());
+        assert_eq!(db.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_with_expiry() {
+        let mut db = Database::new();
+        let past_ms = current_time_ms() - 1000;
+        db.set(
+            Bytes::from_static(b"expired"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+        );
+        assert!(!db.exists(b"expired"));
+    }
+
+    #[test]
+    fn test_len_and_expires_count() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"k1"),
+            Entry::new_string(Bytes::from_static(b"v1")),
+        );
+        let future_ms = current_time_ms() + 3_600_000;
+        db.set(
+            Bytes::from_static(b"k2"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
+        );
+        assert_eq!(db.len(), 2);
+        assert_eq!(db.expires_count(), 1);
+    }
+
+    #[test]
+    fn test_is_expired() {
+        let past_ms = current_time_ms() - 1000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
+        assert!(Database::is_expired(&entry));
+
+        let future_ms = current_time_ms() + 3_600_000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
+        assert!(!Database::is_expired(&entry));
+
+        let entry = Entry::new_string(Bytes::from_static(b"v"));
+        assert!(!Database::is_expired(&entry));
+    }
+
+    #[test]
+    fn test_get_mut() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"key"),
+            Entry::new_string(Bytes::from_static(b"old")),
+        );
+        let entry = db.get_mut(b"key").unwrap();
+        entry.set_string_value(Bytes::from_static(b"new"));
+        let entry = db.get(b"key").unwrap();
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"new"),
+            _ => panic!("unexpected type"),
+        }
+    }
+
+    // --- Type-checked helper tests ---
+
+    #[test]
+    fn test_get_or_create_hash() {
+        let mut db = Database::new();
+        let map = db.get_or_create_hash(b"myhash").unwrap();
+        map.insert(Bytes::from_static(b"field"), Bytes::from_static(b"value"));
+        let map = db.get_hash(b"myhash").unwrap().unwrap();
+        assert_eq!(
+            map.get(&Bytes::from_static(b"field")).unwrap().as_ref(),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn test_hash_wrongtype() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        let result = db.get_or_create_hash(b"k");
+        assert!(result.is_err());
+        let result = db.get_hash(b"k");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_or_create_list() {
+        let mut db = Database::new();
+        let list = db.get_or_create_list(b"mylist").unwrap();
+        list.push_back(Bytes::from_static(b"item"));
+        let list = db.get_list(b"mylist").unwrap().unwrap();
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn test_get_or_create_set() {
+        let mut db = Database::new();
+        let set = db.get_or_create_set(b"myset").unwrap();
+        set.insert(Bytes::from_static(b"member"));
+        let set = db.get_set(b"myset").unwrap().unwrap();
+        assert!(set.contains(&Bytes::from_static(b"member")));
+    }
+
+    #[test]
+    fn test_get_or_create_sorted_set() {
+        let mut db = Database::new();
+        let (members, scores) = db.get_or_create_sorted_set(b"myzset").unwrap();
+        members.insert(Bytes::from_static(b"a"), 1.0);
+        scores.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
+        let (members, scores) = db.get_sorted_set(b"myzset").unwrap().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(scores.len(), 1);
+    }
+
+    #[test]
+    fn test_get_hash_missing() {
+        let mut db = Database::new();
+        assert!(db.get_hash(b"missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_keys_with_expiry() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        let future_ms = current_time_ms() + 3_600_000;
+        db.set_string_with_expiry(
+            Bytes::from_static(b"k2"),
+            Bytes::from_static(b"v2"),
+            future_ms,
+        );
+        let keys = db.keys_with_expiry();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].as_ref(), b"k2");
+    }
+
+    #[test]
+    fn test_is_key_expired() {
+        let mut db = Database::new();
+        let past_ms = current_time_ms() - 1000;
+        db.set(
+            Bytes::from_static(b"expired"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
+        );
+        assert!(db.is_key_expired(b"expired"));
+        assert!(!db.is_key_expired(b"missing"));
+    }
+
+    #[test]
+    fn test_data_accessor() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        assert_eq!(db.data().len(), 1);
+    }
+
+    #[test]
+    fn test_used_memory_tracking() {
+        let mut db = Database::new();
+        assert_eq!(db.estimated_memory(), 0);
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        assert!(db.estimated_memory() > 0);
+        let mem_after_set = db.estimated_memory();
+        db.remove(b"key");
+        assert_eq!(db.estimated_memory(), 0);
+        // Overwrite should not double-count
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"longer_value"),
+        );
+        assert!(db.estimated_memory() > 0);
+        // Should not equal 2x the original
+        assert_ne!(db.estimated_memory(), mem_after_set * 2);
+    }
+
+    #[test]
+    fn test_version_tracking() {
+        let mut db = Database::new();
+        assert_eq!(db.get_version(b"key"), 0);
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
+        assert_eq!(db.get_version(b"key"), 0); // first set, version 0
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
+        assert_eq!(db.get_version(b"key"), 1); // second set, version 0+1=1
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
+        assert_eq!(db.get_version(b"key"), 2);
+    }
+
+    #[test]
+    fn test_increment_version() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
+        assert_eq!(db.get_version(b"key"), 0);
+        db.increment_version(b"key");
+        assert_eq!(db.get_version(b"key"), 1);
+        // non-existent key is a no-op
+        db.increment_version(b"missing");
+    }
+
+    #[test]
+    fn test_refresh_now_from_cache() {
+        let mut db = Database::new();
+        let clock = CachedClock::new();
+        db.refresh_now_from_cache(&clock);
+        // cached_now should match clock
+        assert_eq!(db.now(), clock.secs());
+        assert_eq!(db.now_ms(), clock.ms());
+    }
+
+    // -----------------------------------------------------------------
+    // P0 cold-collection-visibility fix
+    // (.planning/reviews/storage-audit-2026-07-12-kv.md)
+    //
+    // Disk-offload spills Hash/List/Set/ZSet/Stream via
+    // `evict_one_async_spill` / `evict_batch_durable` (production
+    // paths, `kv_serde::serialize_collection` handles every type), but the
+    // type-specific accessors used to consult only `self.data`, never the
+    // `ColdIndex` — so a spilled collection read as absent, and a write
+    // fabricated a brand-new EMPTY container that permanently shadowed
+    // (destroyed) the cold copy on the next `set`.
+    //
+    // These tests spill a collection directly via the same
+    // `spill_to_datafile` production helper the eviction paths use (mirrors
+    // the pattern in `tiered::cold_read`'s own tests), bypassing the
+    // eviction machinery itself (out of scope here) while exercising the
+    // exact on-disk format the accessors must decode.
+    // -----------------------------------------------------------------
+
+    use crate::persistence::manifest::ShardManifest;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::RedisValue as TestRedisValue;
+    use crate::storage::tiered::cold_index::ColdIndex;
+    use crate::storage::tiered::kv_spill::spill_to_datafile;
+
+    /// Build a `Database` with an active cold tier holding one spilled
+    /// collection at `key`. Mirrors `cold_read::tests::db_with_spilled_key`
+    /// but accepts an arbitrary `RedisValue` (collections, not just strings).
+    fn db_with_spilled_value(
+        shard_dir: &std::path::Path,
+        key: &[u8],
+        value: TestRedisValue,
+    ) -> Database {
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        let mut entry = Entry::new_string(Bytes::new()); // placeholder, overwritten below
+        entry.value = CompactValue::from_redis_value(value);
+
+        spill_to_datafile(
+            shard_dir,
+            900,
+            key,
+            &entry,
+            0,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let mut db = Database::new();
+        db.cold_shard_dir = Some(shard_dir.to_path_buf());
+        db.cold_index = Some(cold_index);
+        db
+    }
+
+    #[test]
+    fn test_get_or_create_hash_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
+        fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+
+        // Precondition: nothing hot yet, key only exists cold.
+        assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
+
+        // Simulates HSET's get_or_create_hash call: must promote the real
+        // spilled fields, NOT fabricate an empty hash that would permanently
+        // shadow (destroy) the cold copy.
+        let map = db.get_or_create_hash(b"myhash").unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "must promote existing fields, not fabricate empty hash"
+        );
+        assert_eq!(map.get(b"color".as_slice()).unwrap(), b"red".as_slice());
+
+        // Promotion must also clear the cold index entry (no dual reference).
+        assert!(db.cold_index.as_ref().unwrap().lookup(b"myhash").is_none());
+        assert!(db.is_hot(b"myhash"));
+    }
+
+    #[test]
+    fn test_get_or_create_hash_merges_new_field_with_promoted_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(
+            Bytes::from_static(b"old_field"),
+            Bytes::from_static(b"old_value"),
+        );
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        // HSET h new_field new_value
+        {
+            let map = db.get_or_create_hash(b"h").unwrap();
+            map.insert(
+                Bytes::from_static(b"new_field"),
+                Bytes::from_static(b"new_value"),
+            );
+        }
+
+        let map = db.get_hash(b"h").unwrap().unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "old spilled field + new field must both be present"
+        );
+        assert_eq!(
+            map.get(b"old_field".as_slice()).unwrap(),
+            b"old_value".as_slice()
+        );
+        assert_eq!(
+            map.get(b"new_field".as_slice()).unwrap(),
+            b"new_value".as_slice()
+        );
+    }
+
+    #[test]
+    fn test_get_hash_ref_if_alive_sees_cold_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        let href = db
+            .get_hash_ref_if_alive(b"h", 0)
+            .unwrap()
+            .expect("must see cold hash");
+        assert_eq!(href.get_field(b"f").unwrap(), b"v".as_slice());
+        assert_eq!(href.len(), 1);
+
+        // Non-promoting: `&self` accessor must not have mutated hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "get_hash_ref_if_alive takes &self and must not promote"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"h").is_some(),
+            "cold index entry must remain untouched by a non-promoting read"
+        );
+    }
+
+    /// W5 pin: the ref accessor's WRONGTYPE leg on a live hot key.
+    #[test]
+    fn test_ref_accessors_wrongtype_on_hot_string() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"v"));
+        assert!(db.get_hash_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_list_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_set_ref_if_alive(b"s", 0).is_err());
+        assert!(db.get_sorted_set_ref_if_alive(b"s", 0).is_err());
+    }
+
+    /// W5 pin: `get_hash_ref_if_alive` must map a hot `HashWithTtl` entry to
+    /// `HashRef::WithTtl` carrying the CALLER's `now_ms` — an expired field
+    /// filters out, a live one reads through.
+    #[test]
+    fn test_hash_ref_with_ttl_leg_filters_expired_fields() {
+        let mut db = Database::new();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"dead"), Bytes::from_static(b"x"));
+        fields.insert(Bytes::from_static(b"live"), Bytes::from_static(b"y"));
+        let mut ttls = HashMap::new();
+        ttls.insert(Bytes::from_static(b"dead"), 1_000u64);
+        ttls.insert(Bytes::from_static(b"live"), 5_000u64);
+        let mut entry = Entry::new_hash();
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms: 1_000,
+            },
+        );
+        db.set(Bytes::from_static(b"h"), entry);
+
+        // now_ms between the two field deadlines: "dead" filtered, "live" seen.
+        let href = db.get_hash_ref_if_alive(b"h", 2_000).unwrap().unwrap();
+        assert!(matches!(href, HashRef::WithTtl { .. }));
+        assert_eq!(href.get_field(b"dead"), None, "expired field must filter");
+        assert_eq!(
+            href.get_field(b"live").unwrap(),
+            Bytes::from_static(b"y"),
+            "live field must read through"
+        );
+    }
+
+    #[test]
+    fn test_get_or_create_list_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"a"));
+        list.push_back(Bytes::from_static(b"b"));
+        let mut db = db_with_spilled_value(tmp.path(), b"mylist", TestRedisValue::List(list));
+
+        let l = db.get_or_create_list(b"mylist").unwrap();
+        assert_eq!(
+            l.len(),
+            2,
+            "must promote existing elements, not fabricate empty list"
+        );
+        assert_eq!(l[0], Bytes::from_static(b"a"));
+    }
+
+    #[test]
+    fn test_get_list_ref_if_alive_sees_cold_list_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"x"));
+        let db = db_with_spilled_value(tmp.path(), b"l", TestRedisValue::List(list));
+
+        let lref = db
+            .get_list_ref_if_alive(b"l", 0)
+            .unwrap()
+            .expect("must see cold list");
+        assert_eq!(lref.len(), 1);
+        assert!(!db.is_hot(b"l"));
+    }
+
+    #[test]
+    fn test_get_or_create_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m1"));
+        set.insert(Bytes::from_static(b"m2"));
+        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+
+        let s = db.get_or_create_set(b"myset").unwrap();
+        assert_eq!(
+            s.len(),
+            2,
+            "must promote existing members, not fabricate empty set"
+        );
+        assert!(s.contains(b"m1".as_slice()));
+    }
+
+    #[test]
+    fn test_get_set_ref_if_alive_sees_cold_set_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut set = HashSet::new();
+        set.insert(Bytes::from_static(b"m"));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+
+        let sref = db
+            .get_set_ref_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold set");
+        assert!(sref.contains(b"m"));
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_get_or_create_sorted_set_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(1.5), Bytes::from_static(b"alice"));
+        members.insert(Bytes::from_static(b"alice"), 1.5);
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myzset",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "must promote existing members, not fabricate empty zset"
+        );
+        assert_eq!(members.get(b"alice".as_slice()), Some(&1.5));
+    }
+
+    #[test]
+    fn test_get_sorted_set_ref_if_alive_sees_cold_zset_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        tree.insert(OrderedFloat(2.0), Bytes::from_static(b"bob"));
+        members.insert(Bytes::from_static(b"bob"), 2.0);
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"z",
+            TestRedisValue::SortedSetBPTree { tree, members },
+        );
+
+        let zref = db
+            .get_sorted_set_ref_if_alive(b"z", 0)
+            .unwrap()
+            .expect("must see cold zset");
+        assert_eq!(zref.score(b"bob"), Some(2.0));
+        assert!(!db.is_hot(b"z"));
+    }
+
+    #[test]
+    fn test_get_or_create_stream_promotes_cold_instead_of_fabricating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 1000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"field"), Bytes::from_static(b"value"))],
+        );
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"mystream",
+            TestRedisValue::Stream(Box::new(stream)),
+        );
+
+        let s = db.get_or_create_stream(b"mystream").unwrap();
+        assert_eq!(
+            s.length, 1,
+            "must promote existing entries, not fabricate empty stream"
+        );
+        assert_eq!(s.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_get_stream_if_alive_sees_cold_stream_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = StreamData::new();
+        let id = crate::storage::stream::StreamId { ms: 2000, seq: 0 };
+        stream.last_id = id;
+        stream.length = 1;
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+        );
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Stream(Box::new(stream)));
+
+        let sref = db
+            .get_stream_if_alive(b"s", 0)
+            .unwrap()
+            .expect("must see cold stream");
+        assert_eq!(sref.length, 1);
+        assert!(!db.is_hot(b"s"));
+    }
+
+    #[test]
+    fn test_exists_counts_cold_only_hash_without_promoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+
+        assert!(db.exists(b"h"), "cold-only key must count as existing");
+        // Cheap presence check must not have promoted the key into hot RAM.
+        assert!(
+            !db.is_hot(b"h"),
+            "EXISTS must not promote — cheap check only"
+        );
+
+        let now_ms = db.now_ms();
+        assert!(db.exists_if_alive(b"h", now_ms));
+        assert!(!db.is_hot(b"h"));
+    }
+
+    #[test]
+    fn test_exists_false_for_genuinely_missing_key() {
+        let mut db = Database::new();
+        db.cold_index = Some(ColdIndex::new());
+        assert!(!db.exists(b"nope"));
+        let now_ms = db.now_ms();
+        assert!(!db.exists_if_alive(b"nope", now_ms));
+    }
+}

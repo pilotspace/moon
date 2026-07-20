@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance is now an exact equality).
 
 ### Changed
+- **`storage::db` is now a directory module.** `db.rs` had grown to 3113
+  lines against the repo's 1500-line ceiling; the W5 accessor unification
+  made a clean split possible. The file is now `db/mod.rs` (types, cost
+  constants, ctor/clock, memory accounting, tests) plus `db/hash_ttl.rs`
+  (HEXPIRE-family per-field TTL primitives), `db/kv_ops.rs` (core keyspace
+  ops: get/set/remove, lazy expiry, cold-tier promotion, scan) and
+  `db/accessors.rs` (ValueKind/OwnedKind generics, per-type delegators,
+  read-only refs, blocking-hook helpers, streams). Pure code motion — every
+  method body moved verbatim, public paths unchanged; four private helpers
+  became `pub(super)` for cross-file visibility within the module.
+
 - **`aof_manifest::ShardManifest` renamed `AofShardManifest` (W6).** Two
   unrelated structs shared the name `ShardManifest` — the page manifest's
   (`persistence::manifest`, the durable spill/offload root) and the AOF
