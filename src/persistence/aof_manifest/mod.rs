@@ -95,8 +95,13 @@ pub enum AofLayout {
 }
 
 /// Per-shard manifest entry. One per shard in `PerShard` layout.
+///
+/// W6: renamed from `ShardManifest` — that name collided with the page
+/// manifest's `persistence::manifest::ShardManifest` (a different struct
+/// with a different on-disk format), which made cross-plane persistence
+/// discussion and code search ambiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardManifest {
+pub struct AofShardManifest {
     /// Shard ID (0..num_shards).
     pub shard_id: u16,
     /// Max LSN persisted to this shard's incr file so far. Semantics defined
@@ -117,7 +122,7 @@ pub struct AofManifest {
     pub layout: AofLayout,
     /// Per-shard metadata. Length is 1 for `TopLevel`, `num_shards` for
     /// `PerShard`. Indexed by `shard_id`.
-    pub shards: Vec<ShardManifest>,
+    pub shards: Vec<AofShardManifest>,
 }
 
 impl AofManifest {
@@ -220,7 +225,7 @@ impl AofManifest {
             dir: dir.to_path_buf(),
             seq: 1,
             layout: AofLayout::TopLevel,
-            shards: vec![ShardManifest {
+            shards: vec![AofShardManifest {
                 shard_id: 0,
                 max_lsn: 0,
             }],
@@ -263,7 +268,7 @@ impl AofManifest {
             dir: dir.to_path_buf(),
             seq: 1,
             layout: AofLayout::TopLevel,
-            shards: vec![ShardManifest {
+            shards: vec![AofShardManifest {
                 shard_id: 0,
                 max_lsn: 0,
             }],
@@ -396,7 +401,7 @@ impl AofManifest {
             dir: dir.to_path_buf(),
             seq,
             layout: AofLayout::TopLevel,
-            shards: vec![ShardManifest {
+            shards: vec![AofShardManifest {
                 shard_id: 0,
                 max_lsn: 0,
             }],
@@ -421,7 +426,7 @@ impl AofManifest {
     fn parse_v2(content: &str, dir: &Path, manifest_path: &Path) -> std::io::Result<Self> {
         let mut seq = 0u64;
         let mut num_shards: Option<u16> = None;
-        let mut shards: Vec<ShardManifest> = Vec::new();
+        let mut shards: Vec<AofShardManifest> = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -504,7 +509,7 @@ impl AofManifest {
                         ),
                     )
                 })?;
-                shards.push(ShardManifest {
+                shards.push(AofShardManifest {
                     shard_id: id,
                     max_lsn,
                 });
@@ -1136,11 +1141,11 @@ mod tests_v2 {
             seq: 1,
             layout: AofLayout::PerShard,
             shards: vec![
-                ShardManifest {
+                AofShardManifest {
                     shard_id: 0,
                     max_lsn: 0,
                 },
-                ShardManifest {
+                AofShardManifest {
                     shard_id: 1,
                     max_lsn: 0,
                 },
@@ -1194,15 +1199,15 @@ mod tests_v2 {
             seq: 1,
             layout: AofLayout::PerShard,
             shards: vec![
-                ShardManifest {
+                AofShardManifest {
                     shard_id: 0,
                     max_lsn: 100,
                 },
-                ShardManifest {
+                AofShardManifest {
                     shard_id: 1,
                     max_lsn: 500,
                 },
-                ShardManifest {
+                AofShardManifest {
                     shard_id: 2,
                     max_lsn: 250,
                 },

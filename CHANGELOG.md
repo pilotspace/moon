@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance is now an exact equality).
 
 ### Changed
+- **`aof_manifest::ShardManifest` renamed `AofShardManifest` (W6).** Two
+  unrelated structs shared the name `ShardManifest` — the page manifest's
+  (`persistence::manifest`, the durable spill/offload root) and the AOF
+  manifest's per-shard entry — making cross-plane persistence code search
+  and discussion ambiguous. The AOF one (private to its module tree, no
+  external importers) now carries the plane in its name. `storage::tier`'s
+  `ResidencyTier` gained a doc note disambiguating it from the on-disk
+  `manifest::StorageTier` (they intersect in concept but not in role and
+  must not be merged); the unified-manifest RFC gained the task-#48
+  poison-record policy tie-in for its future section decoders.
+
 - **One typed-accessor skeleton in `Database` (W5).** The ~20-method
   accessor matrix (`get_X` / `get_or_create_X` / `get_X_ref_if_alive` per
   container type) copy-pasted the same skeleton — expiry check → cold
