@@ -387,24 +387,6 @@ mod yield_costfree_tests {
     }
 }
 
-#[cfg(test)]
-mod uring_entries_tests {
-    // Shared process-global: run assertions in one test to avoid ordering
-    // races between parallel test threads.
-    #[test]
-    fn uring_entries_default_set_and_clamp() {
-        assert_eq!(super::uring_entries(), None, "unset must read as None");
-        super::set_uring_entries(4096);
-        assert_eq!(super::uring_entries(), Some(4096));
-        super::set_uring_entries(64);
-        assert_eq!(
-            super::uring_entries(),
-            Some(super::MIN_URING_ENTRIES),
-            "sub-floor values clamp up to monoio's minimum"
-        );
-    }
-}
-
 // --- Runtime-specific type aliases for TCP networking ---
 // These allow subsystem code to use a single type name regardless of runtime.
 
@@ -455,3 +437,21 @@ pub type RuntimeFactoryImpl = TokioRuntimeFactory;
 
 #[cfg(feature = "runtime-monoio")]
 pub type RuntimeFactoryImpl = MonoioRuntimeFactory;
+
+#[cfg(test)]
+mod uring_entries_tests {
+    // Shared process-global: run assertions in one test to avoid ordering
+    // races between parallel test threads.
+    #[test]
+    fn uring_entries_default_set_and_clamp() {
+        assert_eq!(super::uring_entries(), None, "unset must read as None");
+        super::set_uring_entries(4096);
+        assert_eq!(super::uring_entries(), Some(4096));
+        super::set_uring_entries(64);
+        assert_eq!(
+            super::uring_entries(),
+            Some(super::MIN_URING_ENTRIES),
+            "sub-floor values clamp up to monoio's minimum"
+        );
+    }
+}

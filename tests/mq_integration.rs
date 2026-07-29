@@ -90,6 +90,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         uring_sqpoll_ms: None,
         io_driver: "auto".to_string(),
         io_busy_poll_us: 0,
+        uring_entries: None,
         ft_search_workers: None,
         admin_port: 0,
         slowlog_log_slower_than: 10000,
