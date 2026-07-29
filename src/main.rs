@@ -617,6 +617,47 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("{msg}");
     }
 
+    // c10k W3: make maxclients honest against RLIMIT_NOFILE (Redis parity —
+    // Redis raises the soft limit to fit maxclients or shrinks maxclients
+    // loudly; moon previously never looked, so a 10k-conn target on a 1024-fd
+    // shell died in silent EMFILE accept-backoff loops). Non-unix: no-op.
+    #[cfg(unix)]
+    {
+        let reserved = rlimit_reserved_fds(num_shards);
+        // SAFETY: getrlimit/setrlimit with a valid resource constant and a
+        // pointer to a properly initialized rlimit struct — plain libc FFI
+        // with no aliasing or lifetime concerns.
+        unsafe {
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                let need = config.maxclients as u64 + reserved;
+                if config.maxclients > 0 && u64::from(rl.rlim_cur) < need {
+                    let want = need.min(u64::from(rl.rlim_max));
+                    let mut raised = rl;
+                    raised.rlim_cur = want as libc::rlim_t;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                        tracing::info!(
+                            "Raised RLIMIT_NOFILE soft limit {} -> {} to fit maxclients {} (+{} reserved fds)",
+                            rl.rlim_cur, want, config.maxclients, reserved
+                        );
+                    }
+                    if want < need {
+                        tracing::warn!(
+                            "RLIMIT_NOFILE hard limit {} cannot fit maxclients {} (+{} reserved fds): \
+                             accepts beyond ~{} clients will fail with EMFILE. Raise `ulimit -n` \
+                             or lower --maxclients.",
+                            rl.rlim_max, config.maxclients, reserved,
+                            want.saturating_sub(reserved)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Create channel mesh for inter-shard communication
     let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
 
@@ -2042,9 +2083,27 @@ pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Op
     }
 }
 
+/// Fds moon needs beyond client sockets (c10k W3 rlimit check): listeners
+/// (per-shard SO_REUSEPORT + central), per-shard WAL/AOF segments + spill +
+/// manifest handles, io_uring fds, logs. Deliberately generous — the cost of
+/// over-reserving is a slightly earlier warning, the cost of under-reserving
+/// is EMFILE on the persistence path mid-flight.
+pub fn rlimit_reserved_fds(num_shards: usize) -> u64 {
+    64 + (num_shards as u64) * 16
+}
+
 #[cfg(test)]
 mod tests {
+    use super::rlimit_reserved_fds;
     use super::should_warn_undersubscription;
+
+    #[test]
+    fn reserved_fds_scale_with_shards() {
+        assert_eq!(rlimit_reserved_fds(1), 80);
+        assert_eq!(rlimit_reserved_fds(16), 320);
+        // Never zero — listeners + logs always exist.
+        assert!(rlimit_reserved_fds(0) >= 64);
+    }
 
     #[test]
     fn no_warn_single_shard() {

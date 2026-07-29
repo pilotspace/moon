@@ -272,6 +272,13 @@ pub(crate) fn spawn_tokio_connection(
                     "Shard {}: TLS connection rejected: maxclients reached",
                     shard_id
                 );
+                // c10k W3 Redis parity: loud rejection. The plaintext write
+                // surfaces client-side as a handshake failure (best effort).
+                use tokio::io::AsyncWriteExt;
+                let mut rejected = tcp_stream;
+                let _ = rejected
+                    .write_all(b"-ERR max number of clients reached\r\n")
+                    .await;
                 return;
             }
             // R-3: capture the underlying TCP fd before the handshake moves the
@@ -579,6 +586,34 @@ pub(crate) fn spawn_monoio_connection(
             };
             #[cfg(not(unix))]
             let kill_fd = -1;
+
+            // c10k W3: maxclients gate BEFORE the per-connection clone-fest +
+            // ConnectionContext construction. A rejected connection previously
+            // paid 3 O(num_shards) Vec clones, ~25 Arc bumps and a spawned
+            // handler task before the CAS ran — and was then closed SILENTLY.
+            // Redis parity: write `-ERR max number of clients reached` (best
+            // effort; for TLS clients the plaintext write surfaces as a loud
+            // handshake failure, matching Redis's raw-fd behavior), then
+            // close. The slot was never taken, so no record_connection_closed.
+            let maxclients = runtime_config.read().maxclients;
+            if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                tracing::warn!(
+                    "Shard {}: connection rejected: maxclients reached",
+                    shard_id
+                );
+                monoio::spawn(async move {
+                    use monoio::io::AsyncWriteRentExt;
+                    let mut rejected = tcp_stream;
+                    let (_res, _buf) = rejected
+                        .write_all(bytes::Bytes::from_static(
+                            b"-ERR max number of clients reached\r\n",
+                        ))
+                        .await;
+                    // drop closes the fd
+                });
+                return;
+            }
+
             let aff = affinity_tracker.clone();
             let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
@@ -667,18 +702,14 @@ pub(crate) fn spawn_monoio_connection(
                 do_dir,
             );
 
-            let maxclients = conn_ctx.runtime_config.read().maxclients;
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
                 // Load current TLS config from ArcSwap — new connections see reloaded certs
                 let tls_cfg = tls_swap.load_full();
                 monoio::spawn(async move {
-                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                        tracing::warn!(
-                            "Shard {}: TLS connection rejected: maxclients reached",
-                            shard_id
-                        );
-                        return;
-                    }
+                    // maxclients slot already taken by the pre-spawn gate above
+                    // (still BEFORE the handshake, preserving #17's stalled-
+                    // ClientHello bound); released by record_connection_closed
+                    // at the end of this task.
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     // #17: bound the handshake so a stalled ClientHello cannot
                     // pin the fd + maxclients slot forever.
@@ -723,13 +754,8 @@ pub(crate) fn spawn_monoio_connection(
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
-                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                        tracing::warn!(
-                            "Shard {}: connection rejected: maxclients reached",
-                            shard_id
-                        );
-                        return;
-                    }
+                    // maxclients slot already taken by the pre-spawn gate above;
+                    // released by the migration-aware decrement at task end.
                     // R-6 fail-open: keep what we need to re-serve the client
                     // locally if a migration hand-off cannot be delivered.
                     #[cfg(target_os = "linux")]
