@@ -33,7 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (falls back to round-robin) — previously one migrated/subscribed client
     pinned all same-IP connections to one shard with no load feedback.
 
+### Added
+- **`--uring-entries N` (c10k P4)** — per-shard io_uring submission-queue
+  size (monoio default 1024; also the legacy driver's event-batch
+  capacity). Values below monoio's 256 floor clamp up with a warning;
+  monoio runtime only.
+
 ### Changed
+- **Cold command futures boxed out of the connection state machine
+  (c10k P3).** TXN.ABORT rollback, leaked-txn disconnect teardown, and
+  the FT.* body now `Box::pin` behind their name-check fast paths; the
+  per-connection monoio task allocation drops 9.3 KB → 5.9 KB plain TCP
+  (13.2 → 9.9 KB TLS) with zero allocation on the KV dispatch path.
 - **Client registry striped 16 ways (W5).** Accepts/closes no longer
   serialize on one global lock; `CLIENT LIST` locks one stripe at a time
   (output is no longer insertion-ordered — Redis makes no ordering
