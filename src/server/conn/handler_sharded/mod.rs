@@ -2247,7 +2247,10 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
     // kv_intents and pin the key invisible for all subsequent readers.
     if let Some(txn) = conn.active_cross_txn.take() {
-        crate::transaction::abort::abort_cross_store_txn_routed(
+        // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
+        // otherwise sits inline in EVERY connection future; boxing costs one
+        // alloc on the leaked-txn teardown path only.
+        Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
             &ctx.shard_databases,
             ctx.shard_id,
             conn.selected_db,
@@ -2255,7 +2258,7 @@ pub(crate) async fn handle_connection_sharded_inner<
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
             *txn,
-        )
+        ))
         .await;
     }
 

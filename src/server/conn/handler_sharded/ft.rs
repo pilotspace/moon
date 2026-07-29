@@ -25,7 +25,21 @@ pub(super) async fn try_handle_ft_command(
     if cmd.len() <= 3 || !cmd[..3].eq_ignore_ascii_case(b"FT.") {
         return false;
     }
+    // Box::pin (c10k future diet): the FT.* body is a ~2.8 KB state machine
+    // that would otherwise live inline in every connection future. The alloc
+    // happens only when an FT.* command actually executes — never on the
+    // name-mismatch fast path above — and is noise next to the search itself.
+    Box::pin(ft_command_inner(cmd, cmd_args, frame, conn, ctx, responses)).await
+}
 
+async fn ft_command_inner(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    frame: &Frame,
+    conn: &ConnectionState,
+    ctx: &ConnectionContext,
+    responses: &mut Vec<Frame>,
+) -> bool {
     if ctx.num_shards > 1 {
         // Multi-shard: dispatch via SPSC
         #[cfg(feature = "text-index")]
