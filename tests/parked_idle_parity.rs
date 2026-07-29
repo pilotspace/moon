@@ -256,6 +256,63 @@ fn resumed_connection_keeps_registry_identity() {
     let _ = child.wait();
 }
 
+/// A client that dies with an RST while its connection is parked must be
+/// torn down promptly — an RST'd fd stays readable forever, so a handler
+/// that mistakes the resulting read error for a sweep-cancel would spin the
+/// connection through park→wake→park at 100% CPU (the E11 spin, plain-TCP
+/// variant) and pin the fd in CLOSE_WAIT.
+#[cfg(unix)] // SO_LINGER(0) via libc; std's set_linger is unstable
+#[test]
+fn rst_while_parked_tears_down_promptly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+
+    let victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    {
+        let mut v = &victim;
+        v.write_all(b"CLIENT SETNAME rstvictim\r\n").expect("write");
+        let mut buf = [0u8; 8];
+        victim
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let _ = (&victim).read(&mut buf);
+    }
+    std::thread::sleep(PARK_WAIT); // parked now
+
+    // RST close: SO_LINGER(0) makes drop send RST instead of FIN.
+    {
+        use std::os::unix::io::AsRawFd;
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                victim.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER(0) must apply");
+    }
+    drop(victim);
+
+    // The server must fully release the conn: gone from CLIENT LIST and no
+    // respawn loop keeping it alive.
+    std::thread::sleep(Duration::from_millis(2000));
+    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let list = command_reply(&mut control, "CLIENT LIST\r\n");
+    assert!(
+        !list.contains("name=rstvictim"),
+        "RST'd parked connection still registered:\n{list}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// An active sibling must be undisturbed while its neighbor parks and wakes.
 #[test]
 fn active_sibling_undisturbed_by_parking() {

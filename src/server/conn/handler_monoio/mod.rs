@@ -79,6 +79,9 @@ pub(crate) struct ParkArgs {
 
 #[cfg(feature = "runtime-monoio")]
 impl ParkArgs {
+    // Only referenced by the Linux-gated R-6 fail-open re-serve sites in
+    // conn_accept.rs; dead on non-Linux builds.
+    #[allow(dead_code)]
     pub(crate) const NO_PARK: ParkArgs = ParkArgs {
         can_park: false,
         kept_registration: None,
@@ -759,7 +762,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && write_buf.is_empty()
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
-                && conn.active_cross_txn.is_none();
+                && conn.active_cross_txn.is_none()
+                // Stream-side veto LAST (it can do real work): TLS refuses
+                // while its wrapper buffers / rustls session hold anything
+                // the raw fd's readability can't signal.
+                && stream.task_park_safe();
             if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
                 let handle = reg.slot.handle();
                 reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
@@ -772,11 +779,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         read_buf.extend_from_slice(&tmp_buf[..n]);
                         downshifted = false;
                     }
+                    // Real socket/TLS error (EOF without close_notify,
+                    // ECONNRESET, …): terminate. Parking instead would spin
+                    // park→wake→park forever — the dead fd stays readable.
+                    Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
                     Err(_) => {
-                        // Cancelled by the stage-2 sweep (or a real socket
-                        // error, which the resumed handler's first read will
-                        // surface as EOF/err): exit the task. read_buf is
-                        // empty (predicate), so no partial frame is at risk.
+                        // Cancelled by the stage-2 sweep: exit the task.
+                        // read_buf is empty (predicate), so no partial frame
+                        // is at risk.
                         let state = Box::new(MigratedConnectionState {
                             selected_db: conn.selected_db,
                             authenticated: conn.authenticated,
@@ -824,11 +834,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 Ok(n) => {
                     read_buf.extend_from_slice(&tmp_buf[..n]);
                 }
+                // Real socket/TLS error: terminate now. (Pre-P1 this arm
+                // could lump errors in with the cancel because stage 2
+                // always performed a read that re-surfaced them; the
+                // task-park path parks WITHOUT reading, so a mistaken
+                // downshift here would feed the park→wake→park spin.)
+                Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
                 Err(_) => {
-                    // Cancelled by the idle sweep — or a real socket error,
-                    // which the stage-2 re-park's own read surfaces
-                    // immediately. Either way: shed the working set, re-park
-                    // small. No error-kind matching needed.
+                    // Cancelled by the idle sweep: shed the working set,
+                    // re-park small.
                     idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
                     stream.on_idle_downshift();
                     downshifted = true;
