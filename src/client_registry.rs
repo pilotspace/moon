@@ -37,6 +37,62 @@ fn stripe(id: u64) -> &'static RwLock<HashMap<u64, ClientEntry>> {
     &REGISTRY[(id as usize) % STRIPES]
 }
 
+/// Per-shard live connection counts (c10k W8). Readable — unlike the
+/// metrics gauge — so the listener's IP-affinity funnel can refuse to pile
+/// further connections onto an already-overloaded shard. Initialized once
+/// at startup; when unset (unit tests, embedded), the load gate is inert.
+static SHARD_CONNS: std::sync::OnceLock<Box<[AtomicUsize]>> = std::sync::OnceLock::new();
+
+/// Initialize the per-shard connection counters. Called once from startup
+/// with the resolved shard count; later calls are no-ops.
+pub fn init_shard_conn_counts(num_shards: usize) {
+    let _ = SHARD_CONNS.set(
+        (0..num_shards)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+}
+
+#[inline]
+fn shard_conns_delta(shard: usize, add: bool) {
+    if let Some(counts) = SHARD_CONNS.get()
+        && let Some(c) = counts.get(shard)
+    {
+        if add {
+            c.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Is `shard` carrying disproportionate connection load? Used by the
+/// listener to gate the IP-affinity hint: one migrated/subscribed client
+/// used to pin ALL subsequent central-accepted connections from its IP onto
+/// one shard with no load feedback (~2× worst-case skew,
+/// tmp/C10K-REVIEW.md defect #5). Threshold: 2× the mean + a small
+/// absolute floor so tiny fleets never flap.
+pub fn shard_overloaded(shard: usize, num_shards: usize) -> bool {
+    let Some(counts) = SHARD_CONNS.get() else {
+        return false;
+    };
+    let Some(c) = counts.get(shard) else {
+        return false;
+    };
+    overload_threshold_exceeded(
+        c.load(Ordering::Relaxed),
+        TOTAL_CLIENTS.load(Ordering::Relaxed),
+        num_shards,
+    )
+}
+
+/// Pure overload predicate (unit-test surface for the W8 gate).
+#[inline]
+pub(crate) fn overload_threshold_exceeded(count: usize, total: usize, num_shards: usize) -> bool {
+    count > 2 * (total / num_shards.max(1)) + 16
+}
+
 /// Lock-free per-connection state, shared between the connection task
 /// (writer, once per batch) and CLIENT LIST/INFO/KILL (occasional readers).
 pub struct ClientLiveState {
@@ -162,6 +218,7 @@ pub fn register(
     };
     stripe(id).write().insert(id, entry);
     TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    shard_conns_delta(shard, true);
     crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
 }
@@ -170,6 +227,7 @@ pub fn register(
 pub fn deregister(id: u64) {
     if let Some(entry) = stripe(id).write().remove(&id) {
         TOTAL_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+        shard_conns_delta(entry.shard, false);
         crate::admin::metrics_setup::record_shard_connection_delta(entry.shard, -1.0);
     }
 }
@@ -667,5 +725,36 @@ mod striping_tests {
             deregister(*id);
         }
         assert!(client_info(BASE).is_none(), "deregistered id must be gone");
+    }
+}
+
+#[cfg(test)]
+mod overload_gate_tests {
+    use super::overload_threshold_exceeded;
+
+    #[test]
+    fn balanced_load_is_not_overloaded() {
+        // 4 shards, 1000 total, this shard at the mean.
+        assert!(!overload_threshold_exceeded(250, 1000, 4));
+        // Right at 2x mean + 16 is still allowed (strictly-greater gate).
+        assert!(!overload_threshold_exceeded(516, 1000, 4));
+    }
+
+    #[test]
+    fn funneled_shard_trips_the_gate() {
+        assert!(overload_threshold_exceeded(517, 1000, 4));
+        assert!(overload_threshold_exceeded(900, 1000, 4));
+    }
+
+    #[test]
+    fn small_fleets_never_flap() {
+        // Absolute floor: with 10 total conns, even a 10/0/0/0 split stays
+        // under mean*2+16 — affinity wins for tiny fleets.
+        assert!(!overload_threshold_exceeded(10, 10, 4));
+    }
+
+    #[test]
+    fn zero_shards_is_safe() {
+        assert!(!overload_threshold_exceeded(0, 0, 0));
     }
 }

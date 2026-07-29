@@ -658,6 +658,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // c10k W8: readable per-shard connection counters — feeds the listener's
+    // IP-affinity load gate.
+    moon::client_registry::init_shard_conn_counts(num_shards);
+
     // Create channel mesh for inter-shard communication
     let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
 
