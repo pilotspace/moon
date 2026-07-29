@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   512 B probe buffer. Idle RSS/conn 43.5 → 19.9 KB (10k-conn VM A/B);
   GCE-pinned p=1/p=16 A/B perf-neutral. TLS conns and the tokio runtime
   keep the previous behavior.
+- **Idle TLS connections shed their 32 KB wrapper buffers (c10k P4b).**
+  `monoio-rustls` + `monoio-io-wrapper` are now vendored (moon-patch style,
+  like `vendor/monoio`): the wrapper's two eagerly-allocated, never-freed
+  16 KiB per-stream buffers are lazy + releasable, and the TLS stream
+  implements a loss-free cancelable read, so W11's idle downshift now
+  covers TLS connections too — a parked TLS conn drops moon's working set
+  AND both wrapper buffers (they reallocate lazily on the next I/O).
+  Cancel errors are deliberately not stashed for replay in the wrapper
+  (a stashed ECANCELED would resurface on the next read and tear down a
+  healthy connection). Wire parity across downshift/wake cycles is
+  regression-tested on one continuous TLS session
+  (`tests/tls_idle_downshift_parity.rs`).
 - **Cold command futures boxed out of the connection state machine
   (c10k P3).** TXN.ABORT rollback, leaked-txn disconnect teardown, and
   the FT.* body now `Box::pin` behind their name-check fast paths; the

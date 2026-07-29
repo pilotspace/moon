@@ -25,9 +25,11 @@
 //! Per-park hot-path cost: two `Cell` stores + one `Rc` clone of the
 //! `CancelHandle` (no allocation).
 //!
-//! TLS connections (`monoio_rustls` streams) do not implement cancelable
-//! reads; they opt out via [`IdleParkRead::SUPPORTS_IDLE_PARK`] and keep
-//! the pre-W11 behavior byte-for-byte.
+//! TLS connections participate too (c10k P4b): the vendored monoio-rustls
+//! implements a loss-free cancelable read, and their
+//! [`IdleParkRead::on_idle_downshift`] additionally releases the wrapper's
+//! two 16 KiB stream buffers (vendored monoio-io-wrapper reallocates them
+//! lazily on the next I/O).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -164,6 +166,11 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
     ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
         self.read(buf)
     }
+
+    /// Stream-side hook fired when the handler downshifts after a cancelled
+    /// stage-1 read. Default: nothing (plain TCP has no stream-owned
+    /// buffers); TLS releases its drained wrapper buffers here.
+    fn on_idle_downshift(&mut self) {}
 }
 
 impl IdleParkRead for monoio::net::TcpStream {
@@ -178,10 +185,28 @@ impl IdleParkRead for monoio::net::TcpStream {
     }
 }
 
-/// TLS streams keep the pre-W11 behavior (no cancelable read in
-/// monoio_rustls; dropping its read future mid-handshake-record would also
-/// desync the TLS session state).
-impl IdleParkRead for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {}
+/// TLS streams downshift too (c10k P4b): the vendored monoio-rustls
+/// cancelable read forwards the cancel to the inner socket read; raced
+/// bytes persist in the wrapper buffer + rustls deframer, and the cancel
+/// error is deliberately NOT stashed for replay (vendored
+/// `SafeRead::do_io_cancelable`), so the stage-2 probe read resumes the
+/// session cleanly. The downshift hook additionally sheds the wrapper's
+/// two 16 KiB stream buffers.
+impl IdleParkRead for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
+    const SUPPORTS_IDLE_PARK: bool = true;
+
+    fn idle_park_read(
+        &mut self,
+        buf: Vec<u8>,
+        c: CancelHandle,
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+        monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
+    }
+
+    fn on_idle_downshift(&mut self) {
+        self.release_idle_buffers();
+    }
+}
 
 #[cfg(test)]
 mod idle_park_tests {

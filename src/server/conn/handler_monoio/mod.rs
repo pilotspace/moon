@@ -698,6 +698,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // immediately. Either way: shed the working set, re-park
                     // small. No error-kind matching needed.
                     idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
+                    stream.on_idle_downshift();
                     downshifted = true;
                     continue;
                 }
