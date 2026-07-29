@@ -182,6 +182,21 @@ pub(super) fn downshift_idle_buffers(
     }
 }
 
+/// The sweep's cancelled-op error, as monoio constructs it on BOTH drivers:
+/// io_uring surfaces the kernel's `-ECANCELED` (125) and the legacy driver
+/// hardcodes `from_raw_os_error(125)` in its cancel path — including on
+/// macOS, so a raw 125 check is exact everywhere (macOS errno stops at
+/// ~106; no real socket error collides).
+///
+/// The park arms MUST distinguish this from real errors: a real error (TLS
+/// EOF-without-close_notify, ECONNRESET) leaves the fd permanently
+/// readable, so treating it as "cancelled → park" spins the connection
+/// through an infinite park→wake→park loop at 100% CPU (found live in E11:
+/// 3k CLOSE_WAIT TLS conns pinned a shard).
+pub(crate) fn is_sweep_cancel(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(125)
+}
+
 /// Stream capability trait for the two-stage idle park.
 ///
 /// The default is a plain read that ignores the cancel handle and reports
@@ -192,10 +207,20 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
     const SUPPORTS_IDLE_PARK: bool = false;
 
     /// c1M P1: streams whose task can exit while the connection stays open
-    /// (requires a race-free standalone readiness await — plain TCP only;
-    /// TLS keeps W11+P4b behavior because rustls session state lives in the
-    /// stream and the wrapper exposes no readiness API).
+    /// (requires a race-free standalone readiness await on the raw fd —
+    /// plain TCP directly; TLS via the vendored wrapper's `io_ref()`
+    /// passthrough).
     const SUPPORTS_TASK_PARK: bool = false;
+
+    /// c1M P1: per-park veto for streams with internal buffering. Raw-fd
+    /// readability is only a complete wake signal when NOTHING is buffered
+    /// inside the stream itself — TLS overrides this with the vendored
+    /// `task_park_safe()` (wrapper buffers drained, no decrypted plaintext,
+    /// no pending close_notify/output). Plain TCP has no stream-owned
+    /// buffers: always true.
+    fn task_park_safe(&mut self) -> bool {
+        true
+    }
 
     fn idle_park_read(
         &mut self,
@@ -233,6 +258,14 @@ impl IdleParkRead for monoio::net::TcpStream {
 /// two 16 KiB stream buffers.
 impl IdleParkRead for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
     const SUPPORTS_IDLE_PARK: bool = true;
+    /// c1M P1-TLS: the parked watcher awaits readability on the raw fd via
+    /// the vendored `io_ref()` passthrough; `task_park_safe` below vetoes
+    /// any park while the TLS stack has buffered state the fd can't signal.
+    const SUPPORTS_TASK_PARK: bool = true;
+
+    fn task_park_safe(&mut self) -> bool {
+        monoio_rustls::ServerTlsStream::task_park_safe(self)
+    }
 
     fn idle_park_read(
         &mut self,

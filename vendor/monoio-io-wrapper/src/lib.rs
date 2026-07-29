@@ -74,6 +74,18 @@ impl ReadBuffer {
         }
     }
 
+    /// moon patch (c1M P1-TLS): no bytes buffered and no deferred status
+    /// pending. Conservatively false for unsafe-io buffers (never
+    /// task-park them).
+    #[inline]
+    pub fn is_drained(&self) -> bool {
+        match self {
+            Self::Safe(b) => b.is_drained(),
+            #[cfg(feature = "unsafe_io")]
+            Self::Unsafe(_) => false,
+        }
+    }
+
     #[inline]
     #[cfg(feature = "unsafe_io")]
     pub fn is_safe(&self) -> bool {
@@ -141,6 +153,17 @@ impl WriteBuffer {
     pub fn release_if_empty(&mut self) -> bool {
         match self {
             Self::Safe(b) => b.release_if_empty(),
+            #[cfg(feature = "unsafe_io")]
+            Self::Unsafe(_) => false,
+        }
+    }
+
+    /// moon patch (c1M P1-TLS): no bytes buffered and no stashed write
+    /// error pending. Conservatively false for unsafe-io buffers.
+    #[inline]
+    pub fn is_drained(&self) -> bool {
+        match self {
+            Self::Safe(b) => b.is_drained(),
             #[cfg(feature = "unsafe_io")]
             Self::Unsafe(_) => false,
         }

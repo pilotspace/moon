@@ -220,6 +220,20 @@ impl SafeRead {
             .expect("buffer mut expected")
             .release_if_empty()
     }
+
+    /// moon patch (c1M P1-TLS): true when the buffer holds no bytes AND no
+    /// deferred status (EOF/error) is pending delivery. Task-parking on raw
+    /// fd readability is only correct when nothing is waiting here — a
+    /// buffered byte or a pending EOF would never make the fd readable.
+    /// (`buffer` is only `None` transiently inside `do_io`, which holds
+    /// `&mut self` — but answer `false` rather than panic if it ever is:
+    /// "don't park" is always the safe verdict.)
+    pub fn is_drained(&self) -> bool {
+        match (self.buffer.as_ref(), &self.status) {
+            (Some(buffer), ReadStatus::Ok) => buffer.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 impl io::Read for SafeRead {
@@ -322,6 +336,16 @@ impl SafeWrite {
             .as_mut()
             .expect("buffer mut expected")
             .release_if_empty()
+    }
+
+    /// moon patch (c1M P1-TLS): true when no unflushed bytes and no stashed
+    /// write error are pending. See `SafeRead::is_drained` (incl. the
+    /// `None`-buffer rationale).
+    pub fn is_drained(&self) -> bool {
+        match (self.buffer.as_ref(), &self.status) {
+            (Some(buffer), WriteStatus::Ok) => buffer.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -520,5 +544,46 @@ mod moon_patch_tests {
         let mut out = [0u8; 8];
         let replay = r.read(&mut out).unwrap_err();
         assert_eq!(replay.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    // moon patch (c1M P1-TLS): is_drained must be false whenever a byte OR a
+    // deferred status is pending — task-parking on fd readability while
+    // either waits would hang the connection.
+    #[test]
+    fn read_is_drained_tracks_bytes_and_deferred_status() {
+        let mut r = SafeRead::new(64);
+        assert!(r.is_drained(), "fresh buffer is drained");
+        let mut io = MockIo {
+            results: vec![Ok(b"data".to_vec())],
+        };
+        now(r.do_io(&mut io)).unwrap();
+        assert!(!r.is_drained(), "buffered bytes must block parking");
+        let mut out = [0u8; 8];
+        r.read(&mut out).unwrap();
+        assert!(r.is_drained(), "drained after consume");
+        // Pending EOF status must also block parking (it would never make
+        // the fd readable again).
+        let mut io = MockIo {
+            results: vec![Ok(Vec::new())],
+        };
+        now(r.do_io(&mut io)).unwrap();
+        assert!(!r.is_drained(), "pending EOF must block parking");
+        // Pending stashed error likewise.
+        let mut r2 = SafeRead::new(64);
+        let mut io = MockIo {
+            results: vec![Err(io::Error::new(io::ErrorKind::ConnectionReset, "boom"))],
+        };
+        let _ = now(r2.do_io(&mut io));
+        assert!(!r2.is_drained(), "stashed error must block parking");
+    }
+
+    #[test]
+    fn write_is_drained_tracks_unflushed_bytes() {
+        let mut w = SafeWrite::new(64);
+        assert!(w.is_drained(), "fresh buffer is drained");
+        w.write(b"abc").unwrap();
+        assert!(!w.is_drained(), "unflushed bytes must block parking");
+        w.buffer.as_mut().unwrap().advance(3);
+        assert!(w.is_drained(), "drained after flush");
     }
 }

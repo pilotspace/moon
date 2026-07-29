@@ -73,12 +73,43 @@ impl<IO, C> Stream<IO, C> {
         r || w
     }
 
+    /// moon patch (c1M P1-TLS): the underlying transport, for raw-fd
+    /// readiness watching while the connection is task-parked.
+    pub fn io_ref(&self) -> &IO {
+        &self.io
+    }
+
     pub(crate) fn map_conn<C2, F: FnOnce(C) -> C2>(self, f: F) -> Stream<IO, C2> {
         Stream {
             io: self.io,
             session: f(self.session),
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
+        }
+    }
+}
+
+impl<IO, C, SD: SideData> Stream<IO, C>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
+{
+    /// moon patch (c1M P1-TLS): true when NOTHING is buffered anywhere in
+    /// the TLS stack — task-parking on raw-fd readability is only correct
+    /// then. A buffered TLS record, decrypted plaintext, a pending
+    /// close_notify, or unflushed/unsent output would all wait forever
+    /// behind a `readable()` that never fires (or would deadlock a peer
+    /// waiting on our write). A partial record in the deframer is fine:
+    /// completing it requires more socket bytes, which fire readability.
+    pub fn task_park_safe(&mut self) -> bool {
+        if !self.r_buffer.is_drained() || !self.w_buffer.is_drained() || self.session.wants_write()
+        {
+            return false;
+        }
+        match self.session.process_new_packets() {
+            Ok(state) => state.plaintext_bytes_to_read() == 0 && !state.peer_has_closed(),
+            // Corrupt/unexpected TLS state: don't park; the next read
+            // surfaces the error and tears down cleanly.
+            Err(_) => false,
         }
     }
 }

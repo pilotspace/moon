@@ -223,6 +223,14 @@ pub fn register(
     live
 }
 
+/// Fetch the live-state handle for an already-registered client. Used by
+/// resumed parked connections (c1M P1) to reuse their registration across a
+/// park/wake cycle instead of deregister + re-register — keeping the entry
+/// (name, connected_at, counters) continuously intact.
+pub fn live_handle(id: u64) -> Option<Arc<ClientLiveState>> {
+    stripe(id).read().get(&id).map(|e| Arc::clone(&e.live))
+}
+
 /// Deregister a client connection.
 pub fn deregister(id: u64) {
     if let Some(entry) = stripe(id).write().remove(&id) {

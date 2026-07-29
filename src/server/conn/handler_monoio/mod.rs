@@ -61,6 +61,37 @@ impl Drop for RegistryGuard {
     }
 }
 
+/// Park plumbing for `handle_connection_sharded_monoio` (c1M P1).
+#[cfg(feature = "runtime-monoio")]
+pub(crate) struct ParkArgs {
+    /// Only call sites that ROUTE `ParkIdle` (spawning the readiness
+    /// watcher) may pass true — anywhere else a park return would drop the
+    /// stream and silently close a healthy idle connection.
+    pub can_park: bool,
+    /// Registration carried across a park/wake cycle. A resumed parked
+    /// connection reuses this guard instead of re-registering, so the
+    /// CLIENT LIST entry (name, connected_at, kill state) stays
+    /// continuously intact and TOTAL_CLIENTS/shard counters don't churn —
+    /// there is no deregistered window a racing CLIENT LIST/KILL could
+    /// observe. `None` everywhere except `spawn_resumed_parked_conn`.
+    pub kept_registration: Option<RegistryGuard>,
+}
+
+#[cfg(feature = "runtime-monoio")]
+impl ParkArgs {
+    // Only referenced by the Linux-gated R-6 fail-open re-serve sites in
+    // conn_accept.rs; dead on non-Linux builds.
+    #[allow(dead_code)]
+    pub(crate) const NO_PARK: ParkArgs = ParkArgs {
+        can_park: false,
+        kept_registration: None,
+    };
+    pub(crate) const PARK: ParkArgs = ParkArgs {
+        can_park: true,
+        kept_registration: None,
+    };
+}
+
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
 /// Same purpose as the Tokio handler's `HandlerResult`: the generic handler cannot
@@ -78,11 +109,12 @@ pub enum MonoioHandlerResult {
     /// downshifted state; the handler task exits and the caller parks the
     /// stream behind a tiny readiness watcher
     /// (`conn_accept::spawn_parked_idle_watcher`). Only returned when the
-    /// caller opted in via `can_park` — every other call site would drop the
-    /// stream and silently close a healthy connection. `registry_guard`
-    /// keeps the CLIENT LIST/KILL entry (and its maxclients slot) alive for
-    /// the parked lifetime; the watcher drops it just before re-registering
-    /// on wake.
+    /// caller opted in via `park.can_park` — every other call site would
+    /// drop the stream and silently close a healthy connection.
+    /// `registry_guard` keeps the CLIENT LIST/KILL entry (and its maxclients
+    /// slot) alive for the parked lifetime; on wake the watcher hands it
+    /// back to the resumed handler (`ParkArgs::kept_registration`), so the
+    /// registry entry is never dropped across a park/wake cycle.
     ParkIdle {
         state: Box<MigratedConnectionState>,
         registry_guard: RegistryGuard,
@@ -210,10 +242,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here
     // has no `AsRawFd` bound.
     kill_fd: i32,
-    // c1M P1: only call sites that ROUTE `ParkIdle` (spawning the readiness
-    // watcher) may pass true — anywhere else a park return would drop the
-    // stream and silently close a healthy idle connection.
-    can_park: bool,
+    // c1M P1 park plumbing: opt-in flag + optional registration carried
+    // across a park/wake cycle (see [`ParkArgs`]).
+    park: ParkArgs,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -248,15 +279,37 @@ pub(crate) async fn handle_connection_sharded_monoio<
     conn.refresh_acl_cache(&ctx.acl_table);
     let db_count = ctx.shard_databases.db_count();
 
-    // Register in global client registry for CLIENT LIST/INFO/KILL.
-    let client_live = crate::client_registry::register(
-        client_id,
-        peer_addr.clone(),
-        conn.current_user.clone(),
-        ctx.shard_id,
-        kill_fd,
-    );
-    let registry_guard = RegistryGuard(client_id);
+    // Register in global client registry for CLIENT LIST/INFO/KILL. A
+    // resumed parked connection arrives with its registration still held
+    // (`kept_registration`) and reuses it — the entry was never dropped, so
+    // name/connected_at/kill state persist and counters don't churn. The
+    // `live_handle` miss arm is unreachable while the guard is alive (the
+    // guard is the only deregistration path); registering fresh there is a
+    // fail-safe, not a code path.
+    let (client_live, registry_guard) = match park.kept_registration {
+        Some(guard) => {
+            let live = crate::client_registry::live_handle(client_id).unwrap_or_else(|| {
+                crate::client_registry::register(
+                    client_id,
+                    peer_addr.clone(),
+                    conn.current_user.clone(),
+                    ctx.shard_id,
+                    kill_fd,
+                )
+            });
+            (live, guard)
+        }
+        None => (
+            crate::client_registry::register(
+                client_id,
+                peer_addr.clone(),
+                conn.current_user.clone(),
+                ctx.shard_id,
+                kill_fd,
+            ),
+            RegistryGuard(client_id),
+        ),
+    };
 
     // Functions API registry — LAZY per connection (P-1 footprint): built on
     // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
@@ -702,14 +755,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // The predicate is stable while parked in read (no commands can
             // execute), and reaching this arm already excludes subscriber /
             // tracking / idle-timeout connections (each takes its own arm).
-            let parkable = can_park
+            let parkable = park.can_park
                 && S::SUPPORTS_TASK_PARK
                 && idle_park::park_after_ms() > 0
                 && read_buf.is_empty()
                 && write_buf.is_empty()
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
-                && conn.active_cross_txn.is_none();
+                && conn.active_cross_txn.is_none()
+                // Replica-handshake conns (sent REPLCONF) never park: PSYNC
+                // on a resumed parked conn is unsupported (warn+close).
+                && !conn.saw_replconf
+                // Stream-side veto LAST (it can do real work): TLS refuses
+                // while its wrapper buffers / rustls session hold anything
+                // the raw fd's readability can't signal.
+                && stream.task_park_safe();
             if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
                 let handle = reg.slot.handle();
                 reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
@@ -722,11 +782,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         read_buf.extend_from_slice(&tmp_buf[..n]);
                         downshifted = false;
                     }
+                    // Real socket/TLS error (EOF without close_notify,
+                    // ECONNRESET, …): terminate. Parking instead would spin
+                    // park→wake→park forever — the dead fd stays readable.
+                    Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
                     Err(_) => {
-                        // Cancelled by the stage-2 sweep (or a real socket
-                        // error, which the resumed handler's first read will
-                        // surface as EOF/err): exit the task. read_buf is
-                        // empty (predicate), so no partial frame is at risk.
+                        // Cancelled by the stage-2 sweep: exit the task.
+                        // read_buf is empty (predicate), so no partial frame
+                        // is at risk.
                         let state = Box::new(MigratedConnectionState {
                             selected_db: conn.selected_db,
                             authenticated: conn.authenticated,
@@ -774,11 +837,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 Ok(n) => {
                     read_buf.extend_from_slice(&tmp_buf[..n]);
                 }
+                // Real socket/TLS error: terminate now. (Pre-P1 this arm
+                // could lump errors in with the cancel because stage 2
+                // always performed a read that re-surfaced them; the
+                // task-park path parks WITHOUT reading, so a mistaken
+                // downshift here would feed the park→wake→park spin.)
+                Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
                 Err(_) => {
-                    // Cancelled by the idle sweep — or a real socket error,
-                    // which the stage-2 re-park's own read surfaces
-                    // immediately. Either way: shed the working set, re-park
-                    // small. No error-kind matching needed.
+                    // Cancelled by the idle sweep: shed the working set,
+                    // re-park small.
                     idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
                     stream.on_idle_downshift();
                     downshifted = true;
@@ -1063,6 +1130,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
+                // Likely a replica mid-handshake (PSYNC next): permanently
+                // exclude from task-parking — the resumed-parked path does
+                // not support the PSYNC hijack.
+                conn.saw_replconf = true;
                 continue;
             }
             // PSYNC: arrives only on a master, hijacks the connection. Encode

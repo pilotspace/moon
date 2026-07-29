@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TLS connections task-park too (c1M P1-TLS).** Idle TLS connections now
+  exit their handler task after `--conn-park-secs`, like plain TCP: the
+  parked watcher awaits readability on the raw fd via a vendored
+  `io_ref()` passthrough, and a vendored `task_park_safe()` check vetoes
+  any park while the TLS stack holds state the fd cannot signal (wrapper
+  buffer bytes, pending EOF/error status, decrypted plaintext, a received
+  close_notify, or unsent output). Parked footprint keeps the rustls
+  session; the task future and working set are freed.
+
+### Fixed
+- **Read errors on a parked-capable connection terminate instead of
+  re-parking (park→wake→park spin).** The idle-park arms treated every
+  read error as the sweep's cancel; with task-exit parking that spun a
+  dead connection through park→wake→park at 100 % CPU forever (a TLS
+  client vanishing with a raw FIN — no close_notify — surfaces as a read
+  ERROR, and the dead fd stays readable; found live in E11 with 3 000
+  CLOSE_WAIT connections pinning a shard; an RST'd plain-TCP conn hits
+  the same loop). The arms now match monoio's exact ECANCELED (raw os
+  error 125, both drivers): only the sweep cancel downshifts/parks; real
+  errors tear down promptly. Regression tests: FIN-while-parked (TLS) and
+  RST-while-parked (plain).
+- **Resumed parked connections keep their registry identity (c1M P1
+  follow-up).** Waking from task-exit parking previously deregistered and
+  re-registered the client across a task-scheduling boundary: a racing
+  `CLIENT LIST` could briefly miss the connection, `CLIENT KILL ID` could
+  return 0, and — worse — the fresh registration silently reset the
+  connection's `CLIENT SETNAME` and `age` in `CLIENT LIST`. The wake now
+  hands the held registration through to the resumed handler
+  (registration handoff), so the entry — name, connected-at, kill state,
+  client counters — persists unbroken across any number of park/wake
+  cycles.
+
+### Changed
+- **Migrated connections task-park too (c1M P1 follow-up).** The
+  migrated-connection spawn path (Linux connection migration) now routes
+  `ParkIdle` like the primary accept path, so a connection that migrated
+  shards and then went idle parks out of the task model instead of holding
+  its full handler task forever.
+
 ## [0.8.3] — 2026-07-29
 
 ### Added

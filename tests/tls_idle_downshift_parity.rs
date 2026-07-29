@@ -139,6 +139,15 @@ fn generate_cert(dir: &std::path::Path) -> bool {
 }
 
 fn spawn_moon_tls(dir: &std::path::Path, port: u16, tls_port: u16) -> std::process::Child {
+    spawn_moon_tls_park(dir, port, tls_port, 0)
+}
+
+fn spawn_moon_tls_park(
+    dir: &std::path::Path,
+    port: u16,
+    tls_port: u16,
+    park_secs: u64,
+) -> std::process::Child {
     Command::new(common::find_moon_binary())
         .args([
             "--port",
@@ -151,6 +160,8 @@ fn spawn_moon_tls(dir: &std::path::Path, port: u16, tls_port: u16) -> std::proce
             "0",
             "--tls-port",
             &tls_port.to_string(),
+            "--conn-park-secs",
+            &park_secs.to_string(),
         ])
         .arg("--tls-cert-file")
         .arg(dir.join("cert.pem"))
@@ -225,6 +236,185 @@ fn tls_idle_connection_serves_all_traffic_after_downshift() {
         r,
         want.as_bytes(),
         "4 KiB value must survive the downshifted TLS round trip"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// c1M P1-TLS: task-exit parking must be invisible on the TLS wire. With
+/// `--conn-park-secs 2`, an idle TLS connection downshifts (~1s), then its
+/// handler task EXITS (~2s more), leaving a watcher on the raw fd via the
+/// vendored `io_ref()` passthrough. Every byte sent afterwards must be
+/// served over the SAME TLS session across repeated park/wake cycles —
+/// a park while any TLS-stack buffer held data would hang the read here,
+/// and a session desync would fail the decrypt loudly. A plain-TCP control
+/// connection proves the parked TLS conn stays visible and killable.
+#[test]
+fn tls_parked_connection_serves_traffic_and_stays_killable() {
+    const PARK_WAIT: Duration = Duration::from_millis(4600);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    if !generate_cert(dir.path()) {
+        eprintln!("SKIP: openssl CLI not available for cert generation");
+        return;
+    }
+    let tls_port = common::reserve_port();
+    let (mut child, plain_port) =
+        common::spawn_listening(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
+    let mut conn = None;
+    for _ in 0..50 {
+        match std::panic::catch_unwind(|| TlsConn::connect(tls_port)) {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let mut conn = conn.expect("TLS connect");
+    conn.write_all(b"CLIENT SETNAME tlspark\r\n");
+    let r = conn.read_exact_deadline(5);
+    assert_eq!(&r, b"+OK\r\n");
+
+    // Cycle 1: park past the task-exit threshold, then a probe wake.
+    std::thread::sleep(PARK_WAIT);
+    conn.ping();
+
+    // Cycle 2: re-park (the resumed handler must re-arm both stages), then
+    // a 100-deep pipeline over the same session.
+    std::thread::sleep(PARK_WAIT);
+    let pipeline = b"PING\r\n".repeat(100);
+    conn.write_all(&pipeline);
+    let replies = conn.read_exact_deadline(7 * 100);
+    assert_eq!(replies.len(), 700, "all 100 pipelined replies must arrive");
+
+    // Cycle 3: re-park, then verify the parked conn is visible (with its
+    // name — registration handoff) and killable from a plain-TCP control.
+    std::thread::sleep(PARK_WAIT);
+    let mut control = TcpStream::connect(("127.0.0.1", plain_port)).expect("connect control");
+    control
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set timeout");
+    let mut list = Vec::new();
+    control.write_all(b"CLIENT LIST\r\n").expect("write LIST");
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = control.read(&mut chunk).expect("read LIST");
+        assert!(n > 0, "control closed mid-reply");
+        list.extend_from_slice(&chunk[..n]);
+        if list.ends_with(b"\r\n") && list.starts_with(b"$") {
+            let s = String::from_utf8_lossy(&list);
+            if let Some(pos) = s.find('\n')
+                && let Ok(len) = s[1..pos - 1].trim().parse::<usize>()
+                && list.len() >= pos + 1 + len + 2
+            {
+                break;
+            }
+        }
+    }
+    let list = String::from_utf8_lossy(&list);
+    let victim_line = list
+        .lines()
+        .find(|l| l.contains("name=tlspark"))
+        .unwrap_or_else(|| panic!("parked TLS conn missing from CLIENT LIST:\n{list}"));
+    let victim_id: u64 = victim_line
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("id="))
+        .expect("id= field")
+        .parse()
+        .expect("numeric id");
+
+    control
+        .write_all(format!("CLIENT KILL ID {victim_id}\r\n").as_bytes())
+        .expect("write KILL");
+    let mut r = [0u8; 16];
+    let n = control.read(&mut r).expect("read KILL reply");
+    assert!(
+        r[..n].starts_with(b":1"),
+        "CLIENT KILL must report 1 killed conn, got: {}",
+        String::from_utf8_lossy(&r[..n])
+    );
+
+    // The parked TLS victim's socket must observe the close promptly.
+    conn.sock
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set timeout");
+    let mut buf = [0u8; 16];
+    match conn.sock.read(&mut buf) {
+        Ok(0) => {}  // EOF
+        Err(_) => {} // RST
+        Ok(n) => panic!("expected close, got {n} raw bytes"),
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A TLS client that vanishes with a raw TCP FIN (no close_notify) while
+/// parked must be torn down promptly. rustls surfaces that FIN as a read
+/// ERROR (unexpected EOF), not `Ok(0)` — a handler that lumps read errors
+/// in with the sweep-cancel re-parks the dead fd, which stays readable
+/// forever: the park→wake→park spin found live in E11 (3k CLOSE_WAIT conns,
+/// shard at 100% CPU).
+#[test]
+fn tls_fin_while_parked_tears_down_promptly() {
+    const PARK_WAIT: Duration = Duration::from_millis(4600);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    if !generate_cert(dir.path()) {
+        eprintln!("SKIP: openssl CLI not available for cert generation");
+        return;
+    }
+    let tls_port = common::reserve_port();
+    let (mut child, plain_port) =
+        common::spawn_listening(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
+    let mut conn = None;
+    for _ in 0..50 {
+        match std::panic::catch_unwind(|| TlsConn::connect(tls_port)) {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let mut conn = conn.expect("TLS connect");
+    conn.write_all(b"CLIENT SETNAME finvictim\r\n");
+    let r = conn.read_exact_deadline(5);
+    assert_eq!(&r, b"+OK\r\n");
+
+    std::thread::sleep(PARK_WAIT); // parked now
+
+    // Raw TCP close WITHOUT a TLS close_notify: drop the socket only.
+    drop(conn);
+
+    std::thread::sleep(Duration::from_millis(2000));
+    let mut control = TcpStream::connect(("127.0.0.1", plain_port)).expect("connect control");
+    control
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set timeout");
+    control.write_all(b"CLIENT LIST\r\n").expect("write LIST");
+    let mut list = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = control.read(&mut chunk).expect("read LIST");
+        assert!(n > 0, "control closed mid-reply");
+        list.extend_from_slice(&chunk[..n]);
+        if list.ends_with(b"\r\n") && list.starts_with(b"$") {
+            let s = String::from_utf8_lossy(&list);
+            if let Some(pos) = s.find('\n')
+                && let Ok(len) = s[1..pos - 1].trim().parse::<usize>()
+                && list.len() >= pos + 1 + len + 2
+            {
+                break;
+            }
+        }
+    }
+    let list = String::from_utf8_lossy(&list);
+    assert!(
+        !list.contains("name=finvictim"),
+        "FIN'd parked TLS connection still registered:\n{list}"
     );
 
     let _ = child.kill();

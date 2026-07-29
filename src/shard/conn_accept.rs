@@ -717,7 +717,10 @@ pub(crate) fn spawn_monoio_connection(
                         .await
                     {
                         Ok(Ok(tls_stream)) => {
-                            let _ = handle_connection_sharded_monoio(
+                            // c1M P1-TLS: kept for the ParkIdle routing below
+                            // (`sd` moves into the handler call).
+                            let sd_park = sd.clone();
+                            let result = handle_connection_sharded_monoio(
                                 tls_stream,
                                 peer_addr,
                                 &conn_ctx,
@@ -727,9 +730,30 @@ pub(crate) fn spawn_monoio_connection(
                                 BytesMut::new(),
                                 None, // fresh connection
                                 kill_fd,
-                                false, // can_park: TLS keeps W11+P4b (no task park)
+                                crate::server::conn::handler_monoio::ParkArgs::PARK, // routes ParkIdle below
                             )
                             .await;
+                            if let (
+                                crate::server::conn::handler_monoio::MonoioHandlerResult::ParkIdle {
+                                    state,
+                                    registry_guard,
+                                },
+                                Some(stream),
+                            ) = result
+                            {
+                                // Watcher chain owns the close accounting now
+                                // (the `return` skips this task's decrement).
+                                spawn_parked_idle_watcher(
+                                    stream,
+                                    state,
+                                    registry_guard,
+                                    Box::new(conn_ctx),
+                                    sd_park,
+                                    cid,
+                                    kill_fd,
+                                );
+                                return;
+                            }
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(
@@ -774,7 +798,7 @@ pub(crate) fn spawn_monoio_connection(
                         BytesMut::new(),
                         None, // fresh connection
                         kill_fd,
-                        true, // can_park: this site routes ParkIdle below
+                        crate::server::conn::handler_monoio::ParkArgs::PARK, // this site routes ParkIdle below
                     )
                     .await;
 
@@ -893,7 +917,7 @@ pub(crate) fn spawn_monoio_connection(
                                 false, // can_migrate
                                 BytesMut::new(),
                                 Some(&state), kill_fd,
-                                false, // can_park: result is discarded here
+                                crate::server::conn::handler_monoio::ParkArgs::NO_PARK, // result is discarded here
                             )
                             .await;
                         } else {
@@ -950,7 +974,7 @@ pub(crate) fn spawn_monoio_connection(
                                     false, // can_migrate: pin locally, no retry loop
                                     BytesMut::new(),
                                     Some(&payload.state), kill_fd,
-                                    false, // can_park: result is discarded here
+                                    crate::server::conn::handler_monoio::ParkArgs::NO_PARK, // result is discarded here
                                 )
                                 .await;
                             }
@@ -973,27 +997,34 @@ pub(crate) fn spawn_monoio_connection(
     }
 }
 
-/// Spawn a migrated connection handler on the target shard (monoio runtime).
-///
-/// Reconstructs a `monoio::net::TcpStream` from a raw FD transferred via
-/// `ShardMessage::MigrateConnection`, prepends synthetic RESP commands for state
-/// restoration, and spawns a handler with `requirepass = None` (pre-authenticated).
-///
-/// # Safety
-///
-/// Same safety requirements as `spawn_migrated_tokio_connection`: the caller must
-/// ensure `fd` is a valid, open file descriptor for a connected TCP socket.
-///
-/// # Limitations
-///
-/// TLS connections cannot be migrated (TLS session state is in userspace).
-// `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
-// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
-// supported targets (Linux + macOS).
+/// c1M P1: raw-fd readiness await for the parked-idle watcher. TLS parks on
+/// its UNDERLYING socket's readability (the vendored `io_ref()`
+/// passthrough) — sound because the handler's `task_park_safe()` veto
+/// guarantees nothing was buffered inside the TLS stack at park time, so
+/// the next wire byte is the only possible wake source.
+#[cfg(all(feature = "runtime-monoio", unix))]
+pub(crate) trait ParkWatchable {
+    fn park_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>>;
+}
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl ParkWatchable for monoio::net::TcpStream {
+    fn park_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        self.readable(false)
+    }
+}
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl ParkWatchable for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
+    fn park_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        self.io_ref().readable(false)
+    }
+}
+
 /// c1M P1: park an idle connection out of the task model. The fat handler
 /// task has exited; this tiny watcher owns the stream, the ~100 B session
 /// state, and the client-registry guard (CLIENT LIST/KILL entry + maxclients
-/// slot stay live). It wakes on read-readiness (`readable(false)` is
+/// slot stay live). It wakes on read-readiness (`park_readable()` is
 /// race-free on both drivers: uring PollAdd / legacy readiness+poll) or
 /// server shutdown. CLIENT KILL's `shutdown(2)` makes the fd read-ready, so
 /// a parked kill flows through the wake path and the resumed handler's first
@@ -1004,18 +1035,24 @@ pub(crate) fn spawn_monoio_connection(
 /// park→resume→park type cycle (the resumed handler task constructs this
 /// watcher again on re-park).
 #[cfg(all(feature = "runtime-monoio", unix))]
-fn spawn_parked_idle_watcher(
-    stream: monoio::net::TcpStream,
+fn spawn_parked_idle_watcher<S>(
+    stream: S,
     state: Box<MigratedConnectionState>,
     registry_guard: crate::server::conn::handler_monoio::RegistryGuard,
     conn_ctx: Box<crate::server::conn::ConnectionContext>,
     shutdown: CancellationToken,
     client_id: u64,
     kill_fd: i32,
-) {
+) where
+    S: monoio::io::AsyncReadRent
+        + monoio::io::AsyncWriteRent
+        + crate::server::conn::handler_monoio::idle_park::IdleParkRead
+        + ParkWatchable
+        + 'static,
+{
     let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
         let woke = monoio::select! {
-            res = stream.readable(false) => {
+            res = stream.park_readable() => {
                 // Err (fd error) also resumes: the handler's first read
                 // surfaces the real error and tears down cleanly.
                 let _ = res;
@@ -1030,18 +1067,19 @@ fn spawn_parked_idle_watcher(
             crate::admin::metrics_setup::record_connection_closed();
             return;
         }
-        // Wake: the handler re-registers this client_id at entry, so drop
-        // the parked entry first. The deregistered window lasts until the
-        // executor first polls the resumed task (a task-scheduling boundary,
-        // not just a few instructions): a racing CLIENT LIST misses the
-        // conn and CLIENT KILL ID returns 0 — same observable as a
-        // reconnect race, and a kill_flag set in that window is superseded
-        // by the shutdown(2) the killer already issued, which is what woke
-        // us. Closing the gap needs registration handoff into the handler
-        // (pass the guard through instead of drop/re-register); not worth
-        // it for a transient-invisibility race on an actively-waking conn.
-        drop(registry_guard);
-        spawn_resumed_parked_conn(stream, state, conn_ctx, shutdown, client_id, kill_fd);
+        // Wake: hand the registration to the resumed handler (registration
+        // handoff) — the entry is never dropped, so there is no window where
+        // a racing CLIENT LIST misses the conn or CLIENT KILL ID returns 0,
+        // and name/connected_at/kill state persist across the wake.
+        spawn_resumed_parked_conn(
+            stream,
+            state,
+            registry_guard,
+            conn_ctx,
+            shutdown,
+            client_id,
+            kill_fd,
+        );
     });
     monoio::spawn(fut);
 }
@@ -1052,14 +1090,21 @@ fn spawn_parked_idle_watcher(
 /// would need the primary spawn site's full migration routing) and route
 /// their own re-parks back to [`spawn_parked_idle_watcher`].
 #[cfg(all(feature = "runtime-monoio", unix))]
-fn spawn_resumed_parked_conn(
-    stream: monoio::net::TcpStream,
+fn spawn_resumed_parked_conn<S>(
+    stream: S,
     mut state: Box<MigratedConnectionState>,
+    registry_guard: crate::server::conn::handler_monoio::RegistryGuard,
     conn_ctx: Box<crate::server::conn::ConnectionContext>,
     shutdown: CancellationToken,
     client_id: u64,
     kill_fd: i32,
-) {
+) where
+    S: monoio::io::AsyncReadRent
+        + monoio::io::AsyncWriteRent
+        + crate::server::conn::handler_monoio::idle_park::IdleParkRead
+        + ParkWatchable
+        + 'static,
+{
     use crate::server::connection::handle_connection_sharded_monoio;
     monoio::spawn(async move {
         let initial = std::mem::take(&mut state.read_buf_remainder);
@@ -1074,7 +1119,12 @@ fn spawn_resumed_parked_conn(
             initial,
             Some(&state),
             kill_fd,
-            true, // can_park: this site routes ParkIdle below
+            // Routes ParkIdle below; carries the parked registration through
+            // the wake so the registry entry is never dropped.
+            crate::server::conn::handler_monoio::ParkArgs {
+                can_park: true,
+                kept_registration: Some(registry_guard),
+            },
         )
         .await;
         match (outcome, stream_back) {
@@ -1115,6 +1165,23 @@ fn spawn_resumed_parked_conn(
     });
 }
 
+/// Spawn a migrated connection handler on the target shard (monoio runtime).
+///
+/// Reconstructs a `monoio::net::TcpStream` from a raw FD transferred via
+/// `ShardMessage::MigrateConnection`, prepends synthetic RESP commands for state
+/// restoration, and spawns a handler with `requirepass = None` (pre-authenticated).
+///
+/// # Safety
+///
+/// Same safety requirements as `spawn_migrated_tokio_connection`: the caller must
+/// ensure `fd` is a valid, open file descriptor for a connected TCP socket.
+///
+/// # Limitations
+///
+/// TLS connections cannot be migrated (TLS session state is in userspace).
+// `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
+// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
+// supported targets (Linux + macOS).
 #[cfg(all(feature = "runtime-monoio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_monoio_connection(
@@ -1265,7 +1332,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
             #[cfg(not(unix))]
             let kill_fd = -1;
             monoio::spawn(async move {
-                let _ = handle_connection_sharded_monoio(
+                // c1M P1: kept for the ParkIdle routing below (`sd` moves
+                // into the handler call).
+                let sd_park = sd.clone();
+                let result = handle_connection_sharded_monoio(
                     tcp_stream,
                     peer_addr,
                     &conn_ctx,
@@ -1275,9 +1345,30 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     migration_buf,
                     Some(&state),
                     kill_fd,
-                    false, // can_park: this site discards the result (follow-up: route ParkIdle here too)
+                    crate::server::conn::handler_monoio::ParkArgs::PARK, // routes ParkIdle below
                 )
                 .await;
+                if let (
+                    crate::server::conn::handler_monoio::MonoioHandlerResult::ParkIdle {
+                        state,
+                        registry_guard,
+                    },
+                    Some(stream),
+                ) = result
+                {
+                    // Idle migrated connection parks like a plain one; the
+                    // watcher chain now owns the balancing decrement below.
+                    spawn_parked_idle_watcher(
+                        stream,
+                        state,
+                        registry_guard,
+                        Box::new(conn_ctx),
+                        sd_park,
+                        cid,
+                        kill_fd,
+                    );
+                    return;
+                }
                 // Migrated connection: the source shard's wrapper skipped the
                 // decrement (because `_migrated == true`), so this target-shard
                 // spawn site owns the balancing decrement.  Without this the

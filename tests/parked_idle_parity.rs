@@ -200,6 +200,122 @@ fn parked_connection_visible_and_killable() {
     let _ = child.wait();
 }
 
+/// Registry identity must survive a park/wake cycle unbroken: the resumed
+/// connection keeps its CLIENT SETNAME, its id, and CLIENT LIST never
+/// double-counts (registration handoff — the wake must not deregister and
+/// re-register across a task-scheduling boundary).
+#[test]
+fn resumed_connection_keeps_registry_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+
+    let mut victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    victim.set_nodelay(true).ok();
+    let r = command_reply(&mut victim, "CLIENT SETNAME wakekeeper\r\n");
+    assert!(r.starts_with("+OK"), "SETNAME failed: {r}");
+
+    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let list = command_reply(&mut control, "CLIENT LIST\r\n");
+    let orig_id: u64 = list
+        .lines()
+        .find(|l| l.contains("name=wakekeeper"))
+        .expect("named conn listed before park")
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("id="))
+        .expect("id= field")
+        .parse()
+        .expect("numeric id");
+
+    // Two full park → data-wake cycles.
+    for cycle in 0..2 {
+        std::thread::sleep(PARK_WAIT);
+        ping(&mut victim); // data-wake
+
+        let list = command_reply(&mut control, "CLIENT LIST\r\n");
+        let line = list
+            .lines()
+            .find(|l| l.contains("name=wakekeeper"))
+            .unwrap_or_else(|| {
+                panic!("cycle {cycle}: resumed conn lost its name in CLIENT LIST:\n{list}")
+            });
+        let id: u64 = line
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("id="))
+            .expect("id= field")
+            .parse()
+            .expect("numeric id");
+        assert_eq!(id, orig_id, "cycle {cycle}: client id changed across wake");
+        let entries = list.lines().filter(|l| l.contains("id=")).count();
+        assert_eq!(
+            entries, 2,
+            "cycle {cycle}: CLIENT LIST must hold exactly victim+control:\n{list}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A client that dies with an RST while its connection is parked must be
+/// torn down promptly — an RST'd fd stays readable forever, so a handler
+/// that mistakes the resulting read error for a sweep-cancel would spin the
+/// connection through park→wake→park at 100% CPU (the E11 spin, plain-TCP
+/// variant) and pin the fd in CLOSE_WAIT.
+#[cfg(unix)] // SO_LINGER(0) via libc; std's set_linger is unstable
+#[test]
+fn rst_while_parked_tears_down_promptly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+
+    let victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    {
+        let mut v = &victim;
+        v.write_all(b"CLIENT SETNAME rstvictim\r\n").expect("write");
+        let mut buf = [0u8; 8];
+        victim
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let _ = (&victim).read(&mut buf);
+    }
+    std::thread::sleep(PARK_WAIT); // parked now
+
+    // RST close: SO_LINGER(0) makes drop send RST instead of FIN.
+    {
+        use std::os::unix::io::AsRawFd;
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `victim` owns a live socket fd for the duration of this
+        // call, and the pointer/length describe a valid `libc::linger` on
+        // the stack.
+        let rc = unsafe {
+            libc::setsockopt(
+                victim.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER(0) must apply");
+    }
+    drop(victim);
+
+    // The server must fully release the conn: gone from CLIENT LIST and no
+    // respawn loop keeping it alive.
+    std::thread::sleep(Duration::from_millis(2000));
+    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let list = command_reply(&mut control, "CLIENT LIST\r\n");
+    assert!(
+        !list.contains("name=rstvictim"),
+        "RST'd parked connection still registered:\n{list}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// An active sibling must be undisturbed while its neighbor parks and wakes.
 #[test]
 fn active_sibling_undisturbed_by_parking() {
