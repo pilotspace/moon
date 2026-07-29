@@ -264,6 +264,15 @@ pub(crate) struct ConnectionState {
     pub workspace_id: Option<WorkspaceId>,
     pub command_queue: Vec<Frame>,
 
+    /// c1M P1: this connection has issued REPLCONF — it is (almost
+    /// certainly) a replica mid-handshake that will send PSYNC next, and
+    /// the resumed-parked path does not support the PSYNC hijack. Such
+    /// connections never task-park (sticky for the connection's lifetime;
+    /// health-checker probes that send a bare REPLCONF are short-lived, so
+    /// keeping them unparked costs nothing).
+    #[allow(dead_code)] // Read only by the monoio handler's park predicate
+    pub saw_replconf: bool,
+
     // Tracking
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
@@ -323,6 +332,11 @@ impl ConnectionState {
             active_cross_txn: None,
             workspace_id: migrated.and_then(|s| s.workspace_id),
             command_queue: Vec::new(),
+            // Not carried through MigratedConnectionState: a conn that sent
+            // REPLCONF never parks (so never rehydrates through this path),
+            // and migration of a mid-handshake replica is not a supported
+            // flow (PSYNC hijacks before migration sampling matters).
+            saw_replconf: false,
             tracking_state: TrackingState::default(),
             tracking_rx: None,
             watched_keys: HashMap::new(),

@@ -763,6 +763,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
                 && conn.active_cross_txn.is_none()
+                // Replica-handshake conns (sent REPLCONF) never park: PSYNC
+                // on a resumed parked conn is unsupported (warn+close).
+                && !conn.saw_replconf
                 // Stream-side veto LAST (it can do real work): TLS refuses
                 // while its wrapper buffers / rustls session hold anything
                 // the raw fd's readability can't signal.
@@ -1127,6 +1130,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
+                // Likely a replica mid-handshake (PSYNC next): permanently
+                // exclude from task-parking — the resumed-parked path does
+                // not support the PSYNC hijack.
+                conn.saw_replconf = true;
                 continue;
             }
             // PSYNC: arrives only on a master, hijacks the connection. Encode

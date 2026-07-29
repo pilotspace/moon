@@ -225,12 +225,14 @@ impl SafeRead {
     /// deferred status (EOF/error) is pending delivery. Task-parking on raw
     /// fd readability is only correct when nothing is waiting here — a
     /// buffered byte or a pending EOF would never make the fd readable.
+    /// (`buffer` is only `None` transiently inside `do_io`, which holds
+    /// `&mut self` — but answer `false` rather than panic if it ever is:
+    /// "don't park" is always the safe verdict.)
     pub fn is_drained(&self) -> bool {
-        self.buffer
-            .as_ref()
-            .expect("buffer ref expected")
-            .is_empty()
-            && matches!(self.status, ReadStatus::Ok)
+        match (self.buffer.as_ref(), &self.status) {
+            (Some(buffer), ReadStatus::Ok) => buffer.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -337,13 +339,13 @@ impl SafeWrite {
     }
 
     /// moon patch (c1M P1-TLS): true when no unflushed bytes and no stashed
-    /// write error are pending. See `SafeRead::is_drained`.
+    /// write error are pending. See `SafeRead::is_drained` (incl. the
+    /// `None`-buffer rationale).
     pub fn is_drained(&self) -> bool {
-        self.buffer
-            .as_ref()
-            .expect("buffer ref expected")
-            .is_empty()
-            && matches!(self.status, WriteStatus::Ok)
+        match (self.buffer.as_ref(), &self.status) {
+            (Some(buffer), WriteStatus::Ok) => buffer.is_empty(),
+            _ => false,
+        }
     }
 }
 

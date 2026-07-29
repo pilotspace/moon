@@ -286,6 +286,9 @@ fn rst_while_parked_tears_down_promptly() {
             l_onoff: 1,
             l_linger: 0,
         };
+        // SAFETY: `victim` owns a live socket fd for the duration of this
+        // call, and the pointer/length describe a valid `libc::linger` on
+        // the stack.
         let rc = unsafe {
             libc::setsockopt(
                 victim.as_raw_fd(),
