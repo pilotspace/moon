@@ -112,6 +112,16 @@ impl super::Shard {
                     Ok(mut d) => match d.init() {
                         Ok(()) => {
                             info!("Shard {} started (io_uring mode)", self.id);
+                            // c10k T3: known limitation, stated loudly — bridge
+                            // connections bypass maxclients AND the client
+                            // registry (CLIENT LIST/KILL blind); capacity is
+                            // bounded only by the driver's FdTable.
+                            tracing::warn!(
+                                "Shard {} io_uring bridge: connections accepted here bypass \
+                                 maxclients and CLIENT LIST/KILL (experimental path; see \
+                                 .planning/rfcs/c1m-connection-plane.md)",
+                                self.id
+                            );
                             Some(d)
                         }
                         Err(e) => {
