@@ -562,3 +562,16 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$-1\r\n");
 }
+
+/// c10k W2 regression guard: `active_cross_txn` must stay boxed. Unboxed,
+/// CrossStoreTxn's inline SmallVecs put ~2.2 KB into EVERY connection's task
+/// future (tmp/C10K-REVIEW.md §2). If this assert fires, something re-inlined
+/// large state into ConnectionState — box it instead.
+#[test]
+fn connection_state_stays_small() {
+    let sz = std::mem::size_of::<crate::server::conn::core::ConnectionState>();
+    assert!(
+        sz <= 768,
+        "ConnectionState is {sz} B — keep bulky fields boxed (was 2.7 KB before c10k W2)"
+    );
+}

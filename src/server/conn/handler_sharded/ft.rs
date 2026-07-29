@@ -126,7 +126,7 @@ pub(super) async fn try_handle_ft_command(
                         let as_of_lsn = match resolve_ft_search_as_of_lsn(
                             cmd_args,
                             Some(&ctx.shard_databases),
-                            conn.active_cross_txn.as_ref(),
+                            conn.active_cross_txn.as_deref(),
                         ) {
                             Ok(lsn) => lsn,
                             Err(err_frame) => {
@@ -231,7 +231,7 @@ pub(super) async fn try_handle_ft_command(
                         match resolve_ft_search_as_of_lsn(
                             cmd_args,
                             Some(&ctx.shard_databases),
-                            conn.active_cross_txn.as_ref(),
+                            conn.active_cross_txn.as_deref(),
                         ) {
                             Err(err_frame) => err_frame,
                             Ok(as_of_lsn) => {
@@ -461,7 +461,7 @@ pub(super) async fn try_handle_ft_command(
         Some(resolve_ft_search_as_of_lsn(
             cmd_args,
             Some(&ctx.shard_databases),
-            conn.active_cross_txn.as_ref(),
+            conn.active_cross_txn.as_deref(),
         ))
     } else {
         None

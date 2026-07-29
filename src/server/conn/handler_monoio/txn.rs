@@ -33,11 +33,11 @@ pub(super) fn try_handle_txn_begin(
             // Get next txn_id and snapshot_lsn from vector store's transaction manager
             let active =
                 crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
-            conn.active_cross_txn = Some(CrossStoreTxn::new(
+            conn.active_cross_txn = Some(Box::new(CrossStoreTxn::new(
                 active.txn_id,
                 active.snapshot_lsn,
                 conn.selected_db,
-            ));
+            )));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),
@@ -280,7 +280,7 @@ pub(super) async fn try_handle_txn_abort(
                     ctx.num_shards,
                     &ctx.dispatch_tx,
                     &ctx.spsc_notifiers,
-                    txn,
+                    *txn,
                 )
                 .await;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));

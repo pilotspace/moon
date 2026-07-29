@@ -2492,7 +2492,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             ctx.num_shards,
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
-            txn,
+            *txn,
         )
         .await;
     }
