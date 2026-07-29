@@ -1097,6 +1097,21 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("--uring-entries has no effect under the tokio runtime");
     }
 
+    // c1M P1: stage-2 task-parking threshold — set BEFORE shard threads spawn
+    // (same contract as set_uring_entries above). Default 60s; 0 disables.
+    moon::runtime::set_conn_park_secs(config.conn_park_secs);
+    #[cfg(feature = "runtime-monoio")]
+    if config.conn_park_secs > 0 {
+        tracing::info!(
+            "Idle task-parking: downshifted connections park after {}s (--conn-park-secs)",
+            config.conn_park_secs
+        );
+    }
+    #[cfg(not(feature = "runtime-monoio"))]
+    if config.conn_park_secs != 60 {
+        tracing::warn!("--conn-park-secs has no effect under the tokio runtime");
+    }
+
     // Graph traversal timeout default — set BEFORE shard threads spawn so every
     // TraversalGuard::with_default_timeout observes it (per-query TIMEOUT overrides).
     #[cfg(feature = "graph")]

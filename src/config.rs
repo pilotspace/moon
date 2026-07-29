@@ -304,6 +304,13 @@ pub struct ServerConfig {
     #[arg(long = "uring-entries")]
     pub uring_entries: Option<u32>,
 
+    /// c1M P1: seconds a downshifted idle connection waits before its handler
+    /// task exits entirely, leaving only a tiny readiness watcher (task-exit
+    /// parking; plain-TCP monoio connections only — TLS and the tokio runtime
+    /// keep the buffer-downshift behavior). 0 disables task parking.
+    #[arg(long = "conn-park-secs", default_value_t = 60)]
+    pub conn_park_secs: u64,
+
     /// I/O driver for the monoio runtime. "auto" lets FusionDriver pick
     /// (io_uring on Linux when available, else epoll/kqueue); "epoll" forces
     /// the legacy poller. Measured on GCE ARM (c4a Axion, 2026-07): epoll is

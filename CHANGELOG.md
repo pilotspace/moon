@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Task-exit parking for idle connections (c1M P1, `--conn-park-secs`,
+  default 60 s).** A plain-TCP monoio connection that stays idle past the
+  W11 downshift now has its handler task exit entirely: only a tiny
+  readiness watcher (boxed future holding the stream, ~100 B of session
+  state, and the client-registry guard) remains, reclaiming the ~6 KB task
+  state machine plus the remaining per-task buffers. The watcher wakes on
+  read-readiness (`readable(false)`, race-free on io_uring and
+  epoll/kqueue) or server shutdown and rehydrates a fresh handler through
+  the migration-restore path — wire-invisible across repeated park/wake
+  cycles. Parked connections stay in CLIENT LIST, keep their maxclients
+  slot, and CLIENT KILL still works (its `shutdown(2)` wakes the watcher;
+  the resumed handler sees EOF). Exclusions: subscriber/tracking/timeout
+  connections (structurally never reach the park arm), MULTI/EXEC or
+  cross-store-txn sessions, partial frames, TLS (keeps W11+P4b buffer
+  downshift), and the tokio runtime. `--conn-park-secs 0` disables.
+
 ### Fixed
 - **c10k connection-plane wave (PR #TBD)** — from the 2026-07-29 empirical
   review (`tmp/C10K-REVIEW.md`: 10k/25k live-connection ramps, idle-CPU

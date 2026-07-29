@@ -72,6 +72,25 @@ pub fn uring_entries() -> Option<u32> {
     }
 }
 
+/// c1M P1: stage-2 idle task-parking threshold (`--conn-park-secs`), in ms.
+/// 0 = task parking disabled. Set once from main BEFORE shard threads spawn
+/// (same contract as [`set_uring_entries`]); read by the monoio idle-park
+/// sweep and stage-2 read arm.
+static CONN_PARK_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60_000);
+
+/// Configure the task-parking threshold from `--conn-park-secs`.
+pub fn set_conn_park_secs(secs: u64) {
+    CONN_PARK_AFTER_MS.store(
+        secs.saturating_mul(1000),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Current task-parking threshold in ms; 0 = disabled.
+pub fn conn_park_after_ms() -> u64 {
+    CONN_PARK_AFTER_MS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// True when the epoll busy-poll park is configured — via the
 /// `--io-busy-poll-us` flag (the caller passes the config value) or the
 /// `MOON_EPOLL_SPIN_US` env fallback the vendored driver also honors. Gates

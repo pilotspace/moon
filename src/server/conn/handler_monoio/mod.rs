@@ -47,6 +47,20 @@ use crate::shard::dispatch::ShardMessage;
 // AtomicWaker rides that mechanism. Transaction (txn.rs) and blocking-write
 // (write.rs) paths remain on oneshots — they are off the hot path.
 
+/// RAII client-registry entry: deregisters on drop. Lives as a handler
+/// local, EXCEPT for a task-parked connection (c1M P1), where it travels
+/// inside [`MonoioHandlerResult::ParkIdle`] to the readiness watcher so the
+/// CLIENT LIST/KILL entry and maxclients slot survive the parked lifetime.
+#[cfg(feature = "runtime-monoio")]
+pub struct RegistryGuard(pub(crate) u64);
+
+#[cfg(feature = "runtime-monoio")]
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        crate::client_registry::deregister(self.0);
+    }
+}
+
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
 /// Same purpose as the Tokio handler's `HandlerResult`: the generic handler cannot
@@ -59,6 +73,19 @@ pub enum MonoioHandlerResult {
     MigrateConnection {
         state: MigratedConnectionState,
         target_shard: usize,
+    },
+    /// c1M P1: the connection idled past `--conn-park-secs` in the
+    /// downshifted state; the handler task exits and the caller parks the
+    /// stream behind a tiny readiness watcher
+    /// (`conn_accept::spawn_parked_idle_watcher`). Only returned when the
+    /// caller opted in via `can_park` — every other call site would drop the
+    /// stream and silently close a healthy connection. `registry_guard`
+    /// keeps the CLIENT LIST/KILL entry (and its maxclients slot) alive for
+    /// the parked lifetime; the watcher drops it just before re-registering
+    /// on wake.
+    ParkIdle {
+        state: Box<MigratedConnectionState>,
+        registry_guard: RegistryGuard,
     },
     /// PSYNC arrived on this connection. Caller must hand the underlying
     /// `monoio::net::TcpStream` to
@@ -183,6 +210,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here
     // has no `AsRawFd` bound.
     kill_fd: i32,
+    // c1M P1: only call sites that ROUTE `ParkIdle` (spawning the readiness
+    // watcher) may pass true — anywhere else a park return would drop the
+    // stream and silently close a healthy idle connection.
+    can_park: bool,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -225,13 +256,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         ctx.shard_id,
         kill_fd,
     );
-    struct RegistryGuard(u64);
-    impl Drop for RegistryGuard {
-        fn drop(&mut self) {
-            crate::client_registry::deregister(self.0);
-        }
-    }
-    let _registry_guard = RegistryGuard(client_id);
+    let registry_guard = RegistryGuard(client_id);
 
     // Functions API registry — LAZY per connection (P-1 footprint): built on
     // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
@@ -665,18 +690,75 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
         } else if downshifted {
-            // c10k W11 stage 2: park with the probe buffer, no chore state.
-            // Real data restores the full working set (lazily, via the
-            // pre-park sizing above) and re-arms stage 1.
-            let (result, returned_buf) = stream.read(tmp_buf).await;
-            tmp_buf = returned_buf;
-            match result {
-                Ok(0) => break,
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp_buf[..n]);
-                    downshifted = false;
+            // c10k W11 stage 2: park with the probe buffer. Real data
+            // restores the full working set (lazily, via the pre-park sizing
+            // above) and re-arms stage 1.
+            //
+            // c1M P1: when task parking is enabled and the session is
+            // parkable, the stage-2 read is ALSO cancelable and registered
+            // with the sweep under the longer `--conn-park-secs` threshold —
+            // a cancel here means "exit the task", leaving only a tiny
+            // readiness watcher (conn_accept::spawn_parked_idle_watcher).
+            // The predicate is stable while parked in read (no commands can
+            // execute), and reaching this arm already excludes subscriber /
+            // tracking / idle-timeout connections (each takes its own arm).
+            let parkable = can_park
+                && S::SUPPORTS_TASK_PARK
+                && idle_park::park_after_ms() > 0
+                && read_buf.is_empty()
+                && write_buf.is_empty()
+                && !conn.in_multi
+                && conn.command_queue.is_empty()
+                && conn.active_cross_txn.is_none();
+            if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
+                let handle = reg.slot.handle();
+                reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
+                let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+                reg.slot.mark_unparked();
+                tmp_buf = returned_buf;
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                        downshifted = false;
+                    }
+                    Err(_) => {
+                        // Cancelled by the stage-2 sweep (or a real socket
+                        // error, which the resumed handler's first read will
+                        // surface as EOF/err): exit the task. read_buf is
+                        // empty (predicate), so no partial frame is at risk.
+                        let state = Box::new(MigratedConnectionState {
+                            selected_db: conn.selected_db,
+                            authenticated: conn.authenticated,
+                            client_name: conn.client_name.clone(),
+                            protocol_version: conn.protocol_version,
+                            current_user: conn.current_user.clone(),
+                            flags: 0,
+                            read_buf_remainder: read_buf.split(),
+                            client_id,
+                            peer_addr: peer_addr.clone(),
+                            workspace_id: conn.workspace_id,
+                        });
+                        return (
+                            MonoioHandlerResult::ParkIdle {
+                                state,
+                                registry_guard,
+                            },
+                            Some(stream),
+                        );
+                    }
                 }
-                Err(_) => break,
+            } else {
+                let (result, returned_buf) = stream.read(tmp_buf).await;
+                tmp_buf = returned_buf;
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                        downshifted = false;
+                    }
+                    Err(_) => break,
+                }
             }
         } else if let Some(reg) = idle_reg.as_ref() {
             // c10k W11 stage 1: full-size read, registered for the shard
