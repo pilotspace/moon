@@ -4502,7 +4502,9 @@ mod drain_rotation_tests {
     fn successive_starts_change_the_first_visited_consumer() {
         // The budget cut-off truncates the TAIL of the visit order; rotating
         // the head is what guarantees no consumer is permanently tail-most.
-        let firsts: Vec<usize> = (0..4).map(|s| rotated_indices(s, 4).next().unwrap()).collect();
+        let firsts: Vec<usize> = (0..4)
+            .map(|s| rotated_indices(s, 4).next().unwrap())
+            .collect();
         assert_eq!(firsts, vec![0, 1, 2, 3]);
     }
 

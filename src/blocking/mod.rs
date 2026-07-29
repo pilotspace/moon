@@ -433,7 +433,12 @@ mod deadline_heap_tests {
             reg.register(
                 0,
                 Bytes::copy_from_slice(k),
-                WaitEntry { wait_id: id, cmd: BlockedCommand::BLPop, reply_tx: tx, deadline },
+                WaitEntry {
+                    wait_id: id,
+                    cmd: BlockedCommand::BLPop,
+                    reply_tx: tx,
+                    deadline,
+                },
             );
         }
         let visited = reg.expire_timed_out(now);

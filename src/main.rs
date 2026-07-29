@@ -633,15 +633,19 @@ fn main() -> anyhow::Result<()> {
                 rlim_max: 0,
             };
             if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
-                let need = config.maxclients as u64 + reserved;
-                if config.maxclients > 0 && u64::from(rl.rlim_cur) < need {
-                    let want = need.min(u64::from(rl.rlim_max));
+                // rlim_t is u64 on every supported unix; `reserved` is u64.
+                let need: libc::rlim_t = config.maxclients as libc::rlim_t + reserved;
+                if config.maxclients > 0 && rl.rlim_cur < need {
+                    let want = need.min(rl.rlim_max);
                     let mut raised = rl;
-                    raised.rlim_cur = want as libc::rlim_t;
+                    raised.rlim_cur = want;
                     if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
                         tracing::info!(
                             "Raised RLIMIT_NOFILE soft limit {} -> {} to fit maxclients {} (+{} reserved fds)",
-                            rl.rlim_cur, want, config.maxclients, reserved
+                            rl.rlim_cur,
+                            want,
+                            config.maxclients,
+                            reserved
                         );
                     }
                     if want < need {
@@ -649,7 +653,9 @@ fn main() -> anyhow::Result<()> {
                             "RLIMIT_NOFILE hard limit {} cannot fit maxclients {} (+{} reserved fds): \
                              accepts beyond ~{} clients will fail with EMFILE. Raise `ulimit -n` \
                              or lower --maxclients.",
-                            rl.rlim_max, config.maxclients, reserved,
+                            rl.rlim_max,
+                            config.maxclients,
+                            reserved,
                             want.saturating_sub(reserved)
                         );
                     }

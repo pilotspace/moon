@@ -246,7 +246,10 @@ pub fn update<F: FnOnce(&mut ClientEntry)>(id: u64, f: F) {
 /// Registry-lookup variant for code without the live handle; connection
 /// loops use `ClientLiveState::is_killed` (lock-free) instead.
 pub fn is_killed(id: u64) -> bool {
-    stripe(id).read().get(&id).is_some_and(|e| e.live.is_killed())
+    stripe(id)
+        .read()
+        .get(&id)
+        .is_some_and(|e| e.live.is_killed())
 }
 
 /// Format all clients as a CLIENT LIST string.
@@ -707,7 +710,10 @@ mod striping_tests {
         // CLIENT LIST must see every entry regardless of stripe.
         let list = client_list();
         for id in &ids {
-            assert!(list.contains(&format!("id={id} ")), "id {id} missing from list");
+            assert!(
+                list.contains(&format!("id={id} ")),
+                "id {id} missing from list"
+            );
         }
 
         // Kill-by-id is a single-stripe O(1) lookup — exactly one victim.

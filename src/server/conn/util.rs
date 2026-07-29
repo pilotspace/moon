@@ -112,12 +112,17 @@ pub(crate) fn unpropagate_subscription(
 /// experiment E5). Shrinking only above the trigger keeps every realloc off
 /// the small-batch path: a p99 batch (≤64 frames) never grows past the
 /// trigger, so it never pays a shrink.
+/// (Consumed by the monoio handler only — the tokio handler allocates its
+/// batch vecs per batch; cfg-gated so the tokio-only build stays warning-free.)
+#[cfg(any(feature = "runtime-monoio", test))]
 pub(crate) const BATCH_VEC_STEADY_CAP: usize = 64;
+#[cfg(any(feature = "runtime-monoio", test))]
 pub(crate) const BATCH_VEC_SHRINK_TRIGGER: usize = 256;
 
 /// Shrink an emptied batch scratch vector back to steady-state capacity.
 /// Call only after `clear()` — shrinking an empty Vec moves no elements.
 #[inline]
+#[cfg(any(feature = "runtime-monoio", test))]
 pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
     debug_assert!(v.is_empty(), "shrink_batch_vec expects a cleared vec");
     if v.capacity() > BATCH_VEC_SHRINK_TRIGGER {
@@ -154,7 +159,11 @@ mod shrink_tests {
         let mut v: Vec<u64> = Vec::with_capacity(BATCH_VEC_SHRINK_TRIGGER);
         let cap_before = v.capacity();
         shrink_batch_vec(&mut v);
-        assert_eq!(v.capacity(), cap_before, "at-trigger capacity must not shrink");
+        assert_eq!(
+            v.capacity(),
+            cap_before,
+            "at-trigger capacity must not shrink"
+        );
     }
 
     #[test]

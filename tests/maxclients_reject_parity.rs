@@ -93,7 +93,10 @@ fn rejected_connection_receives_err_max_clients() {
     );
 
     // The slot-holder must be unaffected by the rejection.
-    assert!(ping_ok(&mut conn_a), "conn A must survive conn B's rejection");
+    assert!(
+        ping_ok(&mut conn_a),
+        "conn A must survive conn B's rejection"
+    );
 
     drop(conn_a);
     common::sigkill(&mut child);
