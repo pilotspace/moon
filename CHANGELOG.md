@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-07-29
+
 ### Added
 - **Task-exit parking for idle connections (c1M P1, `--conn-park-secs`,
   default 60 s).** A plain-TCP monoio connection that stays idle past the
@@ -24,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downshift), and the tokio runtime. `--conn-park-secs 0` disables.
 
 ### Fixed
-- **c10k connection-plane wave (PR #TBD)** — from the 2026-07-29 empirical
+- **c10k connection-plane wave (PR #421)** — from the 2026-07-29 empirical
   review (`tmp/C10K-REVIEW.md`: 10k/25k live-connection ramps, idle-CPU
   measurement, symbolized flames, pipeline-ratchet A/B on the Linux VM):
   - **Pipeline memory ratchet fixed (W1).** One 1024-deep pipeline

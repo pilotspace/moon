@@ -372,7 +372,8 @@ Redis 8.6.1.*
 | **v0.7.x** | Replication GA for multi-shard masters — `WAIT`/`ACK` across all six planes, 24 h kill-9 soak (zero acked-write loss) | **GA** |
 | **v0.8.0** | One Storage Kernel — kill-9-lossless on every plane (46-cell crash matrix) + 10× RAM datasets under disk offload | **GA** |
 | **v0.8.1** | Deploy-safe busy-poll (O3 contention governor auto-gates on shared cores) + single-shard tuning preset | **GA** |
-| **v0.8.2** (current) | Storage kernel unification — one value codec / spill pipeline / eviction entry point / accessor skeleton, millisecond-TTL fidelity fix, batched sync-eviction manifest fsyncs | **GA** |
+| **v0.8.2** | Storage kernel unification — one value codec / spill pipeline / eviction entry point / accessor skeleton, millisecond-TTL fidelity fix, batched sync-eviction manifest fsyncs | **GA** |
+| **v0.8.3** (current) | Connection plane at scale — idle conns 56.5 → 3.25 KB (−94%, task-exit parking + idle downshift + TLS diet), loud maxclients, striped registry, c1M-ready (1 M idle ≈ 3.3 GB) | **GA** |
 | **v0.9** | Horizontal scale — cluster-on-monoio + multi-shard replicas | planned |
 | **v1.0** | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA box ticked | gate |
 
