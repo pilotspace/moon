@@ -177,11 +177,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
     client_id: u64,
     can_migrate: bool,
     initial_read_buf: BytesMut,
-    // Event-loop waker relay. No longer used by this handler — the cross-shard
-    // reply path awaits its oneshot directly (M2, spsc-wake-floor; cross-thread
-    // wake proven by swf0). The relay plumbing is kept for future registrants
-    // and the event loop still sweeps it every iteration.
-    _pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
     // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here

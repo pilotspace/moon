@@ -1238,16 +1238,12 @@ impl super::Shard {
             }
         }
 
-        // Waker relay, swept after every drain cycle. HISTORICAL NOTE: this was
-        // built on the belief that monoio's !Send executor cannot receive
-        // cross-thread Waker::wake() — that is FALSE with the `sync` feature
-        // (enabled in Cargo.toml): a remote wake rides a per-thread waker
-        // channel + driver unpark (eventfd/kqueue), proven at runtime by
-        // tests/spsc_wake_floor_red.rs::swf0. The hot cross-shard reply path
-        // now awaits its oneshot directly (handler_monoio, M2); the relay is
-        // kept for future registrants and stays correct either way.
-        #[cfg(feature = "runtime-monoio")]
-        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
+        // NOTE: the old `pending_wakers` relay (register-waker, event-loop
+        // sweeps after SPSC drain) was deleted in the c10k wave — it had zero
+        // registrants since M2 made the cross-shard reply path await its
+        // oneshot directly (cross-thread wake via monoio's `sync` feature,
+        // proven by tests/spsc_wake_floor_red.rs::swf0). For cross-thread
+        // signalling prefer flume oneshots, not a waker relay.
 
         // R-4: backoff for the tokio per-shard SO_REUSEPORT accept branch so an
         // fd-exhaustion storm can't hot-spin this shard's select loop.
@@ -1468,7 +1464,6 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
-                                &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
@@ -1574,7 +1569,6 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
-                                &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
@@ -1955,7 +1949,6 @@ impl super::Shard {
                         shard_id,
                         num_shards,
                         config_port,
-                        &pending_wakers,
                         &spill_sender,
                         &spill_file_id,
                         &disk_offload_dir,
@@ -1997,16 +1990,10 @@ impl super::Shard {
                     shard_id,
                     num_shards,
                     config_port,
-                    &pending_wakers,
                     &spill_sender,
                     &spill_file_id,
                     &disk_offload_dir,
                 );
-            }
-            // Wake cross-shard response tasks that registered during the previous iteration.
-            #[cfg(feature = "runtime-monoio")]
-            for waker in pending_wakers.borrow_mut().drain(..) {
-                waker.wake();
             }
 
             // Monoio runtime: direct-await on 1ms periodic tick.
@@ -2131,7 +2118,7 @@ impl super::Shard {
                 }
 
                 // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
-                //     handle drain outputs, sweep the pending_wakers relay ---
+                //     handle drain outputs ---
                 let mut pending_snapshot = None;
                 // No outer with_shard — each arm takes its own flat borrow.
                 let hit_cap = spsc_handler::drain_spsc_shared(
@@ -2178,9 +2165,6 @@ impl super::Shard {
                 if !pending_cdc_subscribes.is_empty() {
                     let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                     cdc_registry.register_pending(pending_cdc_subscribes.drain(..), wal_dir);
-                }
-                for waker in pending_wakers.borrow_mut().drain(..) {
-                    waker.wake();
                 }
                 persistence_tick::handle_pending_snapshot(
                     pending_snapshot,
@@ -2231,7 +2215,6 @@ impl super::Shard {
                             shard_id,
                             num_shards,
                             config_port,
-                            &pending_wakers,
                             &spill_sender,
                             &spill_file_id,
                             &disk_offload_dir,

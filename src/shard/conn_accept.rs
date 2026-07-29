@@ -554,7 +554,6 @@ pub(crate) fn spawn_monoio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
-    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
     spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
@@ -626,7 +625,6 @@ pub(crate) fn spawn_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
-            let pw = pending_wakers.clone();
             let all_regs = all_pubsub_registries.to_vec();
             let all_rsm = all_remote_sub_maps.to_vec();
 
@@ -696,7 +694,6 @@ pub(crate) fn spawn_monoio_connection(
                                 cid,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
-                                pw,
                                 None, // fresh connection
                                 kill_fd,
                             )
@@ -736,7 +733,7 @@ pub(crate) fn spawn_monoio_connection(
                     // R-6 fail-open: keep what we need to re-serve the client
                     // locally if a migration hand-off cannot be delivered.
                     #[cfg(target_os = "linux")]
-                    let (sd2, pw2, peer2) = (sd.clone(), pw.clone(), peer_addr.clone());
+                    let (sd2, peer2) = (sd.clone(), peer_addr.clone());
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -745,7 +742,6 @@ pub(crate) fn spawn_monoio_connection(
                         cid,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
-                        pw,
                         None, // fresh connection
                         kill_fd,
                     )
@@ -838,7 +834,7 @@ pub(crate) fn spawn_monoio_connection(
                             let _ = handle_connection_sharded_monoio(
                                 stream, peer2, &conn_ctx, sd2, cid,
                                 false, // can_migrate
-                                BytesMut::new(), pw2,
+                                BytesMut::new(),
                                 Some(&state), kill_fd,
                             )
                             .await;
@@ -894,7 +890,7 @@ pub(crate) fn spawn_monoio_connection(
                                 let _ = handle_connection_sharded_monoio(
                                     stream, peer2, &conn_ctx, sd2, cid,
                                     false, // can_migrate: pin locally, no retry loop
-                                    BytesMut::new(), pw2,
+                                    BytesMut::new(),
                                     Some(&payload.state), kill_fd,
                                 )
                                 .await;
@@ -964,7 +960,6 @@ pub(crate) fn spawn_migrated_monoio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
-    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
     spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
@@ -1038,7 +1033,6 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let all_regs = all_pubsub_registries.to_vec();
             let all_rsm = all_remote_sub_maps.to_vec();
             let aff = pubsub_affinity.clone();
-            let pw = pending_wakers.clone();
             let spill_tx = spill_sender.clone();
             let spill_fid = spill_file_id.clone();
             let do_dir = disk_offload_dir.clone();
@@ -1095,7 +1089,6 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     cid,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
-                    pw,
                     Some(&state),
                     kill_fd,
                 )

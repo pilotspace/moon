@@ -145,7 +145,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Never hold a lock across `.await` points.
 - Replace `.read().unwrap()` / `.write().unwrap()` with `.read()` / `.write()` (parking_lot doesn't poison).
 - Per-shard locks only — no global locks on the write path.
-- **monoio cross-thread wakers:** `monoio::spawn` creates `!Send` tasks; `Waker::wake()` from another OS thread does NOT reach them. The cross-shard **reply** path therefore has the connection **await a `flume` oneshot directly** (the target shard sends the reply on it after executing). A `pending_wakers: Rc<RefCell<Vec<Waker>>>` relay is still swept each event-loop iteration (pub/sub + backpressure paths thread it), but it is **no longer the reply-wake mechanism** — the old "register your waker, event loop drains it after SPSC" design was retired when test `swf0` disproved its premise (see `event_loop.rs` ~1730). For cross-thread signalling, prefer `flume::bounded(1)` over custom atomic oneshots.
+- **monoio cross-thread wakers:** `monoio::spawn` creates `!Send` tasks; `Waker::wake()` from another OS thread does NOT reach them. The cross-shard **reply** path therefore has the connection **await a `flume` oneshot directly** (the target shard sends the reply on it after executing). The old `pending_wakers` relay ("register your waker, event loop drains it after SPSC") was retired when test `swf0` disproved its premise, and the vestigial plumbing was **deleted entirely** in the c10k wave (it had zero registrants). For cross-thread signalling, prefer `flume::bounded(1)` over custom atomic oneshots.
 
 ### Error Handling
 - All command errors return `Frame::Error(Bytes)` — no `Result` types in dispatch paths.
