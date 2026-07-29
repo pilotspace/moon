@@ -2136,7 +2136,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                 }
 
-                arena.reset();
+                // c10k W1: cap the bump arena before reuse. `reset()` retains
+                // the largest chunk, so one huge batch would otherwise pin its
+                // high-water allocation until disconnect (the tokio-side twin
+                // of the monoio batch-vec ratchet, tmp/C10K-REVIEW.md E5).
+                if arena.allocated_bytes() > 65536 {
+                    arena = bumpalo::Bump::with_capacity(4096);
+                } else {
+                    arena.reset();
+                }
 
                 // AUTH rate limiting: delay response to slow down brute-force attacks
                 if auth_delay_ms > 0 {
@@ -2190,8 +2198,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     );
                 }
 
-                if write_buf.capacity() > 65536 { write_buf = BytesMut::with_capacity(8192); }
-                if read_buf.capacity() > 65536 {
+                // c10k W1: shrink floor lowered 64 KiB → 16 KiB (see
+                // super::util::IO_BUF_SHRINK_TRIGGER).
+                if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+                    write_buf = BytesMut::with_capacity(8192);
+                }
+                if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
                     let remaining = read_buf.split();
                     read_buf = BytesMut::with_capacity(8192);
                     if !remaining.is_empty() { read_buf.extend_from_slice(&remaining); }

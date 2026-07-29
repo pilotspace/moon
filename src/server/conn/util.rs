@@ -103,3 +103,65 @@ pub(crate) fn unpropagate_subscription(
             .remove(channel, shard_id, is_pattern);
     }
 }
+
+/// Post-batch capacity governor for the per-connection batch scratch vectors
+/// (c10k W1). `responses`/`frames` are cleared and reused across batches; one
+/// deep pipeline grows them to the 1024-frame batch cap (~74 KB each at
+/// 72 B/Frame) and `.clear()` never returns that capacity — measured as a
+/// permanent ~160 KB/conn RSS ratchet until disconnect (tmp/C10K-REVIEW.md,
+/// experiment E5). Shrinking only above the trigger keeps every realloc off
+/// the small-batch path: a p99 batch (≤64 frames) never grows past the
+/// trigger, so it never pays a shrink.
+pub(crate) const BATCH_VEC_STEADY_CAP: usize = 64;
+pub(crate) const BATCH_VEC_SHRINK_TRIGGER: usize = 256;
+
+/// Shrink an emptied batch scratch vector back to steady-state capacity.
+/// Call only after `clear()` — shrinking an empty Vec moves no elements.
+#[inline]
+pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
+    debug_assert!(v.is_empty(), "shrink_batch_vec expects a cleared vec");
+    if v.capacity() > BATCH_VEC_SHRINK_TRIGGER {
+        v.shrink_to(BATCH_VEC_STEADY_CAP);
+    }
+}
+
+/// I/O buffer shrink floor (c10k W1): a connection that once carried a large
+/// value keeps its high-water read/write/rent buffer until disconnect. The
+/// old floor (64 KiB) let 16–64 KiB high-waters ratchet forever; 16 KiB
+/// bounds steady-state at 2× the 8 KiB working size while still amortizing
+/// growth for genuinely large frames in flight.
+pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_batch_vec_shrinks_to_steady_cap() {
+        let mut v: Vec<u64> = Vec::with_capacity(1024);
+        v.clear();
+        shrink_batch_vec(&mut v);
+        assert!(
+            v.capacity() <= BATCH_VEC_SHRINK_TRIGGER,
+            "capacity {} must shrink below trigger",
+            v.capacity()
+        );
+        assert!(v.capacity() >= BATCH_VEC_STEADY_CAP);
+    }
+
+    #[test]
+    fn steady_state_batch_vec_is_untouched() {
+        let mut v: Vec<u64> = Vec::with_capacity(BATCH_VEC_SHRINK_TRIGGER);
+        let cap_before = v.capacity();
+        shrink_batch_vec(&mut v);
+        assert_eq!(v.capacity(), cap_before, "at-trigger capacity must not shrink");
+    }
+
+    #[test]
+    fn small_batch_vec_is_untouched() {
+        let mut v: Vec<u64> = Vec::with_capacity(BATCH_VEC_STEADY_CAP);
+        let cap_before = v.capacity();
+        shrink_batch_vec(&mut v);
+        assert_eq!(v.capacity(), cap_before);
+    }
+}

@@ -300,10 +300,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
             #[allow(clippy::unwrap_used)]
             // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
-            let sub_tmp_buf = vec![0u8; 8192];
+            // c10k W1: rent the main loop's tmp_buf instead of allocating a
+            // fresh zeroed 8 KiB per select iteration. The buffer is only
+            // LOST when the pubsub arm wins (the dropped read op owns it —
+            // io_uring cancel semantics); the refill below re-arms it. A
+            // read-win restores ownership, so command traffic allocates
+            // nothing. Stale bytes past `n` are never read (`&buf[..n]`).
+            if tmp_buf.len() < 8192 {
+                tmp_buf.resize(8192, 0);
+            }
+            let sub_tmp_buf = std::mem::take(&mut tmp_buf);
             monoio::select! {
                 read_result = stream.read(sub_tmp_buf) => {
                     let (result, buf) = read_result;
+                    tmp_buf = buf;
+                    let buf = &tmp_buf;
                     match result {
                         Ok(0) => {
                             // Client half-closed — break out of loop.
@@ -2433,20 +2444,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
             break;
         }
 
-        // Shrink buffers if they grew too large
-        if read_buf.capacity() > 65536 {
+        // Shrink buffers if they grew too large (c10k W1: floor lowered
+        // 64 KiB → 16 KiB — the old floor let 16–64 KiB high-waters ratchet
+        // until disconnect; see tmp/C10K-REVIEW.md).
+        if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
             let remaining = read_buf.split();
             read_buf = BytesMut::with_capacity(8192);
             if !remaining.is_empty() {
                 read_buf.extend_from_slice(&remaining);
             }
         }
-        if write_buf.capacity() > 65536 {
+        if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
             write_buf = BytesMut::with_capacity(8192);
         }
-        if tmp_buf.capacity() > 65536 {
+        if tmp_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
             tmp_buf = vec![0u8; 8192];
         }
+        // c10k W1: drop the batch scratch capacity BEFORE parking in read().
+        // Both vecs are dead scratch here (responses fully serialized to
+        // write_buf, frames fully dispatched); clearing at the top of the
+        // next iteration is too late for a burst-then-idle connection, which
+        // parks holding the 1024-frame high-water (~74 KB each — the E5
+        // permanent-ratchet finding). Sustained >256-frame pipelines pay one
+        // shrink+regrow per batch (~sub-µs vs a 1024-command batch).
+        responses.clear();
+        super::util::shrink_batch_vec(&mut responses);
+        frames.clear();
+        super::util::shrink_batch_vec(&mut frames);
     }
 
     // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---
