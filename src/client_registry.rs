@@ -1,12 +1,14 @@
 //! Global client connection registry for CLIENT LIST/INFO/KILL.
 //!
 //! Every connection registers on accept and deregisters on close.
-//! The registry is a global `parking_lot::RwLock<HashMap>` touched only on
-//! connect/disconnect and CLIENT commands. Per-batch state (db, idle time,
-//! flags, kill checks) flows through the lock-free [`ClientLiveState`] handle
-//! that `register` returns (QW8, 2026-06 review finding 1.3 — previously the
-//! steady-state loop took the global write lock after every pipeline batch
-//! and the global read lock for every kill check).
+//! The registry is a 16-way striped `parking_lot::RwLock<HashMap>` (c10k W5;
+//! stripe = `id % 16`) touched only on connect/disconnect and CLIENT
+//! commands — accepts/closes contend per-stripe, and CLIENT LIST/KILL walk
+//! one stripe at a time instead of freezing the whole registry. Per-batch
+//! state (db, idle time, flags, kill checks) flows through the lock-free
+//! [`ClientLiveState`] handle that `register` returns (QW8, 2026-06 review
+//! finding 1.3 — previously the steady-state loop took the global write lock
+//! after every pipeline batch and the global read lock for every kill check).
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -14,9 +16,26 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-/// Global client registry.
-static REGISTRY: LazyLock<RwLock<HashMap<u64, ClientEntry>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Stripe count for the global registry (c10k W5). Power of two, sized so
+/// that at 10k conns a stripe holds ~625 entries: register/deregister
+/// contention drops 16×, and CLIENT LIST/KILL walks lock ONE stripe at a
+/// time instead of stalling every accept/close on all shards behind a
+/// single write-preferring RwLock (tmp/C10K-REVIEW.md defect #2).
+const STRIPES: usize = 16;
+
+/// Global client registry, striped by `id % STRIPES`.
+static REGISTRY: LazyLock<[RwLock<HashMap<u64, ClientEntry>>; STRIPES]> =
+    LazyLock::new(|| std::array::from_fn(|_| RwLock::new(HashMap::new())));
+
+/// Live client count across all stripes — pre-sizes CLIENT LIST output
+/// without locking anything.
+static TOTAL_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The stripe owning client `id`.
+#[inline]
+fn stripe(id: u64) -> &'static RwLock<HashMap<u64, ClientEntry>> {
+    &REGISTRY[(id as usize) % STRIPES]
+}
 
 /// Lock-free per-connection state, shared between the connection task
 /// (writer, once per batch) and CLIENT LIST/INFO/KILL (occasional readers).
@@ -141,14 +160,16 @@ pub fn register(
         shard,
         live: Arc::clone(&live),
     };
-    REGISTRY.write().insert(id, entry);
+    stripe(id).write().insert(id, entry);
+    TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
     crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
 }
 
 /// Deregister a client connection.
 pub fn deregister(id: u64) {
-    if let Some(entry) = REGISTRY.write().remove(&id) {
+    if let Some(entry) = stripe(id).write().remove(&id) {
+        TOTAL_CLIENTS.fetch_sub(1, Ordering::Relaxed);
         crate::admin::metrics_setup::record_shard_connection_delta(entry.shard, -1.0);
     }
 }
@@ -157,7 +178,7 @@ pub fn deregister(id: u64) {
 /// never the steady-state batch loop; batch state goes through the
 /// [`ClientLiveState`] handle instead).
 pub fn update<F: FnOnce(&mut ClientEntry)>(id: u64, f: F) {
-    if let Some(entry) = REGISTRY.write().get_mut(&id) {
+    if let Some(entry) = stripe(id).write().get_mut(&id) {
         f(entry);
     }
 }
@@ -167,7 +188,7 @@ pub fn update<F: FnOnce(&mut ClientEntry)>(id: u64, f: F) {
 /// Registry-lookup variant for code without the live handle; connection
 /// loops use `ClientLiveState::is_killed` (lock-free) instead.
 pub fn is_killed(id: u64) -> bool {
-    REGISTRY.read().get(&id).is_some_and(|e| e.live.is_killed())
+    stripe(id).read().get(&id).is_some_and(|e| e.live.is_killed())
 }
 
 /// Format all clients as a CLIENT LIST string.
@@ -175,11 +196,19 @@ pub fn is_killed(id: u64) -> bool {
 /// Each line: `id=N addr=... fd=0 name=... db=N ...`
 /// Returns the full response string.
 pub fn client_list() -> String {
-    let registry = REGISTRY.read();
     let now = Instant::now();
-    let mut result = String::with_capacity(registry.len() * 128);
-    for entry in registry.values() {
-        format_client_line(&mut result, entry, now);
+    // Pre-size from the lock-free total; walk one stripe at a time so a big
+    // listing never blocks register/deregister on the other 15 stripes
+    // (c10k W5 — the old single lock held every accept/close hostage for the
+    // whole O(N) format). Ordering across stripes is not insertion order;
+    // Redis makes no CLIENT LIST ordering guarantee.
+    let mut result =
+        String::with_capacity(TOTAL_CLIENTS.load(Ordering::Relaxed).saturating_mul(128));
+    for lock in REGISTRY.iter() {
+        let stripe = lock.read();
+        for entry in stripe.values() {
+            format_client_line(&mut result, entry, now);
+        }
     }
     // Remove trailing newline if present
     if result.ends_with('\n') {
@@ -190,9 +219,8 @@ pub fn client_list() -> String {
 
 /// Format a single client's info (for CLIENT INFO).
 pub fn client_info(id: u64) -> Option<String> {
-    let registry = REGISTRY.read();
     let now = Instant::now();
-    registry.get(&id).map(|entry| {
+    stripe(id).read().get(&id).map(|entry| {
         let mut result = String::with_capacity(128);
         format_client_line(&mut result, entry, now);
         if result.ends_with('\n') {
@@ -216,29 +244,53 @@ pub fn client_info(id: u64) -> Option<String> {
 /// per-batch kill check closes the connection (Redis replies first on
 /// self-kill, then closes).
 pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
-    // Hold the read lock across the whole loop. This is what makes the raw-fd
-    // `shutdown` free of a use-after-reuse race: a connection's `RegistryGuard`
-    // (a local) drops — and calls `deregister`, which needs the registry WRITE
-    // lock — strictly before its `stream` (a parameter) drops and closes the
-    // fd. So while we hold the READ lock and an entry is present, `deregister`
-    // for it is blocked, its `stream` has not dropped, and `kill_fd` is still
-    // an open socket. Once an entry is gone, we never touch its fd.
-    let registry = REGISTRY.read();
+    // Lock ordering / fd-liveness invariant, per stripe (c10k W5): the raw-fd
+    // `shutdown` is race-free because a connection's `RegistryGuard` (a local)
+    // drops — calling `deregister`, which needs its OWN stripe's WRITE lock —
+    // strictly before its `stream` (a parameter) drops and closes the fd. So
+    // while we hold a stripe's READ lock and an entry is present in it,
+    // `deregister` for that entry is blocked, its `stream` has not dropped,
+    // and `kill_fd` is still an open socket. The invariant only ever involves
+    // one entry and its own stripe, so striping preserves it; entries in
+    // other stripes are simply not visited while their lock is free.
     let mut count = 0u64;
-    for entry in registry.values() {
-        let matches = match filter {
-            KillFilter::Id(target_id) => entry.id == *target_id,
-            KillFilter::Addr(addr) => entry.addr == *addr,
-            KillFilter::User(user) => entry.user == *user,
-        };
-        if matches {
-            entry.live.kill_flag.store(true, Ordering::Relaxed);
-            // Self-kill stays cooperative: shutting down our own socket here
-            // would happen mid-command, before the reply is flushed.
-            if self_id != Some(entry.id) {
-                force_close_fd(entry.live.kill_fd);
+    let kill_entry = |entry: &ClientEntry, count: &mut u64| {
+        entry.live.kill_flag.store(true, Ordering::Relaxed);
+        // Self-kill stays cooperative: shutting down our own socket here
+        // would happen mid-command, before the reply is flushed.
+        if self_id != Some(entry.id) {
+            force_close_fd(entry.live.kill_fd);
+        }
+        *count += 1;
+    };
+    match filter {
+        // Id filter: O(1) — direct stripe lookup instead of the old full
+        // registry scan (the map was always id-keyed).
+        KillFilter::Id(target_id) => {
+            let guard = stripe(*target_id).read();
+            if let Some(entry) = guard.get(target_id) {
+                kill_entry(entry, &mut count);
             }
-            count += 1;
+        }
+        // Addr/User filters: walk stripes ONE at a time — a broad kill no
+        // longer stalls every accept/close globally. A connection that
+        // registers into an already-visited stripe mid-walk is missed, the
+        // same inherent race the single-lock version had at command
+        // granularity.
+        KillFilter::Addr(_) | KillFilter::User(_) => {
+            for lock in REGISTRY.iter() {
+                let guard = lock.read();
+                for entry in guard.values() {
+                    let matches = match filter {
+                        KillFilter::Id(_) => false, // handled by the arm above
+                        KillFilter::Addr(addr) => entry.addr == *addr,
+                        KillFilter::User(user) => entry.user == *user,
+                    };
+                    if matches {
+                        kill_entry(entry, &mut count);
+                    }
+                }
+            }
         }
     }
     count
@@ -569,5 +621,51 @@ mod tests {
         let args: Vec<&[u8]> = vec![b"USER", b"alice"];
         let filter = parse_kill_args(&args).unwrap();
         assert!(matches!(filter, KillFilter::User(u) if u == "alice"));
+    }
+}
+
+#[cfg(test)]
+mod striping_tests {
+    use super::*;
+
+    /// Ids chosen to span every stripe; registry state is process-global, so
+    /// use a distinct id range from the legacy tests (which use small ids).
+    const BASE: u64 = 91_000;
+
+    fn register_n(n: u64, user: &str) -> Vec<u64> {
+        (0..n)
+            .map(|i| {
+                let id = BASE + i;
+                let _ = register(id, format!("10.0.0.{i}:1234"), user.to_string(), 0, -1);
+                id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_stripe_list_and_targeted_kill() {
+        let ids = register_n(40, "stripe-user");
+
+        // CLIENT LIST must see every entry regardless of stripe.
+        let list = client_list();
+        for id in &ids {
+            assert!(list.contains(&format!("id={id} ")), "id {id} missing from list");
+        }
+
+        // Kill-by-id is a single-stripe O(1) lookup — exactly one victim.
+        assert_eq!(kill_clients(&KillFilter::Id(BASE + 17), None), 1);
+        assert!(is_killed(BASE + 17));
+        assert!(!is_killed(BASE + 18));
+
+        // Kill-by-user walks all stripes and reaches every entry.
+        assert_eq!(
+            kill_clients(&KillFilter::User("stripe-user".to_string()), None),
+            40
+        );
+        for id in &ids {
+            assert!(is_killed(*id));
+            deregister(*id);
+        }
+        assert!(client_info(BASE).is_none(), "deregistered id must be gone");
     }
 }
