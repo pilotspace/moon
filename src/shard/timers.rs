@@ -209,9 +209,14 @@ pub(crate) fn run_eviction(
 }
 
 /// Expire timed-out blocked clients.
+///
+/// Heap-driven since c10k W6: cost is O(due + stale-heap-entries), not
+/// O(all blocked waiters), so the 100 Hz cadence is safe at 10k+ blocked
+/// clients. The visit count is intentionally dropped here — it exists for
+/// tests/observability at the registry layer.
 pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>) {
     let now = std::time::Instant::now();
-    blocking_rc.borrow_mut().expire_timed_out(now);
+    let _ = blocking_rc.borrow_mut().expire_timed_out(now);
 }
 
 /// Checkpoint tick interval in milliseconds.

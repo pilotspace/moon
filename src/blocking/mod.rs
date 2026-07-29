@@ -66,6 +66,17 @@ pub struct BlockingRegistry {
     waiters: HashMap<(usize, Bytes), VecDeque<WaitEntry>>,
     /// wait_id -> list of (db_index, key) for cross-key cleanup on wakeup/timeout.
     wait_keys: HashMap<u64, Vec<(usize, Bytes)>>,
+    /// Deadline index (c10k W6): min-heap of (deadline, db_index, key) for
+    /// every registered waiter that HAS a deadline. `expire_timed_out` used
+    /// to walk EVERY queue of EVERY blocked waiter at its 100 Hz cadence
+    /// (~2M entry visits/s/shard at 10k blocked clients, tmp/C10K-REVIEW.md
+    /// defect #3); with the heap it touches only queues holding an actually
+    /// -due candidate. Entries are lazily invalidated: a waiter served or
+    /// cancelled before its deadline leaves a stale heap entry that pops to
+    /// a no-op at its original deadline — bounded by registration rate ×
+    /// timeout, the same envelope as the queues themselves. Zero-timeout
+    /// (block-forever) waiters never enter the heap.
+    deadlines: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, usize, Bytes)>>,
     /// Monotonically increasing wait_id counter (lower 48 bits).
     next_id: u64,
     /// Shard ID encoded in upper 16 bits of wait_id for global uniqueness.
@@ -81,6 +92,7 @@ impl BlockingRegistry {
         BlockingRegistry {
             waiters: HashMap::new(),
             wait_keys: HashMap::new(),
+            deadlines: std::collections::BinaryHeap::new(),
             next_id: 0,
             shard_id,
         }
@@ -99,6 +111,11 @@ impl BlockingRegistry {
     pub fn register(&mut self, db_index: usize, key: Bytes, entry: WaitEntry) {
         let wait_id = entry.wait_id;
         let queue_key = (db_index, key.clone());
+
+        if let Some(deadline) = entry.deadline {
+            self.deadlines
+                .push(std::cmp::Reverse((deadline, db_index, key)));
+        }
 
         self.waiters
             .entry(queue_key.clone())
@@ -151,18 +168,36 @@ impl BlockingRegistry {
 
     /// Expire all timed-out waiters. Sends None through their reply channels.
     ///
-    /// Two-pass approach: first collect timed-out entries, then clean up.
-    pub fn expire_timed_out(&mut self, now: std::time::Instant) {
-        // Pass 1: collect timed-out (wait_id, reply_tx) pairs
+    /// Heap-driven (c10k W6): pops due deadline-index entries and scans ONLY
+    /// the queues they name; every other blocked waiter is untouched. Runs at
+    /// 100 Hz from the shard timer, so the no-expiry steady state must stay
+    /// O(1). Returns the number of queue entries visited (observability +
+    /// test surface — the old implementation visited every blocked waiter).
+    pub fn expire_timed_out(&mut self, now: std::time::Instant) -> usize {
+        let mut visited = 0usize;
         let mut timed_out: Vec<(u64, crate::runtime::channel::OneshotSender<Option<Frame>>)> =
             Vec::new();
         let mut timed_out_ids: Vec<u64> = Vec::new();
 
-        for queue in self.waiters.values_mut() {
+        while self
+            .deadlines
+            .peek()
+            .is_some_and(|std::cmp::Reverse((d, _, _))| *d <= now)
+        {
+            #[allow(clippy::unwrap_used)] // peek above just proved non-empty
+            let std::cmp::Reverse((_, db_index, key)) = self.deadlines.pop().unwrap();
+            let queue_key = (db_index, key);
+            // A missing queue is a STALE heap entry (waiter served/cancelled
+            // before its deadline) — the lazy-invalidation no-op.
+            let Some(queue) = self.waiters.get_mut(&queue_key) else {
+                continue;
+            };
             let mut i = 0;
             while i < queue.len() {
+                visited += 1;
                 let is_expired = queue[i].deadline.map_or(false, |d| d <= now);
                 if is_expired {
+                    #[allow(clippy::unwrap_used)] // i < queue.len() by loop guard
                     let entry = queue.remove(i).unwrap();
                     timed_out_ids.push(entry.wait_id);
                     timed_out.push((entry.wait_id, entry.reply_tx));
@@ -170,10 +205,10 @@ impl BlockingRegistry {
                     i += 1;
                 }
             }
+            if queue.is_empty() {
+                self.waiters.remove(&queue_key);
+            }
         }
-
-        // Remove empty queues
-        self.waiters.retain(|_, q| !q.is_empty());
 
         // Send None (timeout) to all timed-out waiters
         for (_wait_id, reply_tx) in timed_out {
@@ -187,6 +222,7 @@ impl BlockingRegistry {
         for id in timed_out_ids {
             self.wait_keys.remove(&id);
         }
+        visited
     }
 }
 
@@ -301,5 +337,108 @@ mod tests {
     fn test_has_waiters_empty() {
         let reg = BlockingRegistry::new(0);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"nokey")));
+    }
+}
+
+#[cfg(test)]
+mod deadline_heap_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn entry(reg: &mut BlockingRegistry, deadline: Option<Instant>) -> (u64, WaitEntry) {
+        let id = reg.next_wait_id();
+        let (tx, _rx) = crate::runtime::channel::oneshot();
+        (
+            id,
+            WaitEntry {
+                wait_id: id,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx,
+                deadline,
+            },
+        )
+    }
+
+    /// c10k W6: the 100 Hz sweep must not touch block-forever waiters. The
+    /// old implementation walked every queue of every blocked client.
+    #[test]
+    fn sweep_skips_undeadlined_waiters() {
+        let mut reg = BlockingRegistry::new(0);
+        let now = Instant::now();
+        for i in 0..100u32 {
+            let (_, e) = entry(&mut reg, None);
+            reg.register(0, Bytes::from(format!("k{i}")), e);
+        }
+        let (_, due) = entry(&mut reg, Some(now - Duration::from_millis(1)));
+        reg.register(0, Bytes::from_static(b"due-key"), due);
+
+        let visited = reg.expire_timed_out(now);
+        assert_eq!(visited, 1, "only the due queue's single entry is visited");
+        assert!(!reg.has_waiters(0, &Bytes::from_static(b"due-key")));
+        assert!(reg.has_waiters(0, &Bytes::from_static(b"k0")));
+        assert!(reg.has_waiters(0, &Bytes::from_static(b"k99")));
+
+        // Steady state after the sweep: nothing due, zero visits.
+        assert_eq!(reg.expire_timed_out(now), 0);
+    }
+
+    /// Shared key: expire only due entries, preserve FIFO of the rest.
+    #[test]
+    fn shared_key_partial_expiry_preserves_fifo() {
+        let mut reg = BlockingRegistry::new(0);
+        let now = Instant::now();
+        let key = Bytes::from_static(b"shared");
+        let (_, e1) = entry(&mut reg, Some(now - Duration::from_millis(5)));
+        reg.register(0, key.clone(), e1);
+        let (id2, e2) = entry(&mut reg, Some(now + Duration::from_secs(60)));
+        reg.register(0, key.clone(), e2);
+        let (id3, e3) = entry(&mut reg, None);
+        reg.register(0, key.clone(), e3);
+
+        reg.expire_timed_out(now);
+        assert_eq!(reg.pop_front(0, &key).unwrap().wait_id, id2);
+        assert_eq!(reg.pop_front(0, &key).unwrap().wait_id, id3);
+        assert!(reg.pop_front(0, &key).is_none());
+    }
+
+    /// A waiter served before its deadline leaves a stale heap entry — the
+    /// sweep at its original deadline must be a no-op, not a panic or a
+    /// spurious timeout reply.
+    #[test]
+    fn served_waiter_stale_heap_entry_is_noop() {
+        let mut reg = BlockingRegistry::new(0);
+        let now = Instant::now();
+        let key = Bytes::from_static(b"served");
+        let (id, e) = entry(&mut reg, Some(now + Duration::from_millis(10)));
+        reg.register(0, key.clone(), e);
+
+        let popped = reg.pop_front(0, &key).expect("served");
+        assert_eq!(popped.wait_id, id);
+        reg.remove_wait(id);
+
+        let visited = reg.expire_timed_out(now + Duration::from_secs(1));
+        assert_eq!(visited, 0, "stale heap entry must no-op");
+    }
+
+    /// Multi-key waiter (BLPOP k1 k2) with one shared deadline: both queue
+    /// entries removed in one sweep, one visit each.
+    #[test]
+    fn multikey_waiter_expires_from_all_queues() {
+        let mut reg = BlockingRegistry::new(0);
+        let now = Instant::now();
+        let id = reg.next_wait_id();
+        let deadline = Some(now - Duration::from_millis(1));
+        for k in [&b"mk1"[..], &b"mk2"[..]] {
+            let (tx, _rx) = crate::runtime::channel::oneshot();
+            reg.register(
+                0,
+                Bytes::copy_from_slice(k),
+                WaitEntry { wait_id: id, cmd: BlockedCommand::BLPop, reply_tx: tx, deadline },
+            );
+        }
+        let visited = reg.expire_timed_out(now);
+        assert_eq!(visited, 2);
+        assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk1")));
+        assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk2")));
     }
 }
