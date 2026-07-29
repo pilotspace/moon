@@ -2447,6 +2447,11 @@ impl super::Shard {
                         }
                     }
                     timers::sync_wal_v3(&mut wal_writer);
+                    // c10k W11: cancel reads parked ≥1s so idle connections
+                    // downshift to the probe-sized working set. Same thread
+                    // as the connection tasks (thread-per-core), no locks.
+                    let _ =
+                        crate::server::conn::handler_monoio::idle_park::sweep(cached_clock.ms());
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {

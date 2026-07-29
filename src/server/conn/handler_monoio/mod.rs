@@ -5,6 +5,7 @@
 
 mod dispatch;
 mod ft;
+pub(crate) mod idle_park;
 mod pubsub;
 mod read;
 mod txn;
@@ -168,7 +169,7 @@ fn run_write_eviction_gate(
 #[cfg(feature = "runtime-monoio")]
 #[tracing::instrument(skip_all, level = "debug")]
 pub(crate) async fn handle_connection_sharded_monoio<
-    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent,
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + idle_park::IdleParkRead,
 >(
     mut stream: S,
     peer_addr: String,
@@ -244,6 +245,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
     let mut tmp_buf = vec![0u8; 8192];
+
+    // c10k W11: two-stage idle park (see idle_park.rs). Cancel-capable
+    // streams register for the shard chore's ≥1s sweep; `downshifted` tracks
+    // whether this connection currently holds the probe-sized working set.
+    let idle_reg = S::SUPPORTS_IDLE_PARK.then(|| idle_park::register(client_id));
+    let mut downshifted = false;
 
     // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
     let idle_timeout_secs = ctx.runtime_config.read().timeout;
@@ -590,9 +597,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
 
         // Read data from stream using monoio ownership I/O.
-        // Reuse pre-allocated buffer; restore length to 8192 for the read.
-        if tmp_buf.len() < 8192 {
-            tmp_buf.resize(8192, 0);
+        // Reuse pre-allocated buffer; restore length for the read. While
+        // downshifted (c10k W11) the park size is the probe buffer; the
+        // resize below re-inflates lazily on the first post-idle iteration.
+        let park_len = if downshifted {
+            idle_park::IDLE_PROBE_BUF
+        } else {
+            idle_park::PARK_BUF_FULL
+        };
+        if tmp_buf.len() != park_len {
+            tmp_buf.resize(park_len, 0);
         }
         if let Some(dur) = idle_timeout {
             // Timeout-aware read: select between read and sleep.
@@ -649,6 +663,44 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
                 continue;
+            }
+        } else if downshifted {
+            // c10k W11 stage 2: park with the probe buffer, no chore state.
+            // Real data restores the full working set (lazily, via the
+            // pre-park sizing above) and re-arms stage 1.
+            let (result, returned_buf) = stream.read(tmp_buf).await;
+            tmp_buf = returned_buf;
+            match result {
+                Ok(0) => break,
+                Ok(n) => {
+                    read_buf.extend_from_slice(&tmp_buf[..n]);
+                    downshifted = false;
+                }
+                Err(_) => break,
+            }
+        } else if let Some(reg) = idle_reg.as_ref() {
+            // c10k W11 stage 1: full-size read, registered for the shard
+            // chore's ≥1s idle sweep. Cancel-and-await is loss-free: a
+            // completion that raced the cancel still delivers its bytes.
+            let handle = reg.slot.handle();
+            reg.slot.mark_parked(ctx.cached_clock.ms());
+            let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+            reg.slot.mark_unparked();
+            tmp_buf = returned_buf;
+            match result {
+                Ok(0) => break,
+                Ok(n) => {
+                    read_buf.extend_from_slice(&tmp_buf[..n]);
+                }
+                Err(_) => {
+                    // Cancelled by the idle sweep — or a real socket error,
+                    // which the stage-2 re-park's own read surfaces
+                    // immediately. Either way: shed the working set, re-park
+                    // small. No error-kind matching needed.
+                    idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
+                    downshifted = true;
+                    continue;
+                }
             }
         } else {
             let (result, returned_buf) = stream.read(tmp_buf).await;
