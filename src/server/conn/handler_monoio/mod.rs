@@ -61,6 +61,34 @@ impl Drop for RegistryGuard {
     }
 }
 
+/// Park plumbing for `handle_connection_sharded_monoio` (c1M P1).
+#[cfg(feature = "runtime-monoio")]
+pub(crate) struct ParkArgs {
+    /// Only call sites that ROUTE `ParkIdle` (spawning the readiness
+    /// watcher) may pass true — anywhere else a park return would drop the
+    /// stream and silently close a healthy idle connection.
+    pub can_park: bool,
+    /// Registration carried across a park/wake cycle. A resumed parked
+    /// connection reuses this guard instead of re-registering, so the
+    /// CLIENT LIST entry (name, connected_at, kill state) stays
+    /// continuously intact and TOTAL_CLIENTS/shard counters don't churn —
+    /// there is no deregistered window a racing CLIENT LIST/KILL could
+    /// observe. `None` everywhere except `spawn_resumed_parked_conn`.
+    pub kept_registration: Option<RegistryGuard>,
+}
+
+#[cfg(feature = "runtime-monoio")]
+impl ParkArgs {
+    pub(crate) const NO_PARK: ParkArgs = ParkArgs {
+        can_park: false,
+        kept_registration: None,
+    };
+    pub(crate) const PARK: ParkArgs = ParkArgs {
+        can_park: true,
+        kept_registration: None,
+    };
+}
+
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
 /// Same purpose as the Tokio handler's `HandlerResult`: the generic handler cannot
@@ -78,11 +106,12 @@ pub enum MonoioHandlerResult {
     /// downshifted state; the handler task exits and the caller parks the
     /// stream behind a tiny readiness watcher
     /// (`conn_accept::spawn_parked_idle_watcher`). Only returned when the
-    /// caller opted in via `can_park` — every other call site would drop the
-    /// stream and silently close a healthy connection. `registry_guard`
-    /// keeps the CLIENT LIST/KILL entry (and its maxclients slot) alive for
-    /// the parked lifetime; the watcher drops it just before re-registering
-    /// on wake.
+    /// caller opted in via `park.can_park` — every other call site would
+    /// drop the stream and silently close a healthy connection.
+    /// `registry_guard` keeps the CLIENT LIST/KILL entry (and its maxclients
+    /// slot) alive for the parked lifetime; on wake the watcher hands it
+    /// back to the resumed handler (`ParkArgs::kept_registration`), so the
+    /// registry entry is never dropped across a park/wake cycle.
     ParkIdle {
         state: Box<MigratedConnectionState>,
         registry_guard: RegistryGuard,
@@ -210,10 +239,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here
     // has no `AsRawFd` bound.
     kill_fd: i32,
-    // c1M P1: only call sites that ROUTE `ParkIdle` (spawning the readiness
-    // watcher) may pass true — anywhere else a park return would drop the
-    // stream and silently close a healthy idle connection.
-    can_park: bool,
+    // c1M P1 park plumbing: opt-in flag + optional registration carried
+    // across a park/wake cycle (see [`ParkArgs`]).
+    park: ParkArgs,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -248,15 +276,37 @@ pub(crate) async fn handle_connection_sharded_monoio<
     conn.refresh_acl_cache(&ctx.acl_table);
     let db_count = ctx.shard_databases.db_count();
 
-    // Register in global client registry for CLIENT LIST/INFO/KILL.
-    let client_live = crate::client_registry::register(
-        client_id,
-        peer_addr.clone(),
-        conn.current_user.clone(),
-        ctx.shard_id,
-        kill_fd,
-    );
-    let registry_guard = RegistryGuard(client_id);
+    // Register in global client registry for CLIENT LIST/INFO/KILL. A
+    // resumed parked connection arrives with its registration still held
+    // (`kept_registration`) and reuses it — the entry was never dropped, so
+    // name/connected_at/kill state persist and counters don't churn. The
+    // `live_handle` miss arm is unreachable while the guard is alive (the
+    // guard is the only deregistration path); registering fresh there is a
+    // fail-safe, not a code path.
+    let (client_live, registry_guard) = match park.kept_registration {
+        Some(guard) => {
+            let live = crate::client_registry::live_handle(client_id).unwrap_or_else(|| {
+                crate::client_registry::register(
+                    client_id,
+                    peer_addr.clone(),
+                    conn.current_user.clone(),
+                    ctx.shard_id,
+                    kill_fd,
+                )
+            });
+            (live, guard)
+        }
+        None => (
+            crate::client_registry::register(
+                client_id,
+                peer_addr.clone(),
+                conn.current_user.clone(),
+                ctx.shard_id,
+                kill_fd,
+            ),
+            RegistryGuard(client_id),
+        ),
+    };
 
     // Functions API registry — LAZY per connection (P-1 footprint): built on
     // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
@@ -702,7 +752,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // The predicate is stable while parked in read (no commands can
             // execute), and reaching this arm already excludes subscriber /
             // tracking / idle-timeout connections (each takes its own arm).
-            let parkable = can_park
+            let parkable = park.can_park
                 && S::SUPPORTS_TASK_PARK
                 && idle_park::park_after_ms() > 0
                 && read_buf.is_empty()

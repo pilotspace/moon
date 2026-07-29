@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Resumed parked connections keep their registry identity (c1M P1
+  follow-up).** Waking from task-exit parking previously deregistered and
+  re-registered the client across a task-scheduling boundary: a racing
+  `CLIENT LIST` could briefly miss the connection, `CLIENT KILL ID` could
+  return 0, and — worse — the fresh registration silently reset the
+  connection's `CLIENT SETNAME` and `age` in `CLIENT LIST`. The wake now
+  hands the held registration through to the resumed handler
+  (registration handoff), so the entry — name, connected-at, kill state,
+  client counters — persists unbroken across any number of park/wake
+  cycles.
+
+### Changed
+- **Migrated connections task-park too (c1M P1 follow-up).** The
+  migrated-connection spawn path (Linux connection migration) now routes
+  `ParkIdle` like the primary accept path, so a connection that migrated
+  shards and then went idle parks out of the task model instead of holding
+  its full handler task forever.
+
 ## [0.8.3] — 2026-07-29
 
 ### Added

@@ -200,6 +200,62 @@ fn parked_connection_visible_and_killable() {
     let _ = child.wait();
 }
 
+/// Registry identity must survive a park/wake cycle unbroken: the resumed
+/// connection keeps its CLIENT SETNAME, its id, and CLIENT LIST never
+/// double-counts (registration handoff — the wake must not deregister and
+/// re-register across a task-scheduling boundary).
+#[test]
+fn resumed_connection_keeps_registry_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+
+    let mut victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    victim.set_nodelay(true).ok();
+    let r = command_reply(&mut victim, "CLIENT SETNAME wakekeeper\r\n");
+    assert!(r.starts_with("+OK"), "SETNAME failed: {r}");
+
+    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let list = command_reply(&mut control, "CLIENT LIST\r\n");
+    let orig_id: u64 = list
+        .lines()
+        .find(|l| l.contains("name=wakekeeper"))
+        .expect("named conn listed before park")
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("id="))
+        .expect("id= field")
+        .parse()
+        .expect("numeric id");
+
+    // Two full park → data-wake cycles.
+    for cycle in 0..2 {
+        std::thread::sleep(PARK_WAIT);
+        ping(&mut victim); // data-wake
+
+        let list = command_reply(&mut control, "CLIENT LIST\r\n");
+        let line = list
+            .lines()
+            .find(|l| l.contains("name=wakekeeper"))
+            .unwrap_or_else(|| {
+                panic!("cycle {cycle}: resumed conn lost its name in CLIENT LIST:\n{list}")
+            });
+        let id: u64 = line
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("id="))
+            .expect("id= field")
+            .parse()
+            .expect("numeric id");
+        assert_eq!(id, orig_id, "cycle {cycle}: client id changed across wake");
+        let entries = list.lines().filter(|l| l.contains("id=")).count();
+        assert_eq!(
+            entries, 2,
+            "cycle {cycle}: CLIENT LIST must hold exactly victim+control:\n{list}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// An active sibling must be undisturbed while its neighbor parks and wakes.
 #[test]
 fn active_sibling_undisturbed_by_parking() {

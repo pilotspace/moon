@@ -727,7 +727,7 @@ pub(crate) fn spawn_monoio_connection(
                                 BytesMut::new(),
                                 None, // fresh connection
                                 kill_fd,
-                                false, // can_park: TLS keeps W11+P4b (no task park)
+                                crate::server::conn::handler_monoio::ParkArgs::NO_PARK, // TLS keeps W11+P4b (no task park)
                             )
                             .await;
                         }
@@ -774,7 +774,7 @@ pub(crate) fn spawn_monoio_connection(
                         BytesMut::new(),
                         None, // fresh connection
                         kill_fd,
-                        true, // can_park: this site routes ParkIdle below
+                        crate::server::conn::handler_monoio::ParkArgs::PARK, // this site routes ParkIdle below
                     )
                     .await;
 
@@ -893,7 +893,7 @@ pub(crate) fn spawn_monoio_connection(
                                 false, // can_migrate
                                 BytesMut::new(),
                                 Some(&state), kill_fd,
-                                false, // can_park: result is discarded here
+                                crate::server::conn::handler_monoio::ParkArgs::NO_PARK, // result is discarded here
                             )
                             .await;
                         } else {
@@ -950,7 +950,7 @@ pub(crate) fn spawn_monoio_connection(
                                     false, // can_migrate: pin locally, no retry loop
                                     BytesMut::new(),
                                     Some(&payload.state), kill_fd,
-                                    false, // can_park: result is discarded here
+                                    crate::server::conn::handler_monoio::ParkArgs::NO_PARK, // result is discarded here
                                 )
                                 .await;
                             }
@@ -1030,18 +1030,19 @@ fn spawn_parked_idle_watcher(
             crate::admin::metrics_setup::record_connection_closed();
             return;
         }
-        // Wake: the handler re-registers this client_id at entry, so drop
-        // the parked entry first. The deregistered window lasts until the
-        // executor first polls the resumed task (a task-scheduling boundary,
-        // not just a few instructions): a racing CLIENT LIST misses the
-        // conn and CLIENT KILL ID returns 0 — same observable as a
-        // reconnect race, and a kill_flag set in that window is superseded
-        // by the shutdown(2) the killer already issued, which is what woke
-        // us. Closing the gap needs registration handoff into the handler
-        // (pass the guard through instead of drop/re-register); not worth
-        // it for a transient-invisibility race on an actively-waking conn.
-        drop(registry_guard);
-        spawn_resumed_parked_conn(stream, state, conn_ctx, shutdown, client_id, kill_fd);
+        // Wake: hand the registration to the resumed handler (registration
+        // handoff) — the entry is never dropped, so there is no window where
+        // a racing CLIENT LIST misses the conn or CLIENT KILL ID returns 0,
+        // and name/connected_at/kill state persist across the wake.
+        spawn_resumed_parked_conn(
+            stream,
+            state,
+            registry_guard,
+            conn_ctx,
+            shutdown,
+            client_id,
+            kill_fd,
+        );
     });
     monoio::spawn(fut);
 }
@@ -1055,6 +1056,7 @@ fn spawn_parked_idle_watcher(
 fn spawn_resumed_parked_conn(
     stream: monoio::net::TcpStream,
     mut state: Box<MigratedConnectionState>,
+    registry_guard: crate::server::conn::handler_monoio::RegistryGuard,
     conn_ctx: Box<crate::server::conn::ConnectionContext>,
     shutdown: CancellationToken,
     client_id: u64,
@@ -1074,7 +1076,12 @@ fn spawn_resumed_parked_conn(
             initial,
             Some(&state),
             kill_fd,
-            true, // can_park: this site routes ParkIdle below
+            // Routes ParkIdle below; carries the parked registration through
+            // the wake so the registry entry is never dropped.
+            crate::server::conn::handler_monoio::ParkArgs {
+                can_park: true,
+                kept_registration: Some(registry_guard),
+            },
         )
         .await;
         match (outcome, stream_back) {
@@ -1265,7 +1272,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
             #[cfg(not(unix))]
             let kill_fd = -1;
             monoio::spawn(async move {
-                let _ = handle_connection_sharded_monoio(
+                // c1M P1: kept for the ParkIdle routing below (`sd` moves
+                // into the handler call).
+                let sd_park = sd.clone();
+                let result = handle_connection_sharded_monoio(
                     tcp_stream,
                     peer_addr,
                     &conn_ctx,
@@ -1275,9 +1285,30 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     migration_buf,
                     Some(&state),
                     kill_fd,
-                    false, // can_park: this site discards the result (follow-up: route ParkIdle here too)
+                    crate::server::conn::handler_monoio::ParkArgs::PARK, // routes ParkIdle below
                 )
                 .await;
+                if let (
+                    crate::server::conn::handler_monoio::MonoioHandlerResult::ParkIdle {
+                        state,
+                        registry_guard,
+                    },
+                    Some(stream),
+                ) = result
+                {
+                    // Idle migrated connection parks like a plain one; the
+                    // watcher chain now owns the balancing decrement below.
+                    spawn_parked_idle_watcher(
+                        stream,
+                        state,
+                        registry_guard,
+                        Box::new(conn_ctx),
+                        sd_park,
+                        cid,
+                        kill_fd,
+                    );
+                    return;
+                }
                 // Migrated connection: the source shard's wrapper skipped the
                 // decrement (because `_migrated == true`), so this target-shard
                 // spawn site owns the balancing decrement.  Without this the
