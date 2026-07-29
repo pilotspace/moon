@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-07-29
+
 ### Added
 - **TLS connections task-park too (c1M P1-TLS).** Idle TLS connections now
   exit their handler task after `--conn-park-secs`, like plain TCP: the
