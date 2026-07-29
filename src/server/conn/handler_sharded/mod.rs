@@ -2136,7 +2136,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                 }
 
-                arena.reset();
+                // c10k W1: cap the bump arena before reuse. `reset()` retains
+                // the largest chunk, so one huge batch would otherwise pin its
+                // high-water allocation until disconnect (the tokio-side twin
+                // of the monoio batch-vec ratchet, tmp/C10K-REVIEW.md E5).
+                if arena.allocated_bytes() > 65536 {
+                    arena = bumpalo::Bump::with_capacity(4096);
+                } else {
+                    arena.reset();
+                }
 
                 // AUTH rate limiting: delay response to slow down brute-force attacks
                 if auth_delay_ms > 0 {
@@ -2190,8 +2198,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     );
                 }
 
-                if write_buf.capacity() > 65536 { write_buf = BytesMut::with_capacity(8192); }
-                if read_buf.capacity() > 65536 {
+                // c10k W1: shrink floor lowered 64 KiB → 16 KiB (see
+                // super::util::IO_BUF_SHRINK_TRIGGER).
+                if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+                    write_buf = BytesMut::with_capacity(8192);
+                }
+                if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
                     let remaining = read_buf.split();
                     read_buf = BytesMut::with_capacity(8192);
                     if !remaining.is_empty() { read_buf.extend_from_slice(&remaining); }
@@ -2235,15 +2247,18 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
     // kv_intents and pin the key invisible for all subsequent readers.
     if let Some(txn) = conn.active_cross_txn.take() {
-        crate::transaction::abort::abort_cross_store_txn_routed(
+        // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
+        // otherwise sits inline in EVERY connection future; boxing costs one
+        // alloc on the leaked-txn teardown path only.
+        Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
             &ctx.shard_databases,
             ctx.shard_id,
             conn.selected_db,
             ctx.num_shards,
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
-            txn,
-        )
+            *txn,
+        ))
         .await;
     }
 

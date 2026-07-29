@@ -295,6 +295,15 @@ pub struct ServerConfig {
     #[arg(long = "uring-sqpoll")]
     pub uring_sqpoll_ms: Option<u32>,
 
+    /// io_uring submission-queue entries per shard ring (default: monoio's
+    /// 1024; CQ is sized 2x by the kernel). Raise for high-connection shards
+    /// under bursty pipelines — 1024 in-flight ops per shard is small at 10k+
+    /// conns/shard. Values below 256 are raised to 256 (monoio's floor).
+    /// Also sizes the legacy (epoll/kqueue) driver's event batch. Applies to
+    /// the monoio runtime only.
+    #[arg(long = "uring-entries")]
+    pub uring_entries: Option<u32>,
+
     /// I/O driver for the monoio runtime. "auto" lets FusionDriver pick
     /// (io_uring on Linux when available, else epoll/kqueue); "epoll" forces
     /// the legacy poller. Measured on GCE ARM (c4a Axion, 2026-07): epoll is
@@ -1999,6 +2008,18 @@ mod tests {
         assert_eq!(config.io_driver, "epoll");
         // clap-level validation: anything outside auto|epoll is a parse error.
         assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
+    }
+
+    #[test]
+    fn test_uring_entries_flag() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(
+            config.uring_entries, None,
+            "default must be None (monoio's built-in 1024)"
+        );
+        let config = ServerConfig::parse_from(["moon", "--uring-entries", "4096"]);
+        assert_eq!(config.uring_entries, Some(4096));
+        assert!(ServerConfig::try_parse_from(["moon", "--uring-entries", "x"]).is_err());
     }
 
     #[test]

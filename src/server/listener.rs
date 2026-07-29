@@ -443,10 +443,16 @@ pub async fn run_sharded(
                             continue;
                         }
 
-                        // Affinity-aware routing: check if this IP has a preferred shard
+                        // Affinity-aware routing: check if this IP has a preferred shard.
+                        // c10k W8: the hint is load-gated — an overloaded shard falls
+                        // back to round-robin instead of funneling every same-IP conn.
                         let target_shard = {
                             let peer_ip = addr.ip();
-                            if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                            if let Some(preferred) = affinity_tracker
+                                .read()
+                                .lookup(&peer_ip)
+                                .filter(|&s| !crate::client_registry::shard_overloaded(s, num_shards))
+                            {
                                 if preferred < num_shards {
                                     preferred
                                 } else {
@@ -576,10 +582,14 @@ pub async fn run_sharded(
                                 let _ = monoio::io::AsyncWriteRentExt::write_all(&mut stream, err_msg).await;
                                 continue;
                             }
-                            // Affinity-aware routing
+                            // Affinity-aware routing (c10k W8: load-gated hint)
                             let target_shard = {
                                 let peer_ip = addr.ip();
-                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                                if let Some(preferred) = affinity_tracker
+                                    .read()
+                                    .lookup(&peer_ip)
+                                    .filter(|&s| !crate::client_registry::shard_overloaded(s, num_shards))
+                                {
                                     if preferred < num_shards { preferred } else {
                                         let s = next_shard;
                                         next_shard = (next_shard + 1) % num_shards;
@@ -666,10 +676,14 @@ pub async fn run_sharded(
                                 continue;
                             }
 
-                            // Affinity-aware routing
+                            // Affinity-aware routing (c10k W8: load-gated hint)
                             let target_shard = {
                                 let peer_ip = addr.ip();
-                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                                if let Some(preferred) = affinity_tracker
+                                    .read()
+                                    .lookup(&peer_ip)
+                                    .filter(|&s| !crate::client_registry::shard_overloaded(s, num_shards))
+                                {
                                     if preferred < num_shards { preferred } else {
                                         let s = next_shard;
                                         next_shard = (next_shard + 1) % num_shards;

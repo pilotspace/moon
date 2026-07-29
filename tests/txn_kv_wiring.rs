@@ -102,6 +102,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             uring_sqpoll_ms: None,
             io_driver: "auto".to_string(),
             io_busy_poll_us: 0,
+            uring_entries: None,
             ft_search_workers: None,
             admin_port: 0,
             slowlog_log_slower_than: 10000,

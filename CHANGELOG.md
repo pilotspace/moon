@@ -6,6 +6,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **c10k connection-plane wave (PR #TBD)** — from the 2026-07-29 empirical
+  review (`tmp/C10K-REVIEW.md`: 10k/25k live-connection ramps, idle-CPU
+  measurement, symbolized flames, pipeline-ratchet A/B on the Linux VM):
+  - **Pipeline memory ratchet fixed (W1).** One 1024-deep pipeline
+    permanently ratcheted a connection from 56.5 KB to ~217 KB RSS until
+    disconnect (measured: 5000 such conns pinned 1.09 GB). Batch scratch
+    vecs now shrink after oversized batches, I/O buffer shrink floor
+    lowered 64 KiB → 16 KiB, tokio bump arena capped, subscriber-mode
+    per-message 8 KiB alloc+zero removed.
+  - **maxclients rejection is loud (W3).** Over-cap connections now receive
+    `-ERR max number of clients reached` (Redis parity) instead of a silent
+    EOF on the monoio + TLS paths; the gate runs before per-connection
+    context construction; startup now checks `RLIMIT_NOFILE` against
+    maxclients, raises the soft limit when possible, and warns with the
+    real client ceiling otherwise.
+  - **Blocked-client sweep is deadline-heap driven (W6)** — O(due) instead
+    of walking every blocked waiter at 100 Hz (~2M entry visits/s/shard at
+    10k BLPOP clients); block-forever waiters are never visited.
+  - **SPSC drain starvation fixed (W7).** The cross-shard drain rotates its
+    start consumer, so the 256-message budget no longer lets a hot
+    low-index peer starve high-index peers indefinitely.
+  - **IP-affinity funnel load-gated (W8).** A shard above 2× the mean
+    connection count no longer receives affinity-funneled connections
+    (falls back to round-robin) — previously one migrated/subscribed client
+    pinned all same-IP connections to one shard with no load feedback.
+
+### Added
+- **`--uring-entries N` (c10k P4)** — per-shard io_uring submission-queue
+  size (monoio default 1024; also the legacy driver's event-batch
+  capacity). Values below monoio's 256 floor clamp up with a warning;
+  monoio runtime only.
+
+### Changed
+- **Idle connections downshift to a ~0.5 KB working set (c10k W11).**
+  A connection parked in `read()` ≥1s has its read cancelled by the shard's
+  1s chore (loss-free cancel-and-await on both io_uring and epoll/kqueue),
+  sheds its 8 KiB rent buffer and empty scratch buffers, and re-parks on a
+  512 B probe buffer. Idle RSS/conn 43.5 → 19.9 KB (10k-conn VM A/B);
+  GCE-pinned p=1/p=16 A/B perf-neutral. TLS conns and the tokio runtime
+  keep the previous behavior.
+- **Idle TLS connections shed their 32 KB wrapper buffers (c10k P4b).**
+  `monoio-rustls` + `monoio-io-wrapper` are now vendored (moon-patch style,
+  like `vendor/monoio`): the wrapper's two eagerly-allocated, never-freed
+  16 KiB per-stream buffers are lazy + releasable, and the TLS stream
+  implements a loss-free cancelable read, so W11's idle downshift now
+  covers TLS connections too — a parked TLS conn drops moon's working set
+  AND both wrapper buffers (they reallocate lazily on the next I/O).
+  Cancel errors are deliberately not stashed for replay in the wrapper
+  (a stashed ECANCELED would resurface on the next read and tear down a
+  healthy connection). Wire parity across downshift/wake cycles is
+  regression-tested on one continuous TLS session
+  (`tests/tls_idle_downshift_parity.rs`).
+- **Cold command futures boxed out of the connection state machine
+  (c10k P3).** TXN.ABORT rollback, leaked-txn disconnect teardown, and
+  the FT.* body now `Box::pin` behind their name-check fast paths; the
+  per-connection monoio task allocation drops 9.3 KB → 5.9 KB plain TCP
+  (13.2 → 9.9 KB TLS) with zero allocation on the KV dispatch path.
+- **Client registry striped 16 ways (W5).** Accepts/closes no longer
+  serialize on one global lock; `CLIENT LIST` locks one stripe at a time
+  (output is no longer insertion-ordered — Redis makes no ordering
+  guarantee); `CLIENT KILL ID` is an O(1) lookup instead of a full scan.
+- **`active_cross_txn` boxed (W2)** — ~2.2 KB of inline transaction
+  SmallVecs no longer ride in every connection's task future;
+  `ConnectionState` is guarded ≤768 B by a regression test.
+- **Dead plumbing deleted (W4):** the zero-registrant `pending_wakers`
+  waker relay (per-conn Rc clone + twice-per-iteration sweep) and the
+  never-adopted duplicate `server/conn_state.rs` module (209 lines).
+- The experimental `MOON_URING=1` tokio bridge now logs a loud startup
+  warning that its connections bypass maxclients and CLIENT LIST/KILL
+  (T3; full accounting integration tracked in
+  `.planning/rfcs/c1m-connection-plane.md`).
+
 ## [0.8.2] — 2026-07-20
 
 ### Fixed

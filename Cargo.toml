@@ -135,6 +135,8 @@ text-index = [
 # when the MOON_* spin knobs are unset.
 [patch.crates-io]
 monoio = { path = "vendor/monoio" }
+monoio-rustls = { path = "vendor/monoio-rustls" }
+monoio-io-wrapper = { path = "vendor/monoio-io-wrapper" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

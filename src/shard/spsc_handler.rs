@@ -221,8 +221,27 @@ pub(crate) fn drain_spsc_shared(
         other_messages.push(msg);
     }
 
+    // c10k W7: rotate the consumer start index per drain call. The loop used
+    // to start at consumers[0] every cycle, so whenever the 256-message
+    // budget ran out before the tail was reached, a hot low-index peer shard
+    // starved high-index peers indefinitely (tmp/C10K-REVIEW.md defect #4).
+    thread_local! {
+        static DRAIN_START: Cell<usize> = const { Cell::new(0) };
+    }
+    let n = consumers.len();
+    let start = if n > 0 {
+        DRAIN_START.with(|c| {
+            let s = c.get() % n;
+            c.set(s + 1);
+            s
+        })
+    } else {
+        0
+    };
+
     let mut snapshot_seen = false;
-    for consumer in consumers.iter_mut() {
+    for idx in rotated_indices(start, n) {
+        let consumer = &mut consumers[idx];
         if snapshot_seen {
             break;
         }
@@ -4454,5 +4473,43 @@ mod drain_cap_tests {
         );
         use ringbuf::traits::Observer;
         assert!(consumers[0].is_empty(), "all 300 messages must be consumed");
+    }
+}
+
+/// c10k W7: visit order for the SPSC consumer drain — a rotation of
+/// `0..n` beginning at `start`. Extracted so the fairness property is unit
+/// -testable without standing up the full drain call.
+#[inline]
+pub(crate) fn rotated_indices(start: usize, n: usize) -> impl Iterator<Item = usize> {
+    (0..n).map(move |off| (start + off) % n)
+}
+
+#[cfg(test)]
+mod drain_rotation_tests {
+    use super::rotated_indices;
+
+    #[test]
+    fn every_cycle_covers_all_consumers_exactly_once() {
+        for start in 0..5 {
+            let mut seen: Vec<usize> = rotated_indices(start, 5).collect();
+            assert_eq!(seen.len(), 5);
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn successive_starts_change_the_first_visited_consumer() {
+        // The budget cut-off truncates the TAIL of the visit order; rotating
+        // the head is what guarantees no consumer is permanently tail-most.
+        let firsts: Vec<usize> = (0..4)
+            .map(|s| rotated_indices(s, 4).next().unwrap())
+            .collect();
+        assert_eq!(firsts, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn zero_consumers_is_empty_not_panic() {
+        assert_eq!(rotated_indices(0, 0).count(), 0);
     }
 }

@@ -255,7 +255,10 @@ pub(crate) struct ConnectionState {
     pub in_multi: bool,
     /// Active cross-store transaction (None if not in transaction).
     /// Mutually exclusive with in_multi (MULTI/EXEC is KV-only).
-    pub active_cross_txn: Option<CrossStoreTxn>,
+    /// Boxed (c10k W2): CrossStoreTxn is ~2.2 KB of inline SmallVecs which
+    /// otherwise sits in EVERY connection's task future, transacting or not
+    /// (tmp/C10K-REVIEW.md §2). TXN.BEGIN (cold path) pays one heap alloc.
+    pub active_cross_txn: Option<Box<CrossStoreTxn>>,
     /// Active workspace binding for this connection (None = no workspace context).
     /// Set by WS.AUTH, cleared on connection drop.
     pub workspace_id: Option<WorkspaceId>,
