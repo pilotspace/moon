@@ -65,13 +65,17 @@ impl RuntimeFactory for MonoioRuntimeFactory {
         // explicitly. (Previously MOON_NO_URING only gated the tokio bridge
         // + uring_active(); the monoio driver choice ignored it — discovered
         // during the c4a p=1 driver A/B.)
+        // --uring-entries: per-shard ring size (SQ entries; also the legacy
+        // driver's mio event-batch capacity). monoio's default is 1024.
+        let ring_entries = crate::runtime::uring_entries();
         if crate::runtime::legacy_driver_forced() {
-            let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
-                .enable_timer()
-                .build()
-                .unwrap_or_else(|e| {
-                    panic!("failed to build monoio legacy runtime '{}': {}", name, e)
-                });
+            let mut builder = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new();
+            if let Some(n) = ring_entries {
+                builder = builder.with_entries(n);
+            }
+            let mut rt = builder.enable_timer().build().unwrap_or_else(|e| {
+                panic!("failed to build monoio legacy runtime '{}': {}", name, e)
+            });
             rt.block_on(f);
             return;
         }
@@ -121,11 +125,12 @@ impl RuntimeFactory for MonoioRuntimeFactory {
                     .setup_single_issuer()
                     .setup_defer_taskrun();
             }
-            match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                .uring_builder(urb)
-                .enable_timer()
-                .build()
-            {
+            let mut builder =
+                monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().uring_builder(urb);
+            if let Some(n) = ring_entries {
+                builder = builder.with_entries(n);
+            }
+            match builder.enable_timer().build() {
                 Ok(mut rt) => {
                     rt.block_on(f);
                     return;
@@ -141,7 +146,11 @@ impl RuntimeFactory for MonoioRuntimeFactory {
             }
         }
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        let mut builder = monoio::RuntimeBuilder::<monoio::FusionDriver>::new();
+        if let Some(n) = ring_entries {
+            builder = builder.with_entries(n);
+        }
+        let mut rt = builder
             .enable_timer()
             .build()
             .unwrap_or_else(|e| panic!("failed to build monoio runtime '{}': {}", name, e));

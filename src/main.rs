@@ -1074,6 +1074,28 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "runtime-monoio"))]
         tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
     }
+    if let Some(entries) = config.uring_entries {
+        // Same before-shard-spawn contract as force_legacy_driver above.
+        moon::runtime::set_uring_entries(entries);
+        #[cfg(feature = "runtime-monoio")]
+        {
+            let effective = entries.max(moon::runtime::MIN_URING_ENTRIES);
+            if effective != entries {
+                tracing::warn!(
+                    "--uring-entries {} below the {} floor; using {}",
+                    entries,
+                    moon::runtime::MIN_URING_ENTRIES,
+                    effective
+                );
+            }
+            tracing::info!(
+                "I/O ring size: {} SQ entries per shard (--uring-entries)",
+                effective
+            );
+        }
+        #[cfg(not(feature = "runtime-monoio"))]
+        tracing::warn!("--uring-entries has no effect under the tokio runtime");
+    }
 
     // Graph traversal timeout default — set BEFORE shard threads spawn so every
     // TraversalGuard::with_default_timeout observes it (per-query TIMEOUT overrides).
