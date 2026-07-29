@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   monoio runtime only.
 
 ### Changed
+- **Idle connections downshift to a ~0.5 KB working set (c10k W11).**
+  A connection parked in `read()` ≥1s has its read cancelled by the shard's
+  1s chore (loss-free cancel-and-await on both io_uring and epoll/kqueue),
+  sheds its 8 KiB rent buffer and empty scratch buffers, and re-parks on a
+  512 B probe buffer. Idle RSS/conn 43.5 → 19.9 KB (10k-conn VM A/B);
+  GCE-pinned p=1/p=16 A/B perf-neutral. TLS conns and the tokio runtime
+  keep the previous behavior.
 - **Cold command futures boxed out of the connection state machine
   (c10k P3).** TXN.ABORT rollback, leaked-txn disconnect teardown, and
   the FT.* body now `Box::pin` behind their name-check fast paths; the
