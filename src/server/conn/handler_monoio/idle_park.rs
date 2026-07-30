@@ -234,6 +234,27 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
     /// stage-1 read. Default: nothing (plain TCP has no stream-owned
     /// buffers); TLS releases its drained wrapper buffers here.
     fn on_idle_downshift(&mut self) {}
+
+    /// c10k A1: await read-readiness WITHOUT consuming anything.
+    ///
+    /// Two properties make this the right primitive for watching a blocked
+    /// client's socket:
+    ///   * it is cancel-safe by construction — a readiness poll owns no
+    ///     buffer, so losing the `select!` race cannot lose client bytes
+    ///     (`spawn_parked_idle_watcher` relies on the same property);
+    ///   * once it fires, the fd is level-triggered ready, so the follow-up
+    ///     read completes immediately with data, EOF or an error and can be
+    ///     issued OUTSIDE the `select!`, where nothing can cancel it.
+    ///
+    /// The default never resolves, which leaves streams without a race-free
+    /// standalone readiness await on exactly the pre-A1 behaviour. TLS
+    /// deliberately keeps that default: `Stream::read_inner` loops on
+    /// `read_io` until rustls yields plaintext, so a post-readiness read can
+    /// park inside a partial record — the one thing the design above must
+    /// never do. See the module docs on `blocking.rs` for the consequence.
+    fn peer_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::pending()
+    }
 }
 
 impl IdleParkRead for monoio::net::TcpStream {
@@ -246,6 +267,13 @@ impl IdleParkRead for monoio::net::TcpStream {
         c: CancelHandle,
     ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
+    }
+
+    /// `relaxed = false`: a real `poll(2)`, no false positives. A spurious
+    /// wake would cost a wasted read, not correctness, but the blocked-client
+    /// watcher must never mistake one for EOF.
+    fn peer_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        self.readable(false)
     }
 }
 

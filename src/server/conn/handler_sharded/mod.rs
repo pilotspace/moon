@@ -299,6 +299,9 @@ pub(crate) async fn handle_connection_sharded_inner<
         buf
     };
     let mut write_buf = BytesMut::with_capacity(8192);
+    // c10k A1: set when a blocking command leaves unparsed input in
+    // `read_buf` (see the read-skip guard in the main select).
+    let mut carried_input = false;
     let parse_config = crate::protocol::ParseConfig::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -387,7 +390,17 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
         tokio::select! {
             result = async {
-                if let Some(dur) = idle_timeout {
+                // c10k A1: a blocking command's peer watch may have pulled
+                // bytes the client pipelined behind it out of the kernel and
+                // into `read_buf`. Pre-A1 they stayed in the socket, so this
+                // read returned them at once; now they are already here and
+                // awaiting a read would hang the pipelined command. Report
+                // them as if just read — a carry that is only a partial frame
+                // parses to nothing and the loop comes straight back with the
+                // flag already cleared.
+                if std::mem::take(&mut carried_input) && !read_buf.is_empty() {
+                    Ok(read_buf.len())
+                } else if let Some(dur) = idle_timeout {
                     match tokio::time::timeout(dur, stream.read_buf(&mut read_buf)).await {
                         Ok(r) => r,
                         Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
@@ -1009,13 +1022,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                         if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
-                        let blocking_response = handle_blocking_command(
+                        // c10k A1: `read_buf` doubles as the carry buffer — it
+                        // holds only the unparsed tail of this batch here, so
+                        // bytes the client pipelines while blocked append in
+                        // wire order.
+                        let blocking_outcome = handle_blocking_command(
                             cmd, cmd_args, conn.selected_db, &ctx.shard_databases, &ctx.blocking_registry,
                             ctx.shard_id, ctx.num_shards, &ctx.dispatch_tx, &shutdown,
+                            &mut stream, &mut read_buf,
                         ).await;
+                        let blocking_response = match blocking_outcome {
+                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+                            // Peer vanished mid-block: registrations are torn
+                            // down, nothing to reply to, close the connection.
+                            crate::server::conn::blocking::BlockingOutcome::PeerGone => {
+                                arena.reset();
+                                return (HandlerResult::Done, None);
+                            }
+                        };
                         let blocking_response = apply_resp3_conversion(cmd, blocking_response, conn.protocol_version);
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
+                        // A1: anything left in read_buf is either this batch's
+                        // unparsed tail or bytes the peer watch carried; parse
+                        // before awaiting the next read either way.
+                        carried_input = !read_buf.is_empty();
                         break;
                     }
 

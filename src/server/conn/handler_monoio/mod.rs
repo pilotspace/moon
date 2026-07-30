@@ -265,6 +265,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
         buf
     };
     let mut write_buf = BytesMut::with_capacity(8192);
+    // c10k A1: set when a blocking command leaves unparsed input in
+    // `read_buf` (see the read-skip guard in the main loop).
+    let mut carried_input = false;
     let mut codec = RespCodec::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -686,7 +689,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if tmp_buf.len() != park_len {
             tmp_buf.resize(park_len, 0);
         }
-        if let Some(dur) = idle_timeout {
+        // c10k A1: a blocking command's peer watch may have pulled bytes the
+        // client pipelined behind it out of the kernel and into `read_buf`.
+        // Pre-A1 those bytes stayed in the socket, so the read below returned
+        // them at once; now they are already here, and parking in read() first
+        // would hang the pipelined command until the client happened to send
+        // more. Skip exactly one read and let the parser drain them. A carry
+        // that is only a partial frame parses to nothing, `frames.is_empty()`
+        // sends us straight back here, and the flag is already cleared.
+        if std::mem::take(&mut carried_input) {
+            // Nothing to read: `read_buf` already holds unparsed input.
+        } else if let Some(dur) = idle_timeout {
             // Timeout-aware read: select between read and sleep.
             // monoio::select! drops the losing future, so tmp_buf ownership transfers.
             // We allocate a fresh buffer when timeout is enabled (safety feature, not hot path).
@@ -1400,6 +1413,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
+                &mut read_buf,
                 &mut stream,
                 &shutdown,
             )
@@ -1407,8 +1421,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 dispatch::BlockingResult::NotBlocking => {}
                 dispatch::BlockingResult::Queued => continue,
-                dispatch::BlockingResult::Handled => break,
+                dispatch::BlockingResult::Handled => {
+                    // A1: anything left in read_buf is either this batch's
+                    // unparsed tail or bytes the peer watch carried; parse
+                    // before the next read either way.
+                    carried_input = !read_buf.is_empty();
+                    break;
+                }
                 dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
+                // c10k A1: peer vanished mid-block. Nothing to write; the
+                // registry entry and maxclients slot are released by returning.
+                dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---

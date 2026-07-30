@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A client that disconnects while blocked is now reaped (c10k hardening
+  A1).** The infinite-wait `select!` behind `BLPOP`/`BRPOP`/`BLMOVE`/
+  `BZPOPMIN`/`BZPOPMAX`/`BLMPOP`/`BZMPOP`/`BRPOPLPUSH` had exactly two arms,
+  `reply_rx` and `shutdown` — nothing watched the socket. `BLPOP key 0`
+  followed by a disconnect therefore leaked the handler task, the
+  `WaitEntry`, the client-registry entry and the maxclients slot *forever*:
+  infinite waiters carry `deadline: None` so the deadline sweep skips them,
+  and `timeout` exempts blocked clients by design (Redis parity). A few
+  thousand throwaway connections wedged the server until restart, using one
+  unauthenticated command. The wait now also watches the peer, and a
+  vanished client tears down every registration it held (local and remote)
+  before closing. `CLIENT KILL` of a blocked client works through the same
+  path, since it closes the fd with `shutdown(2)`. Bytes a client legally
+  pipelines behind its blocking command are carried into the parse stream
+  rather than consumed and dropped — they used to wait in the kernel, so
+  the handler now skips exactly one read to drain them. **Known gap:** TLS
+  connections keep the old behaviour; the vendored monoio-rustls read loops
+  internally until rustls yields plaintext, so a post-readiness read can
+  park inside a partial record, which the cancel-free design must never do.
 - **A timed-out cross-shard `BLPOP` no longer eats the next push to that
   key (c10k hardening A2/A3).** Two defects compounded into silent data
   loss at `--shards > 1`. First, the tokio single-key cleanup condition
