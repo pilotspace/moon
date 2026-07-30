@@ -170,6 +170,7 @@ pub fn handle_acl(
                 ));
             }
             let mut count = 0i64;
+            let mut revoked: Vec<String> = Vec::new();
             let Ok(mut table) = acl_table.write() else {
                 return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
             };
@@ -182,8 +183,23 @@ pub fn handle_acl(
                     }
                     if table.del_user(name) {
                         count += 1;
+                        revoked.push(name.to_string());
                     }
                 }
+            }
+            // c10k B2/B3: Redis disconnects clients authenticated as a deleted
+            // user, and so do we now that the registry tracks the post-AUTH
+            // identity. Deleting the account alone never closed the sessions
+            // it had already granted; the permission checks fail those
+            // sessions closed since B2, but leaving them connected would keep
+            // holding maxclients slots on a credential that no longer exists.
+            // Released before the kill so a self-kill cannot deadlock on it.
+            drop(table);
+            for name in revoked {
+                crate::client_registry::kill_clients(
+                    &crate::client_registry::KillFilter::User(name),
+                    None,
+                );
             }
             Frame::Integer(count)
         }
@@ -318,6 +334,10 @@ pub fn handle_acl(
                                 new_table.set_user(user.username.clone(), user);
                             }
                         }
+                        // c10k B2: unknown users are denied now, so a file
+                        // without a `default` line must not brick the server.
+                        let requirepass = runtime_config.read().requirepass.clone();
+                        new_table.ensure_default_user(requirepass.as_deref());
                         let Ok(mut table) = acl_table.write() else {
                             return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
                         };

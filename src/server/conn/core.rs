@@ -360,6 +360,30 @@ impl ConnectionState {
         }
     }
 
+    /// Adopt a new authenticated identity — the ONLY way to change
+    /// `current_user`.
+    ///
+    /// c10k hardening B3. Beyond the ACL cache refresh, this publishes the
+    /// new username to the client registry. `register` captures `user` once,
+    /// at accept time, when it is always `default`; every AUTH/HELLO success
+    /// used to update only the connection-local copy. The registry's copy is
+    /// what `CLIENT LIST` reports and what `CLIENT KILL USER <name>` matches
+    /// on, so both lied about every authenticated session: `CLIENT LIST`
+    /// showed `user=default` for everyone and `CLIENT KILL USER alice`
+    /// returned 0 — the primary incident-response lever for a compromised
+    /// credential, inert. It is also what makes revocation reachable, since
+    /// dropping a user from the table cannot by itself close their live
+    /// sessions.
+    ///
+    /// The registry write takes a stripe lock, which is fine here: AUTH and
+    /// HELLO are per-session events, never the steady-state batch loop.
+    pub fn adopt_user(&mut self, username: String, acl_table: &StdRwLock<crate::acl::AclTable>) {
+        self.current_user = username;
+        self.refresh_acl_cache(acl_table);
+        let user = self.current_user.clone();
+        crate::client_registry::update(self.client_id, move |e| e.user = user);
+    }
+
     /// Resolve and cache the unrestricted flag from the AclTable.
     /// Called once on connection init and after AUTH / HELLO.
     ///

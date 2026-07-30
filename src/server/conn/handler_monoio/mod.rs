@@ -1075,24 +1075,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // connection-level command names. Cut per-command dispatch cost
             // from ~14 non-matching function calls to ~1 on SET/GET workloads.
             let cmd_len = cmd.len();
-            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
-                continue;
-            }
-            if cmd_len == 7
-                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
-            {
-                continue;
-            }
-            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
-            {
-                continue;
-            }
-            if cmd_len == 6 && dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
-                continue;
-            }
-            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
-                continue;
-            }
+            // === ACL-EXEMPT COMMANDS ===
+            //
+            // AUTH and HELLO carry Redis's `NO_AUTH` flag and are permitted
+            // regardless of the current user's permissions - a restricted user
+            // must always be able to re-authenticate as somebody else, and
+            // gating HELLO would break the RESP3 handshake. `check_auth_gate`
+            // above only handles them while UNauthenticated, so these are the
+            // post-authentication path and must stay ahead of the gate.
             if cmd_len == 4
                 && dispatch::try_handle_auth(
                     cmd,
@@ -1119,6 +1109,48 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     &mut codec,
                 )
             {
+                continue;
+            }
+
+            // === ACL GATE - every privileged intercept MUST sit below this ===
+            //
+            // c10k hardening B1. This gate used to sit ~200 lines further
+            // down, below the script/ACL/CONFIG/REPLICAOF/BGSAVE/SHUTDOWN
+            // intercepts, while the comment attached to it claimed the
+            // opposite invariant. Because those intercepts `continue` on a
+            // match, they returned before any permission check ever ran: a
+            // user holding nothing but `~app:* +get` was correctly refused a
+            // plain SET yet could still run `ACL SETUSER evil on nopass ~*
+            // +@all`, `CONFIG SET`, arbitrary Lua, `REPLICAOF` and `BGSAVE`
+            // - verified end-to-end, see tests/acl_privileged_intercepts.rs.
+            // Authenticated-restricted-user escalation to full admin.
+            //
+            // The auth gate runs earlier still, so unauthenticated clients
+            // get NOAUTH rather than NOPERM; only AUTH/HELLO above are exempt
+            // (Redis marks both NO_AUTH).
+            //
+            // If you add a privileged intercept, add it BELOW this line.
+            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
+            {
+                continue;
+            }
+
+            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
+                continue;
+            }
+            if cmd_len == 7
+                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
+                continue;
+            }
+            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
+                continue;
+            }
+            if cmd_len == 6 && dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
+                continue;
+            }
+            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
             if cmd_len == 3
@@ -1277,13 +1309,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
             }
-            // ACL gate MUST run before any privileged intercept (SWAPDB included)
-            // — otherwise unauthenticated clients can mutate cross-DB state.
-            // handler_sharded already enforces this ordering; this matches it.
-            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
-            {
-                continue;
-            }
+            // (B1) The ACL gate that used to sit here now runs far above, ahead
+            // of every privileged intercept. Its old comment claimed exactly
+            // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
             if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
                 continue;

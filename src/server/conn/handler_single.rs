@@ -330,8 +330,7 @@ pub async fn handle_connection(
                                             conn.client_name = Some(name);
                                         }
                                         if let Some(uname) = opt_user {
-                                            conn.current_user = uname;
-                                            conn.refresh_acl_cache(&acl_table);
+                                            conn.adopt_user(uname, &acl_table);
                                         }
                                         let _ = framed.send(response).await;
                                     }
@@ -450,8 +449,7 @@ pub async fn handle_connection(
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&acl_table);
+                                    conn.adopt_user(uname, &acl_table);
                                 } else {
                                     // Log failed auth attempt
                                     conn.acl_log.push(crate::acl::AclLogEntry {
@@ -485,8 +483,7 @@ pub async fn handle_connection(
                                     conn.client_name = Some(name);
                                 }
                                 if let Some(uname) = opt_user {
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&acl_table);
+                                    conn.adopt_user(uname, &acl_table);
                                 }
                                 responses.push(response);
                                 continue;
@@ -511,8 +508,7 @@ pub async fn handle_connection(
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                             if let Some(uname) = opt_user {
-                                conn.current_user = uname;
-                                conn.refresh_acl_cache(&acl_table);
+                                conn.adopt_user(uname, &acl_table);
                             }
                             responses.push(response);
                             continue;
@@ -534,8 +530,7 @@ pub async fn handle_connection(
                                 conn.client_name = Some(name);
                             }
                             if let Some(uname) = opt_user {
-                                conn.current_user = uname;
-                                conn.refresh_acl_cache(&acl_table);
+                                conn.adopt_user(uname, &acl_table);
                             }
                             responses.push(response);
                             continue;
