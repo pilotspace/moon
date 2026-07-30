@@ -1743,6 +1743,7 @@ impl super::Shard {
                     // never exempted replication links).
                     let _ = crate::client_registry::kill_idle_clients(
                         shard_id,
+                        num_shards,
                         runtime_config.read().timeout,
                         crate::storage::entry::current_time_ms(),
                     );
@@ -2505,6 +2506,7 @@ impl super::Shard {
                     // CONFIG SET timeout applies to live connections.
                     let _ = crate::client_registry::kill_idle_clients(
                         shard_id,
+                        num_shards,
                         runtime_config.read().timeout,
                         crate::storage::entry::current_time_ms(),
                     );

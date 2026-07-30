@@ -1665,7 +1665,9 @@ pub(super) async fn try_handle_blocking<
     // idle-timeout sweep (`client_registry::kill_idle_clients`) exempts
     // blocked clients, matching Redis — without this a client parked in
     // `BLPOP key 0` looks idle and gets closed at `timeout`.
-    client_live.set_blocked(true);
+    // RAII, not a set/clear pair: a leaked `blocked` bit exempts the client
+    // from `timeout` permanently.
+    let blocked_guard = client_live.blocked_guard();
     let outcome = handle_blocking_command_monoio(
         cmd,
         cmd_args,
@@ -1681,7 +1683,7 @@ pub(super) async fn try_handle_blocking<
         read_buf,
     )
     .await;
-    client_live.set_blocked(false);
+    drop(blocked_guard);
 
     let blocking_response = match outcome {
         crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,

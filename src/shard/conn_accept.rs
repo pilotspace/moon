@@ -1121,6 +1121,18 @@ fn spawn_parked_idle_watcher<S>(
             crate::admin::metrics_setup::record_connection_closed();
             return;
         }
+        // Woken by an out-of-band kill rather than client traffic: the idle
+        // -timeout sweep and CLIENT KILL both `shutdown(2)` the fd purely to
+        // break the park. Rehydrating a full handler task just so its first
+        // read can observe `kill_flag` and exit is pure overhead, and a
+        // fleet-wide `timeout` expiry wakes them in a burst. Close here
+        // instead — this watcher already owns the close accounting.
+        if crate::client_registry::is_killed(client_id) {
+            drop(registry_guard);
+            drop(stream);
+            crate::admin::metrics_setup::record_connection_closed();
+            return;
+        }
         // Wake: hand the registration to the resumed handler (registration
         // handoff) — the entry is never dropped, so there is no window where
         // a racing CLIENT LIST misses the conn or CLIENT KILL ID returns 0,

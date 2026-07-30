@@ -192,6 +192,33 @@ impl ClientLiveState {
         };
         self.flags.store(next, Ordering::Relaxed);
     }
+
+    /// Mark the client blocked for the lifetime of the returned guard.
+    ///
+    /// Prefer this over a manual `set_blocked(true)` / `set_blocked(false)`
+    /// pair around an await: the pair leaks the exemption if the await panics
+    /// or its future is dropped before completing (connection migration,
+    /// task cancellation), and a client stuck with `blocked` set is exempt
+    /// from `timeout` FOREVER — the same immortal-connection shape the
+    /// timeout sweep exists to prevent.
+    #[inline]
+    pub fn blocked_guard(self: &Arc<Self>) -> BlockedGuard {
+        self.set_blocked(true);
+        BlockedGuard {
+            live: Arc::clone(self),
+        }
+    }
+}
+
+/// RAII `blocked` flag, cleared on drop however the scope is left.
+pub struct BlockedGuard {
+    live: Arc<ClientLiveState>,
+}
+
+impl Drop for BlockedGuard {
+    fn drop(&mut self) {
+        self.live.set_blocked(false);
+    }
 }
 
 /// Information about a connected client.
@@ -480,8 +507,44 @@ pub fn parked_clients() -> u64 {
 ///
 /// Exemptions mirror Redis's `clientsCronHandleTimeout`: subscribers,
 /// blocked clients, and replication links are never idle-closed.
-pub fn kill_idle_clients(shard: usize, timeout_secs: u64, now_epoch_ms: u64) -> u64 {
-    if timeout_secs == 0 {
+pub fn kill_idle_clients(
+    shard: usize,
+    num_shards: usize,
+    timeout_secs: u64,
+    now_epoch_ms: u64,
+) -> u64 {
+    sweep_idle_clients(shard, num_shards, timeout_secs, now_epoch_ms, None)
+}
+
+/// Core of [`kill_idle_clients`], with a test-only shard filter.
+///
+/// The registry is striped by `id % STRIPES`, NOT by shard, so a stripe holds
+/// clients belonging to every shard. Each shard therefore sweeps a DISJOINT
+/// SUBSET OF STRIPES (`i % num_shards == shard`) rather than the whole
+/// registry filtered by `entry.shard`: the latter is what the first version
+/// did, and because the chore runs once per shard per second it made the
+/// total cost `O(num_shards × total_clients)` per second — 12× the necessary
+/// work at `--shards 12`, all of it holding stripe read locks that contend
+/// with the write locks `register`/`deregister` need on accept and close.
+/// Partitioning keeps the cost at one full pass per second no matter how many
+/// shards there are, and genuinely distributes it. Shards ≥ `STRIPES` sweep
+/// nothing, which is correct: stripes 0..STRIPES are still fully covered.
+///
+/// Killing is deliberately shard-agnostic — `kill_flag` is an atomic and
+/// `force_close_fd` is a `shutdown(2)`, both safe from any thread. This is
+/// exactly what `CLIENT KILL` already does cross-shard.
+///
+/// `only_shard` is `Some` only from unit tests: the registry is process-global
+/// and cargo runs tests in parallel, so each test scopes its assertions to its
+/// own synthetic shard id.
+fn sweep_idle_clients(
+    shard: usize,
+    num_shards: usize,
+    timeout_secs: u64,
+    now_epoch_ms: u64,
+    only_shard: Option<usize>,
+) -> u64 {
+    if timeout_secs == 0 || num_shards == 0 {
         return 0;
     }
     let timeout_ms = timeout_secs.saturating_mul(1000);
@@ -490,10 +553,16 @@ pub fn kill_idle_clients(shard: usize, timeout_secs: u64, now_epoch_ms: u64) -> 
     // stripe's READ lock is held and an entry is present, that connection's
     // `deregister` (which needs the stripe's WRITE lock) cannot have run, so
     // its stream has not dropped and `kill_fd` is still an open socket.
-    for lock in REGISTRY.iter() {
+    for (idx, lock) in REGISTRY.iter().enumerate() {
+        if idx % num_shards != shard {
+            continue;
+        }
         let guard = lock.read();
         for entry in guard.values() {
-            if entry.shard != shard || entry.live.is_killed() {
+            if entry.live.is_killed() {
+                continue;
+            }
+            if only_shard.is_some_and(|s| entry.shard != s) {
                 continue;
             }
             let flags = ClientFlags::from_bits(entry.live.flags.load(Ordering::Relaxed));
@@ -937,9 +1006,21 @@ mod overload_gate_tests {
 mod idle_timeout_tests {
     use super::*;
 
+    /// Sweep EVERY stripe but act only on `shard`'s entries.
+    ///
+    /// Production partitions stripes across shards and does not filter by
+    /// `entry.shard` at all (see [`sweep_idle_clients`]), so tests cannot use
+    /// `kill_idle_clients` directly: a test's clients land in stripes by
+    /// `id % STRIPES` and would only be visited by whichever shard owns that
+    /// stripe. This walks all stripes — the pre-partition behaviour — and
+    /// keeps the shard filter purely as test isolation.
+    fn sweep_for_test_shard(shard: usize, timeout_secs: u64, now_epoch_ms: u64) -> u64 {
+        sweep_idle_clients(0, 1, timeout_secs, now_epoch_ms, Some(shard))
+    }
+
     /// The registry is process-global and `cargo test` runs these in
-    /// parallel, so every test gets its own synthetic shard id: the sweep
-    /// already filters by shard, which is exactly the isolation needed.
+    /// parallel, so every test gets its own synthetic shard id, applied via
+    /// `sweep_for_test_shard` above.
     /// (`SHARD_CONNS` is unset in unit tests, so the per-shard counters are
     /// inert for these ids.)
     fn client(id: u64, shard: usize) -> Arc<ClientLiveState> {
@@ -953,6 +1034,83 @@ mod idle_timeout_tests {
         is_killed(id)
     }
 
+    /// The stripe partition is the whole point of the sweep's shape: each
+    /// shard must visit a DISJOINT subset of stripes, and the union across
+    /// shards must cover every stripe exactly once. Without this the chore
+    /// re-scans the entire registry once per shard per second.
+    #[test]
+    fn stripe_partition_is_disjoint_and_total() {
+        for num_shards in [1usize, 2, 3, 4, 12, 16, 24] {
+            let mut seen = vec![0usize; STRIPES];
+            for shard in 0..num_shards {
+                for stripe in 0..STRIPES {
+                    if stripe % num_shards == shard {
+                        seen[stripe] += 1;
+                    }
+                }
+            }
+            assert!(
+                seen.iter().all(|&n| n == 1),
+                "num_shards={num_shards}: every stripe must be swept exactly \
+                 once per round, got {seen:?}"
+            );
+        }
+    }
+
+    /// A shard only sweeps its own stripes, so an idle client is reaped by
+    /// exactly ONE shard — never by all of them, and never by none.
+    #[test]
+    fn idle_client_is_reaped_by_exactly_one_shard() {
+        const SHARD: usize = 908;
+        const NUM_SHARDS: usize = 4;
+        let live = client(9_080, SHARD);
+        let now = live.connected_at_epoch_ms + 30_000;
+
+        // Which stripe holds it, and therefore which shard owns the sweep.
+        let owner = (9_080usize % STRIPES) % NUM_SHARDS;
+        for shard in 0..NUM_SHARDS {
+            if shard == owner {
+                continue;
+            }
+            assert_eq!(
+                sweep_idle_clients(shard, NUM_SHARDS, 5, now, Some(SHARD)),
+                0,
+                "shard {shard} must not sweep another shard's stripes"
+            );
+        }
+        assert!(!killed(9_080), "no non-owner shard may have killed it");
+        assert_eq!(
+            sweep_idle_clients(owner, NUM_SHARDS, 5, now, Some(SHARD)),
+            1,
+            "the owning shard must reap it"
+        );
+        assert!(killed(9_080));
+        deregister(9_080);
+    }
+
+    /// The `blocked` exemption must survive an early return: a leaked bit
+    /// would exempt the client from `timeout` forever.
+    #[test]
+    fn blocked_guard_clears_on_drop() {
+        const SHARD: usize = 909;
+        let live = client(9_090, SHARD);
+        let now = live.connected_at_epoch_ms + 30_000;
+        {
+            let _g = live.blocked_guard();
+            assert_eq!(
+                sweep_for_test_shard(SHARD, 5, now),
+                0,
+                "a blocked client is exempt while the guard is alive"
+            );
+        }
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 5, now),
+            1,
+            "once the guard drops the exemption must be gone"
+        );
+        deregister(9_090);
+    }
+
     #[test]
     fn idle_past_timeout_is_killed_and_active_is_not() {
         const SHARD: usize = 900;
@@ -963,7 +1121,11 @@ mod idle_timeout_tests {
         // The active client completed a batch 1s ago; the idle one never has.
         live_active.touch(0, ClientFlags::default(), now - 1_000);
 
-        assert_eq!(kill_idle_clients(SHARD, 10, now), 1, "only the idle client");
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 10, now),
+            1,
+            "only the idle client"
+        );
         assert!(killed(9_001));
         assert!(!killed(9_002));
 
@@ -976,7 +1138,7 @@ mod idle_timeout_tests {
         const SHARD: usize = 901;
         let live = client(9_003, SHARD);
         let now = live.connected_at_epoch_ms + 3_600_000;
-        assert_eq!(kill_idle_clients(SHARD, 0, now), 0);
+        assert_eq!(sweep_for_test_shard(SHARD, 0, now), 0);
         assert!(!killed(9_003));
         deregister(9_003);
     }
@@ -1011,7 +1173,11 @@ mod idle_timeout_tests {
             blocked.connected_at_epoch_ms,
         );
 
-        assert_eq!(kill_idle_clients(SHARD, 5, now), 0, "all three are exempt");
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 5, now),
+            0,
+            "all three are exempt"
+        );
         assert!(!killed(9_010));
         assert!(!killed(9_011));
         assert!(!killed(9_012));
@@ -1030,10 +1196,10 @@ mod idle_timeout_tests {
         let now = live.connected_at_epoch_ms + 60_000;
 
         live.set_blocked(true);
-        assert_eq!(kill_idle_clients(SHARD, 5, now), 0);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 0);
 
         live.set_blocked(false);
-        assert_eq!(kill_idle_clients(SHARD, 5, now), 1);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 1);
         assert!(killed(9_020));
         deregister(9_020);
     }
@@ -1074,7 +1240,7 @@ mod idle_timeout_tests {
         let _theirs = client(9_041, THEIRS);
         let now = mine.connected_at_epoch_ms + 60_000;
 
-        assert_eq!(kill_idle_clients(MINE, 5, now), 1);
+        assert_eq!(sweep_for_test_shard(MINE, 5, now), 1);
         assert!(killed(9_040));
         assert!(
             !killed(9_041),
@@ -1092,8 +1258,8 @@ mod idle_timeout_tests {
         let live = client(9_050, SHARD);
         let now = live.connected_at_epoch_ms + 60_000;
 
-        assert_eq!(kill_idle_clients(SHARD, 5, now), 1);
-        assert_eq!(kill_idle_clients(SHARD, 5, now), 0, "idempotent");
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 1);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 0, "idempotent");
         deregister(9_050);
     }
 

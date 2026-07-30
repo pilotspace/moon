@@ -218,12 +218,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same arm also read its config once at connection setup (so `CONFIG SET
   timeout` never reached a live connection) and had no exemption for
   replication links. Enforcement now runs from each shard's existing 1 s
-  chore over the connections it owns (`client_registry::kill_idle_clients`),
-  which needs no per-connection timer and additionally reaches connections
-  whose handler task has exited — matching how Redis enforces `timeout` from
-  `serverCron`. Idle clients are now closed within one sweep interval of the
-  deadline rather than exactly at it. Blocked clients, subscribers and
-  replication links are exempt, as in Redis.
+  chore (`client_registry::kill_idle_clients`), which needs no per-connection
+  timer and additionally reaches connections whose handler task has exited —
+  matching how Redis enforces `timeout` from `serverCron`. The registry is
+  striped by client id rather than by shard, so each shard sweeps a disjoint
+  subset of stripes: total cost stays at one full pass per second regardless
+  of shard count, instead of `O(num_shards × total_clients)`. A parked
+  connection closed by the sweep (or by `CLIENT KILL`) is now torn down by
+  its watcher directly rather than rehydrating a full handler task purely to
+  observe the kill and exit. Idle clients are closed within one sweep
+  interval of the deadline rather than exactly at it. Blocked clients,
+  subscribers and replication links are exempt, as in Redis.
 - **`CLIENT LIST`'s blocked flag was dead code.** `ClientFlags::blocked` was
   hardcoded `false` at every call site, so a client parked in `BLPOP key 0`
   never showed `flags=b` — and would have been treated as idle by the new

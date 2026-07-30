@@ -1135,14 +1135,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // bytes the client pipelines while blocked append in
                         // wire order.
                         // D1: exempt this connection from the idle-timeout sweep
-                        // while it is blocked (Redis does the same).
-                        client_live.set_blocked(true);
+                        // while it is blocked (Redis does the same). RAII, not a
+                        // set/clear pair: a leaked `blocked` bit exempts the
+                        // client from `timeout` permanently.
+                        let blocked_guard = client_live.blocked_guard();
                         let blocking_outcome = handle_blocking_command(
                             cmd, cmd_args, conn.selected_db, &ctx.shard_databases, &ctx.blocking_registry,
                             ctx.shard_id, ctx.num_shards, &ctx.dispatch_tx, &shutdown,
                             &mut stream, &mut read_buf,
                         ).await;
-                        client_live.set_blocked(false);
+                        drop(blocked_guard);
                         let blocking_response = match blocking_outcome {
                             crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
                             // Peer vanished mid-block: registrations are torn
