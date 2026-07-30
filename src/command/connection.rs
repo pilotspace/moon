@@ -185,6 +185,15 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         "connected_clients:{}\r\n",
         crate::admin::metrics_setup::connected_clients(),
     );
+    // c1M task-exit parking: connections held only by a readiness watcher.
+    // Counted separately rather than folded into connected_clients — a parked
+    // connection is fully live (CLIENT LIST/KILL reach it), just not holding a
+    // handler task or a working set.
+    let _ = write!(
+        sections,
+        "parked_clients:{}\r\n",
+        crate::client_registry::parked_clients(),
+    );
     sections.push_str("\r\n");
 
     sections.push_str("# Memory\r\n");

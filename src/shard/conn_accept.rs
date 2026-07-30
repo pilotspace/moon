@@ -1065,6 +1065,25 @@ impl ParkWatchable for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
 /// this future, so it must stay small and measurable; and it breaks the
 /// park→resume→park type cycle (the resumed handler task constructs this
 /// watcher again on re-park).
+/// RAII counter for connections currently held only by a park watcher.
+#[cfg(all(feature = "runtime-monoio", unix))]
+struct ParkedCount;
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl ParkedCount {
+    fn enter() -> Self {
+        crate::client_registry::parked_delta(true);
+        ParkedCount
+    }
+}
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl Drop for ParkedCount {
+    fn drop(&mut self) {
+        crate::client_registry::parked_delta(false);
+    }
+}
+
 #[cfg(all(feature = "runtime-monoio", unix))]
 fn spawn_parked_idle_watcher<S>(
     stream: S,
@@ -1082,6 +1101,10 @@ fn spawn_parked_idle_watcher<S>(
         + 'static,
 {
     let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
+        // Observability for `INFO clients.parked_clients`. RAII so the gauge
+        // stays accurate even when this future is dropped outright (runtime
+        // teardown), where neither select arm runs.
+        let _parked = ParkedCount::enter();
         let woke = monoio::select! {
             res = stream.park_readable() => {
                 // Err (fd error) also resumes: the handler's first read

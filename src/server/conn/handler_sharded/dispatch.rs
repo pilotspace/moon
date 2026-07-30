@@ -110,7 +110,9 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -128,7 +130,9 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );

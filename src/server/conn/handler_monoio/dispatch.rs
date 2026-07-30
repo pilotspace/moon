@@ -984,7 +984,9 @@ pub(super) fn try_handle_client_admin(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -1002,7 +1004,9 @@ pub(super) fn try_handle_client_admin(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -1611,6 +1615,7 @@ pub(super) async fn try_handle_blocking<
     read_buf: &mut bytes::BytesMut,
     stream: &mut S,
     shutdown: &CancellationToken,
+    client_live: &std::sync::Arc<crate::client_registry::ClientLiveState>,
 ) -> BlockingResult {
     if !cmd.eq_ignore_ascii_case(b"BLPOP")
         && !cmd.eq_ignore_ascii_case(b"BRPOP")
@@ -1656,6 +1661,11 @@ pub(super) async fn try_handle_blocking<
         }
     }
 
+    // D1: mark the connection blocked for the duration of the wait. The
+    // idle-timeout sweep (`client_registry::kill_idle_clients`) exempts
+    // blocked clients, matching Redis — without this a client parked in
+    // `BLPOP key 0` looks idle and gets closed at `timeout`.
+    client_live.set_blocked(true);
     let outcome = handle_blocking_command_monoio(
         cmd,
         cmd_args,
@@ -1671,6 +1681,7 @@ pub(super) async fn try_handle_blocking<
         read_buf,
     )
     .await;
+    client_live.set_blocked(false);
 
     let blocking_response = match outcome {
         crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,

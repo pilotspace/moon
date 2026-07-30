@@ -408,16 +408,17 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
-    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
-    let idle_timeout_secs = ctx.runtime_config.read().timeout;
-    let idle_timeout = if idle_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(idle_timeout_secs))
-    } else {
-        None
-    };
+    // Client idle timeout (`timeout N`) is NOT enforced here any more — see
+    // `client_registry::kill_idle_clients`, which the 1 s shard chore runs.
+    // The old per-connection `tokio::time::timeout` wrapper read the config
+    // exactly once at connection setup, so `CONFIG SET timeout` never applied
+    // to live connections, and it had no exemption for replication links
+    // (Redis exempts them). Its monoio twin additionally shadowed the entire
+    // c1M connection park. One sweep now enforces the same policy on both
+    // runtimes, live-reconfigurable, with Redis's exemption set.
 
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
-    // Read once alongside the idle timeout — never on the hot path.
+    // Read once at connection setup — never on the hot path.
     let (write_timeout, out_cap_normal) = {
         let rt = ctx.runtime_config.read();
         (
@@ -471,13 +472,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // them as if just read — a carry that is only a partial frame
                 // parses to nothing and the loop comes straight back with the
                 // flag already cleared.
+                //
+                // c10k D1: no `idle_timeout` arm here — `timeout N` is enforced
+                // out-of-band by `client_registry::kill_idle_clients`.
                 if std::mem::take(&mut carried_input) && !read_buf.is_empty() {
                     Ok(read_buf.len())
-                } else if let Some(dur) = idle_timeout {
-                    match tokio::time::timeout(dur, stream.read_buf(&mut read_buf)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
-                    }
                 } else {
                     stream.read_buf(&mut read_buf).await
                 }
@@ -485,10 +484,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
-                        break;
-                    }
                     Err(_) => break,
                 }
 
@@ -1139,11 +1134,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
                         // wire order.
+                        // D1: exempt this connection from the idle-timeout sweep
+                        // while it is blocked (Redis does the same).
+                        client_live.set_blocked(true);
                         let blocking_outcome = handle_blocking_command(
                             cmd, cmd_args, conn.selected_db, &ctx.shard_databases, &ctx.blocking_registry,
                             ctx.shard_id, ctx.num_shards, &ctx.dispatch_tx, &shutdown,
                             &mut stream, &mut read_buf,
                         ).await;
+                        client_live.set_blocked(false);
                         let blocking_response = match blocking_outcome {
                             crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
                             // Peer vanished mid-block: registrations are torn
@@ -2315,7 +2314,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                     crate::client_registry::ClientFlags {
                         subscriber: conn.subscription_count > 0,
                         in_multi: conn.in_multi,
+                        // A batch just completed, so this connection is by
+                        // definition not blocked right now; the blocked bit is
+                        // owned by `set_blocked` around the blocking await.
                         blocked: false,
+                        replica: conn.saw_replconf,
                     },
                     ctx.cached_clock.ms(),
                 );

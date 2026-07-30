@@ -168,6 +168,30 @@ impl ClientLiveState {
     pub fn is_killed(&self) -> bool {
         self.kill_flag.load(Ordering::Relaxed)
     }
+
+    /// Set or clear the blocked bit, leaving the other flags and the idle
+    /// clock alone.
+    ///
+    /// Only the connection's own task writes `flags`, so the read-modify-write
+    /// is not a race — same relaxed, single-writer discipline as [`touch`].
+    ///
+    /// Needed because every `touch` call site hardcodes `blocked: false`: the
+    /// bit existed but was never set, so `CLIENT LIST`'s `b` flag was dead
+    /// code, and — the reason this matters now — [`kill_idle_clients`] would
+    /// see a client parked in `BLPOP key 0` as idle and close it. Redis
+    /// exempts blocked clients from `timeout`, and so did moon implicitly
+    /// (a blocked client never reached the old per-connection timeout arm).
+    #[inline]
+    pub fn set_blocked(&self, blocked: bool) {
+        const BLOCKED_BIT: u8 = 1 << 2;
+        let cur = self.flags.load(Ordering::Relaxed);
+        let next = if blocked {
+            cur | BLOCKED_BIT
+        } else {
+            cur & !BLOCKED_BIT
+        };
+        self.flags.store(next, Ordering::Relaxed);
+    }
 }
 
 /// Information about a connected client.
@@ -186,6 +210,14 @@ pub struct ClientFlags {
     pub subscriber: bool,
     pub in_multi: bool,
     pub blocked: bool,
+    /// Replication link (this connection sent REPLCONF/PSYNC).
+    ///
+    /// Exemption bit only — deliberately NOT surfaced by [`to_flag_str`], so
+    /// `CLIENT LIST` output is byte-identical to before. Redis's
+    /// `clientsCronHandleTimeout` skips `CLIENT_SLAVE`/`CLIENT_MASTER`, and
+    /// [`kill_idle_clients`] needs the same exemption: a replica link is
+    /// idle between writes by design and must never be idle-closed.
+    pub replica: bool,
 }
 
 impl ClientFlags {
@@ -205,7 +237,10 @@ impl ClientFlags {
     /// Pack into one byte for `ClientLiveState::flags`.
     #[inline]
     pub fn to_bits(self) -> u8 {
-        (self.subscriber as u8) | ((self.in_multi as u8) << 1) | ((self.blocked as u8) << 2)
+        (self.subscriber as u8)
+            | ((self.in_multi as u8) << 1)
+            | ((self.blocked as u8) << 2)
+            | ((self.replica as u8) << 3)
     }
 
     /// Unpack from `ClientLiveState::flags`.
@@ -215,6 +250,7 @@ impl ClientFlags {
             subscriber: bits & 1 != 0,
             in_multi: bits & 2 != 0,
             blocked: bits & 4 != 0,
+            replica: bits & 8 != 0,
         }
     }
 }
@@ -392,6 +428,89 @@ pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
                         kill_entry(entry, &mut count);
                     }
                 }
+            }
+        }
+    }
+    count
+}
+
+/// Connections whose handler task has exited and which are held only by a
+/// readiness watcher (c1M task-exit parking).
+///
+/// Exposed as `parked_clients` in `INFO clients`. Operators get to see how
+/// much of the connection fleet is actually parked; tests get a direct,
+/// non-flaky assertion that parking engaged, instead of inferring it from
+/// process RSS.
+static PARKED_CLIENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a connection entering (`+1`) or leaving (`-1`) task-exit parking.
+pub fn parked_delta(entering: bool) {
+    if entering {
+        PARKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PARKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Number of connections currently task-parked.
+pub fn parked_clients() -> u64 {
+    PARKED_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// Close connections idle for at least `timeout_secs` — Redis's `timeout`
+/// config. Returns the number closed.
+///
+/// Called once per second from each shard's chore, which visits only the
+/// entries it owns (`entry.shard == shard`), so the work is distributed and
+/// no shard walks another's connections.
+///
+/// **Why this is not a per-connection timer (c10k hardening D1).** `timeout`
+/// used to be enforced by a `select!` arm racing the connection's idle read
+/// against `sleep(timeout)`. That arm sat FIRST in the read loop's if/else
+/// chain, which made the entire c1M connection park structurally unreachable
+/// whenever `timeout` was set: every connection reverted from the parked
+/// ~3.3 KB to its full ~46 KB working set, silently, in exactly the
+/// deployments that use the only slowloris knob we ship. Enforcing from the
+/// chore instead costs no per-connection timer or allocation, and reaches
+/// connections the handler cannot: ones parked in `read()`, and ones whose
+/// handler TASK has exited entirely (task-exit parking) and are held only by
+/// a readiness watcher. Redis enforces `timeout` from `serverCron` the same
+/// way, so enforcement being up to one sweep interval late matches upstream
+/// rather than diverging from it.
+///
+/// Exemptions mirror Redis's `clientsCronHandleTimeout`: subscribers,
+/// blocked clients, and replication links are never idle-closed.
+pub fn kill_idle_clients(shard: usize, timeout_secs: u64, now_epoch_ms: u64) -> u64 {
+    if timeout_secs == 0 {
+        return 0;
+    }
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    let mut count = 0u64;
+    // Same per-stripe fd-liveness invariant as `kill_clients`: while this
+    // stripe's READ lock is held and an entry is present, that connection's
+    // `deregister` (which needs the stripe's WRITE lock) cannot have run, so
+    // its stream has not dropped and `kill_fd` is still an open socket.
+    for lock in REGISTRY.iter() {
+        let guard = lock.read();
+        for entry in guard.values() {
+            if entry.shard != shard || entry.live.is_killed() {
+                continue;
+            }
+            let flags = ClientFlags::from_bits(entry.live.flags.load(Ordering::Relaxed));
+            if flags.subscriber || flags.blocked || flags.replica {
+                continue;
+            }
+            // `last_cmd_ms` is ms-since-connect of the last completed batch,
+            // so a connection that has never completed one reads 0 and is
+            // idle since it connected — which is what we want for a client
+            // that opens a socket and never speaks.
+            let idle_ms = now_epoch_ms
+                .saturating_sub(entry.live.connected_at_epoch_ms)
+                .saturating_sub(entry.live.last_cmd_ms.load(Ordering::Relaxed));
+            if idle_ms >= timeout_ms {
+                entry.live.kill_flag.store(true, Ordering::Relaxed);
+                force_close_fd(entry.live.kill_fd);
+                count += 1;
             }
         }
     }
@@ -811,5 +930,181 @@ mod overload_gate_tests {
     #[test]
     fn zero_shards_is_safe() {
         assert!(!overload_threshold_exceeded(0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+
+    /// The registry is process-global and `cargo test` runs these in
+    /// parallel, so every test gets its own synthetic shard id: the sweep
+    /// already filters by shard, which is exactly the isolation needed.
+    /// (`SHARD_CONNS` is unset in unit tests, so the per-shard counters are
+    /// inert for these ids.)
+    fn client(id: u64, shard: usize) -> Arc<ClientLiveState> {
+        register(id, format!("127.0.0.1:{id}"), "default".into(), shard, -1)
+    }
+
+    /// `kill_fd` is -1 here, so `force_close_fd` is a no-op and the observable
+    /// effect is the cooperative kill flag — which is what the handler loop
+    /// checks anyway.
+    fn killed(id: u64) -> bool {
+        is_killed(id)
+    }
+
+    #[test]
+    fn idle_past_timeout_is_killed_and_active_is_not() {
+        const SHARD: usize = 900;
+        let live_idle = client(9_001, SHARD);
+        let live_active = client(9_002, SHARD);
+        let now = live_idle.connected_at_epoch_ms + 30_000;
+
+        // The active client completed a batch 1s ago; the idle one never has.
+        live_active.touch(0, ClientFlags::default(), now - 1_000);
+
+        assert_eq!(kill_idle_clients(SHARD, 10, now), 1, "only the idle client");
+        assert!(killed(9_001));
+        assert!(!killed(9_002));
+
+        deregister(9_001);
+        deregister(9_002);
+    }
+
+    #[test]
+    fn timeout_zero_never_kills() {
+        const SHARD: usize = 901;
+        let live = client(9_003, SHARD);
+        let now = live.connected_at_epoch_ms + 3_600_000;
+        assert_eq!(kill_idle_clients(SHARD, 0, now), 0);
+        assert!(!killed(9_003));
+        deregister(9_003);
+    }
+
+    /// Redis's `clientsCronHandleTimeout` exempts blocked clients,
+    /// subscribers and replication links. Before D1 these were exempt only by
+    /// accident of control flow (each took a different arm of the read loop);
+    /// a sweep has to exempt them explicitly.
+    #[test]
+    fn blocked_subscriber_and_replica_are_exempt() {
+        const SHARD: usize = 902;
+        let blocked = client(9_010, SHARD);
+        let subscriber = client(9_011, SHARD);
+        let replica = client(9_012, SHARD);
+        let now = blocked.connected_at_epoch_ms + 60_000;
+
+        blocked.set_blocked(true);
+        subscriber.touch(
+            0,
+            ClientFlags {
+                subscriber: true,
+                ..Default::default()
+            },
+            blocked.connected_at_epoch_ms,
+        );
+        replica.touch(
+            0,
+            ClientFlags {
+                replica: true,
+                ..Default::default()
+            },
+            blocked.connected_at_epoch_ms,
+        );
+
+        assert_eq!(kill_idle_clients(SHARD, 5, now), 0, "all three are exempt");
+        assert!(!killed(9_010));
+        assert!(!killed(9_011));
+        assert!(!killed(9_012));
+
+        deregister(9_010);
+        deregister(9_011);
+        deregister(9_012);
+    }
+
+    /// A blocked client becomes eligible again once it unblocks — the bit is
+    /// an exemption, not permanent immunity.
+    #[test]
+    fn unblocking_restores_eligibility() {
+        const SHARD: usize = 903;
+        let live = client(9_020, SHARD);
+        let now = live.connected_at_epoch_ms + 60_000;
+
+        live.set_blocked(true);
+        assert_eq!(kill_idle_clients(SHARD, 5, now), 0);
+
+        live.set_blocked(false);
+        assert_eq!(kill_idle_clients(SHARD, 5, now), 1);
+        assert!(killed(9_020));
+        deregister(9_020);
+    }
+
+    /// `set_blocked` must not disturb the other flag bits.
+    #[test]
+    fn set_blocked_preserves_other_flags() {
+        const SHARD: usize = 904;
+        let live = client(9_030, SHARD);
+        live.touch(
+            3,
+            ClientFlags {
+                subscriber: true,
+                in_multi: true,
+                blocked: false,
+                replica: true,
+            },
+            live.connected_at_epoch_ms,
+        );
+
+        live.set_blocked(true);
+        let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
+        assert!(f.subscriber && f.in_multi && f.replica && f.blocked);
+
+        live.set_blocked(false);
+        let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
+        assert!(f.subscriber && f.in_multi && f.replica && !f.blocked);
+        deregister(9_030);
+    }
+
+    /// Each shard sweeps only the connections it owns, so N shards do not do
+    /// N times the work — and never close another shard's clients.
+    #[test]
+    fn sweep_only_touches_its_own_shard() {
+        const MINE: usize = 905;
+        const THEIRS: usize = 906;
+        let mine = client(9_040, MINE);
+        let _theirs = client(9_041, THEIRS);
+        let now = mine.connected_at_epoch_ms + 60_000;
+
+        assert_eq!(kill_idle_clients(MINE, 5, now), 1);
+        assert!(killed(9_040));
+        assert!(
+            !killed(9_041),
+            "shard 906's client is not shard 905's business"
+        );
+
+        deregister(9_040);
+        deregister(9_041);
+    }
+
+    /// An already-killed client is not counted twice by a later sweep.
+    #[test]
+    fn already_killed_is_not_recounted() {
+        const SHARD: usize = 907;
+        let live = client(9_050, SHARD);
+        let now = live.connected_at_epoch_ms + 60_000;
+
+        assert_eq!(kill_idle_clients(SHARD, 5, now), 1);
+        assert_eq!(kill_idle_clients(SHARD, 5, now), 0, "idempotent");
+        deregister(9_050);
+    }
+
+    #[test]
+    fn parked_gauge_tracks_deltas() {
+        let before = parked_clients();
+        parked_delta(true);
+        parked_delta(true);
+        assert_eq!(parked_clients(), before + 2);
+        parked_delta(false);
+        parked_delta(false);
+        assert_eq!(parked_clients(), before);
     }
 }

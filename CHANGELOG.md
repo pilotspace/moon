@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OFF by default — jemalloc's stats add bookkeeping to every allocation. Fields
   are absent rather than zero-filled when not built in, because a zero would
   read as "no fragmentation", which is worse than "not measured".
+- **`INFO clients` reports `parked_clients`.** How many connections are
+  currently held only by a task-exit park watcher — real operational
+  visibility into how much of the fleet is actually parked, and a direct
+  signal for tests instead of inferring parking from process RSS.
 
 ### Known issues
 - **An idle moon may not return freed memory to the OS on Apple platforms, and
@@ -204,6 +208,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shutdown-aware push, notify the owning shard on success, and fail the
   command loudly (`MOONERR blocking registration failed`) rather than
   blocking on a key nobody is watching.
+- **`timeout N` no longer silently disables the c1M connection park.** The
+  idle timeout was enforced by a per-connection `select!` arm racing the read
+  against `sleep(timeout)`, and that arm sat FIRST in the read loop's if/else
+  chain — so setting `timeout` made the stage-1 buffer downshift, the stage-2
+  park and task-exit parking all structurally unreachable. Every connection
+  reverted from the parked footprint to its full working set, silently, in
+  exactly the deployments that use the only slowloris knob moon ships. The
+  same arm also read its config once at connection setup (so `CONFIG SET
+  timeout` never reached a live connection) and had no exemption for
+  replication links. Enforcement now runs from each shard's existing 1 s
+  chore over the connections it owns (`client_registry::kill_idle_clients`),
+  which needs no per-connection timer and additionally reaches connections
+  whose handler task has exited — matching how Redis enforces `timeout` from
+  `serverCron`. Idle clients are now closed within one sweep interval of the
+  deadline rather than exactly at it. Blocked clients, subscribers and
+  replication links are exempt, as in Redis.
+- **`CLIENT LIST`'s blocked flag was dead code.** `ClientFlags::blocked` was
+  hardcoded `false` at every call site, so a client parked in `BLPOP key 0`
+  never showed `flags=b` — and would have been treated as idle by the new
+  timeout sweep. The flag is now set for the duration of a blocking command
+  on both runtimes.
 
 ## [0.8.4] — 2026-07-29
 
