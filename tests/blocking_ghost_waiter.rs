@@ -48,13 +48,70 @@ fn send(stream: &mut TcpStream, parts: &[&str]) {
     stream.write_all(out.as_bytes()).expect("write command");
 }
 
-/// Read one reply. Every reply this suite issues fits in a single small
-/// response, so one read is sufficient; the socket carries a read timeout so
-/// a wedged server fails the test instead of hanging it.
+/// Read one reply, tolerating TCP segmentation.
+///
+/// A single `read()` is NOT enough even for small replies: TCP gives no
+/// framing guarantee, so a multi-bulk `BLPOP` answer (`*2\r\n$5\r\nghost...`)
+/// can arrive split across segments and a one-shot read would see a prefix,
+/// failing the assertions spuriously. Accumulate until the buffer parses as a
+/// complete RESP reply. The socket's read timeout still bounds a wedged
+/// server, so this fails the test rather than hanging it.
 fn read_reply(stream: &mut TcpStream) -> String {
+    let mut acc = Vec::new();
     let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).expect("read reply");
-    String::from_utf8_lossy(&buf[..n]).into_owned()
+    loop {
+        let n = stream.read(&mut buf).expect("read reply");
+        if n == 0 {
+            break; // EOF — return whatever we have; the caller asserts on it.
+        }
+        acc.extend_from_slice(&buf[..n]);
+        if resp_reply_complete(&acc) {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&acc).into_owned()
+}
+
+/// Is `buf` exactly one complete RESP reply? Covers the reply shapes this
+/// suite issues: simple string / error / integer (one CRLF-terminated line),
+/// bulk string, null bulk, and one level of array.
+fn resp_reply_complete(buf: &[u8]) -> bool {
+    complete_len(buf).is_some()
+}
+
+/// Length of the complete RESP value at the front of `buf`, or `None` if more
+/// bytes are needed.
+fn complete_len(buf: &[u8]) -> Option<usize> {
+    let line_end = find_crlf(buf)?;
+    let header = &buf[..line_end];
+    let after = line_end + 2;
+    match header.first()? {
+        b'+' | b'-' | b':' => Some(after),
+        b'$' => {
+            let len: i64 = std::str::from_utf8(&header[1..]).ok()?.parse().ok()?;
+            if len < 0 {
+                return Some(after); // null bulk
+            }
+            let end = after + len as usize + 2;
+            (buf.len() >= end).then_some(end)
+        }
+        b'*' => {
+            let n: i64 = std::str::from_utf8(&header[1..]).ok()?.parse().ok()?;
+            if n < 0 {
+                return Some(after); // null array
+            }
+            let mut cursor = after;
+            for _ in 0..n {
+                cursor += complete_len(buf.get(cursor..)?)?;
+            }
+            Some(cursor)
+        }
+        _ => None,
+    }
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
 }
 
 fn connect(port: u16) -> TcpStream {

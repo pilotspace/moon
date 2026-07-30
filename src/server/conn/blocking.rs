@@ -90,6 +90,14 @@ async fn push_block_msg(
     }
     // A5: the owner's event loop may be parked; without this kick the
     // registration sits in the ring until the next periodic tick.
+    //
+    // `notify` is `Some` only on the monoio runtime, whose shard loops park in
+    // the driver and need the explicit eventfd kick. The tokio shard loop has
+    // no equivalent task-local `Notify` receive path — it discovers ring items
+    // through its own periodic drain — so tokio call sites pass `None` and
+    // accept up to one tick of latency rather than a lost registration. Wiring
+    // a `Notify` into the tokio loop is a separate change; this comment states
+    // what the code actually does today.
     if let Some(n) = notify {
         n.notify_one();
     }
@@ -114,7 +122,7 @@ async fn cancel_multikey_registrations(
 ) {
     blocking_registry.borrow_mut().remove_wait(wait_id);
     for &remote_shard in registered_remote_shards {
-        let _ = push_block_msg(
+        let delivered = push_block_msg(
             shutdown,
             dispatch_tx,
             shard_id,
@@ -123,6 +131,27 @@ async fn cancel_multikey_registrations(
             notifiers.map(|n| &*n[remote_shard]),
         )
         .await;
+        if !delivered {
+            // The push budget is bounded by design (A4 — the old unbounded
+            // retry was itself the bug), so a shard wedged for the whole
+            // ~0.5 s budget, or a shutdown mid-cancel, can still drop this.
+            // The owner then keeps a `WaitEntry` that its deadline sweep will
+            // not reap (remote entries carry `deadline: None`).
+            //
+            // This is a memory leak, NOT data loss: since A2 every wake path
+            // checks `is_disconnected()` before touching the datastore and
+            // restores anything it popped, so a stale entry is skipped and
+            // pruned rather than swallowing an element. Log it so the leak is
+            // observable instead of silent — a shard wedged this long is
+            // already an incident.
+            tracing::warn!(
+                wait_id,
+                from_shard = shard_id,
+                owner_shard = remote_shard,
+                "BlockCancel undelivered: owner shard not draining; its waiter \
+                 entry leaks until a later push prunes it"
+            );
+        }
     }
 }
 
