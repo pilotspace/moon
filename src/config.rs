@@ -272,6 +272,22 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     pub client_query_buffer_limit: usize,
 
+    /// Run a jemalloc arena decay every N milliseconds (0 = disabled).
+    ///
+    /// jemalloc's `background_thread` is compiled out on Apple platforms
+    /// (`JEMALLOC_BACKGROUND_THREAD` is only defined when `abi != macho`), so
+    /// the `background_thread:true` moon bakes into its malloc conf is a
+    /// silent no-op there and nothing runs decay on a schedule.
+    ///
+    /// DEFAULT 0 — deliberately off. A 384 MiB churn-and-free on macOS was
+    /// measured reclaiming to a 3.7 MiB physical footprint with no decay call
+    /// at all, because decay also runs as a side effect of allocator activity.
+    /// So this is an available lever, not a proven fix; enable it only once
+    /// `INFO memory` (built with `--features jemalloc-stats`) shows
+    /// `allocator_unreturned_bytes` is actually where your memory went.
+    #[arg(long, default_value_t = 0)]
+    pub memory_decay_interval_ms: u64,
+
     /// Give up on a reply write that has made no progress for this many
     /// milliseconds and close the connection (0 = wait forever).
     ///

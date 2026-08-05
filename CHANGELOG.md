@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`INFO memory` can now explain a `used_memory`-vs-RSS gap.** Build with
+  `--features jemalloc-stats` and `INFO memory` reports Redis's `allocator_*`
+  fields: `allocator_allocated`, `allocator_active`, `allocator_resident`,
+  `allocator_retained`, `allocator_frag_bytes`, `allocator_frag_ratio`, and
+  `allocator_unreturned_bytes`. `active - allocated` is fragmentation,
+  `resident - active` is dirty pages jemalloc holds but has not returned, and
+  anything the OS charges beyond `resident` belongs to something other than the
+  allocator. Motivated by a real instance reporting `used_memory` 2.43 GB while
+  the OS charged it 7.3 GB (7.2 GB of that swapped) with no way to tell which.
+  OFF by default — jemalloc's stats add bookkeeping to every allocation. Fields
+  are absent rather than zero-filled when not built in, because a zero would
+  read as "no fragmentation", which is worse than "not measured".
+- **`--memory-decay-interval-ms` (default 0, off)** runs a jemalloc arena decay
+  on a timer. jemalloc's `background_thread` is compiled out on Apple platforms
+  (`JEMALLOC_BACKGROUND_THREAD` is only defined when `abi != macho`), so the
+  `background_thread:true` moon bakes into its malloc conf is a silent no-op
+  there. Shipped **off and explicitly not claimed as a fix**: a 384 MiB
+  churn-and-free on macOS was measured reclaiming to a 3.7 MiB physical
+  footprint with no decay call at all, because decay also runs as a side effect
+  of allocator activity. Enable it only once `allocator_unreturned_bytes` shows
+  that is actually where the memory went.
+
 ### Security
 - **Reply writes were unbounded — a client that stops reading held the whole
   reply forever (c10k C1).** `write_all` on a socket whose receive window is

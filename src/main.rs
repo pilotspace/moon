@@ -284,6 +284,10 @@ fn main() -> anyhow::Result<()> {
     // never reach the allocator. CLI-only by design; see malloc_respawn.rs.
     malloc_respawn::warn_if_conf_only_overrides(config.memory_arenas_cap, config.memory_thp);
 
+    // Allocator decay housekeeping. Off unless the operator asks for it — see
+    // `ServerConfig::memory_decay_interval_ms` for why it is not a default.
+    moon::memory_ctl::spawn(config.memory_decay_interval_ms);
+
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
         tracing::warn!(

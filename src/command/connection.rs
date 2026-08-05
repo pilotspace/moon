@@ -231,6 +231,41 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
     );
+
+    // Allocator counters, Redis's `allocator_*` field names so existing
+    // dashboards and exporters read them without translation.
+    //
+    // These are the fields that make a used_memory-vs-RSS gap diagnosable
+    // rather than a guess: `allocator_frag_bytes` is space lost to size-class
+    // rounding, `allocator_unreturned_bytes` is dirty pages jemalloc is
+    // holding instead of giving back, and whatever the OS charges beyond
+    // `allocator_resident` belongs to something other than the allocator
+    // (mmap'd segments, thread stacks, the binary image).
+    //
+    // Only present on `--features jemalloc-stats`; jemalloc's stats cost
+    // bookkeeping on every allocation, so the default build does not pay it.
+    // Absent rather than zero-filled: a zero here would read as "no
+    // fragmentation", which is a worse answer than "not measured".
+    #[cfg(feature = "jemalloc-stats")]
+    if let Some(st) = crate::memory_ctl::jemalloc_stats() {
+        let _ = write!(
+            sections,
+            "allocator_allocated:{}\r\n\
+             allocator_active:{}\r\n\
+             allocator_resident:{}\r\n\
+             allocator_retained:{}\r\n\
+             allocator_frag_bytes:{}\r\n\
+             allocator_frag_ratio:{:.2}\r\n\
+             allocator_unreturned_bytes:{}\r\n",
+            st.allocated,
+            st.active,
+            st.resident,
+            st.retained,
+            st.frag_bytes(),
+            st.frag_ratio(),
+            st.unreturned_bytes(),
+        );
+    }
     sections.push_str("\r\n");
 
     sections.push_str("# Persistence\r\n");
