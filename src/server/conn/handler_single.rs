@@ -544,6 +544,7 @@ pub async fn handle_connection(
                                 &conn.current_user,
                                 &peer_addr,
                                 &runtime_config,
+                                client_id,
                             );
                             responses.push(response);
                             continue;

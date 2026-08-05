@@ -248,6 +248,61 @@ fn run_deluser_disconnects(shards: &str) {
     );
 }
 
+/// Deleting your OWN account must still answer before it disconnects you.
+///
+/// `kill_clients` takes a `self_id` precisely so a self-kill stays
+/// cooperative — the flag is set, but the caller's fd is NOT `shutdown(2)`
+/// out from under the in-flight reply. `ACL DELUSER` passed `None`, so a user
+/// deleting itself had its socket torn down mid-command and saw a connection
+/// error instead of the `:1`. Reply-then-disconnect is the contract.
+fn run_self_deluser_replies_first(shards: &str) {
+    let Some(moon) = spawn_moon("self", shards) else {
+        return; // binary missing — skip
+    };
+    let tag = format!("[shards={shards}]");
+
+    let mut admin = Resp::connect(moon.port);
+    // `carol` needs +acl to delete herself, and ~* so the ACL command's key
+    // check does not deny her first.
+    let r = admin.cmd(&["ACL", "SETUSER", "carol", "on", ">pw", "~*", "+@all"]);
+    assert!(r.contains("+OK"), "{tag} ACL SETUSER carol failed: {r:?}");
+
+    let mut carol = Resp::connect(moon.port);
+    let r = carol.cmd(&["AUTH", "carol", "pw"]);
+    assert!(r.contains("+OK"), "{tag} AUTH carol failed: {r:?}");
+    let r = carol.cmd(&["PING"]);
+    assert!(r.contains("+PONG"), "{tag} carol PING failed: {r:?}");
+
+    // The reply must arrive. Before the fix this came back empty (socket shut
+    // down mid-command) rather than `:1`.
+    let r = carol.cmd(&["ACL", "DELUSER", "carol"]);
+    assert!(
+        r.starts_with(":1"),
+        "{tag} a self-DELUSER must answer before disconnecting, got: {r:?}"
+    );
+
+    // ...and only then is the session gone.
+    assert!(
+        carol.is_closed(),
+        "{tag} carol's session must still be torn down after the reply"
+    );
+    let r = admin.cmd(&["PING"]);
+    assert!(
+        r.contains("+PONG"),
+        "{tag} other sessions must be undisturbed: {r:?}"
+    );
+}
+
+#[test]
+fn self_deluser_replies_before_disconnect_single_shard() {
+    run_self_deluser_replies_first("1");
+}
+
+#[test]
+fn self_deluser_replies_before_disconnect_multi_shard() {
+    run_self_deluser_replies_first("4");
+}
+
 #[test]
 fn client_kill_by_user_finds_authenticated_sessions_single_shard() {
     run_kill_by_user("1");

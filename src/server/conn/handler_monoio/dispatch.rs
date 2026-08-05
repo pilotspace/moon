@@ -414,6 +414,7 @@ pub(super) fn try_handle_acl(
         &conn.current_user,
         peer_addr,
         &ctx.runtime_config,
+        conn.client_id,
     );
     responses.push(response);
     true

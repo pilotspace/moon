@@ -768,7 +768,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- ACL ---
                     if cmd.eq_ignore_ascii_case(b"ACL") {
                         let response = crate::command::acl::handle_acl(
-                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config,
+                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config, client_id,
                         );
                         responses.push(response);
                         continue;
