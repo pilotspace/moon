@@ -215,10 +215,36 @@ fn run_preauth_cap(shards: &str) {
         "{tag} unexpected reply: {:?}",
         v.reply
     );
+    // No assertion on `v.sent`. It counts bytes the KERNEL accepted — client
+    // sndbuf + in-flight window + server rcvbuf — not bytes the server
+    // buffered, and Linux autotunes those into the megabytes. An earlier
+    // `v.sent <= 1MiB` bound passed on macOS and failed on Linux at 2.5 MiB
+    // while the server's own `read_buf` never exceeded the 64 KiB ceiling: it
+    // was measuring the OS, not moon.
+    //
+    // The differential control below measures the server instead. Same
+    // dribble, same everything, except the pre-auth ceiling is lifted — if
+    // that connection survives while the capped one died, the ceiling is what
+    // did the killing, and no amount of socket buffering can fake it.
+    let Some(uncapped) = spawn_moon(
+        "preauth-off",
+        shards,
+        &[
+            "--requirepass",
+            "pw",
+            "--client-query-buffer-limit-preauth",
+            "0",
+            "--client-query-buffer-limit",
+            "0",
+        ],
+    ) else {
+        return;
+    };
+    let control = dribble_incomplete_bulk(uncapped.port, None, 4 * 1024 * 1024);
     assert!(
-        v.sent <= 1024 * 1024,
-        "{tag} the pre-auth ceiling let {} bytes through before closing",
-        v.sent
+        !control.closed,
+        "{tag} control server has NO query-buffer ceiling, so the same 4 MiB          dribble must be absorbed — it closed after {} bytes instead, which          means something other than the ceiling is ending these connections          and the test above proves nothing",
+        control.sent
     );
 }
 
