@@ -419,6 +419,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                     Err(_) => break,
                 }
 
+                // c10k C2: query-buffer ceiling. Sited after the read and
+                // ahead of the parse, because an incomplete frame is exactly
+                // what makes `read_buf` grow and it decodes to nothing — the
+                // loop would otherwise come straight back and read more.
+                // `$536870911` plus a dribble pins half a gigabyte per
+                // connection, invisible to `used_memory`, and the auth gate
+                // runs after parsing so it costs no credentials. See
+                // `util::query_buf_limit` for the pre-auth ceiling.
+                {
+                    let (limit, preauth) = {
+                        let rt = ctx.runtime_config.read();
+                        (rt.client_query_buffer_limit, rt.client_query_buffer_limit_preauth)
+                    };
+                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(super::util::QUERY_BUF_LIMIT_ERROR).await;
+                        break;
+                    }
+                }
+
                 // Parse all complete frames from buffer
                 let mut batch: Vec<Frame> = Vec::with_capacity(64);
                 const MAX_BATCH: usize = 1024;

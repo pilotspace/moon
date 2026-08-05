@@ -174,3 +174,91 @@ mod shrink_tests {
         assert_eq!(v.capacity(), cap_before);
     }
 }
+
+/// Resolve the query-buffer ceiling that applies to a connection right now.
+///
+/// c10k hardening C2. The input buffer grows to whatever a frame header
+/// declares — a `$536870911` bulk header plus a dribble of bytes pins half a
+/// gigabyte, bounded only by the parser's 512 MiB ceiling — and that memory
+/// is invisible to `used_memory`, so `maxmemory` never sees it. The auth gate
+/// runs AFTER parsing, so this is reachable with no credentials at all: 20
+/// connections is 10 GB.
+///
+/// Unauthenticated connections therefore get their own, much smaller ceiling.
+/// No legitimate pre-auth command is large (AUTH, HELLO and the inline forms
+/// all fit in well under a kilobyte), and the full limit applies from the
+/// moment a client authenticates.
+///
+/// `0` means unlimited on either knob; a `0` pre-auth limit falls back to the
+/// general one rather than to "unlimited".
+#[inline]
+pub(crate) fn query_buf_limit(authenticated: bool, limit: usize, preauth_limit: usize) -> usize {
+    if authenticated {
+        return limit;
+    }
+    match (preauth_limit, limit) {
+        (0, l) => l,
+        // Never let the pre-auth ceiling exceed the general one: an operator
+        // who lowers `--client-query-buffer-limit` below the pre-auth default
+        // means the lower number.
+        (p, 0) => p,
+        (p, l) => p.min(l),
+    }
+}
+
+/// True when `len` has passed the resolved ceiling. Always false when the
+/// resolved ceiling is `0` (unlimited).
+#[inline]
+pub(crate) fn query_buf_exceeded(
+    len: usize,
+    authenticated: bool,
+    limit: usize,
+    preauth_limit: usize,
+) -> bool {
+    let resolved = query_buf_limit(authenticated, limit, preauth_limit);
+    resolved != 0 && len > resolved
+}
+
+/// The error moon sends before closing a connection that blew its query
+/// buffer. Redis closes silently (and logs); we say why first, then close —
+/// a silent close on a large pipeline is very hard to tell from a crash.
+pub(crate) const QUERY_BUF_LIMIT_ERROR: &[u8] =
+    b"-ERR Protocol error: query buffer limit reached\r\n";
+
+#[cfg(test)]
+mod query_buf_limit_tests {
+    use super::*;
+
+    #[test]
+    fn preauth_ceiling_is_the_smaller_of_the_two() {
+        // Defaults: 1 GiB general, 64 KiB pre-auth.
+        assert_eq!(query_buf_limit(false, 1 << 30, 64 * 1024), 64 * 1024);
+        assert_eq!(query_buf_limit(true, 1 << 30, 64 * 1024), 1 << 30);
+
+        // An operator who lowers the general limit below the pre-auth default
+        // means the lower number, even before auth.
+        assert_eq!(query_buf_limit(false, 4096, 64 * 1024), 4096);
+
+        // 0 pre-auth = "no separate pre-auth rule", not "unlimited".
+        assert_eq!(query_buf_limit(false, 4096, 0), 4096);
+        // 0 general = unlimited once authenticated, but the pre-auth rule
+        // still binds before that.
+        assert_eq!(query_buf_limit(true, 0, 64 * 1024), 0);
+        assert_eq!(query_buf_limit(false, 0, 64 * 1024), 64 * 1024);
+    }
+
+    #[test]
+    fn exceeded_is_strict_and_honours_unlimited() {
+        // Exactly at the limit is fine; one byte past is not.
+        assert!(!query_buf_exceeded(4096, true, 4096, 0));
+        assert!(query_buf_exceeded(4097, true, 4096, 0));
+
+        // Unlimited on both knobs never trips, at any size.
+        assert!(!query_buf_exceeded(usize::MAX, true, 0, 0));
+        assert!(!query_buf_exceeded(usize::MAX, false, 0, 0));
+
+        // The pre-auth ceiling is what an unauthenticated client hits.
+        assert!(query_buf_exceeded(64 * 1024 + 1, false, 1 << 30, 64 * 1024));
+        assert!(!query_buf_exceeded(64 * 1024 + 1, true, 1 << 30, 64 * 1024));
+    }
+}

@@ -171,12 +171,38 @@ pub async fn handle_connection(
     );
     conn.refresh_acl_cache(&acl_table);
 
+    // c10k C2: arm the query-buffer ceiling. This handler reads through
+    // `Framed`, which loops read -> decode -> read internally and does not
+    // yield while a frame is incomplete — so the ceiling lives in the codec
+    // (see `RespCodec::max_query_buf`) rather than in this loop. A connection
+    // that starts out already authenticated (no requirepass) gets the full
+    // limit immediately; the rest are raised by `arm_query_buf_limit` on
+    // their first successful AUTH/HELLO.
+    let (qbuf_limit, qbuf_preauth) = {
+        let rt = runtime_config.read();
+        (
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
+        )
+    };
+
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
     // Phase 9+ will leverage this for per-request temporaries.
     let mut arena = Bump::with_capacity(4096); // 4KB initial capacity
 
     loop {
+        // c10k C2: re-arm the ceiling every pass rather than at each of the
+        // five AUTH/HELLO success sites — two local loads and a field store,
+        // and it cannot be forgotten when a sixth site appears. It must run
+        // before `framed.next()`, which is exactly here.
+        framed
+            .codec_mut()
+            .set_max_query_buf(super::util::query_buf_limit(
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            ));
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]

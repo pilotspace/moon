@@ -877,6 +877,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // c10k C2: query-buffer ceiling. One check per read iteration, sited
+        // after every read arm and ahead of both parse paths — an incomplete
+        // frame is exactly what makes `read_buf` grow, and an incomplete
+        // frame decodes to nothing, so the loop would otherwise come straight
+        // back here and read more. `$536870911` plus a dribble of bytes pins
+        // half a gigabyte per connection this way, invisible to
+        // `used_memory`, and the auth gate runs after parsing — so it costs
+        // no credentials. Unauthenticated connections get the much smaller
+        // pre-auth ceiling; see `util::query_buf_limit`.
+        {
+            let (limit, preauth) = {
+                let rt = ctx.runtime_config.read();
+                (
+                    rt.client_query_buffer_limit,
+                    rt.client_query_buffer_limit_preauth,
+                )
+            };
+            if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                let (_r, _b): (std::io::Result<usize>, bytes::Bytes) = stream
+                    .write_all(bytes::Bytes::from_static(
+                        super::util::QUERY_BUF_LIMIT_ERROR,
+                    ))
+                    .await;
+                break;
+            }
+        }
+
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
         if conn.authenticated && conn.workspace_id.is_none() {

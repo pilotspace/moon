@@ -1280,6 +1280,8 @@ mod tests {
             client_pause_write_only: false,
             lazyfree_threshold: 64,
             maxclients: 10000,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
             timeout: 0,
             tcp_keepalive: 300,
             num_shards: 1,

@@ -259,6 +259,29 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub timeout: u64,
 
+    /// Maximum size in bytes a single connection's query (input) buffer may
+    /// reach before the connection is closed (0 = unlimited). Redis parity:
+    /// `client-query-buffer-limit`, default 1gb.
+    ///
+    /// c10k hardening C2. Without this the input buffer grows to whatever a
+    /// frame header declares, bounded only by the parser's 512 MiB bulk
+    /// ceiling — and the auth gate runs AFTER parsing, so an
+    /// unauthenticated client can pin half a gigabyte per connection with
+    /// `$536870911` plus a dribble of bytes. That memory sits outside
+    /// `used_memory`, so `maxmemory` never sees it.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    pub client_query_buffer_limit: usize,
+
+    /// Query-buffer ceiling applied to connections that have NOT yet
+    /// authenticated, in bytes (0 = use `--client-query-buffer-limit`).
+    ///
+    /// No legitimate pre-auth command is large: AUTH, HELLO and the inline
+    /// forms all fit in well under a kilobyte. Keeping the unauthenticated
+    /// ceiling small is what makes C2 unreachable without credentials; the
+    /// full limit applies from the moment a client authenticates.
+    #[arg(long, default_value_t = 64 * 1024)]
+    pub client_query_buffer_limit_preauth: usize,
+
     /// TCP keepalive interval in seconds (0 = disabled). Sets SO_KEEPALIVE on accepted sockets.
     #[arg(long = "tcp-keepalive", default_value_t = 300)]
     pub tcp_keepalive: u64,
@@ -1417,6 +1440,8 @@ impl ServerConfig {
             lazyfree_threshold: 64,
             maxclients: self.maxclients,
             timeout: self.timeout,
+            client_query_buffer_limit: self.client_query_buffer_limit,
+            client_query_buffer_limit_preauth: self.client_query_buffer_limit_preauth,
             tcp_keepalive: self.tcp_keepalive,
             // Default to single-shard (no division). The server overwrites this
             // on the shared RuntimeConfig with the resolved shard count once it
@@ -1785,6 +1810,12 @@ pub struct RuntimeConfig {
     pub maxclients: usize,
     /// Close connections idle for more than N seconds (0 = disabled).
     pub timeout: u64,
+    /// Per-connection query (input) buffer ceiling in bytes (0 = unlimited).
+    /// c10k C2; Redis parity `client-query-buffer-limit`.
+    pub client_query_buffer_limit: usize,
+    /// Query-buffer ceiling for not-yet-authenticated connections, in bytes
+    /// (0 = fall back to `client_query_buffer_limit`).
+    pub client_query_buffer_limit_preauth: usize,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
     /// Resolved shard count — used only to derive the per-shard eviction budget.
@@ -1860,6 +1891,8 @@ impl Default for RuntimeConfig {
             lazyfree_threshold: 64,
             maxclients: 10000,
             timeout: 0,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
             tcp_keepalive: 300,
             num_shards: 1,
         }
