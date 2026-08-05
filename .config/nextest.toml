@@ -28,3 +28,13 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(/recall/)'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# The idle-reclaim probe is a MEASUREMENT, not just a pass/fail gate: on Apple
+# platforms it deliberately records whether the host reclaimed or retained
+# rather than failing, because jemalloc's background_thread is compiled out
+# there and no in-process remedy exists (see src/memory_ctl.rs). Captured
+# stdout on a pass would discard the only number the test exists to produce,
+# so surface it either way.
+[[profile.ci.overrides]]
+filter = 'test(/freed_memory_is_returned_to_the_os_when_idle/)'
+success-output = "final"
