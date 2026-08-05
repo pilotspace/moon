@@ -16,7 +16,7 @@
 //! dirty pages jemalloc holds but has not returned; anything still missing
 //! after those is memory moon holds outside the allocator.
 //!
-//! # A hypothesis this module does NOT support
+//! # When the decay lever is needed
 //!
 //! moon bakes `dirty_decay_ms:1000,muzzy_decay_ms:5000,background_thread:true`
 //! into `_rjem_malloc_conf` (see `main.rs`), on the understanding that jemalloc
@@ -64,16 +64,27 @@
 //! tolerates quietly (`background_thread.c` falls back when
 //! `dlsym(RTLD_NEXT, "pthread_create")` returns NULL).
 //!
-//! **It is off by default (`--memory-decay-interval-ms 0`) and it is NOT the
-//! explanation for the instance above.** A 384 MiB churn-and-free on macOS was
-//! measured reclaiming to a 3.7 MiB physical footprint with no decay call at
-//! all: decay runs as a side effect of the frees themselves, so "an idle
-//! process never purges" does not hold for that workload. The missing
-//! background thread is a real gap, but it is unproven against the observed
-//! symptom, and shipping it enabled would be claiming a fix that has not been
-//! demonstrated. Turn it on once `INFO memory` shows that dirty-but-unreturned
-//! pages (`resident - active`) are in fact where the memory went.
-//! `tests/allocator_idle_decay.rs` records the measurement.
+//! Whether going idle reclaims on its own is **platform- and
+//! configuration-dependent, and must not be assumed either way**. Measured:
+//!
+//! * Apple Silicon dev machine, macOS 15.7: 384 MiB churned and freed
+//!   reclaimed to a 3.7 MiB physical footprint with no decay call at all —
+//!   decay ran as a side effect of the frees themselves.
+//! * GitHub macOS CI runner, same commit: the identical churn retained all
+//!   386 MiB indefinitely.
+//!
+//! So retention is real, but not universal. An early version of this module
+//! claimed the "idle never purges" hypothesis had been disproved, on the
+//! strength of the first measurement alone; the second measurement showed that
+//! conclusion was drawn from a sample of one.
+//!
+//! It stays off by default (`--memory-decay-interval-ms 0`) because a default
+//! should not be flipped on a property that varies by platform without knowing
+//! which side a given deployment is on. Build with `--features jemalloc-stats`
+//! and read `allocator_unreturned_bytes`: if it is large and stays large, this
+//! deployment is on the retaining side and wants the lever.
+//! `tests/allocator_idle_decay.rs` asserts the invariant that actually holds —
+//! that one of the two paths must work.
 
 /// jemalloc's `MALLCTL_ARENAS_ALL` (`jemalloc_macros.h`): the pseudo-arena
 /// index that fans an arena ctl out across every arena.

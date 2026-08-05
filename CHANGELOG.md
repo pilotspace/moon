@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a timer. jemalloc's `background_thread` is compiled out on Apple platforms
   (`JEMALLOC_BACKGROUND_THREAD` is only defined when `abi != macho`), so the
   `background_thread:true` moon bakes into its malloc conf is a silent no-op
-  there. Shipped **off and explicitly not claimed as a fix**: a 384 MiB
-  churn-and-free on macOS was measured reclaiming to a 3.7 MiB physical
-  footprint with no decay call at all, because decay also runs as a side effect
-  of allocator activity. Enable it only once `allocator_unreturned_bytes` shows
-  that is actually where the memory went.
+  there. Shipped **off by default because the need for it varies by platform**:
+  the same 384 MiB churn-and-free reclaimed to a 3.7 MiB physical footprint
+  with no decay call on one Apple Silicon machine, and retained all 386 MiB
+  indefinitely on a GitHub macOS runner. Build with `--features jemalloc-stats`
+  and check `allocator_unreturned_bytes` — if it is large and stays large, that
+  deployment is on the retaining side and wants this enabled.
 
 ### Security
 - **Reply writes were unbounded — a client that stops reading held the whole

@@ -118,33 +118,30 @@ fn footprint_floor_over(secs: u64) -> u64 {
 const MB: u64 = 1024 * 1024;
 const CHURN_MB: usize = 384;
 
-/// The property that actually matters, and the one that turned out to hold:
-/// after a large working set is freed, the OS stops charging us for it.
+/// Can moon get freed memory back from the allocator — and if going idle is
+/// not enough, does the decay lever actually work?
 ///
-/// This started life asserting the opposite — that an idle jemalloc on macOS
-/// never purges, so an explicit `arena.<i>.decay` was needed to get the memory
-/// back. That hypothesis was WRONG, and this test is the record of it being
-/// disproved: 384 MiB churned and freed drops the physical footprint to a few
-/// MiB with no decay call at all, because decay also runs as a side effect of
-/// the frees themselves.
+/// This test has been wrong twice, in opposite directions, and the history is
+/// the point:
 ///
-/// Two measurement traps are baked into this file, both of which produced
-/// confident wrong answers before being caught:
+/// 1. First it asserted that an idle jemalloc on macOS never purges. It
+///    "failed" because `ps -o rss` is the wrong instrument there: Darwin
+///    jemalloc is built with `JEMALLOC_PURGE_MADVISE_FREE`, so purged pages
+///    stay *resident* and merely become discardable — RSS reads ~387 MiB where
+///    the physical footprint reads 3.7 MiB.
+/// 2. Then it asserted the opposite — that going idle is always enough —
+///    because on one developer machine 384 MiB churned and freed reclaimed to
+///    3.7 MiB with no decay call at all. That passed locally and FAILED on the
+///    CI macOS runner, which held all 386 MiB. Retention is real; it is just
+///    not universal, so "it reclaimed on my machine" proved nothing.
 ///
-/// 1. `ps -o rss` is the wrong instrument on macOS. jemalloc is built with
-///    `JEMALLOC_PURGE_MADVISE_FREE` on Darwin, so purged pages stay *resident*
-///    and merely become discardable — RSS reads ~387 MiB while the physical
-///    footprint reads 3.7 MiB. `phys_footprint` is what the kernel charges.
-/// 2. Measure the instrument before trusting it. A `vmmap` parse that silently
-///    returns a small number is indistinguishable from a process that
-///    reclaimed perfectly. `footprint_tracks_live_allocations` below exists so
-///    a broken reader fails loudly instead of confirming whatever you hoped.
-///
-/// It remains a real regression guard: if moon ever starts holding freed
-/// memory — an allocator change, a leak, a pool that never shrinks — the
-/// footprint stays up and this fails.
+/// So the property asserted here is the one that is actually invariant and
+/// actually matters: **moon must be able to return freed memory**. Going idle
+/// is allowed to be sufficient (it is on Linux, and on some macOS configs);
+/// where it is not, `decay_all_arenas()` must do the job. A platform where
+/// NEITHER works is the real bug, and that is what fails this test.
 #[test]
-fn freed_memory_stops_being_charged_to_the_process() {
+fn freed_memory_can_be_returned_to_the_os() {
     let baseline = footprint_bytes();
     assert!(
         baseline > 0,
@@ -153,18 +150,55 @@ fn freed_memory_stops_being_charged_to_the_process() {
 
     churn_and_free(CHURN_MB);
 
-    // Generous: decay is not instantaneous, and on Linux this waits for the
-    // background thread rather than doing the work inline.
-    let floor = footprint_floor_over(10);
+    // Leg 1: does going idle suffice on its own?
+    let idle_floor = footprint_floor_over(8);
+    let after_idle = idle_floor.saturating_sub(baseline);
+    if after_idle < 128 * MB {
+        eprintln!(
+            "idle reclaim sufficed: {} MiB retained of {CHURN_MB} MiB              (baseline {} MiB)",
+            after_idle / MB,
+            baseline / MB,
+        );
+        return;
+    }
+
+    // Leg 2: it did not. This is the platform the decay lever exists for —
+    // jemalloc's background_thread is compiled out when `abi == macho`, so
+    // nothing runs decay on a schedule. Drive it the way `memory_ctl::spawn`
+    // does and require the memory back.
+    //
+    // Decay is a two-stage pipeline (dirty --dirty_decay_ms--> muzzy
+    // --muzzy_decay_ms--> released), so a single call is not enough; the loop
+    // must outlast muzzy_decay_ms (5s) for the second stage to fire.
+    eprintln!(
+        "idle reclaim did NOT suffice ({} MiB retained); exercising decay",
+        after_idle / MB
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut floor = u64::MAX;
+    while Instant::now() < deadline {
+        assert!(
+            moon::memory_ctl::decay_all_arenas(),
+            "the decay ctl was rejected by the linked jemalloc"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        floor = floor.min(footprint_bytes());
+        if floor.saturating_sub(baseline) < 128 * MB {
+            break;
+        }
+    }
+
     let retained = floor.saturating_sub(baseline);
     assert!(
         retained < 128 * MB,
-        "after churning and freeing {CHURN_MB} MiB the process is still charged \
-         {} MiB above its {} MiB baseline. Freed memory is not being returned — \
-         on a long-lived instance this is what becomes multi-GB of swapped-out \
-         dirty anonymous memory.",
+        "neither going idle nor an explicit arena decay returned the memory: \
+         still charged {} MiB above a {} MiB baseline after churning and \
+         freeing {CHURN_MB} MiB (idle floor {} MiB). On a long-lived instance \
+         this is what becomes multi-GB of swapped-out dirty anonymous memory, \
+         and it means --memory-decay-interval-ms is not a sufficient remedy.",
         retained / MB,
         baseline / MB,
+        idle_floor / MB,
     );
 }
 

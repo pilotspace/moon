@@ -279,12 +279,13 @@ pub struct ServerConfig {
     /// the `background_thread:true` moon bakes into its malloc conf is a
     /// silent no-op there and nothing runs decay on a schedule.
     ///
-    /// DEFAULT 0 — deliberately off. A 384 MiB churn-and-free on macOS was
-    /// measured reclaiming to a 3.7 MiB physical footprint with no decay call
-    /// at all, because decay also runs as a side effect of allocator activity.
-    /// So this is an available lever, not a proven fix; enable it only once
-    /// `INFO memory` (built with `--features jemalloc-stats`) shows
-    /// `allocator_unreturned_bytes` is actually where your memory went.
+    /// DEFAULT 0 — deliberately off, because whether it is needed varies by
+    /// platform. The same 384 MiB churn-and-free reclaimed to a 3.7 MiB
+    /// footprint with no decay call on one Apple Silicon machine, and retained
+    /// all 386 MiB indefinitely on a GitHub macOS runner. Build with
+    /// `--features jemalloc-stats` and check `allocator_unreturned_bytes`: if
+    /// it is large and stays large, this deployment is on the retaining side
+    /// and wants this enabled.
     #[arg(long, default_value_t = 0)]
     pub memory_decay_interval_ms: u64,
 
