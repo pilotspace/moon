@@ -140,17 +140,32 @@ impl Resp {
         String::from_utf8_lossy(&self.buf).into_owned()
     }
 
-    /// True once the peer has closed (or reset) this socket. Polls for up to
-    /// 2s so a cooperative teardown has time to land.
+    /// True once this session is dead — either the peer already tore the
+    /// socket down, or it refuses to serve another command.
+    ///
+    /// The poke matters. `CLIENT KILL` sets a cooperative `kill_flag` AND
+    /// `shutdown(2)`s the fd, but `force_close_fd` is `#[cfg(unix)]` — on
+    /// Windows only the flag is set, so the connection is torn down when the
+    /// handler next looks at it, i.e. on the client's next command. Asserting
+    /// on a bare `read` therefore passed on unix and failed on Windows, which
+    /// is exactly what CI caught. Sending a PING first exercises the same
+    /// teardown Redis clients see on every platform; on unix the socket is
+    /// already shut down, so the poke fails immediately and costs nothing.
     fn is_closed(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut chunk = [0u8; 4096];
         while Instant::now() < deadline {
+            if self.stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_err() {
+                return true; // EPIPE / ECONNRESET — already gone
+            }
             match self.stream.read(&mut chunk) {
                 Ok(0) => return true,
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                // A killed connection may still drain a reply that was
+                // already queued; keep poking until it stops answering.
+                Ok(_) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(_) => return true, // ECONNRESET and friends
             }
         }
