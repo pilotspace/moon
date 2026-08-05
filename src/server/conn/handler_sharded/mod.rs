@@ -79,10 +79,15 @@ pub(crate) async fn handle_connection_sharded(
 ) {
     let maxclients = ctx.runtime_config.read().maxclients;
     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+        // c10k C3: bounded. Unbounded, a zero-window peer holds this task and
+        // its fd open for as long as it likes, so live fds climb past
+        // maxclients without limit.
         use tokio::io::AsyncWriteExt;
-        let _ = stream
-            .write_all(b"-ERR max number of clients reached\r\n")
-            .await;
+        let _ = tokio::time::timeout(
+            super::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+            stream.write_all(b"-ERR max number of clients reached\r\n"),
+        )
+        .await;
         return;
     }
     let peer_addr = stream

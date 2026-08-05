@@ -268,17 +268,28 @@ pub(crate) fn spawn_tokio_connection(
         tokio::task::spawn_local(async move {
             // maxclients check for TLS connections (plain TCP checks in handle_connection_sharded)
             if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                tracing::warn!(
-                    "Shard {}: TLS connection rejected: maxclients reached",
-                    shard_id
-                );
+                // c10k C3: rate-limited (see the plaintext site below).
+                if let Some(suppressed) = crate::server::conn::util::maxclients_warn_due(
+                    crate::storage::entry::current_time_ms(),
+                ) {
+                    tracing::warn!(
+                        "Shard {}: TLS connection rejected: maxclients reached                          ({} further rejections suppressed since the last line)",
+                        shard_id,
+                        suppressed
+                    );
+                }
                 // c10k W3 Redis parity: loud rejection. The plaintext write
                 // surfaces client-side as a handshake failure (best effort).
+                // c10k C3: bounded — this one awaits INLINE on the accept
+                // path, so an unbounded write parks every subsequent accept
+                // on this shard behind one zero-window peer.
                 use tokio::io::AsyncWriteExt;
                 let mut rejected = tcp_stream;
-                let _ = rejected
-                    .write_all(b"-ERR max number of clients reached\r\n")
-                    .await;
+                let _ = tokio::time::timeout(
+                    crate::server::conn::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+                    rejected.write_all(b"-ERR max number of clients reached\r\n"),
+                )
+                .await;
                 return;
             }
             // R-3: capture the underlying TCP fd before the handshake moves the
@@ -597,18 +608,38 @@ pub(crate) fn spawn_monoio_connection(
             // close. The slot was never taken, so no record_connection_closed.
             let maxclients = runtime_config.read().maxclients;
             if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                tracing::warn!(
-                    "Shard {}: connection rejected: maxclients reached",
-                    shard_id
-                );
+                // c10k C3: one line per second, carrying the count it stands
+                // for. Being at maxclients is exactly when connections arrive
+                // fastest, so a line per rejection floods the log with the
+                // symptom and competes for the I/O needed to diagnose it.
+                if let Some(suppressed) = crate::server::conn::util::maxclients_warn_due(
+                    crate::storage::entry::current_time_ms(),
+                ) {
+                    tracing::warn!(
+                        "Shard {}: connection rejected: maxclients reached                          ({} further rejections suppressed since the last line)",
+                        shard_id,
+                        suppressed
+                    );
+                }
                 monoio::spawn(async move {
                     use monoio::io::AsyncWriteRentExt;
                     let mut rejected = tcp_stream;
-                    let (_res, _buf) = rejected
-                        .write_all(bytes::Bytes::from_static(
-                            b"-ERR max number of clients reached\r\n",
-                        ))
-                        .await;
+                    // c10k C3: bounded. This 36-byte write was untimed, so a
+                    // zero-window peer parked the task and held the rejected
+                    // fd open indefinitely — live fds climb past maxclients
+                    // without limit, defeating the gate and the RLIMIT_NOFILE
+                    // reconciliation behind it.
+                    let _ = monoio::time::timeout(
+                        crate::server::conn::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+                        async {
+                            let (_res, _buf) = rejected
+                                .write_all(bytes::Bytes::from_static(
+                                    b"-ERR max number of clients reached\r\n",
+                                ))
+                                .await;
+                        },
+                    )
+                    .await;
                     // drop closes the fd
                 });
                 return;

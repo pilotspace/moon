@@ -262,3 +262,76 @@ mod query_buf_limit_tests {
         assert!(!query_buf_exceeded(64 * 1024 + 1, true, 1 << 30, 64 * 1024));
     }
 }
+
+/// How long the `maxclients` rejection write may take before we give up and
+/// close (c10k C3).
+///
+/// The reject is 36 bytes, so any peer that is reading at all completes it
+/// instantly. A peer that advertises a zero window never does — and the write
+/// was unbounded and untimed, so the rejected fd stayed open for as long as
+/// the attacker cared to hold it. That defeats the whole point of the gate:
+/// live fds climb past `maxclients` without limit, which is exactly what the
+/// RLIMIT_NOFILE reconciliation is there to prevent. Two seconds is far more
+/// than a healthy client needs and far less than an attacker wants.
+pub(crate) const MAXCLIENTS_REJECT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+static MAXCLIENTS_WARN_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAXCLIENTS_WARN_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Rate-limit the "maxclients reached" warning to at most one per second,
+/// returning the number of warnings suppressed since the last emit.
+///
+/// c10k C3. Being at `maxclients` is precisely the state in which
+/// connections arrive fastest, and every rejection logged a line — so the
+/// symptom (a full connection table) produced an unbounded log flood that
+/// competes for the very I/O needed to diagnose it. Returning the suppressed
+/// count keeps the signal: one line per second that says how many others it
+/// stands for.
+pub(crate) fn maxclients_warn_due(now_ms: u64) -> Option<u64> {
+    let last = MAXCLIENTS_WARN_LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1000 {
+        MAXCLIENTS_WARN_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    // Lost CAS = another thread is emitting this second's line; count as
+    // suppressed rather than emitting twice.
+    if MAXCLIENTS_WARN_LAST_MS
+        .compare_exchange(
+            last,
+            now_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        MAXCLIENTS_WARN_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    Some(MAXCLIENTS_WARN_SUPPRESSED.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod maxclients_warn_tests {
+    use super::*;
+
+    #[test]
+    fn warn_is_rate_limited_to_one_per_second_and_reports_the_gap() {
+        // Serialized against the process-wide statics by running the whole
+        // sequence in one test; `now_ms` is a parameter, so no sleeping.
+        MAXCLIENTS_WARN_LAST_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        MAXCLIENTS_WARN_SUPPRESSED.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // First rejection of the storm emits, standing for nothing yet.
+        assert_eq!(maxclients_warn_due(10_000), Some(0));
+        // The next 999 ms are swallowed...
+        for t in 10_001..10_999 {
+            assert_eq!(maxclients_warn_due(t), None);
+        }
+        // ...and the next emit says how many it stands for.
+        assert_eq!(maxclients_warn_due(11_000), Some(998));
+        // The counter resets with each emit.
+        assert_eq!(maxclients_warn_due(12_000), Some(0));
+    }
+}
