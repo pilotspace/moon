@@ -137,6 +137,40 @@ pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
 /// growth for genuinely large frames in flight.
 pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
 
+/// Reply size at or above which a write arms the `--client-write-timeout-ms`
+/// watchdog (c10k C1).
+///
+/// Arming a timer costs a wheel insert + removal on EVERY batch flush. At
+/// pipeline depth 1 that lands once per command, on the path this project
+/// spent a whole milestone winning against Redis — so it must not be paid
+/// where it cannot buy anything.
+///
+/// A reply that fits in the socket buffer is handed to the kernel and returns
+/// without ever blocking, so no timeout can fire for it. Linux's default
+/// `net.core.wmem_default` is 208 KiB and autotuning only raises it; 256 KiB
+/// is therefore comfortably inside "this write will not block".
+///
+/// Residual, stated plainly rather than hidden: a SMALL write to a socket
+/// whose window is genuinely closed is still unbounded. It holds at most this
+/// many bytes instead of the hundreds of megabytes C1 is about, but it does
+/// keep its `maxclients` slot. That connection is now visible (`omem` > 0 in
+/// CLIENT LIST) and killable (`CLIENT KILL` shuts the fd down, which makes the
+/// blocked write return), which it was not before.
+pub(crate) const WRITE_TIMEOUT_MIN_BYTES: usize = 256 * 1024;
+
+/// Should this write arm the stall watchdog? `None` means "write unbounded".
+#[inline]
+pub(crate) fn arm_write_timeout(
+    pending: usize,
+    configured: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if pending >= WRITE_TIMEOUT_MIN_BYTES {
+        configured
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod shrink_tests {
     use super::*;
@@ -333,5 +367,40 @@ mod maxclients_warn_tests {
         assert_eq!(maxclients_warn_due(11_000), Some(998));
         // The counter resets with each emit.
         assert_eq!(maxclients_warn_due(12_000), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod write_timeout_gate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const WT: Option<Duration> = Some(Duration::from_millis(60_000));
+
+    #[test]
+    fn small_writes_never_arm_the_timer() {
+        // The p=1 hot path: a +OK, a bulk string, a small batch. None of these
+        // can block on a healthy socket, so none may pay for a timer.
+        for n in [0, 5, 64, 4096, WRITE_TIMEOUT_MIN_BYTES - 1] {
+            assert_eq!(arm_write_timeout(n, WT), None, "{n} bytes must not arm");
+        }
+    }
+
+    #[test]
+    fn writes_that_can_block_do_arm() {
+        for n in [
+            WRITE_TIMEOUT_MIN_BYTES,
+            WRITE_TIMEOUT_MIN_BYTES + 1,
+            64 << 20,
+        ] {
+            assert_eq!(arm_write_timeout(n, WT), WT, "{n} bytes must arm");
+        }
+    }
+
+    #[test]
+    fn disabled_stays_disabled_regardless_of_size() {
+        // `--client-write-timeout-ms 0` means wait forever, and the size gate
+        // must not resurrect a timeout the operator turned off.
+        assert_eq!(arm_write_timeout(1 << 30, None), None);
     }
 }

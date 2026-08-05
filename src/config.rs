@@ -288,6 +288,19 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 60_000)]
     pub client_write_timeout_ms: u64,
 
+    /// Refuse to buffer a command reply larger than this many bytes and
+    /// close the connection instead (0 = unlimited).
+    ///
+    /// c10k hardening C1, Redis's `client-output-buffer-limit normal <hard>`.
+    /// This DIVERGES from Redis deliberately: Redis defaults the normal class
+    /// to unlimited, which is why an unread-socket OOM is reachable there too.
+    /// A client that asks for more than this in one batch is disconnected —
+    /// including a single value larger than the cap, which is therefore
+    /// undeliverable. Raise it for workloads that legitimately stream very
+    /// large replies.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    pub client_output_buffer_limit_normal: usize,
+
     /// Query-buffer ceiling applied to connections that have NOT yet
     /// authenticated, in bytes (0 = use `--client-query-buffer-limit`).
     ///
@@ -1459,6 +1472,7 @@ impl ServerConfig {
             client_query_buffer_limit: self.client_query_buffer_limit,
             client_query_buffer_limit_preauth: self.client_query_buffer_limit_preauth,
             client_write_timeout_ms: self.client_write_timeout_ms,
+            client_output_buffer_limit_normal: self.client_output_buffer_limit_normal,
             tcp_keepalive: self.tcp_keepalive,
             // Default to single-shard (no division). The server overwrites this
             // on the shared RuntimeConfig with the resolved shard count once it
@@ -1836,6 +1850,9 @@ pub struct RuntimeConfig {
     /// Abandon a reply write that stalls for this many ms (0 = wait forever).
     /// c10k C1 — see `ServerConfig::client_write_timeout_ms`.
     pub client_write_timeout_ms: u64,
+    /// Reply-size ceiling for normal clients, in bytes (0 = unlimited).
+    /// c10k C1 — see `ServerConfig::client_output_buffer_limit_normal`.
+    pub client_output_buffer_limit_normal: usize,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
     /// Resolved shard count — used only to derive the per-shard eviction budget.
@@ -1914,6 +1931,7 @@ impl Default for RuntimeConfig {
             client_query_buffer_limit: 1024 * 1024 * 1024,
             client_query_buffer_limit_preauth: 64 * 1024,
             client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             tcp_keepalive: 300,
             num_shards: 1,
         }

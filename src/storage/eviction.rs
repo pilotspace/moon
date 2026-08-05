@@ -1283,6 +1283,7 @@ mod tests {
             client_query_buffer_limit: 1024 * 1024 * 1024,
             client_query_buffer_limit_preauth: 64 * 1024,
             client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             timeout: 0,
             tcp_keepalive: 300,
             num_shards: 1,

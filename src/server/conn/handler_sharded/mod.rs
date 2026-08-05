@@ -19,29 +19,44 @@
 /// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
 /// wait-forever behaviour.
 macro_rules! write_all_bounded {
-    ($stream:expr, $buf:expr, $wt:expr, $live:expr, $client_id:expr) => {{
+    ($stream:expr, $buf:expr, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
         let buf = $buf;
         let pending = buf.len();
-        // c10k C1: publish what this connection is holding, so a stalled reply
-        // is visible in CLIENT LIST (`obl`/`omem`) while it happens.
-        $live.begin_write(pending);
-        let ok = match $wt {
-            None => $stream.write_all(buf).await.is_ok(),
-            Some(dur) => match tokio::time::timeout(dur, $stream.write_all(buf)).await {
-                Ok(r) => r.is_ok(),
-                Err(_) => {
-                    tracing::warn!(
-                        "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
-                        $client_id,
-                        dur.as_millis(),
-                        pending,
-                    );
-                    false
-                }
-            },
-        };
-        $live.end_write(pending, ok);
-        ok
+        if $cap != 0 && pending > $cap {
+            // c10k C1: see the monoio handler's copy of this macro.
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            // Publish what this connection is holding, so a stalled reply is
+            // visible in CLIENT LIST (`obl`/`omem`) while it happens.
+            $live.begin_write(pending);
+            // c10k C1: only a write big enough to actually block arms the
+            // watchdog. A timer per batch flush would land once per command
+            // at pipeline depth 1 and buy nothing there — a reply that fits
+            // in the socket buffer never blocks. See `util::arm_write_timeout`.
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => $stream.write_all(buf).await.is_ok(),
+                Some(dur) => match tokio::time::timeout(dur, $stream.write_all(buf)).await {
+                    Ok(r) => r.is_ok(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                            $client_id,
+                            dur.as_millis(),
+                            pending,
+                        );
+                        false
+                    }
+                },
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
     }};
 }
 
@@ -403,9 +418,15 @@ pub(crate) async fn handle_connection_sharded_inner<
 
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once alongside the idle timeout — never on the hot path.
-    let write_timeout = match ctx.runtime_config.read().client_write_timeout_ms {
-        0 => None,
-        ms => Some(std::time::Duration::from_millis(ms)),
+    let (write_timeout, out_cap_normal) = {
+        let rt = ctx.runtime_config.read();
+        (
+            match rt.client_write_timeout_ms {
+                0 => None,
+                ms => Some(std::time::Duration::from_millis(ms)),
+            },
+            rt.client_output_buffer_limit_normal,
+        )
     };
 
     let mut break_outer = false;
@@ -1113,7 +1134,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -2282,7 +2303,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) {
+                if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                     return (HandlerResult::Done, None);
                 }
 
@@ -2346,7 +2367,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(push_frame) = push {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) {
+                    if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                         break;
                     }
                 }

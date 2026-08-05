@@ -52,7 +52,7 @@ impl Drop for Moon {
 
 /// `write_timeout_ms` is passed through verbatim so a test can also assert the
 /// *disabled* (0) behaviour without a second spawn helper.
-fn spawn_moon(tag: &str, shards: &str, write_timeout_ms: &str) -> Option<Moon> {
+fn spawn_moon(tag: &str, shards: &str, write_timeout_ms: &str, extra: &[&str]) -> Option<Moon> {
     let bin = moon_binary()?;
     let tmp_dir = std::env::temp_dir().join(format!(
         "moon-write-timeout-{}-{tag}-{shards}",
@@ -79,6 +79,7 @@ fn spawn_moon(tag: &str, shards: &str, write_timeout_ms: &str) -> Option<Moon> {
                 "--dir",
                 tmp_dir.to_str().expect("utf8 tmp dir"),
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -198,7 +199,7 @@ fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
 
 fn run_stalled_write_is_abandoned(shards: &str) {
     // 1.5s: long enough that no healthy client trips it, short enough to test.
-    let Some(moon) = spawn_moon("stall", shards, "1500") else {
+    let Some(moon) = spawn_moon("stall", shards, "1500", &[]) else {
         return; // binary missing — skip
     };
     let tag = format!("[shards={shards}]");
@@ -243,7 +244,7 @@ fn run_stalled_write_is_abandoned(shards: &str) {
 /// The escape hatch has to actually work: `0` means "wait forever", the
 /// pre-C1 behaviour, for operators who would rather stall than drop a reply.
 fn run_zero_disables(shards: &str) {
-    let Some(moon) = spawn_moon("zero", shards, "0") else {
+    let Some(moon) = spawn_moon("zero", shards, "0", &[]) else {
         return; // binary missing — skip
     };
     let tag = format!("[shards={shards}]");
@@ -300,4 +301,100 @@ fn stalled_write_is_abandoned_multi_shard() {
 #[test]
 fn write_timeout_zero_disables_single_shard() {
     run_zero_disables("1");
+}
+
+/// A reply larger than `--client-output-buffer-limit-normal` must be refused
+/// outright rather than buffered.
+///
+/// This is the size half of C1, and it deliberately diverges from Redis, whose
+/// normal class defaults to UNLIMITED — which is precisely why an unread
+/// socket can OOM it. moon ships a real 256 MiB ceiling; the test drives a
+/// 1 MiB one so it can prove the mechanism without allocating a quarter of a
+/// gigabyte.
+///
+/// Note the consequence, which is real and intended: the cap applies to the
+/// whole serialized reply, so a SINGLE value larger than the cap is
+/// undeliverable, not merely a long pipeline.
+fn run_output_cap(shards: &str) {
+    let Some(moon) = spawn_moon(
+        "outcap",
+        shards,
+        "0",
+        &["--client-output-buffer-limit-normal", "1048576"],
+    ) else {
+        return; // binary missing — skip
+    };
+    let tag = format!("[shards={shards}]");
+
+    let mut c = Resp::connect(moon.port);
+
+    // Comfortably under the 1 MiB cap: must work, so we know the cap is not
+    // simply breaking everything.
+    let small = "y".repeat(64 * 1024);
+    assert!(
+        c.cmd(&["SET", "small", &small]).contains("+OK"),
+        "{tag} SET small failed"
+    );
+    let r = c.cmd(&["GET", "small"]);
+    assert!(
+        r.starts_with(&format!("${}", small.len())),
+        "{tag} a reply under the cap must be delivered, got {:?}",
+        &r[..r.len().min(64)]
+    );
+
+    // Now ask for more than the cap in one reply. 8 x 256 KiB = 2 MiB.
+    let big = "z".repeat(256 * 1024);
+    assert!(
+        c.cmd(&["SET", "big", &big]).contains("+OK"),
+        "{tag} SET big failed"
+    );
+    let mut pipeline = Vec::new();
+    for _ in 0..8 {
+        pipeline.extend_from_slice(&encode(&["GET", "big"]));
+    }
+    c.stream.write_all(&pipeline).expect("pipeline write");
+
+    // The server must close rather than buffer 2 MiB. Poke until it stops
+    // answering — same reasoning as the ACL revocation suite: on Windows the
+    // teardown is observed on the next command, not as a spontaneous EOF.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    let mut chunk = [0u8; 8192];
+    while Instant::now() < deadline {
+        match c.stream.read(&mut chunk) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if c.stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_err() {
+                    closed = true;
+                    break;
+                }
+            }
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        closed,
+        "{tag} a reply exceeding --client-output-buffer-limit-normal must close \
+         the connection instead of being buffered"
+    );
+}
+
+#[test]
+fn output_buffer_limit_refuses_oversized_reply_single_shard() {
+    run_output_cap("1");
+}
+
+#[test]
+fn output_buffer_limit_refuses_oversized_reply_multi_shard() {
+    run_output_cap("4");
 }

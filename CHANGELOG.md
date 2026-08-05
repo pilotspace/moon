@@ -37,6 +37,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own a client-registry entry (monoio top-level and sharded); the legacy tokio
   `handler_single` path bounds its writes but does not register, so it has
   nothing to report through.
+- **No size ceiling on a reply (c10k C1).** Adds
+  `--client-output-buffer-limit-normal`, Redis's
+  `client-output-buffer-limit normal <hard>`, and ships it at **256 MiB rather
+  than Redis's unlimited default** — that default is exactly why an unread
+  socket can OOM Redis too. A reply exceeding the cap is refused and the
+  connection closed instead of buffering it. Consequence, intended and worth
+  knowing: the cap covers the whole serialized reply, so a single value larger
+  than the cap is undeliverable, not merely a long pipeline. No pub/sub-class
+  knob ships: moon's only subscriber write is already hard-capped at 64 KiB by
+  `MAX_COALESCE_BYTES`, so such a knob could never fire, and the real pub/sub
+  backpressure is the 4096-slot bounded channel (`CONN_CHANNEL_CAPACITY`) —
+  which bounds message COUNT, not bytes, and is a genuine follow-up.
+- **The write watchdog no longer arms on the hot path.** A timer per batch
+  flush would land once per command at pipeline depth 1, the path this project
+  spent a milestone winning against Redis. A reply that fits in the socket
+  buffer cannot block, so only writes ≥ 256 KiB arm the watchdog now
+  (`util::arm_write_timeout`). Residual, stated rather than hidden: a small
+  write to a genuinely wedged socket is still unbounded — it holds at most
+  256 KiB instead of hundreds of MB, but keeps its `maxclients` slot. It is now
+  visible (`omem` > 0) and killable (`CLIENT KILL` shuts the fd down), which it
+  was not before.
 - **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
   Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
   `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so
