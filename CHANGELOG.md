@@ -19,16 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OFF by default — jemalloc's stats add bookkeeping to every allocation. Fields
   are absent rather than zero-filled when not built in, because a zero would
   read as "no fragmentation", which is worse than "not measured".
-- **`--memory-decay-interval-ms` (default 0, off)** runs a jemalloc arena decay
-  on a timer. jemalloc's `background_thread` is compiled out on Apple platforms
-  (`JEMALLOC_BACKGROUND_THREAD` is only defined when `abi != macho`), so the
-  `background_thread:true` moon bakes into its malloc conf is a silent no-op
-  there. Shipped **off by default because the need for it varies by platform**:
-  the same 384 MiB churn-and-free reclaimed to a 3.7 MiB physical footprint
-  with no decay call on one Apple Silicon machine, and retained all 386 MiB
-  indefinitely on a GitHub macOS runner. Build with `--features jemalloc-stats`
-  and check `allocator_unreturned_bytes` — if it is large and stays large, that
-  deployment is on the retaining side and wants this enabled.
+
+### Known issues
+- **An idle moon may not return freed memory to the OS on Apple platforms, and
+  there is no in-process fix.** jemalloc's `background_thread` is compiled out
+  when `abi == macho` (`JEMALLOC_BACKGROUND_THREAD` is only defined otherwise),
+  so the `background_thread:true` moon bakes into its malloc conf is a silent
+  no-op there and decay runs only as a side effect of allocator activity. The
+  same 384 MiB churn-and-free reclaimed to a 3.7 MiB physical footprint on one
+  Apple Silicon machine and retained all 386 MiB indefinitely on a GitHub macOS
+  runner, so the behaviour varies by machine. A `--memory-decay-interval-ms`
+  timer calling `mallctl("arena.4096.decay")` — the same call jemalloc's own
+  background thread makes — was implemented and then **removed after it failed
+  to reclaim anything on the runner that reproduces the retention**, across 30
+  seconds of driving it and three independent retries, while the ctl itself
+  returned success. Production targets Linux, where the background thread is
+  compiled in and the retention has not been observed; on macOS, build with
+  `--features jemalloc-stats` and watch `allocator_unreturned_bytes` to tell
+  whether a given host is affected.
 
 ### Security
 - **Reply writes were unbounded — a client that stops reading held the whole

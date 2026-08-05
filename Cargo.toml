@@ -102,13 +102,15 @@ levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional
 #   cargo build --no-default-features --features runtime-tokio,jemalloc   # force Tokio
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc", "graph", "text-index"]
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Compile jemalloc with --enable-stats and expose its counters through
 # `INFO memory` (Redis-compatible `allocator_*` field names). OFF by default:
 # jemalloc's stats add bookkeeping to every allocation, which this project
 # will not pay on the hot path unconditionally. Build with it when you need
 # to answer "why is RSS N times used_memory" — see src/memory_ctl.rs.
-jemalloc-stats = ["jemalloc", "tikv-jemalloc-ctl/stats", "tikv-jemalloc-sys/stats"]
+# Only `jemalloc-stats` needs the -sys crate: no Rust code calls it directly,
+# it is here solely to turn on jemalloc's `stats` build option.
+jemalloc-stats = ["jemalloc", "dep:tikv-jemalloc-sys", "tikv-jemalloc-ctl/stats", "tikv-jemalloc-sys/stats"]
 # Opt-in alternate allocator. Mutually exclusive with `jemalloc`.
 # Usage:
 #   cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index

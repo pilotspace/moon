@@ -1,5 +1,5 @@
-//! Allocator introspection and control: the `mallctl` surface moon needs to
-//! answer "where did the memory go", plus the decay lever to act on the answer.
+//! Allocator introspection: the `mallctl` surface moon needs to answer "where
+//! did the memory go".
 //!
 //! # Why this exists
 //!
@@ -16,11 +16,12 @@
 //! dirty pages jemalloc holds but has not returned; anything still missing
 //! after those is memory moon holds outside the allocator.
 //!
-//! # When the decay lever is needed
+//! # Known limitation: idle retention on Apple platforms
 //!
 //! moon bakes `dirty_decay_ms:1000,muzzy_decay_ms:5000,background_thread:true`
 //! into `_rjem_malloc_conf` (see `main.rs`), on the understanding that jemalloc
-//! hands dirty pages back about a second after they go idle.
+//! hands dirty pages back about a second after they go idle. That understanding
+//! does not hold everywhere.
 //!
 //! `background_thread` is not portable. From jemalloc's own `configure.ac`:
 //!
@@ -34,151 +35,42 @@
 //! `abi != macho` — on Apple platforms the macro is never defined and
 //! `background_threads_enable` compiles down to `not_reached()`. The option is
 //! still *accepted* (so `abort_conf:true` does not fire and nothing is logged),
-//! it simply does nothing.
+//! it simply does nothing. Without that thread, jemalloc runs decay only as a
+//! side effect of allocator activity in the arena being used, so a process that
+//! goes quiet may never purge — exactly the shape moon is built for: a
+//! long-lived cache that peaks during an index build or a compaction and then
+//! idles.
 //!
-//! Without that thread, jemalloc runs decay only as a side effect of allocator
-//! activity in the arena being used. A process that goes quiet therefore never
-//! purges — which is exactly the shape moon is built for: a long-lived cache
-//! that peaks during an index build or a compaction and then idles.
+//! # What was measured, including the remedy that did not work
 //!
-//! Measured on a real instance, 6.8 days uptime, macOS, jemalloc build:
-//! logical dataset 2.43 GB, but 7.4 GB of dirty anonymous memory across 37,474
-//! regions, physical footprint peaked at 8.5 GB and never came back down. The
-//! OS had swapped 7.2 GB of it out — the process was the largest single
-//! consumer of the machine's swap while `ps` showed a healthy-looking 183 MB
-//! RSS, because RSS does not count what has been paged out.
+//! Whether going idle reclaims is **platform- and configuration-dependent and
+//! must not be assumed either way**. Churning and freeing 384 MiB:
 //!
-//! # The fix
+//! * Apple Silicon dev machine, macOS 15.7: reclaimed to a 3.7 MiB physical
+//!   footprint with no intervention — decay ran as a side effect of the frees.
+//! * GitHub macOS CI runner, same commit: retained all 386 MiB indefinitely.
 //!
-//! Re-implement the missing thread: one low-frequency housekeeping thread that
-//! asks jemalloc to run decay. `arena.<i>.decay` is precisely what the
-//! background thread invokes, and it *respects* `dirty_decay_ms` — it returns
-//! only pages that have genuinely been idle long enough, unlike
-//! `arena.<i>.purge`, which would discard the allocator's whole dirty cache and
-//! force it to re-fault pages back in under load.
+//! An earlier revision of this module shipped a `--memory-decay-interval-ms`
+//! lever: a housekeeping thread calling `mallctl("arena.4096.decay")`, which is
+//! precisely what jemalloc's own background thread invokes. **It was removed
+//! after measurement showed it does not work on the platform that needs it.**
+//! On the retaining CI runner, driving that ctl in a loop for 30 seconds
+//! reclaimed nothing — the footprint stayed 386 MiB above baseline across three
+//! independent retries — while `mallctl` itself returned success and a
+//! separately-validated footprint instrument confirmed the measurement. Shipping
+//! it would have meant an `unsafe` FFI block and a documented knob that silently
+//! fails wherever it is actually needed.
 //!
-//! This runs on every jemalloc build, not just Apple ones. On Linux the
-//! background thread has usually already done the work, so the call finds
-//! nothing to do and costs one `mallctl` per second — and it covers the case
-//! where the background thread silently fails to start, which jemalloc also
-//! tolerates quietly (`background_thread.c` falls back when
-//! `dlsym(RTLD_NEXT, "pthread_create")` returns NULL).
+//! So there is currently **no in-process remedy** for idle retention on the
+//! affected platforms. What this module provides instead is the ability to *see*
+//! it: build with `--features jemalloc-stats` and watch
+//! `allocator_unreturned_bytes`. If it is large and stays large while the
+//! instance is quiet, that deployment is on the retaining side, and the
+//! mitigations are external — restart cadence, or `MALLOC_CONF` tuning at the
+//! operator's discretion. `tests/allocator_idle_decay.rs` records the finding.
 //!
-//! Whether going idle reclaims on its own is **platform- and
-//! configuration-dependent, and must not be assumed either way**. Measured:
-//!
-//! * Apple Silicon dev machine, macOS 15.7: 384 MiB churned and freed
-//!   reclaimed to a 3.7 MiB physical footprint with no decay call at all —
-//!   decay ran as a side effect of the frees themselves.
-//! * GitHub macOS CI runner, same commit: the identical churn retained all
-//!   386 MiB indefinitely.
-//!
-//! So retention is real, but not universal. An early version of this module
-//! claimed the "idle never purges" hypothesis had been disproved, on the
-//! strength of the first measurement alone; the second measurement showed that
-//! conclusion was drawn from a sample of one.
-//!
-//! It stays off by default (`--memory-decay-interval-ms 0`) because a default
-//! should not be flipped on a property that varies by platform without knowing
-//! which side a given deployment is on. Build with `--features jemalloc-stats`
-//! and read `allocator_unreturned_bytes`: if it is large and stays large, this
-//! deployment is on the retaining side and wants the lever.
-//! `tests/allocator_idle_decay.rs` asserts the invariant that actually holds —
-//! that one of the two paths must work.
-
-/// jemalloc's `MALLCTL_ARENAS_ALL` (`jemalloc_macros.h`): the pseudo-arena
-/// index that fans an arena ctl out across every arena.
-#[cfg(all(feature = "jemalloc", test))]
-const MALLCTL_ARENAS_ALL: usize = 4096;
-
-/// `arena.4096.decay`, NUL-terminated for the C API.
-///
-/// Written out rather than formatted so the hot call allocates nothing and the
-/// constant is verifiable by eye against `MALLCTL_ARENAS_ALL` above; the unit
-/// test below pins the two together.
-#[cfg(feature = "jemalloc")]
-const ARENA_ALL_DECAY: &[u8] = b"arena.4096.decay\0";
-
-/// Ask jemalloc to run decay across all arenas. Returns `false` if the ctl was
-/// rejected (which would mean this build's jemalloc does not have the ctl —
-/// worth knowing, but never worth failing on).
-///
-/// # Soundness
-///
-/// `mallctl` is jemalloc's thread-safe control entry point. `ARENA_ALL_DECAY`
-/// is a `'static` NUL-terminated byte string, so the name pointer is valid for
-/// the whole call and outlives it. `arena.<i>.decay` is declared
-/// `NEITHER_READ_NOR_WRITE()` in jemalloc's `ctl.c`, which returns `EPERM`
-/// unless `oldp`, `oldlenp` and `newp` are all NULL and `newlen` is 0 —
-/// exactly what is passed below. No buffer is read or written by jemalloc on
-/// this path, so there is nothing for the caller to size, own, or keep alive.
-#[cfg(feature = "jemalloc")]
-pub fn decay_all_arenas() -> bool {
-    // SAFETY: see "Soundness" above — a 'static NUL-terminated name and the
-    // all-NULL/zero-length argument set that `NEITHER_READ_NOR_WRITE()`
-    // requires; jemalloc neither reads nor writes a caller buffer here.
-    let rc = unsafe {
-        tikv_jemalloc_sys::mallctl(
-            ARENA_ALL_DECAY.as_ptr().cast::<std::ffi::c_char>(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    rc == 0
-}
-
-/// Non-jemalloc builds have nothing to decay.
-#[cfg(not(feature = "jemalloc"))]
-pub fn decay_all_arenas() -> bool {
-    false
-}
-
-/// Start the housekeeping thread. `interval_ms == 0` disables it.
-///
-/// A plain OS thread, deliberately: this must be independent of which async
-/// runtime is compiled in, must not sit on a shard thread (where a purge would
-/// show up as command latency), and must keep running while every shard is
-/// parked — the idle case is the one that matters.
-///
-/// The thread is detached and runs for the lifetime of the process. It holds
-/// no state and touches nothing but the allocator, so there is nothing to
-/// unwind at shutdown.
-pub fn spawn(interval_ms: u64) {
-    if interval_ms == 0 {
-        tracing::debug!("memory decay thread disabled (interval 0)");
-        return;
-    }
-    if !cfg!(feature = "jemalloc") {
-        // mimalloc has no equivalent ctl in this codebase; saying so once is
-        // better than a thread that spins doing nothing.
-        tracing::debug!("memory decay thread not started: non-jemalloc build");
-        return;
-    }
-    let interval = std::time::Duration::from_millis(interval_ms);
-    let spawned = std::thread::Builder::new()
-        .name("moon-decay".into())
-        .spawn(move || {
-            // First call is deferred by one interval: at startup there is
-            // nothing idle yet, and the allocator is busy warming up.
-            loop {
-                std::thread::sleep(interval);
-                if !decay_all_arenas() {
-                    tracing::warn!(
-                        "jemalloc arena decay ctl rejected; stopping the decay \
-                         thread (freed memory will not be returned to the OS \
-                         while this process is idle)"
-                    );
-                    return;
-                }
-            }
-        });
-    match spawned {
-        Ok(_) => tracing::info!("memory decay thread started ({}ms)", interval_ms),
-        Err(e) => tracing::warn!("could not start memory decay thread: {e}"),
-    }
-}
+//! Production deployments target Linux (see `CLAUDE.md`), where the background
+//! thread is compiled in and the retention has not been observed.
 
 /// A snapshot of jemalloc's own accounting, in bytes.
 ///
@@ -271,43 +163,4 @@ pub fn jemalloc_stats() -> Option<JemallocStats> {
 #[cfg(not(feature = "jemalloc-stats"))]
 pub fn jemalloc_stats() -> Option<()> {
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The ctl name is hand-written; if `MALLCTL_ARENAS_ALL` ever changes, the
-    /// string would silently start addressing a real arena index instead of
-    /// "all arenas" — a bug that would look like a partial fix.
-    #[cfg(feature = "jemalloc")]
-    #[test]
-    fn ctl_name_matches_the_arenas_all_constant() {
-        let expected = format!("arena.{MALLCTL_ARENAS_ALL}.decay\0");
-        assert_eq!(
-            ARENA_ALL_DECAY,
-            expected.as_bytes(),
-            "the hardcoded ctl name drifted from MALLCTL_ARENAS_ALL"
-        );
-    }
-
-    /// The ctl must actually exist and be accepted by the linked jemalloc.
-    /// This is the assertion that catches a jemalloc upgrade renaming or
-    /// re-typing it — without it, `decay_all_arenas` could return false
-    /// forever and the only symptom would be memory growth in production.
-    #[cfg(feature = "jemalloc")]
-    #[test]
-    fn decay_ctl_is_accepted_by_the_linked_jemalloc() {
-        assert!(
-            decay_all_arenas(),
-            "mallctl(\"arena.4096.decay\") was rejected — the ctl this fix \
-             depends on is not available in the linked jemalloc"
-        );
-    }
-
-    /// Disabling must not start a thread, and must not panic.
-    #[test]
-    fn zero_interval_is_a_no_op() {
-        spawn(0);
-    }
 }

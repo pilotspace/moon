@@ -129,6 +129,10 @@ impl Resp {
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set read timeout");
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: TcpStream) -> Self {
         Self {
             stream,
             buf: Vec::new(),
@@ -172,10 +176,39 @@ fn client_field(admin: &mut Resp, id: &str, field: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Build a victim that has pipelined a reply far larger than any socket buffer
-/// and then stopped reading. Returns its client id.
+/// Connect with a deliberately tiny receive buffer.
+///
+/// A victim that "stops reading" only stalls the server if the kernel cannot
+/// absorb the reply on its behalf, and "the reply is bigger than any socket
+/// buffer" is a guess rather than a guarantee. It was wrong on Windows: Winsock
+/// autotuning swallowed all ~25 MB, the server's `write_all` completed, and all
+/// three tests here saw a perfectly healthy client with `omem=0`.
+///
+/// Pinning `SO_RCVBUF` closes the TCP window deterministically and stops the
+/// test depending on a platform's default buffer sizing. On Windows, setting it
+/// explicitly *also* disables receive-window autotuning — the mechanism that
+/// grew the buffer in the first place.
+fn connect_with_tiny_rcvbuf(port: u16) -> TcpStream {
+    use socket2::{Domain, Socket, Type};
+
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+    // Set before connect: the window is negotiated during the handshake.
+    sock.set_recv_buffer_size(8 * 1024)
+        .expect("set SO_RCVBUF on the victim socket");
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    sock.connect(&addr.into()).expect("connect");
+
+    let stream: TcpStream = sock.into();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    stream
+}
+
+/// Build a victim that has pipelined a large reply and then stopped reading,
+/// with its receive window pinned shut. Returns its client id.
 fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
-    let mut victim = Resp::connect(port);
+    let mut victim = Resp::from_stream(connect_with_tiny_rcvbuf(port));
     let idreply = victim.cmd(&["CLIENT", "ID"]);
     let id = idreply.trim().trim_start_matches(':').trim().to_string();
     assert!(
@@ -183,8 +216,9 @@ fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
         "CLIENT ID must return an integer, got {idreply:?}"
     );
 
-    // ~25 MB of replies: 100 GETs of a 256 KiB value. Comfortably past any
-    // kernel socket buffer, so the server's write blocks partway through.
+    // ~25 MB of replies: 100 GETs of a 256 KiB value. With the victim's
+    // receive window pinned to 8 KiB above, the server's send buffer fills and
+    // its write blocks partway through no matter how the platform sizes things.
     let mut pipeline = Vec::new();
     for _ in 0..100 {
         pipeline.extend_from_slice(&encode(&["GET", value_key]));
