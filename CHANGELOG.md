@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each byte. Verified at 1 and 4 shards on both runtimes, with the `0` case as
   a differential control proving the mechanism rather than the harness
   (`tests/write_timeout.rs`).
+- **`CLIENT LIST` reported `obl=0 oll=0 omem=0` unconditionally (c10k C1).**
+  The held-output counters were hardcoded, so an operator watching a
+  slow-client output-buffer OOM in progress saw every client reporting zero
+  bytes held — the attack above left no trace anywhere. `obl`/`omem` now report
+  the reply bytes a connection has in an in-flight write, and `tot-net-out`
+  counts reply bytes that actually reached the peer. `oll` stays 0: moon has
+  one contiguous output buffer, not Redis's static-buffer + reply-list pair, so
+  there is no list whose length it could report. Wired in the two handlers that
+  own a client-registry entry (monoio top-level and sharded); the legacy tokio
+  `handler_single` path bounds its writes but does not register, so it has
+  nothing to report through.
 - **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
   Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
   `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so

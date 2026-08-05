@@ -162,6 +162,15 @@ fn client_present(admin: &mut Resp, id: &str) -> bool {
         .contains(&format!("id={id} "))
 }
 
+/// Pull one `key=value` field out of a client's CLIENT LIST line.
+fn client_field(admin: &mut Resp, id: &str, field: &str) -> Option<u64> {
+    let list = admin.cmd(&["CLIENT", "LIST"]);
+    let line = list.lines().find(|l| l.starts_with(&format!("id={id} ")))?;
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+        .and_then(|v| v.parse().ok())
+}
+
 /// Build a victim that has pipelined a reply far larger than any socket buffer
 /// and then stopped reading. Returns its client id.
 fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
@@ -251,6 +260,30 @@ fn run_zero_disables(shards: &str) {
     assert!(
         client_present(&mut admin, &id),
         "{tag} --client-write-timeout-ms 0 must preserve the wait-forever behaviour"
+    );
+
+    // ...and while it sits there, the memory it is pinning must be VISIBLE.
+    // These three were hardcoded to 0, which is why the attack left no trace:
+    // an operator watching CLIENT LIST during an output-buffer OOM saw every
+    // client reporting zero held bytes. This is the wait-forever server, so
+    // the stall is stable and there is no race to lose.
+    let omem = client_field(&mut admin, &id, "omem")
+        .unwrap_or_else(|| panic!("{tag} victim {id} must have an omem field"));
+    assert!(
+        omem > 1_000_000,
+        "{tag} a client holding ~25MB of unread reply must report it in omem, got omem={omem}"
+    );
+    let obl = client_field(&mut admin, &id, "obl").expect("obl field");
+    assert_eq!(obl, omem, "{tag} obl and omem describe the same buffer");
+
+    // A healthy client that reads its replies must NOT look like a stalled
+    // one — otherwise the counter is noise rather than a signal.
+    let admin_id = admin.cmd(&["CLIENT", "ID"]);
+    let admin_id = admin_id.trim().trim_start_matches(':').trim().to_string();
+    let admin_omem = client_field(&mut admin, &admin_id, "omem").expect("admin omem");
+    assert_eq!(
+        admin_omem, 0,
+        "{tag} a client with no reply in flight must report omem=0"
     );
 }
 

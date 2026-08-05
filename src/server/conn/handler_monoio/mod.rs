@@ -30,31 +30,40 @@ mod write;
 /// stalled (both meaning "close this connection"). `$wt` is an
 /// `Option<Duration>`; `None` keeps the pre-C1 wait-forever behaviour.
 macro_rules! write_all_bounded {
-    ($stream:expr, $data:expr, $wt:expr, $client_id:expr) => {{
-        match $wt {
+    ($stream:expr, $data:expr, $wt:expr, $live:expr, $client_id:expr) => {{
+        // Bind first: `$data` is typically a `split().freeze()` and must be
+        // evaluated exactly once, before we can measure it.
+        let data = $data;
+        let pending = data.len();
+        // c10k C1: publish what this connection is holding, so a stalled reply
+        // is visible in CLIENT LIST (`obl`/`omem`) while it happens.
+        $live.begin_write(pending);
+        let ok = match $wt {
             None => {
-                let (r, _): (std::io::Result<usize>, bytes::Bytes) = $stream.write_all($data).await;
+                let (r, _): (std::io::Result<usize>, bytes::Bytes) = $stream.write_all(data).await;
                 r.is_ok()
             }
             Some(dur) => {
                 let mut ok = false;
                 monoio::select! {
-                    res = $stream.write_all($data) => {
+                    res = $stream.write_all(data) => {
                         let (r, _): (std::io::Result<usize>, bytes::Bytes) = res;
                         ok = r.is_ok();
                     }
                     _ = monoio::time::sleep(dur) => {
                         tracing::warn!(
-                            "Connection {} reply write made no progress for {}ms — \
-                         closing (client is not reading)",
+                            "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
                             $client_id,
                             dur.as_millis(),
+                            pending,
                         );
                     }
                 }
                 ok
             }
-        }
+        };
+        $live.end_write(pending, ok);
+        ok
     }};
 }
 
@@ -721,7 +730,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 agg.freeze()
                             };
-                            if !write_all_bounded!(stream, payload, write_timeout, client_id) { break; }
+                            if !write_all_bounded!(stream, payload, write_timeout, client_live, client_id) { break; }
                         }
                         Err(_) => break, // all senders dropped
                     }
@@ -802,7 +811,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let Some(frame) = push_frame {
                 let mut push_buf = BytesMut::new();
                 crate::protocol::serialize_resp3(&frame, &mut push_buf);
-                if !write_all_bounded!(stream, push_buf.freeze(), write_timeout, client_id) {
+                if !write_all_bounded!(
+                    stream,
+                    push_buf.freeze(),
+                    write_timeout,
+                    client_live,
+                    client_id
+                ) {
                     break;
                 }
                 continue;
@@ -1016,7 +1031,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {
                     let data = write_buf.split().freeze();
-                    if !write_all_bounded!(stream, data, write_timeout, client_id) {
+                    if !write_all_bounded!(stream, data, write_timeout, client_live, client_id) {
                         break;
                     }
                 }
@@ -1279,7 +1294,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     if !write_buf.is_empty() {
                         let data = write_buf.split().freeze();
-                        if !write_all_bounded!(stream, data, write_timeout, client_id) {
+                        if !write_all_bounded!(stream, data, write_timeout, client_live, client_id)
+                        {
                             return (MonoioHandlerResult::Done, None);
                         }
                     }
@@ -2722,7 +2738,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {
             let data = write_buf.split().freeze();
-            if !write_all_bounded!(stream, data, write_timeout, client_id) {
+            if !write_all_bounded!(stream, data, write_timeout, client_live, client_id) {
                 break;
             }
         }

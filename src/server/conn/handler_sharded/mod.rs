@@ -19,22 +19,29 @@
 /// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
 /// wait-forever behaviour.
 macro_rules! write_all_bounded {
-    ($stream:expr, $buf:expr, $wt:expr, $client_id:expr) => {{
-        match $wt {
-            None => $stream.write_all($buf).await.is_ok(),
-            Some(dur) => match tokio::time::timeout(dur, $stream.write_all($buf)).await {
+    ($stream:expr, $buf:expr, $wt:expr, $live:expr, $client_id:expr) => {{
+        let buf = $buf;
+        let pending = buf.len();
+        // c10k C1: publish what this connection is holding, so a stalled reply
+        // is visible in CLIENT LIST (`obl`/`omem`) while it happens.
+        $live.begin_write(pending);
+        let ok = match $wt {
+            None => $stream.write_all(buf).await.is_ok(),
+            Some(dur) => match tokio::time::timeout(dur, $stream.write_all(buf)).await {
                 Ok(r) => r.is_ok(),
                 Err(_) => {
                     tracing::warn!(
-                        "Connection {} reply write made no progress for {}ms — \
-                         closing (client is not reading)",
+                        "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
                         $client_id,
                         dur.as_millis(),
+                        pending,
                     );
                     false
                 }
             },
-        }
+        };
+        $live.end_write(pending, ok);
+        ok
     }};
 }
 
@@ -1106,7 +1113,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -2275,7 +2282,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) {
+                if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) {
                     return (HandlerResult::Done, None);
                 }
 
@@ -2339,7 +2346,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(push_frame) = push {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) {
+                    if !write_all_bounded!(stream, &write_buf, write_timeout, client_live, client_id) {
                         break;
                     }
                 }
