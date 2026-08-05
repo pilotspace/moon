@@ -865,8 +865,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
             let parkable = park.can_park
                 && S::SUPPORTS_TASK_PARK
                 && idle_park::park_after_ms() > 0
-                && read_buf.is_empty()
-                && write_buf.is_empty()
+                // c10k D2: unparsed input must NOT block the park. Requiring an
+                // EMPTY read_buf here let one byte (`*`) pin a connection into
+                // the unregistered plain read below, out of the sweep's reach
+                // forever. The remainder rides along in `read_buf_remainder`
+                // and is re-parsed on resume; its size is already bounded by
+                // `client_query_buffer_limit` upstream, so no second cap
+                // belongs here (one would just be an escape hatch to size
+                // past — see `park_policy`).
+                && crate::server::conn::park_policy::remainder_allows_park(
+                    read_buf.len(),
+                    write_buf.len(),
+                )
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
                 && conn.active_cross_txn.is_none()
@@ -895,8 +905,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
                     Err(_) => {
                         // Cancelled by the stage-2 sweep: exit the task.
-                        // read_buf is empty (predicate), so no partial frame
-                        // is at risk.
+                        // read_buf holds at most MAX_PARKED_REMAINDER bytes
+                        // (predicate) and `read_buf.split()` below carries
+                        // them into the parked state, so a partial frame
+                        // resumes exactly where it left off rather than being
+                        // dropped or pinning the connection awake (D2).
                         let state = Box::new(MigratedConnectionState {
                             selected_db: conn.selected_db,
                             authenticated: conn.authenticated,
