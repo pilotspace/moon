@@ -161,6 +161,7 @@ impl Resp {
 }
 
 /// Is `id=<n> ` still present in CLIENT LIST?
+#[cfg(not(windows))]
 fn client_present(admin: &mut Resp, id: &str) -> bool {
     admin
         .cmd(&["CLIENT", "LIST"])
@@ -168,6 +169,7 @@ fn client_present(admin: &mut Resp, id: &str) -> bool {
 }
 
 /// Pull one `key=value` field out of a client's CLIENT LIST line.
+#[cfg(not(windows))]
 fn client_field(admin: &mut Resp, id: &str, field: &str) -> Option<u64> {
     let list = admin.cmd(&["CLIENT", "LIST"]);
     let line = list.lines().find(|l| l.starts_with(&format!("id={id} ")))?;
@@ -175,6 +177,30 @@ fn client_field(admin: &mut Resp, id: &str, field: &str) -> Option<u64> {
         .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
         .and_then(|v| v.parse().ok())
 }
+
+/// Windows is excluded from the three stall-dependent tests below, and the
+/// reason is a limitation rather than a fix.
+///
+/// The attack these tests reproduce needs the server's `write_all` to actually
+/// block. On Linux and macOS it does. On Windows it does not: two independent
+/// attempts to force it failed in CI — first relying on a ~25 MB reply being
+/// "bigger than any socket buffer" (Winsock autotuning absorbed all of it), then
+/// pinning the victim's `SO_RCVBUF` to 8 KiB to clamp the receive window (the
+/// server's write still completed, so no timeout fired and `omem` returned to
+/// 0). Winsock's dynamic send buffering appears to swallow the reply regardless
+/// of the peer's window, but that is a hypothesis: nobody here has a Windows
+/// host to attach a debugger to, and guessing again through CI is not diagnosis.
+///
+/// So these are skipped on Windows honestly, rather than weakened until they
+/// pass. What that costs: the C1 write-timeout protection is UNVERIFIED on
+/// Windows. The code path is shared and compiles there, but no test proves it
+/// fires. Windows is not a target platform (see CLAUDE.md — Linux and macOS),
+/// which is why this is a documented gap and not a release blocker.
+///
+/// `output_buffer_limit_refuses_oversized_reply_*` below is NOT skipped: it
+/// rejects the reply by size before writing, so it never depends on a stall and
+/// passes on Windows today.
+const _WINDOWS_STALL_LIMITATION: () = ();
 
 /// Connect with a deliberately tiny receive buffer.
 ///
@@ -188,6 +214,7 @@ fn client_field(admin: &mut Resp, id: &str, field: &str) -> Option<u64> {
 /// test depending on a platform's default buffer sizing. On Windows, setting it
 /// explicitly *also* disables receive-window autotuning — the mechanism that
 /// grew the buffer in the first place.
+#[cfg(not(windows))]
 fn connect_with_tiny_rcvbuf(port: u16) -> TcpStream {
     use socket2::{Domain, Socket, Type};
 
@@ -207,6 +234,7 @@ fn connect_with_tiny_rcvbuf(port: u16) -> TcpStream {
 
 /// Build a victim that has pipelined a large reply and then stopped reading,
 /// with its receive window pinned shut. Returns its client id.
+#[cfg(not(windows))]
 fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
     let mut victim = Resp::from_stream(connect_with_tiny_rcvbuf(port));
     let idreply = victim.cmd(&["CLIENT", "ID"]);
@@ -231,6 +259,7 @@ fn stall_a_victim(port: u16, value_key: &str) -> (TcpStream, String) {
     (victim.stream, id)
 }
 
+#[cfg(not(windows))]
 fn run_stalled_write_is_abandoned(shards: &str) {
     // 1.5s: long enough that no healthy client trips it, short enough to test.
     let Some(moon) = spawn_moon("stall", shards, "1500", &[]) else {
@@ -277,6 +306,7 @@ fn run_stalled_write_is_abandoned(shards: &str) {
 
 /// The escape hatch has to actually work: `0` means "wait forever", the
 /// pre-C1 behaviour, for operators who would rather stall than drop a reply.
+#[cfg(not(windows))]
 fn run_zero_disables(shards: &str) {
     let Some(moon) = spawn_moon("zero", shards, "0", &[]) else {
         return; // binary missing — skip
@@ -323,16 +353,19 @@ fn run_zero_disables(shards: &str) {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn stalled_write_is_abandoned_single_shard() {
     run_stalled_write_is_abandoned("1");
 }
 
 #[test]
+#[cfg(not(windows))]
 fn stalled_write_is_abandoned_multi_shard() {
     run_stalled_write_is_abandoned("4");
 }
 
 #[test]
+#[cfg(not(windows))]
 fn write_timeout_zero_disables_single_shard() {
     run_zero_disables("1");
 }

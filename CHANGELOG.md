@@ -57,7 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   very slow links should raise it: the budget covers the whole write call, not
   each byte. Verified at 1 and 4 shards on both runtimes, with the `0` case as
   a differential control proving the mechanism rather than the harness
-  (`tests/write_timeout.rs`).
+  (`tests/write_timeout.rs`). **Unverified on Windows**: the tests need the
+  server's write to actually block, and two attempts to force that under
+  Winsock failed (a 25 MB reply was absorbed by send/receive autotuning, and
+  clamping the victim's `SO_RCVBUF` to 8 KiB did not change it), so they are
+  skipped there rather than weakened until they pass. The code path is shared
+  and compiles on Windows, but nothing proves the timeout fires; Windows is not
+  a target platform (Linux and macOS are).
 - **`CLIENT LIST` reported `obl=0 oll=0 omem=0` unconditionally (c10k C1).**
   The held-output counters were hardcoded, so an operator watching a
   slow-client output-buffer OOM in progress saw every client reporting zero
