@@ -11,6 +11,53 @@ mod read;
 mod txn;
 mod write;
 
+/// c10k C1 — bound a reply write so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `write_all` on a socket whose receive window is closed never returns. The
+/// handler is then stuck holding the whole serialized reply (this handler
+/// coalesces an entire batch into ONE `Bytes` before its single write syscall,
+/// so a deep pipeline is hundreds of MB) plus its `maxclients` slot, for as
+/// long as the client cares to wait. N such clients is an OOM that costs the
+/// attacker nothing but an unread socket.
+///
+/// `monoio::select!` drops the losing future — the same pattern the idle
+/// timeout already uses on the read side — which takes the reply buffer with
+/// it. That is exactly what we want here: we are tearing the connection down,
+/// so there is nobody left to deliver it to.
+///
+/// Evaluates to `true` when the write completed, `false` when it failed or
+/// stalled (both meaning "close this connection"). `$wt` is an
+/// `Option<Duration>`; `None` keeps the pre-C1 wait-forever behaviour.
+macro_rules! write_all_bounded {
+    ($stream:expr, $data:expr, $wt:expr, $client_id:expr) => {{
+        match $wt {
+            None => {
+                let (r, _): (std::io::Result<usize>, bytes::Bytes) = $stream.write_all($data).await;
+                r.is_ok()
+            }
+            Some(dur) => {
+                let mut ok = false;
+                monoio::select! {
+                    res = $stream.write_all($data) => {
+                        let (r, _): (std::io::Result<usize>, bytes::Bytes) = res;
+                        ok = r.is_ok();
+                    }
+                    _ = monoio::time::sleep(dur) => {
+                        tracing::warn!(
+                            "Connection {} reply write made no progress for {}ms — \
+                         closing (client is not reading)",
+                            $client_id,
+                            dur.as_millis(),
+                        );
+                    }
+                }
+                ok
+            }
+        }
+    }};
+}
+
 use crate::runtime::cancel::CancellationToken;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
@@ -341,6 +388,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
         None
     };
 
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    // Read once, like the idle timeout above — this must not touch the lock on
+    // the hot path.
+    let write_timeout = match ctx.runtime_config.read().client_write_timeout_ms {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    };
+
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
@@ -666,8 +721,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 agg.freeze()
                             };
-                            let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(payload).await;
-                            if result.is_err() { break; }
+                            if !write_all_bounded!(stream, payload, write_timeout, client_id) { break; }
                         }
                         Err(_) => break, // all senders dropped
                     }
@@ -748,9 +802,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let Some(frame) = push_frame {
                 let mut push_buf = BytesMut::new();
                 crate::protocol::serialize_resp3(&frame, &mut push_buf);
-                let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
-                    stream.write_all(push_buf.freeze()).await;
-                if wr.is_err() {
+                if !write_all_bounded!(stream, push_buf.freeze(), write_timeout, client_id) {
                     break;
                 }
                 continue;
@@ -964,9 +1016,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {
                     let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
-                        stream.write_all(data).await;
-                    if result.is_err() {
+                    if !write_all_bounded!(stream, data, write_timeout, client_id) {
                         break;
                     }
                 }
@@ -1229,9 +1279,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     if !write_buf.is_empty() {
                         let data = write_buf.split().freeze();
-                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
-                            stream.write_all(data).await;
-                        if wr.is_err() {
+                        if !write_all_bounded!(stream, data, write_timeout, client_id) {
                             return (MonoioHandlerResult::Done, None);
                         }
                     }
@@ -2674,9 +2722,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {
             let data = write_buf.split().freeze();
-            let (result, _data): (std::io::Result<usize>, bytes::Bytes) =
-                stream.write_all(data).await;
-            if result.is_err() {
+            if !write_all_bounded!(stream, data, write_timeout, client_id) {
                 break;
             }
         }

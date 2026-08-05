@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Reply writes were unbounded — a client that stops reading held the whole
+  reply forever (c10k C1).** `write_all` on a socket whose receive window is
+  closed never returns. A client could pipeline a large response and then
+  simply stop reading, parking the handler inside that write while it held the
+  ENTIRE serialized reply — the monoio handler coalesces a whole batch into one
+  `Bytes` before its single write syscall, so a deep pipeline is hundreds of MB
+  — plus its `maxclients` slot, for as long as the attacker cared to wait. N
+  such clients is an OOM that costs the attacker nothing: no reads, no CPU,
+  just a TCP window it refuses to open. New `--client-write-timeout-ms`
+  (default `60000`, `0` = the previous wait-forever behaviour) bounds every
+  reply-carrying write in all three handlers — monoio top-level, sharded, and
+  the tokio single-shard `Framed` path — closing the connection and dropping
+  the reply when a write makes no progress for that long. 60s is far beyond any
+  healthy client's stall and replication does not use this path (PSYNC hijacks
+  the connection before it), but operators streaming very large replies over
+  very slow links should raise it: the budget covers the whole write call, not
+  each byte. Verified at 1 and 4 shards on both runtimes, with the `0` case as
+  a differential control proving the mechanism rather than the harness
+  (`tests/write_timeout.rs`).
 - **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
   Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
   `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so

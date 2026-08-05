@@ -5,6 +5,39 @@
 //! Contains `handle_connection_sharded` (thin wrapper) and
 //! `handle_connection_sharded_inner` (generic inner handler).
 
+/// c10k C1 — bound a reply write so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `write_all` on a socket whose receive window is closed never returns, so
+/// the handler sits there holding the whole serialized batch plus its
+/// `maxclients` slot for as long as the client cares to wait. N such clients
+/// is an OOM that costs the attacker nothing but an unread socket.
+///
+/// Cancelling the write may leave a partial reply on the wire; that is
+/// correct here, because the only thing we do afterwards is close the
+/// connection. Evaluates to `true` when the write completed, `false` when it
+/// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
+/// wait-forever behaviour.
+macro_rules! write_all_bounded {
+    ($stream:expr, $buf:expr, $wt:expr, $client_id:expr) => {{
+        match $wt {
+            None => $stream.write_all($buf).await.is_ok(),
+            Some(dur) => match tokio::time::timeout(dur, $stream.write_all($buf)).await {
+                Ok(r) => r.is_ok(),
+                Err(_) => {
+                    tracing::warn!(
+                        "Connection {} reply write made no progress for {}ms — \
+                         closing (client is not reading)",
+                        $client_id,
+                        dur.as_millis(),
+                    );
+                    false
+                }
+            },
+        }
+    }};
+}
+
 use crate::runtime::TcpStream;
 use crate::runtime::cancel::CancellationToken;
 use bumpalo::Bump;
@@ -359,6 +392,13 @@ pub(crate) async fn handle_connection_sharded_inner<
         Some(std::time::Duration::from_secs(idle_timeout_secs))
     } else {
         None
+    };
+
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    // Read once alongside the idle timeout — never on the hot path.
+    let write_timeout = match ctx.runtime_config.read().client_write_timeout_ms {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
     };
 
     let mut break_outer = false;
@@ -1066,7 +1106,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) { arena.reset(); return (HandlerResult::Done, None); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -2235,7 +2275,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if stream.write_all(&write_buf).await.is_err() {
+                if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) {
                     return (HandlerResult::Done, None);
                 }
 
@@ -2299,7 +2339,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(push_frame) = push {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if stream.write_all(&write_buf).await.is_err() {
+                    if !write_all_bounded!(stream, &write_buf, write_timeout, client_id) {
                         break;
                     }
                 }

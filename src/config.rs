@@ -272,6 +272,22 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     pub client_query_buffer_limit: usize,
 
+    /// Give up on a reply write that has made no progress for this many
+    /// milliseconds and close the connection (0 = wait forever).
+    ///
+    /// c10k hardening C1. Reply writes were unbounded: a client that
+    /// pipelines a huge response and then simply stops reading parks the
+    /// handler inside `write_all` holding the entire serialized reply —
+    /// hundreds of MB — plus its maxclients slot, for as long as it likes.
+    /// N such clients is an OOM, and it is invisible while it happens because
+    /// `obl`/`oll`/`omem` in CLIENT LIST are hardcoded to 0.
+    ///
+    /// 60s is far beyond any legitimate client's stall (replication does not
+    /// use this path — PSYNC hijacks the connection before it) and far below
+    /// "forever".
+    #[arg(long, default_value_t = 60_000)]
+    pub client_write_timeout_ms: u64,
+
     /// Query-buffer ceiling applied to connections that have NOT yet
     /// authenticated, in bytes (0 = use `--client-query-buffer-limit`).
     ///
@@ -1442,6 +1458,7 @@ impl ServerConfig {
             timeout: self.timeout,
             client_query_buffer_limit: self.client_query_buffer_limit,
             client_query_buffer_limit_preauth: self.client_query_buffer_limit_preauth,
+            client_write_timeout_ms: self.client_write_timeout_ms,
             tcp_keepalive: self.tcp_keepalive,
             // Default to single-shard (no division). The server overwrites this
             // on the shared RuntimeConfig with the resolved shard count once it
@@ -1816,6 +1833,9 @@ pub struct RuntimeConfig {
     /// Query-buffer ceiling for not-yet-authenticated connections, in bytes
     /// (0 = fall back to `client_query_buffer_limit`).
     pub client_query_buffer_limit_preauth: usize,
+    /// Abandon a reply write that stalls for this many ms (0 = wait forever).
+    /// c10k C1 — see `ServerConfig::client_write_timeout_ms`.
+    pub client_write_timeout_ms: u64,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
     /// Resolved shard count — used only to derive the per-shard eviction budget.
@@ -1893,6 +1913,7 @@ impl Default for RuntimeConfig {
             timeout: 0,
             client_query_buffer_limit: 1024 * 1024 * 1024,
             client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
             tcp_keepalive: 300,
             num_shards: 1,
         }
