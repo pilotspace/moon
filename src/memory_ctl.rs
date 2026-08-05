@@ -91,15 +91,21 @@ const ARENA_ALL_DECAY: &[u8] = b"arena.4096.decay\0";
 /// Ask jemalloc to run decay across all arenas. Returns `false` if the ctl was
 /// rejected (which would mean this build's jemalloc does not have the ctl —
 /// worth knowing, but never worth failing on).
+///
+/// # Soundness
+///
+/// `mallctl` is jemalloc's thread-safe control entry point. `ARENA_ALL_DECAY`
+/// is a `'static` NUL-terminated byte string, so the name pointer is valid for
+/// the whole call and outlives it. `arena.<i>.decay` is declared
+/// `NEITHER_READ_NOR_WRITE()` in jemalloc's `ctl.c`, which returns `EPERM`
+/// unless `oldp`, `oldlenp` and `newp` are all NULL and `newlen` is 0 —
+/// exactly what is passed below. No buffer is read or written by jemalloc on
+/// this path, so there is nothing for the caller to size, own, or keep alive.
 #[cfg(feature = "jemalloc")]
 pub fn decay_all_arenas() -> bool {
-    // SAFETY: `mallctl` is jemalloc's thread-safe control entry point.
-    // `ARENA_ALL_DECAY` is a 'static NUL-terminated byte string, so the name
-    // pointer is valid for the whole call. `arena.<i>.decay` is declared
-    // `NEITHER_READ_NOR_WRITE()` in jemalloc's `ctl.c`, which returns EPERM
-    // unless `oldp`, `oldlenp` and `newp` are all NULL and `newlen` is 0 —
-    // exactly what is passed here. No buffer is read or written by jemalloc on
-    // this path, so there is nothing for the caller to size or own.
+    // SAFETY: see "Soundness" above — a 'static NUL-terminated name and the
+    // all-NULL/zero-length argument set that `NEITHER_READ_NOR_WRITE()`
+    // requires; jemalloc neither reads nor writes a caller buffer here.
     let rc = unsafe {
         tikv_jemalloc_sys::mallctl(
             ARENA_ALL_DECAY.as_ptr().cast::<std::ffi::c_char>(),
