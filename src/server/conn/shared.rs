@@ -225,6 +225,7 @@ pub(crate) fn execute_transaction_sharded(
     selected_db: usize,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_flushes: &mut Vec<(usize, Frame, usize)>,
 ) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
 
@@ -403,6 +404,19 @@ pub(crate) fn execute_transaction_sharded(
         if !matches!(response, Frame::Error(_))
             && (cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
         {
+            // c10k E2: this loop clears only the LOCAL slice. The live
+            // (non-MULTI) path fixed the same bug with
+            // `coordinate_flush_broadcast`; a queued flush needs the identical
+            // fan-out or `EXEC` answers +OK having emptied one shard of N.
+            // Recorded rather than performed here for two reasons: this
+            // function is synchronous (the broadcast awaits), and it runs on
+            // the OWNER shard for a routed transaction, where fanning out from
+            // inside the shard's own message loop risks a shard-to-shard wait
+            // cycle. Same deferral contract as `exec_publishes` directly
+            // above: `(result_index, command, db)`, patched by the originator.
+            // `selected` is the per-entry db, so a queued SELECT before the
+            // flush is honoured.
+            exec_flushes.push((results.len(), cmd_frame.clone(), selected));
             crate::shard::slice::with_shard(|s| {
                 crate::shard::spsc_handler::auto_flush_indexes(
                     &mut s.vector_store,

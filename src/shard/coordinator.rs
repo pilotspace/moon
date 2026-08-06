@@ -1040,6 +1040,54 @@ pub(crate) async fn coordinate_flush_broadcast(
     }
 }
 
+/// Fan out the flushes a MULTI/EXEC body performed locally (c10k E2).
+///
+/// `execute_transaction_sharded` clears only the slice it runs on, so a queued
+/// `FLUSHDB`/`FLUSHALL` empties one shard of N while `EXEC` still answers
+/// `+OK`. Measured at `--shards 4`: 45 of 64 keys survived a transaction that
+/// reported success. The live (non-MULTI) path has broadcast since D-2; this
+/// gives the transactional path the same guarantee.
+///
+/// `exec_shard` is the shard that RAN the body — the owner for a routed
+/// transaction, not necessarily the originator — so it is the one leg already
+/// flushed and correctly skipped.
+///
+/// On a failed leg the corresponding element of the `EXEC` result array is
+/// replaced with the partial-flush error, so a client that sees `+OK` for a
+/// flush inside a transaction can rely on it, exactly as on the live path.
+/// Non-atomic across shards, like every other broadcast here: a concurrent
+/// reader can see shard A flushed before shard B. `MULTI` does not and cannot
+/// change that in a shared-nothing engine — it bounds the report, not the
+/// visibility.
+pub(crate) async fn broadcast_txn_flushes(
+    result: &mut Frame,
+    exec_flushes: &[(usize, Frame, usize)],
+    exec_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) {
+    if exec_flushes.is_empty() || num_shards <= 1 {
+        return;
+    }
+    for (result_index, command, db_index) in exec_flushes {
+        if let Err(err) = coordinate_flush_broadcast(
+            command,
+            exec_shard,
+            num_shards,
+            *db_index,
+            dispatch_tx,
+            spsc_notifiers,
+        )
+        .await
+            && let Frame::Array(items) = result
+            && let Some(slot) = items.get_mut(*result_index)
+        {
+            *slot = err;
+        }
+    }
+}
+
 /// Coordinate MGET across shards using VLL pattern.
 ///
 /// Groups keys by shard in a BTreeMap (ascending shard-ID order), executes

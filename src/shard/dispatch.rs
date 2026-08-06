@@ -948,6 +948,15 @@ pub struct TxnExecutePayload {
 pub struct TxnExecReply {
     pub result: crate::protocol::Frame,
     pub exec_publishes: Vec<(usize, Bytes, Bytes)>,
+    /// c10k E2: keyless FLUSHDB/FLUSHALL executed in the body, as
+    /// `(result_index, command, db)`. The owner shard clears only its OWN
+    /// slice, so the ORIGINATOR must broadcast each of these to the remaining
+    /// shards and patch `result[result_index]` with an explicit partial-flush
+    /// error if any leg fails — otherwise EXEC answers +OK having emptied one
+    /// shard of N. Deferred to the originator for the same reason as
+    /// `exec_publishes`: the fan-out awaits, and doing it inside the owner's
+    /// message loop risks a shard-to-shard wait cycle.
+    pub exec_flushes: Vec<(usize, crate::protocol::Frame, usize)>,
     pub wrote: bool,
     /// `true` iff an AOF append could not be enqueued on the owner (bounded
     /// backpressure exhausted) — the originator surfaces `AOF_APPEND_LOST_ERR`

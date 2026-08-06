@@ -646,7 +646,21 @@ pub(super) async fn try_handle_multi_exec(
                                 // caller's post-EXEC loop patches placeholders +
                                 // scatters from this (originating) shard.
                                 exec_publishes.extend(r.exec_publishes);
-                                responses.push(r.result);
+                                // c10k E2: the owner flushed only ITS slice.
+                                // Broadcast to the rest from here and patch the
+                                // result on a failed leg (same contract as the
+                                // monoio handler).
+                                let mut routed_result = r.result;
+                                crate::shard::coordinator::broadcast_txn_flushes(
+                                    &mut routed_result,
+                                    &r.exec_flushes,
+                                    s,
+                                    ctx.num_shards,
+                                    &ctx.dispatch_tx,
+                                    &ctx.spsc_notifiers,
+                                )
+                                .await;
+                                responses.push(routed_result);
                             }
                             None => {
                                 responses.push(Frame::Error(Bytes::from_static(
@@ -666,13 +680,16 @@ pub(super) async fn try_handle_multi_exec(
                     _ => {}
                 }
             }
-            let (result, aof_entries, graph_records) = execute_transaction_sharded(
+            // c10k E2: a queued FLUSHDB/FLUSHALL clears only this shard.
+            let mut exec_flushes: Vec<(usize, Frame, usize)> = Vec::new();
+            let (mut result, aof_entries, graph_records) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
                 &conn.command_queue,
                 conn.selected_db,
                 &ctx.cached_clock,
                 exec_publishes,
+                &mut exec_flushes,
             );
             // task #52: flush the graph-leg wal-v3 records collected by the
             // txn executor. Replication is monoio-only by design (see
@@ -732,6 +749,18 @@ pub(super) async fn try_handle_multi_exec(
                 }
             }
             conn.command_queue.clear();
+            // c10k E2: broadcast the body's flushes to the other shards and
+            // patch the result on a failed leg, so a `+OK` for a flush inside
+            // a transaction can be trusted (same contract as the live path).
+            crate::shard::coordinator::broadcast_txn_flushes(
+                &mut result,
+                &exec_flushes,
+                ctx.shard_id,
+                ctx.num_shards,
+                &ctx.dispatch_tx,
+                &ctx.spsc_notifiers,
+            )
+            .await;
             responses.push(result);
         }
         return true;
