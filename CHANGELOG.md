@@ -254,6 +254,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never showed `flags=b` — and would have been treated as idle by the new
   timeout sweep. The flag is now set for the duration of a blocking command
   on both runtimes.
+- **Warm-tier transitions leaked their staging directory on every failure
+  (#435).** `transition_to_warm` has ~10 fallible steps between creating
+  `.segment-{id}.staging` and renaming it to its final name, and every early
+  return in that stretch abandoned the whole directory. Found on a live
+  instance: a 27 GB data directory against 2.53 GB of `used_memory`, 20 GB of
+  which was 14,499 orphaned staging directories versus 174 MB in the 94 real
+  segments — 99% of the vector store was abandoned scratch, written in a single
+  three-minute window and already survived a restart. The dot prefix kept them
+  out of `ls` and out of every `vectors/*` glob, so nothing surfaced them. A
+  `Drop` guard now covers every early return, and `sweep_orphan_staging` runs
+  at recovery for orphans no in-process guard can catch (a `kill -9` between
+  the manifest commit and the rename, or anything left by an older build). The
+  sweep is safe by construction: staging paths are produced in exactly one
+  place and read by nothing — every reader opens the final `segment-{id}` name.
+  `transition_to_warm` also removes a stale staging directory for the same id
+  before creating it, so a retry cannot inherit a previous attempt's partial
+  files.
 
 ## [0.8.4] — 2026-07-29
 

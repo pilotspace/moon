@@ -263,6 +263,15 @@ pub fn recover_shard_v3_pitr(
     if manifest_path.exists() {
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
             let vectors_dir = shard_dir.join("vectors");
+            // #435: reclaim `.segment-*.staging` leftovers before scanning.
+            // A warm transition that died between its manifest commit and its
+            // rename leaves a fully-written staging dir that nothing reads and
+            // nothing removed — a live instance accumulated 14,499 of them
+            // holding 20 GB against 174 MB of real segments, invisible to `ls`
+            // and to any `vectors/*` glob because of the dot prefix. The
+            // in-process guard covers new failures; this covers orphans from a
+            // kill -9 or an older build.
+            crate::storage::tiered::warm_tier::sweep_orphan_staging(&vectors_dir);
             for entry in manifest.files() {
                 if entry.tier == StorageTier::Warm
                     && entry.status == FileStatus::Active
