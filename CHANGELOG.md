@@ -148,6 +148,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when authentication is configured and the shard stays on the tokio path.
 
 ### Fixed
+- **`FLUSHALL`/`FLUSHDB` inside `MULTI`/`EXEC` cleared one shard and reported
+  success (c10k E2).** The transactional executor runs the queued body against
+  the LOCAL slice with no fan-out, so a queued flush emptied a single shard of
+  N while `EXEC` still answered `+OK`. Measured at `--shards 4`: 45 of 64 keys
+  survived a transaction that reported the database emptied — a silent wrong
+  answer to a destructive command, typically noticed much later via a non-zero
+  `DBSIZE`. The live (non-`MULTI`) path has broadcast since D-2; the
+  transactional path now does the same. The executor records each flush and the
+  ORIGINATOR fans it out — it cannot fan out itself, being synchronous while
+  the broadcast awaits, and for a routed transaction it runs on the owner
+  shard, where broadcasting from inside that shard's own message loop risks a
+  shard-to-shard wait cycle. A failed leg replaces that entry of the `EXEC`
+  result array with an explicit partial-flush error, so a `+OK` for a flush
+  inside a transaction can be trusted exactly as on the live path. Both
+  handlers and both transaction shapes are covered, and a queued `SELECT`
+  before the flush is honoured. Cross-shard atomicity is unchanged and
+  unchangeable: a concurrent reader can still see shard A flushed before shard
+  B — `MULTI` bounds the report, not the visibility, in a shared-nothing
+  engine.
+
 - **TLS park veto samples `wants_write()` after processing, not before (c10k
   B5).** `Stream::task_park_safe` read `wants_write()` before
   `process_new_packets()`, which can queue outbound bytes and still return

@@ -2722,6 +2722,11 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
+            // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
+            // slice. Collect them and hand them back to the originator, which
+            // broadcasts to the other shards (see `TxnExecReply::exec_flushes`
+            // for why the fan-out cannot happen here).
+            let mut exec_flushes: Vec<(usize, crate::protocol::Frame, usize)> = Vec::new();
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -2730,6 +2735,7 @@ pub(crate) fn handle_shard_message_shared(
                     db_index,
                     cached_clock,
                     &mut exec_publishes,
+                    &mut exec_flushes,
                 );
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
@@ -2783,6 +2789,7 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(crate::shard::dispatch::TxnExecReply {
                 result,
                 exec_publishes,
+                exec_flushes,
                 wrote,
                 append_lost,
             });
