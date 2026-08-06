@@ -1737,6 +1737,16 @@ impl super::Shard {
                 // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal_v3(&mut wal_writer);
+                    // D1: idle-timeout enforcement, same policy and cadence as
+                    // the monoio chore (the per-connection timeout wrapper it
+                    // replaces read its config once at connection setup and
+                    // never exempted replication links).
+                    let _ = crate::client_registry::kill_idle_clients(
+                        shard_id,
+                        num_shards,
+                        runtime_config.read().timeout,
+                        crate::storage::entry::current_time_ms(),
+                    );
                     // P3+MA1+MA2: prune committed + sweep zombies + kill old snapshots
                     //             + update RECL_MVCC_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {
@@ -2490,6 +2500,16 @@ impl super::Shard {
                     // as the connection tasks (thread-per-core), no locks.
                     let _ =
                         crate::server::conn::handler_monoio::idle_park::sweep(cached_clock.ms());
+                    // D1: enforce `timeout N` here rather than from a
+                    // per-connection select! arm — that arm shadowed every
+                    // park stage above. Config is re-read each sweep, so
+                    // CONFIG SET timeout applies to live connections.
+                    let _ = crate::client_registry::kill_idle_clients(
+                        shard_id,
+                        num_shards,
+                        runtime_config.read().timeout,
+                        crate::storage::entry::current_time_ms(),
+                    );
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {

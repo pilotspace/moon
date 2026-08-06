@@ -409,13 +409,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let idle_reg = S::SUPPORTS_IDLE_PARK.then(|| idle_park::register(client_id));
     let mut downshifted = false;
 
-    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
-    let idle_timeout_secs = ctx.runtime_config.read().timeout;
-    let idle_timeout = if idle_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(idle_timeout_secs))
-    } else {
-        None
-    };
+    // Client idle timeout (`timeout N`) is NOT enforced here — see
+    // `client_registry::kill_idle_clients`, run by the 1 s shard chore.
+    //
+    // c10k hardening D1: this used to be a `select!` arm racing the read
+    // against `sleep(timeout)`, sitting FIRST in the read loop's if/else
+    // chain below. That made the stage-1 downshift, the stage-2 park and
+    // task-exit parking all structurally unreachable whenever `timeout` was
+    // set — every connection silently reverted from the parked ~3.3 KB to
+    // its full ~46 KB working set, in exactly the deployments that use the
+    // only slowloris knob we ship. It also read the config once at setup, so
+    // `CONFIG SET timeout` never reached a live connection, and it had no
+    // exemption for replication links. The sweep has none of those problems
+    // and additionally reaches connections whose handler task has exited.
 
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once, like the idle timeout above — this must not touch the lock on
@@ -786,33 +792,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // more. Skip exactly one read and let the parser drain them. A carry
         // that is only a partial frame parses to nothing, `frames.is_empty()`
         // sends us straight back here, and the flag is already cleared.
+        //
+        // c10k D1: there is deliberately no `idle_timeout` arm here. `timeout N`
+        // is enforced out-of-band by `client_registry::kill_idle_clients` (the
+        // 1 s shard chore), which also reaches task-parked connections — an
+        // in-loop `select!` on `sleep(timeout)` used to sit ahead of the park
+        // and made stage-1 downshift, stage-2 park and task-exit parking all
+        // structurally unreachable whenever `timeout` was set.
         if std::mem::take(&mut carried_input) {
             // Nothing to read: `read_buf` already holds unparsed input.
-        } else if let Some(dur) = idle_timeout {
-            // Timeout-aware read: select between read and sleep.
-            // monoio::select! drops the losing future, so tmp_buf ownership transfers.
-            // We allocate a fresh buffer when timeout is enabled (safety feature, not hot path).
-            let timeout_buf = std::mem::take(&mut tmp_buf);
-            monoio::select! {
-                read_result = stream.read(timeout_buf) => {
-                    let (result, returned_buf) = read_result;
-                    tmp_buf = returned_buf;
-                    match result {
-                        Ok(0) => break,
-                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
-                        Err(_) => break,
-                    }
-                }
-                _ = monoio::time::sleep(dur) => {
-                    tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
-                    break;
-                }
-            }
         } else if conn.tracking_rx.is_some() {
             // CLIENT TRACKING: deliver invalidation Push frames while parked
             // in read(). Only tracking connections take this select — the
             // hot path below is untouched for everyone else. Losing-future
-            // buffer semantics mirror the idle-timeout arm above.
+            // buffer semantics mirror the other parked reads in this loop.
             let track_buf = std::mem::take(&mut tmp_buf);
             let mut push_frame: Option<Frame> = None;
             monoio::select! {
@@ -861,7 +854,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // readiness watcher (conn_accept::spawn_parked_idle_watcher).
             // The predicate is stable while parked in read (no commands can
             // execute), and reaching this arm already excludes subscriber /
-            // tracking / idle-timeout connections (each takes its own arm).
+            // tracking connections (each takes its own arm). Connections with
+            // `timeout N` set DO reach here now (D1): the idle deadline is
+            // enforced by the shard chore's registry sweep, which reaches a
+            // task-parked connection just as CLIENT KILL does.
             let parkable = park.can_park
                 && S::SUPPORTS_TASK_PARK
                 && idle_park::park_after_ms() > 0
@@ -1588,6 +1584,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut read_buf,
                 &mut stream,
                 &shutdown,
+                &client_live,
             )
             .await
             {
@@ -2811,7 +2808,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             crate::client_registry::ClientFlags {
                 subscriber: conn.subscription_count > 0,
                 in_multi: conn.in_multi,
+                // A batch just completed, so this connection is by definition
+                // not blocked right now; the blocked bit is owned by
+                // `set_blocked` around the blocking await.
                 blocked: false,
+                replica: conn.saw_replconf,
             },
             ctx.cached_clock.ms(),
         );
