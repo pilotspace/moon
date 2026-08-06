@@ -6,7 +6,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
+  Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
+  `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so
+  the gate below it never ran — even though the comment attached to that gate
+  claimed it "must run before any command-specific handlers ... so that
+  low-privilege users cannot reach admin commands". Any authenticated account
+  could escalate to full admin: a user holding nothing but `~app:* +get` was
+  correctly refused a plain `SET` yet could run
+  `ACL SETUSER evil on nopass ~* +@all` (persisted), `CONFIG SET` (persisted),
+  arbitrary Lua via `EVAL`, `SCRIPT LOAD`, `REPLICAOF` and `BGSAVE`. The gate
+  now sits above every privileged intercept in both handlers, with `AUTH` and
+  `HELLO` lifted above it as Redis's `NO_AUTH` commands. Verified end-to-end at
+  1 and 4 shards (`tests/acl_privileged_intercepts.rs`).
+- **Unknown ACL users failed OPEN (c10k B2).** All three permission checks
+  started with `users.get(username)?`, and `None` is their "allowed" answer, so
+  a username missing from the table was granted everything. Nothing closes a
+  live session when its account disappears, so `ACL DELUSER alice` / `ACL LOAD`
+  silently PROMOTED every connection alice still had open to `~* +@all`.
+  Unknown users are now denied; `default` is guaranteed present after any load
+  (`ensure_default_user`) so a server whose ACL file omits it is not bricked.
+- **`CLIENT KILL USER` was inert and `CLIENT LIST` reported `user=default` for
+  everyone (c10k B3).** The client registry captured the username once, at
+  accept time; AUTH/HELLO updated only the connection-local copy. The primary
+  incident-response lever for a compromised credential matched nothing. AUTH
+  and HELLO now publish the adopted identity to the registry, and — matching
+  Redis — `ACL DELUSER` disconnects the sessions the deleted user still holds.
+- **The experimental io_uring bridge served commands with no auth (c10k B4).**
+  `MOON_URING=1` (tokio, Linux) binds a second `SO_REUSEPORT` listener on the
+  server's own port whose accept path has no auth gate, no ACL check and no
+  client registry — so on a server with `requirepass`/`aclfile` configured the
+  kernel load-balanced roughly half of all new connections onto a listener that
+  skipped authentication entirely. The documented limitation named maxclients
+  and `CLIENT LIST`/`KILL`, not this. The bridge now refuses to arm (loudly)
+  when authentication is configured and the shard stays on the tokio path.
+
 ### Fixed
+- **TLS park veto samples `wants_write()` after processing, not before (c10k
+  B5).** `Stream::task_park_safe` read `wants_write()` before
+  `process_new_packets()`, which can queue outbound bytes and still return
+  `Ok` — reachable in rustls 0.23 via the TLS 1.2 renegotiation rebuff
+  (`NoRenegotiation` warning alert) — so the connection could park owing the
+  peer a reply. (The TLS 1.3 KeyUpdate variant is *not* reachable: rustls
+  defers that reply until the next outbound record; `tests/tls_park_keyupdate.rs`
+  pins the behaviour so a future rustls change is caught.)
 - **A client that disconnects while blocked is now reaped (c10k hardening
   A1).** The infinite-wait `select!` behind `BLPOP`/`BRPOP`/`BLMOVE`/
   `BZPOPMIN`/`BZPOPMAX`/`BLMPOP`/`BZMPOP`/`BRPOPLPUSH` had exactly two arms,

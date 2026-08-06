@@ -36,6 +36,22 @@ use super::shared_databases::ShardDatabases;
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
+/// c10k hardening B4: may the experimental io_uring bridge be armed?
+///
+/// The bridge binds a SECOND `SO_REUSEPORT` listener on the server's own port
+/// and dispatches commands from its own accept path — one with no auth gate,
+/// no ACL check and no client registry. On a server that has configured
+/// authentication the kernel would then load-balance new connections between
+/// a listener that enforces auth and one that does not. Answer `false` there
+/// and stay on the pure-tokio path.
+///
+/// Free function (not `cfg`-gated like its only call site) so the rule is
+/// unit-testable on every platform and under both runtimes.
+#[allow(dead_code)] // Called only under cfg(linux + runtime-tokio); tests use it everywhere.
+pub(crate) fn uring_bridge_allowed(config: &crate::config::ServerConfig) -> bool {
+    config.requirepass.is_none() && config.aclfile.is_none()
+}
+
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
@@ -101,6 +117,28 @@ impl super::Shard {
             if std::env::var("MOON_NO_URING").is_ok() || std::env::var("MOON_URING").is_err() {
                 info!(
                     "Shard {} io_uring disabled (tokio default; set MOON_URING=1 to opt in)",
+                    self.id
+                );
+                None
+            } else if !uring_bridge_allowed(&server_config) {
+                // c10k hardening B4. The bridge's own accept path
+                // (`uring_handler`) dispatches commands directly — it has no
+                // auth gate, no ACL check and no client registry. On a server
+                // that HAS configured authentication it therefore binds a
+                // second SO_REUSEPORT socket on the very same port that serves
+                // every command unauthenticated: the kernel load-balances new
+                // connections between the two listeners, so roughly half of
+                // them skip auth entirely. The documented limitation named
+                // maxclients and CLIENT LIST/KILL, not this.
+                //
+                // Refusing to arm is the fail-closed answer and leaves the
+                // shard on the stable pure-tokio path (which does enforce
+                // auth), rather than killing a server over an experimental
+                // opt-in.
+                tracing::error!(
+                    "Shard {} REFUSING io_uring bridge: MOON_URING=1 with requirepass/aclfile \
+                     configured would serve unauthenticated commands on the same port. \
+                     Falling back to tokio I/O; unset MOON_URING or remove auth to use it.",
                     self.id
                 );
                 None
@@ -2618,5 +2656,35 @@ impl super::Shard {
         // Databases now live in Arc<ShardDatabases>, no reclaim needed.
         self.databases.clear();
         self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uring_bridge_allowed;
+    use crate::config::ServerConfig;
+    use clap::Parser;
+
+    /// c10k B4. The bridge is only allowed when the server has no
+    /// authentication to bypass in the first place.
+    #[test]
+    fn uring_bridge_is_refused_when_auth_is_configured() {
+        let no_auth = ServerConfig::parse_from(["moon"]);
+        assert!(
+            uring_bridge_allowed(&no_auth),
+            "no auth configured: the bridge has nothing to bypass"
+        );
+
+        let with_pass = ServerConfig::parse_from(["moon", "--requirepass", "hunter2"]);
+        assert!(
+            !uring_bridge_allowed(&with_pass),
+            "requirepass set: the bridge would serve unauthenticated commands on the same port"
+        );
+
+        let with_aclfile = ServerConfig::parse_from(["moon", "--aclfile", "/tmp/users.acl"]);
+        assert!(
+            !uring_bridge_allowed(&with_aclfile),
+            "aclfile set: same bypass, via ACL users instead of requirepass"
+        );
     }
 }

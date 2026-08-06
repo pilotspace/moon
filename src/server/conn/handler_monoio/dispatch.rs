@@ -58,8 +58,7 @@ pub(super) fn check_auth_gate(
             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
             if let Some(uname) = opt_user {
                 conn.authenticated = true;
-                conn.current_user = uname;
-                conn.refresh_acl_cache(&ctx.acl_table);
+                conn.adopt_user(uname, &ctx.acl_table);
                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                     crate::auth_ratelimit::record_success(addr.ip());
                 }
@@ -99,8 +98,7 @@ pub(super) fn check_auth_gate(
                 conn.client_name = Some(name);
             }
             if let Some(ref uname) = opt_user {
-                conn.current_user = uname.clone();
-                conn.refresh_acl_cache(&ctx.acl_table);
+                conn.adopt_user(uname.clone(), &ctx.acl_table);
             }
             // HELLO AUTH rate limiting
             if matches!(&response, Frame::Error(_)) {
@@ -337,8 +335,7 @@ pub(super) fn try_handle_auth(
     }
     let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
     if let Some(uname) = opt_user {
-        conn.current_user = uname;
-        conn.refresh_acl_cache(&ctx.acl_table);
+        conn.adopt_user(uname, &ctx.acl_table);
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             crate::auth_ratelimit::record_success(addr.ip());
         }
@@ -382,8 +379,7 @@ pub(super) fn try_handle_hello(
         conn.client_name = Some(name);
     }
     if let Some(ref uname) = opt_user {
-        conn.current_user = uname.clone();
-        conn.refresh_acl_cache(&ctx.acl_table);
+        conn.adopt_user(uname.clone(), &ctx.acl_table);
     }
     if matches!(&response, Frame::Error(_)) {
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
@@ -418,6 +414,7 @@ pub(super) fn try_handle_acl(
         &conn.current_user,
         peer_addr,
         &ctx.runtime_config,
+        conn.client_id,
     );
     responses.push(response);
     true

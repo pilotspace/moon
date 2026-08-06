@@ -469,8 +469,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&ctx.acl_table);
+                                    conn.adopt_user(uname, &ctx.acl_table);
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                         crate::auth_ratelimit::record_success(addr.ip());
                                     }
@@ -507,8 +506,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     conn.client_name = Some(name);
                                 }
                                 if let Some(ref uname) = opt_user {
-                                    conn.current_user = uname.clone();
-                                    conn.refresh_acl_cache(&ctx.acl_table);
+                                    conn.adopt_user(uname.clone(), &ctx.acl_table);
                                 }
                                 // HELLO AUTH rate limiting (same as AUTH gate)
                                 if matches!(&response, Frame::Error(_)) {
@@ -559,6 +557,99 @@ pub(crate) async fn handle_connection_sharded_inner<
                         conn.asking = true;
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         continue;
+                    }
+
+                    // === ACL-EXEMPT COMMANDS ===
+                    //
+                    // AUTH and HELLO carry Redis's `NO_AUTH` flag and are
+                    // allowed whatever the current user's permissions are: a
+                    // restricted user must always be able to re-authenticate,
+                    // and gating HELLO would break the RESP3 handshake. The
+                    // pre-auth gate above handles them only while
+                    // UNauthenticated; this is the post-authentication path.
+                    // --- AUTH (already conn.authenticated) ---
+                    if cmd.eq_ignore_ascii_case(b"AUTH") {
+                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
+                        if let Some(uname) = opt_user {
+                            conn.adopt_user(uname, &ctx.acl_table);
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- HELLO ---
+                    if cmd.eq_ignore_ascii_case(b"HELLO") {
+                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
+                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
+                        );
+                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
+                        if let Some(name) = new_name { conn.client_name = Some(name); }
+                        if let Some(ref uname) = opt_user {
+                            conn.adopt_user(uname.clone(), &ctx.acl_table);
+                        }
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // === ACL GATE - every privileged intercept MUST sit below ===
+                    //
+                    // c10k hardening B1. This gate used to sit ~180 lines
+                    // further down, below the scripting and ACL intercepts,
+                    // while its own comment claimed it ran "before any
+                    // command-specific handlers". That held for CONFIG and
+                    // REPLICAOF, but the Lua and ACL intercepts `continue`d
+                    // above it and so never reached a permission check: a user
+                    // holding only `~app:* +get` was correctly refused a plain
+                    // SET yet could run `ACL SETUSER evil on nopass ~* +@all`
+                    // and arbitrary Lua. See tests/acl_privileged_intercepts.rs.
+                    //
+                    // If you add a privileged intercept, add it BELOW this line.
+                    //
+                    // Fast path: skip RwLock + HashMap for unrestricted users
+                    // with a fresh cache.  Stale caches (after ACL SETUSER /
+                    // DELUSER / LOAD) fall through to the full check.
+                    if !conn.acl_skip_allowed() {
+                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+                        let acl_guard = ctx.acl_table.read().unwrap();
+                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
+                            drop(acl_guard);
+                            conn.acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: conn.current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
+                        let is_write_for_acl = metadata::is_write(cmd);
+                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
+                            drop(acl_guard);
+                            conn.acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: conn.current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
                     }
 
                     // --- CLUSTER subcommands ---
@@ -670,50 +761,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // --- AUTH (already conn.authenticated) ---
-                    if cmd.eq_ignore_ascii_case(b"AUTH") {
-                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user {
-                            conn.current_user = uname;
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                        }
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- HELLO ---
-                    if cmd.eq_ignore_ascii_case(b"HELLO") {
-                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
-                        );
-                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
-                        if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(ref uname) = opt_user {
-                            conn.current_user = uname.clone();
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                        }
-                        if matches!(&response, Frame::Error(_)) {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                            }
-                        } else if opt_user.is_some() {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        }
-                        responses.push(response);
-                        continue;
-                    }
+                    // (B1) The ACL gate that used to sit here now runs far above,
+                    // ahead of every privileged intercept. Its old comment claimed
+                    // exactly the invariant the code above it violated.
 
                     // --- ACL ---
                     if cmd.eq_ignore_ascii_case(b"ACL") {
                         let response = crate::command::acl::handle_acl(
-                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config,
+                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config, client_id,
                         );
                         responses.push(response);
                         continue;
@@ -762,41 +817,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // === ACL permission check ===
-                    // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
-                    // so that low-privilege users cannot reach admin commands.
-                    // Fast path: skip RwLock + HashMap for unrestricted users
-                    // with a fresh cache.  Stale caches (after ACL SETUSER /
-                    // DELUSER / LOAD) fall through to the full check.
-                    if !conn.acl_skip_allowed() {
-                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                        let acl_guard = ctx.acl_table.read().unwrap();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
-                            drop(acl_guard);
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
-                        let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
-                            drop(acl_guard);
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
-                    }
 
                     // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
                     // Placed AFTER ACL check. Respects MULTI queue — if conn.in_multi,
