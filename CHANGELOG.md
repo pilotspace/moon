@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A timed-out cross-shard `BLPOP` no longer eats the next push to that
+  key (c10k hardening A2/A3).** Two defects compounded into silent data
+  loss at `--shards > 1`. First, the tokio single-key cleanup condition
+  `is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_))`
+  parses as `(is_remote && !Null) || Error`, so on a **timeout** — where
+  the result *is* `Frame::Null` — the `BlockCancel` was never sent and the
+  owning shard kept the `WaitEntry` forever (remote entries carry
+  `deadline: None`, so the deadline sweep never reaps them). Second, when
+  a later push found that ghost waiter, every wake path popped the element
+  and then did `let _ = reply_tx.send(...)`: the receiver was long gone, so
+  the value was neither delivered, nor requeued, nor offered to the next
+  FIFO waiter — it simply vanished. Wakes now skip waiters whose client has
+  disconnected *before* touching the datastore, and restore anything popped
+  if the receiver drops in the remaining race window (including BLMOVE's
+  destination push and BLMPOP's multi-element pops, in order). The same
+  boolean bug also sent a local waiter's shutdown cleanup through
+  `target_index(shard, shard)`, which underflows to a panic on shard 0.
+- **Blocking registrations are no longer silently dropped or retried
+  forever (c10k hardening A4/A5/A6).** Cross-shard `BlockRegister` /
+  `BlockCancel` messages were pushed with a bare `try_push` (tokio) or an
+  uncapped `loop { try_push; sleep(10µs) }` with no shutdown arm (monoio).
+  A dropped `BlockRegister` drops the reply sender with it, so `BLPOP key 0`
+  returned nil at t=0 — a protocol violation; a dropped `BlockCancel` leaked
+  the owner-side waiter permanently; and the uncapped retry turned a
+  saturated owner shard into a zombie connection that also blocked graceful
+  shutdown. All four call sites now use the plane-wide bounded,
+  shutdown-aware push, notify the owning shard on success, and fail the
+  command loudly (`MOONERR blocking registration failed`) rather than
+  blocking on a key nobody is watching.
+
 ## [0.8.4] — 2026-07-29
 
 ### Added

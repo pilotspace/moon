@@ -21,6 +21,140 @@ use crate::storage::Database;
 
 use super::util::extract_bytes;
 
+/// Returned to the client when a blocking command cannot be registered on the
+/// shard that owns its key. Fails the command instead of the two silent
+/// alternatives the old code had: replying nil at t=0 (protocol violation) or
+/// blocking forever on a key nobody is watching.
+const BLOCK_REGISTER_FAILED: &[u8] =
+    b"MOONERR blocking registration failed: owning shard not draining";
+
+/// Push a blocking-registry control message (`BlockRegister` / `BlockCancel`)
+/// to the shard that owns the key.
+///
+/// c10k hardening A4/A5/A6. Every call site was previously either a bare
+/// `try_push` — silently dropping the message when the ring was full — or an
+/// unbounded `loop { try_push; sleep(10µs) }` with no shutdown arm. Each
+/// failure mode is a real defect:
+///   * a dropped `BlockRegister` drops `reply_tx` with it, so the waiter's
+///     receiver disconnects and `BLPOP key 0` returns nil immediately;
+///   * a dropped `BlockCancel` leaks the owner-side `WaitEntry` permanently
+///     (remote entries carry `deadline: None`, so the W6 sweep never reaps
+///     them) — the leak that then feeds the A2 data-loss path;
+///   * the unbounded retry turned a saturated owner into a zombie connection
+///     that also prevented graceful shutdown from completing.
+///
+/// Uses the same budget as every other cross-shard push
+/// ([`CROSS_SHARD_PUSH_MAX_RETRIES`] × [`CROSS_SHARD_PUSH_BACKOFF`] ≈ 0.5 s):
+/// wedged-shard detection scale, generous enough not to false-reject a merely
+/// saturated shard. Deliberately NOT a tighter blocking-specific budget — a
+/// registration that gives up early is a client-visible error, and the old
+/// monoio path retried forever, so the only safe direction to move is toward
+/// the plane-wide bound.
+///
+/// Returns `false` if the message could not be delivered.
+async fn push_block_msg(
+    shutdown: &CancellationToken,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    my_shard: usize,
+    target_shard: usize,
+    msg: ShardMessage,
+    notify: Option<&channel::Notify>,
+) -> bool {
+    debug_assert_ne!(
+        my_shard, target_shard,
+        "blocking control message must target a remote shard"
+    );
+    let target_idx = ChannelMesh::target_index(my_shard, target_shard);
+    let mut slot = Some(msg);
+    let outcome = crate::shard::dispatch::push_with_backpressure(
+        shutdown,
+        crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+        crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+        || {
+            let Some(m) = slot.take() else { return true };
+            // Borrow is scoped to this closure body, never held across the
+            // caller's `.await` between retries.
+            let mut producers = dispatch_tx.borrow_mut();
+            match producers[target_idx].try_push(m) {
+                Ok(()) => true,
+                Err(back) => {
+                    slot = Some(back);
+                    false
+                }
+            }
+        },
+    )
+    .await;
+    if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+        return false;
+    }
+    // A5: the owner's event loop may be parked; without this kick the
+    // registration sits in the ring until the next periodic tick.
+    //
+    // `notify` is `Some` only on the monoio runtime, whose shard loops park in
+    // the driver and need the explicit eventfd kick. The tokio shard loop has
+    // no equivalent task-local `Notify` receive path — it discovers ring items
+    // through its own periodic drain — so tokio call sites pass `None` and
+    // accept up to one tick of latency rather than a lost registration. Wiring
+    // a `Notify` into the tokio loop is a separate change; this comment states
+    // what the code actually does today.
+    if let Some(n) = notify {
+        n.notify_one();
+    }
+    true
+}
+
+/// Tear down every registration a multi-key waiter holds: the local ones
+/// directly, the remote ones with a `BlockCancel` per owning shard.
+///
+/// A6: the cancels were bare `try_push`es, so a full ring leaked the owner's
+/// `WaitEntry` — which is exactly the ghost waiter the A2 wake path then had
+/// to defend against. `notifiers` is `Some` only on the monoio runtime, whose
+/// shard loops park and need an explicit kick.
+async fn cancel_multikey_registrations(
+    shutdown: &CancellationToken,
+    blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    shard_id: usize,
+    wait_id: u64,
+    registered_remote_shards: &[usize],
+    notifiers: Option<&[std::sync::Arc<channel::Notify>]>,
+) {
+    blocking_registry.borrow_mut().remove_wait(wait_id);
+    for &remote_shard in registered_remote_shards {
+        let delivered = push_block_msg(
+            shutdown,
+            dispatch_tx,
+            shard_id,
+            remote_shard,
+            ShardMessage::BlockCancel { wait_id },
+            notifiers.map(|n| &*n[remote_shard]),
+        )
+        .await;
+        if !delivered {
+            // The push budget is bounded by design (A4 — the old unbounded
+            // retry was itself the bug), so a shard wedged for the whole
+            // ~0.5 s budget, or a shutdown mid-cancel, can still drop this.
+            // The owner then keeps a `WaitEntry` that its deadline sweep will
+            // not reap (remote entries carry `deadline: None`).
+            //
+            // This is a memory leak, NOT data loss: since A2 every wake path
+            // checks `is_disconnected()` before touching the datastore and
+            // restores anything it popped, so a stale entry is skipped and
+            // pruned rather than swallowing an element. Log it so the leak is
+            // observable instead of silent — a shard wedged this long is
+            // already an incident.
+            tracing::warn!(
+                wait_id,
+                from_shard = shard_id,
+                owner_shard = remote_shard,
+                "BlockCancel undelivered: owner shard not draining; its waiter \
+                 entry leaks until a later push prunes it"
+            );
+        }
+    }
+}
+
 /// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
 /// BLPOP key [key ...] timeout -> LPOP key [key ...]
 /// BRPOP key [key ...] timeout -> RPOP key [key ...]
@@ -145,38 +279,37 @@ pub(crate) async fn handle_blocking_command(
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
+        let is_remote = target != shard_id;
         let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
-        let wait_id = {
-            let mut reg = blocking_registry.borrow_mut();
-            let wait_id = reg.next_wait_id();
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
+        let wait_id = blocking_registry.borrow_mut().next_wait_id();
+        if is_remote {
+            // Remote registration via SPSC — bounded and shutdown-aware
+            // (A4/A5). The borrow above is released before this await.
+            let msg = ShardMessage::BlockRegister(Box::new(
+                crate::shard::dispatch::BlockRegisterPayload {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    deadline,
-                };
-                reg.register(selected_db, keys[0].clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let mut producers = dispatch_tx.borrow_mut();
-                let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: keys[0].clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx,
-                    },
-                ));
-                let _ = producers[target_idx].try_push(msg);
+                },
+            ));
+            if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
+                return Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED));
             }
-            wait_id
-        }; // reg borrow dropped
+        } else {
+            // Local registration
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            blocking_registry
+                .borrow_mut()
+                .register(selected_db, keys[0].clone(), entry);
+        }
 
-        let is_remote = target != shard_id;
         let result = if let Some(dl) = deadline {
             tokio::select! {
                 res = reply_rx => {
@@ -208,11 +341,34 @@ pub(crate) async fn handle_blocking_command(
                 }
             }
         };
-        // Cleanup remote registration on timeout/shutdown
-        if is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_)) {
-            let mut producers = dispatch_tx.borrow_mut();
-            let target_idx = ChannelMesh::target_index(shard_id, target);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        // Cleanup remote registration on timeout/shutdown.
+        //
+        // A3: this used to read
+        //   `is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_))`
+        // which Rust parses as `(is_remote && !Null) || Error`. Two bugs fell
+        // out of that precedence:
+        //   * on TIMEOUT (`result == Frame::Null`) the cancel was never sent,
+        //     so the owner shard kept a `WaitEntry` that nothing can ever
+        //     reap (remote entries carry `deadline: None`, so the W6 deadline
+        //     sweep skips them) — a permanent leak that also hands the next
+        //     pusher a ghost waiter;
+        //   * on a LOCAL wait ending in shutdown (`Frame::Error`) it took the
+        //     remote branch anyway and computed `target_index(shard, shard)`,
+        //     which underflows to a panic on shard 0 and misroutes the cancel
+        //     to an unrelated shard otherwise.
+        // The correct condition is simply "did we register remotely" — the
+        // monoio twin below always had it right. A cancel that races a
+        // successful wake is a harmless no-op (`remove_wait` on an unknown id).
+        if is_remote {
+            let _ = push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                ShardMessage::BlockCancel { wait_id },
+                None,
+            )
+            .await;
         }
         return result;
     }
@@ -224,9 +380,13 @@ pub(crate) async fn handle_blocking_command(
         FuturesUnordered::new();
     let mut registered_remote_shards: Vec<usize> = Vec::new();
 
+    // A4/A5: build every registration under one borrow, but STAGE the remote
+    // ones and push them only after the borrow is released — the old code
+    // pushed while holding both borrows, which forced the bare `try_push`
+    // (no await possible, so no backpressure retry and no shutdown arm).
+    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
     {
         let mut reg = blocking_registry.borrow_mut();
-        let mut producers = dispatch_tx.borrow_mut();
         wait_id = reg.next_wait_id();
 
         for key in &keys {
@@ -245,7 +405,6 @@ pub(crate) async fn handle_blocking_command(
                 reg.register(selected_db, key.clone(), entry);
             } else {
                 // Remote registration via SPSC
-                let target_idx = ChannelMesh::target_index(shard_id, target);
                 let msg = ShardMessage::BlockRegister(Box::new(
                     crate::shard::dispatch::BlockRegisterPayload {
                         db_index: selected_db,
@@ -255,13 +414,38 @@ pub(crate) async fn handle_blocking_command(
                         reply_tx: tx,
                     },
                 ));
-                let _ = producers[target_idx].try_push(msg);
+                pending_remote.push((target, msg));
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
                 }
             }
         }
     } // borrows dropped -- CRITICAL before await
+
+    // A5: a silently dropped registration leaves this waiter blocked on a key
+    // nobody is watching — it would sleep through data that IS available.
+    // Fail the whole command instead, after unwinding what did register.
+    let mut registration_failed = false;
+    for (target, msg) in pending_remote {
+        if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
+            registration_failed = true;
+            break;
+        }
+    }
+    if registration_failed {
+        cancel_multikey_registrations(
+            shutdown,
+            blocking_registry,
+            dispatch_tx,
+            shard_id,
+            wait_id,
+            &registered_remote_shards,
+            None,
+        )
+        .await;
+        drop(receivers);
+        return Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED));
+    }
 
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
@@ -308,14 +492,16 @@ pub(crate) async fn handle_blocking_command(
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
-    blocking_registry.borrow_mut().remove_wait(wait_id);
-    if !registered_remote_shards.is_empty() {
-        let mut producers = dispatch_tx.borrow_mut();
-        for &remote_shard in &registered_remote_shards {
-            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
-        }
-    }
+    cancel_multikey_registrations(
+        shutdown,
+        blocking_registry,
+        dispatch_tx,
+        shard_id,
+        wait_id,
+        &registered_remote_shards,
+        None,
+    )
+    .await;
     // Drop remaining receivers; remote senders get Err on send -- harmless
     drop(receivers);
 
@@ -384,51 +570,46 @@ pub(crate) async fn handle_blocking_command_monoio(
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
+        let is_remote = target != shard_id;
         let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
-        let wait_id = {
-            let mut reg = blocking_registry.borrow_mut();
-            let wait_id = reg.next_wait_id();
-            if target == shard_id {
-                let entry = crate::blocking::WaitEntry {
+        let wait_id = blocking_registry.borrow_mut().next_wait_id();
+        if is_remote {
+            // A4: the old `loop { try_push; sleep(10µs) }` had no retry cap
+            // and no shutdown arm — a saturated owner turned this into a
+            // zombie connection that also blocked graceful shutdown.
+            let msg = ShardMessage::BlockRegister(Box::new(
+                crate::shard::dispatch::BlockRegisterPayload {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    deadline,
-                };
-                reg.register(selected_db, keys[0].clone(), entry);
-            } else {
-                drop(reg);
-                let mut producers = dispatch_tx.borrow_mut();
-                let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: keys[0].clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx,
-                    },
-                ));
-                let mut msg_pending = msg;
-                loop {
-                    match producers[target_idx].try_push(msg_pending) {
-                        Ok(()) => {
-                            spsc_notifiers[target].notify_one();
-                            break;
-                        }
-                        Err(val) => {
-                            msg_pending = val;
-                            drop(producers);
-                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
-                            producers = dispatch_tx.borrow_mut();
-                        }
-                    }
-                }
+                },
+            ));
+            if !push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                msg,
+                Some(&spsc_notifiers[target]),
+            )
+            .await
+            {
+                return Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED));
             }
-            wait_id
-        }; // reg borrow dropped
+        } else {
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            blocking_registry
+                .borrow_mut()
+                .register(selected_db, keys[0].clone(), entry);
+        }
 
-        let is_remote = target != shard_id;
         let result = if let Some(dl) = deadline {
             monoio::select! {
                 res = reply_rx => {
@@ -461,9 +642,17 @@ pub(crate) async fn handle_blocking_command_monoio(
             }
         };
         if is_remote {
-            let mut producers = dispatch_tx.borrow_mut();
-            let target_idx = ChannelMesh::target_index(shard_id, target);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+            // A6: bounded push + notify instead of a bare `try_push` that
+            // leaked the owner's WaitEntry whenever the ring was full.
+            let _ = push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                ShardMessage::BlockCancel { wait_id },
+                Some(&spsc_notifiers[target]),
+            )
+            .await;
         }
         return result;
     }
@@ -475,9 +664,11 @@ pub(crate) async fn handle_blocking_command_monoio(
         FuturesUnordered::new();
     let mut registered_remote_shards: Vec<usize> = Vec::new();
 
+    // A4/A5: stage remote registrations, push them after the borrow is
+    // released. See the tokio twin for the full rationale.
+    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
     {
         let mut reg = blocking_registry.borrow_mut();
-        let mut producers = dispatch_tx.borrow_mut();
         wait_id = reg.next_wait_id();
 
         for key in &keys {
@@ -496,7 +687,6 @@ pub(crate) async fn handle_blocking_command_monoio(
                 reg.register(selected_db, key.clone(), entry);
             } else {
                 // Remote registration via SPSC
-                let target_idx = ChannelMesh::target_index(shard_id, target);
                 let msg = ShardMessage::BlockRegister(Box::new(
                     crate::shard::dispatch::BlockRegisterPayload {
                         db_index: selected_db,
@@ -506,31 +696,44 @@ pub(crate) async fn handle_blocking_command_monoio(
                         reply_tx: tx,
                     },
                 ));
-                // SPSC push with backpressure retry (monoio pattern)
-                let mut msg_pending = msg;
-                loop {
-                    match producers[target_idx].try_push(msg_pending) {
-                        Ok(()) => {
-                            spsc_notifiers[target].notify_one();
-                            break;
-                        }
-                        Err(val) => {
-                            msg_pending = val;
-                            // Drop borrows before await
-                            drop(producers);
-                            drop(reg);
-                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
-                            reg = blocking_registry.borrow_mut();
-                            producers = dispatch_tx.borrow_mut();
-                        }
-                    }
-                }
+                pending_remote.push((target, msg));
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
                 }
             }
         }
     } // borrows dropped -- CRITICAL before await
+
+    let mut registration_failed = false;
+    for (target, msg) in pending_remote {
+        if !push_block_msg(
+            shutdown,
+            dispatch_tx,
+            shard_id,
+            target,
+            msg,
+            Some(&spsc_notifiers[target]),
+        )
+        .await
+        {
+            registration_failed = true;
+            break;
+        }
+    }
+    if registration_failed {
+        cancel_multikey_registrations(
+            shutdown,
+            blocking_registry,
+            dispatch_tx,
+            shard_id,
+            wait_id,
+            &registered_remote_shards,
+            Some(spsc_notifiers),
+        )
+        .await;
+        drop(receivers);
+        return Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED));
+    }
 
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
@@ -578,15 +781,16 @@ pub(crate) async fn handle_blocking_command_monoio(
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
-    blocking_registry.borrow_mut().remove_wait(wait_id);
-    if !registered_remote_shards.is_empty() {
-        let mut producers = dispatch_tx.borrow_mut();
-        for &remote_shard in &registered_remote_shards {
-            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
-            spsc_notifiers[remote_shard].notify_one();
-        }
-    }
+    cancel_multikey_registrations(
+        shutdown,
+        blocking_registry,
+        dispatch_tx,
+        shard_id,
+        wait_id,
+        &registered_remote_shards,
+        Some(spsc_notifiers),
+    )
+    .await;
     // Drop remaining receivers; remote senders get Err on send -- harmless
     drop(receivers);
 
