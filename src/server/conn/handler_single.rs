@@ -9,6 +9,41 @@ use crate::runtime::channel;
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
+
+/// c10k C1 — bound a reply send so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `Framed::send` is feed + flush; the flush blocks once the socket's receive
+/// window closes and never returns. The handler then holds its `maxclients`
+/// slot, and its share of the batch's serialized replies, for as long as the
+/// client cares to wait. N such clients is an OOM that costs the attacker
+/// nothing but an unread socket.
+///
+/// Cancelling the flush may leave a partial frame on the wire; that is
+/// correct here, because the only thing we do afterwards is close the
+/// connection. Evaluates to `true` when the send completed, `false` when it
+/// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
+/// wait-forever behaviour.
+macro_rules! send_bounded {
+    ($framed:expr, $frame:expr, $wt:expr, $client_id:expr) => {{
+        match $wt {
+            None => $framed.send($frame).await.is_ok(),
+            Some(dur) => match tokio::time::timeout(dur, $framed.send($frame)).await {
+                Ok(r) => r.is_ok(),
+                Err(_) => {
+                    tracing::warn!(
+                        "Connection {} reply write made no progress for {}ms — \
+                         closing (client is not reading)",
+                        $client_id,
+                        dur.as_millis(),
+                    );
+                    false
+                }
+            },
+        }
+    }};
+}
+
 use futures::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -171,12 +206,44 @@ pub async fn handle_connection(
     );
     conn.refresh_acl_cache(&acl_table);
 
+    // c10k C2: arm the query-buffer ceiling. This handler reads through
+    // `Framed`, which loops read -> decode -> read internally and does not
+    // yield while a frame is incomplete — so the ceiling lives in the codec
+    // (see `RespCodec::max_query_buf`) rather than in this loop. A connection
+    // that starts out already authenticated (no requirepass) gets the full
+    // limit immediately; the rest are raised by `arm_query_buf_limit` on
+    // their first successful AUTH/HELLO.
+    let (qbuf_limit, qbuf_preauth, write_timeout_ms) = {
+        let rt = runtime_config.read();
+        (
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
+            rt.client_write_timeout_ms,
+        )
+    };
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    let write_timeout = match write_timeout_ms {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    };
+
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
     // Phase 9+ will leverage this for per-request temporaries.
     let mut arena = Bump::with_capacity(4096); // 4KB initial capacity
 
     loop {
+        // c10k C2: re-arm the ceiling every pass rather than at each of the
+        // five AUTH/HELLO success sites — two local loads and a field store,
+        // and it cannot be forgotten when a sixth site appears. It must run
+        // before `framed.next()`, which is exactly here.
+        framed
+            .codec_mut()
+            .set_max_query_buf(super::util::query_buf_limit(
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            ));
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -384,7 +451,7 @@ pub async fn handle_connection(
                                 }
                                 agg.freeze()
                             };
-                            if framed.send(Frame::PreSerialized(payload)).await.is_err() {
+                            if !send_bounded!(framed, Frame::PreSerialized(payload), write_timeout, client_id) {
                                 break;
                             }
                         }
@@ -1141,7 +1208,7 @@ pub async fn handle_connection(
                             // Flush accumulated +OK responses now that AOF durability
                             // has been confirmed (or is fire-and-forget).
                             for resp in responses.drain(..) {
-                                if framed.send(resp).await.is_err() {
+                                if !send_bounded!(framed, resp, write_timeout, client_id) {
                                     break_outer = true;
                                     break;
                                 }
@@ -1208,7 +1275,7 @@ pub async fn handle_connection(
                                         } else {
                                             pubsub::subscribe_response(&channel_or_pattern, conn.subscription_count)
                                         };
-                                        if framed.send(response).await.is_err() {
+                                        if !send_bounded!(framed, response, write_timeout, client_id) {
                                             break_outer = true;
                                             break;
                                         }
@@ -2711,7 +2778,7 @@ pub async fn handle_connection(
                     // EverySec / No policy: flush responses first (zero added latency),
                     // then fire-and-forget AOF enqueue.
                     for response in responses {
-                        if framed.send(response).await.is_err() {
+                        if !send_bounded!(framed, response, write_timeout, client_id) {
                             break_outer = true;
                             break;
                         }
@@ -2742,7 +2809,7 @@ pub async fn handle_connection(
                 }
             } => {
                 if let Some(push_frame) = msg {
-                    if framed.send(push_frame).await.is_err() {
+                    if !send_bounded!(framed, push_frame, write_timeout, client_id) {
                         break;
                     }
                 }

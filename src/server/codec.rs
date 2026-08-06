@@ -21,6 +21,14 @@ use crate::protocol::{self, Frame, ParseConfig, ParseError};
 pub struct RespCodec {
     config: ParseConfig,
     protocol_version: u8,
+    /// c10k C2: per-connection query-buffer ceiling in bytes (0 = unlimited).
+    ///
+    /// Enforced here rather than in the handler because `Framed::next()` does
+    /// not yield between reads while a frame is still incomplete — it loops
+    /// read -> decode -> read internally, so a handler-side check would never
+    /// run during the growth that matters. `decode` is the one place that
+    /// sees the buffer on every pass.
+    max_query_buf: usize,
 }
 
 impl RespCodec {
@@ -28,7 +36,14 @@ impl RespCodec {
         Self {
             config,
             protocol_version: 2,
+            max_query_buf: 0,
         }
+    }
+
+    /// Set the query-buffer ceiling (0 = unlimited). Callers raise this from
+    /// the pre-auth value to the full one when a connection authenticates.
+    pub fn set_max_query_buf(&mut self, max: usize) {
+        self.max_query_buf = max;
     }
 
     pub fn set_protocol_version(&mut self, version: u8) {
@@ -44,6 +59,12 @@ impl RespCodec {
     /// Returns `Ok(Some(frame))` on success, `Ok(None)` if incomplete,
     /// or `Err` on parse error.
     pub fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, std::io::Error> {
+        if self.max_query_buf != 0 && src.len() > self.max_query_buf {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "query buffer limit reached",
+            ));
+        }
         match protocol::parse(src, &self.config) {
             Ok(frame) => Ok(frame),
             Err(ParseError::Incomplete) => Ok(None),

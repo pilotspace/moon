@@ -113,6 +113,18 @@ pub struct ClientLiveState {
     /// non-unix). Set once at registration; only read by `kill_clients` while
     /// holding the registry lock (see the drop-ordering safety note there).
     pub kill_fd: i32,
+    /// Bytes of reply currently held in an in-flight write (c10k C1).
+    ///
+    /// This is the memory a client that stops reading is pinning: the handler
+    /// serializes a whole batch into one buffer before its single write
+    /// syscall, so a deep pipeline against a closed receive window parks
+    /// hundreds of MB here. `CLIENT LIST` reported `obl=0 oll=0 omem=0`
+    /// unconditionally, which made the attack invisible while it happened.
+    /// Reported as `obl`/`omem` — moon has one contiguous output buffer, not
+    /// Redis's static-buffer + reply-list pair, so `oll` stays 0.
+    pub pending_out_bytes: AtomicU64,
+    /// Cumulative reply bytes successfully written — `tot-net-out`.
+    pub tot_net_out: AtomicU64,
 }
 
 impl ClientLiveState {
@@ -130,6 +142,25 @@ impl ClientLiveState {
             Ordering::Relaxed,
         );
         self.flags.store(flags.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Mark a reply write as in flight. One relaxed store, on a path that is
+    /// about to make a syscall — the cost is not measurable there.
+    #[inline]
+    pub fn begin_write(&self, bytes: usize) {
+        self.pending_out_bytes
+            .store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Clear the in-flight marker. `completed` distinguishes a delivered reply
+    /// from one abandoned by `--client-write-timeout-ms` or a socket error, so
+    /// `tot-net-out` counts only bytes that actually reached the peer.
+    #[inline]
+    pub fn end_write(&self, bytes: usize, completed: bool) {
+        self.pending_out_bytes.store(0, Ordering::Relaxed);
+        if completed {
+            self.tot_net_out.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
     }
 
     /// Lock-free CLIENT KILL check for the connection's own loop.
@@ -204,6 +235,8 @@ pub fn register(
         connected_at_epoch_ms: crate::storage::entry::current_time_ms(),
         db: AtomicUsize::new(0),
         last_cmd_ms: AtomicU64::new(0),
+        pending_out_bytes: AtomicU64::new(0),
+        tot_net_out: AtomicU64::new(0),
         flags: AtomicU8::new(ClientFlags::default().to_bits()),
         kill_flag: AtomicBool::new(false),
         kill_fd,
@@ -449,13 +482,21 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
     let name = entry.name.as_deref().unwrap_or("");
     let flags = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed)).to_flag_str();
     let db = live.db.load(Ordering::Relaxed);
+    // c10k C1: `obl`/`omem` report the reply bytes this connection is holding
+    // in an in-flight write. A client that stops reading pins that memory for
+    // as long as `--client-write-timeout-ms` allows, and with these hardcoded
+    // to 0 there was no way to see it happening. `oll` stays 0: moon has one
+    // contiguous output buffer, not Redis's static-buffer + reply-list pair,
+    // so there is no list whose length it could report.
+    let omem = live.pending_out_bytes.load(Ordering::Relaxed);
+    let tot_net_out = live.tot_net_out.load(Ordering::Relaxed);
     let _ = writeln!(
         buf,
         "id={} addr={} laddr=127.0.0.1:0 fd=0 name={} age={} idle={} flags={} db={} \
          sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
-         tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r \
+         tot-net-in=0 tot-net-out={} rbs=1024 rbp=0 obl={} oll=0 omem={} tot-mem={} events=r \
          cmd=NULL user={} redir=-1 resp=2 lib-name= lib-ver=",
-        entry.id, entry.addr, name, age, idle, flags, db, entry.user,
+        entry.id, entry.addr, name, age, idle, flags, db, tot_net_out, omem, omem, omem, entry.user,
     );
 }
 

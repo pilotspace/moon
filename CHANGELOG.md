@@ -6,7 +6,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`INFO memory` can now explain a `used_memory`-vs-RSS gap.** Build with
+  `--features jemalloc-stats` and `INFO memory` reports Redis's `allocator_*`
+  fields: `allocator_allocated`, `allocator_active`, `allocator_resident`,
+  `allocator_retained`, `allocator_frag_bytes`, `allocator_frag_ratio`, and
+  `allocator_unreturned_bytes`. `active - allocated` is fragmentation,
+  `resident - active` is dirty pages jemalloc holds but has not returned, and
+  anything the OS charges beyond `resident` belongs to something other than the
+  allocator. Motivated by a real instance reporting `used_memory` 2.43 GB while
+  the OS charged it 7.3 GB (7.2 GB of that swapped) with no way to tell which.
+  OFF by default — jemalloc's stats add bookkeeping to every allocation. Fields
+  are absent rather than zero-filled when not built in, because a zero would
+  read as "no fragmentation", which is worse than "not measured".
+
+### Known issues
+- **An idle moon may not return freed memory to the OS on Apple platforms, and
+  there is no in-process fix.** jemalloc's `background_thread` is compiled out
+  when `abi == macho` (`JEMALLOC_BACKGROUND_THREAD` is only defined otherwise),
+  so the `background_thread:true` moon bakes into its malloc conf is a silent
+  no-op there and decay runs only as a side effect of allocator activity. The
+  same 384 MiB churn-and-free reclaimed to a 3.7 MiB physical footprint on one
+  Apple Silicon machine and retained all 386 MiB indefinitely on a GitHub macOS
+  runner, so the behaviour varies by machine. A `--memory-decay-interval-ms`
+  timer calling `mallctl("arena.4096.decay")` — the same call jemalloc's own
+  background thread makes — was implemented and then **removed after it failed
+  to reclaim anything on the runner that reproduces the retention**, across 30
+  seconds of driving it and three independent retries, while the ctl itself
+  returned success. Production targets Linux, where the background thread is
+  compiled in and the retention has not been observed; on macOS, build with
+  `--features jemalloc-stats` and watch `allocator_unreturned_bytes` to tell
+  whether a given host is affected.
+
 ### Security
+- **Reply writes were unbounded — a client that stops reading held the whole
+  reply forever (c10k C1).** `write_all` on a socket whose receive window is
+  closed never returns. A client could pipeline a large response and then
+  simply stop reading, parking the handler inside that write while it held the
+  ENTIRE serialized reply — the monoio handler coalesces a whole batch into one
+  `Bytes` before its single write syscall, so a deep pipeline is hundreds of MB
+  — plus its `maxclients` slot, for as long as the attacker cared to wait. N
+  such clients is an OOM that costs the attacker nothing: no reads, no CPU,
+  just a TCP window it refuses to open. New `--client-write-timeout-ms`
+  (default `60000`, `0` = the previous wait-forever behaviour) bounds every
+  reply-carrying write in all three handlers — monoio top-level, sharded, and
+  the tokio single-shard `Framed` path — closing the connection and dropping
+  the reply when a write makes no progress for that long. 60s is far beyond any
+  healthy client's stall and replication does not use this path (PSYNC hijacks
+  the connection before it), but operators streaming very large replies over
+  very slow links should raise it: the budget covers the whole write call, not
+  each byte. Verified at 1 and 4 shards on both runtimes, with the `0` case as
+  a differential control proving the mechanism rather than the harness
+  (`tests/write_timeout.rs`). **Unverified on Windows**: the tests need the
+  server's write to actually block, and two attempts to force that under
+  Winsock failed (a 25 MB reply was absorbed by send/receive autotuning, and
+  clamping the victim's `SO_RCVBUF` to 8 KiB did not change it), so they are
+  skipped there rather than weakened until they pass. The code path is shared
+  and compiles on Windows, but nothing proves the timeout fires; Windows is not
+  a target platform (Linux and macOS are).
+- **`CLIENT LIST` reported `obl=0 oll=0 omem=0` unconditionally (c10k C1).**
+  The held-output counters were hardcoded, so an operator watching a
+  slow-client output-buffer OOM in progress saw every client reporting zero
+  bytes held — the attack above left no trace anywhere. `obl`/`omem` now report
+  the reply bytes a connection has in an in-flight write, and `tot-net-out`
+  counts reply bytes that actually reached the peer. `oll` stays 0: moon has
+  one contiguous output buffer, not Redis's static-buffer + reply-list pair, so
+  there is no list whose length it could report. Wired in the two handlers that
+  own a client-registry entry (monoio top-level and sharded); the legacy tokio
+  `handler_single` path bounds its writes but does not register, so it has
+  nothing to report through.
+- **No size ceiling on a reply (c10k C1).** Adds
+  `--client-output-buffer-limit-normal`, Redis's
+  `client-output-buffer-limit normal <hard>`, and ships it at **256 MiB rather
+  than Redis's unlimited default** — that default is exactly why an unread
+  socket can OOM Redis too. A reply exceeding the cap is refused and the
+  connection closed instead of buffering it. Consequence, intended and worth
+  knowing: the cap covers the whole serialized reply, so a single value larger
+  than the cap is undeliverable, not merely a long pipeline. No pub/sub-class
+  knob ships: moon's only subscriber write is already hard-capped at 64 KiB by
+  `MAX_COALESCE_BYTES`, so such a knob could never fire, and the real pub/sub
+  backpressure is the 4096-slot bounded channel (`CONN_CHANNEL_CAPACITY`) —
+  which bounds message COUNT, not bytes, and is a genuine follow-up.
+- **The write watchdog no longer arms on the hot path.** A timer per batch
+  flush would land once per command at pipeline depth 1, the path this project
+  spent a milestone winning against Redis. A reply that fits in the socket
+  buffer cannot block, so only writes ≥ 256 KiB arm the watchdog now
+  (`util::arm_write_timeout`). Residual, stated rather than hidden: a small
+  write to a genuinely wedged socket is still unbounded — it holds at most
+  256 KiB instead of hundreds of MB, but keeps its `maxclients` slot. It is now
+  visible (`omem` > 0) and killable (`CLIENT KILL` shuts the fd down), which it
+  was not before.
 - **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
   Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
   `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so

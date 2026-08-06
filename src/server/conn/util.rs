@@ -137,6 +137,40 @@ pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
 /// growth for genuinely large frames in flight.
 pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
 
+/// Reply size at or above which a write arms the `--client-write-timeout-ms`
+/// watchdog (c10k C1).
+///
+/// Arming a timer costs a wheel insert + removal on EVERY batch flush. At
+/// pipeline depth 1 that lands once per command, on the path this project
+/// spent a whole milestone winning against Redis — so it must not be paid
+/// where it cannot buy anything.
+///
+/// A reply that fits in the socket buffer is handed to the kernel and returns
+/// without ever blocking, so no timeout can fire for it. Linux's default
+/// `net.core.wmem_default` is 208 KiB and autotuning only raises it; 256 KiB
+/// is therefore comfortably inside "this write will not block".
+///
+/// Residual, stated plainly rather than hidden: a SMALL write to a socket
+/// whose window is genuinely closed is still unbounded. It holds at most this
+/// many bytes instead of the hundreds of megabytes C1 is about, but it does
+/// keep its `maxclients` slot. That connection is now visible (`omem` > 0 in
+/// CLIENT LIST) and killable (`CLIENT KILL` shuts the fd down, which makes the
+/// blocked write return), which it was not before.
+pub(crate) const WRITE_TIMEOUT_MIN_BYTES: usize = 256 * 1024;
+
+/// Should this write arm the stall watchdog? `None` means "write unbounded".
+#[inline]
+pub(crate) fn arm_write_timeout(
+    pending: usize,
+    configured: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if pending >= WRITE_TIMEOUT_MIN_BYTES {
+        configured
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod shrink_tests {
     use super::*;
@@ -172,5 +206,201 @@ mod shrink_tests {
         let cap_before = v.capacity();
         shrink_batch_vec(&mut v);
         assert_eq!(v.capacity(), cap_before);
+    }
+}
+
+/// Resolve the query-buffer ceiling that applies to a connection right now.
+///
+/// c10k hardening C2. The input buffer grows to whatever a frame header
+/// declares — a `$536870911` bulk header plus a dribble of bytes pins half a
+/// gigabyte, bounded only by the parser's 512 MiB ceiling — and that memory
+/// is invisible to `used_memory`, so `maxmemory` never sees it. The auth gate
+/// runs AFTER parsing, so this is reachable with no credentials at all: 20
+/// connections is 10 GB.
+///
+/// Unauthenticated connections therefore get their own, much smaller ceiling.
+/// No legitimate pre-auth command is large (AUTH, HELLO and the inline forms
+/// all fit in well under a kilobyte), and the full limit applies from the
+/// moment a client authenticates.
+///
+/// `0` means unlimited on either knob; a `0` pre-auth limit falls back to the
+/// general one rather than to "unlimited".
+#[inline]
+pub(crate) fn query_buf_limit(authenticated: bool, limit: usize, preauth_limit: usize) -> usize {
+    if authenticated {
+        return limit;
+    }
+    match (preauth_limit, limit) {
+        (0, l) => l,
+        // Never let the pre-auth ceiling exceed the general one: an operator
+        // who lowers `--client-query-buffer-limit` below the pre-auth default
+        // means the lower number.
+        (p, 0) => p,
+        (p, l) => p.min(l),
+    }
+}
+
+/// True when `len` has passed the resolved ceiling. Always false when the
+/// resolved ceiling is `0` (unlimited).
+#[inline]
+pub(crate) fn query_buf_exceeded(
+    len: usize,
+    authenticated: bool,
+    limit: usize,
+    preauth_limit: usize,
+) -> bool {
+    let resolved = query_buf_limit(authenticated, limit, preauth_limit);
+    resolved != 0 && len > resolved
+}
+
+/// The error moon sends before closing a connection that blew its query
+/// buffer. Redis closes silently (and logs); we say why first, then close —
+/// a silent close on a large pipeline is very hard to tell from a crash.
+pub(crate) const QUERY_BUF_LIMIT_ERROR: &[u8] =
+    b"-ERR Protocol error: query buffer limit reached\r\n";
+
+#[cfg(test)]
+mod query_buf_limit_tests {
+    use super::*;
+
+    #[test]
+    fn preauth_ceiling_is_the_smaller_of_the_two() {
+        // Defaults: 1 GiB general, 64 KiB pre-auth.
+        assert_eq!(query_buf_limit(false, 1 << 30, 64 * 1024), 64 * 1024);
+        assert_eq!(query_buf_limit(true, 1 << 30, 64 * 1024), 1 << 30);
+
+        // An operator who lowers the general limit below the pre-auth default
+        // means the lower number, even before auth.
+        assert_eq!(query_buf_limit(false, 4096, 64 * 1024), 4096);
+
+        // 0 pre-auth = "no separate pre-auth rule", not "unlimited".
+        assert_eq!(query_buf_limit(false, 4096, 0), 4096);
+        // 0 general = unlimited once authenticated, but the pre-auth rule
+        // still binds before that.
+        assert_eq!(query_buf_limit(true, 0, 64 * 1024), 0);
+        assert_eq!(query_buf_limit(false, 0, 64 * 1024), 64 * 1024);
+    }
+
+    #[test]
+    fn exceeded_is_strict_and_honours_unlimited() {
+        // Exactly at the limit is fine; one byte past is not.
+        assert!(!query_buf_exceeded(4096, true, 4096, 0));
+        assert!(query_buf_exceeded(4097, true, 4096, 0));
+
+        // Unlimited on both knobs never trips, at any size.
+        assert!(!query_buf_exceeded(usize::MAX, true, 0, 0));
+        assert!(!query_buf_exceeded(usize::MAX, false, 0, 0));
+
+        // The pre-auth ceiling is what an unauthenticated client hits.
+        assert!(query_buf_exceeded(64 * 1024 + 1, false, 1 << 30, 64 * 1024));
+        assert!(!query_buf_exceeded(64 * 1024 + 1, true, 1 << 30, 64 * 1024));
+    }
+}
+
+/// How long the `maxclients` rejection write may take before we give up and
+/// close (c10k C3).
+///
+/// The reject is 36 bytes, so any peer that is reading at all completes it
+/// instantly. A peer that advertises a zero window never does — and the write
+/// was unbounded and untimed, so the rejected fd stayed open for as long as
+/// the attacker cared to hold it. That defeats the whole point of the gate:
+/// live fds climb past `maxclients` without limit, which is exactly what the
+/// RLIMIT_NOFILE reconciliation is there to prevent. Two seconds is far more
+/// than a healthy client needs and far less than an attacker wants.
+pub(crate) const MAXCLIENTS_REJECT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+static MAXCLIENTS_WARN_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAXCLIENTS_WARN_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Rate-limit the "maxclients reached" warning to at most one per second,
+/// returning the number of warnings suppressed since the last emit.
+///
+/// c10k C3. Being at `maxclients` is precisely the state in which
+/// connections arrive fastest, and every rejection logged a line — so the
+/// symptom (a full connection table) produced an unbounded log flood that
+/// competes for the very I/O needed to diagnose it. Returning the suppressed
+/// count keeps the signal: one line per second that says how many others it
+/// stands for.
+pub(crate) fn maxclients_warn_due(now_ms: u64) -> Option<u64> {
+    let last = MAXCLIENTS_WARN_LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1000 {
+        MAXCLIENTS_WARN_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    // Lost CAS = another thread is emitting this second's line; count as
+    // suppressed rather than emitting twice.
+    if MAXCLIENTS_WARN_LAST_MS
+        .compare_exchange(
+            last,
+            now_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        MAXCLIENTS_WARN_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    Some(MAXCLIENTS_WARN_SUPPRESSED.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod maxclients_warn_tests {
+    use super::*;
+
+    #[test]
+    fn warn_is_rate_limited_to_one_per_second_and_reports_the_gap() {
+        // Serialized against the process-wide statics by running the whole
+        // sequence in one test; `now_ms` is a parameter, so no sleeping.
+        MAXCLIENTS_WARN_LAST_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        MAXCLIENTS_WARN_SUPPRESSED.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // First rejection of the storm emits, standing for nothing yet.
+        assert_eq!(maxclients_warn_due(10_000), Some(0));
+        // The next 999 ms are swallowed...
+        for t in 10_001..10_999 {
+            assert_eq!(maxclients_warn_due(t), None);
+        }
+        // ...and the next emit says how many it stands for.
+        assert_eq!(maxclients_warn_due(11_000), Some(998));
+        // The counter resets with each emit.
+        assert_eq!(maxclients_warn_due(12_000), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod write_timeout_gate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const WT: Option<Duration> = Some(Duration::from_millis(60_000));
+
+    #[test]
+    fn small_writes_never_arm_the_timer() {
+        // The p=1 hot path: a +OK, a bulk string, a small batch. None of these
+        // can block on a healthy socket, so none may pay for a timer.
+        for n in [0, 5, 64, 4096, WRITE_TIMEOUT_MIN_BYTES - 1] {
+            assert_eq!(arm_write_timeout(n, WT), None, "{n} bytes must not arm");
+        }
+    }
+
+    #[test]
+    fn writes_that_can_block_do_arm() {
+        for n in [
+            WRITE_TIMEOUT_MIN_BYTES,
+            WRITE_TIMEOUT_MIN_BYTES + 1,
+            64 << 20,
+        ] {
+            assert_eq!(arm_write_timeout(n, WT), WT, "{n} bytes must arm");
+        }
+    }
+
+    #[test]
+    fn disabled_stays_disabled_regardless_of_size() {
+        // `--client-write-timeout-ms 0` means wait forever, and the size gate
+        // must not resurrect a timeout the operator turned off.
+        assert_eq!(arm_write_timeout(1 << 30, None), None);
     }
 }

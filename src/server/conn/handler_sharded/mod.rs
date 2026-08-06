@@ -5,6 +5,61 @@
 //! Contains `handle_connection_sharded` (thin wrapper) and
 //! `handle_connection_sharded_inner` (generic inner handler).
 
+/// c10k C1 — bound a reply write so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `write_all` on a socket whose receive window is closed never returns, so
+/// the handler sits there holding the whole serialized batch plus its
+/// `maxclients` slot for as long as the client cares to wait. N such clients
+/// is an OOM that costs the attacker nothing but an unread socket.
+///
+/// Cancelling the write may leave a partial reply on the wire; that is
+/// correct here, because the only thing we do afterwards is close the
+/// connection. Evaluates to `true` when the write completed, `false` when it
+/// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
+/// wait-forever behaviour.
+macro_rules! write_all_bounded {
+    ($stream:expr, $buf:expr, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
+        let buf = $buf;
+        let pending = buf.len();
+        if $cap != 0 && pending > $cap {
+            // c10k C1: see the monoio handler's copy of this macro.
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            // Publish what this connection is holding, so a stalled reply is
+            // visible in CLIENT LIST (`obl`/`omem`) while it happens.
+            $live.begin_write(pending);
+            // c10k C1: only a write big enough to actually block arms the
+            // watchdog. A timer per batch flush would land once per command
+            // at pipeline depth 1 and buy nothing there — a reply that fits
+            // in the socket buffer never blocks. See `util::arm_write_timeout`.
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => $stream.write_all(buf).await.is_ok(),
+                Some(dur) => match tokio::time::timeout(dur, $stream.write_all(buf)).await {
+                    Ok(r) => r.is_ok(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                            $client_id,
+                            dur.as_millis(),
+                            pending,
+                        );
+                        false
+                    }
+                },
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
+    }};
+}
+
 use crate::runtime::TcpStream;
 use crate::runtime::cancel::CancellationToken;
 use bumpalo::Bump;
@@ -79,10 +134,15 @@ pub(crate) async fn handle_connection_sharded(
 ) {
     let maxclients = ctx.runtime_config.read().maxclients;
     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+        // c10k C3: bounded. Unbounded, a zero-window peer holds this task and
+        // its fd open for as long as it likes, so live fds climb past
+        // maxclients without limit.
         use tokio::io::AsyncWriteExt;
-        let _ = stream
-            .write_all(b"-ERR max number of clients reached\r\n")
-            .await;
+        let _ = tokio::time::timeout(
+            super::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+            stream.write_all(b"-ERR max number of clients reached\r\n"),
+        )
+        .await;
         return;
     }
     let peer_addr = stream
@@ -356,6 +416,19 @@ pub(crate) async fn handle_connection_sharded_inner<
         None
     };
 
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    // Read once alongside the idle timeout — never on the hot path.
+    let (write_timeout, out_cap_normal) = {
+        let rt = ctx.runtime_config.read();
+        (
+            match rt.client_write_timeout_ms {
+                0 => None,
+                ms => Some(std::time::Duration::from_millis(ms)),
+            },
+            rt.client_output_buffer_limit_normal,
+        )
+    };
+
     let mut break_outer = false;
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
@@ -417,6 +490,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                         break;
                     }
                     Err(_) => break,
+                }
+
+                // c10k C2: query-buffer ceiling. Sited after the read and
+                // ahead of the parse, because an incomplete frame is exactly
+                // what makes `read_buf` grow and it decodes to nothing — the
+                // loop would otherwise come straight back and read more.
+                // `$536870911` plus a dribble pins half a gigabyte per
+                // connection, invisible to `used_memory`, and the auth gate
+                // runs after parsing so it costs no credentials. See
+                // `util::query_buf_limit` for the pre-auth ceiling.
+                {
+                    let (limit, preauth) = {
+                        let rt = ctx.runtime_config.read();
+                        (rt.client_query_buffer_limit, rt.client_query_buffer_limit_preauth)
+                    };
+                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(super::util::QUERY_BUF_LIMIT_ERROR).await;
+                        break;
+                    }
                 }
 
                 // Parse all complete frames from buffer
@@ -1041,7 +1134,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -2210,7 +2303,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if stream.write_all(&write_buf).await.is_err() {
+                if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                     return (HandlerResult::Done, None);
                 }
 
@@ -2274,7 +2367,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(push_frame) = push {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if stream.write_all(&write_buf).await.is_err() {
+                    if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                         break;
                     }
                 }
