@@ -1589,10 +1589,20 @@ pub(super) enum BlockingResult {
     Handled,
     /// Write error during flush. Caller should return Done.
     WriteError,
+    /// c10k A1: the client vanished while blocked. Its registrations are gone;
+    /// the caller must close the connection WITHOUT writing a reply.
+    PeerGone,
 }
 
 /// Handle blocking commands (BLPOP, BRPOP, BLMOVE, etc.).
-pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
+///
+/// c10k A1: `read_buf` is the handler's own accumulation buffer, passed in so
+/// the peer watch can carry any bytes the client pipelines behind its blocking
+/// command straight back into the parse stream. It holds only the unparsed
+/// tail of the current batch here, so appending preserves wire order.
+pub(super) async fn try_handle_blocking<
+    S: monoio::io::AsyncWriteRent + super::idle_park::IdleParkRead,
+>(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -1601,6 +1611,7 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
     local_leg_write_idxs: &mut Vec<usize>,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
+    read_buf: &mut bytes::BytesMut,
     stream: &mut S,
     shutdown: &CancellationToken,
 ) -> BlockingResult {
@@ -1648,7 +1659,7 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
         }
     }
 
-    let blocking_response = handle_blocking_command_monoio(
+    let outcome = handle_blocking_command_monoio(
         cmd,
         cmd_args,
         conn.selected_db,
@@ -1659,8 +1670,18 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
         &ctx.dispatch_tx,
         shutdown,
         &ctx.spsc_notifiers,
+        stream,
+        read_buf,
     )
     .await;
+
+    let blocking_response = match outcome {
+        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+        crate::server::conn::blocking::BlockingOutcome::PeerGone => {
+            responses.clear();
+            return BlockingResult::PeerGone;
+        }
+    };
 
     // Encode blocking response directly
     codec.encode_frame(&blocking_response, write_buf);
