@@ -148,7 +148,17 @@ impl Resp {
     fn cmd(&mut self, args: &[&str]) -> String {
         self.buf.clear();
         self.send(args);
-        self.pump(Duration::from_millis(250));
+        // Windows CI (best-effort platform) schedules the server process and
+        // its TCP stack slowly enough that a 250 ms reply window intermittently
+        // returns empty for a reply that WAS delivered — the pump accumulates
+        // until the deadline, so a wider window just tolerates the lag without
+        // changing what is asserted. Non-Windows keeps the tight window.
+        let reply_window = if cfg!(windows) {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_millis(250)
+        };
+        self.pump(reply_window);
         String::from_utf8_lossy(&self.buf).into_owned()
     }
 }
