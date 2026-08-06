@@ -344,3 +344,55 @@ fn active_sibling_undisturbed_by_parking() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// c10k D2: a connection holding a PARTIAL frame must park, and the fragment
+/// must survive the park intact.
+///
+/// Before the fix the stage-2 park predicate required an empty `read_buf`, so
+/// this connection could never park at all — one byte pinned it into the
+/// handler's unregistered plain read, invisible to the idle sweep, holding its
+/// full working set for as long as the attacker cared to wait. The wire
+/// behaviour was identical either way, which is exactly why this needs an
+/// explicit test: the bug was invisible from the client's side.
+///
+/// What this proves is the half that *is* observable — correctness of the
+/// carry. The remainder rides in `MigratedConnectionState::read_buf_remainder`
+/// and is re-parsed on resume, so a command split across a park must complete
+/// normally. If the fragment were dropped or double-counted, the reply would
+/// never arrive or would be garbage.
+#[test]
+fn partial_frame_survives_a_park() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    conn.set_nodelay(true).ok();
+    ping(&mut conn);
+
+    // Send ONE byte of a RESP array and stop. This is the D2 attack byte: it
+    // parses to nothing, so it sits in read_buf indefinitely.
+    conn.write_all(b"*").expect("write partial frame");
+    conn.flush().ok();
+
+    // Long enough for downshift + park threshold + sweep. The connection must
+    // park here rather than pinning its working set awake.
+    std::thread::sleep(PARK_WAIT);
+
+    // Now complete the frame: `*2\r\n$3\r\nGET\r\n$1\r\nk\r\n` minus the `*`
+    // already sent. The carried fragment must join these bytes seamlessly.
+    conn.write_all(b"2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .expect("write frame tail");
+    let r = read_exact_deadline(&mut conn, 5);
+    assert_eq!(
+        &r, b"$-1\r\n",
+        "a command split across a park must complete: the carried fragment \
+         and the tail must reassemble into exactly one GET"
+    );
+
+    // And the connection must still be fully usable afterwards — the carry
+    // must not have left stray bytes in the buffer.
+    ping(&mut conn);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

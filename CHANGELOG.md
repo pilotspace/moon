@@ -39,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a given host is affected.
 
 ### Security
+- **One byte made a connection invisible to the idle sweep (c10k D2).** The
+  stage-2 park predicate required an EMPTY `read_buf`, so a single `*` — the
+  first character of every RESP array — kept it non-empty permanently, made the
+  connection unparkable, and dropped it into the handler's UNREGISTERED plain
+  read. Nothing on that path carries a sweep handle, so the connection held its
+  full stage-2 working set for as long as the attacker left the socket open,
+  with no authentication and no further traffic. One byte and one socket per
+  connection; at 1M connections roughly 10-15 GB that no amount of idle time
+  reclaims. Unparsed input no longer blocks a park: the remainder is carried in
+  `read_buf_remainder` and re-parsed on resume, exactly as a migrating
+  connection already did. Deliberately NOT capped — `read_buf` is already
+  bounded by `client_query_buffer_limit`, and a second threshold would only
+  move the attack past it (send 513 bytes instead of 1). A pending `write_buf`
+  still blocks the park, because a reply the client is owed is carried nowhere
+  and would be silently dropped.
+
 - **Reply writes were unbounded — a client that stops reading held the whole
   reply forever (c10k C1).** `write_all` on a socket whose receive window is
   closed never returns. A client could pipeline a large response and then
