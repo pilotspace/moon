@@ -131,7 +131,7 @@ pub(crate) fn drain_spsc_shared(
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
     pending_migrations: &mut Vec<(
-        crate::shard::dispatch::RawSocketFd,
+        crate::shard::dispatch::MigrateFd,
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
     pending_cdc_subscribes: &mut Vec<crate::shard::dispatch::CdcSubscribePayload>,
@@ -291,6 +291,7 @@ pub(crate) fn drain_spsc_shared(
                             execute_batch.push(msg);
                         }
                         ShardMessage::MigrateConnection(payload) => {
+                            let payload = *payload;
                             pending_migrations.push((payload.fd, payload.state));
                         }
                         ShardMessage::CdcSubscribe(payload) => {

@@ -312,8 +312,25 @@ pub fn register(
         shard,
         live: Arc::clone(&live),
     };
-    stripe(id).write().insert(id, entry);
-    TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    // #438 conn-secondary: a re-register over a still-present id (the
+    // `kept_registration` miss-arm fail-safe firing while the entry somehow
+    // survived, or any future double-register bug) must not double-count —
+    // the single eventual deregister would then leave TOTAL_CLIENTS and the
+    // shard gauges permanently high, skewing `shard_overloaded` routing.
+    // Balance against whatever the insert replaced.
+    let replaced = stripe(id).write().insert(id, entry);
+    if let Some(old) = replaced {
+        tracing::warn!(
+            "client registry: id {} re-registered while present (shard {} -> {})",
+            id,
+            old.shard,
+            shard
+        );
+        shard_conns_delta(old.shard, false);
+        crate::admin::metrics_setup::record_shard_connection_delta(old.shard, -1.0);
+    } else {
+        TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    }
     shard_conns_delta(shard, true);
     crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
@@ -1281,5 +1298,41 @@ mod idle_timeout_tests {
         parked_delta(false);
         parked_delta(false);
         assert_eq!(parked_clients(), before);
+    }
+
+    /// #438 conn-secondary: a re-register of a still-present id (the
+    /// kept_registration miss-arm fail-safe racing an entry back into
+    /// existence) must NOT increment TOTAL_CLIENTS again — the single
+    /// eventual deregister would then leave the count permanently +1,
+    /// skewing `shard_overloaded` routing.
+    ///
+    /// TOTAL_CLIENTS is process-global and other tests mutate it
+    /// concurrently, so the bracket retries with a fresh id when an
+    /// unrelated registration lands inside the two-load window (#446
+    /// review): with the fix, one undisturbed attempt reads t2 == t1; with
+    /// the pre-fix unconditional fetch_add, EVERY attempt reads t1+1.
+    /// Cleanup runs before the verdict so a failure cannot leak entries
+    /// into later tests.
+    #[test]
+    fn replacing_register_does_not_double_count() {
+        use std::sync::atomic::Ordering;
+        let mut clean_attempt_seen = false;
+        for attempt in 0..5u64 {
+            let id = 9_060 + attempt;
+            let _a = register(id, "t:1".into(), "default".into(), 908, -1);
+            let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            let _b = register(id, "t:1".into(), "default".into(), 909, -1);
+            let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            deregister(id);
+            assert!(live_handle(id).is_none(), "single deregister must clear");
+            if t2 == t1 {
+                clean_attempt_seen = true;
+                break;
+            }
+        }
+        assert!(
+            clean_attempt_seen,
+            "replacing insert added to TOTAL_CLIENTS on every attempt — double-count"
+        );
     }
 }

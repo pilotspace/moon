@@ -25,6 +25,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
 
 ### Fixed
+- **Central accept loop no longer head-of-line blocks on one wedged shard
+  (#438 F3).** Every central-listener delivery (tokio plain/TLS, monoio
+  plain/TLS — the monoio sends were *synchronous*, stalling the whole
+  listener thread) previously blocked on the routed shard's bounded conn
+  channel; one shard wedged at its 4096-conn cap froze accepts for every
+  other shard. Deliveries now `try_send` and rotate to the next shard with
+  room; only when every shard's channel is full does the loop fall back to
+  the blocking send (server-wide saturation, where back-pressure is
+  correct).
+- **Connection-migration fds can no longer leak (#438 F4).**
+  `MigrateConnectionPayload` carried the socket as a raw `i32` with no drop
+  semantics: a migration message still queued when a shard shut down — or
+  drained but never spawned — leaked the fd and stranded the client on a
+  connection no task would ever serve. The payload now owns the socket as an
+  `OwnedFd` end to end (producer → SPSC ring → pending-migrations queue →
+  target-shard spawn), so every undelivered path closes the socket and the
+  client sees a FIN. Three `unsafe from_raw_fd` blocks became safe
+  ownership conversions in the process. (Resumed-parked connections remain
+  deliberately `can_migrate:false`; rationale documented at the spawn site.)
+- **Migrated connections now carry the real `requirepass` (#438 F5, sec
+  L3).** The target-shard `ConnectionContext` was built with
+  `requirepass: None`; the session's auth state was unaffected (it travels
+  in `MigratedConnectionState`), but a later `AUTH` on a migrated
+  connection wrongly answered "no password is set", and any future code
+  deriving auth from the context would have failed open.
+- **Unauthenticated connections never task-park (#438 F6, sec L2).** On an
+  auth-enabled server, a client could open sockets and never authenticate
+  nor speak; each one downshifted and task-parked into the ~3.3 KB watcher
+  state, letting an attacker hold a maxclients-worth of silent connections
+  indefinitely at near-zero cost. Pre-AUTH connections now stay un-parked
+  (full handler task — visible in monitoring, still reaped by `timeout N`);
+  no-auth servers are unaffected.
+- **Idle-park cancel provenance + registry counter hygiene (#438
+  conn-secondary).** A bare `ECANCELED` (errno 125) from any non-sweep
+  source was indistinguishable from the idle sweep's cancel and re-parked
+  the connection — for a dead fd that is a permanent park→wake→park spin at
+  100% CPU. Park arms now require the sweep/drain to have marked the slot
+  (`was_swept_cancel`, consume-once) before treating 125 as a park signal.
+  Separately, a re-register over a still-present client id double-counted
+  `TOTAL_CLIENTS`/shard gauges permanently (skewing `shard_overloaded`
+  routing); `register` now balances against the replaced entry and the
+  `kept_registration` miss-arm logs the invariant violation loudly. (The
+  third secondary finding — `timeout` read once at connection setup — was
+  already fixed by the D1 chore-sweep rework, which re-reads the config
+  every second.)
 - **Graceful shutdown now drains connections (#438 F1, conn#8).** On
   SIGTERM/SIGINT each shard previously tore its runtime down the moment its
   event loop observed the cancellation, dropping every pending connection

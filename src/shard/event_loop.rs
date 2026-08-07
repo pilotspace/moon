@@ -999,8 +999,11 @@ impl super::Shard {
         let cached_clock = CachedClock::new();
 
         // Pending FD migrations collected from SPSC drain (spawn wired in Plan 50-02).
+        // F4 (#438): the fd is an OwnedFd — entries still queued when the event
+        // loop exits (shutdown) drop here and CLOSE their sockets, giving the
+        // client a FIN instead of a permanently stranded silent connection.
         let mut pending_migrations: Vec<(
-            crate::shard::dispatch::RawSocketFd,
+            crate::shard::dispatch::MigrateFd,
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
@@ -1497,7 +1500,7 @@ impl super::Shard {
                         {
                             tracing::info!(
                                 "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                                shard_id, fd, state.client_id, state.peer_addr
+                                shard_id, std::os::fd::AsRawFd::as_raw_fd(&fd), state.client_id, state.peer_addr
                             );
                             #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
@@ -1602,7 +1605,7 @@ impl super::Shard {
                         {
                             tracing::info!(
                                 "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                                shard_id, fd, state.client_id, state.peer_addr
+                                shard_id, std::os::fd::AsRawFd::as_raw_fd(&fd), state.client_id, state.peer_addr
                             );
                             #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
@@ -2323,7 +2326,7 @@ impl super::Shard {
                         tracing::info!(
                             "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
                             shard_id,
-                            fd,
+                            std::os::fd::AsRawFd::as_raw_fd(&fd),
                             state.client_id,
                             state.peer_addr
                         );

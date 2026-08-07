@@ -192,12 +192,17 @@ pub(crate) async fn handle_connection_sharded(
         Some(stream),
     ) = (result.0, result.1)
     {
-        use std::os::unix::io::IntoRawFd;
         match stream.into_std() {
             Ok(std_stream) => {
-                let raw_fd = std_stream.into_raw_fd();
+                // F4 (#438): the fd rides the channel as an OwnedFd — an
+                // undelivered message (ring torn down at shutdown) closes the
+                // socket on drop instead of leaking it with a stranded client.
+                let owned_fd = std::os::fd::OwnedFd::from(std_stream);
                 let msg = ShardMessage::MigrateConnection(Box::new(
-                    crate::shard::dispatch::MigrateConnectionPayload { fd: raw_fd, state },
+                    crate::shard::dispatch::MigrateConnectionPayload {
+                        fd: owned_fd,
+                        state,
+                    },
                 ));
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target_shard);
                 let push_result = {
@@ -250,12 +255,12 @@ pub(crate) async fn handle_connection_sharded(
                             // serving the client on this shard with the state
                             // recovered from the undelivered message, instead of
                             // dropping the connection. Migration disabled so the
-                            // affinity tracker cannot loop.
-                            use std::os::unix::io::FromRawFd;
-                            // SAFETY: fd is a valid, uniquely-owned descriptor from
-                            // into_raw_fd(); the failed push left ownership with us.
-                            let std_stream =
-                                unsafe { std::net::TcpStream::from_raw_fd(payload.fd) };
+                            // affinity tracker cannot loop. F4 (#438): the fd
+                            // comes back as an OwnedFd; the safe From conversion
+                            // replaces the old unsafe from_raw_fd.
+                            use std::os::fd::AsRawFd;
+                            let raw_kill_fd = payload.fd.as_raw_fd();
+                            let std_stream = std::net::TcpStream::from(payload.fd);
                             match tokio::net::TcpStream::from_std(std_stream) {
                                 Ok(tcp_stream) => {
                                     let _ = handle_connection_sharded_inner(
@@ -267,7 +272,7 @@ pub(crate) async fn handle_connection_sharded(
                                         false, // can_migrate
                                         BytesMut::new(),
                                         Some(&payload.state),
-                                        payload.fd,
+                                        raw_kill_fd,
                                     )
                                     .await;
                                 }

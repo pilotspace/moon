@@ -363,13 +363,27 @@ pub type RawSocketFd = std::os::unix::io::RawFd;
 #[cfg(not(unix))]
 pub type RawSocketFd = i32;
 
+/// Owned socket fd carried by a connection-migration message (#438 F4).
+///
+/// On Unix this is `std::os::fd::OwnedFd`, so an undelivered or dropped
+/// `MigrateConnectionPayload` — SPSC ring torn down at shutdown, message
+/// drained but never spawned — CLOSES the socket instead of leaking the fd
+/// and stranding the client on a connection no task will ever serve again.
+/// On non-unix targets (where the migration path is compiled out and the
+/// payload is never constructed) it stays the raw alias so the types compile.
+#[cfg(unix)]
+pub type MigrateFd = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+pub type MigrateFd = RawSocketFd;
+
 /// Boxed payload for `ShardMessage::MigrateConnection` (Phase 177, hot-path split).
 ///
 /// `MigratedConnectionState` already holds heap-backed strings/bytes but still
 /// exceeds 120 B inline. Moving it behind a Box keeps the enum slot in the
 /// cache-line budget set by the slotted variants.
 pub struct MigrateConnectionPayload {
-    pub fd: RawSocketFd,
+    /// Owned by the message (#438 F4): dropping the payload closes the socket.
+    pub fd: MigrateFd,
     pub state: crate::server::conn::affinity::MigratedConnectionState,
 }
 
@@ -1616,6 +1630,55 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "timeout must be bounded, took {:?}",
             start.elapsed()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod migrate_fd_tests {
+    use super::MigrateConnectionPayload;
+    use std::os::fd::OwnedFd;
+
+    /// F4 (#438): an undelivered `MigrateConnectionPayload` (SPSC ring torn
+    /// down at shutdown, drain exited before spawn) must CLOSE its socket on
+    /// drop — the pre-F4 raw-i32 field leaked the fd and stranded the client.
+    /// The `OwnedFd` field makes this a type-level guarantee; this test pins
+    /// the type so a revert to a raw fd cannot land silently.
+    ///
+    /// #446 review: verified through the PEER's eyes (read → EOF) instead of
+    /// probing the raw fd number, which another thread could reuse between
+    /// close and probe under the parallel test runner.
+    #[test]
+    fn dropped_payload_closes_socket() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let mut client =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        let payload = MigrateConnectionPayload {
+            fd: OwnedFd::from(server_side),
+            state: crate::server::conn::affinity::MigratedConnectionState {
+                selected_db: 0,
+                authenticated: true,
+                client_name: None,
+                protocol_version: 2,
+                current_user: "default".to_string(),
+                flags: 0,
+                read_buf_remainder: bytes::BytesMut::new(),
+                client_id: 1,
+                peer_addr: "t".to_string(),
+                workspace_id: None,
+            },
+        };
+        drop(payload);
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set timeout");
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).expect("read after payload drop");
+        assert_eq!(
+            n, 0,
+            "peer must observe EOF once dropping the payload closes the socket"
         );
     }
 }

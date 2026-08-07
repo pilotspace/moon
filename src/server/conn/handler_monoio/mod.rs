@@ -382,6 +382,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let (client_live, registry_guard) = match park.kept_registration {
         Some(guard) => {
             let live = crate::client_registry::live_handle(client_id).unwrap_or_else(|| {
+                // #438 conn-secondary: reaching here means the entry vanished
+                // while its guard was alive — an invariant violation, not a
+                // code path. Fail open (re-register so the conn stays served
+                // and killable) but LOUDLY; register() itself now balances
+                // the counters if the entry raced back into existence.
+                tracing::warn!(
+                    "client {}: registry entry missing on park resume despite live guard; re-registering",
+                    client_id
+                );
                 crate::client_registry::register(
                     client_id,
                     peer_addr.clone(),
@@ -919,6 +928,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
                 && conn.active_cross_txn.is_none()
+                // F6 (#438, sec L2): unauthenticated conns never task-park.
+                // On an auth-enabled server, parking a pre-AUTH conn would
+                // let an attacker hold a maxclients-worth of silent sockets
+                // at ~3.3 KB each, indefinitely and invisibly cheap. Keeping
+                // them un-parked leaves each one pinned to a full handler
+                // task — costly enough to surface in CPU/RSS monitoring —
+                // and `timeout N` (the slowloris knob) still reaps them. On
+                // no-auth servers `authenticated` is true from accept, so
+                // this changes nothing there.
+                && conn.authenticated
                 // Replica-handshake conns (sent REPLCONF) never park: PSYNC
                 // on a resumed parked conn is unsupported (warn+close).
                 && !conn.saw_replconf
@@ -941,7 +960,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // Real socket/TLS error (EOF without close_notify,
                     // ECONNRESET, …): terminate. Parking instead would spin
                     // park→wake→park forever — the dead fd stays readable.
-                    Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                    // #438 conn-secondary: `was_swept_cancel` also demands
+                    // sweep provenance — a bare errno 125 that no sweep of
+                    // ours produced is a real error too.
+                    Err(ref e) if !reg.slot.was_swept_cancel(e) => break,
                     // F1 (#438): cancelled by the shutdown drain, not the
                     // stage-2 sweep — exit through the flush+FIN epilogue
                     // instead of task-parking into a watcher that would just
@@ -1006,7 +1028,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // always performed a read that re-surfaced them; the
                 // task-park path parks WITHOUT reading, so a mistaken
                 // downshift here would feed the park→wake→park spin.)
-                Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                // #438 conn-secondary: provenance-checked — see stage 2.
+                Err(ref e) if !reg.slot.was_swept_cancel(e) => break,
                 // F1 (#438): cancelled by the shutdown drain, not the idle
                 // sweep — exit through the flush+FIN epilogue instead of
                 // re-parking a read nothing will ever complete.
