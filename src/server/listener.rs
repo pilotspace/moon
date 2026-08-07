@@ -36,24 +36,32 @@ type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 /// the routed one). A full — or disconnected — channel just moves on to the
 /// next shard; the affinity hint is best-effort, and any live shard serves
 /// the client correctly. Returns `Ok(shard)` with the shard that actually
-/// took the connection, or `Err(payload)` when EVERY shard's channel refused
-/// it — at that point the caller decides between back-pressure (blocking
-/// send, the pre-F3 behaviour, correct when the whole server is saturated)
-/// and dropping (correct during shutdown when the receivers are gone).
+/// took the connection. When every channel refused, returns the payload plus
+/// `Some(shard)` for the first LIVE-but-full shard in rotation order — the
+/// caller back-pressures with a blocking send on THAT shard (review of #446:
+/// blocking on the routed shard would drop the connection whenever the
+/// routed receiver is gone while another shard is merely full) — or `None`
+/// when every receiver is disconnected (shutdown; dropping is correct).
 fn try_route_conn<T>(
     txs: &[channel::MpscSender<T>],
     target: usize,
     payload: T,
-) -> Result<usize, T> {
+) -> Result<usize, (Option<usize>, T)> {
     let mut payload = payload;
+    let mut first_full: Option<usize> = None;
     for i in 0..txs.len() {
         let shard = (target + i) % txs.len();
         match txs[shard].try_send(payload) {
             Ok(()) => return Ok(shard),
-            Err(e) => payload = e.into_inner(),
+            Err(e) => {
+                if first_full.is_none() && matches!(e, flume::TrySendError::Full(_)) {
+                    first_full = Some(shard);
+                }
+                payload = e.into_inner();
+            }
         }
     }
-    Err(payload)
+    Err((first_full, payload))
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -424,10 +432,14 @@ pub async fn run_sharded(
                                 debug!("New TLS connection from {} -> shard {}", addr, tls_next_shard);
                                 // F3 (#438): rotate past a full shard channel instead of
                                 // head-of-line blocking every other shard's accepts.
-                                if let Err(payload) = try_route_conn(&tls_txs, tls_next_shard, (stream, true)) {
-                                    warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", tls_next_shard);
-                                    if tls_txs[tls_next_shard].send_async(payload).await.is_err() {
-                                        error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                                if let Err((live_full, payload)) = try_route_conn(&tls_txs, tls_next_shard, (stream, true)) {
+                                    if let Some(shard) = live_full {
+                                        warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", shard);
+                                        if tls_txs[shard].send_async(payload).await.is_err() {
+                                            error!("Failed to send TLS connection to shard {}", shard);
+                                        }
+                                    } else {
+                                        error!("All shard conn channels disconnected; dropping accepted TLS connection");
                                     }
                                 }
                                 tls_next_shard = (tls_next_shard + 1) % tls_num_shards;
@@ -501,11 +513,16 @@ pub async fn run_sharded(
                         // F3 (#438): rotate past a full shard channel instead of
                         // head-of-line blocking every other shard's accepts. Only
                         // when EVERY channel is full does the accept loop block —
-                        // server-wide saturation, where back-pressure is correct.
-                        if let Err(payload) = try_route_conn(&conn_txs, target_shard, (stream, false)) {
-                            warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
-                            if conn_txs[target_shard].send_async(payload).await.is_err() {
-                                error!("Failed to send connection to shard {}", target_shard);
+                        // server-wide saturation, where back-pressure is correct —
+                        // and it blocks on a shard verified LIVE by the rotation.
+                        if let Err((live_full, payload)) = try_route_conn(&conn_txs, target_shard, (stream, false)) {
+                            if let Some(shard) = live_full {
+                                warn!("All shard conn channels full; back-pressuring accept on shard {}", shard);
+                                if conn_txs[shard].send_async(payload).await.is_err() {
+                                    error!("Failed to send connection to shard {}", shard);
+                                }
+                            } else {
+                                error!("All shard conn channels disconnected; dropping accepted connection");
                             }
                         }
                     }
@@ -650,11 +667,16 @@ pub async fn run_sharded(
                             // blocking `send` here stalls the whole listener
                             // THREAD (this is a sync flume send on the monoio
                             // main loop), freezing TLS accepts too. Block only
-                            // when every channel is full (server saturated).
-                            if let Err(payload) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
-                                warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
-                                if conn_txs[target_shard].send(payload).is_err() {
-                                    error!("Failed to send connection to shard {}", target_shard);
+                            // when every channel is full (server saturated),
+                            // on a shard the rotation verified is still live.
+                            if let Err((live_full, payload)) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
+                                if let Some(shard) = live_full {
+                                    warn!("All shard conn channels full; back-pressuring accept on shard {}", shard);
+                                    if conn_txs[shard].send(payload).is_err() {
+                                        error!("Failed to send connection to shard {}", shard);
+                                    }
+                                } else {
+                                    error!("All shard conn channels disconnected; dropping accepted connection");
                                 }
                             }
                         }
@@ -684,10 +706,14 @@ pub async fn run_sharded(
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
                             // F3 (#438): same rotation as the plain leg above.
-                            if let Err(payload) = try_route_conn(&conn_txs, tls_next_shard, (std_stream, true)) {
-                                warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", tls_next_shard);
-                                if conn_txs[tls_next_shard].send(payload).is_err() {
-                                    error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                            if let Err((live_full, payload)) = try_route_conn(&conn_txs, tls_next_shard, (std_stream, true)) {
+                                if let Some(shard) = live_full {
+                                    warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", shard);
+                                    if conn_txs[shard].send(payload).is_err() {
+                                        error!("Failed to send TLS connection to shard {}", shard);
+                                    }
+                                } else {
+                                    error!("All shard conn channels disconnected; dropping accepted TLS connection");
                                 }
                             }
                             tls_next_shard = (tls_next_shard + 1) % num_shards;
@@ -754,11 +780,16 @@ pub async fn run_sharded(
                             // blocking `send` here stalls the whole listener
                             // THREAD (this is a sync flume send on the monoio
                             // main loop), freezing TLS accepts too. Block only
-                            // when every channel is full (server saturated).
-                            if let Err(payload) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
-                                warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
-                                if conn_txs[target_shard].send(payload).is_err() {
-                                    error!("Failed to send connection to shard {}", target_shard);
+                            // when every channel is full (server saturated),
+                            // on a shard the rotation verified is still live.
+                            if let Err((live_full, payload)) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
+                                if let Some(shard) = live_full {
+                                    warn!("All shard conn channels full; back-pressuring accept on shard {}", shard);
+                                    if conn_txs[shard].send(payload).is_err() {
+                                        error!("Failed to send connection to shard {}", shard);
+                                    }
+                                } else {
+                                    error!("All shard conn channels disconnected; dropping accepted connection");
                                 }
                             }
                         }
@@ -809,15 +840,42 @@ mod listener_tests {
     }
 
     /// Every channel refusing returns the payload for the caller's blocking
-    /// back-pressure fallback — the connection is never silently dropped.
+    /// back-pressure fallback — the connection is never silently dropped —
+    /// together with a LIVE full shard to block on (rotation order from the
+    /// target).
     #[test]
-    fn all_full_returns_payload() {
+    fn all_full_returns_payload_and_live_shard() {
         let (tx0, _rx0) = channel::mpsc_bounded::<u32>(1);
         let (tx1, _rx1) = channel::mpsc_bounded::<u32>(1);
         tx0.try_send(1).unwrap();
         tx1.try_send(2).unwrap();
         let txs = vec![tx0, tx1];
-        assert_eq!(try_route_conn(&txs, 1, 7), Err(7));
+        assert_eq!(try_route_conn(&txs, 1, 7), Err((Some(1), 7)));
+    }
+
+    /// #446 review: a DISCONNECTED routed shard must not become the blocking
+    /// fallback while another shard is merely full — the fallback shard must
+    /// be one whose receiver is alive.
+    #[test]
+    fn disconnected_target_falls_back_to_live_full_shard() {
+        let (tx0, rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, _rx1) = channel::mpsc_bounded::<u32>(1);
+        drop(rx0); // routed shard's receiver is gone
+        tx1.try_send(1).unwrap(); // other shard alive but full
+        let txs = vec![tx0, tx1];
+        assert_eq!(try_route_conn(&txs, 0, 7), Err((Some(1), 7)));
+    }
+
+    /// Every receiver gone (shutdown): no live shard to block on — the
+    /// caller drops the connection instead of blocking forever.
+    #[test]
+    fn all_disconnected_reports_no_live_shard() {
+        let (tx0, rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, rx1) = channel::mpsc_bounded::<u32>(1);
+        drop(rx0);
+        drop(rx1);
+        let txs = vec![tx0, tx1];
+        assert_eq!(try_route_conn(&txs, 0, 7), Err((None, 7)));
     }
 
     /// Rotation starts AT the routed shard, preserving affinity/round-robin

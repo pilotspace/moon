@@ -1304,25 +1304,35 @@ mod idle_timeout_tests {
     /// kept_registration miss-arm fail-safe racing an entry back into
     /// existence) must NOT increment TOTAL_CLIENTS again — the single
     /// eventual deregister would then leave the count permanently +1,
-    /// skewing `shard_overloaded` routing. (TOTAL_CLIENTS is process-global
-    /// and other tests register concurrently, so the assert brackets only
-    /// the one replacing insert — the narrowest possible window.)
+    /// skewing `shard_overloaded` routing.
+    ///
+    /// TOTAL_CLIENTS is process-global and other tests mutate it
+    /// concurrently, so the bracket retries with a fresh id when an
+    /// unrelated registration lands inside the two-load window (#446
+    /// review): with the fix, one undisturbed attempt reads t2 == t1; with
+    /// the pre-fix unconditional fetch_add, EVERY attempt reads t1+1.
+    /// Cleanup runs before the verdict so a failure cannot leak entries
+    /// into later tests.
     #[test]
     fn replacing_register_does_not_double_count() {
         use std::sync::atomic::Ordering;
-        const ID: u64 = 9_060;
-        let _a = register(ID, "t:1".into(), "default".into(), 908, -1);
-        let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
-        let _b = register(ID, "t:1".into(), "default".into(), 909, -1);
-        let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
-        // Pre-fix, the unconditional fetch_add makes this read t1+1 even
-        // with zero concurrency. (An unrelated test registering inside this
-        // two-instruction window could false-fail; the window is nanoseconds
-        // and the suite's other global-counter tests accept the same odds.)
-        assert_eq!(t2, t1, "replacing insert must not double-count");
-        // The entry itself was replaced, not duplicated, and one deregister
-        // fully clears it.
-        deregister(ID);
-        assert!(live_handle(ID).is_none(), "single deregister must clear");
+        let mut clean_attempt_seen = false;
+        for attempt in 0..5u64 {
+            let id = 9_060 + attempt;
+            let _a = register(id, "t:1".into(), "default".into(), 908, -1);
+            let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            let _b = register(id, "t:1".into(), "default".into(), 909, -1);
+            let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            deregister(id);
+            assert!(live_handle(id).is_none(), "single deregister must clear");
+            if t2 == t1 {
+                clean_attempt_seen = true;
+                break;
+            }
+        }
+        assert!(
+            clean_attempt_seen,
+            "replacing insert added to TOTAL_CLIENTS on every attempt — double-count"
+        );
     }
 }

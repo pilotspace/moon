@@ -462,8 +462,33 @@ fn unauthenticated_conn_never_task_parks() {
          never task-park (parked_clients={parked}, expected {expected})"
     );
 
-    drop(silent);
+    // #446 review: the aggregate gauge alone can't say WHICH conn parked.
+    // Close the authed conn and require the gauge to drain to 0 while the
+    // silent conn stays open — if the parked one had been `silent`, the
+    // gauge would stay at 1.
     drop(authed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = command_reply(&mut control, "INFO clients\r\n");
+        let parked_now: u64 = info
+            .lines()
+            .find_map(|l| l.strip_prefix("parked_clients:"))
+            .unwrap_or_else(|| panic!("parked_clients missing from INFO clients:\n{info}"))
+            .trim()
+            .parse()
+            .expect("parked_clients value");
+        if parked_now == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked_clients stuck at {parked_now} after closing the authed \
+             conn — the parked connection was not the authenticated one"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    drop(silent);
     let _ = child.kill();
     let _ = child.wait();
 }

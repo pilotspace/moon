@@ -1637,22 +1637,26 @@ mod tests {
 #[cfg(all(test, unix))]
 mod migrate_fd_tests {
     use super::MigrateConnectionPayload;
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
 
     /// F4 (#438): an undelivered `MigrateConnectionPayload` (SPSC ring torn
     /// down at shutdown, drain exited before spawn) must CLOSE its socket on
     /// drop — the pre-F4 raw-i32 field leaked the fd and stranded the client.
     /// The `OwnedFd` field makes this a type-level guarantee; this test pins
     /// the type so a revert to a raw fd cannot land silently.
+    ///
+    /// #446 review: verified through the PEER's eyes (read → EOF) instead of
+    /// probing the raw fd number, which another thread could reuse between
+    /// close and probe under the parallel test runner.
     #[test]
     fn dropped_payload_closes_socket() {
+        use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let stream =
+        let mut client =
             std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-        let fd = OwnedFd::from(stream);
-        let raw = fd.as_raw_fd();
+        let (server_side, _) = listener.accept().expect("accept");
         let payload = MigrateConnectionPayload {
-            fd,
+            fd: OwnedFd::from(server_side),
             state: crate::server::conn::affinity::MigratedConnectionState {
                 selected_db: 0,
                 authenticated: true,
@@ -1666,18 +1670,15 @@ mod migrate_fd_tests {
                 workspace_id: None,
             },
         };
-        // SAFETY: fcntl(F_GETFD) on any integer is memory-safe; an invalid fd
-        // just returns -1/EBADF.
-        assert!(
-            unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0,
-            "fd must be open while the payload owns it"
-        );
         drop(payload);
-        // SAFETY: as above.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set timeout");
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).expect("read after payload drop");
         assert_eq!(
-            unsafe { libc::fcntl(raw, libc::F_GETFD) },
-            -1,
-            "dropping the payload must close the socket"
+            n, 0,
+            "peer must observe EOF once dropping the payload closes the socket"
         );
     }
 }
