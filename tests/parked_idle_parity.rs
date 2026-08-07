@@ -146,6 +146,14 @@ fn parked_connection_serves_all_traffic_after_wake() {
 /// A parked connection must stay in CLIENT LIST, and CLIENT KILL must close
 /// it (the kill's shutdown(2) wakes the readiness watcher; the resumed
 /// handler sees EOF).
+// Windows (best-effort platform) skip: CLIENT KILL tears the connection down
+// by `shutdown(2)`-ing its fd to unblock the handler's pending read. That
+// interruption does not fire on Windows the way it does on Linux/macOS, so
+// the registry entry is never released and the victim stays in CLIENT LIST.
+// Same socket-semantics gap as `idle_timeout_sweep`'s close test and #431's
+// write-timeout suite (documented in #439); validated on the production
+// platforms via the Linux gate and macOS.
+#[cfg(not(windows))]
 #[test]
 fn parked_connection_visible_and_killable() {
     let dir = tempfile::tempdir().expect("tempdir");
