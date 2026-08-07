@@ -2449,7 +2449,7 @@ pub(crate) fn handle_shard_message_shared(
             // WAL-before-swap: emit the SWAPDB record so that crash-recovery
             // replay can re-apply the swap in the correct order.  The record
             // is written even when wal_writer/wal_writer are None (the
-            // fast-path in wal_append_and_fanout will skip it cheaply).
+            // fast-path skips it cheaply).
             //
             // Serialise "SWAPDB <a> <b>" without heap allocation on the number
             // formatting (itoa writes into a stack buffer).
@@ -2463,25 +2463,40 @@ pub(crate) fn handle_shard_message_shared(
                 crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(b_str.as_bytes())),
             ]);
             let serialized = aof::serialize_command(&wal_frame);
+            // #386 exactly-once wire contract: remote legs write ONLY the
+            // durability planes (WAL v3 + this shard's AOF — per-shard
+            // recovery replays each shard's own record). The REPLICATION
+            // plane record is emitted exactly once, by the coordinator's
+            // local leg (`coordinate_swapdb`), because today's replica
+            // applies the merged wire as one stream: per-remote-leg emission
+            // made the replica swap N-1 times (net no-op at odd shard
+            // counts). When #406 lands per-shard demuxed replicas this must
+            // flip back to per-shard emission.
+            //
             // No per-client response frame exists here (coordinator broadcast,
             // reply is `()`): an AOF-append loss is already counted +
             // error!-logged inside the pool, so the result is discarded.
-            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-            let _ = wal_append_and_fanout(
-                &serialized,
+            if wal_kv_log {
+                if let Some(w) = wal_writer {
+                    w.append(
+                        crate::persistence::wal_v3::record::WalRecordType::Command,
+                        &serialized,
+                    );
+                }
+            }
+            if let Some(pool) = aof_pool {
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 // task #35: SWAPDB affects both `a` and `b` — no single db
                 // context applies; pass 0 (writer may emit a harmless
                 // redundant SELECT 0 if last_db was already non-zero).
-                0,
-                wal_writer,
-                repl_backlog,
-                replica_txs,
-                repl_state,
-                shard_id,
-                aof_pool, // FIX-W1-2
-                wal_kv_log,
-                &mut aof_budget,
-            );
+                let _ = pool.send_append_bounded_blocking(
+                    shard_id,
+                    0,
+                    0,
+                    bytes::Bytes::copy_from_slice(&serialized),
+                    &mut aof_budget,
+                );
+            }
 
             // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
             crate::shard::slice::with_shard(|s| {

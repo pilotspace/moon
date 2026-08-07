@@ -865,29 +865,27 @@ pub async fn handle_connection(
                                         //   - appendfsync=everysec/no → fire-and-forget (fast)
                                         // On any Err the caller aborts and leaves both DBs
                                         // untouched, preserving atomicity from the WAL's perspective.
+                                        let mut a_buf = itoa::Buffer::new();
+                                        let mut b_buf = itoa::Buffer::new();
+                                        let wal_frame = Frame::Array(crate::framevec![
+                                            Frame::BulkString(Bytes::from_static(b"SWAPDB")),
+                                            Frame::BulkString(Bytes::copy_from_slice(
+                                                a_buf.format(a).as_bytes()
+                                            )),
+                                            Frame::BulkString(Bytes::copy_from_slice(
+                                                b_buf.format(b).as_bytes()
+                                            )),
+                                        ]);
+                                        let serialized =
+                                            crate::persistence::aof::serialize_command(&wal_frame);
                                         let wal_ok = if let Some(ref pool) = aof_pool {
-                                            let mut a_buf = itoa::Buffer::new();
-                                            let mut b_buf = itoa::Buffer::new();
-                                            let wal_frame = Frame::Array(crate::framevec![
-                                                Frame::BulkString(Bytes::from_static(b"SWAPDB")),
-                                                Frame::BulkString(Bytes::copy_from_slice(
-                                                    a_buf.format(a).as_bytes()
-                                                )),
-                                                Frame::BulkString(Bytes::copy_from_slice(
-                                                    b_buf.format(b).as_bytes()
-                                                )),
-                                            ]);
-                                            let serialized =
-                                                crate::persistence::aof::serialize_command(
-                                                    &wal_frame,
-                                                );
                                             // Single-shard mode — shard_id = 0.
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
                                             // task #35: SWAPDB affects both `a` and
                                             // `b` — no single db context applies;
                                             // pass 0 (writer may emit a harmless
                                             // redundant SELECT 0).
-                                            pool.try_send_append_durable(0, lsn, 0, serialized)
+                                            pool.try_send_append_durable(0, lsn, 0, serialized.clone())
                                                 .await
                                                 .is_ok()
                                         } else {
@@ -904,6 +902,14 @@ pub async fn handle_connection(
                                             let mut guard_lo = db[lo].write();
                                             let mut guard_hi = db[hi].write();
                                             std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                            drop(guard_hi);
+                                            drop(guard_lo);
+                                            // #386 — replication plane, exactly once per
+                                            // client SWAPDB, AFTER the durability gate and
+                                            // the swap itself (mirrors the coordinator leg).
+                                            crate::replication::state::record_local_write_global(
+                                                0, serialized,
+                                            );
                                             Frame::SimpleString(Bytes::from_static(b"OK"))
                                         }
                                     }
