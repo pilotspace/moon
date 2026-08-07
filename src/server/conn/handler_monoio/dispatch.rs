@@ -262,7 +262,7 @@ pub(super) fn try_handle_cluster_routing(
         let slot = crate::cluster::slots::slot_for_key(key);
         #[allow(clippy::unwrap_used)]
         // std RwLock: poison = prior panic = unrecoverable
-        let route = cs.read().unwrap().route_slot(slot, was_asking);
+        let route = cs.read().route_slot(slot, was_asking);
         match route {
             crate::cluster::SlotRoute::Local => {} // proceed
             other => {

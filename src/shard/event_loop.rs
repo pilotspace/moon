@@ -85,7 +85,7 @@ impl super::Shard {
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
         snapshot_trigger_tx: channel::WatchSender<u64>,
         repl_state_ext: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-        cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
+        cluster_state: Option<std::sync::Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
         acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,

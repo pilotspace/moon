@@ -6,7 +6,8 @@
 #![allow(unused_imports)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::cancel::CancellationToken;
@@ -423,7 +424,7 @@ pub async fn run_gossip_ticker(
             _ = tick.tick() => {
                 // Pick a random peer to PING
                 let (target_addr, ping_msg) = {
-                    let mut cs = cluster_state.write().unwrap();
+                    let mut cs = cluster_state.write();
                     check_failure_states(&mut cs, node_timeout_ms);
 
                     // Reset election_spawned when failover state returns to None
@@ -445,15 +446,16 @@ pub async fn run_gossip_ticker(
                                     // Use try_lock to avoid holding std RwLock across await
                                     // We're in a sync context here so blocking_lock is safe
                                     let mut guard = vote_tx.lock();
-                                    *guard = Some(tx);
+                                    *guard = Some(tx.clone());
                                 }
                                 let cs_election = cluster_state.clone();
                                 let sa = self_addr;
                                 let offset = repl_state.read().total_offset();
                                 let vtx = vote_tx.clone();
+                                let tx_direct = tx.clone();
                                 tokio::spawn(async move {
                                     crate::cluster::failover::run_election_task(
-                                        cs_election, sa, offset, rx,
+                                        cs_election, sa, offset, rx, tx_direct,
                                     ).await;
                                     // Clear vote_tx when election ends
                                     *vtx.lock() = None;
@@ -511,7 +513,7 @@ pub async fn run_gossip_ticker(
                                         let mut pong_buf = vec![0u8; pong_len];
                                         if stream.read_exact(&mut pong_buf).await.is_ok() {
                                             if let Ok(pong) = deserialize_gossip(&pong_buf) {
-                                                let mut cs2 = cs.write().unwrap();
+                                                let mut cs2 = cs.write();
                                                 merge_gossip_into_state(&mut cs2, &pong);
                                             }
                                         }

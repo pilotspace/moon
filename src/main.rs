@@ -1008,7 +1008,7 @@ fn main() -> anyhow::Result<()> {
     moon::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 
     // Cluster mode initialization
-    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
+    let cluster_state: Option<std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>> =
         if config.cluster_enabled {
             // Redis convention: cluster bus port = port + 10000. Refuse ports
             // where that wraps past u16::MAX instead of silently binding the
@@ -1027,11 +1027,8 @@ fn main() -> anyhow::Result<()> {
                 .expect("invalid bind address");
             let node_id = moon::replication::state::generate_repl_id();
             let state = moon::cluster::ClusterState::new(node_id, self_addr);
-            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
-            info!(
-                "Cluster mode enabled, node ID: {}",
-                cs.read().unwrap().node_id
-            );
+            let cs = std::sync::Arc::new(parking_lot::RwLock::new(state));
+            info!("Cluster mode enabled, node ID: {}", cs.read().node_id);
             Some(cs)
         } else {
             None
@@ -2087,7 +2084,7 @@ fn main() -> anyhow::Result<()> {
 /// it on a dedicated `cluster-ctl` std thread hosting a current-thread tokio
 /// runtime. All I/O here is gossip-rate (100ms ticks), never on shard threads.
 async fn run_cluster_control_plane(
-    cluster_state: std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>,
+    cluster_state: std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>,
     bind: String,
     port: u16,
     node_timeout: u64,
