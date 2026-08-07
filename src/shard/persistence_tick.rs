@@ -629,10 +629,54 @@ fn apply_completion_vec(
     let mut manifest_dirty = false;
     for c in completions {
         if !c.success {
-            tracing::warn!(
-                file_id = c.file_entry.file_id,
-                "Spill pwrite failed on background thread"
-            );
+            // Deep-review F1: the hot entry was removed at evict time on the
+            // promise this completion would land the key in the cold index.
+            // A failed pwrite breaks that promise — without re-insert the key
+            // exists in NEITHER plane and reads nil until an AOF-replay
+            // restart (and permanently under --appendonly no sync paths).
+            // Fail-closed: put the value back in RAM, mirroring the
+            // enqueue-failure path which retains the hot value. Under a
+            // persistently failing disk this re-arms eviction for the same
+            // key — bounded per tick and loudly counted, which beats silent
+            // wrong answers.
+            if let Some(req) = c.failed_request {
+                crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    if db.get_version(&req.key) != 0 {
+                        // A newer write recreated the key while the spill was
+                        // in flight; the failed payload is stale — drop it.
+                        return;
+                    }
+                    match crate::storage::eviction::rehydrate_spill_payload(
+                        req.value_type,
+                        &req.value_bytes,
+                        req.ttl_ms,
+                    ) {
+                        Some(entry) => {
+                            db.set(req.key.clone(), entry);
+                            crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed; evicted key re-inserted into hot table \
+                                 (spill volume is failing writes)"
+                            );
+                        }
+                        None => {
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed AND payload does not rehydrate — key lost \
+                                 until AOF-replay restart"
+                            );
+                        }
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    file_id = c.file_entry.file_id,
+                    "Spill pwrite failed on background thread (no payload carried back)"
+                );
+            }
             continue;
         }
 

@@ -303,6 +303,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          aof_fsync_failures:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
+         spill_failed_reinserted:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n",
         if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -336,6 +337,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
         crate::storage::tiered::spill_thread::spill_completion_dropped_total(),
+        crate::storage::tiered::spill_thread::spill_failed_reinserted_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
     ));
     sections.push_str("\r\n");

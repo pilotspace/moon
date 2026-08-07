@@ -12,7 +12,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::lfu_decay;
+use crate::storage::entry::{RedisValue, lfu_decay};
 use crate::storage::tiered::kv_serde;
 use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
@@ -695,6 +695,37 @@ fn build_spill_payload(
     Some((value_type, value_bytes, flags, ttl_ms))
 }
 
+/// Inverse of [`build_spill_payload`]: rebuild a hot [`Entry`] from a spill
+/// payload that never reached disk (deep-review F1).
+///
+/// `evict_one_async_spill` removes the hot entry as soon as the request is
+/// queued, on the promise that the background thread's completion lands the
+/// key in the cold index. When the pwrite FAILS, that promise is broken: the
+/// key is in neither plane and every read returns nil until an AOF-replay
+/// restart. The completion handler re-inserts via this helper instead
+/// (fail-closed, mirroring the enqueue-failure path which retains the hot
+/// value).
+///
+/// Returns `None` only if the payload does not deserialize — impossible for
+/// bytes produced by `build_spill_payload` unless memory was corrupted in
+/// transit; the caller logs that loudly.
+pub(crate) fn rehydrate_spill_payload(
+    value_type: ValueType,
+    value_bytes: &Bytes,
+    ttl_ms: Option<u64>,
+) -> Option<crate::storage::Entry> {
+    let redis_value = match value_type {
+        ValueType::String => RedisValue::String(value_bytes.clone()),
+        _ => kv_serde::deserialize_collection(value_bytes, value_type)?,
+    };
+    let mut entry = crate::storage::Entry::new_string(Bytes::new());
+    entry.value = crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+    if let Some(ttl) = ttl_ms {
+        entry.set_expires_at_ms(ttl);
+    }
+    Some(entry)
+}
+
 /// Batch-durable synchronous spill (W2: the ONE sync spill implementation).
 ///
 /// Originally built for the no-AOF-backstop case (`--appendonly no`); since
@@ -1101,6 +1132,38 @@ mod tests {
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
+
+    #[test]
+    fn spill_payload_round_trips_through_rehydrate() {
+        // F1 (deep review): a failed background spill must be able to
+        // resurrect the exact hot entry from its request payload.
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+        map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::entry::RedisValue::Hash(map.clone()),
+        );
+        entry.set_expires_at_ms(current_time_ms() + 60_000);
+
+        let (vt, bytes, _flags, ttl) = build_spill_payload(&entry).expect("serializable");
+        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        match restored.as_redis_value() {
+            RedisValueRef::Hash(h) => assert_eq!(*h, map),
+            _ => panic!("expected hash after rehydrate"),
+        }
+        assert_eq!(restored.expires_at_ms(), entry.expires_at_ms());
+
+        // String payloads round-trip too.
+        let s = Entry::new_string(Bytes::from_static(b"hello"));
+        let (vt, bytes, _f, ttl) = build_spill_payload(&s).expect("serializable");
+        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        match restored.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"hello"),
+            _ => panic!("expected string after rehydrate"),
+        }
+    }
 
     #[test]
     fn lru_is_older_valid_beyond_nine_hours() {
