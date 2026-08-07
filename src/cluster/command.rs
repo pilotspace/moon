@@ -3,8 +3,8 @@
 //! All subcommands operate on a shared Arc<RwLock<ClusterState>>.
 //! Called from handle_connection_sharded (intercepted before dispatch, like AUTH/CONFIG).
 
-use std::net::SocketAddr;
 use parking_lot::RwLock;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -788,11 +788,7 @@ mod tests {
             let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
             assert!(matches!(result, Frame::SimpleString(_)));
         }
-        assert_eq!(
-            cs.read().nodes.len(),
-            2,
-            "one placeholder, not three"
-        );
+        assert_eq!(cs.read().nodes.len(), 2, "one placeholder, not three");
     }
 
     /// MEET-ing our own advertised address is refused.

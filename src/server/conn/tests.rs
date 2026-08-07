@@ -472,8 +472,14 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         true, // ...cluster mode wins: nothing may inline
         &rt_config,
     );
-    assert_eq!(total, 0, "cluster mode must fall through to generic dispatch");
-    assert!(!read_buf.is_empty(), "command must remain for the generic loop");
+    assert_eq!(
+        total, 0,
+        "cluster mode must fall through to generic dispatch"
+    );
+    assert!(
+        !read_buf.is_empty(),
+        "command must remain for the generic loop"
+    );
     assert!(write_buf.is_empty());
 }
 

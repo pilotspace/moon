@@ -296,10 +296,22 @@ mod tests {
         let mut table = TrackingTable::with_max_keys(2);
         let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
-        assert!(table.track_key(1, &Bytes::from_static(b"k1"), false).is_none());
-        assert!(table.track_key(1, &Bytes::from_static(b"k2"), false).is_none());
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k1"), false)
+                .is_none()
+        );
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k2"), false)
+                .is_none()
+        );
         // Re-tracking an existing key never evicts.
-        assert!(table.track_key(1, &Bytes::from_static(b"k2"), false).is_none());
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k2"), false)
+                .is_none()
+        );
 
         // Third distinct key: one existing entry must be evicted, with the
         // evicted key's client senders returned for invalidation.

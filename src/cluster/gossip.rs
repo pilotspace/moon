@@ -5,8 +5,8 @@
 //! Gossip sections carry rumors about other nodes we know.
 #![allow(unused_imports)]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use parking_lot::RwLock;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

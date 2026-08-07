@@ -5,8 +5,8 @@
 //! All I/O is on the listener runtime, never on shard threads.
 #![allow(unused_imports)]
 
-use std::net::SocketAddr;
 use parking_lot::RwLock;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::runtime::cancel::CancellationToken;

@@ -924,7 +924,9 @@ pub async fn aof_writer_task(
                         // failed window's loss self-heal invisibly.
                     }
                     Ok(()) => {
-                        crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                        crate::admin::metrics_setup::record_aof_fsync(
+                            t.elapsed().as_micros() as u64
+                        );
                         crate::persistence::aof::record_everysec_fsync_result(true);
                         last_fsync = Instant::now();
                         idle_wait.clear_pending();
@@ -1372,7 +1374,9 @@ pub async fn per_shard_aof_writer_task(
                         crate::persistence::aof::record_everysec_fsync_result(false);
                     }
                     Ok(()) => {
-                        crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                        crate::admin::metrics_setup::record_aof_fsync(
+                            t.elapsed().as_micros() as u64
+                        );
                         crate::persistence::aof::record_everysec_fsync_result(true);
                         last_fsync = Instant::now();
                         idle_wait.clear_pending();

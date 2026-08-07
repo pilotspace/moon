@@ -94,8 +94,7 @@ pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
 
 /// Total everysec deadline-fsync failures across all AOF writers (both
 /// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
-pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the most recent everysec deadline fsync succeeded. Exposed as
 /// `aof_last_fsync_status:ok|err` in INFO (Redis's `aof_last_write_status`

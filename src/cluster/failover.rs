@@ -13,8 +13,8 @@
 //! 4. Masters vote if: request_epoch > last_vote_epoch.
 //! 5. Replica receiving majority: promotes itself, takes master's slots.
 
-use std::net::SocketAddr;
 use parking_lot::RwLock;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -446,8 +446,12 @@ mod tests {
         state.my_node_mut().flags = NodeFlags::Replica {
             master_id: master_id.clone(),
         };
-        let mut master =
-            crate::cluster::ClusterNode::new(master_id.clone(), test_addr(6380), NodeFlags::Fail, 0);
+        let mut master = crate::cluster::ClusterNode::new(
+            master_id.clone(),
+            test_addr(6380),
+            NodeFlags::Fail,
+            0,
+        );
         for s in 0u16..=100 {
             master.set_slot(s);
         }
