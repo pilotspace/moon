@@ -33,7 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first direct contact could NEVER be marked PFAIL. Placeholders are now
   retired on handshake (same-address, different-id), healthy rumors are
   adopted (with self/known-address guards), and adoption stamps a freshness
-  baseline so the staleness clock always runs.
+  baseline so the staleness clock always runs. Review round: `CLUSTER MEET`
+  is idempotent by ADDRESS (repeats no longer stack one placeholder per
+  call) and refuses the node's own address; a cluster-bus bind failure now
+  aborts startup loudly instead of leaving a node serving clients while
+  invisible to every peer; `--cluster-enabled` refuses ports > 55535 (bus
+  port would wrap past 65535); a `cluster-ctl` thread panic aborts the
+  process via the same hook that guards shard threads.
 - **The AOF now compacts itself (#433): Redis-parity automatic rewrite.**
   `--auto-aof-rewrite-percentage` (default 100, `0` disables) and
   `--auto-aof-rewrite-min-size` (default `64mb`, size strings accepted)

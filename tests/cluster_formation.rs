@@ -223,7 +223,7 @@ fn three_node_cluster_forms_via_meet_and_gossip() {
     let dirs: Vec<tempfile::TempDir> = (0..3)
         .map(|_| tempfile::tempdir().expect("tempdir"))
         .collect();
-    let (fleet, mut conns, _ports, _ids) = form_three_node_cluster(&dirs, &[]);
+    let (fleet, mut conns, ports, _ids) = form_three_node_cluster(&dirs, &[]);
 
     // Bus traffic must actually have flowed on the seed node.
     let info = command_reply(&mut conns[0], "CLUSTER INFO\r\n");
@@ -234,7 +234,57 @@ fn three_node_cluster_forms_via_meet_and_gossip() {
         .expect("cluster_stats_messages_sent present");
     assert!(sent > 0, "no cluster bus messages were sent: {info}");
 
+    // MEET is idempotent by address: repeating one must not stack a fresh
+    // placeholder (the placeholder id is random per call).
+    let r = command_reply(
+        &mut conns[0],
+        &format!("CLUSTER MEET 127.0.0.1 {}\r\n", ports[1]),
+    );
+    assert!(r.starts_with("+OK"), "repeat MEET failed: {r}");
+    assert_eq!(
+        known_nodes(&mut conns[0]),
+        3,
+        "repeat MEET stacked a placeholder"
+    );
+
+    // MEET-ing our own advertised address is refused.
+    let r = command_reply(
+        &mut conns[0],
+        &format!("CLUSTER MEET 127.0.0.1 {}\r\n", ports[0]),
+    );
+    assert!(r.starts_with("-ERR"), "self-MEET must error: {r}");
+
     drop(fleet);
+}
+
+/// A cluster node whose bus port (port + 10000) is already taken must abort
+/// loudly at startup — not serve clients while invisible to every peer.
+#[test]
+fn occupied_bus_port_aborts_startup() {
+    let port = reserve_cluster_ports(1)[0];
+    let _bus_blocker = TcpListener::bind(("127.0.0.1", port + 10000)).expect("occupy bus port");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_cluster_node(dir.path(), port, &[]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                assert!(
+                    !status.success(),
+                    "startup must abort with a nonzero status, got {status}"
+                );
+                break;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    common::sigkill(&mut child);
+                    panic!("node kept running with an occupied cluster bus port");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 /// Failure detection through the control plane: killing one node of a formed

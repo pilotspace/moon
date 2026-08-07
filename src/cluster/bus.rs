@@ -42,17 +42,20 @@ pub(crate) const MAX_GOSSIP_FRAME_LEN: usize = 64 * 1024;
 ///
 /// Spawns a new task for each incoming peer connection.
 /// Should be spawned on the listener runtime as a separate task.
+///
+/// Takes an already-bound listener: binding happens in the caller so a bind
+/// failure (EADDRINUSE, bad bind address) aborts startup loudly instead of
+/// leaving a node that serves clients while being invisible to every peer.
 pub async fn run_cluster_bus(
-    bind: &str,
-    cluster_port: u16,
+    listener: TcpListener,
     self_addr: SocketAddr,
     cluster_state: Arc<RwLock<ClusterState>>,
     shutdown: CancellationToken,
     vote_tx: SharedVoteTx,
-) -> anyhow::Result<()> {
-    let addr = format!("{}:{}", bind, cluster_port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Cluster bus listening on {}", addr);
+) {
+    if let Ok(addr) = listener.local_addr() {
+        info!("Cluster bus listening on {}", addr);
+    }
 
     loop {
         tokio::select! {
@@ -80,7 +83,6 @@ pub async fn run_cluster_bus(
             }
         }
     }
-    Ok(())
 }
 
 /// Handle a single cluster peer connection.

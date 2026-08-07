@@ -109,10 +109,11 @@ fn main() -> anyhow::Result<()> {
             default_hook(info);
             let thread = std::thread::current();
             let name = thread.name().unwrap_or("");
-            if name.starts_with("shard-") {
+            if name.starts_with("shard-") || name == "cluster-ctl" {
                 eprintln!(
-                    "FATAL: shard thread '{name}' panicked; aborting the whole \
-                     process rather than serving with a dead shard"
+                    "FATAL: thread '{name}' panicked; aborting the whole \
+                     process rather than serving with a dead shard or a \
+                     dead cluster control plane"
                 );
                 std::process::abort();
             }
@@ -1009,6 +1010,17 @@ fn main() -> anyhow::Result<()> {
     // Cluster mode initialization
     let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
         if config.cluster_enabled {
+            // Redis convention: cluster bus port = port + 10000. Refuse ports
+            // where that wraps past u16::MAX instead of silently binding the
+            // bus on a truncated port no peer would ever compute.
+            if config.port.checked_add(10000).is_none() {
+                eprintln!(
+                    "REFUSING TO START: --cluster-enabled with --port {} — the cluster \
+                     bus port (port + 10000) exceeds 65535. Use a port <= 55535.",
+                    config.port
+                );
+                std::process::exit(2);
+            }
             moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
                 .parse()
@@ -2082,7 +2094,12 @@ async fn run_cluster_control_plane(
     cancel_token: moon::runtime::cancel::CancellationToken,
     repl_state: std::sync::Arc<parking_lot::RwLock<moon::replication::state::ReplicationState>>,
 ) {
-    let cluster_port = (port as u32 + 10000) as u16;
+    // Overflow is refused at startup (cluster init hard-exits on ports >
+    // 55535); the else arm is unreachable defense.
+    let Some(cluster_port) = port.checked_add(10000) else {
+        tracing::error!("Cluster control plane disabled: port {port} + 10000 overflows u16");
+        return;
+    };
     let self_addr: std::net::SocketAddr = match format!("{bind}:{port}").parse() {
         Ok(a) => a,
         Err(e) => {
@@ -2090,6 +2107,21 @@ async fn run_cluster_control_plane(
                 "Cluster control plane disabled: invalid bind address {bind}:{port}: {e}"
             );
             return;
+        }
+    };
+
+    // Bind the bus BEFORE spawning anything, and abort on failure: a cluster
+    // node whose bus is not listening keeps serving clients while being
+    // invisible to every peer — fail loud instead of running half-alive.
+    let bus_addr = format!("{bind}:{cluster_port}");
+    let listener = match tokio::net::TcpListener::bind(&bus_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "FATAL: cluster bus failed to bind {bus_addr}: {e} — a cluster \
+                 node without its bus is invisible to every peer; exiting"
+            );
+            std::process::exit(1);
         }
     };
 
@@ -2101,21 +2133,13 @@ async fn run_cluster_control_plane(
     let bus_cs = cluster_state.clone();
     let bus_cancel = cancel_token.child_token();
     let bus_vote_tx = failover_vote_tx.clone();
-    let bus_bind = bind.clone();
-    tokio::spawn(async move {
-        if let Err(e) = moon::cluster::bus::run_cluster_bus(
-            &bus_bind,
-            cluster_port,
-            self_addr,
-            bus_cs,
-            bus_cancel,
-            bus_vote_tx,
-        )
-        .await
-        {
-            tracing::error!("Cluster bus error: {}", e);
-        }
-    });
+    tokio::spawn(moon::cluster::bus::run_cluster_bus(
+        listener,
+        self_addr,
+        bus_cs,
+        bus_cancel,
+        bus_vote_tx,
+    ));
 
     info!("Cluster bus and gossip ticker started");
     moon::cluster::gossip::run_gossip_ticker(
