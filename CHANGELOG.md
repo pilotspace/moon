@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Cross-shard fan-out no longer drops messages silently on a full SPSC ring
+  (c10k E1/E3), and cross-shard reply awaits are bounded (E4).** PUBLISH
+  fan-out (immediate, batched, and EXEC-queued) and SCRIPT LOAD propagation
+  used a single `try_push` — a transiently-full ring lost the message with no
+  log or metric: subscribers on that shard silently missed the publish, or its
+  script cache diverged (NOSCRIPT for a sha the server had just returned).
+  All five sites now retry with the same bounded, shutdown-aware backpressure
+  as the command dispatch path, and a final give-up is loud
+  (`moon_xshard_fanout_drop_total`). Reply awaits on the slotted dispatch and
+  publish paths — previously unbounded, so one wedged shard could hang a
+  client task forever — now share the coordinator's 30 s bound: publish counts
+  degrade (under-report, counted by `moon_xshard_reply_timeout_total`), while
+  a slotted-dispatch timeout errors the batch and closes the connection,
+  because the per-connection reply slot cannot be safely reused after an
+  abandoned await. Rehydrated connection handlers (park wake / migration)
+  also start with 512 B I/O buffers instead of 3×8 KiB, shrinking the memory
+  spike of fleet-synchronized wakes; buffers grow back on first real traffic
+  (c10k D3).
+
 ### Added
 - **`INFO memory` can now explain a `used_memory`-vs-RSS gap.** Build with
   `--features jemalloc-stats` and `INFO memory` reports Redis's `allocator_*`

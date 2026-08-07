@@ -333,14 +333,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // NOTE: do NOT call record_connection_opened() here — the caller
     // (conn_accept.rs) already increments via try_accept_connection().
 
+    // c10k D3 (lazy resumed-buffer sizing): a fresh connection warms up with
+    // the full 8 KiB per buffer (no growth stall on its first pipeline). A
+    // REHYDRATED handler (park wake / migration) starts at 512 B: wakes
+    // arrive in fleet-sized bursts (synchronized keepalives), and 2×8 KiB
+    // per wake dominated the burst working set before the first byte was
+    // even parsed. BytesMut grows on demand — a busy resumed conn pays one
+    // amortized regrow; the idle majority never pays the 16 KiB at all.
+    let rehydrated = migrated_state.is_some();
+    let init_cap = if rehydrated { 512 } else { 8192 };
     let mut read_buf = if initial_read_buf.is_empty() {
-        BytesMut::with_capacity(8192)
+        BytesMut::with_capacity(init_cap)
     } else {
         let mut buf = initial_read_buf;
-        buf.reserve(8192);
+        buf.reserve(init_cap);
         buf
     };
-    let mut write_buf = BytesMut::with_capacity(8192);
+    let mut write_buf = BytesMut::with_capacity(init_cap);
     // c10k A1: set when a blocking command leaves unparsed input in
     // `read_buf` (see the read-skip guard in the main loop).
     let mut carried_input = false;
@@ -401,7 +410,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
-    let mut tmp_buf = vec![0u8; 8192];
+    // D3: same lazy sizing as read_buf/write_buf — the first read of a
+    // rehydrated conn is usually a probe-sized frame (keepalive PING); the
+    // shrink logic at the loop tail governs the steady state either way.
+    let mut tmp_buf = vec![0u8; init_cap];
 
     // c10k W11: two-stage idle park (see idle_park.rs). Cancel-capable
     // streams register for the shard chore's ≥1s sweep; `downshifted` tracks
@@ -980,6 +992,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // D3: a rehydrated conn starts with a small (512 B) owned read buffer;
+        // the moment a read saturates it (real traffic, not a keepalive-sized
+        // probe), restore the full 8 KiB so bulk transfers aren't capped at
+        // 512 B per syscall. Sited with the C2 check below: after every read
+        // arm, once per iteration.
+        if tmp_buf.len() < 8192 && read_buf.len() >= tmp_buf.len() {
+            tmp_buf = vec![0u8; 8192];
+        }
+
         // c10k C2: query-buffer ceiling. One check per read iteration, sited
         // after every read arm and ahead of both parse paths — an incomplete
         // frame is exactly what makes `read_buf` grow, and an incomplete
@@ -1282,7 +1303,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 6 && dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 6
+                && dispatch::try_handle_script(cmd, cmd_args, ctx, &shutdown, &mut responses).await
+            {
                 continue;
             }
             if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
@@ -1548,7 +1571,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ) {
                             Some(err) => err,
                             None => Frame::Integer(
-                                crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                                crate::server::conn::shared::publish_post_txn(
+                                    ctx, &shutdown, &ch, &msg,
+                                )
+                                .await,
                             ),
                         };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
@@ -2544,33 +2570,75 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>,
                 Vec<usize>,
             )> = Vec::new();
-            {
-                let mut producers = ctx.dispatch_tx.borrow_mut();
-                for (target, entries) in publish_batches.drain() {
-                    let n = entries.len();
-                    let slot = std::sync::Arc::new(
-                        crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
-                    );
-                    let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                    let pairs: Vec<(Bytes, Bytes)> =
-                        entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+            for (target, entries) in publish_batches.drain() {
+                let n = entries.len();
+                let slot = std::sync::Arc::new(
+                    crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
+                );
+                let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                let pairs: Vec<(Bytes, Bytes)> =
+                    entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
 
-                    let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                    let batch_msg = ShardMessage::PubSubPublishBatch {
-                        pairs,
-                        slot: slot.clone(),
-                    };
-                    if producers[idx].try_push(batch_msg).is_ok() {
+                let idx = ChannelMesh::target_index(ctx.shard_id, target);
+                // E1: bounded backpressure retry instead of one bare try_push
+                // — a transiently-full ring no longer loses the batch. Borrow
+                // taken+released per attempt, never held across the backoff
+                // await (tokio parity — handler_sharded).
+                let mut pending = Some(ShardMessage::PubSubPublishBatch {
+                    pairs,
+                    slot: slot.clone(),
+                });
+                let outcome = crate::shard::dispatch::push_with_backpressure(
+                    &shutdown,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                    || match pending.take() {
+                        None => true,
+                        Some(m) => {
+                            let mut producers = ctx.dispatch_tx.borrow_mut();
+                            match producers[idx].try_push(m) {
+                                Ok(()) => true,
+                                Err(back) => {
+                                    pending = Some(back);
+                                    false
+                                }
+                            }
+                        }
+                    },
+                )
+                .await;
+                match outcome {
+                    crate::shard::dispatch::PushOutcome::Pushed => {
                         ctx.spsc_notifiers[target].notify_one();
-                    } else {
-                        slot.add(0); // push failed, mark as done
                     }
-                    batch_slots.push((slot, resp_indices));
+                    outcome => {
+                        // Give-up: deliver-to-zero so the reply can't hang —
+                        // but loudly (was a silent drop pre-E1).
+                        tracing::warn!(
+                            "Shard {}: PUBLISH batch fan-out to shard {target} dropped ({outcome:?})",
+                            ctx.shard_id
+                        );
+                        crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
+                        slot.add(0);
+                    }
                 }
+                batch_slots.push((slot, resp_indices));
             }
-            // Resolve all batch slots
+            // Resolve all batch slots (E4: bounded — a wedged shard degrades
+            // to an under-reported count, never a hung client).
             for (slot, resp_indices) in &batch_slots {
-                crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+                if !crate::shard::dispatch::await_pubsub_slot_bounded(
+                    slot,
+                    crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Shard {}: PUBLISH batch reply timed out awaiting remote shard",
+                        ctx.shard_id
+                    );
+                    crate::admin::metrics_setup::record_xshard_reply_timeout("publish");
+                }
                 for (i, resp_idx) in resp_indices.iter().enumerate() {
                     let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
                     if remote_count > 0 {
@@ -2581,6 +2649,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
         }
+
+        // E4: set when a cross-shard reply await times out. The per-connection
+        // ResponseSlot is REUSED across batches — a late fill after a timeout
+        // would be read by the NEXT batch as its own reply — so a timeout is
+        // fatal: error the affected entries, flush, then close the connection.
+        let mut xshard_reply_fatal = false;
 
         // Phase 2b: Dispatch all deferred remote commands as batched
         // PipelineBatchSlotted messages (one per target shard), await all in parallel.
@@ -2674,10 +2748,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // keeps the slot alive until the last handle drops. (This replaced the
             // old raw-pointer-into-stack-pool design, whose contract required the
             // await to run to completion to avoid a panic-unwind UAF; see the
-            // `ResponseSlotPtr` doc + PR review.) The await is still unbounded here
-            // for simplicity — the target shard always fills every message it
-            // drains — but a shutdown-aware bound is now a safe, tracked follow-up.
-            // The tokio handler carries the identical await.
+            // `ResponseSlotPtr` doc + PR review.) Since E4 the await is BOUNDED
+            // (XSHARD_REPLY_TIMEOUT) — expiry errors the batch and closes the
+            // connection, because the reused slot could otherwise hand a late
+            // fill to the next batch. The tokio handler carries the identical
+            // bounded await.
             //
             // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
             // commands in THIS batch. The reply-side spin may engage only for a singleton
@@ -2705,9 +2780,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
                     match spun {
-                        Some(r) => r,
-                        None => response_pool.future_for(target).await,
+                        Some(r) => Some(r),
+                        // E4: bounded await — a wedged owner shard can no
+                        // longer hang this client task forever.
+                        None => {
+                            crate::shard::dispatch::await_response_slot_bounded(
+                                response_pool.future_for(target),
+                                crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                            )
+                            .await
+                        }
                     }
+                };
+                let Some(shard_responses) = shard_responses else {
+                    tracing::error!(
+                        "Shard {}: cross-shard reply from shard {target} timed out; \
+                         failing the batch and closing the connection (slot unsafe to reuse)",
+                        ctx.shard_id
+                    );
+                    crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
+                    for (resp_idx, _, _, _) in &meta {
+                        responses[*resp_idx] =
+                            Frame::Error(Bytes::from_static(b"ERR cross-shard reply timeout"));
+                    }
+                    xshard_reply_fatal = true;
+                    // Skip the fsync barrier too: with no reply there is
+                    // nothing durable to confirm for these entries.
+                    continue;
                 };
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
@@ -2798,6 +2897,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             ) {
                 break;
             }
+        }
+
+        // E4: a timed-out cross-shard reply slot must never be reused — the
+        // error replies are flushed above, now close.
+        if xshard_reply_fatal {
+            break;
         }
 
         // Update live state after each batch — lock-free (QW8, 2026-06

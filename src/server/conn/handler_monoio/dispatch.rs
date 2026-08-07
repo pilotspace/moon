@@ -8,7 +8,6 @@
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
 use bytes::Bytes;
-use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,8 +19,6 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::extract_bytes;
-use crate::shard::dispatch::ShardMessage;
-use crate::shard::mesh::ChannelMesh;
 use crate::tracking::TrackingState;
 use crate::workspace::strip_workspace_prefix_from_response;
 
@@ -218,12 +215,14 @@ pub(super) fn try_handle_eval(
 
 /// Handle SCRIPT subcommands (LOAD, EXISTS, FLUSH). Returns `true` if consumed.
 ///
-/// `#[inline]`: see `try_handle_cluster` rationale.
-#[inline]
-pub(super) fn try_handle_script(
+/// Async since E3: the SCRIPT LOAD fan-out retries a full ring with bounded
+/// backpressure instead of silently dropping the load (divergent per-shard
+/// script caches). Cold path — SCRIPT is never hot.
+pub(super) async fn try_handle_script(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
@@ -232,21 +231,8 @@ pub(super) fn try_handle_script(
     let (response, fanout) =
         crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
     if let Some((sha1, script_bytes)) = fanout {
-        let mut producers = ctx.dispatch_tx.borrow_mut();
-        for target in 0..ctx.num_shards {
-            if target == ctx.shard_id {
-                continue;
-            }
-            let idx = ChannelMesh::target_index(ctx.shard_id, target);
-            let msg = ShardMessage::ScriptLoad {
-                sha1: sha1.clone(),
-                script: script_bytes.clone(),
-            };
-            if producers[idx].try_push(msg).is_ok() {
-                ctx.spsc_notifiers[target].notify_one();
-            }
-        }
-        drop(producers);
+        crate::server::conn::shared::script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes)
+            .await;
     }
     responses.push(response);
     true

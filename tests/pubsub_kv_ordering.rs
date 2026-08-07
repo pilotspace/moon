@@ -61,7 +61,12 @@ impl Drop for Moon {
 
 fn spawn_moon(shards: &str) -> Option<Moon> {
     let bin = moon_binary()?;
-    let tmp_dir = std::env::temp_dir().join(format!("moon-pubsub-ord-{}", std::process::id()));
+    // `{shards}` in the dir name: the two tests in this file run CONCURRENTLY
+    // under the default cargo-test threading, and the per-dir instance lock
+    // (moon.lock) makes whichever server starts second exit at boot when they
+    // share a --dir (same convention as tests/acl_privileged_intercepts.rs).
+    let tmp_dir =
+        std::env::temp_dir().join(format!("moon-pubsub-ord-{}-{shards}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
     let (child, port) = common::spawn_listening(|port| {
         Command::new(&bin)
