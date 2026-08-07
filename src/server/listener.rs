@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "runtime-tokio")]
 use crate::command::connection as conn_cmd;
@@ -28,6 +28,33 @@ use crate::tracking::TrackingTable;
 /// Type alias for the per-database RwLock container.
 #[cfg(feature = "runtime-tokio")]
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
+/// #438 F3: deliver an accepted connection to a shard WITHOUT head-of-line
+/// blocking the central accept loop on one wedged shard's full conn channel.
+///
+/// Tries the routed shard first, then every other shard once (rotating from
+/// the routed one). A full — or disconnected — channel just moves on to the
+/// next shard; the affinity hint is best-effort, and any live shard serves
+/// the client correctly. Returns `Ok(shard)` with the shard that actually
+/// took the connection, or `Err(payload)` when EVERY shard's channel refused
+/// it — at that point the caller decides between back-pressure (blocking
+/// send, the pre-F3 behaviour, correct when the whole server is saturated)
+/// and dropping (correct during shutdown when the receivers are gone).
+fn try_route_conn<T>(
+    txs: &[channel::MpscSender<T>],
+    target: usize,
+    payload: T,
+) -> Result<usize, T> {
+    let mut payload = payload;
+    for i in 0..txs.len() {
+        let shard = (target + i) % txs.len();
+        match txs[shard].try_send(payload) {
+            Ok(()) => return Ok(shard),
+            Err(e) => payload = e.into_inner(),
+        }
+    }
+    Err(payload)
+}
 
 #[cfg(feature = "runtime-tokio")]
 use super::connection;
@@ -395,9 +422,13 @@ pub async fn run_sharded(
                                     continue;
                                 }
                                 debug!("New TLS connection from {} -> shard {}", addr, tls_next_shard);
-                                let tx = &tls_txs[tls_next_shard];
-                                if tx.send_async((stream, true)).await.is_err() {
-                                    error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                                // F3 (#438): rotate past a full shard channel instead of
+                                // head-of-line blocking every other shard's accepts.
+                                if let Err(payload) = try_route_conn(&tls_txs, tls_next_shard, (stream, true)) {
+                                    warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", tls_next_shard);
+                                    if tls_txs[tls_next_shard].send_async(payload).await.is_err() {
+                                        error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                                    }
                                 }
                                 tls_next_shard = (tls_next_shard + 1) % tls_num_shards;
                             }
@@ -467,9 +498,15 @@ pub async fn run_sharded(
                             }
                         };
                         debug!("New connection from {} -> shard {}", addr, target_shard);
-                        let tx = &conn_txs[target_shard];
-                        if tx.send_async((stream, false)).await.is_err() {
-                            error!("Failed to send connection to shard {}", target_shard);
+                        // F3 (#438): rotate past a full shard channel instead of
+                        // head-of-line blocking every other shard's accepts. Only
+                        // when EVERY channel is full does the accept loop block —
+                        // server-wide saturation, where back-pressure is correct.
+                        if let Err(payload) = try_route_conn(&conn_txs, target_shard, (stream, false)) {
+                            warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
+                            if conn_txs[target_shard].send_async(payload).await.is_err() {
+                                error!("Failed to send connection to shard {}", target_shard);
+                            }
                         }
                     }
                     Err(e) => {
@@ -609,9 +646,16 @@ pub async fn run_sharded(
                                 // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
-                            let tx = &conn_txs[target_shard];
-                            if tx.send((std_stream, false)).is_err() {
-                                error!("Failed to send connection to shard {}", target_shard);
+                            // F3 (#438): rotate past a full shard channel; a
+                            // blocking `send` here stalls the whole listener
+                            // THREAD (this is a sync flume send on the monoio
+                            // main loop), freezing TLS accepts too. Block only
+                            // when every channel is full (server saturated).
+                            if let Err(payload) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
+                                warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
+                                if conn_txs[target_shard].send(payload).is_err() {
+                                    error!("Failed to send connection to shard {}", target_shard);
+                                }
                             }
                         }
                         Err(e) => { accept_backoff.record_error("Accept error", &e).await; }
@@ -639,9 +683,12 @@ pub async fn run_sharded(
                                 // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
-                            let tx = &conn_txs[tls_next_shard];
-                            if tx.send((std_stream, true)).is_err() {
-                                error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                            // F3 (#438): same rotation as the plain leg above.
+                            if let Err(payload) = try_route_conn(&conn_txs, tls_next_shard, (std_stream, true)) {
+                                warn!("All shard conn channels full; back-pressuring TLS accept on shard {}", tls_next_shard);
+                                if conn_txs[tls_next_shard].send(payload).is_err() {
+                                    error!("Failed to send TLS connection to shard {}", tls_next_shard);
+                                }
                             }
                             tls_next_shard = (tls_next_shard + 1) % num_shards;
                         }
@@ -703,9 +750,16 @@ pub async fn run_sharded(
                                 // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
-                            let tx = &conn_txs[target_shard];
-                            if tx.send((std_stream, false)).is_err() {
-                                error!("Failed to send connection to shard {}", target_shard);
+                            // F3 (#438): rotate past a full shard channel; a
+                            // blocking `send` here stalls the whole listener
+                            // THREAD (this is a sync flume send on the monoio
+                            // main loop), freezing TLS accepts too. Block only
+                            // when every channel is full (server saturated).
+                            if let Err(payload) = try_route_conn(&conn_txs, target_shard, (std_stream, false)) {
+                                warn!("All shard conn channels full; back-pressuring accept on shard {}", target_shard);
+                                if conn_txs[target_shard].send(payload).is_err() {
+                                    error!("Failed to send connection to shard {}", target_shard);
+                                }
                             }
                         }
                         Err(e) => {
@@ -722,4 +776,58 @@ pub async fn run_sharded(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::try_route_conn;
+    use crate::runtime::channel;
+
+    /// F3 (#438): one wedged shard's full channel must not stop delivery —
+    /// the connection rotates to the next shard.
+    #[test]
+    fn full_target_rotates_to_next_shard() {
+        let (tx0, _rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, rx1) = channel::mpsc_bounded::<u32>(1);
+        let (tx2, _rx2) = channel::mpsc_bounded::<u32>(1);
+        tx0.try_send(99).unwrap(); // wedge shard 0
+        let txs = vec![tx0, tx1, tx2];
+        assert_eq!(try_route_conn(&txs, 0, 7), Ok(1));
+        assert_eq!(rx1.try_recv(), Ok(7));
+    }
+
+    /// A disconnected shard (receiver dropped — shard thread gone) is skipped
+    /// the same way a full one is.
+    #[test]
+    fn disconnected_shard_is_skipped() {
+        let (tx0, rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, rx1) = channel::mpsc_bounded::<u32>(1);
+        drop(rx0);
+        let txs = vec![tx0, tx1];
+        assert_eq!(try_route_conn(&txs, 0, 7), Ok(1));
+        assert_eq!(rx1.try_recv(), Ok(7));
+    }
+
+    /// Every channel refusing returns the payload for the caller's blocking
+    /// back-pressure fallback — the connection is never silently dropped.
+    #[test]
+    fn all_full_returns_payload() {
+        let (tx0, _rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, _rx1) = channel::mpsc_bounded::<u32>(1);
+        tx0.try_send(1).unwrap();
+        tx1.try_send(2).unwrap();
+        let txs = vec![tx0, tx1];
+        assert_eq!(try_route_conn(&txs, 1, 7), Err(7));
+    }
+
+    /// Rotation starts AT the routed shard, preserving affinity/round-robin
+    /// placement whenever the target has room.
+    #[test]
+    fn target_with_room_keeps_the_connection() {
+        let (tx0, rx0) = channel::mpsc_bounded::<u32>(1);
+        let (tx1, _rx1) = channel::mpsc_bounded::<u32>(1);
+        let txs = vec![tx0, tx1];
+        assert_eq!(try_route_conn(&txs, 0, 7), Ok(0));
+        assert_eq!(rx0.try_recv(), Ok(7));
+    }
 }

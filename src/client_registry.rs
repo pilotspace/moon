@@ -312,8 +312,25 @@ pub fn register(
         shard,
         live: Arc::clone(&live),
     };
-    stripe(id).write().insert(id, entry);
-    TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    // #438 conn-secondary: a re-register over a still-present id (the
+    // `kept_registration` miss-arm fail-safe firing while the entry somehow
+    // survived, or any future double-register bug) must not double-count —
+    // the single eventual deregister would then leave TOTAL_CLIENTS and the
+    // shard gauges permanently high, skewing `shard_overloaded` routing.
+    // Balance against whatever the insert replaced.
+    let replaced = stripe(id).write().insert(id, entry);
+    if let Some(old) = replaced {
+        tracing::warn!(
+            "client registry: id {} re-registered while present (shard {} -> {})",
+            id,
+            old.shard,
+            shard
+        );
+        shard_conns_delta(old.shard, false);
+        crate::admin::metrics_setup::record_shard_connection_delta(old.shard, -1.0);
+    } else {
+        TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    }
     shard_conns_delta(shard, true);
     crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
@@ -1281,5 +1298,31 @@ mod idle_timeout_tests {
         parked_delta(false);
         parked_delta(false);
         assert_eq!(parked_clients(), before);
+    }
+
+    /// #438 conn-secondary: a re-register of a still-present id (the
+    /// kept_registration miss-arm fail-safe racing an entry back into
+    /// existence) must NOT increment TOTAL_CLIENTS again — the single
+    /// eventual deregister would then leave the count permanently +1,
+    /// skewing `shard_overloaded` routing. (TOTAL_CLIENTS is process-global
+    /// and other tests register concurrently, so the assert brackets only
+    /// the one replacing insert — the narrowest possible window.)
+    #[test]
+    fn replacing_register_does_not_double_count() {
+        use std::sync::atomic::Ordering;
+        const ID: u64 = 9_060;
+        let _a = register(ID, "t:1".into(), "default".into(), 908, -1);
+        let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+        let _b = register(ID, "t:1".into(), "default".into(), 909, -1);
+        let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+        // Pre-fix, the unconditional fetch_add makes this read t1+1 even
+        // with zero concurrency. (An unrelated test registering inside this
+        // two-instruction window could false-fail; the window is nanoseconds
+        // and the suite's other global-counter tests accept the same odds.)
+        assert_eq!(t2, t1, "replacing insert must not double-count");
+        // The entry itself was replaced, not duplicated, and one deregister
+        // fully clears it.
+        deregister(ID);
+        assert!(live_handle(ID).is_none(), "single deregister must clear");
     }
 }

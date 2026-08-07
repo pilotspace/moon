@@ -407,29 +407,24 @@ pub(crate) fn spawn_tokio_connection(
 
 /// Spawn a migrated connection handler on the target shard (Tokio runtime).
 ///
-/// Reconstructs a `TcpStream` from a raw FD transferred via `ShardMessage::MigrateConnection`,
-/// prepends synthetic RESP commands for state restoration (SELECT, CLIENT SETNAME), and
-/// spawns a handler with `requirepass = None` (pre-authenticated).
-///
-/// # Safety
-///
-/// The caller must ensure `fd` is a valid, open file descriptor representing a connected
-/// TCP socket. Ownership is transferred: this function consumes the FD (via `from_raw_fd`).
+/// Reconstructs a `TcpStream` from the `OwnedFd` transferred via
+/// `ShardMessage::MigrateConnection` (#438 F4: ownership is in the type — the
+/// conversion chain is entirely safe, and an undelivered fd closes on drop),
+/// prepends synthetic RESP commands for state restoration (SELECT, CLIENT
+/// SETNAME), and spawns the handler.
 ///
 /// # Limitations
 ///
 /// TLS connections cannot be migrated because TLS session state lives in userspace and
 /// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
-// `unix`-gated alongside `runtime-tokio`: the signature takes a
-// `std::os::unix::io::RawFd` and reconstructs the socket via `from_raw_fd`,
-// both of which only exist on Unix. Moon targets Linux + macOS (both Unix), so
-// on every supported build `unix` is always true; the extra predicate just makes
-// the platform coupling explicit (CodeRabbit PR #144). Full non-Unix support
-// would also require gating `MigrateConnectionPayload.fd` — out of scope.
+// `unix`-gated alongside `runtime-tokio`: the signature takes an `OwnedFd`
+// (`MigrateFd` aliases it on Unix only). Moon targets Linux + macOS (both
+// Unix), so on every supported build `unix` is always true; the extra
+// predicate just makes the platform coupling explicit (CodeRabbit PR #144).
 #[cfg(all(feature = "runtime-tokio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_tokio_connection(
-    fd: std::os::unix::io::RawFd,
+    fd: crate::shard::dispatch::MigrateFd,
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -459,24 +454,15 @@ pub(crate) fn spawn_migrated_tokio_connection(
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
-    use std::os::unix::io::FromRawFd;
-
     use crate::server::connection::handle_connection_sharded_inner;
 
-    // `fd` was produced by `libc::dup()` on the source shard before being pushed
-    // through the SPSC channel. That dup is a fresh, owned kernel fd, distinct from
-    // any other open fd. Ownership is transferred exactly once through the channel —
-    // the source shard drops the original stream immediately after `dup`, and on
-    // SPSC push failure the producer reconstructs an `OwnedFd` to close the dup.
-    // Here on the consumer side we take ownership by wrapping it in `TcpStream`,
-    // whose `Drop` closes the fd exactly once. No aliasing, no double-close.
-    // SAFETY: fd is a valid, uniquely-owned dup'd socket transferred via SPSC.
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // F4 (#438): ownership rode the channel as an OwnedFd, so the conversion
+    // to TcpStream is the safe From impl — no raw-fd reasoning left here.
+    let std_stream = std::net::TcpStream::from(fd);
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(
-            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            "Shard {}: migrated fd set_nonblocking failed: {}",
             shard_id,
-            fd,
             e
         );
         return; // std_stream Drop closes FD
@@ -525,6 +511,8 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let sc = script_cache_rc.clone();
             let acl = acl_table.clone();
             let rtcfg = runtime_config.clone();
+            // F5 (#438): read before rtcfg moves into ConnectionContext::new.
+            let reqpass = rtcfg.read().requirepass.clone();
             let scfg = server_config.clone();
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
@@ -548,7 +536,14 @@ pub(crate) fn spawn_migrated_tokio_connection(
                 num_shards,
                 psr,
                 blk,
-                None, // requirepass: None = pre-authenticated
+                // F5 (#438, sec L3): carry the REAL requirepass. The conn's
+                // auth state comes from MigratedConnectionState (a migrated
+                // conn is already authenticated), so this is inert for the
+                // session itself — but a later AUTH on the migrated conn now
+                // validates against the actual password instead of erroring
+                // with "no password is set", and any future code that
+                // re-derives auth from ctx.requirepass sees the truth.
+                reqpass,
                 pool_for_ctx,
                 trk,
                 rs,
@@ -1023,9 +1018,15 @@ pub(crate) fn spawn_monoio_connection(
                             )
                             .await;
                         } else {
+                            // F4 (#438): wrap the dup immediately — from here on
+                            // the fd is closed by Drop on every path (undelivered
+                            // message, ring torn down at shutdown), never leaked.
+                            // SAFETY: dup_fd is the fresh, uniquely-owned fd
+                            // libc::dup returned above; nothing else closes it.
+                            let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(dup_fd) };
                             let mut pending_msg = Some(ShardMessage::MigrateConnection(Box::new(
                                 crate::shard::dispatch::MigrateConnectionPayload {
-                                    fd: dup_fd,
+                                    fd: owned_fd,
                                     state,
                                 },
                             )));
@@ -1060,11 +1061,8 @@ pub(crate) fn spawn_monoio_connection(
                             if _migrated {
                                 drop(stream); // hand-off confirmed: target owns dup_fd
                             } else if let Some(ShardMessage::MigrateConnection(payload)) = pending_msg {
-                                // SAFETY: dup_fd is a valid dup'd socket from libc::dup
-                                // above; the push never succeeded so we still own it.
-                                drop(unsafe {
-                                    std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
-                                });
+                                // F4 (#438): dropping the payload closes the
+                                // dup'd fd (OwnedFd) — no manual reclaim needed.
                                 tracing::warn!(
                                     "Shard {}: migration SPSC full, keeping connection {} local (monoio)",
                                     shard_id, cid
@@ -1309,6 +1307,13 @@ fn spawn_resumed_parked_conn<S>(
             &conn_ctx,
             shutdown.clone(),
             client_id,
+            // can_migrate=false is DELIBERATE (#438 F4 review): this wrapper
+            // has no MigrateConnection arm — enabling migration here would
+            // need the full dup/SPSC/fail-open plumbing of the primary spawn
+            // site. The affinity value is also marginal: a conn only reaches
+            // this path by idling past --conn-park-secs, and migration
+            // sampling exists for HOT connections. A resumed conn that turns
+            // hot simply stays on the shard the affinity router first chose.
             false, // can_migrate
             initial,
             Some(&state),
@@ -1361,25 +1366,21 @@ fn spawn_resumed_parked_conn<S>(
 
 /// Spawn a migrated connection handler on the target shard (monoio runtime).
 ///
-/// Reconstructs a `monoio::net::TcpStream` from a raw FD transferred via
-/// `ShardMessage::MigrateConnection`, prepends synthetic RESP commands for state
-/// restoration, and spawns a handler with `requirepass = None` (pre-authenticated).
-///
-/// # Safety
-///
-/// Same safety requirements as `spawn_migrated_tokio_connection`: the caller must
-/// ensure `fd` is a valid, open file descriptor for a connected TCP socket.
+/// Reconstructs a `monoio::net::TcpStream` from the `OwnedFd` transferred via
+/// `ShardMessage::MigrateConnection` (#438 F4: safe ownership transfer, drop
+/// closes), prepends synthetic RESP commands for state restoration, and
+/// spawns the handler.
 ///
 /// # Limitations
 ///
 /// TLS connections cannot be migrated (TLS session state is in userspace).
 // `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
-// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
-// supported targets (Linux + macOS).
+// above: `MigrateFd` is `OwnedFd` on Unix only. Always true on supported
+// targets (Linux + macOS).
 #[cfg(all(feature = "runtime-monoio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_monoio_connection(
-    fd: std::os::unix::io::RawFd,
+    fd: crate::shard::dispatch::MigrateFd,
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -1409,19 +1410,15 @@ pub(crate) fn spawn_migrated_monoio_connection(
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
-    use std::os::unix::io::FromRawFd;
-
     use crate::server::connection::handle_connection_sharded_monoio;
 
-    // Same ownership chain as `spawn_migrated_tokio_connection`: `fd` is a dup'd
-    // socket transferred exactly once through SPSC, source already dropped its handle.
-    // SAFETY: fd is a valid, uniquely-owned dup'd socket; TcpStream is sole close-owner.
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // F4 (#438): same as the tokio twin — OwnedFd in, safe From conversion,
+    // TcpStream is sole close-owner from here.
+    let std_stream = std::net::TcpStream::from(fd);
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(
-            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            "Shard {}: migrated fd set_nonblocking failed: {}",
             shard_id,
-            fd,
             e
         );
         // Source shard's `try_accept_connection` already counted this
@@ -1470,6 +1467,8 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let sc = script_cache_rc.clone();
             let acl = acl_table.clone();
             let rtcfg = runtime_config.clone();
+            // F5 (#438): read before rtcfg moves into ConnectionContext::new.
+            let reqpass = rtcfg.read().requirepass.clone();
             let scfg = server_config.clone();
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
@@ -1493,7 +1492,14 @@ pub(crate) fn spawn_migrated_monoio_connection(
                 num_shards,
                 psr,
                 blk,
-                None, // requirepass: None = pre-authenticated
+                // F5 (#438, sec L3): carry the REAL requirepass. The conn's
+                // auth state comes from MigratedConnectionState (a migrated
+                // conn is already authenticated), so this is inert for the
+                // session itself — but a later AUTH on the migrated conn now
+                // validates against the actual password instead of erroring
+                // with "no password is set", and any future code that
+                // re-derives auth from ctx.requirepass sees the truth.
+                reqpass,
                 pool_for_ctx,
                 trk,
                 rs,

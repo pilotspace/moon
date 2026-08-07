@@ -18,7 +18,7 @@ use std::time::Duration;
 /// Past downshift (1s) + park threshold (2s) + sweep cadence (1s) + margin.
 const PARK_WAIT: Duration = Duration::from_millis(4600);
 
-fn spawn_moon(dir: &std::path::Path, port: u16) -> std::process::Child {
+fn spawn_moon_with(dir: &std::path::Path, port: u16, extra: &[&str]) -> std::process::Child {
     Command::new(common::find_moon_binary())
         .args([
             "--port",
@@ -32,10 +32,15 @@ fn spawn_moon(dir: &std::path::Path, port: u16) -> std::process::Child {
             "--conn-park-secs",
             "2",
         ])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn moon")
+}
+
+fn spawn_moon(dir: &std::path::Path, port: u16) -> std::process::Child {
+    spawn_moon_with(dir, port, &[])
 }
 
 fn read_exact_deadline(stream: &mut TcpStream, want: usize) -> Vec<u8> {
@@ -401,6 +406,64 @@ fn partial_frame_survives_a_park() {
     // must not have left stray bytes in the buffer.
     ping(&mut conn);
 
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// F6 (#438, sec L2): an UNAUTHENTICATED connection on an auth-enabled server
+/// must never task-park. Parking a pre-AUTH conn would let an attacker hold a
+/// maxclients-worth of silent sockets at ~3.3 KB each, indefinitely and
+/// invisibly cheap; keeping them un-parked leaves each pinned to a full
+/// handler task, costly enough to surface in monitoring.
+///
+/// The authed idle sibling doubles as the positive control: it MUST park
+/// (proving the park machinery is live, so the unauth conn's absence from the
+/// gauge is the F6 exclusion, not a broken park path). Task parking is
+/// monoio-only; under tokio both counts are 0 and the test degenerates to
+/// "unauth conn is never parked" (vacuously green, same caveat as the rest of
+/// this suite).
+#[test]
+fn unauthenticated_conn_never_task_parks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut child, port) =
+        common::spawn_listening(|p| spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"]));
+
+    // Positive control: authenticated, then idle past the park threshold.
+    let mut authed = TcpStream::connect(("127.0.0.1", port)).expect("connect authed");
+    let r = command_reply(&mut authed, "AUTH park-f6\r\n");
+    assert!(r.starts_with("+OK"), "AUTH failed: {r}");
+
+    // Victim: connects and never speaks — no AUTH, no bytes.
+    let silent = TcpStream::connect(("127.0.0.1", port)).expect("connect silent");
+
+    std::thread::sleep(PARK_WAIT);
+
+    // Control conn (freshly active, not parked) reads the gauge.
+    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let r = command_reply(&mut control, "AUTH park-f6\r\n");
+    assert!(r.starts_with("+OK"), "control AUTH failed: {r}");
+    let info = command_reply(&mut control, "INFO clients\r\n");
+    let parked: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("parked_clients:"))
+        .unwrap_or_else(|| panic!("parked_clients missing from INFO clients:\n{info}"))
+        .trim()
+        .parse()
+        .expect("parked_clients value");
+
+    let expected = if cfg!(feature = "runtime-monoio") {
+        1
+    } else {
+        0
+    };
+    assert_eq!(
+        parked, expected,
+        "exactly the authed idle conn may park; an unauthenticated conn must \
+         never task-park (parked_clients={parked}, expected {expected})"
+    );
+
+    drop(silent);
+    drop(authed);
     let _ = child.kill();
     let _ = child.wait();
 }
