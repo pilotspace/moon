@@ -132,11 +132,12 @@ fn drive_handshake(
 /// the KeyUpdate deadlock the c10k review described becomes real.
 #[test]
 fn keyupdate_reply_is_deferred_until_the_next_outbound_record() {
-    let tmp = std::env::temp_dir().join(format!("moon-tls-keyupdate-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
+    // Test-hygiene sweep: RAII tempdir (unique, removed even on panic/early
+    // return) replaces the pid-only name that could resurrect stale certs.
+    let tmp_guard = tempfile::tempdir().expect("tempdir");
+    let tmp = tmp_guard.path().to_path_buf();
     if !generate_cert(&tmp) {
         eprintln!("skipping: openssl unavailable");
-        let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
 
@@ -224,6 +225,4 @@ fn keyupdate_reply_is_deferred_until_the_next_outbound_record() {
         !s2c.is_empty(),
         "the deferred KeyUpdate must ride out with the next record"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }

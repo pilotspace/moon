@@ -147,9 +147,15 @@ fn spawn_moon(shards: usize, tag: &str) -> Option<Moon> {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let tmp_dir =
-        std::env::temp_dir().join(format!("moon-db-isolation-{tag}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    // Test-hygiene sweep: unique random dir via tempfile, then `keep()` so the
+    // EXISTING PathBuf ownership + manual cleanup keep working (the restart
+    // flow shares one dir between two Moon values, so TempDir RAII does not
+    // fit). Pid-only names resurrected stale dirs on pid reuse after crashes.
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(&format!("moon-db-isolation-{tag}-"))
+        .tempdir()
+        .expect("tempdir")
+        .keep();
     spawn_moon_first(&tmp_dir, shards)
 }
 
@@ -380,9 +386,12 @@ fn restart_round_trip_preserves_db_binding() {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let tmp_dir =
-        std::env::temp_dir().join(format!("moon-db-isolation-restart-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    // Test-hygiene sweep: unique random dir (see spawn_moon for rationale).
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("moon-db-isolation-restart-")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
 
     let mut moon = match spawn_moon_first(&tmp_dir, 1) {
         Some(m) => m,

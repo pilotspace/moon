@@ -42,14 +42,17 @@ struct Moon {
     child: Child,
     port: u16,
     admin_port: u16,
-    tmp_dir: std::path::PathBuf,
+    /// RAII tempdir (test-hygiene sweep): random unique name, removed on
+    /// drop (after the child is killed in `Drop` above the field drop).
+    /// The old pid-only name resurrected stale dirs after a crashed run
+    /// once the pid was reused, reloading stale persistence state.
+    _tmp_dir: tempfile::TempDir,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
@@ -67,8 +70,7 @@ fn spawn_moon() -> Option<Moon> {
         return None;
     }
     let admin_port = common::reserve_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-test-prom-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
     let (child, port) = common::spawn_listening(|port| {
         Command::new(&bin)
             .args([
@@ -81,7 +83,7 @@ fn spawn_moon() -> Option<Moon> {
                 "--appendonly",
                 "no",
                 "--dir",
-                tmp_dir.to_str().unwrap(),
+                tmp_dir.path().to_str().unwrap(),
                 "--disk-offload",
                 "disable",
             ])
@@ -94,7 +96,7 @@ fn spawn_moon() -> Option<Moon> {
         child,
         port,
         admin_port,
-        tmp_dir,
+        _tmp_dir: tmp_dir,
     };
 
     // Wait up to ~5s for PING to succeed.

@@ -271,9 +271,10 @@ fn rerank_sidecar_survives_persistence_roundtrip() {
         0x9E12,
     );
 
-    let dir = std::env::temp_dir().join(format!("moon-xr-per-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Test-hygiene sweep: RAII tempdir (unique name, removed even on panic)
+    // replaces the pid-only name that resurrected stale dirs on pid reuse.
+    let dir_guard = tempfile::tempdir().unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     // Write the compacted segment, then read it back fresh.
     {
@@ -301,8 +302,6 @@ fn rerank_sidecar_survives_persistence_roundtrip() {
             truth
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── 5. Legacy segment dirs (no sidecar file) still load and search ──────────
@@ -319,9 +318,10 @@ fn legacy_segment_without_sidecar_still_searches() {
         0x1E64,
     );
 
-    let dir = std::env::temp_dir().join(format!("moon-xr-leg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Test-hygiene sweep: RAII tempdir (unique name, removed even on panic)
+    // replaces the pid-only name that resurrected stale dirs on pid reuse.
+    let dir_guard = tempfile::tempdir().unwrap();
+    let dir = dir_guard.path().to_path_buf();
     {
         let idx = store.get_index_mut(b"xr_leg").expect("index");
         let snap = idx.segments.load();
@@ -339,8 +339,6 @@ fn legacy_segment_without_sidecar_still_searches() {
         !results.is_empty(),
         "legacy segment without sidecar must still search (ADC distances)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── 6. GraphUnion merge preserves the sidecar ────────────────────────────────
@@ -640,9 +638,10 @@ fn exact_beam_without_sidecar_falls_back_to_adc() {
         32,
         0x1B3A,
     );
-    let dir = std::env::temp_dir().join(format!("moon-xr-bleg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Test-hygiene sweep: RAII tempdir (unique name, removed even on panic)
+    // replaces the pid-only name that resurrected stale dirs on pid reuse.
+    let dir_guard = tempfile::tempdir().unwrap();
+    let dir = dir_guard.path().to_path_buf();
     {
         let idx = store.get_index_mut(b"xr_bleg").expect("index");
         let snap = idx.segments.load();
@@ -668,5 +667,4 @@ fn exact_beam_without_sidecar_falls_back_to_adc() {
         !results.is_empty(),
         "EXACT_BEAM on a sidecar-less segment must silently fall back to ADC"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
