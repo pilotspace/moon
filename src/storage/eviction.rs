@@ -182,18 +182,18 @@ fn sample_random_keys(
     out
 }
 
-/// Compare two LRU timestamps with u16 wraparound handling.
-/// Uses signed-distance comparison: treats the 16-bit clock as circular.
+/// Compare two LRU timestamps with u32 wraparound handling.
+/// Uses signed-distance comparison: treats the 32-bit epoch-seconds clock as
+/// circular, so verdicts are correct for access-time gaps up to ±68 years —
+/// including across the year-2106 clock wrap. (The old 16-bit variant
+/// inverted verdicts once two keys' access times differed by more than
+/// ~9.1h, making LRU evict hot keys under diurnal workloads.)
 /// Returns true if `a` is considered older (less recent) than `b`.
 #[inline]
 pub fn lru_is_older(a: u32, b: u32) -> bool {
-    let a16 = a as i16;
-    let b16 = b as i16;
     // Signed difference handles wraparound: if a was accessed before b,
-    // (a16 - b16) is negative (a < b in time), meaning a is older.
-    // Wraparound case: a=65400 (pre-wrap), b=100 (post-wrap):
-    //   a16=-136, b16=100, -136-100=-236 < 0 → correctly identifies a as older.
-    a16.wrapping_sub(b16) < 0
+    // the circular distance a-b is negative (a < b in time) → a is older.
+    (a.wrapping_sub(b) as i32) < 0
 }
 
 /// Sum used_memory across all databases for aggregate eviction decisions.
@@ -1101,6 +1101,21 @@ mod tests {
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
+
+    #[test]
+    fn lru_is_older_valid_beyond_nine_hours() {
+        // Regression: the old i16 comparison window (±32768s ≈ ±9.1h)
+        // inverted verdicts for diurnal idle gaps — a key idle 10h compared
+        // as NEWER than one touched a minute ago, so LRU evicted the hot key.
+        let now: u32 = 1_754_000_000;
+        let idle_10h = now - 36_000;
+        let idle_1m = now - 60;
+        assert!(lru_is_older(idle_10h, idle_1m));
+        assert!(!lru_is_older(idle_1m, idle_10h));
+        // Still correct at multi-day idle.
+        let idle_3d = now - 259_200;
+        assert!(lru_is_older(idle_3d, idle_10h));
+    }
 
     // -----------------------------------------------------------------
     // compute_elastic_budget (GAP-1)

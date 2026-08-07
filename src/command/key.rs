@@ -530,8 +530,9 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
         match db.get(key) {
             Some(entry) => {
                 let last = entry.last_access();
-                // Wraparound-safe delta in seconds (16-bit)
-                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                // Full u32 epoch-seconds delta; saturate rather than wrap if
+                // the cached clock lags a concurrent touch.
+                let idle = now.saturating_sub(last);
                 Frame::Integer(idle as i64)
             }
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
@@ -599,8 +600,9 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         match db.get_if_alive(key, now_ms) {
             Some(entry) => {
                 let last = entry.last_access();
-                // Wraparound-safe delta in seconds (16-bit)
-                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                // Full u32 epoch-seconds delta; saturate rather than wrap if
+                // the cached clock lags a concurrent touch.
+                let idle = now.saturating_sub(last);
                 Frame::Integer(idle as i64)
             }
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),

@@ -751,22 +751,23 @@ mod tests {
     #[test]
     fn test_version_tracking() {
         let mut db = Database::new();
+        // 0 is reserved for "key absent" so WATCH detects creation.
         assert_eq!(db.get_version(b"key"), 0);
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
-        assert_eq!(db.get_version(b"key"), 0); // first set, version 0
+        assert_eq!(db.get_version(b"key"), 1); // first set: INITIAL_VERSION
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
-        assert_eq!(db.get_version(b"key"), 1); // second set, version 0+1=1
+        assert_eq!(db.get_version(b"key"), 2); // overwrite bumps
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
-        assert_eq!(db.get_version(b"key"), 2);
+        assert_eq!(db.get_version(b"key"), 3);
     }
 
     #[test]
     fn test_increment_version() {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
-        assert_eq!(db.get_version(b"key"), 0);
-        db.increment_version(b"key");
         assert_eq!(db.get_version(b"key"), 1);
+        db.increment_version(b"key");
+        assert_eq!(db.get_version(b"key"), 2);
         // non-existent key is a no-op
         db.increment_version(b"missing");
     }
