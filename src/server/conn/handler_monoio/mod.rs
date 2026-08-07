@@ -516,8 +516,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // socket. CARRY_READY is an impossible real read length (reads
             // are bounded by the 8 KiB buffer), used as an in-band "no new
             // bytes, just parse" marker so the arm's parse loop is shared.
+            // The flag is only CLEARED inside the read arm's body — if the
+            // pubsub or shutdown arm wins this select round, the carry stays
+            // armed and retries next iteration (a take() here would eat the
+            // flag on a lost race and re-introduce the stall).
             const CARRY_READY: usize = usize::MAX;
-            let have_carry = !read_buf.is_empty() && std::mem::take(&mut carried_input);
+            let have_carry = !read_buf.is_empty() && carried_input;
             monoio::select! {
                 read_result = async {
                     if have_carry {
@@ -526,6 +530,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         stream.read(sub_tmp_buf).await
                     }
                 } => {
+                    // Read arm won: the carry (if any) is being consumed now.
+                    carried_input = false;
                     let (result, buf) = read_result;
                     tmp_buf = buf;
                     let buf = &tmp_buf;

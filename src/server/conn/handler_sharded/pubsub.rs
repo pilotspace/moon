@@ -38,7 +38,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
     ctx: &ConnectionContext,
     peer_addr: &str,
     shutdown: &CancellationToken,
-    have_carry: bool,
+    carried_input: &mut bool,
 ) -> SubscriberAction {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -46,8 +46,12 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
     // re-encoded in read_buf — parse it without awaiting the socket.
     // CARRY_READY is an impossible real read length, used as an in-band
     // "no new bytes, just parse" marker so the read arm's parse loop is
-    // shared.
+    // shared. The flag is only CLEARED inside the read arm's body — if the
+    // pubsub or shutdown arm wins this select round, the carry stays armed
+    // and retries on the next call (consuming it up front would eat the
+    // flag on a lost race and stall the carried frames).
     const CARRY_READY: usize = usize::MAX;
+    let have_carry = !read_buf.is_empty() && *carried_input;
 
     #[allow(clippy::unwrap_used)]
     // conn.pubsub_rx is always Some when conn.subscription_count > 0
@@ -60,6 +64,8 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                 stream.read_buf(read_buf).await
             }
         } => {
+            // Read arm won: the carry (if any) is being consumed now.
+            *carried_input = false;
             match n {
                 Ok(0) | Err(_) => return SubscriberAction::BreakOuter,
                 Ok(_) => {}

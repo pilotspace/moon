@@ -444,10 +444,9 @@ pub(crate) async fn handle_connection_sharded_inner<
 
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
-            // #438: consume the carry flag here — a deferred batch tail from
-            // the subscribe break sits in read_buf and must be parsed before
-            // awaiting the socket.
-            let have_carry = !read_buf.is_empty() && std::mem::take(&mut carried_input);
+            // #438: a deferred batch tail from the subscribe break sits in
+            // read_buf; run_subscriber_step parses it before awaiting the
+            // socket, clearing the flag only when its read arm actually wins.
             match pubsub::run_subscriber_step(
                 &mut stream,
                 &mut read_buf,
@@ -457,7 +456,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 ctx,
                 &peer_addr,
                 &shutdown,
-                have_carry,
+                &mut carried_input,
             )
             .await
             {
@@ -485,12 +484,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                 //
                 // c10k D1: no `idle_timeout` arm here — `timeout N` is enforced
                 // out-of-band by `client_registry::kill_idle_clients`.
-                if std::mem::take(&mut carried_input) && !read_buf.is_empty() {
+                // #438: read (don't take) the flag — it is cleared in the
+                // arm BODY below, so a select round lost to the tracking or
+                // shutdown arm keeps the carry armed instead of eating it
+                // (the old take() here could drop carried input on the race).
+                if carried_input && !read_buf.is_empty() {
                     Ok(read_buf.len())
                 } else {
                     stream.read_buf(&mut read_buf).await
                 }
             } => {
+                // Read arm won: the carry (if any) is being consumed now.
+                carried_input = false;
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
