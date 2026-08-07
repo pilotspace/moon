@@ -23,7 +23,11 @@ flume = "0.12"
 atomic-waker = "1"
 # Base features (rt, net) are always available for the admin HTTP server.
 # runtime-tokio adds the full feature set (multi-thread, io-util, signal, etc.).
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+# Base features include "time" + "io-util" for the cluster control plane
+# (bus + gossip + election), which is tokio-native on BOTH runtimes — under
+# monoio it runs on a dedicated std thread with a current-thread runtime
+# (v0.9 C-1, #405).
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

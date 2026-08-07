@@ -1891,10 +1891,48 @@ fn main() -> anyhow::Result<()> {
 
     let listener_cancel = cancel_token.clone();
 
+    // v0.9 C-1 (#405): the cluster control plane (bus + gossip + election) is
+    // tokio-native and runs on a dedicated `cluster-ctl` std thread hosting a
+    // current-thread tokio runtime — on BOTH server runtimes. Under monoio
+    // there is no tokio runtime to share; under tokio, sharing the listener
+    // runtime made gossip compete with the accept loop and every connection,
+    // which starved the 100ms ticker under load (observed as PFAIL detection
+    // stalling in the formation e2e). The control plane is not
+    // latency-critical, and monoio's !Send task model makes a port high-risk
+    // for zero payoff.
+    if let Some(ref cs) = cluster_state {
+        let ctl_cs = cs.clone();
+        let ctl_bind = config.bind.clone();
+        let ctl_port = config.port;
+        let ctl_node_timeout = config.cluster_node_timeout;
+        let ctl_cancel = cancel_token.child_token();
+        let ctl_repl_state = repl_state.clone();
+        std::thread::Builder::new()
+            .name("cluster-ctl".to_string())
+            .spawn(move || {
+                // O5: escape the shard-core mask this thread would otherwise
+                // inherit from its spawning thread.
+                moon::shard::numa::pin_current_aux_thread("cluster-ctl");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build cluster control-plane runtime");
+                // Runs until the shutdown token cancels the gossip ticker.
+                rt.block_on(run_cluster_control_plane(
+                    ctl_cs,
+                    ctl_bind,
+                    ctl_port,
+                    ctl_node_timeout,
+                    ctl_cancel,
+                    ctl_repl_state,
+                ));
+            })
+            .expect("failed to spawn cluster control-plane thread");
+    }
+
     // Run the sharded listener on the main thread.
     // Under tokio: uses current_thread runtime with tokio::spawn for background tasks.
-    // Under monoio: uses monoio RuntimeFactory with simplified startup (cluster/gossip
-    //   not yet supported under monoio).
+    // Under monoio: uses monoio RuntimeFactory (auto-save on its own thread).
     #[cfg(feature = "runtime-tokio")]
     {
         let listener_rt = tokio::runtime::Builder::new_current_thread()
@@ -1923,57 +1961,6 @@ fn main() -> anyhow::Result<()> {
                     ));
                     info!("Auto-save timer started (sharded mode)");
                 }
-            }
-
-            // Start cluster bus and gossip ticker when cluster mode is enabled
-            if let Some(ref cs) = cluster_state {
-                let cluster_port = (config.port as u32 + 10000) as u16;
-                let cs_clone = cs.clone();
-                let bus_cancel = cancel_token.child_token();
-                let bind2 = config.bind.clone();
-                let self_addr: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-
-                // Shared vote channel: gossip ticker sets sender when election starts,
-                // bus handler forwards FailoverAuthAck votes through it.
-                let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
-                    std::sync::Arc::new(parking_lot::Mutex::new(None));
-
-                let bus_vote_tx = failover_vote_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = moon::cluster::bus::run_cluster_bus(
-                        &bind2,
-                        cluster_port,
-                        self_addr,
-                        cs_clone,
-                        bus_cancel,
-                        bus_vote_tx,
-                    )
-                    .await
-                    {
-                        tracing::error!("Cluster bus error: {}", e);
-                    }
-                });
-
-                let cs_gossip = cs.clone();
-                let gossip_cancel = cancel_token.child_token();
-                let node_timeout = config.cluster_node_timeout;
-                let self_addr2: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-                let gossip_vote_tx = failover_vote_tx.clone();
-                let gossip_repl_state = repl_state.clone();
-                tokio::spawn(async move {
-                    moon::cluster::gossip::run_gossip_ticker(
-                        self_addr2,
-                        cs_gossip,
-                        node_timeout,
-                        gossip_cancel,
-                        gossip_vote_tx,
-                        gossip_repl_state,
-                    )
-                    .await;
-                });
-                info!("Cluster bus and gossip ticker started");
             }
 
             // The central tokio listener plain-binds the port (no SO_REUSEPORT,
@@ -2006,9 +1993,6 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "runtime-monoio")]
     {
-        // Monoio listener: simplified startup. Cluster bus and gossip not yet
-        // supported under monoio.
-
         // Auto-save runs on a dedicated thread (same pattern as AOF writer).
         if config.save.is_some() {
             let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
@@ -2080,6 +2064,69 @@ fn main() -> anyhow::Result<()> {
 
     info!("Server shut down");
     Ok(())
+}
+
+/// Run the cluster control plane — bus listener, gossip ticker, and (via the
+/// ticker) failover elections — on the CURRENT tokio runtime, until the
+/// cancellation token fires.
+///
+/// v0.9 C-1 (#405): the control plane is tokio-native on BOTH runtimes. The
+/// tokio server spawns this onto its listener runtime; the monoio server runs
+/// it on a dedicated `cluster-ctl` std thread hosting a current-thread tokio
+/// runtime. All I/O here is gossip-rate (100ms ticks), never on shard threads.
+async fn run_cluster_control_plane(
+    cluster_state: std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>,
+    bind: String,
+    port: u16,
+    node_timeout: u64,
+    cancel_token: moon::runtime::cancel::CancellationToken,
+    repl_state: std::sync::Arc<parking_lot::RwLock<moon::replication::state::ReplicationState>>,
+) {
+    let cluster_port = (port as u32 + 10000) as u16;
+    let self_addr: std::net::SocketAddr = match format!("{bind}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                "Cluster control plane disabled: invalid bind address {bind}:{port}: {e}"
+            );
+            return;
+        }
+    };
+
+    // Shared vote channel: gossip ticker sets sender when election starts,
+    // bus handler forwards FailoverAuthAck votes through it.
+    let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+
+    let bus_cs = cluster_state.clone();
+    let bus_cancel = cancel_token.child_token();
+    let bus_vote_tx = failover_vote_tx.clone();
+    let bus_bind = bind.clone();
+    tokio::spawn(async move {
+        if let Err(e) = moon::cluster::bus::run_cluster_bus(
+            &bus_bind,
+            cluster_port,
+            self_addr,
+            bus_cs,
+            bus_cancel,
+            bus_vote_tx,
+        )
+        .await
+        {
+            tracing::error!("Cluster bus error: {}", e);
+        }
+    });
+
+    info!("Cluster bus and gossip ticker started");
+    moon::cluster::gossip::run_gossip_ticker(
+        self_addr,
+        cluster_state,
+        node_timeout,
+        cancel_token.child_token(),
+        failover_vote_tx,
+        repl_state,
+    )
+    .await;
 }
 
 /// Resolve the automatic shard count, optionally capped to the empirical

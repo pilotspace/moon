@@ -275,7 +275,12 @@ pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
 
     let mut state = cs.write().unwrap();
     if !state.nodes.contains_key(&peer_id) {
-        let node = ClusterNode::new(peer_id.clone(), addr, NodeFlags::Master, 0);
+        let mut node = ClusterNode::new(peer_id.clone(), addr, NodeFlags::Master, 0);
+        // Freshness baseline: check_failure_states skips pong_recv_ms == 0
+        // entries, so MEET-ing a dead address would otherwise leave an
+        // entry that never goes PFAIL. The handshake replaces this
+        // placeholder (and its clock) with the peer's real identity.
+        node.pong_recv_ms = crate::cluster::gossip::now_ms();
         state.nodes.insert(peer_id, node);
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
