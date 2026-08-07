@@ -6,7 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The AOF now compacts itself (#433): Redis-parity automatic rewrite.**
+  `--auto-aof-rewrite-percentage` (default 100, `0` disables) and
+  `--auto-aof-rewrite-min-size` (default `64mb`, size strings accepted)
+  trigger a background rewrite once the AOF has grown the given percentage
+  over its size after the last rewrite. Before this, the AOF grew with write
+  volume rather than dataset size — observed 4.8 GB on disk for a 2.43 GB
+  dataset, ~1 GB/day — until the diskfull guard paused writes. A monitor
+  thread samples the on-disk size once a second and dispatches the same
+  entry point as `BGREWRITEAOF`; a failed dispatch backs off 60 s instead of
+  hot-retrying. Both knobs appear in `CONFIG GET`.
+- **Multi-shard `BGREWRITEAOF` is un-gated.** The per-shard fan-out rewrite
+  (cooperative snapshot + synchronized manifest commit) is now the default —
+  the historical gate dated from a pre-C4 design that lost ~38% of keys, and
+  the current path holds exact INCR recovery across a rewrite straddling a
+  live write stream plus SIGKILL (crash matrix, 5/5 repeat runs).
+  `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
+
 ### Fixed
+- **`INFO persistence` reports real AOF state (#432).** `aof_enabled` and
+  `aof_rewrite_in_progress` were hardcoded `0` even with `--appendonly yes`
+  (the default) and a rewrite running; they now reflect reality, and new
+  `aof_base_size` / `aof_current_size` fields expose the growth the
+  auto-rewrite trigger acts on — an operator can finally see the
+  AOF-vs-dataset ratio the diskfull incident hid.
+- **The per-shard BGREWRITEAOF crash matrix no longer reports phantom data
+  loss on nearly-full hosts.** The harness lacked `--disk-free-min-pct 0`
+  and parsed `MOONERR diskfull` INCR rejections as silently-dropped writes
+  (the host root volume hovers at ~4% free, making it intermittent). The
+  suite now disables the guard, panics on any non-numeric INCR reply, and is
+  green 5/5 consecutive runs.
 - **Replicas now apply streamed `SWAPDB` (#386), and the record reaches the
   wire exactly once per client call.** Two stacked defects: (1) the replica's
   apply path had no SWAPDB intercept — generic dispatch hard-errors ("must be

@@ -487,6 +487,9 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 // ── Submodule decomposition (refactor: aof.rs 4379 lines -> directory module) ──
 // Codec (serialize_command/replay_aof) stays in this parent so children reach it
 // via `use super::*`. AofWriterPool, writer tasks, and rewrite paths move out.
+/// #433 — automatic AOF rewrite monitor (Redis `auto-aof-rewrite-*` parity)
+/// plus the INFO-persistence size/enabled statics (#432).
+pub mod auto_rewrite;
 /// Group-commit batching seam (coalesce concurrent pending writes into one
 /// fsync under `appendfsync=always`). `pub` so the §4 red suite can pin the pure
 /// seam (collect/commit) against the public API.

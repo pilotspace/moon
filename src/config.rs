@@ -117,25 +117,31 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,
 
-    /// [EXPERIMENTAL] Enable per-shard BGREWRITEAOF (compaction) for the
-    /// `--shards >= 2 + --appendonly yes` PerShard layout.
-    ///
-    /// Default `false`: BGREWRITEAOF stays gated in PerShard mode (the
-    /// shipped, crash-safe "append-only, no in-place compaction" behavior).
-    /// When `true`, BGREWRITEAOF fans the rewrite out to every per-shard
-    /// writer (synchronized seq bump + single manifest commit). This path is
-    /// validated by `tests/crash_matrix_per_shard_bgrewriteaof.rs` and is
-    /// opt-in until the both-runtime crash matrix is green by default.
-    ///
-    /// The flag only takes effect alongside `per_shard_aof_active`; it is a
-    /// no-op for `--shards 1` (TopLevel rewrite already works) and for
-    /// `--appendonly no`.
+    /// [DEPRECATED — no-op] Per-shard BGREWRITEAOF is the DEFAULT since #433
+    /// (the fan-out compaction path is validated by
+    /// `tests/crash_matrix_per_shard_bgrewriteaof.rs` and the auto-rewrite
+    /// suite). Passing this flag only emits a deprecation warning. Remove it
+    /// from launch commands; it will be deleted in a future release.
     #[arg(long, default_value_t = false)]
     pub experimental_per_shard_rewrite: bool,
 
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
+
+    /// Automatic AOF rewrite trigger: rewrite when the AOF has grown by this
+    /// percentage over its size after the last rewrite (Redis parity:
+    /// `auto-aof-rewrite-percentage`). `0` disables automatic rewrites;
+    /// manual `BGREWRITEAOF` still works. Default 100 (= rewrite at 2× the
+    /// post-rewrite size), same as Redis.
+    #[arg(long = "auto-aof-rewrite-percentage", default_value_t = 100)]
+    pub auto_aof_rewrite_percentage: u64,
+
+    /// Automatic AOF rewrite floor: never auto-rewrite while the total AOF
+    /// size is below this (Redis parity: `auto-aof-rewrite-min-size`).
+    /// Accepts size strings ("64mb", "1gb") or raw bytes. Default "64mb".
+    #[arg(long = "auto-aof-rewrite-min-size", default_value = "64mb")]
+    pub auto_aof_rewrite_min_size: String,
 
     /// Max time (ms) a write may block awaiting the `appendfsync=always`
     /// fsync ack before the write is failed instead of parking the

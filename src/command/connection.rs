@@ -278,13 +278,26 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# Persistence\r\n");
+    // #432: aof_enabled / aof_rewrite_in_progress / sizes are real state, not
+    // hardcoded zeros. Sizes come from the auto-rewrite monitor's statics
+    // (#433); refresh_current_size keeps `aof_current_size` honest when INFO
+    // is read between monitor ticks (one directory walk — INFO is cold path).
+    let aof_enabled = crate::persistence::aof::auto_rewrite::AOF_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let aof_current_size = if aof_enabled {
+        crate::persistence::aof::auto_rewrite::refresh_current_size()
+    } else {
+        0
+    };
     sections.push_str(&format!(
         "loading:0\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
          rdb_last_bgsave_status:{}\r\n\
-         aof_enabled:0\r\n\
-         aof_rewrite_in_progress:0\r\n\
+         aof_enabled:{}\r\n\
+         aof_rewrite_in_progress:{}\r\n\
+         aof_base_size:{}\r\n\
+         aof_current_size:{}\r\n\
          aof_backpressure_dropped:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
@@ -303,6 +316,14 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         } else {
             "err"
         },
+        u8::from(aof_enabled),
+        u8::from(
+            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                .load(std::sync::atomic::Ordering::SeqCst)
+        ),
+        crate::persistence::aof::auto_rewrite::AOF_BASE_SIZE
+            .load(std::sync::atomic::Ordering::Relaxed),
+        aof_current_size,
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
