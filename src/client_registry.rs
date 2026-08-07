@@ -410,14 +410,23 @@ pub fn client_info(id: u64) -> Option<String> {
 /// self-kill, then closes).
 pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
     // Lock ordering / fd-liveness invariant, per stripe (c10k W5): the raw-fd
-    // `shutdown` is race-free because a connection's `RegistryGuard` (a local)
-    // drops — calling `deregister`, which needs its OWN stripe's WRITE lock —
-    // strictly before its `stream` (a parameter) drops and closes the fd. So
-    // while we hold a stripe's READ lock and an entry is present in it,
-    // `deregister` for that entry is blocked, its `stream` has not dropped,
-    // and `kill_fd` is still an open socket. The invariant only ever involves
-    // one entry and its own stripe, so striping preserves it; entries in
-    // other stripes are simply not visited while their lock is free.
+    // `shutdown` is race-free because a connection's `RegistryGuard` drops —
+    // calling `deregister`, which needs its OWN stripe's WRITE lock —
+    // strictly before its `stream` drops and closes the fd. So while we hold
+    // a stripe's READ lock and an entry is present in it, `deregister` for
+    // that entry is blocked, its `stream` has not dropped, and `kill_fd` is
+    // still an open socket. The invariant only ever involves one entry and
+    // its own stripe, so striping preserves it; entries in other stripes are
+    // simply not visited while their lock is free.
+    //
+    // WHO upholds guard-before-stream (F2, #438): in a handler task it falls
+    // out of drop order — the guard is a local, the stream a parameter, and
+    // locals drop first. A task-parked connection has NO handler task; its
+    // watcher co-owns both as future upvars (drop order = capture order, no
+    // language guarantee that helps), so they are wrapped in
+    // `conn_accept::ParkedSession`, whose hand-written Drop deregisters
+    // before closing. Any future owner of a {guard, stream} pair must
+    // preserve this order or wrap in ParkedSession.
     let mut count = 0u64;
     let kill_entry = |entry: &ClientEntry, count: &mut u64| {
         entry.live.kill_flag.store(true, Ordering::Relaxed);
