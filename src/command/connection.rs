@@ -299,6 +299,8 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          aof_base_size:{}\r\n\
          aof_current_size:{}\r\n\
          aof_backpressure_dropped:{}\r\n\
+         aof_last_fsync_status:{}\r\n\
+         aof_fsync_failures:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n",
@@ -326,6 +328,12 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         aof_current_size,
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
+        if crate::persistence::aof::AOF_LAST_FSYNC_OK.load(std::sync::atomic::Ordering::Relaxed) {
+            "ok"
+        } else {
+            "err"
+        },
+        crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
         crate::storage::tiered::spill_thread::spill_completion_dropped_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),

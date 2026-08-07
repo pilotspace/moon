@@ -630,9 +630,13 @@ pub async fn aof_writer_task(
                 let t = Instant::now();
                 if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                     error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
-                    // Non-fatal for everysec: retry next interval
+                    crate::persistence::aof::record_everysec_fsync_result(false);
+                    // Non-fatal for everysec: retry next interval (status
+                    // stays latched "err" in INFO — the failed window's
+                    // pages are already gone even if the retry "succeeds").
                 } else {
                     crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                    crate::persistence::aof::record_everysec_fsync_result(true);
                     last_fsync = Instant::now();
                     idle_wait.clear_pending();
                 }
@@ -906,10 +910,26 @@ pub async fn aof_writer_task(
                 && !write_error
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
-                let _ = writer.flush().await;
-                let _ = writer.get_ref().sync_data().await;
-                last_fsync = Instant::now();
-                idle_wait.clear_pending();
+                let t = Instant::now();
+                let res = match writer.flush().await {
+                    Ok(()) => writer.get_ref().sync_data().await,
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Err(e) => {
+                        error!("AOF sync failed (everysec, tokio TopLevel): {}", e);
+                        crate::persistence::aof::record_everysec_fsync_result(false);
+                        // Keep last_fsync unadvanced so the deadline stays
+                        // armed — a silent success-record here would let the
+                        // failed window's loss self-heal invisibly.
+                    }
+                    Ok(()) => {
+                        crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                        crate::persistence::aof::record_everysec_fsync_result(true);
+                        last_fsync = Instant::now();
+                        idle_wait.clear_pending();
+                    }
+                }
             }
         }
     }
@@ -1335,12 +1355,29 @@ pub async fn per_shard_aof_writer_task(
             // arm under load, leaving >1s of writes buffered in the BufWriter
             // and lost on SIGKILL — the COMPOSE crash-matrix failure.)
             if fsync == FsyncPolicy::EverySec
+                && !write_error
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
-                let _ = writer.flush().await;
-                let _ = writer.get_ref().sync_data().await;
-                last_fsync = Instant::now();
-                idle_wait.clear_pending();
+                let t = Instant::now();
+                let res = match writer.flush().await {
+                    Ok(()) => writer.get_ref().sync_data().await,
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Err(e) => {
+                        error!(
+                            "AOF sync failed shard {} (everysec, tokio PerShard): {}",
+                            shard_id, e
+                        );
+                        crate::persistence::aof::record_everysec_fsync_result(false);
+                    }
+                    Ok(()) => {
+                        crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                        crate::persistence::aof::record_everysec_fsync_result(true);
+                        last_fsync = Instant::now();
+                        idle_wait.clear_pending();
+                    }
+                }
             }
         }
     }
@@ -1734,8 +1771,10 @@ pub async fn per_shard_aof_writer_task(
                         "AOF EverySec proactive sync failed shard {} (seq {}): {}",
                         shard_id, manifest.seq, e
                     );
+                    crate::persistence::aof::record_everysec_fsync_result(false);
                 } else {
                     crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                    crate::persistence::aof::record_everysec_fsync_result(true);
                     last_fsync = Instant::now();
                     idle_wait.clear_pending();
                 }

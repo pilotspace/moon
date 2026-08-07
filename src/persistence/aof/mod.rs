@@ -92,6 +92,34 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Total everysec deadline-fsync failures across all AOF writers (both
+/// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
+pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the most recent everysec deadline fsync succeeded. Exposed as
+/// `aof_last_fsync_status:ok|err` in INFO (Redis's `aof_last_write_status`
+/// analogue). Kernel semantics make a *retry* of a failed fsync succeed
+/// trivially while the failed window's pages are already gone (fsyncgate),
+/// so the status latches "err" until a fsync that follows a successful
+/// write batch completes — operators must treat any "err" observation as
+/// "the AOF has a hole".
+pub static AOF_LAST_FSYNC_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Record the outcome of an everysec deadline fsync attempt. Failure bumps
+/// [`AOF_FSYNC_FAILURES`] and flips [`AOF_LAST_FSYNC_OK`]; success restores
+/// the ok status (the counter keeps the history).
+pub fn record_everysec_fsync_result(ok: bool) {
+    use std::sync::atomic::Ordering;
+    if ok {
+        AOF_LAST_FSYNC_OK.store(true, Ordering::Relaxed);
+    } else {
+        AOF_FSYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
+        AOF_LAST_FSYNC_OK.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Bound for the SPSC-drain path's blocking AOF backpressure
 /// ([`AofWriterPool::send_append_bounded_blocking`]). Sized to cover the
 /// writer draining one group-commit batch (≤1024 msgs / 8 MiB buffered
@@ -1314,5 +1342,21 @@ mod tests {
             "AOF_FSYNC_ERR must start with 'ERR ' (got {:?})",
             std::str::from_utf8(AOF_FSYNC_ERR).unwrap_or("<non-utf8>")
         );
+    }
+
+    /// F2/F3 (deep review): everysec fsync failures must latch an "err"
+    /// status and count — the old tokio paths dropped the error and recorded
+    /// success, so an operator had no way to learn the AOF has a hole.
+    #[test]
+    fn everysec_fsync_failure_latches_err_status() {
+        use std::sync::atomic::Ordering;
+        let before = AOF_FSYNC_FAILURES.load(Ordering::Relaxed);
+        record_everysec_fsync_result(false);
+        assert!(!AOF_LAST_FSYNC_OK.load(Ordering::Relaxed));
+        assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
+        // Success restores the status but never the counter.
+        record_everysec_fsync_result(true);
+        assert!(AOF_LAST_FSYNC_OK.load(Ordering::Relaxed));
+        assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
     }
 }
