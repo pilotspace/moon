@@ -1603,15 +1603,7 @@ pub(super) async fn try_handle_blocking<
     shutdown: &CancellationToken,
     client_live: &std::sync::Arc<crate::client_registry::ClientLiveState>,
 ) -> BlockingResult {
-    if !cmd.eq_ignore_ascii_case(b"BLPOP")
-        && !cmd.eq_ignore_ascii_case(b"BRPOP")
-        && !cmd.eq_ignore_ascii_case(b"BLMOVE")
-        && !cmd.eq_ignore_ascii_case(b"BZPOPMIN")
-        && !cmd.eq_ignore_ascii_case(b"BZPOPMAX")
-        && !cmd.eq_ignore_ascii_case(b"BLMPOP")
-        && !cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
-        && !cmd.eq_ignore_ascii_case(b"BZMPOP")
-    {
+    if !crate::server::conn::blocking::is_blocking_command(cmd) {
         return BlockingResult::NotBlocking;
     }
 

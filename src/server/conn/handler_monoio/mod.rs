@@ -352,7 +352,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let mut write_buf = BytesMut::with_capacity(init_cap);
     // c10k A1: set when a blocking command leaves unparsed input in
     // `read_buf` (see the read-skip guard in the main loop).
-    let mut carried_input = false;
+    // #438: a resumed MIGRATED (or task-park-resumed) connection starts with
+    // the source handler's unparsed remainder already in read_buf — without
+    // arming the flag its first iteration awaited a fresh socket read and
+    // the carried bytes sat unprocessed until the client happened to send
+    // more (pipelined tails crossing a migration stalled indefinitely).
+    let mut carried_input = !read_buf.is_empty();
     let mut codec = RespCodec::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -506,8 +511,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 tmp_buf.resize(8192, 0);
             }
             let sub_tmp_buf = std::mem::take(&mut tmp_buf);
+            // #438: a deferred batch tail (subscribe/blocking carry) already
+            // sits re-encoded in read_buf — parse it without awaiting the
+            // socket. CARRY_READY is an impossible real read length (reads
+            // are bounded by the 8 KiB buffer), used as an in-band "no new
+            // bytes, just parse" marker so the arm's parse loop is shared.
+            // The flag is only CLEARED inside the read arm's body — if the
+            // pubsub or shutdown arm wins this select round, the carry stays
+            // armed and retries next iteration (a take() here would eat the
+            // flag on a lost race and re-introduce the stall).
+            const CARRY_READY: usize = usize::MAX;
+            let have_carry = !read_buf.is_empty() && carried_input;
             monoio::select! {
-                read_result = stream.read(sub_tmp_buf) => {
+                read_result = async {
+                    if have_carry {
+                        (Ok(CARRY_READY), sub_tmp_buf)
+                    } else {
+                        stream.read(sub_tmp_buf).await
+                    }
+                } => {
+                    // Read arm won: the carry (if any) is being consumed now.
+                    carried_input = false;
                     let (result, buf) = read_result;
                     tmp_buf = buf;
                     let buf = &tmp_buf;
@@ -518,7 +542,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             break;
                         }
                         Ok(n) => {
-                            read_buf.extend_from_slice(&buf[..n]);
+                            if n != CARRY_READY {
+                                read_buf.extend_from_slice(&buf[..n]);
+                            }
                             // Parse frames from buffer
                             loop {
                                 match codec.decode_frame(&mut read_buf) {
@@ -1173,7 +1199,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         let mut auth_delay_ms: u64 = 0;
 
-        for frame in frames.drain(..) {
+        // #438 batch-tail hardening: index-based iteration (not
+        // `frames.drain(..)`) so early-flush arms (blocking / SUBSCRIBE /
+        // PSYNC) can defer themselves plus the unconsumed tail to the next
+        // batch iteration, and so subscribe/blocking breaks carry the parsed
+        // tail forward instead of silently dropping it (Drain::drop discarded
+        // the remainder on break).
+        let num_frames = frames.len();
+        let mut deferred_tail_from: Option<usize> = None;
+        let mut frame_idx = 0usize;
+        while frame_idx < num_frames {
+            let frame = std::mem::replace(&mut frames[frame_idx], Frame::Null);
+            frame_idx += 1;
             // --- AUTH gate ---
             match dispatch::check_auth_gate(
                 &frame,
@@ -1220,6 +1257,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 conn.asking = true;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 continue;
+            }
+            // #438 batch-tail crash class: an early-flush command (blocking /
+            // SUBSCRIBE / PSUBSCRIBE / PSYNC) while remote-slotted commands
+            // are pending would flush their Frame::Null placeholders to the
+            // client (wrong replies) and clear `responses`, leaving phase 2's
+            // drain to index into an empty vec — shard-thread panic, whole
+            // process aborts. Defer this command and the unconsumed tail to
+            // the next batch iteration; phase 2 resolves the pending replies
+            // and the epilogue flushes them first. The two `is_empty()`
+            // loads keep the common local-only batch at zero name compares.
+            if (!remote_groups.is_empty() || !publish_batches.is_empty())
+                && (crate::server::conn::blocking::is_blocking_command(cmd)
+                    || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+                    || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+                    || cmd.eq_ignore_ascii_case(b"PSYNC"))
+            {
+                frames[frame_idx - 1] = frame;
+                deferred_tail_from = Some(frame_idx - 1);
+                break;
             }
             // --- Connection-level commands (dispatched to dispatch.rs) ---
             //
@@ -1447,7 +1503,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 pubsub::SubscribeResult::NotSubscribe => {}
                 pubsub::SubscribeResult::ArgError => continue,
-                pubsub::SubscribeResult::Subscribed => break,
+                pubsub::SubscribeResult::Subscribed => {
+                    // #438: carry the parsed-but-unconsumed batch tail into
+                    // the next iteration (subscriber mode) instead of
+                    // dropping it — `[SUBSCRIBE ch, PING]` in one pipelined
+                    // write used to swallow the PING.
+                    if frame_idx < num_frames {
+                        deferred_tail_from = Some(frame_idx);
+                    }
+                    break;
+                }
                 pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
             }
             if pubsub::try_handle_unsubscribe(cmd, &mut responses) {
@@ -1621,6 +1686,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // unparsed tail or bytes the peer watch carried; parse
                     // before the next read either way.
                     carried_input = !read_buf.is_empty();
+                    // #438: parsed-but-unconsumed frames after the blocking
+                    // command used to be dropped by the drain-on-break; carry
+                    // them into the next iteration.
+                    if frame_idx < num_frames {
+                        deferred_tail_from = Some(frame_idx);
+                    }
                     break;
                 }
                 dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
@@ -1783,10 +1854,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             .write()
                             .register_key(addr.ip(), migrate_to);
                     }
-                    if !conn.in_multi
-                        && conn.subscription_count == 0
-                        && !conn.tracking_state.enabled
-                    {
+                    // Migration preconditions (D4 #438): shared gate —
+                    // MULTI / cross-txn / subs / tracking / replica state
+                    // doesn't transfer. Re-checked at the batch-end
+                    // execution point, which is authoritative.
+                    if conn.migration_eligible() {
                         conn.migration_target = Some(migrate_to);
                     }
                 }
@@ -2564,6 +2636,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // #438: re-encode any deferred batch tail back into the FRONT of
+        // read_buf and skip the next socket read — the frames re-parse on the
+        // next loop iteration, AFTER phase 2 below resolves every pending
+        // remote reply and the epilogue flushes them. RESP command arrays
+        // (arrays of bulk strings) round-trip losslessly through
+        // serialize_resp3. If a migration executes at this batch's end, the
+        // carried bytes ride along in `read_buf_remainder`.
+        if let Some(from) = deferred_tail_from {
+            let mut carry = BytesMut::with_capacity(64 + read_buf.len());
+            for f in &frames[from..num_frames] {
+                crate::protocol::serialize_resp3(f, &mut carry);
+            }
+            carry.extend_from_slice(&read_buf);
+            read_buf = carry;
+            carried_input = true;
+        }
+
         // Phase 2a: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
         if !publish_batches.is_empty() {
             let mut batch_slots: Vec<(
@@ -2925,7 +3014,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Check if migration was triggered during frame processing.
         // All responses for the current batch have been written, so the
         // client sees no interruption -- TCP socket stays open.
-        if let Some(target_shard) = conn.migration_target {
+        // D4 (#438): re-evaluate eligibility HERE — the latch fired
+        // mid-batch and the batch tail may have entered MULTI,
+        // subscribed, or enabled tracking since. Ineligible → keep the
+        // latch and retry at the next clean batch end.
+        if let Some(target_shard) = conn.migration_target
+            && conn.migration_eligible()
+        {
             let migrated_state = MigratedConnectionState {
                 selected_db: conn.selected_db,
                 authenticated: conn.authenticated,

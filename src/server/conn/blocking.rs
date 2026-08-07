@@ -294,6 +294,21 @@ async fn cancel_multikey_registrations(
 /// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout -> LMOVE src dst LEFT|RIGHT LEFT|RIGHT
 /// BZPOPMIN key [key ...] timeout -> ZPOPMIN key [key ...]
 /// BZPOPMAX key [key ...] timeout -> ZPOPMAX key [key ...]
+/// The full set of client-blocking commands (the ones whose handler may
+/// early-flush accumulated responses and await outside the batch loop).
+/// Keep in sync with the dispatch guards in `try_handle_blocking`
+/// (handler_monoio) and the sharded handler's blocking arm.
+pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"BLPOP")
+        || cmd.eq_ignore_ascii_case(b"BRPOP")
+        || cmd.eq_ignore_ascii_case(b"BLMOVE")
+        || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
+        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+        || cmd.eq_ignore_ascii_case(b"BLMPOP")
+        || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
+        || cmd.eq_ignore_ascii_case(b"BZMPOP")
+}
+
 pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
     let mut new_args = Vec::new();
     if cmd.eq_ignore_ascii_case(b"BLPOP") {

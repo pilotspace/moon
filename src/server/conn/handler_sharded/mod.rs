@@ -361,7 +361,12 @@ pub(crate) async fn handle_connection_sharded_inner<
     let mut write_buf = BytesMut::with_capacity(8192);
     // c10k A1: set when a blocking command leaves unparsed input in
     // `read_buf` (see the read-skip guard in the main select).
-    let mut carried_input = false;
+    // #438: a resumed MIGRATED connection starts with the source handler's
+    // unparsed remainder already in read_buf — without arming the flag its
+    // first select awaited a fresh socket read and the carried bytes sat
+    // unprocessed until the client happened to send more (pipelined tails
+    // crossing a migration stalled indefinitely).
+    let mut carried_input = !read_buf.is_empty();
     let parse_config = crate::protocol::ParseConfig::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -439,6 +444,9 @@ pub(crate) async fn handle_connection_sharded_inner<
 
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
+            // #438: a deferred batch tail from the subscribe break sits in
+            // read_buf; run_subscriber_step parses it before awaiting the
+            // socket, clearing the flag only when its read arm actually wins.
             match pubsub::run_subscriber_step(
                 &mut stream,
                 &mut read_buf,
@@ -448,6 +456,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 ctx,
                 &peer_addr,
                 &shutdown,
+                &mut carried_input,
             )
             .await
             {
@@ -475,12 +484,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                 //
                 // c10k D1: no `idle_timeout` arm here — `timeout N` is enforced
                 // out-of-band by `client_registry::kill_idle_clients`.
-                if std::mem::take(&mut carried_input) && !read_buf.is_empty() {
+                // #438: read (don't take) the flag — it is cleared in the
+                // arm BODY below, so a select round lost to the tracking or
+                // shutdown arm keeps the carry armed instead of eating it
+                // (the old take() here could drop carried input on the race).
+                if carried_input && !read_buf.is_empty() {
                     Ok(read_buf.len())
                 } else {
                     stream.read_buf(&mut read_buf).await
                 }
             } => {
+                // Read arm won: the carry (if any) is being consumed now.
+                carried_input = false;
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
@@ -549,7 +564,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut local_dispatches: u32 = 0;
                 let mut cross_spsc_dispatches: u32 = 0;
 
-                for frame in batch {
+                // #438 batch-tail hardening: index-based iteration (not a
+                // consuming `for`) so early-flush arms (blocking / SUBSCRIBE)
+                // can defer themselves plus the unconsumed tail to the next
+                // batch iteration, and so subscribe/blocking breaks carry the
+                // parsed tail forward instead of silently dropping it.
+                let num_frames = batch.len();
+                let mut deferred_tail_from: Option<usize> = None;
+                let mut frame_idx = 0usize;
+                while frame_idx < num_frames {
+                    let frame = std::mem::replace(&mut batch[frame_idx], Frame::Null);
+                    frame_idx += 1;
                     // --- AUTH gate ---
                     if !conn.authenticated {
                         match extract_command(&frame) {
@@ -645,6 +670,24 @@ pub(crate) async fn handle_connection_sharded_inner<
                         conn.asking = true;
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         continue;
+                    }
+
+                    // #438 batch-tail crash class: an early-flush command
+                    // (blocking / SUBSCRIBE / PSUBSCRIBE) while remote-slotted
+                    // commands are pending would flush their Frame::Null
+                    // placeholders (wrong replies) and drop/clear `responses`,
+                    // leaving phase 2's drain to index a stale/short vec —
+                    // shard-thread panic aborts the whole process. Defer this
+                    // command and the unconsumed tail to the next batch
+                    // iteration; phase 2 resolves the pending replies first.
+                    if (!remote_groups.is_empty() || !publish_batches.is_empty())
+                        && (crate::server::conn::blocking::is_blocking_command(cmd)
+                            || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+                            || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"))
+                    {
+                        batch[frame_idx - 1] = frame;
+                        deferred_tail_from = Some(frame_idx - 1);
+                        break;
                     }
 
                     // === ACL-EXEMPT COMMANDS ===
@@ -1094,12 +1137,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
 
                     // --- BLOCKING COMMANDS ---
-                    if cmd.eq_ignore_ascii_case(b"BLPOP") || cmd.eq_ignore_ascii_case(b"BRPOP")
-                        || cmd.eq_ignore_ascii_case(b"BLMOVE") || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
-                        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
-                        || cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
-                        || cmd.eq_ignore_ascii_case(b"BZMPOP")
-                    {
+                    if crate::server::conn::blocking::is_blocking_command(cmd) {
                         if conn.in_multi {
                             let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
                             conn.command_queue.push(nb_frame);
@@ -1157,6 +1195,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // unparsed tail or bytes the peer watch carried; parse
                         // before awaiting the next read either way.
                         carried_input = !read_buf.is_empty();
+                        // #438: parsed-but-unconsumed frames after the blocking
+                        // command used to be dropped on break; carry them into
+                        // the next iteration.
+                        if frame_idx < num_frames {
+                            deferred_tail_from = Some(frame_idx);
+                        }
                         break;
                     }
 
@@ -1178,7 +1222,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     ).await {
                         match action {
                             pubsub::SubscriberAction::Continue => { continue; }
-                            pubsub::SubscriberAction::BreakOuter => { break; }
+                            pubsub::SubscriberAction::BreakOuter => {
+                                // #438: carry the parsed-but-unconsumed batch
+                                // tail into subscriber mode instead of
+                                // dropping it.
+                                if frame_idx < num_frames {
+                                    deferred_tail_from = Some(frame_idx);
+                                }
+                                break;
+                            }
                             pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, None); }
                         }
                     }
@@ -1388,9 +1440,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                 ctx.pubsub_affinity.write().register_key(addr.ip(), migrate_to);
                             }
-                            // Migration preconditions: not in MULTI, no active CLIENT TRACKING
-                            // (tracking connections need untrack_all cleanup which doesn't transfer)
-                            if !conn.in_multi && !conn.tracking_state.enabled {
+                            // Migration preconditions (D4 #438): shared gate —
+                            // MULTI / cross-txn / subs / tracking / replica state
+                            // doesn't transfer. Re-checked at the batch-end
+                            // execution point, which is authoritative.
+                            if conn.migration_eligible() {
                                 conn.migration_target = Some(migrate_to);
                             }
                         }
@@ -2084,6 +2138,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                 crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
 
+                // #438: re-encode any deferred batch tail back into the FRONT
+                // of read_buf and skip the next socket read — the frames
+                // re-parse on the next loop iteration, AFTER phase 2 below
+                // resolves every pending remote reply and the epilogue
+                // flushes them. RESP command arrays round-trip losslessly
+                // through serialize_resp3.
+                if let Some(from) = deferred_tail_from {
+                    let mut carry = BytesMut::with_capacity(64 + read_buf.len());
+                    for f in &batch[from..num_frames] {
+                        crate::protocol::serialize_resp3(f, &mut carry);
+                    }
+                    carry.extend_from_slice(&read_buf);
+                    read_buf = carry;
+                    carried_input = true;
+                }
+
                 // E4: set when a cross-shard reply await times out. The
                 // per-connection ResponseSlot is REUSED across batches — a
                 // late fill after a timeout would be read by the NEXT batch
@@ -2402,7 +2472,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Check if migration was triggered during frame processing.
                 // All responses for the current batch have been written, so the
                 // client sees no interruption -- TCP socket stays open.
-                if let Some(target_shard) = conn.migration_target {
+                // D4 (#438): re-evaluate eligibility HERE — the latch fired
+                // mid-batch and the batch tail may have entered MULTI,
+                // subscribed, or enabled tracking since. Ineligible → keep the
+                // latch and retry at the next clean batch end.
+                if let Some(target_shard) = conn.migration_target
+                    && conn.migration_eligible()
+                {
                     let migrated_state = MigratedConnectionState {
                         selected_db: conn.selected_db,
                         authenticated: conn.authenticated,

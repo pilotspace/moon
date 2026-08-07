@@ -25,6 +25,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
 
 ### Fixed
+- **Remotely-triggerable shard-thread crash on pipelined batch tails
+  (#438 follow-on).** On any `--shards >= 2` deployment, one pipelined write
+  shaped `[<remote-key cmd>…, SUBSCRIBE|BLPOP|…]` aborted the whole server:
+  the early-flush arm flushed the remote commands' placeholder replies,
+  cleared the response vec, and the batch-end remote-reply drain then
+  indexed into it out of bounds — shard-thread panic, process abort (both
+  runtimes). Early-flush commands (blocking / SUBSCRIBE / PSUBSCRIBE /
+  PSYNC) now defer themselves and the unconsumed batch tail to the next
+  iteration when remote-slotted work is pending, so every prior reply
+  resolves and flushes first.
+- **Migration no longer discards MULTI / subscriptions latched mid-batch
+  (#438 D4).** The affinity sampler latched `migration_target` mid-batch,
+  but migration executed at batch end with no re-check — a tail like
+  `[…GETs, MULTI, SET]` migrated with the transaction queued and
+  `MigratedConnectionState` carries none of that state (queued txn
+  discarded, EXEC answered `-ERR EXEC without MULTI`; a tail SUBSCRIBE was
+  orphaned). `ConnectionState::migration_eligible()` (not in MULTI, no
+  cross-store txn, no subscriptions, no CLIENT TRACKING, not a replica) is
+  now evaluated at BOTH the latch and the batch-end execution point; an
+  ineligible batch end keeps the latch and migrates at the first clean one.
+- **Migrated connections no longer stall on their carried remainder.** A
+  resumed migrated handler received the source's unparsed bytes in its read
+  buffer but awaited a fresh socket read before parsing them — a pipelined
+  tail crossing a migration sat unanswered until the client happened to
+  send more. The resumed handler now parses the carried remainder
+  immediately.
+- **The parsed batch tail after SUBSCRIBE/blocking is no longer swallowed.**
+  `[SUBSCRIBE ch, PING]` in one pipelined write silently dropped the PING
+  (the frame iterator discarded the remainder on break); the tail is now
+  re-encoded and carried into the next iteration (subscriber mode answers
+  it in order).
 - **`INFO persistence` reports real AOF state (#432).** `aof_enabled` and
   `aof_rewrite_in_progress` were hardcoded `0` even with `--appendonly yes`
   (the default) and a rewrite running; they now reflect reality, and new
