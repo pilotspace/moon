@@ -968,40 +968,18 @@ fn main() -> anyhow::Result<()> {
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
-    // FIX-W1-4: gate BGREWRITEAOF whenever per-shard AOF is active
-    // (num_shards >= 2 + appendonly=yes). The original gate was too narrow:
-    // it required disk_offload to be enabled, missing the plain AOF case.
-    // Per-shard rewrite is not yet implemented (AofPoolSendError::
-    // RewriteUnsupportedInPerShard); the pool already refuses the message,
-    // but this early gate provides a stable, documented error to operators
-    // BEFORE the channel send so no in-progress flag is flipped.
-    // Verified 2026-05-26: multi-shard BGREWRITEAOF loses ~38% of keys on
-    // restart. Gate lifted only when multi-part AOF replay ships (v2.0+).
-    // See docs/runbooks/multi-shard-aof-rewrite.md.
-    // [F6] When `--experimental-per-shard-rewrite` is set, leave the gate OPEN
-    // so BGREWRITEAOF routes to the per-shard fan-out coordinator
-    // (try_send_rewrite_per_shard): synchronized seq bump + single manifest
-    // commit across all per-shard writers, validated by
-    // tests/crash_matrix_per_shard_bgrewriteaof.rs. Default (flag off) keeps
-    // the gate closed — the shipped, crash-safe "no in-place compaction"
-    // behavior that avoided the historical ~38%-key-loss-on-restart.
-    if config.per_shard_aof_active(num_shards) {
-        if config.experimental_per_shard_rewrite {
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF per-shard rewrite ENABLED (--experimental-per-shard-rewrite). \
-                 Per-shard fan-out compaction is active; this path is experimental."
-            );
-        } else {
-            moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, or --experimental-per-shard-rewrite to enable per-shard compaction."
-            );
-        }
+    // #433: per-shard BGREWRITEAOF is the DEFAULT — the gate that refused it
+    // (historical ~38%-key-loss era, pre-C4 cooperative snapshot) is retired.
+    // The fan-out path is validated by tests/crash_matrix_per_shard_bgrewriteaof.rs
+    // (exact INCR recovery across a straddling rewrite + SIGKILL) and
+    // tests/aof_auto_rewrite.rs. `MULTI_SHARD_AOF_REWRITE_UNSAFE` is never set
+    // at boot anymore; the refusal branch it guards stays as dead-man code for
+    // tests and any future re-gate.
+    if config.experimental_per_shard_rewrite {
+        tracing::warn!(
+            "--experimental-per-shard-rewrite is deprecated and now a no-op: \
+             per-shard BGREWRITEAOF is the default (#433)."
+        );
     }
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
@@ -1762,6 +1740,31 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
         moon::shard::shared_databases::replay_mq_wal(&mut slice_inits, dir_path);
+    }
+
+    // #433: AOF auto-rewrite monitor + INFO size statics. Init AFTER recovery
+    // (the just-replayed generation is the growth baseline), spawn regardless
+    // of percentage so `INFO persistence` sizes stay fresh; percentage 0
+    // disables only the trigger.
+    if let Some(ref pool) = aof_pool {
+        moon::persistence::aof::auto_rewrite::init(
+            std::path::Path::new(&config.dir),
+            &config.appendfilename,
+        );
+        let min_size =
+            ServerConfig::parse_size(&config.auto_aof_rewrite_min_size).unwrap_or_else(|| {
+                tracing::warn!(
+                    "unparseable --auto-aof-rewrite-min-size {:?}; using 64mb",
+                    config.auto_aof_rewrite_min_size
+                );
+                64 * 1024 * 1024
+            });
+        moon::persistence::aof::auto_rewrite::spawn_monitor(
+            pool.clone(),
+            shard_databases.clone(),
+            config.auto_aof_rewrite_percentage,
+            min_size,
+        );
     }
 
     // All shards recovered — mark server as ready for /readyz.
