@@ -22,6 +22,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MEET + gossip and flags a killed node, per runtime.
 
 ### Fixed
+- **Deep-review wave (2026-08): long-uptime and large-scale correctness.**
+  Eight fix groups from a six-dimension architecture review (durability
+  ordering, long-uptime resource growth, concurrency, cluster correctness,
+  long-horizon arithmetic, silent degradation):
+  - *Eviction/metadata*: `CompactEntry` now stores a full-width u32
+    `last_access` (repurposed padding — zero size cost) and a 24-bit entry
+    version starting at 1. Fixes LFU decay that was effectively random
+    (u16/u32 domain mix truncated `as u8`), LRU inversion for idle gaps
+    beyond ~9.1h, `OBJECT IDLETIME` wrapping at 18.2h, and WATCH/EXEC's
+    8-bit version ABA (wrap now needs 16.7M writes; version 0 reliably
+    means "absent" so WATCH detects creation).
+  - *AOF everysec*: tokio deadline-fsync paths no longer swallow errors and
+    record success; all four sites (both runtimes/layouts) latch
+    `aof_last_fsync_status:ok|err` + `aof_fsync_failures` into INFO.
+  - *Spill*: a failed background spill pwrite re-inserts the already-evicted
+    key into the hot table (payload carried back in the completion) instead
+    of silently serving nil until restart; counted as
+    `spill_failed_reinserted` in INFO.
+  - *AOF rewrite prune*: the old generation is deleted only after a new
+    manifest-sync flush barrier (pending deferred ShardManifest commits
+    made durable — they relied on the old incr as their crash backstop) and
+    an explicit durable dir-fsync of the manifest flip.
+  - *CLIENT TRACKING*: the documented `max_keys` bound is enforced (evict +
+    invalidate instead of unbounded growth).
+  - *Cluster*: inline GET/SET fast path is disabled in cluster mode (was
+    bypassing MOVED/ASK entirely); election acks are now actually received
+    (read back on the request stream), epoch-bound and voter-deduped; the
+    election winner no longer claims an unvoted epoch; graceful `CLUSTER
+    FAILOVER` errors instead of permanently wedging automatic failover;
+    `ClusterState` migrated to `parking_lot::RwLock` (no poisoning, ~25
+    `.unwrap()` sites removed from the per-command path).
+  - *Fail-loud + bounds*: vector background-compaction failures now log at
+    every layer; CDC reaps disconnected subscribers on write-idle shards;
+    `TemporalRegistry` is bounded (262K bindings/shard, oldest evicted).
 - **Cluster formation actually converges (pre-existing, both runtimes).**
   A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
   random-id placeholder was never retired when the peer's handshake arrived
