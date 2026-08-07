@@ -2907,10 +2907,10 @@ pub async fn coordinate_swapdb(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
 ) -> Frame {
-    debug_assert!(
-        num_shards > 1,
-        "coordinate_swapdb is the multi-shard path (single-shard SWAPDB lives in handler_single.rs)"
-    );
+    // Serves num_shards >= 1: the tokio single-shard SWAPDB lives in
+    // handler_single.rs, but the monoio handler routes ALL shard counts here
+    // (at shards=1 the remote loop is simply empty).
+    debug_assert!(num_shards >= 1);
     // Local shard first: durable append BEFORE the swap AND before any
     // remote dispatch. SWAPDB has no command-level rollback; anything that
     // can fail must fail while NOTHING in the cluster has mutated —
@@ -2949,7 +2949,10 @@ pub async fn coordinate_swapdb(
                 my_shard,
                 serialized.len(),
             );
-            match pool.send_append_group(my_shard, lsn, 0, serialized).await {
+            match pool
+                .send_append_group(my_shard, lsn, 0, serialized.clone())
+                .await
+            {
                 Ok(needs_barrier) => {
                     if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
                         return Frame::Error(bytes::Bytes::from_static(
@@ -2972,6 +2975,18 @@ pub async fn coordinate_swapdb(
                 s.databases.swap(a, b);
             }
         });
+
+        // #386 — replication plane, exactly once per client SWAPDB. Today's
+        // replica applies the merged wire as ONE stream, so the record must
+        // appear on it exactly once: the coordinator emits it here, AFTER
+        // the durability gate (an abort above never reaches this line, so a
+        // failed SWAPDB can never ship to replicas) and after the local
+        // swap; the remote legs' SPSC arms write AOF/WAL only. Safe on both
+        // runtimes: this runs on the shard's own OS thread (monoio shard
+        // thread / tokio per-shard LocalSet), whose event loop drains
+        // `self_msg`. When #406 lands per-shard demuxed replicas this must
+        // flip to per-shard emission.
+        crate::replication::state::record_local_write_global(my_shard, serialized);
     }
 
     // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).

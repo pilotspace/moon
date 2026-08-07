@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **Cross-shard fan-out no longer drops messages silently on a full SPSC ring
+- **Replicas now apply streamed `SWAPDB` (#386), and the record reaches the
+  wire exactly once per client call.** Two stacked defects: (1) the replica's
+  apply path had no SWAPDB intercept — generic dispatch hard-errors ("must be
+  issued at the connection handler level") and the error was only logged, so
+  every streamed SWAPDB silently no-op'd and the replica served pre-swap data
+  for both databases until a full resync; (2) a multi-shard master emitted the
+  record once per REMOTE shard leg and never for the coordinator's own leg —
+  against today's single merged replica stream that means N−1 swaps, a net
+  no-op whenever N−1 is even (e.g. `--shards 3`). The coordinator now emits
+  the replication record exactly once, after the durability gate and the
+  local swap (an aborted SWAPDB can never ship to replicas); remote SPSC legs
+  keep their per-shard AOF/WAL writes but stay off the replication plane; the
+  tokio single-shard handler emits it too. Replicas apply it with the same
+  slice-split swap as WAL replay, skipping (with a warning) indexes outside
+  their own `--databases` range instead of poisoning the stream.
   (c10k E1/E3), and cross-shard reply awaits are bounded (E4).** PUBLISH
   fan-out (immediate, batched, and EXEC-queued) and SCRIPT LOAD propagation
   used a single `try_push` — a transiently-full ring lost the message with no
