@@ -62,6 +62,8 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             appendonly: appendonly.clone(),
             unsafe_multishard_aof: false,
             experimental_per_shard_rewrite: false,
+            auto_aof_rewrite_percentage: 100,
+            auto_aof_rewrite_min_size: "64mb".to_string(),
             appendfsync: "everysec".to_string(),
             aof_fsync_timeout_ms: 2000,
             save: None,

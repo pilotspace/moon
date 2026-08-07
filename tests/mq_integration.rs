@@ -52,6 +52,8 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         appendfsync: "everysec".to_string(),
         aof_fsync_timeout_ms: 2000,
         experimental_per_shard_rewrite: false,
+        auto_aof_rewrite_percentage: 100,
+        auto_aof_rewrite_min_size: "64mb".to_string(),
         save: None,
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
