@@ -847,6 +847,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             let track_buf = std::mem::take(&mut tmp_buf);
             let mut push_frame: Option<Frame> = None;
             monoio::select! {
+                // F1 (#438): tracking conns park in this select (not the
+                // cancel-registered reads below), so the shutdown drain
+                // reaches them via the token. Losing the read future drops
+                // `track_buf` — acceptable, the connection is exiting.
+                _ = shutdown.cancelled() => { break; }
                 read_result = stream.read(track_buf) => {
                     let (result, returned_buf) = read_result;
                     tmp_buf = returned_buf;
@@ -937,6 +942,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // ECONNRESET, …): terminate. Parking instead would spin
                     // park→wake→park forever — the dead fd stays readable.
                     Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                    // F1 (#438): cancelled by the shutdown drain, not the
+                    // stage-2 sweep — exit through the flush+FIN epilogue
+                    // instead of task-parking into a watcher that would just
+                    // be dropped.
+                    Err(_) if shutdown.is_cancelled() => break,
                     Err(_) => {
                         // Cancelled by the stage-2 sweep: exit the task.
                         // read_buf holds at most MAX_PARKED_REMAINDER bytes
@@ -997,6 +1007,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // task-park path parks WITHOUT reading, so a mistaken
                 // downshift here would feed the park→wake→park spin.)
                 Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                // F1 (#438): cancelled by the shutdown drain, not the idle
+                // sweep — exit through the flush+FIN epilogue instead of
+                // re-parking a read nothing will ever complete.
+                Err(_) if shutdown.is_cancelled() => break,
                 Err(_) => {
                     // Cancelled by the idle sweep: shed the working set,
                     // re-park small.

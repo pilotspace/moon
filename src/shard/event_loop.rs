@@ -36,6 +36,15 @@ use super::shared_databases::ShardDatabases;
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
+/// F1 (#438): ceiling on the graceful-shutdown connection drain. Normal
+/// drains finish in single-digit milliseconds (parked reads wake instantly,
+/// in-flight batches are already bounded by the C1 write timeout); the
+/// ceiling exists so a wedged peer — zero-window reader with
+/// `client_write_timeout_ms 0`, or a hung cross-shard leg — cannot hold up
+/// process shutdown. On expiry the remaining tasks are dropped, which is
+/// exactly the pre-F1 behaviour for every task.
+const SHUTDOWN_DRAIN_MAX: Duration = Duration::from_secs(5);
+
 /// c10k hardening B4: may the experimental io_uring bridge be armed?
 ///
 /// The bridge binds a SECOND `SO_REUSEPORT` listener on the server's own port
@@ -1932,6 +1941,33 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    // F1 (#438): bounded connection drain BEFORE persistence
+                    // teardown — the `break` below returns from `run`, and
+                    // dropping the LocalSet/runtime kills every connection
+                    // task still pending, truncating in-flight replies and
+                    // skipping the blocking/subscriber shutdown arms. The
+                    // token (already cancelled) wakes the tokio selects'
+                    // shutdown arms; this loop just keeps the thread polling
+                    // until they have all exited through the flush+FIN
+                    // epilogue, or the deadline expires (a wedged peer must
+                    // not hold up shutdown — its task is then dropped, the
+                    // pre-F1 behaviour).
+                    {
+                        let drain_deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_MAX;
+                        loop {
+                            let live = conn_accept::live_conn_tasks();
+                            if live == 0 {
+                                break;
+                            }
+                            if std::time::Instant::now() >= drain_deadline {
+                                tracing::warn!(
+                                    "Shard {shard_id}: shutdown drain timed out with {live} connection task(s) still live; dropping them"
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
                         &mut shard_manifest,
@@ -2064,6 +2100,51 @@ impl super::Shard {
                 // Check shutdown before awaiting (non-blocking)
                 if shutdown.is_cancelled() {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    // F1 (#438): bounded connection drain BEFORE persistence
+                    // teardown — the `break` below returns from `run`, and
+                    // dropping the monoio runtime kills every connection task
+                    // still pending, truncating in-flight replies and
+                    // skipping the blocking/subscriber shutdown arms (found
+                    // live: 19/50 BLPOP clients lost their shutdown reply on
+                    // Linux io_uring). Stage-1/2 idle-park reads are plain
+                    // awaits the token cannot wake, so fire their cancellers;
+                    // the woken handlers see the cancelled token and exit
+                    // through the flush+FIN epilogue. Re-fired every tick to
+                    // close the mid-batch re-park race. Deadline-bounded: a
+                    // wedged peer must not hold up shutdown — its task is
+                    // then dropped, the pre-F1 behaviour.
+                    {
+                        let drain_deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_MAX;
+                        let mut ticks = 0u32;
+                        loop {
+                            crate::server::conn::handler_monoio::idle_park::cancel_all_parked();
+                            let live = conn_accept::live_conn_tasks();
+                            if live == 0 {
+                                break;
+                            }
+                            if std::time::Instant::now() >= drain_deadline {
+                                tracing::warn!(
+                                    "Shard {shard_id}: shutdown drain timed out with {live} connection task(s) still live; dropping them"
+                                );
+                                break;
+                            }
+                            // Fast ticks catch the one legal re-park race (a
+                            // task that passed its post-batch shutdown check
+                            // before the token cancelled, then parked after
+                            // the first canceller sweep); after that no task
+                            // can park again, so back off — the O(registry)
+                            // canceller scan every 2 ms for the full 5 s
+                            // ceiling would be a shutdown-only CPU spike at
+                            // high connection counts.
+                            let tick = if ticks < 5 {
+                                std::time::Duration::from_millis(2)
+                            } else {
+                                std::time::Duration::from_millis(50)
+                            };
+                            ticks += 1;
+                            monoio::time::sleep(tick).await;
+                        }
+                    }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
                         &mut shard_manifest,

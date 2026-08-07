@@ -164,6 +164,32 @@ pub(crate) fn sweep(now_ms: u64) -> usize {
     })
 }
 
+/// F1 (#438): cancel EVERY currently-parked stage-1/2 read, regardless of
+/// age. Called from the shard event loop's shutdown drain — the parked
+/// reads are plain awaits (not selects), so the shutdown token alone cannot
+/// wake them; the canceller is the only same-thread wake the design has.
+/// The woken handler sees the sweep-cancel error, checks the shutdown token
+/// and exits through the normal flush+FIN epilogue instead of re-parking.
+///
+/// Re-fired every drain tick: a connection that was mid-batch at the first
+/// call parks again only if it raced the token check, and the next tick
+/// catches it. Idempotent on unparked slots.
+pub(crate) fn cancel_all_parked() -> usize {
+    REGISTRY.with(|r| {
+        let mut cancelled = 0usize;
+        for slot in r.borrow().values() {
+            if slot.parked_since_ms.get() != 0 {
+                let old = slot.canceller.replace(Canceller::new());
+                let fresh = old.cancel();
+                slot.canceller.replace(fresh);
+                slot.parked_since_ms.set(0);
+                cancelled += 1;
+            }
+        }
+        cancelled
+    })
+}
+
 /// Release the parked working set. The rent buffer is dropped outright (the
 /// pre-park sizing reallocates the probe size next iteration); the scratch
 /// buffers are only released when empty — a non-empty `read_buf` holds a
@@ -353,6 +379,21 @@ mod idle_park_tests {
         // A later stage-1 park on the same slot reverts to the 1s threshold.
         reg.slot.mark_parked(300_000);
         assert_eq!(sweep(300_000 + IDLE_DOWNSHIFT_MS), 1);
+    }
+
+    #[test]
+    fn cancel_all_parked_ignores_age_and_unparked() {
+        let reg_young = register(90_010);
+        let reg_old = register(90_011);
+        let reg_idle = register(90_012);
+        reg_young.slot.mark_parked(10_000); // just parked — sweep would skip
+        reg_old.slot.mark_parked_stage2(1); // ancient stage-2 park
+        // reg_idle: not parked at all.
+        assert_eq!(cancel_all_parked(), 2, "both parked slots, any age/stage");
+        assert_eq!(reg_young.slot.parked_since_ms.get(), 0);
+        assert_eq!(reg_old.slot.parked_since_ms.get(), 0);
+        assert_eq!(cancel_all_parked(), 0, "idempotent once unparked");
+        drop(reg_idle);
     }
 
     #[test]

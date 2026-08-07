@@ -25,6 +25,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
 
 ### Fixed
+- **Graceful shutdown now drains connections (#438 F1, conn#8).** On
+  SIGTERM/SIGINT each shard previously tore its runtime down the moment its
+  event loop observed the cancellation, dropping every pending connection
+  task mid-poll: in-flight replies were truncated and the blocking/subscriber
+  shutdown arms (`-ERR server shutting down`) never ran — measured 19/50
+  BLPOP-blocked clients losing their shutdown reply on Linux io_uring
+  (macOS passed only by scheduler luck). Shards now run a bounded drain
+  before persistence teardown: parked stage-1/2 reads are woken through
+  their cancellers (re-fired per tick to close the re-park race), token arms
+  cover the tracking/subscriber/blocking parks, and the loop waits for the
+  shard's live connection tasks to exit through the normal flush+FIN
+  epilogue, up to a 5 s ceiling so a wedged peer cannot hold up shutdown.
+  Writing the drain's red test surfaced a second, tokio-only leak in the
+  same class: connections accepted by the CENTRAL listener were io-bound to
+  the MAIN runtime's driver (tokio io resources bind at creation), so their
+  reads/writes died with main's runtime no matter what the shard drained —
+  with SO_REUSEPORT splitting accepts roughly evenly, about half of all
+  tokio connections failed their final writes with "A Tokio 1.x context was
+  found, but it is being shutdown". Forwarded streams are now re-registered
+  with the owning shard's runtime driver at spawn (the monoio path already
+  did this by forwarding std streams).
+- **Parked-connection teardown can no longer close a reused fd out from
+  under a kill scan (#438 F2, conn#9 / sec L1).** `kill_clients`'
+  fd-liveness invariant (registry deregister strictly before fd close) held
+  in handler tasks by local-before-parameter drop order, but a task-parked
+  connection's watcher co-owned guard and stream as future upvars, whose
+  drop order is merely capture order — and the F1 drain makes dropping that
+  future a routine path. Both are now wrapped in a `ParkedSession` whose
+  hand-written `Drop` deregisters before closing, with the invariant
+  restated at the kill site.
 - **Remotely-triggerable shard-thread crash on pipelined batch tails
   (#438 follow-on).** On any `--shards >= 2` deployment, one pipelined write
   shaped `[<remote-key cmd>…, SUBSCRIBE|BLPOP|…]` aborted the whole server:
