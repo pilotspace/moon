@@ -188,7 +188,9 @@ fn run_local(
 /// any legitimate cross-shard command latency (including group-commit fsync
 /// under load) — it exists only so a genuinely wedged shard surfaces an error
 /// instead of an unbounded hang.
-const XSHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// One shared bound with the connection handlers' slot awaits (E4) — a
+// single constant so the two reply paths can't drift apart.
+use crate::shard::dispatch::XSHARD_REPLY_TIMEOUT;
 
 /// Await a cross-shard `reply_rx` with a bounded timeout (#11).
 ///

@@ -1097,6 +1097,57 @@ pub(crate) async fn push_with_backpressure(
     PushOutcome::Backpressure
 }
 
+/// One shared bound for every cross-shard reply await on the connection
+/// handlers (E4 — design-for-failure), mirroring the coordinator's
+/// [`crate::shard::coordinator::recv_reply_bounded`]: a wedged owner shard
+/// must never hang a client task forever. 30s is far beyond any legitimate
+/// drain latency, so expiry means "the owner is not coming back".
+pub(crate) const XSHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Await a [`PubSubResponseSlot`] with a bounded timeout (E4).
+///
+/// Returns `true` when every pending shard responded within `timeout`,
+/// `false` on expiry. The slot is per-call (freshly allocated by every
+/// publish fan-out), so abandoning it on timeout is SAFE: a late `add()`
+/// lands on the Arc'd slot and is simply never read — unlike the reusable
+/// per-connection `ResponseSlot` (see [`await_response_slot_bounded`]).
+pub(crate) async fn await_pubsub_slot_bounded(
+    slot: &std::sync::Arc<PubSubResponseSlot>,
+    timeout: std::time::Duration,
+) -> bool {
+    use crate::runtime::race::{Arm, race2};
+    use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+    let fut = std::pin::pin!(PubSubResponseFuture::new(slot.clone()));
+    let sleep = std::pin::pin!(TimerImpl::sleep(timeout));
+    // race2 polls the first arm first: a ready slot always wins the tie.
+    matches!(race2(fut, sleep).await, Arm::First(_))
+}
+
+/// Await a [`crate::server::response_slot::ResponseSlotFuture`] with a
+/// bounded timeout (E4). `None` means the owner shard never filled the slot
+/// within `timeout`.
+///
+/// # Caller contract — `None` is FATAL for the connection
+///
+/// Unlike the per-call pubsub slot, a connection's `ResponseSlot` is REUSED
+/// across batches. After a timeout the wedged owner may still fill the slot
+/// late, and the next batch to that shard would read the stale reply as its
+/// own. Callers MUST error the affected entries and close the connection —
+/// never continue dispatching to the timed-out slot.
+pub(crate) async fn await_response_slot_bounded(
+    fut: crate::server::response_slot::ResponseSlotFuture,
+    timeout: std::time::Duration,
+) -> Option<Vec<Frame>> {
+    use crate::runtime::race::{Arm, race2};
+    use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+    let fut = std::pin::pin!(fut);
+    let sleep = std::pin::pin!(TimerImpl::sleep(timeout));
+    match race2(fut, sleep).await {
+        Arm::First(frames) => Some(frames),
+        Arm::Second(()) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1504,6 +1555,67 @@ mod tests {
         assert!(
             payload_sz > 0 && payload_sz < 4096,
             "FtHybridPayload size sanity: {payload_sz}",
+        );
+    }
+
+    // ── E4: bounded cross-shard reply awaits ──
+    // Tokio-gated like the F3 suite: these drive the runtime timer.
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn pubsub_slot_bounded_completes_when_all_shards_respond() {
+        let slot = Arc::new(PubSubResponseSlot::new(1));
+        slot.add(3);
+        assert!(
+            await_pubsub_slot_bounded(&slot, std::time::Duration::from_secs(5)).await,
+            "a fully-responded slot must complete, not time out"
+        );
+        assert_eq!(slot.get(), 3);
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn pubsub_slot_bounded_times_out_on_a_wedged_shard() {
+        // 2 pending, only 1 ever responds — pre-E4 this await hung forever.
+        let slot = Arc::new(PubSubResponseSlot::new(2));
+        slot.add(1);
+        let start = std::time::Instant::now();
+        assert!(
+            !await_pubsub_slot_bounded(&slot, std::time::Duration::from_millis(50)).await,
+            "a slot with a missing shard response must time out"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must be bounded by the requested duration, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn response_slot_bounded_returns_frames_when_filled() {
+        let pool = crate::server::response_slot::ResponseSlotPool::new(2, 0);
+        pool.slot_arc(1).fill(vec![Frame::Integer(7)]);
+        let frames =
+            await_response_slot_bounded(pool.future_for(1), std::time::Duration::from_secs(5))
+                .await
+                .expect("filled slot must resolve");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn response_slot_bounded_times_out_on_a_wedged_owner() {
+        let pool = crate::server::response_slot::ResponseSlotPool::new(2, 0);
+        let start = std::time::Instant::now();
+        let got =
+            await_response_slot_bounded(pool.future_for(1), std::time::Duration::from_millis(50))
+                .await;
+        assert!(got.is_none(), "an unfilled slot must time out with None");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must be bounded, took {:?}",
+            start.elapsed()
         );
     }
 }

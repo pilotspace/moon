@@ -785,16 +785,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if cmd.eq_ignore_ascii_case(b"SCRIPT") {
                         let (response, fanout) = crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
                         if let Some((sha1, script_bytes)) = fanout {
-                            let mut producers = ctx.dispatch_tx.borrow_mut();
-                            for target in 0..ctx.num_shards {
-                                if target == ctx.shard_id { continue; }
-                                let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                                let msg = ShardMessage::ScriptLoad { sha1: sha1.clone(), script: script_bytes.clone() };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    ctx.spsc_notifiers[target].notify_one();
-                                }
-                            }
-                            drop(producers);
+                            // E3: bounded fan-out — a full ring no longer
+                            // silently diverges that shard's script cache.
+                            crate::server::conn::shared::script_fanout_bounded(
+                                ctx, &shutdown, &sha1, &script_bytes,
+                            )
+                            .await;
                         }
                         responses.push(response);
                         continue;
@@ -1074,7 +1070,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ) {
                                     Some(err) => err,
                                     None => Frame::Integer(
-                                        crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &ch, &msg).await,
                                     ),
                                 };
                                 if let Frame::Array(items) = &mut responses[exec_idx] {
@@ -2088,6 +2084,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
 
+                // E4: set when a cross-shard reply await times out. The
+                // per-connection ResponseSlot is REUSED across batches — a
+                // late fill after a timeout would be read by the NEXT batch
+                // as its own reply — so a timeout is fatal: error the
+                // affected entries, flush, then close the connection.
+                let mut xshard_reply_fatal = false;
+
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
                     type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>);
@@ -2174,9 +2177,32 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                             }
                             match spun {
-                                Some(r) => r,
-                                None => response_pool.future_for(target).await,
+                                Some(r) => Some(r),
+                                // E4: bounded await — a wedged owner shard
+                                // can no longer hang this client task forever.
+                                None => crate::shard::dispatch::await_response_slot_bounded(
+                                    response_pool.future_for(target),
+                                    crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                                )
+                                .await,
                             }
+                        };
+                        let Some(shard_responses) = shard_responses else {
+                            tracing::error!(
+                                "Shard {}: cross-shard reply from shard {target} timed out; \
+                                 failing the batch and closing the connection (slot unsafe to reuse)",
+                                ctx.shard_id
+                            );
+                            crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
+                            for (resp_idx, _, _, _) in &meta {
+                                responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                    b"ERR cross-shard reply timeout",
+                                ));
+                            }
+                            xshard_reply_fatal = true;
+                            // Skip the fsync barrier too: with no reply there
+                            // is nothing durable to confirm for these entries.
+                            continue;
                         };
 
                         // H1-BARRIER: collect (resp_idx, had_aof_bytes) pairs so
@@ -2248,30 +2274,72 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Phase 3: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
                 if !publish_batches.is_empty() {
                     let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, Vec<usize>)> = Vec::new();
-                    {
-                        let mut producers = ctx.dispatch_tx.borrow_mut();
-                        for (target, entries) in publish_batches.drain() {
-                            let n = entries.len();
-                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
-                            let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                            let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+                    for (target, entries) in publish_batches.drain() {
+                        let n = entries.len();
+                        let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
+                        let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                        let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
 
-                            let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                            let batch_msg = ShardMessage::PubSubPublishBatch {
-                                pairs,
-                                slot: slot.clone(),
-                            };
-                            if producers[idx].try_push(batch_msg).is_ok() {
+                        let idx = ChannelMesh::target_index(ctx.shard_id, target);
+                        // E1: bounded backpressure retry instead of one bare
+                        // try_push — a transiently-full ring no longer loses
+                        // the batch. Borrow taken+released per attempt, never
+                        // held across the backoff await.
+                        let mut pending = Some(ShardMessage::PubSubPublishBatch {
+                            pairs,
+                            slot: slot.clone(),
+                        });
+                        let outcome = crate::shard::dispatch::push_with_backpressure(
+                            &shutdown,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                            || match pending.take() {
+                                None => true,
+                                Some(m) => {
+                                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                                    match producers[idx].try_push(m) {
+                                        Ok(()) => true,
+                                        Err(back) => {
+                                            pending = Some(back);
+                                            false
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            crate::shard::dispatch::PushOutcome::Pushed => {
                                 ctx.spsc_notifiers[target].notify_one();
-                            } else {
-                                slot.add(0); // push failed, mark as done
                             }
-                            batch_slots.push((slot, resp_indices));
+                            outcome => {
+                                // Give-up: deliver-to-zero so the reply can't
+                                // hang — but loudly (was a silent drop pre-E1).
+                                tracing::warn!(
+                                    "Shard {}: PUBLISH batch fan-out to shard {target} dropped ({outcome:?})",
+                                    ctx.shard_id
+                                );
+                                crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
+                                slot.add(0);
+                            }
                         }
+                        batch_slots.push((slot, resp_indices));
                     }
-                    // Resolve all batch slots
+                    // Resolve all batch slots (E4: bounded — a wedged shard
+                    // degrades to an under-reported count, never a hung client).
                     for (slot, resp_indices) in &batch_slots {
-                        crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+                        if !crate::shard::dispatch::await_pubsub_slot_bounded(
+                            slot,
+                            crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Shard {}: PUBLISH batch reply timed out awaiting remote shard",
+                                ctx.shard_id
+                            );
+                            crate::admin::metrics_setup::record_xshard_reply_timeout("publish");
+                        }
                         for (i, resp_idx) in resp_indices.iter().enumerate() {
                             let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
                             if remote_count > 0 {
@@ -2305,6 +2373,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                 }
                 if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
+                    return (HandlerResult::Done, None);
+                }
+
+                // E4: a timed-out cross-shard reply slot must never be reused
+                // — the error replies are flushed above, now close.
+                if xshard_reply_fatal {
                     return (HandlerResult::Done, None);
                 }
 

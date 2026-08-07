@@ -584,6 +584,7 @@ pub(crate) fn pubsub_command_acl_deny(
 /// before the PUBLISH has been applied.
 pub(crate) async fn publish_post_txn(
     ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
     channel: &Bytes,
     message: &Bytes,
 ) -> i64 {
@@ -605,28 +606,130 @@ pub(crate) async fn publish_post_txn(
     let slot = Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(
         remote_targets.len() as u32,
     ));
-    {
-        let mut producers = ctx.dispatch_tx.borrow_mut();
-        for target in &remote_targets {
-            let msg = crate::shard::dispatch::ShardMessage::PubSubPublish(Box::new(
-                crate::shard::dispatch::PubSubPublishPayload {
-                    channel: channel.clone(),
-                    message: message.clone(),
-                    slot: slot.clone(),
-                },
-            ));
-            let idx = ChannelMesh::target_index(ctx.shard_id, *target);
-            if producers[idx].try_push(msg).is_ok() {
+    for target in &remote_targets {
+        // E1: bounded backpressure retry instead of one bare `try_push` — a
+        // transiently-full ring no longer loses the message. The borrow of
+        // `dispatch_tx` is taken+released inside each attempt, never held
+        // across the backoff await.
+        let mut pending = Some(crate::shard::dispatch::ShardMessage::PubSubPublish(
+            Box::new(crate::shard::dispatch::PubSubPublishPayload {
+                channel: channel.clone(),
+                message: message.clone(),
+                slot: slot.clone(),
+            }),
+        ));
+        let idx = ChannelMesh::target_index(ctx.shard_id, *target);
+        let outcome = crate::shard::dispatch::push_with_backpressure(
+            shutdown,
+            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+            || match pending.take() {
+                None => true,
+                Some(m) => {
+                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                    match producers[idx].try_push(m) {
+                        Ok(()) => true,
+                        Err(back) => {
+                            pending = Some(back);
+                            false
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        match outcome {
+            crate::shard::dispatch::PushOutcome::Pushed => {
                 ctx.spsc_notifiers[*target].notify_one();
-            } else {
-                // Ring full: count this target as delivered-to-zero rather
-                // than hanging the EXEC reply (mirrors the batch-flush path).
+            }
+            outcome => {
+                // Give-up: count the target as delivered-to-zero so the EXEC
+                // reply can't hang — but LOUDLY: this is real message loss to
+                // that shard's subscribers (was a silent drop pre-E1).
+                tracing::warn!(
+                    "shard {}: EXEC PUBLISH fan-out to shard {target} dropped ({outcome:?})",
+                    ctx.shard_id
+                );
+                crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
                 slot.add(0);
             }
         }
     }
-    crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+    // E4: bounded await — a wedged target shard can't hang the EXEC reply
+    // forever. The slot is per-call, so abandoning it on expiry is safe; the
+    // count degrades to whatever responded in time (under-report, loud).
+    if !crate::shard::dispatch::await_pubsub_slot_bounded(
+        &slot,
+        crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+    )
+    .await
+    {
+        tracing::warn!(
+            "shard {}: EXEC PUBLISH reply timed out awaiting remote shards",
+            ctx.shard_id
+        );
+        crate::admin::metrics_setup::record_xshard_reply_timeout("publish");
+    }
     local_count + slot.get()
+}
+
+/// Fan one `SCRIPT LOAD` out to every other shard with bounded backpressure
+/// (E3). A full ring used to drop the load SILENTLY, leaving that shard's
+/// script cache divergent: EVALSHA there answered NOSCRIPT for a sha this
+/// server had just returned. On give-up the drop is loud (warn + counter);
+/// the client still gets the sha — the script IS loaded locally, and client
+/// libraries' NOSCRIPT→EVAL fallback covers the divergent-shard window.
+pub(crate) async fn script_fanout_bounded(
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    sha1: &str,
+    script: &Bytes,
+) {
+    use crate::shard::mesh::ChannelMesh;
+    use ringbuf::traits::Producer;
+
+    for target in 0..ctx.num_shards {
+        if target == ctx.shard_id {
+            continue;
+        }
+        let idx = ChannelMesh::target_index(ctx.shard_id, target);
+        let mut pending = Some(crate::shard::dispatch::ShardMessage::ScriptLoad {
+            sha1: sha1.to_owned(),
+            script: script.clone(),
+        });
+        let outcome = crate::shard::dispatch::push_with_backpressure(
+            shutdown,
+            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+            || match pending.take() {
+                None => true,
+                Some(m) => {
+                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                    match producers[idx].try_push(m) {
+                        Ok(()) => true,
+                        Err(back) => {
+                            pending = Some(back);
+                            false
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        match outcome {
+            crate::shard::dispatch::PushOutcome::Pushed => {
+                ctx.spsc_notifiers[target].notify_one();
+            }
+            outcome => {
+                tracing::warn!(
+                    "shard {}: SCRIPT LOAD fan-out to shard {target} dropped ({outcome:?}); \
+                     that shard's script cache is divergent until the next load",
+                    ctx.shard_id
+                );
+                crate::admin::metrics_setup::record_xshard_fanout_drop("script_load");
+            }
+        }
+    }
 }
 
 /// Extract the primary key from a parsed command for shard routing.

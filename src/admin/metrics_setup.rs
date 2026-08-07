@@ -923,6 +923,31 @@ pub fn record_dispatch_cross_spsc() {
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
 }
 
+/// Cross-shard fan-out message dropped after bounded retry (c10k E1/E3):
+/// the target shard's SPSC ring stayed full through every backoff. `kind` is
+/// `"publish"` (that shard's subscribers miss the message; PUBLISH count
+/// under-reports) or `"script_load"` (that shard's script cache diverges —
+/// EVALSHA there answers NOSCRIPT until the next SCRIPT LOAD).
+#[inline]
+pub fn record_xshard_fanout_drop(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_fanout_drop_total", "kind" => kind).increment(1);
+}
+
+/// Cross-shard reply await expired (c10k E4): the owner shard did not fill
+/// the reply slot within `XSHARD_REPLY_TIMEOUT`. `kind` `"dispatch"` is
+/// fatal for the connection (the reusable slot may be filled late);
+/// `"publish"` degrades to an under-reported subscriber count.
+#[inline]
+pub fn record_xshard_reply_timeout(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_reply_timeout_total", "kind" => kind).increment(1);
+}
+
 /// Batched variant of `record_dispatch_cross_spsc`.
 #[inline]
 pub fn record_dispatch_cross_spsc_batch(count: u64) {
