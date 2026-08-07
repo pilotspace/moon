@@ -419,13 +419,57 @@ impl PerShardRewriteCoord {
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
-            for sid in 0..self.n_shards {
-                m.prune_shard_files(sid as u16, self.old_seq);
+            // Deep-review D1/D4: prune the old generation ONLY once (a) every
+            // manifest-sync agent's pending deferred ShardManifest commit is
+            // durable — the old incr is the AOF-replay backstop for exactly
+            // those spill placements — and (b) the manifest flip's dirent is
+            // durable (a crash booting the OLD manifest against pruned files
+            // replays as a silent fresh init and orphan-sweeps the NEW
+            // generation). On either failure keep both generations: costs
+            // disk, never data.
+            let safe_to_prune = match crate::persistence::manifest_sync::flush_all_agents() {
+                Ok(()) => {
+                    let dirent_durable = m
+                        .manifest_path()
+                        .parent()
+                        .map(crate::persistence::fsync::fsync_directory)
+                        .transpose();
+                    match dirent_durable {
+                        Ok(_) => true,
+                        Err(e) => {
+                            error!(
+                                "F6 rewrite: manifest dirent not durable ({}); keeping old \
+                                 generation seq {} on disk",
+                                e, self.old_seq
+                            );
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "F6 rewrite: manifest-sync barrier failed ({}); keeping old \
+                         generation seq {} on disk as the durability backstop",
+                        e, self.old_seq
+                    );
+                    false
+                }
+            };
+            if safe_to_prune {
+                for sid in 0..self.n_shards {
+                    m.prune_shard_files(sid as u16, self.old_seq);
+                }
             }
             drop(m);
             info!(
-                "F6 per-shard rewrite complete: committed seq {} across {} shards, pruned seq {}",
-                self.new_seq, self.n_shards, self.old_seq
+                "F6 per-shard rewrite complete: committed seq {} across {} shards{}",
+                self.new_seq,
+                self.n_shards,
+                if safe_to_prune {
+                    format!(", pruned seq {}", self.old_seq)
+                } else {
+                    format!(" (old seq {} retained)", self.old_seq)
+                }
             );
             // Success: new_seq is committed. Folded writers already reopened onto
             // new_seq in phase 6, so the barrier is a no-op for them — but it must
