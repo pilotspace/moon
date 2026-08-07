@@ -575,3 +575,68 @@ fn connection_state_stays_small() {
         "ConnectionState is {sz} B — keep bulky fields boxed (was 2.7 KB before c10k W2)"
     );
 }
+
+/// D4 (#438): the migration-eligibility gate must block every state class
+/// that `MigratedConnectionState` cannot carry. A fresh connection is
+/// eligible; each non-transferable state flips it off; clearing the state
+/// restores eligibility (the latched target retries at the next clean
+/// batch end).
+#[test]
+fn migration_eligibility_gate() {
+    fn fresh() -> crate::server::conn::core::ConnectionState {
+        crate::server::conn::core::ConnectionState::new(
+            1,
+            "127.0.0.1:1".to_string(),
+            &None,
+            0,
+            4,
+            true,
+            128,
+            None,
+        )
+    }
+
+    assert!(
+        fresh().migration_eligible(),
+        "fresh connection must be eligible"
+    );
+
+    let mut c = fresh();
+    c.in_multi = true;
+    assert!(
+        !c.migration_eligible(),
+        "queued MULTI txn must block migration"
+    );
+    c.in_multi = false;
+    assert!(c.migration_eligible(), "EXEC/DISCARD restores eligibility");
+
+    let mut c = fresh();
+    c.subscription_count = 1;
+    assert!(
+        !c.migration_eligible(),
+        "subscriptions must block migration"
+    );
+    c.subscription_count = 0;
+    assert!(c.migration_eligible(), "UNSUBSCRIBE restores eligibility");
+
+    let mut c = fresh();
+    c.active_cross_txn = Some(Box::new(crate::transaction::CrossStoreTxn::new(1, 1, 0)));
+    assert!(
+        !c.migration_eligible(),
+        "cross-store txn must block migration"
+    );
+
+    let mut c = fresh();
+    c.tracking_state.enabled = true;
+    assert!(
+        !c.migration_eligible(),
+        "CLIENT TRACKING must block migration"
+    );
+
+    let mut c = fresh();
+    c.saw_replconf = true;
+    assert!(
+        !c.migration_eligible(),
+        "replica handshake must block migration"
+    );
+}

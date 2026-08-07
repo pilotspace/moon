@@ -444,6 +444,26 @@ impl ConnectionState {
         self.active_cross_txn.is_some()
     }
 
+    /// D4 (#438): whether this connection may migrate to another shard
+    /// RIGHT NOW. `MigratedConnectionState` carries none of the state
+    /// checked here (queued MULTI txn, cross-store txn, subscriptions,
+    /// CLIENT TRACKING registration, replica handshake), so migrating
+    /// while any of it is live silently discards it. Evaluated at BOTH
+    /// the affinity-sampler latch point and the batch-end execution
+    /// point — commands later in the same batch can flip any of these
+    /// after the latch, so the execution-point check is authoritative.
+    /// An ineligible batch end keeps `migration_target` latched; the
+    /// migration runs at the first batch end where the connection is
+    /// clean again (e.g. after EXEC/UNSUBSCRIBE).
+    #[inline]
+    pub fn migration_eligible(&self) -> bool {
+        !self.in_multi
+            && self.active_cross_txn.is_none()
+            && self.subscription_count == 0
+            && !self.tracking_state.enabled
+            && !self.saw_replconf
+    }
+
     /// Get the active transaction's ID, if any.
     #[inline]
     #[allow(dead_code)] // API reserved for future handler-level TXN integration
