@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
 
 ### Fixed
+- **Test-hygiene sweep: pid-only temp dirs + timing-race asserts.** Eight
+  spawn sites across six integration suites named their data dirs by pid
+  only, so a crashed run's leftover dir was silently resurrected once the
+  pid was reused — the server then reloaded stale persistence state and the
+  suite failed on ghosts (the documented stale-reload trap). All eight now
+  use `tempfile` (RAII where a single owner exists; unique `keep()` dirs
+  where the restart flow shares one dir between two server handles).
+  `parked_idle_parity` additionally gets deadline-polled asserts: CLIENT
+  KILL's registry removal is polled instead of read once (the CI
+  assert-too-soon race that fired 3/3 on a starved 2-vCPU runner),
+  connects retry against a listening-but-backlogged server, and read
+  deadlines widened 10s→30s (deadline-bound — green runs are unaffected).
+  The `client_tracking_invalidation` multikey second-key push flake is
+  product-side, not harness-side, and is now tracked as #448.
 - **Central accept loop no longer head-of-line blocks on one wedged shard
   (#438 F3).** Every central-listener delivery (tokio plain/TLS, monoio
   plain/TLS — the monoio sends were *synchronous*, stalling the whole

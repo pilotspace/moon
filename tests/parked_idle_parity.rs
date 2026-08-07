@@ -43,9 +43,29 @@ fn spawn_moon(dir: &std::path::Path, port: u16) -> std::process::Child {
     spawn_moon_with(dir, port, &[])
 }
 
+/// Test-hygiene sweep: connect with a deadline. Under full-suite load a
+/// freshly listening server can still refuse/reset the first attempts
+/// (SYN backlog + debug-binary scheduling), which failed tests at the
+/// connect line rather than on anything they assert.
+fn connect_retry(port: u16) -> TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => return s,
+            Err(e) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connect to 127.0.0.1:{port} kept failing: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn read_exact_deadline(stream: &mut TcpStream, want: usize) -> Vec<u8> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("set timeout");
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 4096];
@@ -70,7 +90,7 @@ fn ping(stream: &mut TcpStream) {
 fn command_reply(stream: &mut TcpStream, cmd: &str) -> String {
     stream.write_all(cmd.as_bytes()).expect("write cmd");
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("set timeout");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
@@ -104,7 +124,7 @@ fn parked_connection_serves_all_traffic_after_wake() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
-    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut conn = connect_retry(port);
     conn.set_nodelay(true).ok();
     ping(&mut conn);
 
@@ -165,13 +185,13 @@ fn parked_connection_visible_and_killable() {
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
     // Victim: name itself so the control conn can find its id, then park.
-    let mut victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    let mut victim = connect_retry(port);
     let r = command_reply(&mut victim, "CLIENT SETNAME parkvictim\r\n");
     assert!(r.starts_with("+OK"), "SETNAME failed: {r}");
     std::thread::sleep(PARK_WAIT);
 
     // Control connection stays active.
-    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let mut control = connect_retry(port);
     let list = command_reply(&mut control, "CLIENT LIST\r\n");
     let victim_line = list
         .lines()
@@ -193,7 +213,7 @@ fn parked_connection_visible_and_killable() {
 
     // The victim's socket must observe the close (EOF or reset) promptly.
     victim
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("set timeout");
     let mut buf = [0u8; 16];
     match victim.read(&mut buf) {
@@ -202,12 +222,22 @@ fn parked_connection_visible_and_killable() {
         Ok(n) => panic!("expected close, got {n} bytes"),
     }
 
-    // And it must be gone from CLIENT LIST.
-    let list = command_reply(&mut control, "CLIENT LIST\r\n");
-    assert!(
-        !list.contains("name=parkvictim"),
-        "killed parked connection still listed:\n{list}"
-    );
+    // And it must be gone from CLIENT LIST. The client-side close arrives
+    // instantly (shutdown(2)); the registry entry is released only once the
+    // killed handler task gets scheduled — poll with a deadline instead of
+    // asserting the very first read (the documented CI assert-too-soon race).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = command_reply(&mut control, "CLIENT LIST\r\n");
+        if !list.contains("name=parkvictim") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "killed parked connection still listed after 10s:\n{list}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     let _ = child.kill();
     let _ = child.wait();
@@ -222,12 +252,12 @@ fn resumed_connection_keeps_registry_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
-    let mut victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    let mut victim = connect_retry(port);
     victim.set_nodelay(true).ok();
     let r = command_reply(&mut victim, "CLIENT SETNAME wakekeeper\r\n");
     assert!(r.starts_with("+OK"), "SETNAME failed: {r}");
 
-    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let mut control = connect_retry(port);
     let list = command_reply(&mut control, "CLIENT LIST\r\n");
     let orig_id: u64 = list
         .lines()
@@ -280,13 +310,13 @@ fn rst_while_parked_tears_down_promptly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
-    let victim = TcpStream::connect(("127.0.0.1", port)).expect("connect victim");
+    let victim = connect_retry(port);
     {
         let mut v = &victim;
         v.write_all(b"CLIENT SETNAME rstvictim\r\n").expect("write");
         let mut buf = [0u8; 8];
         victim
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let _ = (&victim).read(&mut buf);
     }
@@ -318,7 +348,7 @@ fn rst_while_parked_tears_down_promptly() {
     // The server must fully release the conn: gone from CLIENT LIST and no
     // respawn loop keeping it alive.
     std::thread::sleep(Duration::from_millis(2000));
-    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let mut control = connect_retry(port);
     let list = command_reply(&mut control, "CLIENT LIST\r\n");
     assert!(
         !list.contains("name=rstvictim"),
@@ -335,10 +365,10 @@ fn active_sibling_undisturbed_by_parking() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
-    let mut idle = TcpStream::connect(("127.0.0.1", port)).expect("connect idle");
+    let mut idle = connect_retry(port);
     ping(&mut idle);
 
-    let mut active = TcpStream::connect(("127.0.0.1", port)).expect("connect active");
+    let mut active = connect_retry(port);
     active.set_nodelay(true).ok();
 
     // ~5s of continuous activity spanning downshift + park of the sibling.
@@ -378,7 +408,7 @@ fn partial_frame_survives_a_park() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
 
-    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut conn = connect_retry(port);
     conn.set_nodelay(true).ok();
     ping(&mut conn);
 
@@ -429,17 +459,17 @@ fn unauthenticated_conn_never_task_parks() {
         common::spawn_listening(|p| spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"]));
 
     // Positive control: authenticated, then idle past the park threshold.
-    let mut authed = TcpStream::connect(("127.0.0.1", port)).expect("connect authed");
+    let mut authed = connect_retry(port);
     let r = command_reply(&mut authed, "AUTH park-f6\r\n");
     assert!(r.starts_with("+OK"), "AUTH failed: {r}");
 
     // Victim: connects and never speaks — no AUTH, no bytes.
-    let silent = TcpStream::connect(("127.0.0.1", port)).expect("connect silent");
+    let silent = connect_retry(port);
 
     std::thread::sleep(PARK_WAIT);
 
     // Control conn (freshly active, not parked) reads the gauge.
-    let mut control = TcpStream::connect(("127.0.0.1", port)).expect("connect control");
+    let mut control = connect_retry(port);
     let r = command_reply(&mut control, "AUTH park-f6\r\n");
     assert!(r.starts_with("+OK"), "control AUTH failed: {r}");
     let info = command_reply(&mut control, "INFO clients\r\n");
