@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Cluster mode now works on the default (monoio) runtime — v0.9 W0/C-1
+  (#405).** The cluster control plane (bus listener, gossip ticker, failover
+  election) runs on a dedicated `cluster-ctl` std thread hosting a
+  current-thread tokio runtime, on BOTH server runtimes. Before this the
+  monoio startup path never spawned the bus or the ticker: `--cluster-enabled`
+  accepted `CLUSTER MEET` but no peer ever learned anything. Under tokio the
+  control plane previously shared the listener runtime with the accept loop
+  and every connection, so gossip starved under load (observed as PFAIL
+  detection stalling); the dedicated thread fixes that too. The unused,
+  untested monoio duplicates of the bus/gossip/election code were deleted —
+  one control-plane implementation on both runtimes. New e2e suite
+  `tests/cluster_formation.rs` proves a real 3-node cluster forms via
+  MEET + gossip and flags a killed node, per runtime.
+
+### Fixed
+- **Cluster formation actually converges (pre-existing, both runtimes).**
+  A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
+  random-id placeholder was never retired when the peer's handshake arrived
+  under its real id, double-counting every met peer (`known_nodes` 5 in a
+  3-node cluster); (2) gossip sections were only consumed for PFAIL/FAIL
+  reports, so nodes MEET-ed into a common peer never learned about EACH
+  OTHER; (3) nodes adopted from rumors started with `pong_recv_ms = 0`,
+  which `check_failure_states` skips — a rumored node that died before
+  first direct contact could NEVER be marked PFAIL. Placeholders are now
+  retired on handshake (same-address, different-id), healthy rumors are
+  adopted (with self/known-address guards), and adoption stamps a freshness
+  baseline so the staleness clock always runs. Review round: `CLUSTER MEET`
+  is idempotent by ADDRESS (repeats no longer stack one placeholder per
+  call) and refuses the node's own address; a cluster-bus bind failure now
+  aborts startup loudly instead of leaving a node serving clients while
+  invisible to every peer; `--cluster-enabled` refuses ports > 55535 (bus
+  port would wrap past 65535); a `cluster-ctl` thread panic aborts the
+  process via the same hook that guards shard threads.
 - **The AOF now compacts itself (#433): Redis-parity automatic rewrite.**
   `--auto-aof-rewrite-percentage` (default 100, `0` disables) and
   `--auto-aof-rewrite-min-size` (default `64mb`, size strings accepted)

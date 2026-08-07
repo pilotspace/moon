@@ -269,13 +269,25 @@ pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
 
-    // Generate a placeholder node ID (will be replaced by gossip handshake)
+    // Generate a placeholder node ID (retired by the gossip handshake, which
+    // re-registers the peer under its real id)
     use crate::replication::state::generate_repl_id;
     let peer_id = generate_repl_id();
 
     let mut state = cs.write().unwrap();
-    if !state.nodes.contains_key(&peer_id) {
-        let node = ClusterNode::new(peer_id.clone(), addr, NodeFlags::Master, 0);
+    if state.my_node().addr == addr {
+        return Frame::Error(Bytes::from_static(b"ERR Can't MEET myself"));
+    }
+    // Idempotence by ADDRESS, not by the (fresh-random) placeholder id:
+    // repeated MEETs for one address — or a MEET for a peer we already
+    // know — must not stack a new placeholder per call.
+    if !state.nodes.values().any(|n| n.addr == addr) {
+        let mut node = ClusterNode::new(peer_id.clone(), addr, NodeFlags::Master, 0);
+        // Freshness baseline: check_failure_states skips pong_recv_ms == 0
+        // entries, so MEET-ing a dead address would otherwise leave an
+        // entry that never goes PFAIL. The handshake replaces this
+        // placeholder (and its clock) with the peer's real identity.
+        node.pong_recv_ms = crate::cluster::gossip::now_ms();
         state.nodes.insert(peer_id, node);
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -752,6 +764,45 @@ mod tests {
         let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
         assert!(matches!(result, Frame::SimpleString(_)));
         assert_eq!(cs.read().unwrap().nodes.len(), 2);
+    }
+
+    /// Repeated CLUSTER MEET for one address must not stack placeholders:
+    /// the placeholder id is fresh-random per call, so idempotence has to
+    /// key on the address.
+    #[test]
+    fn test_cluster_meet_is_idempotent_by_address() {
+        let cs = make_cs();
+        let args = vec![
+            Frame::BulkString(bytes::Bytes::from_static(b"MEET")),
+            Frame::BulkString(bytes::Bytes::from_static(b"192.168.1.2")),
+            Frame::BulkString(bytes::Bytes::from_static(b"6380")),
+        ];
+        for _ in 0..3 {
+            let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
+            assert!(matches!(result, Frame::SimpleString(_)));
+        }
+        assert_eq!(
+            cs.read().unwrap().nodes.len(),
+            2,
+            "one placeholder, not three"
+        );
+    }
+
+    /// MEET-ing our own advertised address is refused.
+    #[test]
+    fn test_cluster_meet_self_is_error() {
+        let cs = make_cs();
+        let args = vec![
+            Frame::BulkString(bytes::Bytes::from_static(b"MEET")),
+            Frame::BulkString(bytes::Bytes::from_static(b"127.0.0.1")),
+            Frame::BulkString(bytes::Bytes::from_static(b"6379")),
+        ];
+        let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
+        assert!(
+            matches!(result, Frame::Error(_)),
+            "self-MEET must be an error"
+        );
+        assert_eq!(cs.read().unwrap().nodes.len(), 1);
     }
 
     /// Helper: create a ClusterState where this node is a replica of a FAIL master.
