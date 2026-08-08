@@ -133,6 +133,35 @@ pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
     }
 }
 
+/// Degraded-state latch (#452.4): `false` once ANY acked append has been
+/// dropped at the writer channel since boot. Unlike the rolling counter
+/// above, this is a sticky health bit — operators (and test harnesses) can
+/// alert on `aof_last_append_status:err` in `INFO persistence` without
+/// diffing counters. It never resets: after a drop the AOF is missing an
+/// acked record for the lifetime of this generation, so "everything is fine
+/// again" would be a lie until a successful rewrite folds live state into a
+/// fresh base. (`BGREWRITEAOF` is the operator remediation; wiring the latch
+/// reset into rewrite completion is deliberate follow-up work tracked in
+/// #452 — reset must only happen if NO drop occurred during the fold.)
+pub static AOF_LAST_APPEND_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Reason-DELs (eviction/expiry) dropped at the writer channel (#452.4).
+/// Strictly worse than a dropped client write: replay RESURRECTS a key the
+/// server told clients was gone. Kept as a dedicated counter so a non-zero
+/// value can be alerted on independently of generic backpressure drops.
+pub static AOF_REASON_DEL_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record `n` dropped acked appends: bumps [`AOF_BACKPRESSURE_DROPPED`] and
+/// latches [`AOF_LAST_APPEND_OK`] to `err`. Every drop site MUST go through
+/// this helper so the degraded-state latch can never miss a loss.
+#[inline]
+pub fn record_append_dropped(n: u64) {
+    AOF_BACKPRESSURE_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    AOF_LAST_APPEND_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bound for the SPSC-drain path's blocking AOF backpressure
 /// ([`AofWriterPool::send_append_bounded_blocking`]). Sized to cover the
 /// writer draining one group-commit batch (≤1024 msgs / 8 MiB buffered
@@ -140,6 +169,17 @@ pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
 /// while keeping the worst-case shard event-loop stall small. Reached only
 /// when the writer channel (10k slots) is completely full.
 pub const AOF_SPSC_BACKPRESSURE_BOUND: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Backpressure bound for reason-DELs (eviction/expiry — #452.4). 100× the
+/// generic SPSC bound: a dropped reason-DEL makes restart replay resurrect
+/// data clients were told is gone, so we trade a longer worst-case shard
+/// stall (only reachable when the writer is >10k appends behind) for a much
+/// smaller loss window. NOT unbounded: a dead writer must not hang the
+/// shard, and a deferred-retry queue would reorder DEL-after-SET on replay —
+/// beyond this bound the drop is counted in [`AOF_REASON_DEL_DROPPED`] and
+/// latches [`AOF_LAST_APPEND_OK`], never silent.
+pub const AOF_REASON_DEL_BACKPRESSURE_BOUND: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// Result of awaiting an `AppendSync` ack under a bounded timeout (F2).
 ///
@@ -235,9 +275,16 @@ pub enum AofMessage {
         ack: crate::runtime::channel::OneshotSender<AofAck>,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
-    Rewrite(SharedDatabases),
+    /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
+    /// buffer (issue #452.1): armed by the writer around the fold, fed by the
+    /// pool's producers when the append channel saturates mid-fold.
+    Rewrite(SharedDatabases, Arc<rewrite::RewriteOverflow>),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
-    RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
+    /// Overflow semantics identical to [`AofMessage::Rewrite`].
+    RewriteSharded(
+        Arc<crate::shard::shared_databases::ShardDatabases>,
+        Arc<rewrite::RewriteOverflow>,
+    ),
     /// [F6] Trigger a per-shard AOF rewrite (compaction) in the PerShard
     /// layout. Sent to EVERY per-shard writer at once. Each writer folds its
     /// own shard (drain → AofFold SPSC → snapshot → write new base+incr at
@@ -259,6 +306,11 @@ pub enum AofMessage {
             Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         /// Notifier that wakes the shard event loop after an SPSC push.
         fold_notifier: Arc<crate::runtime::channel::Notify>,
+        /// Rewrite-window spill buffer for THIS shard (issue #452.1) — armed
+        /// by the writer around the fold, fed by the pool's producers when
+        /// the append channel saturates mid-fold, drained by the writer into
+        /// the committed incr immediately after the fold.
+        overflow: Arc<rewrite::RewriteOverflow>,
     },
     /// Shut down the AOF writer task gracefully.
     Shutdown,
@@ -580,7 +632,8 @@ pub mod auto_rewrite;
 /// seam (collect/commit) against the public API.
 pub mod group_commit;
 mod pool;
-mod rewrite;
+pub mod rewrite;
+pub mod rewrite_overflow;
 mod writer_task;
 
 pub use pool::AofWriterPool;

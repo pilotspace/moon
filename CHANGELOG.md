@@ -56,6 +56,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Fail-loud + bounds*: vector background-compaction failures now log at
     every layer; CDC reaps disconnected subscribers on write-idle shards;
     `TemporalRegistry` is bounded (262K bindings/shard, oldest evicted).
+- **Durability wave 1 (#452, #54): AOF rewrite-window append drops, degraded-state
+  visibility, escalated reason-DEL backpressure, and a fail-loud WAL mid-chain
+  tear policy.** (1) While a rewrite fold ran, the writer thread was out of its
+  recv loop, so under sustained pipelined writes the bounded (10k) append
+  channel saturated and acked records were dropped — lost even on a clean
+  restart, and default-on since #433 made rewrites automatic. A per-writer
+  `RewriteOverflow` spill buffer (aof_rewrite_buf equivalent; 256 MiB cap,
+  strict ordering, all six fold arms on both runtimes) now buffers the
+  overflow and drains it into the committed incr right after the fold;
+  `INFO persistence` gains `aof_rewrite_overflow_spilled`. Merge-base A/B
+  (tests/recovery_matrix_w1.rs): main lost/error-failed ~5.6k acked writes per
+  hit; fixed is exact across SIGKILL + recovery. (2) Any dropped acked append
+  now latches sticky `aof_last_append_status:err` (INFO) via a single
+  accounting helper. (3) Eviction/expiry reason-DELs get a 100× escalated
+  backpressure bound (500ms) plus a dedicated `aof_reason_del_dropped`
+  counter — a dropped reason-DEL means restart replay resurrects data clients
+  were told was gone. (4) WAL v3 replay now REFUSES to continue past a
+  corrupt record when later segments exist (mid-chain tear = on-disk
+  corruption; applying later segments silently replays operations from after
+  a hole) — `MOON_WAL_SALVAGE=1` is the explicit operator override; a torn
+  FINAL segment stays the benign crash-tail it always was.
+
+  Adversarial-review hardening round (pre-merge): the rewrite fold's
+  exactly-once contract now extends to the overflow buffer — a snapshot
+  **cut** (`mark_cut`, recorded at the fold's atomic snapshot instant)
+  splits spilled entries so a COMMITTED fold discards pre-snapshot spills
+  (their effects are in the new base; replaying them would double-apply
+  INCR/APPEND/LPUSH) while an aborted fold still writes everything.
+  Producer paths are fully gated (`spill_first` on every enqueue leg,
+  including backpressure/AppendSync parks) so mid-fold channel drains can
+  never invert same-key replay order, and the finish drain is two-phase
+  (channel before buffer, disarm under the buffer lock). Arming is
+  unwind-safe: a panicking fold disarms with drop accounting instead of
+  leaving producers spilling into a dead buffer forever. Boot paths now
+  actually ABORT (exit 70) on a fatal mid-chain tear instead of falling
+  back to legacy recovery, reason-DEL backpressure shares ONE bound per
+  eviction/expiry sweep (was one 500ms bound per victim key), and every
+  cap/shutdown drop path routes through the loss-accounting latch.
+
 - **Cluster formation actually converges (pre-existing, both runtimes).**
   A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
   random-id placeholder was never retired when the peer's handshake arrived

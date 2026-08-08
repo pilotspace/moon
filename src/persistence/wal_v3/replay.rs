@@ -28,6 +28,12 @@ pub struct WalV3ReplayResult {
     pub last_lsn: u64,
     /// Number of FPI records applied.
     pub fpi_applied: usize,
+    /// #452.2: this segment (or, at dir level, the last segment examined)
+    /// ended in a corrupt/truncated record rather than at a clean record
+    /// boundary. On the FINAL segment this is the ordinary crash-tail shape;
+    /// on any EARLIER segment it is a mid-chain tear — records after the
+    /// hole exist in later segments and must NOT be silently applied.
+    pub torn: bool,
 }
 
 /// Auto-detect WAL format and replay accordingly.
@@ -276,6 +282,72 @@ pub fn replay_wal_v3_dir_until(
     on_command: &mut dyn FnMut(&WalRecord),
     on_fpi: &mut dyn FnMut(&WalRecord),
 ) -> std::io::Result<WalV3ReplayResult> {
+    replay_wal_v3_dir_until_with_salvage(
+        wal_dir,
+        redo_lsn,
+        stop_at_lsn,
+        wal_salvage_enabled(),
+        on_command,
+        on_fpi,
+    )
+}
+
+/// #452.2 salvage override: `MOON_WAL_SALVAGE=1` downgrades the mid-chain
+/// tear error to a loud warning and keeps replaying later segments —
+/// operator-driven partial recovery only, never the default (the class of
+/// corruption InnoDB/RocksDB treat as fatal-by-default).
+fn wal_salvage_enabled() -> bool {
+    std::env::var("MOON_WAL_SALVAGE").is_ok_and(|v| v == "1")
+}
+
+/// True when `e` is the #452.2 mid-chain-tear refusal. Boot-path callers
+/// MUST abort startup on it ("refuse to recover" — the pre-tear records
+/// were already applied via the eager callbacks and cannot be rolled back;
+/// continuing would serve a silently-truncated history and the stale
+/// `last_lsn` would poison `wal_flush_lsn` restoration). Every other replay
+/// error keeps the pre-existing log-and-continue behavior.
+pub fn is_mid_chain_tear(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("mid-chain tear")
+}
+
+/// Abort startup on a mid-chain WAL tear (#452.2 "refuse to recover"). A
+/// distinct exit code (70 / EX_SOFTWARE) so supervisors can tell this apart
+/// from a crash; the actionable message (restore from backup/replica or set
+/// `MOON_WAL_SALVAGE=1`) is in `e` itself.
+pub fn abort_boot_on_mid_chain_tear(shard_id: usize, e: &std::io::Error) -> ! {
+    tracing::error!(
+        "Shard {}: REFUSING TO BOOT — {}. (Pre-tear records were already applied; \
+         a partial boot would serve silently truncated history.)",
+        shard_id,
+        e
+    );
+    // Flush the tracing pipeline is not guaranteed; mirror to stderr so the
+    // reason survives even a minimal logging setup.
+    eprintln!("moon: refusing to boot: {e}");
+    std::process::exit(70);
+}
+
+/// [`replay_wal_v3_dir_until`] with the salvage decision as an explicit
+/// parameter (tests; the public wrapper reads `MOON_WAL_SALVAGE`).
+///
+/// # Mid-chain tear policy (#452.2)
+///
+/// Replay stops at the first corrupt record *within* a segment (crash-tail
+/// handling, keep the valid prefix). Historically later segments were then
+/// still applied — silently replaying operations from after a hole (a lost
+/// SET followed by an applied INCR/DEL). A tear is only a benign crash tail
+/// when it is in the FINAL segment: rotation fsyncs a segment before opening
+/// the next, so a mid-chain tear can only mean on-disk corruption (bit rot,
+/// truncation) — data is missing and continuing would silently reorder
+/// history. Default: fail loudly (`InvalidData`) and refuse to continue.
+pub fn replay_wal_v3_dir_until_with_salvage(
+    wal_dir: &Path,
+    redo_lsn: u64,
+    stop_at_lsn: Option<u64>,
+    salvage: bool,
+    on_command: &mut dyn FnMut(&WalRecord),
+    on_fpi: &mut dyn FnMut(&WalRecord),
+) -> std::io::Result<WalV3ReplayResult> {
     let mut segments: Vec<_> = std::fs::read_dir(wal_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
@@ -286,12 +358,38 @@ pub fn replay_wal_v3_dir_until(
     segments.sort();
 
     let mut combined = WalV3ReplayResult::default();
-    for seg_path in &segments {
+    for (idx, seg_path) in segments.iter().enumerate() {
         let result = replay_wal_v3_file_until(seg_path, redo_lsn, stop_at_lsn, on_command, on_fpi)?;
         combined.commands_replayed += result.commands_replayed;
         combined.fpi_applied += result.fpi_applied;
         if result.last_lsn > combined.last_lsn {
             combined.last_lsn = result.last_lsn;
+        }
+        combined.torn = result.torn;
+        if result.torn && idx + 1 < segments.len() {
+            // Mid-chain tear: records beyond the hole exist in later
+            // segments (#452.2).
+            if salvage {
+                tracing::error!(
+                    "WAL v3 replay: mid-chain tear in {} with {} later segment(s) — \
+                     MOON_WAL_SALVAGE=1 set, CONTINUING past the hole; recovered state \
+                     may be missing acked writes that later operations depended on",
+                    seg_path.display(),
+                    segments.len() - idx - 1,
+                );
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL v3 mid-chain tear: segment {} ends in a corrupt/truncated record \
+                         but {} later segment(s) exist — applying them would silently replay \
+                         operations from after a hole. Refusing to recover. Restore from a \
+                         backup/replica, or set MOON_WAL_SALVAGE=1 to accept partial recovery.",
+                        seg_path.display(),
+                        segments.len() - idx - 1,
+                    ),
+                ));
+            }
         }
         // Early exit: once a segment indicates we crossed the stop boundary,
         // later segments only contain higher LSNs (segments are monotonic).
@@ -334,7 +432,12 @@ pub fn replay_wal_v3_file_until(
     let data = std::fs::read(path)?;
 
     if data.len() < WAL_V3_HEADER_SIZE {
-        return Ok(WalV3ReplayResult::default());
+        // A zero-byte file is a benign fresh segment; a partial header is a
+        // tear (#452.2).
+        return Ok(WalV3ReplayResult {
+            torn: !data.is_empty(),
+            ..WalV3ReplayResult::default()
+        });
     }
 
     // Verify v3 header
@@ -351,6 +454,8 @@ pub fn replay_wal_v3_file_until(
     while offset < data.len() {
         // Need at least 4 bytes for record_len
         if offset + 4 > data.len() {
+            // Torn header tail — same class as a corrupt record (#452.2).
+            result.torn = true;
             break;
         }
 
@@ -362,6 +467,7 @@ pub fn replay_wal_v3_file_until(
                     "WAL v3 replay: corrupt/truncated record at offset {}, stopping",
                     offset
                 );
+                result.torn = true;
                 break;
             }
         };
@@ -787,6 +893,115 @@ mod tests {
         assert_eq!(result.commands_replayed, 2);
         assert_eq!(cmd_count, 2);
         assert_eq!(result.last_lsn, 2);
+    }
+
+    /// #452.2 RED baseline → GREEN: a corrupt record in a NON-final segment
+    /// must abort recovery by default — the pre-fix replay silently skipped
+    /// the rest of the torn segment and then applied every later segment
+    /// (operations from after a hole).
+    #[test]
+    fn test_v3_dir_mid_chain_tear_fails_loud_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut seg1 = make_v3_header(0);
+        write_wal_v3_record(&mut seg1, 1, WalRecordType::Command, b"SET a 1");
+        let corrupt_offset = seg1.len();
+        write_wal_v3_record(&mut seg1, 2, WalRecordType::Command, b"SET b 2");
+        seg1[corrupt_offset + 16] ^= 0xFF; // hole mid-chain
+        std::fs::write(tmp.path().join("000000000001.wal"), &seg1).unwrap();
+
+        let mut seg2 = make_v3_header(0);
+        write_wal_v3_record(&mut seg2, 3, WalRecordType::Command, b"INCR b");
+        std::fs::write(tmp.path().join("000000000002.wal"), &seg2).unwrap();
+
+        let mut replayed = Vec::new();
+        let err = replay_wal_v3_dir_until_with_salvage(
+            tmp.path(),
+            0,
+            None,
+            false,
+            &mut |r| replayed.push(r.lsn),
+            &mut |_| {},
+        )
+        .expect_err("mid-chain tear with later segments must refuse to recover");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("MOON_WAL_SALVAGE"),
+            "error must name the salvage override: {err}"
+        );
+        assert!(
+            is_mid_chain_tear(&err),
+            "boot-path classifier must recognize this error so callers abort \
+             instead of falling back to legacy recovery: {err}"
+        );
+        assert_eq!(
+            replayed,
+            vec![1],
+            "only the pre-hole prefix may have been applied before the abort"
+        );
+    }
+
+    /// #452.2: the salvage override keeps the old skip-and-continue behavior
+    /// for operator-driven partial recovery.
+    #[test]
+    fn test_v3_dir_mid_chain_tear_salvage_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut seg1 = make_v3_header(0);
+        write_wal_v3_record(&mut seg1, 1, WalRecordType::Command, b"SET a 1");
+        let corrupt_offset = seg1.len();
+        write_wal_v3_record(&mut seg1, 2, WalRecordType::Command, b"SET b 2");
+        seg1[corrupt_offset + 16] ^= 0xFF;
+        std::fs::write(tmp.path().join("000000000001.wal"), &seg1).unwrap();
+
+        let mut seg2 = make_v3_header(0);
+        write_wal_v3_record(&mut seg2, 3, WalRecordType::Command, b"INCR b");
+        std::fs::write(tmp.path().join("000000000002.wal"), &seg2).unwrap();
+
+        let mut replayed = Vec::new();
+        let result = replay_wal_v3_dir_until_with_salvage(
+            tmp.path(),
+            0,
+            None,
+            true,
+            &mut |r| replayed.push(r.lsn),
+            &mut |_| {},
+        )
+        .expect("salvage mode must continue past the hole");
+        assert_eq!(replayed, vec![1, 3]);
+        assert_eq!(result.commands_replayed, 2);
+    }
+
+    /// #452.2: a torn record in the FINAL segment is the ordinary crash-tail
+    /// shape — recovery keeps the valid prefix and succeeds, exactly as
+    /// before.
+    #[test]
+    fn test_v3_dir_tail_tear_stays_benign() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut seg1 = make_v3_header(0);
+        write_wal_v3_record(&mut seg1, 1, WalRecordType::Command, b"SET a 1");
+        std::fs::write(tmp.path().join("000000000001.wal"), &seg1).unwrap();
+
+        let mut seg2 = make_v3_header(0);
+        write_wal_v3_record(&mut seg2, 2, WalRecordType::Command, b"SET b 2");
+        let corrupt_offset = seg2.len();
+        write_wal_v3_record(&mut seg2, 3, WalRecordType::Command, b"SET c 3");
+        seg2[corrupt_offset + 16] ^= 0xFF; // torn tail — crash shape
+        std::fs::write(tmp.path().join("000000000002.wal"), &seg2).unwrap();
+
+        let mut replayed = Vec::new();
+        let result = replay_wal_v3_dir_until_with_salvage(
+            tmp.path(),
+            0,
+            None,
+            false,
+            &mut |r| replayed.push(r.lsn),
+            &mut |_| {},
+        )
+        .expect("tail tear must remain a benign crash shape");
+        assert_eq!(replayed, vec![1, 2]);
+        assert!(result.torn, "dir result must surface the tail tear");
     }
 
     #[test]

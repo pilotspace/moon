@@ -62,8 +62,8 @@ pub struct GroupCommitBatch {
 fn is_control(msg: &AofMessage) -> bool {
     matches!(
         msg,
-        AofMessage::Rewrite(_)
-            | AofMessage::RewriteSharded(_)
+        AofMessage::Rewrite(..)
+            | AofMessage::RewriteSharded(..)
             | AofMessage::RewritePerShard { .. }
             | AofMessage::Shutdown
     )
