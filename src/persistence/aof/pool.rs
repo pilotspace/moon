@@ -590,7 +590,7 @@ impl AofWriterPool {
             Err(returned) => msg = returned,
         }
         if budget.is_zero() {
-            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::record_append_dropped(1);
             tracing::error!(
                 "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
                  backpressure_dropped={}",
@@ -611,7 +611,7 @@ impl AofWriterPool {
             Ok(()) => true,
             Err(e) => {
                 if matches!(e, flume::SendTimeoutError::Timeout(_)) {
-                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    super::record_append_dropped(1);
                 }
                 tracing::error!(
                     "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
@@ -686,7 +686,7 @@ impl AofWriterPool {
             };
         }
         if outcome == Err(AofAck::ChannelFull) {
-            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::record_append_dropped(1);
             warn!(
                 "AOF writer channel full (shard {}): everysec append dropped after {:?} \
                  backpressure bound; backpressure_dropped={}",
@@ -738,7 +738,7 @@ impl AofWriterPool {
                 // signal ChannelFull back to the caller via a pre-filled
                 // oneshot so the caller's `.await` resolves immediately to
                 // Err(AofAck::ChannelFull) without a writer round-trip.
-                AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::record_append_dropped(1);
                 warn!(
                     "AOF writer channel full (shard {}): AppendSync dropped; \
                      backpressure_dropped={}",
@@ -2316,6 +2316,26 @@ mod pool_tests {
         assert!(
             matches!(rx0.try_recv(), Ok(AofMessage::Append { lsn: 1, .. })),
             "the awaited append must actually be enqueued, not lost"
+        );
+    }
+
+    /// #452.4: any drop must flip the sticky degraded latch.
+    #[test]
+    fn dropped_append_latches_degraded_status() {
+        let (tx, _rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let pool = AofWriterPool::top_level(tx);
+        assert!(pool.try_send_append(0, 1, 0, Bytes::from_static(b"fill")));
+        let mut budget = Duration::ZERO;
+        assert!(!pool.send_append_bounded_blocking(
+            0,
+            2,
+            0,
+            Bytes::from_static(b"lost"),
+            &mut budget
+        ));
+        assert!(
+            !super::super::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
+            "a dropped acked append must latch aof_last_append_status:err"
         );
     }
 

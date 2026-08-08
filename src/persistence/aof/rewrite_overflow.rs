@@ -259,7 +259,7 @@ impl RewriteOverflow {
         let mut buf = self.buf.lock();
         let lost = buf.len() as u64;
         if lost > 0 {
-            AOF_BACKPRESSURE_DROPPED.fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
+            super::record_append_dropped(lost);
             error!(
                 "rewrite overflow discarded {} spilled appends — writer exiting without a usable file",
                 lost
