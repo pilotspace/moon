@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MEET + gossip and flags a killed node, per runtime.
 
 ### Fixed
+<<<<<<< HEAD
 - **Deep-review wave (2026-08): long-uptime and large-scale correctness.**
   Eight fix groups from a six-dimension architecture review (durability
   ordering, long-uptime resource growth, concurrency, cluster correctness,
@@ -56,6 +57,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Fail-loud + bounds*: vector background-compaction failures now log at
     every layer; CDC reaps disconnected subscribers on write-idle shards;
     `TemporalRegistry` is bounded (262K bindings/shard, oldest evicted).
+=======
+- **Durability wave 1 (#452, #54): AOF rewrite-window append drops, degraded-state
+  visibility, escalated reason-DEL backpressure, and a fail-loud WAL mid-chain
+  tear policy.** (1) While a rewrite fold ran, the writer thread was out of its
+  recv loop, so under sustained pipelined writes the bounded (10k) append
+  channel saturated and acked records were dropped — lost even on a clean
+  restart, and default-on since #433 made rewrites automatic. A per-writer
+  `RewriteOverflow` spill buffer (aof_rewrite_buf equivalent; 256 MiB cap,
+  strict ordering, all six fold arms on both runtimes) now buffers the
+  overflow and drains it into the committed incr right after the fold;
+  `INFO persistence` gains `aof_rewrite_overflow_spilled`. Merge-base A/B
+  (tests/recovery_matrix_w1.rs): main lost/error-failed ~5.6k acked writes per
+  hit; fixed is exact across SIGKILL + recovery. (2) Any dropped acked append
+  now latches sticky `aof_last_append_status:err` (INFO) via a single
+  accounting helper. (3) Eviction/expiry reason-DELs get a 100× escalated
+  backpressure bound (500ms) plus a dedicated `aof_reason_del_dropped`
+  counter — a dropped reason-DEL means restart replay resurrects data clients
+  were told was gone. (4) WAL v3 replay now REFUSES to continue past a
+  corrupt record when later segments exist (mid-chain tear = on-disk
+  corruption; applying later segments silently replays operations from after
+  a hole) — `MOON_WAL_SALVAGE=1` is the explicit operator override; a torn
+  FINAL segment stays the benign crash-tail it always was.
+
+>>>>>>> e2eaef81 (test(persistence): wave-1 recovery matrix — rewrite-under-pipelined-load e2e (#54))
 - **Cluster formation actually converges (pre-existing, both runtimes).**
   A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
   random-id placeholder was never retired when the peer's handshake arrived

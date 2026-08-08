@@ -197,6 +197,10 @@ impl CompactionTracker {
     }
 }
 
+/// One-shot convenience over [`CompactionTracker`]; unused since the
+/// mid-stream-sampling refactor but kept as the documented entry point for
+/// future post-hoc waits.
+#[allow(dead_code)]
 fn wait_for_compaction(dir: &std::path::Path, timeout: Duration) -> bool {
     CompactionTracker::new(dir).wait(dir, timeout)
 }
