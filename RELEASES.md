@@ -1,5 +1,10 @@
 # Releases
 
+## v0.8.5 — 2026-08-08
+milestones: none (patch release: 2026-08 deep-review wave + durability wave 1)
+waivers: none new — `XSHARD-READ-01` remains the open GA gap (ROADMAP R4), unchanged from v0.8.4.
+evidence: Patch release rolling up the 2026-08 deep-review wave (#453) and durability wave 1 (#452/#54, PR #454), both merged after two-round adversarial review. Headline: AOF rewrites no longer drop acked writes under sustained load — a per-writer RewriteOverflow spill buffer with an exactly-once snapshot cut covers all six fold arms on both runtimes; merge-base A/B (tests/recovery_matrix_w1.rs) showed main losing ~5.6k acked writes per hit, fixed is exact across SIGKILL + recovery (251k appends through the overflow in the release-gate run). The re-verify round closed an abort-treated-as-commit P0 (aborted multi-shard fold discarded spills + false Synced acks), a same-key replay-inversion window, an ungated ordered-append leg, and taken-batch loss accounting; residual architectural findings tracked in #455. Also: WAL v3 mid-chain tears now abort boot (exit 70) instead of replaying past the hole (MOON_WAL_SALVAGE=1 override); sticky aof_last_append_status + per-writer aof_last_fsync_status latches; reason-DEL escalated backpressure with ONE shared bound per eviction sweep; manifest-sync failure latch keeps the AOF backstop until a newer snapshot persists; failed spill pwrite re-inserts the victim; eviction metadata widened (LFU decay/LRU inversion/OBJECT IDLETIME wrap/WATCH ABA); cluster election acks actually received + inline fast path disabled in cluster mode; CLIENT TRACKING max_keys enforced. Validation: fmt + clippy x2 feature sets, macOS monoio 4541 + tokio 3705 and VM Linux 4563 lib tests, rewrite-under-pipelined-load e2e green, PR CI green on both PRs pre-merge; crash-matrix nightly + ITERS=20 soak dispatched on the RC (b346910d), green before tag (soak-first-then-tag).
+
 ## v0.8.4 — 2026-07-29
 milestones: none (patch release: c1M P1 follow-ups + the park-vs-error spin fix)
 waivers: none new — `XSHARD-READ-01` remains the open GA gap (ROADMAP R4), unchanged from v0.8.3.

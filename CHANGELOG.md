@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-08-08
+
 ### Added
 - **Cluster mode now works on the default (monoio) runtime — v0.9 W0/C-1
   (#405).** The cluster control plane (bus listener, gossip ticker, failover
