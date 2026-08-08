@@ -3,8 +3,9 @@
 //! All subcommands operate on a shared Arc<RwLock<ClusterState>>.
 //! Called from handle_connection_sharded (intercepted before dispatch, like AUTH/CONFIG).
 
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -56,7 +57,7 @@ pub fn handle_cluster_command(
 
 /// CLUSTER INFO -- return a bulk string with cluster statistics in Redis format.
 pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAddr) -> Frame {
-    let state = cs.read().unwrap();
+    let state = cs.read();
     let cluster_state_str = if state.status == ClusterStatus::Ok {
         "ok"
     } else {
@@ -89,7 +90,7 @@ pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAdd
 
 /// CLUSTER MYID -- return this node's 40-char hex node ID.
 pub fn handle_cluster_myid(cs: &Arc<RwLock<ClusterState>>) -> Frame {
-    let state = cs.read().unwrap();
+    let state = cs.read();
     Frame::BulkString(Bytes::from(state.node_id.clone()))
 }
 
@@ -153,7 +154,7 @@ fn format_node_line(node: &ClusterNode, self_node_id: &str) -> String {
 /// CLUSTER NODES -- one line per known node in nodes.conf format:
 /// `<node-id> <ip>:<port>@<bus-port> <flags> <master-id> <ping-sent> <pong-recv> <epoch> <link-state> <slot-ranges>`
 pub fn handle_cluster_nodes(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAddr) -> Frame {
-    let state = cs.read().unwrap();
+    let state = cs.read();
     let mut output = String::new();
     for node in state.nodes.values() {
         output.push_str(&format_node_line(node, &state.node_id));
@@ -177,7 +178,7 @@ pub fn handle_cluster_replicas(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
     }
     let target_id = extract_string(&args[0]);
 
-    let state = cs.read().unwrap();
+    let state = cs.read();
 
     // ERR if the requested node-id is not in the cluster.
     if !state.nodes.contains_key(&target_id) {
@@ -197,7 +198,7 @@ pub fn handle_cluster_replicas(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
 
 /// CLUSTER SLOTS -- return nested array: [start, end, [master-ip, master-port, master-id], [replica...]]
 pub fn handle_cluster_slots(cs: &Arc<RwLock<ClusterState>>) -> Frame {
-    let state = cs.read().unwrap();
+    let state = cs.read();
     let mut result = Vec::new();
     for node in state.nodes.values() {
         if !matches!(node.flags, NodeFlags::Master) {
@@ -274,7 +275,7 @@ pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
     use crate::replication::state::generate_repl_id;
     let peer_id = generate_repl_id();
 
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     if state.my_node().addr == addr {
         return Frame::Error(Bytes::from_static(b"ERR Can't MEET myself"));
     }
@@ -304,7 +305,7 @@ pub fn handle_cluster_addslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
         Ok(s) => s,
         Err(e) => return Frame::Error(Bytes::from(e)),
     };
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     for slot in &slots {
         state.my_node_mut().set_slot(*slot);
     }
@@ -322,7 +323,7 @@ pub fn handle_cluster_delslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
         Ok(s) => s,
         Err(e) => return Frame::Error(Bytes::from(e)),
     };
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     for slot in &slots {
         state.my_node_mut().clear_slot(*slot);
     }
@@ -345,7 +346,7 @@ pub fn handle_cluster_setslot(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) ->
         _ => return Frame::Error(Bytes::from_static(b"ERR invalid subcommand")),
     };
 
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     match subop.as_slice() {
         b"MIGRATING" => {
             if args.len() < 3 {
@@ -418,7 +419,7 @@ pub fn handle_cluster_reset(
     _self_addr: SocketAddr,
 ) -> Frame {
     let hard = args.first().map(|a| matches!(a, Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"hard"))).unwrap_or(false);
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     let my_id = state.node_id.clone();
     // Clear slots on my node
     *state.my_node_mut().slots = [0u8; 2048];
@@ -438,7 +439,7 @@ pub fn handle_cluster_replicate(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) 
         return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     }
     let master_id = extract_string(&args[0]);
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
     let my_id = state.node_id.clone();
     if let Some(my_node) = state.nodes.get_mut(&my_id) {
         my_node.flags = NodeFlags::Replica { master_id };
@@ -485,7 +486,7 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
         FailoverMode::Normal
     };
 
-    let mut state = cs.write().unwrap();
+    let mut state = cs.write();
 
     // Must be a replica to failover
     let _master_id = match &state.my_node().flags {
@@ -499,12 +500,18 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
 
     match mode {
         FailoverMode::Normal => {
-            // Set failover_state to trigger election on next gossip tick
-            state.failover_state = crate::cluster::FailoverState::WaitingDelay {
-                start_ms: now_ms(),
-                delay_ms: 0, // gossip ticker will compute actual delay
-            };
-            Frame::SimpleString(Bytes::from_static(b"OK"))
+            // Deep-review R8: this used to park failover_state at
+            // WaitingDelay{delay_ms:0} — which nothing ever consumed (the
+            // ticker's election gate requires FailoverState::None and the
+            // graceful manual-failover protocol is not yet implemented), so
+            // one innocuous admin command permanently disabled AUTOMATIC
+            // failover on the node too. Until the coordinated
+            // (pause-master/offset-sync) protocol lands, fail loudly instead
+            // of wedging.
+            Frame::Error(Bytes::from_static(
+                b"ERR CLUSTER FAILOVER without FORCE or TAKEOVER is not yet supported; \
+                  use CLUSTER FAILOVER FORCE (skip offset sync) or TAKEOVER (skip voting)",
+            ))
         }
         FailoverMode::Force => {
             // Skip voting, promote immediately (master may be unreachable)
@@ -540,7 +547,7 @@ pub fn handle_cluster_count_failure_reports(
     // A report is active when its age is strictly less than 2 * timeout.
     let stale_cutoff = now.saturating_sub(2 * DEFAULT_NODE_TIMEOUT_MS);
 
-    let state = cs.read().unwrap();
+    let state = cs.read();
     let count = match state.nodes.get(&target_id) {
         None => 0i64,
         Some(node) => node
@@ -676,7 +683,7 @@ mod tests {
     fn test_addslots_updates_bitmap() {
         let cs = make_cs();
         {
-            let state = cs.read().unwrap();
+            let state = cs.read();
             assert_eq!(state.assigned_slot_count(), 0);
         }
         let args = vec![
@@ -685,7 +692,7 @@ mod tests {
         ];
         let result = handle_cluster_addslots(&args, &cs);
         assert!(matches!(result, Frame::SimpleString(_)));
-        let state = cs.read().unwrap();
+        let state = cs.read();
         assert_eq!(state.assigned_slot_count(), 2);
         assert!(state.my_node().owns_slot(0));
         assert!(state.my_node().owns_slot(1));
@@ -703,7 +710,7 @@ mod tests {
         ];
         let r = handle_cluster_setslot(&args, &cs);
         assert!(matches!(r, Frame::SimpleString(_)));
-        assert_eq!(cs.read().unwrap().migrating.get(&100), Some(&node_id));
+        assert_eq!(cs.read().migrating.get(&100), Some(&node_id));
     }
 
     /// KEYSLOT: slot_for_key("foo") == 12182 per CRC16-XMODEM.
@@ -719,10 +726,10 @@ mod tests {
         let cs = make_cs();
         // Add slot 5 first
         handle_cluster_addslots(&[Frame::BulkString(bytes::Bytes::from_static(b"5"))], &cs);
-        assert!(cs.read().unwrap().my_node().owns_slot(5));
+        assert!(cs.read().my_node().owns_slot(5));
         // Delete it
         handle_cluster_delslots(&[Frame::BulkString(bytes::Bytes::from_static(b"5"))], &cs);
-        assert!(!cs.read().unwrap().my_node().owns_slot(5));
+        assert!(!cs.read().my_node().owns_slot(5));
     }
 
     /// SETSLOT NODE clears migrating/importing and transfers ownership.
@@ -738,7 +745,7 @@ mod tests {
             Frame::BulkString(bytes::Bytes::from("b".repeat(40))),
         ];
         handle_cluster_setslot(&args, &cs);
-        assert!(cs.read().unwrap().migrating.contains_key(&42));
+        assert!(cs.read().migrating.contains_key(&42));
         // Now SETSLOT 42 NODE <my_id>
         let args2 = vec![
             Frame::BulkString(bytes::Bytes::from_static(b"42")),
@@ -746,7 +753,7 @@ mod tests {
             Frame::BulkString(bytes::Bytes::from(my_id.clone())),
         ];
         handle_cluster_setslot(&args2, &cs);
-        let state = cs.read().unwrap();
+        let state = cs.read();
         assert!(!state.migrating.contains_key(&42));
         assert!(state.my_node().owns_slot(42));
     }
@@ -755,7 +762,7 @@ mod tests {
     #[test]
     fn test_cluster_meet_adds_node() {
         let cs = make_cs();
-        assert_eq!(cs.read().unwrap().nodes.len(), 1);
+        assert_eq!(cs.read().nodes.len(), 1);
         let args = vec![
             Frame::BulkString(bytes::Bytes::from_static(b"MEET")),
             Frame::BulkString(bytes::Bytes::from_static(b"192.168.1.2")),
@@ -763,7 +770,7 @@ mod tests {
         ];
         let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
         assert!(matches!(result, Frame::SimpleString(_)));
-        assert_eq!(cs.read().unwrap().nodes.len(), 2);
+        assert_eq!(cs.read().nodes.len(), 2);
     }
 
     /// Repeated CLUSTER MEET for one address must not stack placeholders:
@@ -781,11 +788,7 @@ mod tests {
             let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
             assert!(matches!(result, Frame::SimpleString(_)));
         }
-        assert_eq!(
-            cs.read().unwrap().nodes.len(),
-            2,
-            "one placeholder, not three"
-        );
+        assert_eq!(cs.read().nodes.len(), 2, "one placeholder, not three");
     }
 
     /// MEET-ing our own advertised address is refused.
@@ -802,7 +805,7 @@ mod tests {
             matches!(result, Frame::Error(_)),
             "self-MEET must be an error"
         );
-        assert_eq!(cs.read().unwrap().nodes.len(), 1);
+        assert_eq!(cs.read().nodes.len(), 1);
     }
 
     /// Helper: create a ClusterState where this node is a replica of a FAIL master.
@@ -812,7 +815,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
         let cs = Arc::new(RwLock::new(ClusterState::new(my_id.clone(), addr)));
         {
-            let mut state = cs.write().unwrap();
+            let mut state = cs.write();
             // Make self a replica
             state.my_node_mut().flags = NodeFlags::Replica {
                 master_id: master_id.clone(),
@@ -857,7 +860,7 @@ mod tests {
         let args = vec![Frame::BulkString(bytes::Bytes::from_static(b"FORCE"))];
         let result = handle_cluster_failover(&args, &cs);
         assert!(matches!(result, Frame::SimpleString(_)));
-        let state = cs.read().unwrap();
+        let state = cs.read();
         assert!(
             matches!(state.my_node().flags, NodeFlags::Master),
             "expected Master after FORCE failover"
@@ -870,11 +873,11 @@ mod tests {
     #[test]
     fn test_failover_takeover_promotes_replica() {
         let cs = make_replica_with_fail_master();
-        let epoch_before = cs.read().unwrap().epoch;
+        let epoch_before = cs.read().epoch;
         let args = vec![Frame::BulkString(bytes::Bytes::from_static(b"TAKEOVER"))];
         let result = handle_cluster_failover(&args, &cs);
         assert!(matches!(result, Frame::SimpleString(_)));
-        let state = cs.read().unwrap();
+        let state = cs.read();
         assert!(
             matches!(state.my_node().flags, NodeFlags::Master),
             "expected Master after TAKEOVER failover"
@@ -908,20 +911,24 @@ mod tests {
         }
     }
 
-    /// CLUSTER FAILOVER (no args) on a replica sets WaitingDelay state.
+    /// R8 (deep review): graceful CLUSTER FAILOVER (no args) used to park
+    /// failover_state at WaitingDelay forever — nothing consumed it, and the
+    /// ticker's election gate requires FailoverState::None, so the command
+    /// permanently disabled automatic failover on the node. Until the
+    /// coordinated protocol exists it must error and leave state untouched.
     #[test]
-    fn test_failover_normal_sets_waiting_delay() {
+    fn test_failover_normal_errors_without_wedging_state() {
         let cs = make_replica_with_fail_master();
         let result = handle_cluster_failover(&[], &cs);
-        assert!(matches!(result, Frame::SimpleString(_)));
-        let state = cs.read().unwrap();
         assert!(
-            matches!(
-                state.failover_state,
-                crate::cluster::FailoverState::WaitingDelay { .. }
-            ),
-            "expected WaitingDelay state, got {:?}",
-            state.failover_state
+            matches!(result, Frame::Error(_)),
+            "graceful failover is unimplemented and must say so, not wedge"
+        );
+        let state = cs.read();
+        assert_eq!(
+            state.failover_state,
+            crate::cluster::FailoverState::None,
+            "failover_state must stay None so automatic failover keeps working"
         );
     }
 
@@ -938,7 +945,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
         let cs = Arc::new(RwLock::new(ClusterState::new(master_id.clone(), addr)));
         {
-            let mut state = cs.write().unwrap();
+            let mut state = cs.write();
             let r1 = ClusterNode::new(
                 replica1_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
@@ -965,7 +972,7 @@ mod tests {
     #[test]
     fn cluster_replicas_returns_empty_for_master_with_no_replicas() {
         let cs = make_cs(); // single-node, no replicas
-        let my_id = cs.read().unwrap().node_id.clone();
+        let my_id = cs.read().node_id.clone();
         let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
         let result = handle_cluster_replicas(&args, &cs);
         match result {
@@ -1136,7 +1143,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
         let cs = Arc::new(RwLock::new(ClusterState::new(my_id.clone(), addr)));
         {
-            let mut state = cs.write().unwrap();
+            let mut state = cs.write();
             // Make self a replica of master_id
             state.my_node_mut().flags = NodeFlags::Replica {
                 master_id: master_id.clone(),
@@ -1187,7 +1194,7 @@ mod tests {
     #[test]
     fn cluster_count_failure_reports_returns_zero_for_healthy_node() {
         let cs = make_cs();
-        let my_id = cs.read().unwrap().node_id.clone();
+        let my_id = cs.read().node_id.clone();
         let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
         let result = handle_cluster_count_failure_reports(&args, &cs);
         assert_eq!(result, Frame::Integer(0));
@@ -1197,10 +1204,10 @@ mod tests {
     #[test]
     fn cluster_count_failure_reports_counts_active_reports() {
         let cs = make_cs();
-        let my_id = cs.read().unwrap().node_id.clone();
+        let my_id = cs.read().node_id.clone();
         let now = now_ms();
         {
-            let mut state = cs.write().unwrap();
+            let mut state = cs.write();
             let node = state.nodes.get_mut(&my_id).unwrap();
             // Two very recent reports
             node.pfail_reports.insert("reporter1".to_string(), now);
@@ -1215,7 +1222,7 @@ mod tests {
     #[test]
     fn cluster_count_failure_reports_excludes_stale_reports() {
         let cs = make_cs();
-        let my_id = cs.read().unwrap().node_id.clone();
+        let my_id = cs.read().node_id.clone();
         // Use absolute timestamps that are unambiguously on each side of any
         // reasonable stale_cutoff, so the test is not sensitive to clock skew
         // between when we insert and when the handler calls now_ms().
@@ -1226,7 +1233,7 @@ mod tests {
         let stale_ts: u64 = 0;
         let active_ts: u64 = u64::MAX / 2;
         {
-            let mut state = cs.write().unwrap();
+            let mut state = cs.write();
             let node = state.nodes.get_mut(&my_id).unwrap();
             node.pfail_reports
                 .insert("stale_reporter".to_string(), stale_ts);

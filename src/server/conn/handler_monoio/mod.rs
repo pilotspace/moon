@@ -1144,6 +1144,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
                 can_inline_writes,
+                // R6: cluster mode disables the inline fast path entirely —
+                // GET/SET must reach try_handle_cluster_routing for MOVED/ASK.
+                crate::cluster::cluster_enabled(),
                 &ctx.runtime_config,
             );
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);

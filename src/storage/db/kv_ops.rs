@@ -294,12 +294,13 @@ impl Database {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");
                 old_cost = entry_overhead(&key, existing);
-                let new_version = existing.version() + 1;
+                let new_version = Entry::bump_version(existing.version());
                 *existing = new_entry;
                 existing.set_version(new_version);
             },
             || {
-                // Miss path: insert entry as-is (version defaults to 0).
+                // Miss path: insert entry as-is (constructors start versions
+                // at INITIAL_VERSION=1 so WATCH can detect creation).
                 entry_cell.take().expect("make closure called once on miss")
             },
         );

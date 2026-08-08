@@ -5,8 +5,9 @@
 //! All I/O is on the listener runtime, never on shard threads.
 #![allow(unused_imports)]
 
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::runtime::cancel::CancellationToken;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,9 +20,12 @@ use crate::cluster::gossip::{
 };
 
 /// Shared vote sender: set by gossip ticker when election starts, cleared when election ends.
-/// Bus handler forwards FailoverAuthAck votes through this channel.
+/// Bus handler forwards FailoverAuthAck votes through this channel as
+/// `(voter_node_id, ack_epoch)` — the epoch lets the election loop discard
+/// stale acks from a previous timed-out election, and the voter id lets it
+/// dedup so one master can never be counted twice (deep-review C2).
 pub type SharedVoteTx =
-    Arc<parking_lot::Mutex<Option<crate::runtime::channel::MpscSender<String>>>>;
+    Arc<parking_lot::Mutex<Option<crate::runtime::channel::MpscSender<(String, u64)>>>>;
 
 /// Maximum time to wait for a gossip message BODY after its 4-byte length
 /// prefix has been read (prod-hardening #10). Without this bound, any TCP
@@ -141,12 +145,12 @@ async fn handle_cluster_peer(
             GossipMsgType::Ping | GossipMsgType::Meet => {
                 // Merge their state into ours
                 {
-                    let mut cs = cluster_state.write().unwrap();
+                    let mut cs = cluster_state.write();
                     merge_gossip_into_state(&mut cs, &msg);
                 }
                 // Respond with PONG
                 let pong = {
-                    let cs = cluster_state.read().unwrap();
+                    let cs = cluster_state.read();
                     build_message(&cs, self_addr, GossipMsgType::Pong)
                 };
                 let pong_bytes = serialize_gossip(&pong);
@@ -155,7 +159,7 @@ async fn handle_cluster_peer(
                 stream.write_all(&pong_bytes).await?;
             }
             GossipMsgType::Pong => {
-                let mut cs = cluster_state.write().unwrap();
+                let mut cs = cluster_state.write();
                 merge_gossip_into_state(&mut cs, &msg);
             }
             GossipMsgType::FailoverAuthRequest => {
@@ -165,7 +169,7 @@ async fn handle_cluster_peer(
                     .to_string();
                 let request_epoch = msg.config_epoch;
                 let voted = {
-                    let mut cs = cluster_state.write().unwrap();
+                    let mut cs = cluster_state.write();
                     crate::cluster::failover::handle_failover_auth_request(
                         &mut cs,
                         &sender_id,
@@ -173,10 +177,16 @@ async fn handle_cluster_peer(
                     )
                 };
                 if voted {
-                    // Send FailoverAuthAck back to the requesting replica
+                    // Send FailoverAuthAck back to the requesting replica on
+                    // THIS stream — the requester holds it open and reads the
+                    // reply (deep-review C1). The ack ECHOES the request
+                    // epoch (not this voter's own config epoch) so the
+                    // requester can bind the vote to its election (C2).
                     let ack = {
-                        let cs = cluster_state.read().unwrap();
-                        build_message(&cs, self_addr, GossipMsgType::FailoverAuthAck)
+                        let cs = cluster_state.read();
+                        let mut m = build_message(&cs, self_addr, GossipMsgType::FailoverAuthAck);
+                        m.config_epoch = request_epoch;
+                        m
                     };
                     let ack_bytes = serialize_gossip(&ack);
                     let len = (ack_bytes.len() as u32).to_be_bytes();
@@ -189,9 +199,12 @@ async fn handle_cluster_peer(
                     .unwrap_or("")
                     .trim_end_matches('\0')
                     .to_string();
-                debug!("Received failover ACK from {}", sender_id);
+                debug!(
+                    "Received failover ACK from {} (epoch {})",
+                    sender_id, msg.config_epoch
+                );
                 if let Some(tx) = vote_tx.lock().as_ref() {
-                    let _ = tx.send(sender_id);
+                    let _ = tx.send((sender_id, msg.config_epoch));
                 }
             }
         }

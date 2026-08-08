@@ -13,16 +13,17 @@
 //! 4. Masters vote if: request_epoch > last_vote_epoch.
 //! 5. Replica receiving majority: promotes itself, takes master's slots.
 
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::cluster::gossip::{GossipMsgType, build_message, serialize_gossip};
+use crate::cluster::gossip::{GossipMsgType, build_message, deserialize_gossip, serialize_gossip};
 use crate::cluster::{ClusterState, FailoverState, NodeFlags};
 
 /// Check if we should initiate failover.
@@ -56,14 +57,28 @@ pub fn check_and_initiate_failover(state: &mut ClusterState, my_repl_offset: u64
 
     // Increment epoch for this failover attempt
     state.epoch += 1;
+    promote_self_to_master(state, &master_id);
 
-    // Promote ourselves locally
-    // (Awaiting majority votes before taking over master's slots is handled async)
+    true
+}
+
+/// Promote this node to master AT THE CURRENT config epoch, taking over
+/// `master_id`'s slots.
+///
+/// Deliberately does NOT bump `state.epoch`: the election-win path already
+/// incremented it when requesting votes, and a second bump here (deep-review
+/// C4) made the winner claim an epoch nobody voted for — defeating the
+/// `last_vote_epoch` single-vote-per-epoch guarantee and enabling epoch ties
+/// gossip's strict-`>` merge cannot resolve. Callers that skip voting
+/// (FORCE/TAKEOVER, via `check_and_initiate_failover`) bump the epoch
+/// themselves before calling.
+pub fn promote_self_to_master(state: &mut ClusterState, master_id: &str) {
     state.my_node_mut().flags = NodeFlags::Master;
-    state.my_node_mut().epoch = state.epoch;
+    let epoch = state.epoch;
+    state.my_node_mut().epoch = epoch;
 
     // Transfer master's slots to ourselves
-    let master_slots = state.nodes.get(&master_id).map(|n| n.slots.clone());
+    let master_slots = state.nodes.get(master_id).map(|n| n.slots.clone());
 
     if let Some(slots) = master_slots {
         let my_node = state.my_node_mut();
@@ -75,11 +90,9 @@ pub fn check_and_initiate_failover(state: &mut ClusterState, my_repl_offset: u64
     }
 
     // Remove the failed master from active routing (keep in nodes for history)
-    if let Some(failed) = state.nodes.get_mut(&master_id) {
+    if let Some(failed) = state.nodes.get_mut(master_id) {
         failed.flags = NodeFlags::Fail;
     }
-
-    true
 }
 
 /// Determine if this master should grant a failover vote.
@@ -188,7 +201,8 @@ pub async fn run_election_task(
     cluster_state: Arc<RwLock<ClusterState>>,
     self_addr: SocketAddr,
     _my_repl_offset: u64,
-    vote_rx: crate::runtime::channel::MpscReceiver<String>,
+    vote_rx: crate::runtime::channel::MpscReceiver<(String, u64)>,
+    vote_tx: crate::runtime::channel::MpscSender<(String, u64)>,
 ) {
     // Compute delay (rank 0 for now; multi-replica ranking is future work)
     let replica_rank = 0u32;
@@ -196,7 +210,7 @@ pub async fn run_election_task(
 
     // Set state to WaitingDelay
     {
-        let mut cs = cluster_state.write().unwrap();
+        let mut cs = cluster_state.write();
         cs.failover_state = FailoverState::WaitingDelay {
             start_ms: now_ms(),
             delay_ms: delay,
@@ -207,7 +221,7 @@ pub async fn run_election_task(
 
     // Increment epoch and build FailoverAuthRequest
     let (new_epoch, quorum, master_addrs) = {
-        let mut cs = cluster_state.write().unwrap();
+        let mut cs = cluster_state.write();
         cs.epoch += 1;
         let new_epoch = cs.epoch;
         let quorum = cs.quorum();
@@ -232,22 +246,53 @@ pub async fn run_election_task(
 
     // Build the auth request message
     let auth_msg = {
-        let cs = cluster_state.read().unwrap();
+        let cs = cluster_state.read();
         let mut msg = build_message(&cs, self_addr, GossipMsgType::FailoverAuthRequest);
         msg.config_epoch = new_epoch;
         msg
     };
 
-    // Send to all masters
+    // Send to all masters and READ each ack back on the same stream
+    // (deep-review C1): the previous fire-and-forget dropped the stream
+    // before the master's reply, and no master ever dials our bus to deliver
+    // an ack any other way — every multi-voter election timed out. The bus
+    // inbound FailoverAuthAck arm remains as a secondary path.
     let data = serialize_gossip(&auth_msg);
     for addr in &master_addrs {
         let data = data.clone();
         let addr = *addr;
+        let tx = vote_tx.clone();
         tokio::spawn(async move {
-            if let Ok(mut stream) = TcpStream::connect(addr).await {
-                let len = (data.len() as u32).to_be_bytes();
-                let _ = stream.write_all(&len).await;
-                let _ = stream.write_all(&data).await;
+            let Ok(mut stream) = TcpStream::connect(addr).await else {
+                return;
+            };
+            let len = (data.len() as u32).to_be_bytes();
+            if stream.write_all(&len).await.is_err() || stream.write_all(&data).await.is_err() {
+                return;
+            }
+            let read_ack = async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await.ok()?;
+                let body_len = u32::from_be_bytes(len_buf) as usize;
+                if body_len == 0 || body_len > crate::cluster::bus::MAX_GOSSIP_FRAME_LEN {
+                    return None;
+                }
+                let mut buf = vec![0u8; body_len];
+                stream.read_exact(&mut buf).await.ok()?;
+                deserialize_gossip(&buf).ok()
+            };
+            // Bounded: a master that voted NO sends nothing and we must not
+            // hold the task past the election deadline.
+            let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), read_ack).await
+            else {
+                return;
+            };
+            if msg.msg_type == GossipMsgType::FailoverAuthAck {
+                let voter = String::from_utf8_lossy(&msg.sender_node_id)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let _ = tx.send((voter, msg.config_epoch));
             }
         });
     }
@@ -259,8 +304,14 @@ pub async fn run_election_task(
         quorum
     );
 
-    // Collect votes with 5-second timeout
+    // Collect votes with 5-second timeout. Dedup by voter id and bind each
+    // ack to THIS election's epoch (deep-review C2): without these, a stale
+    // ack from a previous timed-out election — or repeated acks from one
+    // voter — could fabricate quorum with fewer distinct voters.
     let mut votes: u32 = 1; // self-vote
+    let mut voters_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let my_id = { cluster_state.read().node_id.clone() };
+    voters_seen.insert(my_id);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
@@ -272,9 +323,19 @@ pub async fn run_election_task(
             break;
         }
         match tokio::time::timeout(remaining, vote_rx.recv_async()).await {
-            Ok(Ok(_voter_id)) => {
+            Ok(Ok((voter_id, ack_epoch))) => {
+                if ack_epoch != new_epoch {
+                    debug!(
+                        "Ignoring stale failover ack from {} (epoch {} != {})",
+                        voter_id, ack_epoch, new_epoch
+                    );
+                    continue;
+                }
+                if !voters_seen.insert(voter_id) {
+                    continue; // duplicate ack from the same voter
+                }
                 votes += 1;
-                let mut cs = cluster_state.write().unwrap();
+                let mut cs = cluster_state.write();
                 if let FailoverState::WaitingVotes {
                     ref mut votes_received,
                     ..
@@ -292,15 +353,24 @@ pub async fn run_election_task(
             "Failover election won: epoch={}, votes={}/{}",
             new_epoch, votes, quorum
         );
-        let mut cs = cluster_state.write().unwrap();
-        check_and_initiate_failover(&mut cs, _my_repl_offset);
+        let mut cs = cluster_state.write();
+        // Promote at the epoch the votes were granted for — NOT via
+        // check_and_initiate_failover, whose extra epoch increment claimed
+        // an unvoted epoch (deep-review C4).
+        let master_id = match &cs.my_node().flags {
+            NodeFlags::Replica { master_id } => Some(master_id.clone()),
+            _ => None,
+        };
+        if let Some(master_id) = master_id {
+            promote_self_to_master(&mut cs, &master_id);
+        }
         cs.failover_state = FailoverState::None;
     } else {
         warn!(
             "Failover election timed out: epoch={}, votes={}/{}",
             new_epoch, votes, quorum
         );
-        let mut cs = cluster_state.write().unwrap();
+        let mut cs = cluster_state.write();
         cs.failover_state = FailoverState::None;
     }
 }
@@ -362,6 +432,43 @@ mod tests {
         assert!(matches!(state.my_node().flags, NodeFlags::Master));
         // We should have inherited master's slots
         assert!(state.my_node().owns_slot(50));
+    }
+
+    /// C4 (deep review): the election-win path must promote at the epoch the
+    /// votes were granted for. check_and_initiate_failover's extra increment
+    /// made the winner claim an unvoted epoch, defeating the
+    /// last_vote_epoch single-vote-per-epoch guarantee.
+    #[test]
+    fn test_promote_self_keeps_voted_epoch() {
+        let my_id = "a".repeat(40);
+        let master_id = "b".repeat(40);
+        let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
+        state.my_node_mut().flags = NodeFlags::Replica {
+            master_id: master_id.clone(),
+        };
+        let mut master = crate::cluster::ClusterNode::new(
+            master_id.clone(),
+            test_addr(6380),
+            NodeFlags::Fail,
+            0,
+        );
+        for s in 0u16..=100 {
+            master.set_slot(s);
+        }
+        state.nodes.insert(master_id.clone(), master);
+
+        // Simulate the election task's own increment (the voted epoch).
+        state.epoch += 1;
+        let voted_epoch = state.epoch;
+
+        promote_self_to_master(&mut state, &master_id);
+        assert!(matches!(state.my_node().flags, NodeFlags::Master));
+        assert!(state.my_node().owns_slot(50));
+        assert_eq!(
+            state.epoch, voted_epoch,
+            "promotion must not claim an epoch nobody voted for"
+        );
+        assert_eq!(state.my_node().epoch, voted_epoch);
     }
 
     /// Pitfall 8: double-vote prevention.

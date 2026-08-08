@@ -298,6 +298,7 @@ fn test_inline_mixed_batch() {
         0,
         1,
         false,
+        false,
         &rt_config,
     );
     assert_eq!(total, 1);
@@ -432,11 +433,54 @@ fn test_inline_multiple_gets() {
         0,
         1,
         false,
+        false,
         &rt_config,
     );
     assert_eq!(total, 2);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$1\r\n1\r\n$1\r\n2\r\n");
+}
+
+/// R6 (deep review): in cluster mode the inline fast path must inline
+/// NOTHING — a GET/SET served locally here would bypass MOVED/ASK routing
+/// entirely (misplaced writes, stale reads for slots owned elsewhere).
+#[test]
+fn test_inline_loop_disabled_in_cluster_mode() {
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"bar")),
+        );
+    });
+    let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    let total = try_inline_dispatch_loop(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true, // even with writes inlinable...
+        true, // ...cluster mode wins: nothing may inline
+        &rt_config,
+    );
+    assert_eq!(
+        total, 0,
+        "cluster mode must fall through to generic dispatch"
+    );
+    assert!(
+        !read_buf.is_empty(),
+        "command must remain for the generic loop"
+    );
+    assert!(write_buf.is_empty());
 }
 
 /// task #59 (coverage-gap fix, review round 3): plain `GET key` for a key

@@ -1976,7 +1976,15 @@ pub(crate) fn try_inline_dispatch(
 
 /// Loop wrapper: call try_inline_dispatch repeatedly until it returns 0.
 /// Returns total number of commands inlined.
+///
+/// `cluster_enabled` must carry `crate::cluster::cluster_enabled()` (a param
+/// for unit-testability): in cluster mode NOTHING may inline — reads and
+/// writes alike must reach the generic dispatch loop's
+/// `try_handle_cluster_routing` so mis-routed keys get MOVED/ASK instead of
+/// being silently served/misplaced against the local DashTable (deep-review
+/// R6 — the classic "three dispatch paths" gap).
 #[cfg(feature = "runtime-monoio")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_inline_dispatch_loop(
     read_buf: &mut BytesMut,
     write_buf: &mut BytesMut,
@@ -1990,8 +1998,12 @@ pub(crate) fn try_inline_dispatch_loop(
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
+    cluster_enabled: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
+    if cluster_enabled {
+        return 0;
+    }
     let mut total = 0;
     loop {
         let n = try_inline_dispatch(

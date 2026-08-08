@@ -65,7 +65,7 @@ pub(crate) struct ConnectionContext {
     /// dispatch by `try_enforce_readonly` to avoid the per-command RwLock CAS.
     /// `None` when replication is disabled entirely.
     pub is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
-    pub cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    pub cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     pub config_port: u16,
@@ -108,7 +108,7 @@ impl ConnectionContext {
         aof_pool: Option<Arc<AofWriterPool>>,
         tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
         repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
-        cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+        cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
         lua: Rc<mlua::Lua>,
         script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
         config_port: u16,

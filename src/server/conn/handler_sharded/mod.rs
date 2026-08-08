@@ -852,8 +852,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let maybe_key = extract_primary_key(cmd, cmd_args);
                             if let Some(key) = maybe_key {
                                 let slot = crate::cluster::slots::slot_for_key(key);
-                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let route = cs.read().unwrap().route_slot(slot, was_asking);
+                                let route = cs.read().route_slot(slot, was_asking);
                                 match route {
                                     crate::cluster::SlotRoute::Local => {}
                                     other => {

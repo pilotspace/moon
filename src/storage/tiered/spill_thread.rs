@@ -151,6 +151,26 @@ pub fn spill_batches_flushed_total() -> u64 {
     SPILL_BATCHES_FLUSHED.load(Ordering::Relaxed)
 }
 
+/// Cumulative keys re-inserted into the hot table after a FAILED spill write
+/// (deep-review F1). Every increment means a pwrite failed (ENOSPC/EIO) after
+/// the key was already evicted from RAM; without the re-insert the key would
+/// read as nil until an AOF-replay restart. Exposed as
+/// `spill_failed_reinserted` in INFO — a nonzero value is an operator signal
+/// that the spill volume is failing writes.
+static SPILL_FAILED_REINSERTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative failed-spill hot re-inserts. Exposed for INFO / metrics.
+#[inline]
+pub fn spill_failed_reinserted_total() -> u64 {
+    SPILL_FAILED_REINSERTED.load(Ordering::Relaxed)
+}
+
+/// Record one failed-spill hot re-insert.
+#[inline]
+pub fn record_spill_failed_reinserted() {
+    SPILL_FAILED_REINSERTED.fetch_add(1, Ordering::Relaxed);
+}
+
 use bytes::Bytes;
 use tracing::warn;
 
@@ -166,6 +186,10 @@ use crate::storage::tiered::kv_spill::{
 ///
 /// Contains all data needed for pwrite -- no references to shard state.
 /// `Bytes` fields are reference-counted (cheap clone on event loop side).
+/// `Clone` exists so a FAILED write can carry the request back to the event
+/// loop for hot re-insert (deep-review F1) — cheap: both payload fields are
+/// refcounted `Bytes`.
+#[derive(Clone)]
 pub struct SpillRequest {
     pub key: Bytes,
     /// Logical database index the key was evicted from. Used by completion
@@ -208,6 +232,11 @@ pub struct SpillCompletionEntry {
     /// event loop can populate `ColdLocation::value_type` (#364: SCAN TYPE
     /// filter over cold keys) without re-reading the just-written file.
     pub value_type: ValueType,
+    /// The originating request's `file_id` (each request gets a unique
+    /// monotonic id even when batching flushes many requests into one
+    /// file). Lets the completion handler retire the per-key in-flight
+    /// spill record for exactly this request (stale-shadow guard).
+    pub req_file_id: u64,
 }
 
 /// Completion sent from background thread back to event loop.
@@ -221,6 +250,11 @@ pub struct SpillCompletion {
     pub entries: Vec<SpillCompletionEntry>,
     /// Whether the pwrite succeeded. If false, no entries should be indexed.
     pub success: bool,
+    /// On failure: the original request, so the event loop can re-insert the
+    /// already-evicted key into the hot table (deep-review F1 — without this
+    /// the key exists in neither plane and reads nil until restart).
+    /// Always `None` on success.
+    pub failed_request: Option<Box<SpillRequest>>,
 }
 
 /// Build a `FileEntry` skeleton for a spill file (fields not tracked by Moon are zero).
@@ -339,12 +373,14 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                                 slot_idx,
                                 ttl_ms: req.ttl_ms,
                                 value_type: req.value_type,
+                                req_file_id: req.file_id,
                             })
                             .collect();
                         completions.push(SpillCompletion {
                             file_entry: make_file_entry(file_id, total_pages, byte_size, chunk_db),
                             entries,
                             success: true,
+                            failed_request: None,
                         });
                     }
                     Err(e) => {
@@ -408,8 +444,10 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     slot_idx: 0,
                     ttl_ms: req.ttl_ms,
                     value_type: req.value_type,
+                    req_file_id: req.file_id,
                 }],
                 success: true,
+                failed_request: None,
             },
             Err(e) => {
                 warn!(
@@ -422,6 +460,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                     entries: Vec::new(),
                     success: false,
+                    failed_request: Some(Box::new(req.clone())),
                 }
             }
         },
@@ -436,6 +475,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                 file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                 entries: Vec::new(),
                 success: false,
+                failed_request: Some(Box::new(req.clone())),
             }
         }
     }
@@ -708,6 +748,36 @@ mod tests {
         completions
     }
 
+    /// F1 (deep review): a failed spill write must carry the original request
+    /// back so the event loop can re-insert the already-evicted key.
+    #[test]
+    fn failed_spill_write_carries_request_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Make shard_dir an existing FILE so the spill write cannot succeed.
+        let bogus_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&bogus_dir, b"occupied").unwrap();
+
+        let req = SpillRequest {
+            key: Bytes::from_static(b"lost-key"),
+            db_index: 3,
+            value_bytes: Bytes::from_static(b"payload"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: Some(12345),
+            file_id: 42,
+            shard_dir: bogus_dir,
+        };
+        let completion = spill_single_entry(&req, req.file_id);
+        assert!(!completion.success);
+        let carried = completion
+            .failed_request
+            .expect("failure completion must carry the request payload back");
+        assert_eq!(carried.key, req.key);
+        assert_eq!(carried.db_index, 3);
+        assert_eq!(carried.value_bytes, req.value_bytes);
+        assert_eq!(carried.ttl_ms, Some(12345));
+    }
+
     #[test]
     fn pace_is_zero_when_no_readers_waiting() {
         assert_eq!(
@@ -888,6 +958,7 @@ mod tests {
             file_entry: make_file_entry(7, 1, PAGE_4K as u64, 0),
             entries: Vec::new(),
             success: true,
+            failed_request: None,
         };
 
         // Saturate the single slot so the next send must wait for a free slot.

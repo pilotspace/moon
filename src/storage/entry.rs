@@ -309,22 +309,33 @@ pub fn lfu_log_incr(counter: u8, lfu_log_factor: u8) -> u8 {
 }
 
 /// Time-based decay for LFU counter.
+///
+/// `last_access` is the full u32 epoch-seconds clock (same domain as
+/// `current_secs()`). `saturating_sub` rather than `wrapping_sub`: around the
+/// year-2106 clock wrap (or transient cross-thread cache skew) a "future"
+/// last_access must yield zero decay, not a near-2^32 elapsed time that would
+/// zero every counter.
 pub fn lfu_decay(counter: u8, last_access: u32, lfu_decay_time: u64) -> u8 {
     if lfu_decay_time == 0 {
         return counter;
     }
     let now = current_secs();
-    let elapsed_secs = now.wrapping_sub(last_access) as u64;
+    let elapsed_secs = now.saturating_sub(last_access) as u64;
     let elapsed_min = elapsed_secs / 60;
-    let decay = (elapsed_min / lfu_decay_time) as u8;
+    let decay = (elapsed_min / lfu_decay_time).min(u8::MAX as u64) as u8;
     counter.saturating_sub(decay)
 }
 
-/// Pack last_access (16 bits), version (8 bits), and access_counter (8 bits) into a u32.
-/// Layout: [last_access:16 | version:8 | access_counter:8]
+/// First version assigned to a newly created entry. Never 0: `get_version()`
+/// returns 0 for a missing key, so WATCH distinguishes "key created between
+/// WATCH and EXEC" from "key still absent" only if live entries never report 0.
+pub const INITIAL_VERSION: u32 = 1;
+
+/// Pack version (24 bits) and access_counter (8 bits) into a u32.
+/// Layout: [version:24 | access_counter:8]
 #[inline]
-fn pack_metadata_u32(last_access: u16, version: u8, access_counter: u8) -> u32 {
-    ((last_access as u32) << 16) | ((version as u32) << 8) | (access_counter as u32)
+fn pack_metadata_u32(version: u32, access_counter: u8) -> u32 {
+    ((version & 0xFF_FFFF) << 8) | (access_counter as u32)
 }
 
 /// A compact 32-byte entry in the database, wrapping a CompactValue with TTL and packed metadata.
@@ -336,8 +347,12 @@ fn pack_metadata_u32(last_access: u16, version: u8, access_counter: u8) -> u32 {
 ///   overflow fix, then W3 used the extra range to store milliseconds instead of seconds —
 ///   PEXPIRE/PEXPIREAT precision previously truncated to whole seconds, expiring keys up to
 ///   999ms EARLY and misreporting PTTL).
-/// - `metadata: u32` (4 bytes, offset 24) -- packed [last_access:16 | version:8 | counter:8]
-/// - _pad: u32 (4 bytes, offset 28) -- alignment padding
+/// - `metadata: u32` (4 bytes, offset 24) -- packed [version:24 | counter:8]
+/// - `last_access_secs: u32` (4 bytes, offset 28) -- full epoch-seconds LRU clock
+///   (formerly alignment padding; repurposed so LRU/LFU/IDLETIME are exact
+///   beyond the old 16-bit field's 18.2h wrap, at zero size cost). The freed
+///   16 metadata bits widened `version` 8→24 bits, pushing the WATCH/EXEC ABA
+///   window from 256 to 16.7M intervening writes.
 ///
 /// NOTE: the size changed from 24 → 32 bytes when the TTL field was widened from u32 to u64.
 /// Memory overhead per key increases by 8 bytes (1/3 overhead on a 100M-key dataset = ~800 MB).
@@ -349,9 +364,10 @@ pub struct CompactEntry {
     pub value: CompactValue,
     /// Absolute expiry time in Unix milliseconds. 0 = no expiry.
     pub ttl_ms: u64,
-    /// Packed metadata: [last_access:16 | version:8 | access_counter:8]
+    /// Packed metadata: [version:24 | access_counter:8]
     pub metadata: u32,
-    _pad: u32,
+    /// Last access time, full epoch seconds (`current_secs()` domain).
+    last_access_secs: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<CompactEntry>() == 32);
@@ -362,16 +378,16 @@ pub type Entry = CompactEntry;
 impl CompactEntry {
     // --- Accessor methods for packed metadata ---
 
-    /// Get the version (8-bit, wraps at 0xFF).
+    /// Get the version (24-bit, wraps to [`INITIAL_VERSION`], never 0).
     #[inline]
     pub fn version(&self) -> u32 {
-        ((self.metadata >> 8) & 0xFF) as u32
+        (self.metadata >> 8) & 0xFF_FFFF
     }
 
-    /// Get the last access time (16-bit relative seconds).
+    /// Get the last access time (full u32 epoch seconds).
     #[inline]
     pub fn last_access(&self) -> u32 {
-        (self.metadata >> 16) as u32
+        self.last_access_secs
     }
 
     /// Get the LFU access counter (8-bit Morris counter).
@@ -380,18 +396,16 @@ impl CompactEntry {
         (self.metadata & 0xFF) as u8
     }
 
-    /// Set the version (8-bit, truncated to lower 8 bits).
+    /// Set the version (24-bit, truncated to lower 24 bits).
     #[inline]
     pub fn set_version(&mut self, v: u32) {
-        let v8 = (v & 0xFF) as u8;
-        self.metadata = (self.metadata & !(0xFF << 8)) | ((v8 as u32) << 8);
+        self.metadata = (self.metadata & 0xFF) | ((v & 0xFF_FFFF) << 8);
     }
 
-    /// Set the last access time (truncated to 16 bits).
+    /// Set the last access time (full u32 epoch seconds).
     #[inline]
     pub fn set_last_access(&mut self, t: u32) {
-        let t16 = (t & 0xFFFF) as u16;
-        self.metadata = (self.metadata & 0xFFFF) | ((t16 as u32) << 16);
+        self.last_access_secs = t;
     }
 
     /// Set the LFU access counter.
@@ -400,11 +414,18 @@ impl CompactEntry {
         self.metadata = (self.metadata & !0xFF) | (c as u32);
     }
 
-    /// Increment version, wrapping at 0xFF.
+    /// Next version after `v`: 24-bit wrap that skips 0 (the WATCH
+    /// "key absent" sentinel — see [`INITIAL_VERSION`]).
+    #[inline]
+    pub fn bump_version(v: u32) -> u32 {
+        let n = (v + 1) & 0xFF_FFFF;
+        if n == 0 { INITIAL_VERSION } else { n }
+    }
+
+    /// Increment version (24-bit wrap, skips 0).
     #[inline]
     pub fn increment_version(&mut self) {
-        let v = ((self.version() + 1) & 0xFF) as u32;
-        self.set_version(v);
+        self.set_version(Self::bump_version(self.version()));
     }
 
     // --- Expiry helpers ---
@@ -465,8 +486,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -475,8 +496,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
             ttl_ms: expires_at_ms,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -485,8 +506,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Hash(HashMap::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -495,8 +516,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -505,8 +526,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -518,8 +539,8 @@ impl CompactEntry {
                 scores: BTreeMap::new(),
             }),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -528,8 +549,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::HashListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -538,8 +559,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::ListListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -548,8 +569,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -558,8 +579,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetIntset(Intset::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -571,8 +592,8 @@ impl CompactEntry {
                 members: HashMap::new(),
             }),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -581,8 +602,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -591,8 +612,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Stream(Box::new(StreamData::new()))),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
-            _pad: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
         }
     }
 
@@ -619,7 +640,7 @@ mod tests {
         assert!(!entry.has_expiry());
         assert_eq!(entry.ttl_ms, 0);
         assert_eq!(entry.value.type_name(), "string");
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
     }
 
@@ -633,7 +654,7 @@ mod tests {
         let recovered_ms = entry.expires_at_ms();
         // Allow 1 second tolerance due to integer division
         assert!((recovered_ms as i64 - exp_ms as i64).unsigned_abs() < 1000);
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
     }
 
@@ -665,7 +686,7 @@ mod tests {
         let entry = Entry::new_hash();
         assert!(!entry.has_expiry());
         assert_eq!(entry.value.type_name(), "hash");
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
     }
 
     #[test]
@@ -673,7 +694,7 @@ mod tests {
         let entry = Entry::new_list();
         assert!(!entry.has_expiry());
         assert_eq!(entry.value.type_name(), "list");
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
     }
 
     #[test]
@@ -681,7 +702,7 @@ mod tests {
         let entry = Entry::new_set();
         assert!(!entry.has_expiry());
         assert_eq!(entry.value.type_name(), "set");
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
     }
 
     #[test]
@@ -689,7 +710,7 @@ mod tests {
         let entry = Entry::new_sorted_set();
         assert!(!entry.has_expiry());
         assert_eq!(entry.value.type_name(), "zset");
-        assert_eq!(entry.version(), 0);
+        assert_eq!(entry.version(), INITIAL_VERSION);
     }
 
     #[test]
@@ -760,30 +781,63 @@ mod tests {
     #[test]
     fn test_metadata_packing_roundtrip() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
-        // Test version (8-bit: max 255)
-        entry.set_version(123);
-        assert_eq!(entry.version(), 123);
-        // Test last_access (16-bit: max 65535)
-        entry.set_last_access(54321);
-        // last_access truncates to u16
-        assert_eq!(entry.last_access(), 54321);
-        // version should be preserved
-        assert_eq!(entry.version(), 123);
+        // Version is 24-bit: values beyond the old 8-bit range must survive.
+        entry.set_version(123_456);
+        assert_eq!(entry.version(), 123_456);
+        // last_access is full u32 seconds — no 16-bit truncation.
+        entry.set_last_access(1_754_000_000);
+        assert_eq!(entry.last_access(), 1_754_000_000);
+        // version preserved across last_access writes
+        assert_eq!(entry.version(), 123_456);
         // Test access_counter
         entry.set_access_counter(42);
         assert_eq!(entry.access_counter(), 42);
         // Other fields preserved
-        assert_eq!(entry.version(), 123);
-        assert_eq!(entry.last_access(), 54321);
+        assert_eq!(entry.version(), 123_456);
+        assert_eq!(entry.last_access(), 1_754_000_000);
     }
 
     #[test]
-    fn test_increment_version_wraps_at_8bit() {
+    fn test_increment_version_wraps_24bit_skipping_zero() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
-        entry.set_version(0xFF);
-        assert_eq!(entry.version(), 0xFF);
+        entry.set_version(0xFF_FFFF);
+        assert_eq!(entry.version(), 0xFF_FFFF);
+        // Wrap must skip 0: version 0 is the WATCH "key absent" sentinel, so a
+        // live entry may never report it.
         entry.increment_version();
-        assert_eq!(entry.version(), 0); // wraps
+        assert_eq!(entry.version(), 1);
+    }
+
+    #[test]
+    fn test_new_entries_start_at_version_one() {
+        // WATCH creation-detection: get_version() returns 0 for a missing key,
+        // so a freshly created entry must NOT also report 0.
+        let entry = Entry::new_string(Bytes::from_static(b"test"));
+        assert_ne!(entry.version(), 0);
+    }
+
+    #[test]
+    fn test_lfu_decay_full_domain_via_entry() {
+        // Regression: lfu_decay used to receive the 16-bit-truncated
+        // last_access and subtract it from the full u32 clock, making the
+        // decay value effectively random. With the full-width field, a key
+        // idle 2h decays by exactly 120 (minutes) at lfu_decay_time=1.
+        let now = current_secs();
+        let mut entry = Entry::new_string(Bytes::from_static(b"test"));
+        entry.set_last_access(now - 7200);
+        assert_eq!(lfu_decay(200, entry.last_access(), 1), 200 - 120);
+        // A key idle long enough saturates to 0 rather than wrapping.
+        entry.set_last_access(now - 40_000);
+        assert_eq!(lfu_decay(200, entry.last_access(), 1), 0);
+    }
+
+    #[test]
+    fn test_last_access_survives_long_idle() {
+        // Regression: an 18.2h+ idle time must not wrap (OBJECT IDLETIME).
+        let now = current_secs();
+        let mut entry = Entry::new_string(Bytes::from_static(b"test"));
+        entry.set_last_access(now - 100_000); // ~27.8h
+        assert_eq!(now - entry.last_access(), 100_000);
     }
 
     #[test]

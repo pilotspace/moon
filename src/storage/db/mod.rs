@@ -198,6 +198,18 @@ pub struct Database {
     pub cold_shard_dir: Option<std::path::PathBuf>,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
+    /// Newest in-flight async-spill request id per key (deep-review P2
+    /// stale-shadow guard). Marked at enqueue (`evict_one_async_spill`),
+    /// consumed when that request's completion applies. The failure
+    /// re-insert arm uses it to detect that a NEWER spill superseded the
+    /// failed one (key re-created and re-evicted while the failed pwrite
+    /// was in flight) — re-inserting the older payload would shadow the
+    /// newer cold value. Touched only on evict/completion paths, never on
+    /// command dispatch. A dropped completion (see
+    /// `spill_completion_dropped_total`) can strand an entry until the key
+    /// is next evicted — bounded and harmless (a stale id only ever
+    /// SUPPRESSES a re-insert of an equally stale payload).
+    spill_inflight: std::collections::HashMap<bytes::Bytes, u64>,
 }
 
 impl Database {
@@ -213,6 +225,7 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+            spill_inflight: std::collections::HashMap::new(),
         }
     }
 
@@ -237,6 +250,28 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+            spill_inflight: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record `req_id` as the newest in-flight async-spill request for
+    /// `key` (called at enqueue time, before the hot entry is removed).
+    pub fn spill_inflight_mark(&mut self, key: bytes::Bytes, req_id: u64) {
+        self.spill_inflight.insert(key, req_id);
+    }
+
+    /// True when `req_id` is still the newest recorded spill request for
+    /// `key` — i.e. no later eviction re-enqueued the key while this
+    /// request was in flight.
+    pub fn spill_inflight_is_newest(&self, key: &[u8], req_id: u64) -> bool {
+        self.spill_inflight.get(key) == Some(&req_id)
+    }
+
+    /// Consume the in-flight record for `key` if (and only if) it belongs
+    /// to `req_id`; a newer request's record is left for its own completion.
+    pub fn spill_inflight_clear(&mut self, key: &[u8], req_id: u64) {
+        if self.spill_inflight.get(key) == Some(&req_id) {
+            self.spill_inflight.remove(key);
         }
     }
 
@@ -751,22 +786,23 @@ mod tests {
     #[test]
     fn test_version_tracking() {
         let mut db = Database::new();
+        // 0 is reserved for "key absent" so WATCH detects creation.
         assert_eq!(db.get_version(b"key"), 0);
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
-        assert_eq!(db.get_version(b"key"), 0); // first set, version 0
+        assert_eq!(db.get_version(b"key"), 1); // first set: INITIAL_VERSION
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
-        assert_eq!(db.get_version(b"key"), 1); // second set, version 0+1=1
+        assert_eq!(db.get_version(b"key"), 2); // overwrite bumps
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
-        assert_eq!(db.get_version(b"key"), 2);
+        assert_eq!(db.get_version(b"key"), 3);
     }
 
     #[test]
     fn test_increment_version() {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
-        assert_eq!(db.get_version(b"key"), 0);
-        db.increment_version(b"key");
         assert_eq!(db.get_version(b"key"), 1);
+        db.increment_version(b"key");
+        assert_eq!(db.get_version(b"key"), 2);
         // non-existent key is a no-op
         db.increment_version(b"missing");
     }
@@ -1148,5 +1184,27 @@ mod tests {
         assert!(!db.exists(b"nope"));
         let now_ms = db.now_ms();
         assert!(!db.exists_if_alive(b"nope", now_ms));
+    }
+
+    /// Deep-review P2 stale-shadow guard: a failed spill completion for a
+    /// SUPERSEDED request (key re-created and re-evicted while the failed
+    /// pwrite was in flight) must be detectable, and the superseded
+    /// completion's cleanup must not drop the newer request's record.
+    #[test]
+    fn spill_inflight_supersession_guard() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k.clone(), 7);
+        assert!(db.spill_inflight_is_newest(b"k", 7));
+        // Key re-evicted with a newer request: 7 is now superseded — its
+        // failure arm must NOT re-insert its stale payload.
+        db.spill_inflight_mark(k, 9);
+        assert!(!db.spill_inflight_is_newest(b"k", 7));
+        // The superseded completion's clear leaves the newer record intact.
+        db.spill_inflight_clear(b"k", 7);
+        assert!(db.spill_inflight_is_newest(b"k", 9));
+        // The newest completion consumes its own record.
+        db.spill_inflight_clear(b"k", 9);
+        assert!(!db.spill_inflight_is_newest(b"k", 9));
     }
 }

@@ -87,18 +87,22 @@ pub struct TrackingTable {
     /// Redirect map: source_client_id -> target_client_id
     redirects: HashMap<u64, u64>,
     /// Maximum keys tracked (bounded table)
-    #[allow(dead_code)]
     max_keys: usize,
 }
 
 impl TrackingTable {
     pub fn new() -> Self {
+        Self::with_max_keys(1_000_000)
+    }
+
+    /// Construct with an explicit key cap (tests; production uses `new`).
+    pub fn with_max_keys(max_keys: usize) -> Self {
         Self {
             key_clients: HashMap::new(),
             bcast_clients: Vec::new(),
             client_channels: HashMap::new(),
             redirects: HashMap::new(),
-            max_keys: 1_000_000,
+            max_keys,
         }
     }
 
@@ -120,11 +124,51 @@ impl TrackingTable {
     }
 
     /// Track that a client has read a key (normal mode).
-    pub fn track_key(&mut self, client_id: u64, key: &Bytes, noloop: bool) {
-        let clients = self.key_clients.entry(key.clone()).or_insert_with(Vec::new);
-        if !clients.iter().any(|(id, _)| *id == client_id) {
-            clients.push((client_id, noloop));
+    ///
+    /// Enforces the `max_keys` bound (deep-review G1: the documented cap was
+    /// dead code, so a long-lived tracking client reading many distinct
+    /// never-written keys grew this table without limit). When tracking a NEW
+    /// key would exceed the cap, an arbitrary existing entry is evicted and
+    /// its `(key, senders)` returned — the caller must push an invalidation
+    /// for it so the evicted key's clients drop their cached copy (Redis's
+    /// "fake invalidation" on tracking-table eviction). Returns `None` when
+    /// no eviction occurred.
+    pub fn track_key(
+        &mut self,
+        client_id: u64,
+        key: &Bytes,
+        noloop: bool,
+    ) -> Option<(Bytes, Vec<channel::MpscSender<Frame>>)> {
+        if let Some(clients) = self.key_clients.get_mut(key) {
+            if !clients.iter().any(|(id, _)| *id == client_id) {
+                clients.push((client_id, noloop));
+            }
+            return None;
         }
+
+        let evicted = if self.key_clients.len() >= self.max_keys.max(1) {
+            // Evict an arbitrary entry (HashMap has no age order; correctness
+            // needs only that the evicted key's trackers are told to drop it).
+            #[allow(clippy::unwrap_used)] // len >= 1 guaranteed by the branch
+            let victim = self.key_clients.keys().next().unwrap().clone();
+            let clients = self.key_clients.remove(&victim).unwrap_or_default();
+            let mut senders = Vec::new();
+            for (cid, _noloop) in clients {
+                // No noloop skip: cap eviction is not a self-write — every
+                // tracker of the victim key must drop its cached copy.
+                let target_id = self.redirects.get(&cid).copied().unwrap_or(cid);
+                if let Some(tx) = self.client_channels.get(&target_id) {
+                    senders.push(tx.clone());
+                }
+            }
+            Some((victim, senders))
+        } else {
+            None
+        };
+
+        self.key_clients
+            .insert(key.clone(), vec![(client_id, noloop)]);
+        evicted
     }
 
     /// Get the list of client IDs tracking a given key (for testing).
@@ -240,6 +284,45 @@ mod tests {
         let mut clients = table.tracked_clients(&key);
         clients.sort();
         assert_eq!(clients, vec![1, 2]);
+    }
+
+    /// G1 (deep review): the documented max_keys bound was dead code — a
+    /// long-lived tracking client reading many distinct never-written keys
+    /// grew key_clients without limit. The cap must evict an existing entry
+    /// (with invalidation senders so the evicted key's clients drop their
+    /// cached copy) instead of growing.
+    #[test]
+    fn test_track_key_enforces_max_keys_bound() {
+        let mut table = TrackingTable::with_max_keys(2);
+        let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
+        table.register_client(1, tx);
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k1"), false)
+                .is_none()
+        );
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k2"), false)
+                .is_none()
+        );
+        // Re-tracking an existing key never evicts.
+        assert!(
+            table
+                .track_key(1, &Bytes::from_static(b"k2"), false)
+                .is_none()
+        );
+
+        // Third distinct key: one existing entry must be evicted, with the
+        // evicted key's client senders returned for invalidation.
+        let evicted = table
+            .track_key(1, &Bytes::from_static(b"k3"), false)
+            .expect("cap reached: eviction expected");
+        assert!(evicted.0 == Bytes::from_static(b"k1") || evicted.0 == Bytes::from_static(b"k2"));
+        assert_eq!(evicted.1.len(), 1, "evicted key's tracker must be notified");
+        assert_eq!(table.key_clients.len(), 2, "table must stay at the cap");
+        assert_eq!(table.tracked_clients(&Bytes::from_static(b"k3")), vec![1]);
+        drop(rx);
     }
 
     #[test]
