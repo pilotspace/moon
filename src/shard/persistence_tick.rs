@@ -905,6 +905,10 @@ pub(crate) fn handle_memory_pressure(
             };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();
+                // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                // (per-key minting could stall the shard bound x victim-count).
+                let mut reason_del_budget =
+                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                 // task/issue #45: `offload_shard_dir` is precomputed at shard
                 // init. `spill_thread` and `shard_manifest` share its
                 // disk-offload gate, so both branches below pair their
@@ -954,6 +958,7 @@ pub(crate) fn handle_memory_pressure(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     },
                                 ),
@@ -1007,6 +1012,7 @@ pub(crate) fn handle_memory_pressure(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     }),
                                 );
@@ -1030,6 +1036,7 @@ pub(crate) fn handle_memory_pressure(
                                                 shard_id,
                                                 aof_pool,
                                                 wal_kv_log,
+                                                &mut reason_del_budget,
                                             );
                                         }),
                                 );

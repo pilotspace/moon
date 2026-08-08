@@ -627,6 +627,12 @@ pub fn recover_shard_v3_pitr(
                 );
             }
             Err(e) => {
+                // #452.2: a mid-chain tear must ABORT boot, not degrade to a
+                // silently-truncated dataset (pre-tear records are already
+                // applied; post-tear segments were dropped).
+                if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                    crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(shard_id, &e);
+                }
                 tracing::error!("Shard {}: WAL v3 replay failed: {}", shard_id, e);
             }
         }
@@ -719,6 +725,12 @@ pub fn recover_shard_v3_pitr(
                         );
                     }
                     Err(e) => {
+                        // #452.2: mid-chain tear ⇒ refuse to boot.
+                        if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                            crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(
+                                shard_id, &e,
+                            );
+                        }
                         tracing::error!(
                             "Shard {}: legacy-mode WAL v3 fallback replay failed: {}",
                             shard_id,

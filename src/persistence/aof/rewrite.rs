@@ -282,7 +282,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 #[derive(Default)]
 pub(crate) struct DrainOutcome {
     pub(crate) drained: usize,
-    shutdown_requested: bool,
+    pub(crate) shutdown_requested: bool,
     /// AppendSync ack senders for entries drained during a rewrite. Under
     /// `appendfsync=always` the client must NOT be told `Synced` until the
     /// post-drain boundary `sync_data()` makes those bytes durable, so the acks
@@ -853,6 +853,7 @@ pub(crate) fn do_rewrite_single(
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
     last_db: &mut usize,
+    overflow: &super::rewrite_overflow::RewriteOverflow,
 ) -> Result<(), MoonError> {
     // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
     // resolve their parked AppendSync acks (issue #140). task #35: continues
@@ -870,6 +871,12 @@ pub(crate) fn do_rewrite_single(
     // fsync, then resolve their parked AppendSync acks (issue #140).
     let mut mid_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
+
+    // #452.1 snapshot cut (P0 fix): appends are enqueued/spilled in-guard,
+    // so while we hold EVERY db write lock no producer can race this mark —
+    // everything spilled so far is pre-snapshot (its effect will be in the
+    // phase-4 snapshot below) and must not be re-written into the new incr.
+    overflow.mark_cut();
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
     let now_ms = current_time_ms();

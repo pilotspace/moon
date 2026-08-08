@@ -300,6 +300,33 @@ fn wal_salvage_enabled() -> bool {
     std::env::var("MOON_WAL_SALVAGE").is_ok_and(|v| v == "1")
 }
 
+/// True when `e` is the #452.2 mid-chain-tear refusal. Boot-path callers
+/// MUST abort startup on it ("refuse to recover" — the pre-tear records
+/// were already applied via the eager callbacks and cannot be rolled back;
+/// continuing would serve a silently-truncated history and the stale
+/// `last_lsn` would poison `wal_flush_lsn` restoration). Every other replay
+/// error keeps the pre-existing log-and-continue behavior.
+pub fn is_mid_chain_tear(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("mid-chain tear")
+}
+
+/// Abort startup on a mid-chain WAL tear (#452.2 "refuse to recover"). A
+/// distinct exit code (70 / EX_SOFTWARE) so supervisors can tell this apart
+/// from a crash; the actionable message (restore from backup/replica or set
+/// `MOON_WAL_SALVAGE=1`) is in `e` itself.
+pub fn abort_boot_on_mid_chain_tear(shard_id: usize, e: &std::io::Error) -> ! {
+    tracing::error!(
+        "Shard {}: REFUSING TO BOOT — {}. (Pre-tear records were already applied; \
+         a partial boot would serve silently truncated history.)",
+        shard_id,
+        e
+    );
+    // Flush the tracing pipeline is not guaranteed; mirror to stderr so the
+    // reason survives even a minimal logging setup.
+    eprintln!("moon: refusing to boot: {e}");
+    std::process::exit(70);
+}
+
 /// [`replay_wal_v3_dir_until`] with the salvage decision as an explicit
 /// parameter (tests; the public wrapper reads `MOON_WAL_SALVAGE`).
 ///
@@ -901,6 +928,11 @@ mod tests {
         assert!(
             err.to_string().contains("MOON_WAL_SALVAGE"),
             "error must name the salvage override: {err}"
+        );
+        assert!(
+            is_mid_chain_tear(&err),
+            "boot-path classifier must recognize this error so callers abort \
+             instead of falling back to legacy recovery: {err}"
         );
         assert_eq!(
             replayed,

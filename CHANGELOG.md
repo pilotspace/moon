@@ -22,7 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MEET + gossip and flags a killed node, per runtime.
 
 ### Fixed
-<<<<<<< HEAD
 - **Deep-review wave (2026-08): long-uptime and large-scale correctness.**
   Eight fix groups from a six-dimension architecture review (durability
   ordering, long-uptime resource growth, concurrency, cluster correctness,
@@ -57,7 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Fail-loud + bounds*: vector background-compaction failures now log at
     every layer; CDC reaps disconnected subscribers on write-idle shards;
     `TemporalRegistry` is bounded (262K bindings/shard, oldest evicted).
-=======
 - **Durability wave 1 (#452, #54): AOF rewrite-window append drops, degraded-state
   visibility, escalated reason-DEL backpressure, and a fail-loud WAL mid-chain
   tear policy.** (1) While a rewrite fold ran, the writer thread was out of its
@@ -80,7 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a hole) — `MOON_WAL_SALVAGE=1` is the explicit operator override; a torn
   FINAL segment stays the benign crash-tail it always was.
 
->>>>>>> e2eaef81 (test(persistence): wave-1 recovery matrix — rewrite-under-pipelined-load e2e (#54))
+  Adversarial-review hardening round (pre-merge): the rewrite fold's
+  exactly-once contract now extends to the overflow buffer — a snapshot
+  **cut** (`mark_cut`, recorded at the fold's atomic snapshot instant)
+  splits spilled entries so a COMMITTED fold discards pre-snapshot spills
+  (their effects are in the new base; replaying them would double-apply
+  INCR/APPEND/LPUSH) while an aborted fold still writes everything.
+  Producer paths are fully gated (`spill_first` on every enqueue leg,
+  including backpressure/AppendSync parks) so mid-fold channel drains can
+  never invert same-key replay order, and the finish drain is two-phase
+  (channel before buffer, disarm under the buffer lock). Arming is
+  unwind-safe: a panicking fold disarms with drop accounting instead of
+  leaving producers spilling into a dead buffer forever. Boot paths now
+  actually ABORT (exit 70) on a fatal mid-chain tear instead of falling
+  back to legacy recovery, reason-DEL backpressure shares ONE bound per
+  eviction/expiry sweep (was one 500ms bound per victim key), and every
+  cap/shutdown drop path routes through the loss-accounting latch.
+
 - **Cluster formation actually converges (pre-existing, both runtimes).**
   A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
   random-id placeholder was never retired when the peer's handshake arrived
