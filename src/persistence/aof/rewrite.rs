@@ -341,6 +341,8 @@ pub(crate) fn sync_and_fulfill_drain(
     }
 }
 
+pub use super::rewrite_overflow::{AOF_REWRITE_OVERFLOW_SPILLED, RewriteOverflow};
+
 /// Bounded variant of [`drain_pending_appends`]: drain at most `max_drain`
 /// messages (RAW RESP, no framing).  Pass [`usize::MAX`] for unbounded.
 ///
@@ -357,7 +359,7 @@ pub(crate) fn sync_and_fulfill_drain(
 /// record whose db differs from `*db_ctx` gets a raw `SELECT <db>` record
 /// written first (same rule as the live writer loops); `*db_ctx` is updated
 /// in place so the caller can read back the final context after the drain.
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
@@ -408,8 +410,8 @@ pub(crate) fn drain_pending_appends_bounded(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {
                     // Already rewriting — drop redundant request.
                 }
@@ -519,8 +521,8 @@ pub(crate) fn drain_pending_appends_framed(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {
                     // Already rewriting this shard — drop redundant request.
                 }
@@ -580,24 +582,20 @@ pub(crate) fn drain_pending_appends_framed(
 /// thread cannot lock another thread's `!Send` `Rc<RefCell<Shard>>`, so the
 /// per-shard rewrite would need a different snapshot-coordination mechanism.
 ///
-/// # Known limitation — channel saturation during the fold
+/// # Channel saturation during the fold — closed by [`RewriteOverflow`] (#452.1)
 ///
-/// Exactly-once holds *absent append-channel saturation during the fold*. While
-/// this function runs (phases 2-6, including the base-RDB serialize + write +
-/// fsync of phase 6, which is hundreds of ms on a large shard) the writer is
-/// NOT in its recv loop, so it is not draining the bounded
-/// `mpsc_bounded::<AofMessage>(10_000)` append channel. Post-snapshot appends
-/// queue there for the new incr; the event loop enqueues them with
-/// `try_send_append` (drop-on-full, return ignored — `spsc_handler.rs`). Under
-/// *sustained concurrent* writes on a large dataset, > 10_000 appends can pile
-/// up during the window and the overflow is silently dropped — lost even on a
-/// clean restart (worse than the everysec contract, which only loses on crash).
-/// The single-client crash matrix cannot surface this (serialized `redis-cli`
-/// never pressures the channel). This window is *pre-existing*: the shipped
-/// `do_rewrite_sharded` has the identical non-draining gap. Tracked as a
-/// known limitation (F6 is behind `--experimental-per-shard-rewrite`); the fix
-/// (keep draining during phase 6, or block-on-full for the rewrite's duration)
-/// is a separate scoped task. See `tmp/F6-known-limitations.md`.
+/// While this function runs (phases 2-6, including the base-RDB serialize +
+/// write + fsync of phase 6, hundreds of ms on a large shard) the writer is
+/// NOT in its recv loop, so the bounded `mpsc_bounded::<AofMessage>(10_000)`
+/// append channel can saturate under sustained write load. Historically the
+/// overflow was silently dropped (acked writes lost even on a clean restart —
+/// worse than the everysec contract). The writer task now arms this writer's
+/// [`RewriteOverflow`] around the fold: producers spill channel-overflow
+/// appends into the buffer (capped, fail-loud beyond the cap), and the writer
+/// drains channel-then-buffer into the committed incr immediately after the
+/// fold, before resuming its recv loop. See [`RewriteOverflow`]'s ordering
+/// invariant. The single-client crash matrix cannot pressure the channel;
+/// the recovery-test matrix (#54) covers rewrite-under-sustained-load.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn do_rewrite_per_shard(
     shard_id: u16,
@@ -1242,8 +1240,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
                 AofMessage::Shutdown => {
                     pre_shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {}
             }
         }
@@ -1371,8 +1369,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     AofMessage::Shutdown => {
                         mid_shutdown_requested = true;
                     }
-                    AofMessage::Rewrite(_)
-                    | AofMessage::RewriteSharded(_)
+                    AofMessage::Rewrite(..)
+                    | AofMessage::RewriteSharded(..)
                     | AofMessage::RewritePerShard { .. } => {}
                 },
                 Err(_) => break,

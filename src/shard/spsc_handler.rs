@@ -4219,8 +4219,8 @@ mod wal_append_tests {
                 );
             }
             AofMessage::AppendSync { .. } => panic!("expected Append, got AppendSync"),
-            AofMessage::Rewrite(_) => panic!("expected Append, got Rewrite"),
-            AofMessage::RewriteSharded(_) => panic!("expected Append, got RewriteSharded"),
+            AofMessage::Rewrite(..) => panic!("expected Append, got Rewrite"),
+            AofMessage::RewriteSharded(..) => panic!("expected Append, got RewriteSharded"),
             AofMessage::RewritePerShard { .. } => panic!("expected Append, got RewritePerShard"),
             AofMessage::Shutdown => panic!("expected Append, got Shutdown"),
         }

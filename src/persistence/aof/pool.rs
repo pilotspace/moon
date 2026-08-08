@@ -10,6 +10,11 @@ use super::rewrite::drain_pending_appends;
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
+    /// Per-writer rewrite-window spill buffers (issue #452.1), parallel to
+    /// `senders` (index = writer index, mapped via [`Self::overflow_for`]
+    /// exactly like [`Self::sender`]). Armed only while that writer runs a
+    /// rewrite fold.
+    overflow: Vec<Arc<super::rewrite::RewriteOverflow>>,
     layout: crate::persistence::aof_manifest::AofLayout,
     /// Fsync policy configured at writer-task construction. Read on the
     /// hot append path: `Always` routes through `AppendSync` for
@@ -60,6 +65,9 @@ impl AofWriterPool {
         fsync_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
+            overflow: (0..1)
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders: vec![sender],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
@@ -91,6 +99,10 @@ impl AofWriterPool {
             "per_shard pool needs >=2 writers; use top_level for single-writer"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -116,6 +128,10 @@ impl AofWriterPool {
             "per_shard pool needs >=2 writers; use top_level for single-writer"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -160,6 +176,10 @@ impl AofWriterPool {
             "fold_notifiers must have one entry per shard"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -448,26 +468,65 @@ impl AofWriterPool {
     /// [`Self::try_send_append_durable`] (async contexts).
     #[inline]
     pub fn try_send_append(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
+        let ovf = self.overflow_for(shard_id);
+        // #452.1 ordering rule 1: while this writer's rewrite overflow holds
+        // spilled appends, every new append must also spill — a `try_send`
+        // that succeeds here would be replayed BEFORE the older spilled ones.
+        if ovf.spill_first() {
+            match ovf.try_spill(AofMessage::Append { lsn, db, bytes }) {
+                Ok(()) => return true,
+                Err(AofMessage::Append { lsn, db, bytes }) => {
+                    return self.try_send_append_no_spill(shard_id, lsn, db, bytes);
+                }
+                Err(_) => return false,
+            }
+        }
+        self.try_send_append_no_spill(shard_id, lsn, db, bytes)
+    }
+
+    /// [`Self::try_send_append`] minus the spill-first gate: `try_send`, then
+    /// on Full one spill attempt (rewrite in progress), then the pre-existing
+    /// counted drop.
+    #[inline]
+    fn try_send_append_no_spill(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
         match self
             .sender(shard_id)
             .try_send(AofMessage::Append { lsn, db, bytes })
         {
             Ok(()) => true,
             Err(e) => {
-                if matches!(e, flume::TrySendError::Full(_)) {
-                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reason = match &e {
+                    flume::TrySendError::Full(_) => "full",
+                    flume::TrySendError::Disconnected(_) => "disconnected",
+                };
+                if let flume::TrySendError::Full(msg) = e {
+                    // #452.1: channel saturated — if a rewrite fold is holding
+                    // the writer out of its recv loop, spill instead of drop.
+                    match self.overflow_for(shard_id).try_spill(msg) {
+                        Ok(()) => return true,
+                        Err(_) => {
+                            AOF_BACKPRESSURE_DROPPED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
                 warn!(
                     "AOF append dropped for shard {} (lsn {}): channel {}",
-                    shard_id,
-                    lsn,
-                    match e {
-                        flume::TrySendError::Full(_) => "full",
-                        flume::TrySendError::Disconnected(_) => "disconnected",
-                    }
+                    shard_id, lsn, reason
                 );
                 false
             }
+        }
+    }
+
+    /// The rewrite-window overflow slot for `shard_id`'s writer — same
+    /// mapping as [`Self::sender`].
+    #[inline]
+    pub(crate) fn overflow_for(&self, shard_id: usize) -> &Arc<super::rewrite::RewriteOverflow> {
+        use crate::persistence::aof_manifest::AofLayout;
+        match self.layout {
+            AofLayout::TopLevel => &self.overflow[0],
+            AofLayout::PerShard => &self.overflow[shard_id],
         }
     }
 
@@ -504,6 +563,15 @@ impl AofWriterPool {
         budget: &mut Duration,
     ) -> bool {
         let mut msg = AofMessage::Append { lsn, db, bytes };
+        // #452.1 ordering rule 1: while the rewrite overflow holds spilled
+        // appends, keep spilling — see `try_send_append`.
+        let ovf = self.overflow_for(shard_id);
+        if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return true,
+                Err(returned) => msg = returned,
+            }
+        }
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return true,
             Err(flume::TrySendError::Disconnected(_)) => {
@@ -514,6 +582,12 @@ impl AofWriterPool {
                 return false;
             }
             Err(flume::TrySendError::Full(returned)) => msg = returned,
+        }
+        // #452.1: channel saturated — spill instead of blocking/dropping when
+        // a rewrite fold is holding the writer out of its recv loop.
+        match ovf.try_spill(msg) {
+            Ok(()) => return true,
+            Err(returned) => msg = returned,
         }
         if budget.is_zero() {
             AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -761,7 +835,10 @@ impl AofWriterPool {
     pub fn try_send_rewrite(&self, msg: AofMessage) -> Result<(), AofPoolSendError> {
         use crate::persistence::aof_manifest::AofLayout;
         debug_assert!(
-            matches!(msg, AofMessage::Rewrite(_) | AofMessage::RewriteSharded(_)),
+            matches!(
+                msg,
+                AofMessage::Rewrite(..) | AofMessage::RewriteSharded(..)
+            ),
             "try_send_rewrite called with a non-Rewrite variant",
         );
         if self.layout == AofLayout::PerShard {
@@ -873,6 +950,7 @@ impl AofWriterPool {
                 coord: coord.clone(),
                 fold_producer,
                 fold_notifier,
+                overflow: self.overflow[idx].clone(),
             })
             .is_err()
             {
@@ -1209,7 +1287,10 @@ mod pool_tests {
 
         let dummies: SharedDatabases = Arc::new(vec![]);
         let err = pool
-            .try_send_rewrite(AofMessage::Rewrite(dummies))
+            .try_send_rewrite(AofMessage::Rewrite(
+                dummies,
+                std::sync::Arc::new(crate::persistence::aof::rewrite::RewriteOverflow::new()),
+            ))
             .unwrap_err();
         assert_eq!(err, AofPoolSendError::RewriteUnsupportedInPerShard);
     }
@@ -1220,8 +1301,12 @@ mod pool_tests {
         let pool = AofWriterPool::top_level(tx);
 
         let dummies: SharedDatabases = Arc::new(vec![]);
-        pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap();
-        assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(_))));
+        pool.try_send_rewrite(AofMessage::Rewrite(
+            dummies,
+            std::sync::Arc::new(crate::persistence::aof::rewrite::RewriteOverflow::new()),
+        ))
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(..))));
     }
 
     #[test]

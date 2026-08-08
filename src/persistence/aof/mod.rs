@@ -235,9 +235,16 @@ pub enum AofMessage {
         ack: crate::runtime::channel::OneshotSender<AofAck>,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
-    Rewrite(SharedDatabases),
+    /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
+    /// buffer (issue #452.1): armed by the writer around the fold, fed by the
+    /// pool's producers when the append channel saturates mid-fold.
+    Rewrite(SharedDatabases, Arc<rewrite::RewriteOverflow>),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
-    RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
+    /// Overflow semantics identical to [`AofMessage::Rewrite`].
+    RewriteSharded(
+        Arc<crate::shard::shared_databases::ShardDatabases>,
+        Arc<rewrite::RewriteOverflow>,
+    ),
     /// [F6] Trigger a per-shard AOF rewrite (compaction) in the PerShard
     /// layout. Sent to EVERY per-shard writer at once. Each writer folds its
     /// own shard (drain → AofFold SPSC → snapshot → write new base+incr at
@@ -259,6 +266,11 @@ pub enum AofMessage {
             Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         /// Notifier that wakes the shard event loop after an SPSC push.
         fold_notifier: Arc<crate::runtime::channel::Notify>,
+        /// Rewrite-window spill buffer for THIS shard (issue #452.1) — armed
+        /// by the writer around the fold, fed by the pool's producers when
+        /// the append channel saturates mid-fold, drained by the writer into
+        /// the committed incr immediately after the fold.
+        overflow: Arc<rewrite::RewriteOverflow>,
     },
     /// Shut down the AOF writer task gracefully.
     Shutdown,
@@ -580,7 +592,8 @@ pub mod auto_rewrite;
 /// seam (collect/commit) against the public API.
 pub mod group_commit;
 mod pool;
-mod rewrite;
+pub mod rewrite;
+pub mod rewrite_overflow;
 mod writer_task;
 
 pub use pool::AofWriterPool;

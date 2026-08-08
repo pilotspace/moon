@@ -562,7 +562,9 @@ pub async fn aof_writer_task(
                         info!("AOF writer shutting down (monoio, seq {})", manifest.seq);
                         break;
                     }
-                    Some(AofMessage::Rewrite(db)) => {
+                    Some(AofMessage::Rewrite(db, overflow)) => {
+                        // #452.1: spill window opens for the whole fold.
+                        overflow.arm();
                         if !write_error {
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
@@ -574,10 +576,20 @@ pub async fn aof_writer_task(
                             }
                             Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
                         }
+                        // #452.1: channel backlog + spilled overflow → current
+                        // (committed) incr, in order, before resuming the loop.
+                        if let Err(e) = overflow.finish_raw(&rx, &mut file, &mut last_db) {
+                            error!(
+                                "AOF rewrite overflow drain failed (seq {}): {}",
+                                manifest.seq, e
+                            );
+                        }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                     }
-                    Some(AofMessage::RewriteSharded(shard_dbs)) => {
+                    Some(AofMessage::RewriteSharded(shard_dbs, overflow)) => {
+                        // #452.1: spill window opens for the whole fold.
+                        overflow.arm();
                         if !write_error {
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
@@ -600,6 +612,14 @@ pub async fn aof_writer_task(
                                 write_error = false;
                             }
                             Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
+                        }
+                        // #452.1: channel backlog + spilled overflow → current
+                        // (committed) incr, in order, before resuming the loop.
+                        if let Err(e) = overflow.finish_raw(&rx, &mut file, &mut last_db) {
+                            error!(
+                                "AOF rewrite overflow drain failed (seq {}): {}",
+                                manifest.seq, e
+                            );
                         }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -780,7 +800,9 @@ pub async fn aof_writer_task(
                     // -- handle the control message that ended the drain (if any) --
                     match batch.deferred_control {
                         None => {}
-                        Some(AofMessage::Rewrite(db)) => {
+                        Some(AofMessage::Rewrite(db, overflow)) => {
+                            // #452.1: spill window opens for the whole rewrite.
+                            overflow.arm();
                             // Flush current writer before rewrite (skip if torn).
                             if !write_error {
                                 let _ = writer.flush().await;
@@ -815,8 +837,18 @@ pub async fn aof_writer_task(
                                 }
                                 Err(e) => {
                                     error!("Failed to reopen AOF file after rewrite: {}", e);
+                                    overflow.disarm_dropping();
                                     return;
                                 }
+                            }
+                            // #452.1: channel backlog + spilled overflow → the
+                            // fresh file, in order, before resuming the loop.
+                            {
+                                let mut sf = writer.into_inner().into_std().await;
+                                if let Err(e) = overflow.finish_raw(&rx, &mut sf, &mut last_db) {
+                                    error!("AOF rewrite overflow drain failed: {}", e);
+                                }
+                                writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
                             }
                             // Back-date so the backlog drained right after the
                             // rewrite reaches disk within ~100ms + wake floor,
@@ -828,7 +860,9 @@ pub async fn aof_writer_task(
                             last_fsync = Instant::now() - std::time::Duration::from_millis(900);
                             idle_wait.mark_pending();
                         }
-                        Some(AofMessage::RewriteSharded(shard_dbs)) => {
+                        Some(AofMessage::RewriteSharded(shard_dbs, overflow)) => {
+                            // #452.1: spill window opens for the whole fold.
+                            overflow.arm();
                             // C4 TopLevel cooperative fold (tokio path):
                             // flush + sync the BufWriter (skip if torn), convert to
                             // std::fs::File for the sync fold (same pattern as tokio
@@ -864,8 +898,18 @@ pub async fn aof_writer_task(
                                 Ok(f) => writer = tokio::io::BufWriter::new(f),
                                 Err(e) => {
                                     error!("Failed to reopen AOF after rewrite: {}", e);
+                                    overflow.disarm_dropping();
                                     return;
                                 }
+                            }
+                            // #452.1: channel backlog + spilled overflow → the
+                            // fresh file, in order, before resuming the loop.
+                            {
+                                let mut sf = writer.into_inner().into_std().await;
+                                if let Err(e) = overflow.finish_raw(&rx, &mut sf, &mut last_db) {
+                                    error!("AOF rewrite overflow drain failed: {}", e);
+                                }
+                                writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
                             }
                             // Back-date so the channel backlog that accumulated
                             // during the blocking fold reaches disk within ~100ms
@@ -1273,8 +1317,8 @@ pub async fn per_shard_aof_writer_task(
                             // -- handle the control message that ended the drain --
                             match batch.deferred_control {
                                 None => {}
-                                Some(AofMessage::Rewrite(_))
-                                | Some(AofMessage::RewriteSharded(_)) => {
+                                Some(AofMessage::Rewrite(..))
+                                | Some(AofMessage::RewriteSharded(..)) => {
                                     warn!(
                                         "AOF writer shard {}: received Rewrite/RewriteSharded — \
                                          not applicable in PerShard layout, dropped.",
@@ -1295,7 +1339,10 @@ pub async fn per_shard_aof_writer_task(
                                     coord,
                                     fold_producer,
                                     fold_notifier,
+                                    overflow,
                                 }) => {
+                                    // #452.1: spill window opens for the fold.
+                                    overflow.arm();
                                     if let Err(e) = writer.flush().await {
                                         error!(
                                             "F6 tokio per-shard rewrite: shard {} pre-fold flush \
@@ -1304,6 +1351,7 @@ pub async fn per_shard_aof_writer_task(
                                         );
                                         coord.mark_failed();
                                         coord.shard_done();
+                                        overflow.disarm_dropping();
                                     } else {
                                         // `into_std().await` waits for in-flight ops
                                         // and is infallible; buffer flushed above.
@@ -1318,6 +1366,17 @@ pub async fn per_shard_aof_writer_task(
                                         // The fold's ShardDoneGuard already did
                                         // `shard_done` for every exit, so do NOT
                                         // decrement again. Wrap `sf` back either way.
+                                        // #452.1: drain channel backlog + spilled
+                                        // overflow into the committed incr first.
+                                        if let Err(e) =
+                                            overflow.finish_framed(&rx, &mut sf, &mut last_db)
+                                        {
+                                            error!(
+                                                "F6 tokio per-shard rewrite: shard {} overflow \
+                                                 drain failed: {}",
+                                                shard_id, e
+                                            );
+                                        }
                                         writer = tokio::io::BufWriter::new(
                                             tokio::fs::File::from_std(sf),
                                         );
@@ -1655,7 +1714,7 @@ pub async fn per_shard_aof_writer_task(
                 // -- handle the control message that ended the drain (if any) --
                 match batch.deferred_control {
                     None => {}
-                    Some(AofMessage::Rewrite(_)) | Some(AofMessage::RewriteSharded(_)) => {
+                    Some(AofMessage::Rewrite(..)) | Some(AofMessage::RewriteSharded(..)) => {
                         warn!(
                             "AOF writer shard {}: received Rewrite/RewriteSharded — \
                              not applicable in PerShard layout (use per-shard \
@@ -1672,7 +1731,10 @@ pub async fn per_shard_aof_writer_task(
                         coord,
                         fold_producer,
                         fold_notifier,
+                        overflow,
                     }) => {
+                        // #452.1: spill window opens for the fold.
+                        overflow.arm();
                         if let Err(e) = do_rewrite_per_shard(
                             shard_id,
                             &shard_dbs,
@@ -1692,6 +1754,15 @@ pub async fn per_shard_aof_writer_task(
                                 "F6 per-shard rewrite: shard {} fold failed: {}. \
                                  Rewrite aborted by the fold guard; old generation \
                                  stays authoritative.",
+                                shard_id, e
+                            );
+                        }
+                        // #452.1: drain channel backlog + spilled overflow into
+                        // the committed incr, in order, before the EverySec
+                        // post-fold drain below picks up anything newer.
+                        if let Err(e) = overflow.finish_framed(&rx, &mut file, &mut last_db) {
+                            error!(
+                                "F6 per-shard rewrite: shard {} overflow drain failed: {}",
                                 shard_id, e
                             );
                         }
