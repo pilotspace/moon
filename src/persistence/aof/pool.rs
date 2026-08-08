@@ -894,11 +894,45 @@ impl AofWriterPool {
             lsn,
         );
         let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
-        let _ = self.sender(shard_id).try_send(AofMessage::Append {
+        let msg = AofMessage::Append {
             lsn: tagged_lsn,
             db,
             bytes,
-        });
+        };
+        // #452.1 (re-verify Q2): this leg must honor the same spill-first
+        // gate as every other producer — an ungated try_send during a fold
+        // could place this record ahead of older buffered ones at the
+        // post-fold drain. And its drops must be counted (P2.5), never a
+        // silent `let _ =`.
+        let overflow = self.overflow_for(shard_id);
+        let msg = if overflow.spill_first() {
+            match overflow.try_spill(msg) {
+                Ok(()) => return,
+                Err(super::rewrite_overflow::SpillReject::Disarmed(m)) => m,
+                Err(super::rewrite_overflow::SpillReject::CapExceeded) => {
+                    super::record_append_dropped(1);
+                    tracing::error!("AOF ordered append dropped: rewrite overflow cap exceeded");
+                    return;
+                }
+            }
+        } else {
+            msg
+        };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(m)) => match overflow.try_spill(m) {
+                Ok(()) => {}
+                Err(_) => {
+                    super::record_append_dropped(1);
+                    tracing::error!(
+                        "AOF ordered append dropped: writer channel full and overflow unavailable"
+                    );
+                }
+            },
+            Err(flume::TrySendError::Disconnected(_)) => {
+                super::record_append_dropped(1);
+            }
+        }
     }
 
     /// Issue an LSN for an AOF append at every call site that has the
@@ -2549,6 +2583,33 @@ mod pool_tests {
     /// post-fold drain writes channel-before-buffer, inverting same-key
     /// replay order (e.g. SET entering ahead of a spilled eviction-DEL →
     /// replay deletes an acked key).
+    /// Re-verify Q2: the ordered (cross-shard TXN) leg must honor the
+    /// spill-first gate like every other producer, and its cap/full drops
+    /// must be counted — the pre-fix body was an ungated silent `let _ =`.
+    #[test]
+    fn ordered_append_spills_while_buffer_nonempty() {
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level(tx);
+        let ovf = pool.overflow_for(0);
+        ovf.arm();
+        assert!(
+            ovf.try_spill(AofMessage::Append {
+                lsn: 1,
+                db: 0,
+                bytes: Bytes::from_static(b"older-buffered"),
+            })
+            .is_ok()
+        );
+        // Channel has room, but the non-empty buffer must win (rule 1).
+        pool.try_send_append_ordered(0, 2, 0, Bytes::from_static(b"newer-ordered"));
+        assert_eq!(
+            rx.len(),
+            0,
+            "ordered append must spill, not enter the channel ahead of older buffered entries"
+        );
+        assert_eq!(ovf.buffered_len_for_test(), 2);
+    }
+
     #[test]
     fn backpressure_path_spills_while_buffer_nonempty() {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);

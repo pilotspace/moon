@@ -606,7 +606,7 @@ pub(crate) fn do_rewrite_per_shard(
     fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
     fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
     last_db: &mut usize,
-) -> Result<(), MoonError> {
+) -> Result<bool, MoonError> {
     use ringbuf::traits::Producer;
     // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
     // (success via `complete()`, `?`-error or panic-unwind via `Drop`). The
@@ -822,8 +822,15 @@ pub(crate) fn do_rewrite_per_shard(
              committed seq {} (no restart needed)",
             shard_id, committed_seq
         );
+        // Re-verify P0: an abort is NOT a commit — the new base this shard's
+        // snapshot cut refers to was PRUNED. Returning Ok(true) here would
+        // make finish_* discard pre-cut spills (their effects exist only in
+        // the discarded base) and resolve their acks Synced — permanent,
+        // acked data loss. The caller must drain the overflow
+        // write-everything into the rolled-back OLD incr instead.
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
@@ -872,10 +879,16 @@ pub(crate) fn do_rewrite_single(
     let mut mid_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
-    // #452.1 snapshot cut (P0 fix): appends are enqueued/spilled in-guard,
-    // so while we hold EVERY db write lock no producer can race this mark —
-    // everything spilled so far is pre-snapshot (its effect will be in the
-    // phase-4 snapshot below) and must not be re-written into the new incr.
+    // #452.1 snapshot cut (P0 fix): while we hold EVERY db write lock no NEW
+    // mutation can start, so everything spilled so far is pre-snapshot (its
+    // effect will be in the phase-4 snapshot below) and must not be
+    // re-written into the new incr. Known residual gap (re-verify Q1,
+    // tracked as a follow-up issue): paths that enqueue AFTER releasing the
+    // db guard (deferred batch flush, a producer parked in send_async) can
+    // suspend between mutation and enqueue — such a record can land past
+    // this cut (and past `pending_aof_count` on the sharded fold, a gap that
+    // predates the overflow) although its effect is in the snapshot. The
+    // exposure needs channel-full + a fold arriving inside that gap.
     overflow.mark_cut();
 
     // Phase 4: snapshot under the write locks. No mutation is possible.

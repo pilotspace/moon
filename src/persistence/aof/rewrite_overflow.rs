@@ -140,6 +140,12 @@ impl RewriteOverflow {
             .store(buf.len(), std::sync::atomic::Ordering::Release);
     }
 
+    /// Test-only: number of currently buffered spilled messages.
+    #[cfg(test)]
+    pub(crate) fn buffered_len_for_test(&self) -> usize {
+        self.buf.lock().len()
+    }
+
     /// Producer fast-path gate: true when the producer must spill directly
     /// (skip `try_send`) to preserve order — see ordering rule 1.
     #[inline]
@@ -283,7 +289,7 @@ impl RewriteOverflow {
             // (b) then the buffered overflow: swap-write rounds until a swap
             // finds the buffer empty (that round disarms under the lock).
             loop {
-                let spilled = {
+                let mut spilled = {
                     let mut buf = self.buf.lock();
                     if buf.is_empty() {
                         self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -293,18 +299,44 @@ impl RewriteOverflow {
                     }
                     std::mem::take(&mut *buf)
                 };
+                // Re-drain the channel BEFORE this batch (re-verify Q3): the
+                // buffer-empty window (finish entry, or before the armed
+                // window's first spill) lets a producer try_send into a slot
+                // phase (a) freed — such an entry is OLDER than everything
+                // buffered afterwards (rule 1 forces spilling from the first
+                // buffered byte on), so writing this swap first would invert
+                // same-key replay order. Every channel entry present at this
+                // instant predates every entry in `spilled`; drain them first.
+                let late = rx.len();
+                if late > 0 {
+                    let o = if framed {
+                        drain_pending_appends_framed(rx, file, late, db_ctx)?
+                    } else {
+                        drain_pending_appends_bounded(rx, file, late, db_ctx)?
+                    };
+                    outcome.drained += o.drained;
+                    outcome.shutdown_requested |= o.shutdown_requested;
+                    outcome.pending_acks.extend(o.pending_acks);
+                }
                 let batch_cut = if first_swap {
                     cut.min(spilled.len())
                 } else {
                     0
                 };
                 first_swap = false;
-                for (idx, msg) in spilled.into_iter().enumerate() {
+                // Drain-by-index so a mid-batch write error can count the
+                // un-written remainder as dropped (re-verify: fail-loud) —
+                // `?` inside a consuming for-loop silently discards it.
+                let mut wrote_err: Option<MoonError> = None;
+                let batch_total = spilled.len();
+                let mut batch_consumed = 0usize;
+                for (idx, msg) in spilled.drain(..).enumerate() {
                     // Pre-cut entries: effect already in the committed base —
                     // writing the record would double-apply on replay. Ack
                     // any parked AppendSync (durable via the base) and skip.
                     if idx < batch_cut {
                         folded_into_base += 1;
+                        batch_consumed += 1;
                         if let AofMessage::AppendSync { ack, .. } = msg {
                             outcome.pending_acks.push(ack);
                         }
@@ -312,12 +344,16 @@ impl RewriteOverflow {
                     }
                     match msg {
                         AofMessage::Append { lsn, db, bytes } => {
-                            if let Some(sel) = select_prefix_if_needed(db, bytes.is_empty(), db_ctx)
-                            {
-                                write_record(file, 0, &sel).map_err(io_err)?;
+                            let r = select_prefix_if_needed(db, bytes.is_empty(), db_ctx)
+                                .map_or(Ok(()), |sel| write_record(file, 0, &sel))
+                                .and_then(|()| write_record(file, lsn, &bytes));
+                            match r {
+                                Ok(()) => {
+                                    drained_overflow += 1;
+                                    batch_consumed += 1;
+                                }
+                                Err(e) => wrote_err = Some(io_err(e)),
                             }
-                            write_record(file, lsn, &bytes).map_err(io_err)?;
-                            drained_overflow += 1;
                         }
                         AofMessage::AppendSync {
                             lsn,
@@ -329,18 +365,49 @@ impl RewriteOverflow {
                             // on-disk record, ack parks for the boundary
                             // fsync below (H1-BARRIER, mirrors
                             // drain_pending_appends_framed).
-                            if !bytes.is_empty() {
-                                if let Some(sel) = select_prefix_if_needed(db, false, db_ctx) {
-                                    write_record(file, 0, &sel).map_err(io_err)?;
+                            let r = if bytes.is_empty() {
+                                Ok(())
+                            } else {
+                                select_prefix_if_needed(db, false, db_ctx)
+                                    .map_or(Ok(()), |sel| write_record(file, 0, &sel))
+                                    .and_then(|()| write_record(file, lsn, &bytes))
+                            };
+                            match r {
+                                Ok(()) => {
+                                    drained_overflow += 1;
+                                    batch_consumed += 1;
+                                    outcome.pending_acks.push(ack);
                                 }
-                                write_record(file, lsn, &bytes).map_err(io_err)?;
+                                // Dropping the ack here fails safe: the
+                                // parked receiver sees RecvError, never a
+                                // false Synced.
+                                Err(e) => wrote_err = Some(io_err(e)),
                             }
-                            drained_overflow += 1;
-                            outcome.pending_acks.push(ack);
                         }
                         // try_spill only ever admits Append/AppendSync.
-                        _ => {}
+                        _ => {
+                            batch_consumed += 1;
+                        }
                     }
+                    if wrote_err.is_some() {
+                        let _ = idx;
+                        break;
+                    }
+                }
+                if let Some(e) = wrote_err {
+                    // The un-written remainder of this TAKEN batch (the
+                    // failed message + everything after it) was consumed by
+                    // `drain(..)`'s drop and is not in `buf` — the outer
+                    // error path can't see it. Count it here so no acked
+                    // append is ever lost silently (re-verify: P2.5 gap).
+                    // AppendSync remainders fail safe on their own: the
+                    // dropped ack sender surfaces as RecvError, never a
+                    // false Synced.
+                    let lost = (batch_total - batch_consumed) as u64;
+                    if lost > 0 {
+                        super::record_append_dropped(lost);
+                    }
+                    return Err(e);
                 }
             }
             if outcome.drained > 0 || drained_overflow > 0 || folded_into_base > 0 {
@@ -536,6 +603,38 @@ mod tests {
             1,
             "spilled entry reached the file"
         );
+    }
+
+    /// Re-verify P2.5 gap: a mid-batch write error during the finish drain
+    /// loses the TAKEN batch's un-written remainder (cleared by
+    /// `drain(..)`'s drop, invisible to the outer buf-count) — it must be
+    /// counted as dropped, never silent. Uses a read-only file handle so
+    /// every write fails.
+    #[test]
+    fn finish_write_error_counts_unwritten_batch_remainder() {
+        use crate::persistence::aof::AOF_BACKPRESSURE_DROPPED;
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let ovf = RewriteOverflow::new();
+        ovf.arm();
+        assert!(ovf.try_spill(append(1, b"a")).is_ok());
+        assert!(ovf.try_spill(append(2, b"b")).is_ok());
+        assert!(ovf.try_spill(append(3, b"c")).is_ok());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("readonly.aof");
+        std::fs::write(&path, b"").unwrap();
+        let mut file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let mut db_ctx = 0usize;
+        let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let res = ovf.finish_framed(&rx, &mut file, &mut db_ctx, false);
+        assert!(res.is_err(), "writes to a read-only handle must fail");
+        let after = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        // >= not ==: process-global counter, parallel tests may bump it.
+        assert!(
+            after - before >= 3,
+            "all 3 un-written spills must be counted (before={before}, after={after})"
+        );
+        assert!(!ovf.spill_first(), "error path must disarm");
     }
 
     #[test]

@@ -1411,11 +1411,15 @@ pub async fn per_shard_aof_writer_task(
                                         // #452.1: drain channel backlog + spilled
                                         // overflow into the committed incr first.
                                         // On commit, pre-cut spills fold into base.
+                                        // committed = Ok(true) ONLY: an
+                                        // aborted fold (Ok(false)) pruned the
+                                        // new base — pre-cut spills must be
+                                        // WRITTEN, not discarded (re-verify P0).
                                         if let Err(e) = overflow.finish_framed(
                                             &rx,
                                             &mut sf,
                                             &mut last_db,
-                                            res.is_ok(),
+                                            matches!(res, Ok(true)),
                                         ) {
                                             error!(
                                                 "F6 tokio per-shard rewrite: shard {} overflow \
@@ -1809,9 +1813,15 @@ pub async fn per_shard_aof_writer_task(
                         // the committed incr, in order, before the EverySec
                         // post-fold drain below picks up anything newer.
                         // On commit, pre-cut spills fold into the new base.
-                        if let Err(e) =
-                            overflow.finish_framed(&rx, &mut file, &mut last_db, fold_res.is_ok())
-                        {
+                        // committed = Ok(true) ONLY (re-verify P0): an aborted
+                        // fold (Ok(false)) rolled back to the OLD incr and the
+                        // new base was pruned — pre-cut spills must be written.
+                        if let Err(e) = overflow.finish_framed(
+                            &rx,
+                            &mut file,
+                            &mut last_db,
+                            matches!(fold_res, Ok(true)),
+                        ) {
                             error!(
                                 "F6 per-shard rewrite: shard {} overflow drain failed: {}",
                                 shard_id, e
