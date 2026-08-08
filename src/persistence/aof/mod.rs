@@ -96,26 +96,40 @@ pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
 /// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
 pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether the most recent everysec deadline fsync succeeded. Exposed as
-/// `aof_last_fsync_status:ok|err` in INFO (Redis's `aof_last_write_status`
-/// analogue). Kernel semantics make a *retry* of a failed fsync succeed
-/// trivially while the failed window's pages are already gone (fsyncgate),
-/// so the status latches "err" until a fsync that follows a successful
-/// write batch completes — operators must treat any "err" observation as
-/// "the AOF has a hole".
-pub static AOF_LAST_FSYNC_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+/// Per-writer "most recent everysec deadline fsync FAILED" bits (bit =
+/// `min(writer_idx, 63)`; TopLevel layout uses writer 0, PerShard uses the
+/// shard index). Surfaced as `aof_last_fsync_status:ok|err` in INFO
+/// (Redis's `aof_last_write_status` analogue): the status reads "err" while
+/// ANY writer's latest fsync failed. Per-writer bits — not one global bool —
+/// because with N per-shard writers a healthy shard's success within ~1s
+/// would otherwise mask a failing shard's hole (deep-review P2). Kernel
+/// semantics make a *retry* of a failed fsync succeed trivially while the
+/// failed window's pages are already gone (fsyncgate), so each writer's bit
+/// clears only when a fsync that follows a successful write batch completes
+/// on THAT writer — operators must treat any "err" observation as "an AOF
+/// has a hole".
+pub static AOF_FSYNC_ERR_WRITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-/// Record the outcome of an everysec deadline fsync attempt. Failure bumps
-/// [`AOF_FSYNC_FAILURES`] and flips [`AOF_LAST_FSYNC_OK`]; success restores
-/// the ok status (the counter keeps the history).
-pub fn record_everysec_fsync_result(ok: bool) {
+/// True while every AOF writer's most recent everysec deadline fsync
+/// succeeded (the INFO `aof_last_fsync_status` predicate).
+pub fn aof_last_fsync_ok() -> bool {
+    AOF_FSYNC_ERR_WRITERS.load(std::sync::atomic::Ordering::Relaxed) == 0
+}
+
+/// Record the outcome of an everysec deadline fsync attempt on `writer_idx`
+/// (0 for the TopLevel writer, shard index for PerShard writers). Failure
+/// bumps [`AOF_FSYNC_FAILURES`] and sets the writer's bit in
+/// [`AOF_FSYNC_ERR_WRITERS`]; success clears only that writer's bit (the
+/// counter keeps the history).
+pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
     use std::sync::atomic::Ordering;
+    let bit = 1u64 << writer_idx.min(63);
     if ok {
-        AOF_LAST_FSYNC_OK.store(true, Ordering::Relaxed);
+        AOF_FSYNC_ERR_WRITERS.fetch_and(!bit, Ordering::Relaxed);
     } else {
         AOF_FSYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
-        AOF_LAST_FSYNC_OK.store(false, Ordering::Relaxed);
+        AOF_FSYNC_ERR_WRITERS.fetch_or(bit, Ordering::Relaxed);
     }
 }
 
@@ -1390,16 +1404,26 @@ mod tests {
     /// F2/F3 (deep review): everysec fsync failures must latch an "err"
     /// status and count — the old tokio paths dropped the error and recorded
     /// success, so an operator had no way to learn the AOF has a hole.
+    /// Per-writer bits (deep-review P2 follow-up): a healthy writer's
+    /// success must NOT clear a failing sibling writer's "err" status.
     #[test]
     fn everysec_fsync_failure_latches_err_status() {
         use std::sync::atomic::Ordering;
+        // Use writer indexes far above any concurrently-running writer-loop
+        // test so parallel tests can't flip these bits.
         let before = AOF_FSYNC_FAILURES.load(Ordering::Relaxed);
-        record_everysec_fsync_result(false);
-        assert!(!AOF_LAST_FSYNC_OK.load(Ordering::Relaxed));
+        record_everysec_fsync_result(61, false);
+        assert!(!aof_last_fsync_ok());
         assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
-        // Success restores the status but never the counter.
-        record_everysec_fsync_result(true);
-        assert!(AOF_LAST_FSYNC_OK.load(Ordering::Relaxed));
+        // A DIFFERENT writer's success must not mask writer 61's hole.
+        record_everysec_fsync_result(62, true);
+        assert!(
+            !aof_last_fsync_ok(),
+            "a healthy writer's fsync success must not clear a failing sibling's err status"
+        );
+        // Success on the failing writer restores the status but never the counter.
+        record_everysec_fsync_result(61, true);
+        assert!(aof_last_fsync_ok());
         assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
     }
 }

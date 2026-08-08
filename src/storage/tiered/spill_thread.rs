@@ -232,6 +232,11 @@ pub struct SpillCompletionEntry {
     /// event loop can populate `ColdLocation::value_type` (#364: SCAN TYPE
     /// filter over cold keys) without re-reading the just-written file.
     pub value_type: ValueType,
+    /// The originating request's `file_id` (each request gets a unique
+    /// monotonic id even when batching flushes many requests into one
+    /// file). Lets the completion handler retire the per-key in-flight
+    /// spill record for exactly this request (stale-shadow guard).
+    pub req_file_id: u64,
 }
 
 /// Completion sent from background thread back to event loop.
@@ -368,6 +373,7 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                                 slot_idx,
                                 ttl_ms: req.ttl_ms,
                                 value_type: req.value_type,
+                                req_file_id: req.file_id,
                             })
                             .collect();
                         completions.push(SpillCompletion {
@@ -438,6 +444,7 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     slot_idx: 0,
                     ttl_ms: req.ttl_ms,
                     value_type: req.value_type,
+                    req_file_id: req.file_id,
                 }],
                 success: true,
                 failed_request: None,

@@ -925,6 +925,11 @@ fn evict_one_async_spill(
         if sender.try_send(req).is_err() {
             return false;
         }
+        // Deep-review P2 stale-shadow guard: record this request as the
+        // newest in-flight spill for the key BEFORE freeing RAM, so a later
+        // failed-pwrite re-insert of an OLDER superseded request for the
+        // same key can be detected and suppressed.
+        db.spill_inflight_mark(Bytes::copy_from_slice(key.as_bytes()), file_id);
 
         // Now safe to free RAM. The bg thread holds the SpillRequest and will
         // produce a SpillCompletion that updates cold_index for this db_index.

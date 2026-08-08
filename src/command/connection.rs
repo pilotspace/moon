@@ -329,7 +329,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         aof_current_size,
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
-        if crate::persistence::aof::AOF_LAST_FSYNC_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"
         } else {
             "err"

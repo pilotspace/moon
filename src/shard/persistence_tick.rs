@@ -641,6 +641,23 @@ fn apply_completion_vec(
             // wrong answers.
             if let Some(req) = c.failed_request {
                 crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    // Deep-review P2 stale-shadow guard: if the key was
+                    // re-created and re-evicted while this pwrite was in
+                    // flight, a NEWER spill request supersedes this one —
+                    // re-inserting this older payload would shadow the newer
+                    // cold value in the hot plane (and the next eviction
+                    // would spill the stale copy as authoritative).
+                    let newest = db.spill_inflight_is_newest(&req.key, req.file_id);
+                    db.spill_inflight_clear(&req.key, req.file_id);
+                    if !newest {
+                        tracing::warn!(
+                            file_id = c.file_entry.file_id,
+                            key_len = req.key.len(),
+                            "Spill pwrite failed for a SUPERSEDED request; skipping \
+                             re-insert (a newer spill of this key is in flight or landed)"
+                        );
+                        return;
+                    }
                     if db.get_version(&req.key) != 0 {
                         // A newer write recreated the key while the spill was
                         // in flight; the failed payload is stale — drop it.
@@ -704,6 +721,10 @@ fn apply_completion_vec(
                 if let Some(ref mut ci) = db.cold_index {
                     ci.insert(entry.key.clone(), location);
                 }
+                // Retire this request's in-flight record (stale-shadow
+                // guard); a newer request's record is left for its own
+                // completion.
+                db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
         }
     }
