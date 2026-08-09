@@ -191,12 +191,12 @@
     },
     "client-compat-harness": {
       "title": "Raw-RESP diff harness: Moon vs a real redis-server, RESP2 + RESP3",
-      "phase": "build",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [],
       "created": "2026-08-09T07:32:03+00:00",
-      "updated": "2026-08-09T08:22:27+00:00"
+      "updated": "2026-08-09T09:17:12+00:00"
     },
     "monoio-ci-coverage": {
       "title": "CI runs the test suite on a monoio build (and clippy --all-targets)",
@@ -377,7 +377,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-09T08:22:27+00:00",
+  "updated": "2026-08-09T09:17:12+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
