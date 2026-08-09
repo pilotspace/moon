@@ -97,20 +97,15 @@ entries:
 
   # ── Transaction integrity ─────────────────────────────────────────────
 
+  # Found by this harness 2026-08-09 and FIXED in the same v0.8.6 hotfix
+  # (PR #457): GET inside MULTI was answered by the inline fast path instead of
+  # queued, so EXEC returned *0. The waiver that recorded it went stale the
+  # moment the fix landed and --strict said so by name — which is the whole
+  # point of the mechanism. Kept unwaived as the permanent regression guard.
   - name: multi_get_must_queue
     setup: ["SET k v"]
     command: "GET k"
     policy: exact
-    expect_diff:
-      reason: >-
-        FOUND BY THIS HARNESS, 2026-08-09. GET inside MULTI is answered
-        immediately on the monoio inline fast path instead of being queued: the
-        client receives $1 v where Redis sends +QUEUED, and EXEC then returns
-        *0 instead of *1[$1 v]. Root cause is the same gate as the v0.8.6 P0
-        (PR #457) — can_inline_writes carries !conn.in_multi but
-        can_inline_reads does not. MGET, which is not inline-eligible, queues
-        correctly. Monoio-only, so no CI job can observe it.
-        Owner: v0.8.6 hotfix (one added condition).
 
   - name: multi_queues_config_get
     command: "CONFIG GET maxmemory"
@@ -267,13 +262,9 @@ entries:
 
   # ── Error-code parity (compared on the code, never the message) ───────
 
+  # Waiver removed with the MULTI queueing fix: the MULTI legs used to diverge
+  # only because the inline GET ran instead of queueing, emptying EXEC.
   - name: error_wrongtype
     setup: ["DEL k", "LPUSH k v"]
     command: "GET k"
     policy: exact
-    expect_diff:
-      reason: >-
-        Standalone and pipeline are correct (-WRONGTYPE both sides). The MULTI
-        legs diverge for the multi_get_must_queue reason — the inline GET runs
-        instead of queueing, so EXEC is empty. Remove this waiver together with
-        multi_get_must_queue. Owner: v0.8.6 hotfix.
