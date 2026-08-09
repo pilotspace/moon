@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": null,
+  "active_task": "client-compat-harness",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -188,6 +188,90 @@
       "created": "2026-06-16T16:43:09+00:00",
       "updated": "2026-06-17T01:47:24+00:00",
       "flag_verified": true
+    },
+    "client-compat-harness": {
+      "title": "Raw-RESP diff harness: Moon vs a real redis-server, RESP2 + RESP3",
+      "phase": "build",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [],
+      "created": "2026-08-09T07:32:03+00:00",
+      "updated": "2026-08-09T08:22:27+00:00"
+    },
+    "monoio-ci-coverage": {
+      "title": "CI runs the test suite on a monoio build (and clippy --all-targets)",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [],
+      "created": "2026-08-09T07:32:03+00:00",
+      "updated": "2026-08-09T07:32:03+00:00"
+    },
+    "client-identity-introspection": {
+      "title": "HELLO/COMMAND/ROLE/RESET identity + registry-dispatch reconciliation",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T07:32:03+00:00",
+      "updated": "2026-08-09T07:32:03+00:00"
+    },
+    "resp3-type-fidelity": {
+      "title": "RESP3 reply-type parity, applied at one conversion choke point",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T07:32:04+00:00",
+      "updated": "2026-08-09T07:32:04+00:00"
+    },
+    "pubsub-resp3-push": {
+      "title": "Pub/sub Push frames, subscriber-mode rules, and sharded pub/sub",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T07:32:04+00:00",
+      "updated": "2026-08-09T07:32:04+00:00"
+    },
+    "cluster-client-bootstrap": {
+      "title": "CLUSTER SHARDS, READONLY/READWRITE, and honest cluster_state",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T07:32:04+00:00",
+      "updated": "2026-08-09T07:32:04+00:00"
+    },
+    "info-observability": {
+      "title": "INFO sections/fields, keyspace notifications, protocol-error replies",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T07:32:04+00:00",
+      "updated": "2026-08-09T07:32:04+00:00"
+    },
+    "sdk-wire-form-fixes": {
+      "title": "First-party Rust/Python SDK wire forms + MQ/WS registry entries",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-identity-introspection"
+      ],
+      "created": "2026-08-09T07:32:04+00:00",
+      "updated": "2026-08-09T07:32:04+00:00"
     }
   },
   "milestones": {
@@ -293,7 +377,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-09T07:18:25+00:00",
+  "updated": "2026-08-09T08:22:27+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Client-compat harness: raw-RESP diff against a real `redis-server`
+  (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
+  (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
+  to text before any assertion can see them — it even strips `(integer) ` — and
+  never sends `-3`, so the entire RESP3 surface was uncompared. That blindness
+  is why ~22 type-level compatibility defects survived into v0.8.5. The new
+  harness speaks RESP on a raw socket and compares in a fixed order — TYPE, then
+  SHAPE, then VALUE — across the full {RESP2, RESP3} × {standalone, MULTI/EXEC,
+  pipeline} matrix, so a finding says which of the three diverged and whether a
+  reply changes shape by context. A missing `redis-server` FAILS
+  (`ERR_NO_ORACLE`) rather than skipping. New CI job `client-compat` on the
+  self-hosted runner; the manifest carries a recorded baseline of reasoned
+  waivers so the job is a ratchet — a new divergence fails it, and `--strict`
+  fails the moment a waived divergence is fixed and its waiver goes stale.
+  First full run vs Redis 8.6.1: 152 comparisons, 94 pass, 58 waived, plus 34
+  named missing `INFO` fields via `--info-manifest`.
+
 ### Security
 - **ACL bypass on the inline GET fast path (monoio runtime).** An
   authenticated but restricted user could read any key with plain `GET`:
