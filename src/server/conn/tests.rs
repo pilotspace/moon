@@ -52,7 +52,8 @@ fn test_inline_get_hit() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 1);
@@ -91,7 +92,8 @@ fn test_inline_get_hit_byte_parity_sizes() {
             &None,
             0,
             1,
-            false,
+            true,  // can_inline_reads
+            false, // can_inline_writes
             &rt_config,
         );
 
@@ -136,7 +138,8 @@ fn test_inline_get_miss() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 1);
@@ -165,7 +168,8 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 0, "SET should fall through inline dispatch");
@@ -193,7 +197,8 @@ fn test_inline_set_executes_when_writes_enabled() {
         &None,
         0,
         1,
-        true,
+        true, // can_inline_reads
+        true, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 1, "SET should be inlined");
@@ -234,7 +239,8 @@ fn test_inline_set_with_options_falls_through() {
         &None,
         0,
         1,
-        true,
+        true, // can_inline_reads
+        true, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 0, "SET with options should fall through");
@@ -261,7 +267,8 @@ fn test_inline_fallthrough() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 0);
@@ -297,13 +304,62 @@ fn test_inline_mixed_batch() {
         &None,
         0,
         1,
-        false,
-        false,
+        true,  // can_inline_reads: unrestricted, non-tracking connection
+        false, // can_inline_writes
+        false, // cluster_enabled
         &rt_config,
     );
     assert_eq!(total, 1);
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
     assert_eq!(&read_buf[..], b"*1\r\n$4\r\nPING\r\n");
+}
+
+/// A restricted (or client-side-caching) connection must NOT have its GET
+/// answered here: the inline path runs neither the ACL command/key check nor
+/// `track_read_keys`, so the command has to fall through to generic dispatch.
+/// End-to-end coverage lives in `tests/acl_inline_read_enforcement.rs`; this
+/// pins the gate itself so a future refactor cannot quietly drop it.
+#[test]
+fn test_inline_get_refused_when_reads_not_inlinable() {
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"bar")),
+        );
+    });
+    let mut read_buf = BytesMut::new();
+    read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+    let original_len = read_buf.len();
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    let total = try_inline_dispatch_loop(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        false, // can_inline_reads: restricted ACL or CLIENT TRACKING conn
+        false, // can_inline_writes
+        false, // cluster_enabled
+        &rt_config,
+    );
+    assert_eq!(total, 0, "GET must not be inlined when reads are gated off");
+    assert_eq!(
+        read_buf.len(),
+        original_len,
+        "the command must be left in the buffer for generic dispatch"
+    );
+    assert!(
+        write_buf.is_empty(),
+        "no value may reach the wire from the inline path"
+    );
 }
 
 #[test]
@@ -330,7 +386,8 @@ fn test_inline_case_insensitive() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 1);
@@ -358,7 +415,8 @@ fn test_inline_partial() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 0);
@@ -391,7 +449,8 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(
@@ -432,8 +491,9 @@ fn test_inline_multiple_gets() {
         &None,
         0,
         1,
-        false,
-        false,
+        true,  // can_inline_reads: unrestricted, non-tracking connection
+        false, // can_inline_writes
+        false, // cluster_enabled
         &rt_config,
     );
     assert_eq!(total, 2);
@@ -468,7 +528,8 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         &None,
         0,
         1,
-        true, // even with writes inlinable...
+        true, // even with reads inlinable...
+        true, // ...and writes inlinable...
         true, // ...cluster mode wins: nothing may inline
         &rt_config,
     );
@@ -548,7 +609,8 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     let elapsed = start.elapsed();
@@ -599,7 +661,8 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         &None,
         0,
         1,
-        false,
+        true,  // can_inline_reads
+        false, // can_inline_writes
         &rt_config,
     );
     assert_eq!(result, 1);

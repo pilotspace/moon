@@ -23,9 +23,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn moon_binary() -> Option<std::path::PathBuf> {
+fn moon_binary() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("MOON_BIN") {
-        return Some(std::path::PathBuf::from(p));
+        return std::path::PathBuf::from(p);
     }
     // CARGO_BIN_EXE_moon is the binary cargo built for THIS test invocation
     // — guaranteed fresh and feature-matched. Never probe target/release
@@ -33,7 +33,7 @@ fn moon_binary() -> Option<std::path::PathBuf> {
     // binary of unknown provenance (this exact fallback silently ran an
     // ancient server and "failed" all 5 tests during the v0.6.0 release
     // gate), and in a bare worktree it silently SKIPS the whole suite.
-    Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon")))
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
 struct Moon {
@@ -50,8 +50,12 @@ impl Drop for Moon {
     }
 }
 
-fn spawn_moon_4shard() -> Option<Moon> {
-    let bin = moon_binary()?;
+fn spawn_moon_4shard() -> Moon {
+    spawn_moon("4")
+}
+
+fn spawn_moon(shards: &str) -> Moon {
+    let bin = moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-tracking-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
@@ -60,7 +64,7 @@ fn spawn_moon_4shard() -> Option<Moon> {
                 "--port",
                 &port.to_string(),
                 "--shards",
-                "4",
+                shards,
                 "--admin-port",
                 "0",
                 "--appendonly",
@@ -73,13 +77,17 @@ fn spawn_moon_4shard() -> Option<Moon> {
                 tmp_dir.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Captured, not discarded: when readiness fails the panic below
+            // prints this, so the failure names its cause.
+            .stderr(
+                std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
+            )
             .spawn()
             .expect("spawn moon")
     });
     // Same directory formula the closure used for the winning attempt.
     let tmp_dir = std::env::temp_dir().join(format!("moon-tracking-{port}"));
-    let moon = Moon {
+    let mut moon = Moon {
         child,
         port,
         tmp_dir,
@@ -95,14 +103,26 @@ fn spawn_moon_4shard() -> Option<Moon> {
                     && n > 0
                     && buf.starts_with(b"+PONG")
                 {
-                    return Some(moon);
+                    return moon;
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
-    None
+    // Never skip: this suite is the regression guard for a CLIENT TRACKING
+    // failure that already shipped once by being invisible. A silent early
+    // return would let it report green while exercising no server at all.
+    let status = match moon.child.try_wait() {
+        Ok(Some(s)) => format!("exited with {s}"),
+        Ok(None) => "still running but never answered PING".to_string(),
+        Err(e) => format!("status unavailable: {e}"),
+    };
+    let log = std::fs::read_to_string(moon.tmp_dir.join("moon.stderr"))
+        .unwrap_or_else(|e| format!("<stderr log unreadable: {e}>"));
+    panic!(
+        "moon did not become ready on port {port} within 10s (--shards {shards}); \
+         child {status}\n--- moon stderr ---\n{log}"
+    );
 }
 
 /// Minimal RESP client over a blocking TcpStream.
@@ -176,11 +196,22 @@ impl Resp {
 
 /// Start a RESP3 connection with CLIENT TRACKING ON.
 fn tracking_client(port: u16) -> Resp {
+    tracking_client_with(port, &[])
+}
+
+/// Start a RESP3 connection with `CLIENT TRACKING ON <opts...>`.
+fn tracking_client_with(port: u16, opts: &[&str]) -> Resp {
     let mut c = Resp::connect(port);
     c.cmd(&["HELLO", "3"]);
     assert!(c.saw(b"proto"), "HELLO 3 handshake must answer");
-    c.cmd(&["CLIENT", "TRACKING", "ON"]);
-    assert!(c.saw(b"+OK"), "CLIENT TRACKING ON must be accepted");
+    let mut args = vec!["CLIENT", "TRACKING", "ON"];
+    args.extend_from_slice(opts);
+    c.cmd(&args);
+    assert!(
+        c.saw(b"+OK"),
+        "CLIENT TRACKING ON {opts:?} must be accepted (got: {:?})",
+        String::from_utf8_lossy(&c.buf)
+    );
     c.clear();
     c
 }
@@ -189,7 +220,7 @@ const INVALIDATE: &[u8] = b"$10\r\ninvalidate\r\n";
 
 #[test]
 fn nontracking_writer_invalidates_cross_connection() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port); // plain RESP2, tracking OFF
     writer.cmd(&["SET", "ct:k1", "v1"]);
@@ -220,7 +251,7 @@ fn nontracking_writer_invalidates_cross_connection() {
 
 #[test]
 fn multikey_del_invalidates_every_key() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["MSET", "ct:a", "1", "ct:b", "2"]);
@@ -251,7 +282,7 @@ fn multikey_del_invalidates_every_key() {
 
 #[test]
 fn flushall_pushes_flush_invalidation() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["SET", "ct:f", "v"]);
@@ -276,7 +307,7 @@ fn flushall_pushes_flush_invalidation() {
 
 #[test]
 fn mset_invalidates_every_second_arg_key() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["MSET", "ct:m1", "x", "ct:m2", "y"]);
@@ -314,7 +345,7 @@ fn mset_invalidates_every_second_arg_key() {
 /// occasional local iteration), which the threshold cleanly rejects.
 #[test]
 fn routed_multi_exec_invalidates_tracking_client() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     // One warmed writer (fixed accept shard → most keys route) reused for seed
     // + commit; one reader reused across keys. Low connection churn.
@@ -362,5 +393,96 @@ fn routed_multi_exec_invalidates_tracking_client() {
         "routed MULTI/EXEC invalidation regression: only {delivered}/{total} writes \
          invalidated the tracking client (pre-fix routed EXEC skips invalidation \
          entirely, delivering ~2/12; the fix restores ~9/12)"
+    );
+}
+
+// ── client-compat P0: inline GET fast path skipped read tracking ────────
+//
+// `try_inline_dispatch` (`src/server/conn/blocking.rs`) answers plain
+// `GET key` without entering the generic dispatch path — and therefore
+// without calling `track_read_keys`. A tracking client's own GETs were
+// never registered, so nothing ever invalidated them: `CLIENT TRACKING ON`
+// answered `+OK` and then went silent forever.
+//
+// At `--shards 4` the tests above pass only because their keys happen to
+// hash off the reader's own shard (cross-shard reads are not inline-eligible)
+// — a latent flake as much as a coverage hole. At `--shards 1` — the config
+// CLAUDE.md recommends for non-pipelined workloads — every GET is inlined and
+// the failure is total. Demonstrated on 0.8.4: an identical trial reading via
+// `MGET` (not inline-eligible) received the invalidate, `GET` received nothing.
+
+#[test]
+fn tracked_inline_get_invalidates_on_single_shard() {
+    let m = spawn_moon("1");
+
+    let mut writer = Resp::connect(m.port); // plain RESP2, tracking OFF
+    writer.cmd(&["SET", "ct:inline", "v1"]);
+    assert!(writer.saw(b"+OK"));
+
+    let mut reader = tracking_client(m.port);
+    // Plain `GET` — the exact shape `try_inline_dispatch` intercepts.
+    reader.cmd(&["GET", "ct:inline"]);
+    assert!(reader.saw(b"v1"), "tracked GET must return the seed value");
+    reader.clear();
+
+    writer.cmd(&["SET", "ct:inline", "v2"]);
+    assert!(writer.saw(b"+OK"), "writer SET must succeed");
+
+    assert!(
+        reader.wait_for(INVALIDATE, Duration::from_secs(3)) && reader.saw(b"ct:inline"),
+        "a key read via the inline GET fast path must still be tracked and \
+         invalidated on a foreign write (got: {:?})",
+        String::from_utf8_lossy(&reader.buf)
+    );
+}
+
+// ── client-compat P0: BCAST mode never registered anything ──────────────
+//
+// `CLIENT TRACKING ON BCAST` with no `PREFIX` means "invalidate me for ALL
+// keys" in Redis. Moon only called `TrackingTable::register_prefix` inside
+// `for prefix in &config_parsed.prefixes`, so a prefix-less BCAST client
+// registered zero prefixes and received nothing — at any shard count, and
+// regardless of whether it ever read the key (BCAST does not depend on reads).
+
+#[test]
+fn bcast_without_prefix_invalidates_every_key() {
+    let m = spawn_moon("1");
+
+    let mut reader = tracking_client_with(m.port, &["BCAST"]);
+
+    // BCAST does not require the client to have read the key first.
+    let mut writer = Resp::connect(m.port);
+    writer.cmd(&["SET", "bc:anykey", "v1"]);
+    assert!(writer.saw(b"+OK"), "writer SET must succeed");
+
+    assert!(
+        reader.wait_for(INVALIDATE, Duration::from_secs(3)) && reader.saw(b"bc:anykey"),
+        "BCAST with no PREFIX must invalidate on every key (Redis semantics: \
+         empty prefix matches all), got: {:?}",
+        String::from_utf8_lossy(&reader.buf)
+    );
+}
+
+#[test]
+fn bcast_with_prefix_invalidates_only_matching_keys() {
+    let m = spawn_moon("1");
+
+    let mut reader = tracking_client_with(m.port, &["BCAST", "PREFIX", "want:"]);
+
+    let mut writer = Resp::connect(m.port);
+    writer.cmd(&["SET", "other:k", "v1"]);
+    assert!(writer.saw(b"+OK"));
+    writer.cmd(&["SET", "want:k", "v1"]);
+    assert!(writer.saw(b"+OK"));
+
+    assert!(
+        reader.wait_for(b"want:k", Duration::from_secs(3)),
+        "BCAST PREFIX want: must invalidate want:k (got: {:?})",
+        String::from_utf8_lossy(&reader.buf)
+    );
+    assert!(
+        !reader.saw(b"other:k"),
+        "BCAST PREFIX want: must NOT invalidate out-of-prefix keys (got: {:?})",
+        String::from_utf8_lossy(&reader.buf)
     );
 }

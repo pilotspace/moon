@@ -1123,10 +1123,39 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // for the rest of the process once any replica has ever begun
             // attaching, matching the existing `ctx.spill_sender.is_none()`
             // precedent of "fall back to the full path when it must do more
-            // than this fast path knows how to do". GET inlining is
-            // unaffected (`is_get` in `try_inline_dispatch` doesn't check
-            // `can_inline_writes`).
-            let can_inline_writes = conn.acl_skip_allowed()
+            // than this fast path knows how to do". These write-only
+            // conditions do not gate GET, which has its own `can_inline_reads`
+            // gate below — reads must never be inlined for a restricted or
+            // tracking connection, but a replica/spill/fanout master may still
+            // serve them from the fast path.
+            //
+            // Hoisted: both gates need it, and it is one Acquire load plus a
+            // compare (`cached_acl_unrestricted && acl_cache_fresh()`), so
+            // computing it once keeps the read gate free relative to the
+            // pre-fix code, which already paid for it on the write gate.
+            let acl_unrestricted = conn.acl_skip_allowed();
+            // Reads may be inlined only when this connection can provably skip
+            // the ACL check AND is not itself a client-side-caching client:
+            // the inline path calls neither the ACL gate nor `track_read_keys`.
+            // A restricted user, or a `CLIENT TRACKING ON` connection, falls
+            // back to generic dispatch where both run. Deliberately NOT gated
+            // on the process-global `tracking_active()` — only THIS
+            // connection's own reads populate its invalidation set, so one
+            // tracking client must not push every other connection off the
+            // fast path (writes still use the global gate, since a
+            // non-tracking writer must invalidate everyone else).
+            //
+            // `!conn.in_multi` is shared with the write gate and is not
+            // optional: inside an open transaction a command must be QUEUED,
+            // and the inline path answers it instead. A client then receives
+            // the value where it expects `+QUEUED`, and `EXEC` omits the read
+            // entirely — `MULTI; GET k; EXEC` returned `*0` rather than
+            // `*1[$1 v]`. `MGET`, not being inline-eligible, queued correctly
+            // all along, which is what isolated the path.
+            // See `tests/multi_queues_inline_get.rs`.
+            let can_inline_reads =
+                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
+            let can_inline_writes = acl_unrestricted
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
                 && !crate::tracking::tracking_active()
@@ -1143,6 +1172,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &ctx.repl_state,
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
+                can_inline_reads,
                 can_inline_writes,
                 // R6: cluster mode disables the inline fast path entirely —
                 // GET/SET must reach try_handle_cluster_routing for MOVED/ASK.
