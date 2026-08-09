@@ -142,6 +142,40 @@ impl Resp {
             Err(e) => format!("<read error: {e}>"),
         }
     }
+
+    /// Send several commands in ONE write and read whatever comes back.
+    ///
+    /// Needed because `can_inline_reads` is computed once per read-buffer
+    /// iteration, *before* `try_inline_dispatch_loop` walks the buffer — so a
+    /// `MULTI` arriving in the same write as the `GET` after it is the case
+    /// where the gate is evaluated before the state it depends on exists.
+    fn pipeline(&mut self, cmds: &[&[&str]]) -> String {
+        let mut out = Vec::new();
+        for args in cmds {
+            out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in *args {
+                out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+            }
+        }
+        self.stream.write_all(&out).expect("write");
+        // Replies may arrive across several segments; keep reading until the
+        // socket goes quiet rather than assuming one packet.
+        let mut acc = String::new();
+        let mut buf = [0u8; 8192];
+        for _ in 0..8 {
+            match self.stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if acc.matches("\r\n").count() >= cmds.len() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        acc
+    }
 }
 
 /// Keys enough that at `--shards 4` some land on the connection's own shard —
@@ -225,6 +259,48 @@ fn inline_write_still_queues_inside_multi() {
     );
     assert_eq!(c.cmd(&["EXEC"]), "*1\r\n+OK\r\n");
     assert_eq!(c.cmd(&["GET", "k"]), "$1\r\nv\r\n");
+}
+
+/// The gate's sharpest edge: `can_inline_reads` is computed ONCE per
+/// read-buffer iteration, before `try_inline_dispatch_loop` walks the buffer.
+/// When `MULTI` and the `GET` after it arrive in the SAME write, the gate was
+/// evaluated while `conn.in_multi` was still false.
+///
+/// Measured: this case passes with the `!conn.in_multi` gate REMOVED, because
+/// the inline loop stops at the first command that is not a plain GET/SET, so a
+/// buffer containing `MULTI` hands its whole remainder to generic dispatch and
+/// never reaches the inline path again. The gate is belt-and-braces here — the
+/// defect only reproduces when `MULTI` and the `GET` arrive in separate reads
+/// (`inline_get_is_queued_inside_multi_*` cover that).
+///
+/// So this test does not guard the gate; it guards the *structural property
+/// that makes the gate sufficient*. Anything that teaches the inline loop to
+/// skip past commands it does not recognise, instead of bailing out, would
+/// silently reopen the bug for pipelined clients — and only this test would
+/// notice. Stated plainly because a test whose value is misdescribed is worse
+/// than no test.
+#[test]
+fn pipelined_multi_still_queues_the_following_get() {
+    let moon = spawn_moon("1");
+    let mut c = Resp::connect(moon.port);
+    assert!(c.cmd(&["SET", "k", "v"]).starts_with("+OK"));
+
+    // MULTI arrives in the same write as the GET it must protect.
+    let got = c.pipeline(&[&["MULTI"], &["GET", "k"], &["EXEC"]]);
+    assert_eq!(
+        got, "+OK\r\n+QUEUED\r\n*1\r\n$1\r\nv\r\n",
+        "a pipelined MULTI must still queue the GET that follows it in the \
+         same write (gate is computed before MULTI is parsed)"
+    );
+
+    // ...and a GET *before* the MULTI in one write must still be inlined and
+    // answered directly, so the fix did not simply disable the fast path
+    // whenever a buffer happens to contain MULTI.
+    let got = c.pipeline(&[&["GET", "k"], &["MULTI"], &["GET", "k"], &["EXEC"]]);
+    assert_eq!(
+        got, "$1\r\nv\r\n+OK\r\n+QUEUED\r\n*1\r\n$1\r\nv\r\n",
+        "a GET before MULTI in the same write must still be served inline"
+    );
 }
 
 /// Outside a transaction the inline path must still serve the read — the fix
