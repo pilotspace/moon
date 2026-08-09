@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **`GET` inside `MULTI` was executed instead of queued (monoio).** Third
+  defect from the same ungated inline read path, and the one most visible to a
+  working client: `MULTI; GET k; EXEC` answered `+OK`, `$1 v`, `*0` where Redis
+  answers `+OK`, `+QUEUED`, `*1[$1 v]`. The client receives a value where it
+  expects `+QUEUED`, and then an `EXEC` that silently omits the read — a
+  redis-py/go-redis transaction returns an empty result set for an exchange it
+  believes succeeded. `can_inline_writes` already carried `!conn.in_multi`
+  (so `SET` queued correctly); `can_inline_reads` now carries it too. `MGET`,
+  not being inline-eligible, queued correctly throughout, which is what
+  isolated the path. Found by the new `scripts/test-client-compat.sh` raw-RESP
+  harness on its first run against a real redis-server. New suite:
+  `tests/multi_queues_inline_get.rs`, including controls pinning that `MGET`
+  and `SET` still queue and that a plain `GET` outside a transaction still
+  takes the fast path (measured: 2000/2000 GETs still `local_inline`, before
+  and after a completed transaction).
 - **`CLIENT TRACKING` answered `+OK` and then never invalidated (monoio).**
   Same root cause: the inline GET path also skips
   `tracking::invalidation::track_read_keys`, so a client-side-caching client's

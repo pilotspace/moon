@@ -1144,7 +1144,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // tracking client must not push every other connection off the
             // fast path (writes still use the global gate, since a
             // non-tracking writer must invalidate everyone else).
-            let can_inline_reads = acl_unrestricted && !conn.tracking_state.enabled;
+            //
+            // `!conn.in_multi` is shared with the write gate and is not
+            // optional: inside an open transaction a command must be QUEUED,
+            // and the inline path answers it instead. A client then receives
+            // the value where it expects `+QUEUED`, and `EXEC` omits the read
+            // entirely — `MULTI; GET k; EXEC` returned `*0` rather than
+            // `*1[$1 v]`. `MGET`, not being inline-eligible, queued correctly
+            // all along, which is what isolated the path.
+            // See `tests/multi_queues_inline_get.rs`.
+            let can_inline_reads =
+                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
             let can_inline_writes = acl_unrestricted
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
