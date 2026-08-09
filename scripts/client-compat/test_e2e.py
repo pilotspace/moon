@@ -125,25 +125,54 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(report.tally()["fail"], 0)
 
     def test_a_diverging_entry_exits_one_and_names_the_divergence(self):
-        # GET inside MULTI: Moon answers the value where Redis queues it. The
-        # harness must surface this as a failure with a named divergence, not
-        # swallow it — this is the find that justifies the harness existing.
-        report = Runner(cfg()).run()
+        # SISMEMBER under RESP3: Redis answers Integer :1, Moon over-converts
+        # to Boolean #t. The harness must surface this as a failure naming TYPE,
+        # not swallow it.
+        #
+        # This deliberately does NOT use GET-inside-MULTI any more: that
+        # divergence was real when the harness first ran and is now fixed, so
+        # asserting on it would be asserting a bug rather than harness
+        # behaviour. Replace this entry too if SISMEMBER is ever fixed — a test
+        # that needs a live defect to pass is a maintenance debt, and saying so
+        # here is cheaper than rediscovering it.
+        report = Runner(cfg(manifest_path=manifest("""
+entries:
+  - name: sismember_resp3_type
+    setup: ["DEL s", "SADD s a"]
+    command: "SISMEMBER s a"
+    policy: exact
+    protocols: [resp3]
+    contexts: [standalone]
+"""))).run()
         self.assertEqual(report.exit_code(), 1)
         diffs = [r for r in report.results if r.verdict == "diff"]
         self.assertTrue(diffs)
         for r in diffs:
-            self.assertEqual(r.context, "multi")
-            self.assertIn(r.divergence, ("type", "shape", "value"))
+            self.assertEqual(r.divergence, "type")
 
     def test_info_manifest_reports_missing_fields_by_name(self):
+        # run_id is emitted by real Redis and not by Moon, so it is a genuine
+        # finding; redis_version is emitted by both.
         fields = manifest("")  # reuse tempfile helper for a plain list file
         with open(fields, "w") as f:
-            f.write("redis_version\nuptime_in_seconds\n"
-                    "moon_field_that_cannot_exist\n")
+            f.write("redis_version\nrun_id\n")
         report = Runner(cfg(info_manifest=fields)).run()
         missing = [r.name for r in report.results if r.verdict == "diff"]
-        self.assertIn("info:moon_field_that_cannot_exist", missing)
+        self.assertIn("info:run_id", missing)
+        self.assertNotIn("info:redis_version", missing)
+
+    def test_info_manifest_blames_the_pin_not_moon_when_redis_lacks_it_too(self):
+        # The differential must cut both ways: a field absent from the ORACLE
+        # is a wrong pin, not a Moon defect. Reporting it against Moon would
+        # manufacture a finding, which is the mirror image of the blindness
+        # this harness exists to remove.
+        fields = manifest("")
+        with open(fields, "w") as f:
+            f.write("field_that_no_redis_has\n")
+        report = Runner(cfg(info_manifest=fields)).run()
+        r = next(x for x in report.results if x.name == "info:field_that_no_redis_has")
+        self.assertNotEqual(r.verdict, "diff")
+        self.assertIn("fix the pin", r.detail)
 
     def test_a_type_divergence_is_found_and_exits_one(self):
         # SISMEMBER: Redis answers Integer. If Moon over-converts it under

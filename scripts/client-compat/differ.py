@@ -337,10 +337,15 @@ class RespConn:
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.buf = b""
+        # Everything actually written, so the byte-identical-send invariant is
+        # checked against an OBSERVATION rather than against a reconstruction
+        # built from the same inputs (which could never disagree).
+        self.sent_log = bytearray()
         if protocol == "resp3":
             self.roundtrip(["HELLO", "3"])
 
     def send(self, payload: bytes) -> None:
+        self.sent_log.extend(payload)
         self.sock.sendall(payload)
 
     def read_reply(self) -> tuple[bytes, Optional[Node]]:
@@ -464,6 +469,7 @@ class Runner:
         self.spawned_pids: list[int] = []
         self.spawned_dirs: list[str] = []
         self._procs: list[subprocess.Popen] = []
+        self._oracle_version = "?"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -515,18 +521,19 @@ class Runner:
                   ) -> tuple[bytes, bytes, Optional[Node]]:
         """Run one command in one context. Returns (sent, raw, compared node)."""
         cmd = encode_command(argv)
+        conn.sent_log.clear()                       # drop setup traffic
         if context == "standalone":
             conn.send(cmd)
             raw, node = conn.read_reply()
-            return cmd, raw, node
+            return bytes(conn.sent_log), raw, node
 
         if context == "multi":
             conn.roundtrip(["MULTI"])
             conn.send(cmd)
             conn.read_reply()                       # +QUEUED
-            sent = encode_command(["MULTI"]) + cmd + encode_command(["EXEC"])
             conn.send(encode_command(["EXEC"]))
             raw, node = conn.read_reply()
+            sent = bytes(conn.sent_log)
             if node is not None and node.children:
                 return sent, raw, node.children[0]
             return sent, raw, node
@@ -534,12 +541,11 @@ class Runner:
         # pipeline: the command under test is bracketed, sent in ONE write, so a
         # shape that only changes when batched is observable.
         ping = encode_command(["PING"])
-        sent = ping + cmd + ping
-        conn.send(sent)
+        conn.send(ping + cmd + ping)
         conn.read_reply()
         raw, node = conn.read_reply()
         conn.read_reply()
-        return sent, raw, node
+        return bytes(conn.sent_log), raw, node
 
     def _prepare(self, conn: RespConn, entry: Entry) -> None:
         conn.roundtrip(["FLUSHALL"])
@@ -589,14 +595,26 @@ class Runner:
             rc.close()
             mc.close()
         moon_body = (m_node.value or b"").decode("latin1") if m_node else ""
+        redis_body = (r_node.value or b"").decode("latin1") if r_node else ""
         out = []
         for fname in fields:
-            present = re.search(rf"^{re.escape(fname)}:", moon_body, re.M) is not None
+            pat = rf"^{re.escape(fname)}:"
+            in_moon = re.search(pat, moon_body, re.M) is not None
+            in_redis = re.search(pat, redis_body, re.M) is not None
+            if not in_redis:
+                # The oracle does not emit it either: the pinned list is wrong,
+                # not Moon. Reporting this as a Moon defect would manufacture a
+                # finding — the differential must cut both ways.
+                verdict, div = "parse_error", None
+                detail = (f"pinned field '{fname}' is absent from redis "
+                          f"{self._oracle_version} too — fix the pin, not moon")
+            elif in_moon:
+                verdict, div, detail = "pass", None, ""
+            else:
+                verdict, div = "diff", "value"
+                detail = f"INFO is missing '{fname}'"
             out.append(Result(f"info:{fname}", "resp2", "standalone", sent,
-                              r_raw, m_raw,
-                              "pass" if present else "diff",
-                              None if present else "value",
-                              "" if present else f"INFO is missing '{fname}'"))
+                              r_raw, m_raw, verdict, div, detail))
         return out
 
     # -- entry point -------------------------------------------------------
@@ -628,6 +646,7 @@ class Runner:
             self._await_ready(rport, "redis-server")
 
             redis_version = self._server_field(rport, "redis_version")
+            self._oracle_version = redis_version
             if _version_tuple(redis_version) < _version_tuple(cfg.min_redis):
                 raise HarnessError(
                     "ERR_NO_ORACLE",
