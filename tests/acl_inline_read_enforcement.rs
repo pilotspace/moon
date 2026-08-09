@@ -53,7 +53,7 @@ impl Drop for Moon {
     }
 }
 
-fn spawn_moon(shards: &str) -> Option<Moon> {
+fn spawn_moon(shards: &str) -> Moon {
     // CARGO_BIN_EXE_moon is the binary cargo built for THIS invocation —
     // fresh and feature-matched. Never probe target/release directly.
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
@@ -78,12 +78,17 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                 tmp_dir.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Captured, not discarded: when readiness fails the panic below
+            // prints this, so the failure names its cause instead of just its
+            // symptom.
+            .stderr(
+                std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
+            )
             .spawn()
             .expect("spawn moon")
     });
     let tmp_dir = std::env::temp_dir().join(format!("moon-aclinline-{port}"));
-    let moon = Moon {
+    let mut moon = Moon {
         child,
         port,
         tmp_dir,
@@ -98,14 +103,26 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                     && n > 0
                     && buf.starts_with(b"+PONG")
                 {
-                    return Some(moon);
+                    return moon;
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
-    None
+    // Never skip. These tests are the regression guard for a security bypass
+    // and a transaction-correctness bug; a silent early return would let them
+    // report green while exercising no server at all.
+    let status = match moon.child.try_wait() {
+        Ok(Some(s)) => format!("exited with {s}"),
+        Ok(None) => "still running but never answered PING".to_string(),
+        Err(e) => format!("status unavailable: {e}"),
+    };
+    let log = std::fs::read_to_string(moon.tmp_dir.join("moon.stderr"))
+        .unwrap_or_else(|e| format!("<stderr log unreadable: {e}>"));
+    panic!(
+        "moon did not become ready on port {port} within 10s (--shards {shards}); \
+         child {status}\n--- moon stderr ---\n{log}"
+    );
 }
 
 /// Minimal synchronous RESP client: one command, one reply.
@@ -175,7 +192,7 @@ fn collect_get_leaks(port: u16, user: &str) -> Vec<(String, String)> {
 }
 
 fn assert_no_leaks(shards: &str, user: &str, rules: &[&str]) {
-    let Some(m) = spawn_moon(shards) else { return };
+    let m = spawn_moon(shards);
     seed(m.port, user, rules);
     let leaks = collect_get_leaks(m.port, user);
     assert!(
@@ -203,7 +220,7 @@ fn deny_all_user_cannot_inline_get_multi_shard() {
 // ── key-pattern user: the key check must reject out-of-pattern GET ──────
 
 fn assert_pattern_enforced(shards: &str, user: &str) {
-    let Some(m) = spawn_moon(shards) else { return };
+    let m = spawn_moon(shards);
     seed(m.port, user, &["+@read", "~app:*"]);
 
     let mut c = Resp::connect(m.port);

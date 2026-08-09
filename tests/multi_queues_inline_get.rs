@@ -47,7 +47,7 @@ impl Drop for Moon {
     }
 }
 
-fn spawn_moon(shards: &str) -> Option<Moon> {
+fn spawn_moon(shards: &str) -> Moon {
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
     let (child, port) = common::spawn_listening(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-multiinline-{port}"));
@@ -70,12 +70,17 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                 tmp_dir.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Captured, not discarded: when readiness fails the panic below
+            // prints this, so the failure names its cause instead of just its
+            // symptom.
+            .stderr(
+                std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
+            )
             .spawn()
             .expect("spawn moon")
     });
     let tmp_dir = std::env::temp_dir().join(format!("moon-multiinline-{port}"));
-    let moon = Moon {
+    let mut moon = Moon {
         child,
         port,
         tmp_dir,
@@ -90,14 +95,26 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                     && n > 0
                     && buf.starts_with(b"+PONG")
                 {
-                    return Some(moon);
+                    return moon;
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
-    None
+    // Never skip. These tests are the regression guard for a security bypass
+    // and a transaction-correctness bug; a silent early return would let them
+    // report green while exercising no server at all.
+    let status = match moon.child.try_wait() {
+        Ok(Some(s)) => format!("exited with {s}"),
+        Ok(None) => "still running but never answered PING".to_string(),
+        Err(e) => format!("status unavailable: {e}"),
+    };
+    let log = std::fs::read_to_string(moon.tmp_dir.join("moon.stderr"))
+        .unwrap_or_else(|e| format!("<stderr log unreadable: {e}>"));
+    panic!(
+        "moon did not become ready on port {port} within 10s (--shards {shards}); \
+         child {status}\n--- moon stderr ---\n{log}"
+    );
 }
 
 struct Resp {
@@ -133,9 +150,7 @@ impl Resp {
 const KEYS: usize = 24;
 
 fn assert_queues_and_execs(shards: &str) {
-    let Some(moon) = spawn_moon(shards) else {
-        return;
-    };
+    let moon = spawn_moon(shards);
     let mut c = Resp::connect(moon.port);
 
     for i in 0..KEYS {
@@ -186,9 +201,7 @@ fn inline_get_is_queued_inside_multi_multi_shard() {
 /// gate by disabling transaction queueing wholesale.
 #[test]
 fn non_inlinable_read_still_queues() {
-    let Some(moon) = spawn_moon("1") else {
-        return;
-    };
+    let moon = spawn_moon("1");
     let mut c = Resp::connect(moon.port);
     assert!(c.cmd(&["SET", "k", "v"]).starts_with("+OK"));
     assert!(c.cmd(&["MULTI"]).starts_with("+OK"));
@@ -203,9 +216,7 @@ fn non_inlinable_read_still_queues() {
 /// `!conn.in_multi`). Pinned so the read fix cannot regress the write gate.
 #[test]
 fn inline_write_still_queues_inside_multi() {
-    let Some(moon) = spawn_moon("1") else {
-        return;
-    };
+    let moon = spawn_moon("1");
     let mut c = Resp::connect(moon.port);
     assert!(c.cmd(&["MULTI"]).starts_with("+OK"));
     assert!(
@@ -221,9 +232,7 @@ fn inline_write_still_queues_inside_multi() {
 /// GET entirely, which would silently cost the hot path.
 #[test]
 fn inline_get_still_serves_outside_multi() {
-    let Some(moon) = spawn_moon("1") else {
-        return;
-    };
+    let moon = spawn_moon("1");
     let mut c = Resp::connect(moon.port);
     assert!(c.cmd(&["SET", "k", "v"]).starts_with("+OK"));
     assert_eq!(c.cmd(&["GET", "k"]), "$1\r\nv\r\n");

@@ -23,9 +23,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn moon_binary() -> Option<std::path::PathBuf> {
+fn moon_binary() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("MOON_BIN") {
-        return Some(std::path::PathBuf::from(p));
+        return std::path::PathBuf::from(p);
     }
     // CARGO_BIN_EXE_moon is the binary cargo built for THIS test invocation
     // — guaranteed fresh and feature-matched. Never probe target/release
@@ -33,7 +33,7 @@ fn moon_binary() -> Option<std::path::PathBuf> {
     // binary of unknown provenance (this exact fallback silently ran an
     // ancient server and "failed" all 5 tests during the v0.6.0 release
     // gate), and in a bare worktree it silently SKIPS the whole suite.
-    Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon")))
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
 struct Moon {
@@ -50,12 +50,12 @@ impl Drop for Moon {
     }
 }
 
-fn spawn_moon_4shard() -> Option<Moon> {
+fn spawn_moon_4shard() -> Moon {
     spawn_moon("4")
 }
 
-fn spawn_moon(shards: &str) -> Option<Moon> {
-    let bin = moon_binary()?;
+fn spawn_moon(shards: &str) -> Moon {
+    let bin = moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-tracking-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
@@ -77,13 +77,17 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                 tmp_dir.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Captured, not discarded: when readiness fails the panic below
+            // prints this, so the failure names its cause.
+            .stderr(
+                std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
+            )
             .spawn()
             .expect("spawn moon")
     });
     // Same directory formula the closure used for the winning attempt.
     let tmp_dir = std::env::temp_dir().join(format!("moon-tracking-{port}"));
-    let moon = Moon {
+    let mut moon = Moon {
         child,
         port,
         tmp_dir,
@@ -99,14 +103,26 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
                     && n > 0
                     && buf.starts_with(b"+PONG")
                 {
-                    return Some(moon);
+                    return moon;
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
-    None
+    // Never skip: this suite is the regression guard for a CLIENT TRACKING
+    // failure that already shipped once by being invisible. A silent early
+    // return would let it report green while exercising no server at all.
+    let status = match moon.child.try_wait() {
+        Ok(Some(s)) => format!("exited with {s}"),
+        Ok(None) => "still running but never answered PING".to_string(),
+        Err(e) => format!("status unavailable: {e}"),
+    };
+    let log = std::fs::read_to_string(moon.tmp_dir.join("moon.stderr"))
+        .unwrap_or_else(|e| format!("<stderr log unreadable: {e}>"));
+    panic!(
+        "moon did not become ready on port {port} within 10s (--shards {shards}); \
+         child {status}\n--- moon stderr ---\n{log}"
+    );
 }
 
 /// Minimal RESP client over a blocking TcpStream.
@@ -204,7 +220,7 @@ const INVALIDATE: &[u8] = b"$10\r\ninvalidate\r\n";
 
 #[test]
 fn nontracking_writer_invalidates_cross_connection() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port); // plain RESP2, tracking OFF
     writer.cmd(&["SET", "ct:k1", "v1"]);
@@ -235,7 +251,7 @@ fn nontracking_writer_invalidates_cross_connection() {
 
 #[test]
 fn multikey_del_invalidates_every_key() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["MSET", "ct:a", "1", "ct:b", "2"]);
@@ -266,7 +282,7 @@ fn multikey_del_invalidates_every_key() {
 
 #[test]
 fn flushall_pushes_flush_invalidation() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["SET", "ct:f", "v"]);
@@ -291,7 +307,7 @@ fn flushall_pushes_flush_invalidation() {
 
 #[test]
 fn mset_invalidates_every_second_arg_key() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     let mut writer = Resp::connect(m.port);
     writer.cmd(&["MSET", "ct:m1", "x", "ct:m2", "y"]);
@@ -329,7 +345,7 @@ fn mset_invalidates_every_second_arg_key() {
 /// occasional local iteration), which the threshold cleanly rejects.
 #[test]
 fn routed_multi_exec_invalidates_tracking_client() {
-    let Some(m) = spawn_moon_4shard() else { return };
+    let m = spawn_moon_4shard();
 
     // One warmed writer (fixed accept shard → most keys route) reused for seed
     // + commit; one reader reused across keys. Low connection churn.
@@ -397,7 +413,7 @@ fn routed_multi_exec_invalidates_tracking_client() {
 
 #[test]
 fn tracked_inline_get_invalidates_on_single_shard() {
-    let Some(m) = spawn_moon("1") else { return };
+    let m = spawn_moon("1");
 
     let mut writer = Resp::connect(m.port); // plain RESP2, tracking OFF
     writer.cmd(&["SET", "ct:inline", "v1"]);
@@ -430,7 +446,7 @@ fn tracked_inline_get_invalidates_on_single_shard() {
 
 #[test]
 fn bcast_without_prefix_invalidates_every_key() {
-    let Some(m) = spawn_moon("1") else { return };
+    let m = spawn_moon("1");
 
     let mut reader = tracking_client_with(m.port, &["BCAST"]);
 
@@ -449,7 +465,7 @@ fn bcast_without_prefix_invalidates_every_key() {
 
 #[test]
 fn bcast_with_prefix_invalidates_only_matching_keys() {
-    let Some(m) = spawn_moon("1") else { return };
+    let m = spawn_moon("1");
 
     let mut reader = tracking_client_with(m.port, &["BCAST", "PREFIX", "want:"]);
 
