@@ -6,6 +6,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **ACL bypass on the inline GET fast path (monoio runtime).** An
+  authenticated but restricted user could read any key with plain `GET`:
+  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
+  map, running neither the ACL command check nor the ACL key-pattern check.
+  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
+  its pattern; no ACL LOG entry was produced. Writes were already gated on
+  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
+  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
+  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
+  suite); `--shards 1` — the config recommended for non-pipelined workloads —
+  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
+  so a restricted connection falls through to generic dispatch where both ACL
+  checks run. The tokio handlers were never affected (they gate correctly at
+  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
+  caught this: every CI test job builds tokio. New suite:
+  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
+  `--shards 1` and `--shards 4`).
+
+### Fixed
+- **`CLIENT TRACKING` answered `+OK` and then never invalidated (monoio).**
+  Same root cause: the inline GET path also skips
+  `tracking::invalidation::track_read_keys`, so a client-side-caching client's
+  own `GET`s were never registered and nothing ever invalidated them — the
+  cache served stale data indefinitely. At `--shards 1` this was total; at
+  `--shards 4` it depended on whether the key hashed to the reader's own
+  shard, which also made the existing `mset_invalidates_every_second_arg_key`
+  test flaky (observed failing 2 of 3 runs on 0.8.5). Reads from a connection
+  with tracking enabled now take the generic path. Deliberately gated on this
+  connection's own `tracking_state.enabled`, not the process-global
+  `tracking_active()`: only a connection's own reads populate its invalidation
+  set, so one caching client must not push every other connection off the fast
+  path.
+- **`CLIENT TRACKING ON BCAST` with no `PREFIX` never invalidated anything.**
+  Redis treats prefix-less BCAST as "invalidate me for every key", but the
+  handlers only registered broadcast interest inside
+  `for prefix in &config_parsed.prefixes`, so a prefix-less BCAST client
+  registered nothing — at any shard count, and regardless of what it read
+  (BCAST does not depend on reads). `parse_tracking_args` now normalises
+  prefix-less BCAST to the empty prefix, which `TrackingTable`'s
+  `key.starts_with(prefix)` match treats as "all keys"; one change fixes all
+  three handlers.
+
+  The default (unrestricted, non-tracking) connection keeps the inline fast
+  path byte-for-byte, verified against
+  `moon_dispatch_path_total{path="local_inline"}`: 2000/2000 GETs still
+  inlined with and without `--requirepass`, 0/2000 for restricted and
+  tracking connections.
+
 ## [0.8.5] — 2026-08-08
 
 ### Added

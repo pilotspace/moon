@@ -1621,6 +1621,7 @@ pub(crate) fn try_inline_dispatch(
     >,
     now_ms: u64,
     num_shards: usize,
+    can_inline_reads: bool,
     can_inline_writes: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
@@ -1651,7 +1652,15 @@ pub(crate) fn try_inline_dispatch(
     if buf[2] != b'\r' || buf[3] != b'\n' {
         return 0;
     }
-    let is_get = argc == b'2';
+    // `can_inline_reads` is NOT optional bookkeeping: this path answers GET
+    // without entering generic dispatch, so it runs neither the ACL
+    // command/key check nor `tracking::invalidation::track_read_keys`.
+    // Ungated it was (a) an ACL bypass — a `-@all` user read any key by name
+    // — and (b) a silent client-side-caching failure: a tracking client's own
+    // GETs were never registered, so nothing ever invalidated them.
+    // See `tests/acl_inline_read_enforcement.rs` and the inline-GET cases in
+    // `tests/client_tracking_invalidation.rs`.
+    let is_get = argc == b'2' && can_inline_reads;
     let is_set = argc == b'3' && can_inline_writes;
     if !is_get && !is_set {
         return 0;
@@ -1997,6 +2006,7 @@ pub(crate) fn try_inline_dispatch_loop(
     >,
     now_ms: u64,
     num_shards: usize,
+    can_inline_reads: bool,
     can_inline_writes: bool,
     cluster_enabled: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
@@ -2016,6 +2026,7 @@ pub(crate) fn try_inline_dispatch_loop(
             repl_state,
             now_ms,
             num_shards,
+            can_inline_reads,
             can_inline_writes,
             runtime_config,
         );
