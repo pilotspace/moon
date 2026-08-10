@@ -227,6 +227,21 @@ pub struct Database {
     /// to, so the value stays charged to RAM until the key is next written or
     /// deleted. Reads stay correct throughout; the cost is that the eviction
     /// did not actually reclaim that key's memory.
+    ///
+    /// ACCOUNTING (pre-existing, tracked in #466): the payload is resident RAM that
+    /// `used_memory` does not count. `evict_one_async_spill` calls
+    /// `db.remove()`, whose `remove_hot` credits back the whole
+    /// `entry_overhead`, while the queued `SpillRequest` still holds a full
+    /// `Bytes::copy_from_slice` of the value — so for the length of the
+    /// window the eviction loop believes it reclaimed memory it has not.
+    /// That was equally true before this plane existed (the request has
+    /// always owned that copy); what is added here is the key `Bytes` plus
+    /// this struct per in-flight key, and a retention window that now ends
+    /// when the event loop APPLIES the completion rather than when the spill
+    /// thread drains the channel. Charging the pending bytes honestly would
+    /// require teaching `evict_to_budget` to stop when pending bytes are
+    /// large, or it would evict in a runaway loop chasing memory that cannot
+    /// drop yet — a design change, deliberately out of scope for #459.
     spill_inflight: std::collections::HashMap<bytes::Bytes, PendingSpill>,
 }
 

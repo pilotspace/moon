@@ -6,39 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **A key whose disk-offload spill was in flight was invisible to the whole
-  server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
-  freed the hot entry the moment the `SpillRequest` was queued, and the key
-  was only registered in `cold_index` when the completion landed. In between
-  it existed in no plane the database consults: `spill_inflight` held only a
-  request id and was read solely by the completion path. The eviction code
-  documented the window as an acceptable "brief read-miss" backstopped by the
-  AOF — but the AOF backstops *durability*, not *visibility*, and nothing
-  considered a write landing inside the window. Measured on 400 × 4 KiB keys
-  against a 512 KiB cap: `DBSIZE` answered 124 for 400 acked keys and then
-  climbed to 400 on its own; `GET`/`EXISTS` denied live keys that returned
-  unaided 250 ms later; and 277 of 400 `DEL`s answered `:0` and were then
-  reversed by the completion — which publishes into `cold_index`
-  unconditionally, so those resurrections reached the manifest and survived
-  restart. A client that deleted data got it back.
-
-  `spill_inflight` is now a real third storage plane carrying the payload
-  (the same refcounted `Bytes` the queued request already pins — a refcount,
-  not a copy, and no extra peak memory). Reads promote from it with no disk
-  read at all, across all three dispatch paths (`promote_cold_if_present` for
-  collections and Lua/MULTI, the monoio async GET pre-warm, and the inline
-  `GET` fast path). `EXISTS`/`DEL` count it, `DBSIZE`/`logical_len` count it,
-  and `KEYS`/`RANDOMKEY` enumerate it. `DEL`, an overwriting `SET`, and a
-  promoting read each retire the record, which withdraws the completion's
-  authorization to publish — that is what makes a delete inside the window
-  final. Unpublished completions are counted as `spill_completion_superseded`
-  in INFO. Non-spilling servers pay one `is_empty()` load on the affected
-  paths. Known remaining gap, documented at the call site: `SCAN`'s ordered
-  cursor does not merge the unordered in-flight plane, so it may skip a key
-  for the milliseconds its spill is queued — within SCAN's contract, unlike
-  `KEYS`.
-
 ### Added
 - **Client-compat harness: raw-RESP diff against a real `redis-server`
   (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
@@ -77,6 +44,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **A key whose disk-offload spill was in flight was invisible to the whole
+  server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
+  freed the hot entry the moment the `SpillRequest` was queued, and the key
+  was only registered in `cold_index` when the completion landed. In between
+  it existed in no plane the database consults: `spill_inflight` held only a
+  request id and was read solely by the completion path. The eviction code
+  documented the window as an acceptable "brief read-miss" backstopped by the
+  AOF — but the AOF backstops *durability*, not *visibility*, and nothing
+  considered a write landing inside the window. Measured on 400 × 4 KiB keys
+  against a 512 KiB cap: `DBSIZE` answered 124 for 400 acked keys and then
+  climbed to 400 on its own; `GET`/`EXISTS` denied live keys that returned
+  unaided 250 ms later; and 277 of 400 `DEL`s answered `:0` and were then
+  reversed by the completion — which publishes into `cold_index`
+  unconditionally, so those resurrections reached the manifest and survived
+  restart. A client that deleted data got it back.
+
+  `spill_inflight` is now a real third storage plane carrying the payload
+  (the same refcounted `Bytes` the queued request already pins — a refcount,
+  not a copy, and no extra peak memory). Reads promote from it with no disk
+  read at all, across all three dispatch paths (`promote_cold_if_present` for
+  collections and Lua/MULTI, the monoio async GET pre-warm, and the inline
+  `GET` fast path). `EXISTS`/`DEL` count it, `DBSIZE`/`logical_len` count it,
+  and `KEYS`/`RANDOMKEY` enumerate it. `DEL`, an overwriting `SET`, and a
+  promoting read each retire the record, which withdraws the completion's
+  authorization to publish — that is what makes a delete inside the window
+  final. Unpublished completions are counted as `spill_completion_superseded`
+  in INFO. Non-spilling servers pay one `is_empty()` load on the affected
+  paths. Known remaining gap, documented at the call site: `SCAN`'s ordered
+  cursor does not merge the unordered in-flight plane, so it may skip a key
+  for the milliseconds its spill is queued — within SCAN's contract, unlike
+  `KEYS`.
 - **`GET` inside `MULTI` was executed instead of queued (monoio).** Third
   defect from the same ungated inline read path, and the one most visible to a
   working client: `MULTI; GET k; EXEC` answered `+OK`, `$1 v`, `*0` where Redis

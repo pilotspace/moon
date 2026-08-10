@@ -279,14 +279,51 @@ fn load_keys(c: &mut Client) {
         .map(|i| vec![b"SET".to_vec(), key_name(i), val.clone()])
         .collect();
     for (i, r) in c.pipeline(&cmds).into_iter().enumerate() {
+        // A refused SET is an ENVIRONMENT failure, not a #459 finding: on a
+        // slow disk the spill queue backs up, `try_send` fails in
+        // `evict_one_async_spill`, and `evict_to_budget` surfaces OOM. Say so
+        // explicitly so the run is not misread as the defect reappearing.
+        if let V::Err(ref e) = r {
+            panic!(
+                "SET k{i} was refused ({e}). The spill queue could not keep up with the \
+                 write burst, so this run cannot say anything about #459 — it never \
+                 reached the in-flight window. Re-run on a less loaded machine."
+            );
+        }
         assert_eq!(r, V::Simple("OK".into()), "SET k{i} was not acknowledged");
     }
 }
 
-/// Drain window for the spill queue + completion processing. Generous: these
-/// tests must fail on the DEFECT, never on a slow machine.
-fn drain() {
-    std::thread::sleep(Duration::from_secs(5));
+/// Wait for the spill queue and completion processing to go quiet.
+///
+/// Polls for a STABLE `DBSIZE` rather than sleeping a fixed span: a fixed
+/// sleep that is too short on a slow disk fails the test for a reason that is
+/// not the defect, and one long enough to be safe everywhere wastes the
+/// common case. Returns once the count holds steady across consecutive
+/// samples, or at the deadline (the assertions then report whatever the
+/// server actually settled on, which is still a truthful observation).
+fn drain(c: &mut Client) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = i64::MIN;
+    let mut stable = 0;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        let V::Int(n) = c.cmd(&[b"DBSIZE"]) else {
+            continue;
+        };
+        if n == last {
+            stable += 1;
+            // Four consecutive identical samples ≈ 1s of quiet. The spill
+            // thread flushes on a sub-second cadence, so a queue still
+            // draining moves this number.
+            if stable >= 4 {
+                return;
+            }
+        } else {
+            stable = 0;
+            last = n;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +396,7 @@ fn a_deleted_key_must_not_come_back_after_the_spill_queue_drains() {
         .filter(|r| *r == V::Int(0))
         .count();
 
-    drain();
+    drain(&mut c);
 
     let gets: Vec<Vec<Vec<u8>>> = (0..N_KEYS)
         .map(|i| vec![b"GET".to_vec(), key_name(i)])
@@ -409,7 +446,7 @@ fn dbsize_must_not_undercount_keys_whose_spill_is_in_flight() {
     load_keys(&mut c);
 
     let immediate = c.cmd(&[b"DBSIZE"]);
-    drain();
+    drain(&mut c);
     let settled = c.cmd(&[b"DBSIZE"]);
 
     let (V::Int(immediate), V::Int(settled)) = (immediate.clone(), settled.clone()) else {
