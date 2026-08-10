@@ -294,34 +294,69 @@ fn load_keys(c: &mut Client) {
     }
 }
 
-/// Wait for the spill queue and completion processing to go quiet.
+/// One `INFO persistence` counter, or `None` when the field is absent (the
+/// pre-fix binary has no `spill_completion_superseded`, and saying "absent"
+/// beats defaulting to 0 and silently satisfying a guard).
+fn info_counter(c: &mut Client, field: &str) -> Option<u64> {
+    let V::Bulk(body) = c.cmd(&[b"INFO", b"persistence"]) else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(&body);
+    let prefix = format!("{field}:");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Total spill work the server reports having COMPLETED.
 ///
-/// Polls for a STABLE `DBSIZE` rather than sleeping a fixed span: a fixed
-/// sleep that is too short on a slow disk fails the test for a reason that is
-/// not the defect, and one long enough to be safe everywhere wastes the
-/// common case. Returns once the count holds steady across consecutive
-/// samples, or at the deadline (the assertions then report whatever the
-/// server actually settled on, which is still a truthful observation).
+/// `spill_batches_flushed` counts batches the background thread wrote;
+/// `spill_completion_superseded` counts completions the event loop applied
+/// and refused to publish. Together they move whenever the pipeline makes
+/// progress, which `DBSIZE` alone does not.
+fn spill_progress(c: &mut Client) -> u64 {
+    info_counter(c, "spill_batches_flushed").unwrap_or(0)
+        + info_counter(c, "spill_completion_superseded").unwrap_or(0)
+}
+
+/// Wait for the spill pipeline — queue AND completion application — to go
+/// quiet.
+///
+/// Gating on a stable `DBSIZE` alone is NOT sufficient, and is unsound in the
+/// direction that matters. After the deletion test's `DEL` sweep every key is
+/// either deleted or in-flight-invisible, so `DBSIZE` reads 0 immediately
+/// while completions are still queued; a stability gate can return before any
+/// completion is applied, and a completion that republishes a deleted key
+/// then lands AFTER the assertions have run. That is a FALSE PASS hiding the
+/// exact P0 this file exists to catch. (It happened to catch it anyway,
+/// because completions land inside the poll's ~1s floor — luck, not a
+/// guarantee.)
+///
+/// So gate on server-reported spill PROGRESS as well: hold until neither the
+/// progress counters nor `DBSIZE` have moved for several consecutive samples.
+/// A fixed sleep is avoided for the same reason as before — too short fails
+/// on a slow disk for a reason that is not the defect.
 fn drain(c: &mut Client) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last = i64::MIN;
+    let mut last = (i64::MIN, u64::MAX);
     let mut stable = 0;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         let V::Int(n) = c.cmd(&[b"DBSIZE"]) else {
             continue;
         };
-        if n == last {
+        let now = (n, spill_progress(c));
+        if now == last {
             stable += 1;
-            // Four consecutive identical samples ≈ 1s of quiet. The spill
-            // thread flushes on a sub-second cadence, so a queue still
-            // draining moves this number.
-            if stable >= 4 {
+            // Six consecutive identical samples ≈ 1.5s with BOTH signals
+            // still. The spill thread flushes on a sub-second cadence, so a
+            // pipeline with anything left in it moves one of them.
+            if stable >= 6 {
                 return;
             }
         } else {
             stable = 0;
-            last = n;
+            last = now;
         }
     }
 }
@@ -410,6 +445,13 @@ fn a_deleted_key_must_not_come_back_after_the_spill_queue_drains() {
 
     let dbsize = c.cmd(&[b"DBSIZE"]);
 
+    // Vacuity guard. "Nothing came back" is only meaningful if the spill
+    // completions actually ARRIVED and were refused — otherwise a run where
+    // the queue never drained, or never spilled at all, passes while proving
+    // nothing. `spill_completion_superseded` counts completions the event
+    // loop applied and declined to publish because DEL had retired their
+    // in-flight record, which is precisely the mechanism under test.
+    let superseded = info_counter(&mut c, "spill_completion_superseded");
     assert!(
         resurrected.is_empty(),
         "{} key(s) were readable again after DEL + drain (DBSIZE={:?}); \
@@ -423,6 +465,14 @@ fn a_deleted_key_must_not_come_back_after_the_spill_queue_drains() {
         dbsize,
         V::Int(0),
         "every key was deleted, so DBSIZE must be 0"
+    );
+    assert!(
+        superseded.is_some_and(|n| n > 0),
+        "the run proved nothing: spill_completion_superseded={superseded:?}, so no \
+         completion was observed arriving and being refused. Either the DELs never \
+         raced an in-flight spill (nothing spilled, or the queue drained first), or \
+         the drain returned early. A green result here would not mean deletes are \
+         final — it would mean the window was never entered."
     );
 }
 
