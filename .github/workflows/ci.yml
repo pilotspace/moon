@@ -136,6 +136,50 @@ jobs:
         run: "cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc,graph --lib -E 'test(graph::)'"
         timeout-minutes: 5
 
+  # ── monoio — the runtime Moon actually SHIPS ────────────────────────
+  # Until this job existed, every CI job that EXECUTED tests did so under
+  # `--no-default-features --features runtime-tokio`. Moon's default feature
+  # set is runtime-monoio, and that is what ships on Linux — so 26 monoio
+  # integration test files and 30 monoio-gated src/ files were unreachable by
+  # CI. That is how the v0.8.6 inline-GET ACL bypass (#457) shipped green: it
+  # was wrong only on the monoio dispatch path, which no CI job could see.
+  #
+  # Self-hosted is not a preference: it is the only Linux runner, and therefore
+  # the only place monoio's io_uring driver executes at all. MOON_NO_URING is
+  # deliberately NOT set here (the tokio jobs set it) — the point is io_uring.
+  #
+  # Measured before landing (moon-dev, kernel 6.17, 2026-08-10):
+  #   cargo nextest run --profile ci  ->  5145 passed, 1 flaky, 244 skipped,
+  #   exit 0, 80.3s of test time. The `ci` profile's retries=2 absorbs the
+  #   known load-sensitive flake class (#459) while still reporting it FLAKY,
+  #   so the job is green from day one without hiding the signal.
+  #
+  # Guarded by tests/ci_covers_monoio.rs — weakening this job (wrong features,
+  # continue-on-error, bare `cargo test`, shared target dir) fails that suite.
+  check-monoio:
+    name: Check (monoio — the shipped runtime)
+    runs-on: [self-hosted, moon-dev]
+    env:
+      # MUST differ from `check`'s dir: the two jobs build incompatible feature
+      # sets from one checkout and can run concurrently on this runner.
+      CARGO_TARGET_DIR: /home/tindang/ci-target/check-monoio
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@nextest
+
+      # Default features == runtime-monoio. Never --no-default-features here.
+      # `--profile ci` is load-bearing: a bare `cargo test` has no retries, and
+      # an intermittently-red required job gets disabled — which is worse than
+      # no job, because it still looks like coverage.
+      - name: Test (default features — monoio + io_uring)
+        run: cargo nextest run --profile ci
+        # 30m mirrors `check`: the budget is dominated by compiling test
+        # binaries on a cold CARGO_TARGET_DIR, not by the 80s of test time.
+        timeout-minutes: 30
+
   # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
   # Main-push only (2026-07-13 queue-killer round): macOS runners are the
   # scarcest hosted pool and were the long pole on every PR. Development

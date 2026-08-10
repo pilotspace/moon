@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **CI now tests the runtime Moon actually ships (`check-monoio`).** Every CI job that *executed*
+  tests did so under `--no-default-features --features runtime-tokio,…`, while Moon's default
+  feature set — and what ships on Linux — is `runtime-monoio`. 26 monoio integration test files and
+  30 monoio-gated `src/` files were unreachable by CI. That is how the v0.8.6 inline-GET ACL bypass
+  shipped green: it was wrong only on the monoio dispatch path, which no CI job could see. The new
+  job runs on the self-hosted Linux runner (the only place monoio's io_uring driver executes at
+  all), uses the default feature set, and invokes `cargo nextest run --profile ci` so the repo's
+  existing flake policy applies — a bare `cargo test` has no retries, and an intermittently-red
+  required job gets disabled, which is worse than no job because it still looks like coverage.
+  Measured before landing: **5145 passed, 1 flaky, 244 skipped, exit 0, 80.3s**.
+
+  Proven by negative control rather than asserted: a deliberate defect on the monoio-only
+  `try_inline_dispatch` path **passes** the tokio suite 6/6 and **fails** the new job 3/6.
+  `tests/ci_covers_monoio.rs` guards the job against being silently weakened — wrong feature set,
+  `continue-on-error`, a bare `cargo test`, or a shared `CARGO_TARGET_DIR` all fail the suite.
+
+### Added
 - **Client-compat harness: raw-RESP diff against a real `redis-server`
   (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
   (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
