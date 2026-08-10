@@ -907,6 +907,11 @@ fn evict_one_async_spill(
         let file_id = *next_file_id;
         *next_file_id += 1;
 
+        // Second handle on the SAME payload the request carries (refcount,
+        // not a copy) so the in-flight plane below can answer reads from RAM
+        // while the request is queued.
+        let pending_bytes = value_bytes.clone();
+
         let req = SpillRequest {
             key: Bytes::copy_from_slice(key.as_bytes()),
             db_index,
@@ -925,23 +930,33 @@ fn evict_one_async_spill(
         if sender.try_send(req).is_err() {
             return false;
         }
-        // Deep-review P2 stale-shadow guard: record this request as the
-        // newest in-flight spill for the key BEFORE freeing RAM, so a later
-        // failed-pwrite re-insert of an OLDER superseded request for the
-        // same key can be detected and suppressed.
-        db.spill_inflight_mark(Bytes::copy_from_slice(key.as_bytes()), file_id);
-
-        // Now safe to free RAM. The bg thread holds the SpillRequest and will
-        // produce a SpillCompletion that updates cold_index for this db_index.
+        // Free RAM, then hand the key to the in-flight plane. `db.remove`
+        // clears any in-flight record for the key (that is what makes DEL
+        // final), so the mark MUST follow it — marking first would erase
+        // itself. Both calls run synchronously on the shard thread with no
+        // `.await` between them, so no reader can catch the key between
+        // planes.
         db.remove(key.as_bytes());
 
-        // NOTE: we do NOT insert a tentative cold_index entry here.
+        // NOTE: we still do NOT insert a tentative cold_index entry here.
         // Under batching the (page_idx, slot_idx) are unknown at evict time;
-        // slot 0 would return a *different* key's value in the pre-flush window.
-        // Accept a brief read-miss until the completion applies — the key is
-        // safe: it is in the SpillRequest and will be registered once the bg
-        // thread writes and the event loop processes the SpillCompletion.
-        // AOF incr log is the durability backstop for the pre-flush window.
+        // slot 0 would return a *different* key's value in the pre-flush
+        // window. Instead the key stays readable from the in-flight plane
+        // itself, which holds the payload in RAM until the completion lands
+        // (#459). Before that fix this window was documented as "accept a
+        // brief read-miss" with the AOF as backstop — but the AOF backstops
+        // DURABILITY, not VISIBILITY: measured on 400 keys, GET and EXISTS
+        // denied live keys, DEL answered :0 and was then undone by the
+        // completion, and DBSIZE under-counted by 276.
+        db.spill_inflight_mark(
+            Bytes::copy_from_slice(key.as_bytes()),
+            crate::storage::db::PendingSpill {
+                req_id: file_id,
+                value_type,
+                value_bytes: pending_bytes,
+                ttl_ms,
+            },
+        );
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());

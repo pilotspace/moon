@@ -653,8 +653,10 @@ fn apply_completion_vec(
                         tracing::warn!(
                             file_id = c.file_entry.file_id,
                             key_len = req.key.len(),
-                            "Spill pwrite failed for a SUPERSEDED request; skipping \
-                             re-insert (a newer spill of this key is in flight or landed)"
+                            "Spill pwrite failed for a request that no longer owns this \
+                             key; skipping re-insert (a newer spill is in flight or \
+                             landed, or the key was deleted / overwritten / read-promoted \
+                             while this write was in flight — #459)"
                         );
                         return;
                     }
@@ -718,12 +720,22 @@ fn apply_completion_vec(
             };
 
             crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                // The in-flight record is this completion's AUTHORIZATION to
+                // publish, not just a stale-shadow guard (#459). It is gone
+                // when the key was deleted, overwritten, or read-promoted
+                // while the spill was in flight; publishing anyway resurrects
+                // a deleted key — and because this insert reaches the
+                // manifest, the resurrection survives restart. Measured
+                // pre-fix: 277 of 400 DELs undone this way.
+                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+                    return;
+                }
                 if let Some(ref mut ci) = db.cold_index {
                     ci.insert(entry.key.clone(), location);
                 }
-                // Retire this request's in-flight record (stale-shadow
-                // guard); a newer request's record is left for its own
-                // completion.
+                // Retire this request's record; a newer request's is left
+                // for its own completion.
                 db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
         }
