@@ -949,6 +949,12 @@ pub struct TxnExecutePayload {
     /// Oneshot channel: the owner sends the executed result + deferred
     /// PUBLISH fan-out back to the caller.
     pub reply_tx: channel::OneshotSender<TxnExecReply>,
+    /// The ORIGINATING connection's protocol version. RESP3 reply conversion
+    /// happens on the owner shard, where each inner reply is produced, so the
+    /// owner must know how the caller negotiated. Without it a cross-shard
+    /// EXEC would answer RESP2 shapes to a RESP3 client — the same
+    /// context-dependent shape defect, reached over a shard hop.
+    pub proto: u8,
 }
 
 /// Reply for [`ShardMessage::TxnExecute`].

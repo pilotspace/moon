@@ -2776,6 +2776,7 @@ pub(crate) fn handle_shard_message_shared(
                 db_index,
                 commands,
                 reply_tx,
+                proto,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
@@ -2789,6 +2790,7 @@ pub(crate) fn handle_shard_message_shared(
                     shard_id,
                     &commands,
                     db_index,
+                    proto,
                     cached_clock,
                     &mut exec_publishes,
                     &mut exec_flushes,

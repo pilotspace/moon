@@ -43,18 +43,36 @@ pub(crate) fn restore_migrated_state(
     )
 }
 
-/// Apply RESP3 response type conversion based on command name and protocol version.
+/// Classify a command's RESP3 reply shape from its name and arguments.
 /// Uppercases the command name into a stack buffer for O(1) lookup.
+///
+/// Split out from [`apply_resp3_conversion`] because the cross-shard path must
+/// classify at ENQUEUE time (where the args still exist) and apply later, when
+/// the batch reply arrives carrying only the shape tag.
 #[inline]
-pub(crate) fn apply_resp3_conversion(cmd: &[u8], response: Frame, proto: u8) -> Frame {
-    if proto < 3 {
-        return response;
-    }
+pub(crate) fn resp3_shape_for(cmd: &[u8], args: &[Frame]) -> crate::protocol::resp3::Resp3Shape {
     let mut cmd_upper_buf = [0u8; 32];
     let cmd_upper_len = cmd.len().min(32);
     cmd_upper_buf[..cmd_upper_len].copy_from_slice(&cmd[..cmd_upper_len]);
     cmd_upper_buf[..cmd_upper_len].make_ascii_uppercase();
-    crate::protocol::resp3::maybe_convert_resp3(&cmd_upper_buf[..cmd_upper_len], response, proto)
+    crate::protocol::resp3::resp3_shape_of(&cmd_upper_buf[..cmd_upper_len], args)
+}
+
+/// Apply RESP3 response type conversion for a command whose args are in scope.
+///
+/// `args` EXCLUDES the command name. The `proto < 3` early return happens
+/// before any classification, so a RESP2 connection never pays for the lookup.
+#[inline]
+pub(crate) fn apply_resp3_conversion(
+    cmd: &[u8],
+    args: &[Frame],
+    response: Frame,
+    proto: u8,
+) -> Frame {
+    if proto < 3 {
+        return response;
+    }
+    crate::protocol::resp3::apply_shape(resp3_shape_for(cmd, args), response, proto)
 }
 
 /// Propagate a subscription (or pattern subscription) to all remote shards' subscriber maps.
