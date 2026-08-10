@@ -1755,6 +1755,13 @@ pub(crate) fn try_inline_dispatch(
             if db.hot_keys().tick() {
                 db.hot_keys().observe(key_bytes);
             }
+            // #459: a key mid-spill is in neither hot nor cold, so the miss
+            // arm below would frame `$-1` inline for a key that exists and
+            // that EXISTS reports as present. Pull it back first — RAM only,
+            // no disk read — so the hot lookup answers it. Costs one
+            // `is_empty()` load per inline GET on a server that is not
+            // spilling, which is every server without --disk-offload.
+            db.promote_inflight_if_present(key_bytes, now_ms);
             match db.get_if_alive(key_bytes, now_ms) {
                 Some(entry) => match entry.value.as_bytes() {
                     Some(val) => {
