@@ -23,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/ci_covers_monoio.rs` guards the job against being silently weakened — wrong feature set,
   `continue-on-error`, a bare `cargo test`, or a shared `CARGO_TARGET_DIR` all fail the suite.
 
-### Added
+  The job's first cut proved the premise but not the driver: `MOON_NO_URING: "1"` lived in the
+  workflow-level `env:`, which merges into every job and cannot be unset by one, so the job whose
+  whole point is io_uring ran with io_uring force-disabled. `monoio_yield_overhead_is_microscopic`
+  caught it at 1.45ms/yield (the `sleep(ZERO)` timer-park signature). That variable is now per-job,
+  and `ci_covers_monoio.rs` asserts **both** scopes.
+
 - **Client-compat harness: raw-RESP diff against a real `redis-server`
   (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
   (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies

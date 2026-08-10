@@ -45,6 +45,26 @@ fn job_block(yaml: &str, name: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Body of the top-level `env:` mapping — the block every job inherits.
+/// Empty string when the workflow declares none.
+fn workflow_env_block(yaml: &str) -> String {
+    let Some(start) = yaml.find("\nenv:\n") else {
+        return String::new();
+    };
+    let rest = &yaml[start + "\nenv:\n".len()..];
+    // Ends at the first line that is not indented and not blank/comment.
+    let mut end = rest.len();
+    for (idx, _) in rest.match_indices('\n') {
+        let line = &rest[idx + 1..];
+        let head = line.split('\n').next().unwrap_or("");
+        if !head.is_empty() && !head.starts_with(' ') && !head.starts_with('#') {
+            end = idx + 1;
+            break;
+        }
+    }
+    rest[..end].to_string()
+}
+
 #[test]
 fn ci_has_a_job_that_tests_the_default_monoio_runtime() {
     let yaml = workflow();
@@ -109,6 +129,19 @@ fn the_monoio_job_cannot_pass_without_running() {
         !job.contains("MOON_NO_URING"),
         "`check-monoio` must NOT set MOON_NO_URING. The tokio jobs set it; this job exists \
          to exercise the io_uring driver that actually ships on Linux.\n{job}"
+    );
+    // A clean job block is not enough: workflow-level `env:` merges into every
+    // job, and a job cannot unset an inherited key (an empty value is still a
+    // set variable to `env::var_os`). This assertion is the one the first cut of
+    // this job was missing — the job block was clean, the comment said io_uring
+    // was the point, and the workflow-level `MOON_NO_URING: "1"` silently forced
+    // every `cooperative_yield()` onto the `sleep(ZERO)` timer fallback.
+    // `monoio_yield_overhead_is_microscopic` caught it at 1.45ms/yield.
+    assert!(
+        !workflow_env_block(&yaml).contains("MOON_NO_URING"),
+        "workflow-level `env:` must NOT define MOON_NO_URING — it merges into `check-monoio`, \
+         which cannot unset it, and force-disables the io_uring driver that job exists to \
+         exercise. Set it per-job on the tokio jobs instead."
     );
     assert!(
         job.contains("self-hosted"),
