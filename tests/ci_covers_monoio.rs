@@ -19,7 +19,49 @@ use std::path::PathBuf;
 
 fn workflow() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    // Normalize CRLF. `job_block` and `workflow_env_block` scan for `\n  <key>:\n`
+    // and for indentation immediately after a newline; on a Windows checkout
+    // (`core.autocrlf=true`) every line ends `\r\n`, so those needles never match
+    // and each caller's `.expect()` fires — all 5 tests failed that way on the
+    // first main push, invisible to PR CI because Windows is skipped there.
+    normalize_newlines(&raw)
+}
+
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// The regression guard for the above, runnable on ANY platform — Windows is
+/// skipped on every PR, so a CRLF bug here is otherwise invisible until main.
+#[test]
+fn the_parsers_survive_a_windows_crlf_checkout() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
+    let raw = std::fs::read_to_string(&path).expect("read ci.yml");
+    // Normalize FIRST. On a Windows checkout the bytes on disk are already CRLF,
+    // so converting the raw text would produce `\r\r\n` — a fixture that no
+    // amount of correct normalizing can rescue, which is how this very test
+    // failed on its own first Windows run. Assuming the file is LF is exactly
+    // the bug under test.
+    let lf = normalize_newlines(&raw);
+    let crlf = lf.replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\r\n") && !crlf.contains("\r\r"),
+        "synthetic CRLF fixture is malformed — the test would prove nothing"
+    );
+
+    let yaml = normalize_newlines(&crlf);
+    assert!(
+        job_block(&yaml, "check-monoio").is_some(),
+        "job_block cannot find `check-monoio` in a CRLF checkout. Its needle is \
+         \"\\n  <name>:\\n\", which a \\r\\n line ending breaks — read the workflow \
+         through `workflow()`, never `read_to_string` directly."
+    );
+    assert!(
+        workflow_env_block(&yaml).contains("CARGO_TERM_COLOR"),
+        "workflow_env_block returned nothing usable on a CRLF checkout"
+    );
 }
 
 /// Return the body of a top-level job block, from `  <name>:` to the next
