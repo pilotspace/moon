@@ -38,11 +38,17 @@ fn normalize_newlines(s: &str) -> String {
 #[test]
 fn the_parsers_survive_a_windows_crlf_checkout() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
-    let lf = std::fs::read_to_string(&path).expect("read ci.yml");
+    let raw = std::fs::read_to_string(&path).expect("read ci.yml");
+    // Normalize FIRST. On a Windows checkout the bytes on disk are already CRLF,
+    // so converting the raw text would produce `\r\r\n` — a fixture that no
+    // amount of correct normalizing can rescue, which is how this very test
+    // failed on its own first Windows run. Assuming the file is LF is exactly
+    // the bug under test.
+    let lf = normalize_newlines(&raw);
     let crlf = lf.replace('\n', "\r\n");
     assert!(
-        crlf.contains("\r\n"),
-        "synthetic CRLF fixture did not convert — the test would prove nothing"
+        crlf.contains("\r\n") && !crlf.contains("\r\r"),
+        "synthetic CRLF fixture is malformed — the test would prove nothing"
     );
 
     let yaml = normalize_newlines(&crlf);
