@@ -220,14 +220,14 @@
     },
     "resp3-type-fidelity": {
       "title": "RESP3 reply-type parity, applied at one conversion choke point",
-      "phase": "build",
+      "phase": "verify",
       "gate": "none",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-10T03:41:56+00:00"
+      "updated": "2026-08-10T05:24:17+00:00"
     },
     "pubsub-resp3-push": {
       "title": "Pub/sub Push frames, subscriber-mode rules, and sharded pub/sub",
@@ -410,7 +410,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-10T03:41:56+00:00",
+  "updated": "2026-08-10T05:24:17+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
