@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow-level `env:`, which merges into every job and cannot be unset by one, so the job whose
   whole point is io_uring ran with io_uring force-disabled. `monoio_yield_overhead_is_microscopic`
   caught it at 1.45ms/yield (the `sleep(ZERO)` timer-park signature). That variable is now per-job,
-  and `ci_covers_monoio.rs` asserts **both** scopes.
+  and `ci_covers_monoio.rs` asserts **both** scopes. The guard suite itself then failed on
+  Windows — it matched `"\n  <job>:\n"` against a CRLF checkout — so it now normalizes line
+  endings and carries a platform-independent CRLF regression test (Windows is skipped on every
+  PR, so that class is invisible until a main push).
 
 - **Client-compat harness: raw-RESP diff against a real `redis-server`
   (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
