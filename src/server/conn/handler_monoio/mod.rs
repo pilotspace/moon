@@ -2525,9 +2525,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // (`Database::promote_cold_if_present`), unchanged.
                     if cmd.eq_ignore_ascii_case(b"GET") {
                         if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                            let peek_now_ms = ctx.cached_clock.ms();
                             let cold_loc =
                                 crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                     if db.is_hot(key.as_ref()) {
+                                        None
+                                    } else if db
+                                        .promote_inflight_if_present(key.as_ref(), peek_now_ms)
+                                    {
+                                        // #459: mid-spill, payload still in
+                                        // RAM. Now hot, so `dispatch_read`
+                                        // below answers it — and no disk read
+                                        // was needed. Without this the key is
+                                        // in no plane this peek consults and
+                                        // GET answers nil for a key EXISTS
+                                        // reports as present.
                                         None
                                     } else {
                                         db.cold_lookup_location(key.as_ref())
