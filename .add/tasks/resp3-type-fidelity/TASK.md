@@ -2,7 +2,7 @@
 
 slug: resp3-type-fidelity · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: verify   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower the
      autonomy level to `manual` or `conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -507,7 +507,18 @@ Evidence, recorded 2026-08-10 (commit `70fa83a6`, branch `fix/resp3-type-fidelit
 | `cargo clippy --all-targets -D warnings` (default) | exit 0 |
 | `cargo clippy --all-targets -D warnings` (runtime-tokio,jemalloc) | exit 0 |
 | `cargo fmt --check` | exit 0 |
-| full suite (`--tests --no-fail-fast`) | 194 binaries · 2 failed, both triaged below |
+| full suite, default/monoio (`--tests --no-fail-fast`) | 194 binaries · 2 failed, both triaged below |
+| full suite, **tokio CI parity** (`--no-default-features --features runtime-tokio,jemalloc`) | 195 binaries · **4352 passed · 0 failed** · exit 0 |
+| harness against the **deployed** `:6381` flag set (throwaway server, empty dir) | PASS 157 · FAIL 0 · exit 0 |
+
+The tokio run is the load-bearing one for CI (every CI test job builds tokio — see
+[[gotcha_monoio_intercept_order_ci_blind]]), and it is clean. It also passed BOTH tests that failed
+the monoio run, which independently corroborates the contention diagnosis below.
+
+The deployed-config run deliberately did NOT touch live `:6381`: `differ.py` calls `FLUSHALL` before
+every one of its 182 entries, and that instance holds ~764k actively-growing keys. The live launch
+flags were replicated onto a throwaway server with an empty data dir instead — same configuration,
+none of the data. `DBSIZE` on `:6381` was confirmed unchanged (grown, i.e. still serving) afterwards.
 
 Full-suite residue — NEITHER is caused by this change, and neither is silently dropped:
 1. `cross_shard_consistency_red` — `Connection refused` at server spawn. A DIFFERENT test failed on
@@ -538,14 +549,19 @@ Full-suite residue — NEITHER is caused by this change, and neither is silently
    starves the spill. The pre-change server fails MORE often, so the defect is pre-existing and
    load-induced; this change is not implicated in either direction.
 
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: **PASS**
+Reviewed by: Tin Dang · date: 2026-08-10
 
-<!-- Held open deliberately. §6 line 8 ("a person reviewed and approved the change") is the one
-     box the AI must not tick for itself, and this change carries a disclosure that deserves a human
-     look: a unit test was DELETED during build (see the [!] line in §6). Not auto-gated despite
-     `autonomy: auto`. -->
+Approved after being shown, and explicitly asked about, the one disclosure this change carries: a
+unit test was DELETED during build (the `[!]` line in §6). Not auto-gated despite `autonomy: auto` —
+the reviewer was asked before the gate was recorded, not after.
+
+Follow-ups filed rather than folded in, so nothing found here rides along unreviewed:
+- #459 `dbsize_offload_logical` load fragility, and `recovered > live` — restart resurrecting keys
+  the live instance evicted. Pre-existing (proven by the A/B above); belongs to storage/eviction.
+- #460 remove the now-dead `RemoteMeta.cmd_name` — drops a `Bytes` clone per cross-shard command.
+- #461 the harness silently trusts a stale `MOON_BIN`; make provenance visible and fail `--strict`.
+- #462 intercepts bypass the reply-conversion choke point; make forgetting structurally impossible.
 
 
 
