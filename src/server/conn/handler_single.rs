@@ -1143,7 +1143,12 @@ pub async fn handle_connection(
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
-                                    let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
+                                    let response = apply_resp3_conversion(
+                                    d_cmd,
+                                    d_args,
+                                    response,
+                                    framed.codec().protocol_version(),
+                                );
                                     responses[resp_idx] = response;
                                     if quit {
                                         should_quit = true;
@@ -2285,7 +2290,7 @@ pub async fn handle_connection(
                                     );
                                 }
                                 // Apply RESP3 response conversion if needed
-                                let response = apply_resp3_conversion(d_cmd, response, proto);
+                                let response = apply_resp3_conversion(d_cmd, d_args, response, proto);
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;
@@ -2739,7 +2744,12 @@ pub async fn handle_connection(
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed
-                                let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
+                                let response = apply_resp3_conversion(
+                                    d_cmd,
+                                    d_args,
+                                    response,
+                                    framed.codec().protocol_version(),
+                                );
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;

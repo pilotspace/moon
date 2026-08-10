@@ -763,6 +763,7 @@ pub(super) async fn try_handle_multi_exec(
                             ctx.shard_id,
                             conn.selected_db,
                             commands,
+                            conn.protocol_version,
                             &ctx.dispatch_tx,
                             &ctx.spsc_notifiers,
                         )
@@ -862,6 +863,7 @@ pub(super) async fn try_handle_multi_exec(
                 ctx.shard_id,
                 &conn.command_queue,
                 conn.selected_db,
+                conn.protocol_version,
                 &ctx.cached_clock,
                 exec_publishes,
                 &mut exec_flushes,

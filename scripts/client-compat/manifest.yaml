@@ -53,47 +53,23 @@ entries:
     setup: ["DEL s", "SADD s a b c"]
     command: "SMEMBERS s"
     policy: sorted
-    expect_diff:
-      reason: >-
-        RESP3 inside MULTI only. Redis returns a Set (~3) from EXEC; Moon
-        returns a flat Array (*3). Outside MULTI Moon converts correctly, so
-        this is the EXEC-inner-reply gap: apply_resp3_conversion is called from
-        11 sites across 3 handlers rather than one choke point, and the EXEC
-        path is one of the misses. Owner: resp3-type-fidelity.
 
   - name: hard_unordered_hgetall
     setup: ["DEL h", "HSET h f1 v1 f2 v2"]
     command: "HGETALL h"
     policy: sorted
-    expect_diff:
-      reason: >-
-        Same EXEC-inner-reply gap as hard_unordered_smembers: RESP3 HGETALL is
-        a Map outside MULTI and a flat Array inside EXEC.
-        Owner: resp3-type-fidelity.
 
   - name: hard_float_formatting
     setup: ["SET f 10.5"]
     command: "INCRBYFLOAT f 0.1"
     policy: numeric_tolerance
     tolerance: 0.0001
-    expect_diff:
-      reason: >-
-        RESP3 only, and two defects at once. Redis answers Bulk
-        "10.59999999999999964"; Moon answers Double ,10.6 — wrong TYPE
-        (INCRBYFLOAT must stay Bulk) and a lossy value. RESP2 passes under the
-        tolerance policy, which is the evidence that the policy model itself is
-        sound here. Owner: resp3-type-fidelity.
 
   - name: hard_zscore_float
     setup: ["DEL z", "ZADD z 1.5 a"]
     command: "ZSCORE z a"
     policy: numeric_tolerance
     tolerance: 0.0001
-    expect_diff:
-      reason: >-
-        RESP3 inside MULTI only: Redis returns Double ,1.5 from EXEC, Moon
-        returns Bulk $3 1.5. Outside MULTI Moon converts correctly — the
-        EXEC-inner-reply gap again. Owner: resp3-type-fidelity.
 
   # ── Transaction integrity ─────────────────────────────────────────────
 
@@ -115,7 +91,8 @@ entries:
         FOUND BY THIS HARNESS, 2026-08-09. CONFIG GET inside MULTI is not
         queued either — EXEC returns *0. A second command family bypassing
         transaction queueing, distinct from the inline-GET path.
-        Owner: resp3-type-fidelity (transaction queueing sweep).
+        Owner: multi-exec-queue-semantics (re-owned 2026-08-10: a
+        transaction-QUEUEING defect, not a reply-type one).
 
   - name: multi_aborts_on_unknown_command
     command: "THISCOMMANDDOESNOTEXIST"
@@ -126,7 +103,8 @@ entries:
         -EXECABORT "Transaction discarded because of previous errors."; Moon
         queues the bad command and surfaces the -ERR from inside EXEC instead.
         A client that relies on EXECABORT to detect a poisoned transaction sees
-        a partially-applied one. Owner: resp3-type-fidelity.
+        a partially-applied one. Owner: multi-exec-queue-semantics (re-owned
+        2026-08-10: a transaction-QUEUEING defect, not a reply-type one).
 
   - name: multi_aborts_on_wrong_arity
     command: "GET"
@@ -135,7 +113,7 @@ entries:
       reason: >-
         Same EXECABORT gap as multi_aborts_on_unknown_command, reached through
         an arity error rather than an unknown name.
-        Owner: resp3-type-fidelity.
+        Owner: multi-exec-queue-semantics.
 
   # ── RESP3 reply-type fidelity (review findings, wire-confirmed) ───────
 
@@ -143,78 +121,41 @@ entries:
     setup: ["DEL s", "SADD s a"]
     command: "SISMEMBER s a"
     policy: exact
-    expect_diff:
-      reason: >-
-        RESP3: Redis answers Integer :1, Moon over-converts to Boolean #t.
-        Note resp3/multi passes only by accident — inside EXEC Moon does not
-        convert at all, so the two bugs cancel. Owner: resp3-type-fidelity.
 
   - name: type_expire_is_integer
     setup: ["SET k v"]
     command: "EXPIRE k 100"
     policy: exact
-    expect_diff:
-      reason: >-
-        RESP3: Redis answers Integer :1, Moon over-converts to Boolean #t.
-        Same class as type_sismember_is_integer. Owner: resp3-type-fidelity.
 
   - name: type_incrbyfloat_is_bulk
     setup: ["SET f 1"]
     command: "INCRBYFLOAT f 1"
     policy: type_only
-    expect_diff:
-      reason: >-
-        RESP3: INCRBYFLOAT must stay Bulk; Moon answers Double.
-        Owner: resp3-type-fidelity.
 
   - name: shape_hrandfield_withvalues_is_pair_array
     setup: ["DEL h", "HSET h f1 v1"]
     command: "HRANDFIELD h 1 WITHVALUES"
     policy: sorted
-    expect_diff:
-      reason: >-
-        RESP3: Redis answers an Array of pair Arrays (*1[*2[f1,v1]]); Moon
-        answers a Map (%1). The Map-vs-pairs inversion the deep review flagged,
-        now wire-confirmed. Owner: resp3-type-fidelity.
 
   - name: shape_zrandmember_withscores_is_pair_array
     setup: ["DEL z", "ZADD z 1 a"]
     command: "ZRANDMEMBER z 1 WITHSCORES"
     policy: sorted
-    expect_diff:
-      reason: >-
-        Same Map-vs-pairs inversion as HRANDFIELD WITHVALUES.
-        Owner: resp3-type-fidelity.
 
   - name: shape_zrange_withscores
     setup: ["DEL z", "ZADD z 1 a 2 b"]
     command: "ZRANGE z 0 -1 WITHSCORES"
     policy: exact
-    expect_diff:
-      reason: >-
-        RESP3: Redis pair-wraps and sends Double scores
-        (*2[*2[a,,1],*2[b,,2]]); Moon sends a flat Array of Bulks (*4). Missing
-        pair-wrapping AND missing Double. Owner: resp3-type-fidelity.
 
   - name: shape_zpopmin
     setup: ["DEL z", "ZADD z 1 a 2 b"]
     command: "ZPOPMIN z"
     policy: exact
-    expect_diff:
-      reason: >-
-        RESP3: the score must be a Double (,1); Moon sends Bulk $1 1.
-        Owner: resp3-type-fidelity.
 
   - name: shape_spop_with_count_is_set
     setup: ["DEL s", "SADD s a b c"]
     command: "SPOP s 2"
     policy: type_only
-    expect_diff:
-      reason: >-
-        RESP3: SPOP <count> must be a Set (~2); Moon sends an Array (*2).
-        Policy is type_only, not sorted, because SPOP returns RANDOM members —
-        the two servers legitimately pop different elements, so values can
-        never be compared. Owner: resp3-type-fidelity.
 
   - name: shape_xinfo_stream
     setup: ["DEL st", "XADD st '*' f v"]
@@ -222,21 +163,68 @@ entries:
     policy: type_only
     expect_diff:
       reason: >-
-        RESP3: Redis answers a Map (%16); Moon answers a flat Array (*14) and
-        is also missing fields. Owner: resp3-type-fidelity.
+        NARROWED 2026-08-10 by resp3-type-fidelity: the reply TYPE is now
+        correct — both servers answer a Map. What remains is a FIELD-SET gap,
+        not a reply-shape gap: Moon reports 7 fields, Redis 8.6.1 reports 16.
+        Each missing field (entries-added, max-deleted-entry-id,
+        recorded-first-entry-id, and the 8.x idempotency counters
+        idmp-*/pids-tracked/iids-*) needs real stream bookkeeping, and
+        inventing values would serve a client worse than their absence.
+        Owner: resp3-type-fidelity, carried forward as a SPEC delta —
+        stream-metadata completeness, NOT a RESP3 conversion defect.
 
   - name: config_get_resp3_is_a_map
     command: "CONFIG GET maxmemory"
     policy: type_only
     protocols: [resp3]
     contexts: [standalone, pipeline]
+
+  # ── Miss path: emptiness must not change the reply TYPE ───────────────
+  # Every case above populates its key first, so the harness only ever diffed
+  # the hit path — which is how an empty HGETALL answering *0 instead of %0
+  # survived a 128-PASS run. The miss path is the one clients hit most and
+  # tested least; these cases keep it diffed against the live oracle.
+
+  - name: empty_hgetall_is_still_a_map
+    setup: ["DEL nosuchhash"]
+    command: "HGETALL nosuchhash"
+    policy: type_only
+
+  - name: empty_config_get_is_still_a_map
+    command: "CONFIG GET no-such-parameter-at-all"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
+  # Split from the entry above rather than folded into it: a waiver is
+  # per-entry, so waiving the whole case would blunt the two contexts that
+  # genuinely pass. This entry keeps the MULTI defect on the books.
+  - name: empty_config_get_in_multi
+    command: "CONFIG GET no-such-parameter-at-all"
+    policy: type_only
+    contexts: [multi]
     expect_diff:
       reason: >-
-        RESP3: CONFIG GET must be a Map (%1); Moon answers a flat Array. CONFIG
-        replies are not routed through apply_resp3_conversion at all.
-        (The maxmemory VALUE also differs — Redis 0 vs Moon's auto-set 75% of
-        RAM — which is intentional Moon behaviour, hence type_only.)
-        Owner: resp3-type-fidelity.
+        Redis answers *1[%0]; Moon answers a bare *0 — CONFIG GET is never
+        queued inside MULTI at all, so EXEC returns an empty array. The reply
+        TYPE is correct in every context where the command actually runs
+        (standalone and pipeline both answer %0); this is the transaction
+        QUEUEING gap, not a reply-shape one.
+        Owner: multi-exec-queue-semantics.
+
+  - name: empty_smembers_is_still_a_set
+    setup: ["DEL nosuchset"]
+    command: "SMEMBERS nosuchset"
+    policy: type_only
+
+  - name: empty_zrange_withscores_stays_an_array
+    setup: ["DEL nosuchzset"]
+    command: "ZRANGE nosuchzset 0 -1 WITHSCORES"
+    policy: type_only
+
+  - name: empty_hrandfield_withvalues_stays_an_array
+    setup: ["DEL nosuchhash2"]
+    command: "HRANDFIELD nosuchhash2 2 WITHVALUES"
+    policy: type_only
 
   # ── Identity & introspection (review findings, wire-confirmed) ────────
 
