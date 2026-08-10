@@ -44,6 +44,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **RESP3 reply types now match Redis, and no longer change with the calling
+  context.** A live sweep against `redis-server` 8.6.1 found the conversion
+  table wrong in both directions and, structurally, unable to be right: it keyed
+  only on the command NAME, while `WITHSCORES`, `WITHVALUES` and a `<count>`
+  argument are what actually decide the reply shape. `ZRANGE … WITHSCORES`
+  arrived as a flat array of bulk strings instead of pair-wrapped `[member,
+  Double]` — enough to make an unmodified redis-py raise
+  `ValueError: not enough values to unpack`, so every RESP3 application using
+  sorted-set scores was broken outright. `HRANDFIELD WITHVALUES` and
+  `ZRANDMEMBER WITHSCORES` answered a Map where Redis answers an array of pairs.
+  In the other direction the server over-converted: all seven of `SISMEMBER`,
+  `HEXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `SETNX` and `MSETNX` returned
+  Boolean where Redis returns Integer, and `INCRBYFLOAT`/`HINCRBYFLOAT` returned
+  a lossy Double (`,10.6`) where Redis returns the exact Bulk
+  `"10.59999999999999964"`.
+
+  The conversion is now decided by `(command, args)` at one policy choke point
+  (`Resp3Shape` in `src/protocol/resp3.rs`) instead of by 11 call sites across
+  three handlers. Because the cross-shard reply loop no longer has the command's
+  args by the time its batch returns, the shape is classified at ENQUEUE time
+  and the 1-byte `Copy` tag travels in `RemoteMeta` — no per-command allocation
+  on the shard hot path. `execute_transaction_sharded` now takes the connection's
+  protocol version and converts each inner reply with its own command, so a
+  command answers the same shape standalone, inside `MULTI/EXEC` and inside a
+  pipeline; previously `SMEMBERS` was a Set outside a transaction and a flat
+  Array inside one. `CONFIG GET` (Map) and `CLIENT INFO` (Verbatim) are fixed at
+  their intercepts, which short-circuit the dispatch exit entirely — the reason
+  `CONFIG` could never be fixed before. Also added: `ZMSCORE` and `GEOPOS`
+  Doubles with Null preserved, `SPOP <count>` as a Set, `ZPOPMIN`/`ZPOPMAX`
+  Double scores (flat with no count, wrapped with one), and `XINFO STREAM` as a
+  Map.
+
+  Emptiness no longer changes the reply type either: `HGETALL` and `CONFIG GET`
+  on a miss answered `*0` where Redis answers `%0`, so a client dispatching on
+  the type byte broke on exactly the path it hits most. Every case in the
+  harness populated its key first, which is how that survived a full green run —
+  five miss-path cases were added so it stays diffed against the live oracle.
+
+  RESP2 is byte-identical — pinned by a test written before the fix. Harness
+  result vs Redis 8.6.1: **157 pass / 0 fail / 25 waived**, up from 98 / 0 / 54,
+  with all 13 now-stale waivers deleted and `--strict` green. New suite
+  `tests/resp3_type_fidelity.rs` (13 tests) asserts the wire type byte directly.
+  Known remainder, waived and reasoned: `XINFO STREAM` is now the right TYPE but
+  still reports 7 fields to Redis's 16 — the missing ones need real stream
+  bookkeeping and are tracked separately rather than fabricated.
 - **A key whose disk-offload spill was in flight was invisible to the whole
   server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
   freed the hot entry the moment the `SpillRequest` was queued, and the key

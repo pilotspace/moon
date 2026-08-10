@@ -223,6 +223,12 @@ pub(crate) fn execute_transaction_sharded(
     _shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
+    // `proto`: the connection's protocol version. Each inner reply is
+    // converted with ITS OWN command and args before joining `results` —
+    // without this an EXEC'd HGETALL came back a flat Array while the same
+    // command standalone came back a Map, i.e. the reply shape depended on
+    // the calling context.
+    proto: u8,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
@@ -313,7 +319,9 @@ pub(crate) fn execute_transaction_sharded(
             if !records.is_empty() && !matches!(&response, Frame::Error(_)) {
                 graph_records.extend(records.into_iter().map(|r| (entry_db, r)));
             }
-            results.push(response);
+            results.push(super::util::apply_resp3_conversion(
+                cmd, cmd_args, response, proto,
+            ));
             continue;
         }
 
@@ -430,7 +438,9 @@ pub(crate) fn execute_transaction_sharded(
             });
         }
 
-        results.push(response);
+        results.push(super::util::apply_resp3_conversion(
+            cmd, cmd_args, response, proto,
+        ));
     }
 
     (Frame::Array(results.into()), aof_entries, graph_records)
