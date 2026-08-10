@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Client-compat harness: raw-RESP diff against a real `redis-server`
+  (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
+  (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
+  to text before any assertion can see them — it even strips `(integer) ` — and
+  never sends `-3`, so the entire RESP3 surface was uncompared. That blindness
+  is why ~22 type-level compatibility defects survived into v0.8.5. The new
+  harness speaks RESP on a raw socket and compares in a fixed order — TYPE, then
+  SHAPE, then VALUE — across the full {RESP2, RESP3} × {standalone, MULTI/EXEC,
+  pipeline} matrix, so a finding says which of the three diverged and whether a
+  reply changes shape by context. A missing `redis-server` FAILS
+  (`ERR_NO_ORACLE`) rather than skipping. New CI job `client-compat` on the
+  self-hosted runner; the manifest carries a recorded baseline of reasoned
+  waivers so the job is a ratchet — a new divergence fails it, and `--strict`
+  fails the moment a waived divergence is fixed and its waiver goes stale.
+  First full run vs Redis 8.6.1: 152 comparisons, 94 pass, 58 waived, plus 34
+  named missing `INFO` fields via `--info-manifest`.
+
+### Security
+- **ACL bypass on the inline GET fast path (monoio runtime).** An
+  authenticated but restricted user could read any key with plain `GET`:
+  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
+  map, running neither the ACL command check nor the ACL key-pattern check.
+  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
+  its pattern; no ACL LOG entry was produced. Writes were already gated on
+  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
+  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
+  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
+  suite); `--shards 1` — the config recommended for non-pipelined workloads —
+  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
+  so a restricted connection falls through to generic dispatch where both ACL
+  checks run. The tokio handlers were never affected (they gate correctly at
+  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
+  caught this: every CI test job builds tokio. New suite:
+  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
+  `--shards 1` and `--shards 4`).
+
 ### Fixed
 - **RESP3 reply types now match Redis, and no longer change with the calling
   context.** A live sweep against `redis-server` 8.6.1 found the conversion
@@ -52,45 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Known remainder, waived and reasoned: `XINFO STREAM` is now the right TYPE but
   still reports 7 fields to Redis's 16 — the missing ones need real stream
   bookkeeping and are tracked separately rather than fabricated.
-
-### Added
-- **Client-compat harness: raw-RESP diff against a real `redis-server`
-  (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
-  (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
-  to text before any assertion can see them — it even strips `(integer) ` — and
-  never sends `-3`, so the entire RESP3 surface was uncompared. That blindness
-  is why ~22 type-level compatibility defects survived into v0.8.5. The new
-  harness speaks RESP on a raw socket and compares in a fixed order — TYPE, then
-  SHAPE, then VALUE — across the full {RESP2, RESP3} × {standalone, MULTI/EXEC,
-  pipeline} matrix, so a finding says which of the three diverged and whether a
-  reply changes shape by context. A missing `redis-server` FAILS
-  (`ERR_NO_ORACLE`) rather than skipping. New CI job `client-compat` on the
-  self-hosted runner; the manifest carries a recorded baseline of reasoned
-  waivers so the job is a ratchet — a new divergence fails it, and `--strict`
-  fails the moment a waived divergence is fixed and its waiver goes stale.
-  First full run vs Redis 8.6.1: 152 comparisons, 94 pass, 58 waived, plus 34
-  named missing `INFO` fields via `--info-manifest`.
-
-### Security
-- **ACL bypass on the inline GET fast path (monoio runtime).** An
-  authenticated but restricted user could read any key with plain `GET`:
-  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
-  map, running neither the ACL command check nor the ACL key-pattern check.
-  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
-  its pattern; no ACL LOG entry was produced. Writes were already gated on
-  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
-  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
-  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
-  suite); `--shards 1` — the config recommended for non-pipelined workloads —
-  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
-  so a restricted connection falls through to generic dispatch where both ACL
-  checks run. The tokio handlers were never affected (they gate correctly at
-  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
-  caught this: every CI test job builds tokio. New suite:
-  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
-  `--shards 1` and `--shards 4`).
-
-### Fixed
 - **A key whose disk-offload spill was in flight was invisible to the whole
   server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
   freed the hot entry the moment the `SpillRequest` was queued, and the key
