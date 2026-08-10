@@ -171,6 +171,31 @@ pub fn record_spill_failed_reinserted() {
     SPILL_FAILED_REINSERTED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Spill completions that landed on disk but were NOT published to the cold
+/// index because their in-flight record had been retired — the key was
+/// deleted, overwritten, or read-promoted while the spill was in flight
+/// (#459). Publishing those would resurrect a deleted key.
+///
+/// Not an error: it is the normal, correct outcome of a write racing a
+/// spill. It is counted because the spilled bytes become orphaned in their
+/// file, and a rate that tracks the eviction rate means the workload is
+/// re-touching keys as fast as they are being spilled — the signal that
+/// `maxmemory` is too small for the working set. Exposed as
+/// `spill_completion_superseded` in INFO.
+static SPILL_COMPLETION_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative superseded (unpublished) spill completions. For INFO / metrics.
+#[inline]
+pub fn spill_completion_superseded_total() -> u64 {
+    SPILL_COMPLETION_SUPERSEDED.load(Ordering::Relaxed)
+}
+
+/// Record one superseded spill completion.
+#[inline]
+pub fn record_spill_completion_superseded() {
+    SPILL_COMPLETION_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+}
+
 use bytes::Bytes;
 use tracing::warn;
 

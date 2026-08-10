@@ -442,6 +442,16 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Option<crate::storage::entry::RedisValue> {
+        // In-flight plane first (#459): a key mid-spill is in neither hot nor
+        // cold, so every `&self` reader that stops here would answer nil for
+        // a key `EXISTS` reports as present. No disk read — the payload is in
+        // RAM. This is the choke point for the RwLock-shared-read dispatch
+        // path (`*_readonly` handlers, which the tokio runtime's GET takes),
+        // so it must come before the `cold_shard_dir`/`cold_index` bails
+        // below.
+        if let Some(value) = self.spill_inflight_value(key, now_ms) {
+            return Some(value);
+        }
         let shard_dir = self.cold_shard_dir.as_ref()?;
         let ci = self.cold_index.as_ref()?;
         let (value, _ttl) =
