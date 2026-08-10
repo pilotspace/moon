@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "resp3-type-fidelity",
+  "active_task": "monoio-ci-coverage",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -200,12 +200,12 @@
     },
     "monoio-ci-coverage": {
       "title": "CI runs the test suite on a monoio build (and clippy --all-targets)",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [],
       "created": "2026-08-09T07:32:03+00:00",
-      "updated": "2026-08-09T07:32:03+00:00"
+      "updated": "2026-08-10T08:35:14+00:00"
     },
     "client-identity-introspection": {
       "title": "HELLO/COMMAND/ROLE/RESET identity + registry-dispatch reconciliation",
@@ -410,7 +410,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-10T06:47:03+00:00",
+  "updated": "2026-08-10T08:35:14+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
