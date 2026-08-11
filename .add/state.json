@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "monoio-ci-coverage",
+  "active_task": "watch-cas-transactions",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -275,14 +275,27 @@
     },
     "watch-cas-transactions": {
       "title": "WATCH/UNWATCH optimistic locking on both production dispatch paths",
-      "phase": "ground",
+      "phase": "build",
       "gate": "none",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T16:42:29+00:00",
-      "updated": "2026-08-09T16:42:29+00:00"
+      "updated": "2026-08-11T12:31:35+00:00",
+      "tripwire": {
+        "contract_md5": "6f2cd3da5562c2cc4bd2fcf12c373405",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/server/conn/shared.rs",
+          "src/server/conn/watch.rs",
+          "src/server/conn/core.rs"
+        ],
+        "snapshot_md5": "fe6a109ebabb70ce61c2310ddd28f5e2"
+      },
+      "flag_verified": true
     },
     "protocol-error-lifetime": {
       "title": "Protocol errors reply and close cleanly, never stall or eat the valid prefix",
@@ -410,7 +423,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-10T08:35:14+00:00",
+  "updated": "2026-08-11T12:31:35+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

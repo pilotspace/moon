@@ -2124,6 +2124,20 @@ pub(crate) fn handle_shard_message_shared(
             });
             let _ = reply_tx.send(response);
         }
+        ShardMessage::ReadVersions(payload) => {
+            // WATCH snapshot on the owning shard (task `watch-cas-transactions`).
+            // Read-only and synchronous: no await between the reads, so the
+            // snapshot is coherent for this shard's slice.
+            let crate::shard::dispatch::ReadVersionsPayload {
+                db_index,
+                keys,
+                reply_tx,
+            } = *payload;
+            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
+                keys.iter().map(|k| db.get_version(k)).collect::<Vec<u32>>()
+            });
+            let _ = reply_tx.send(versions);
+        }
         ShardMessage::DocFreq(payload) => {
             let crate::shard::dispatch::DocFreqPayload {
                 index_name,
@@ -2777,6 +2791,7 @@ pub(crate) fn handle_shard_message_shared(
                 commands,
                 reply_tx,
                 proto,
+                watched,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
@@ -2794,6 +2809,7 @@ pub(crate) fn handle_shard_message_shared(
                     cached_clock,
                     &mut exec_publishes,
                     &mut exec_flushes,
+                    &watched,
                 );
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by

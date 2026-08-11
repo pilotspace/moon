@@ -579,6 +579,88 @@ assert_both "TOUCH" TOUCH edge:touch
 assert_both "TOUCH missing" TOUCH edge:nomiss
 
 # ===========================================================================
+# WATCH / UNWATCH optimistic locking (CAS)
+# ===========================================================================
+log "=== WATCH/CAS ==="
+
+# A CAS conflict needs TWO connections interleaved: the transaction has to stay
+# open while a second client writes the watched key. `redis-cli` one-shot mode
+# cannot express that (each invocation is its own connection, closed on exit),
+# so bash's /dev/tcp holds the transaction connection open and drives it with
+# inline commands. The verdict is read from the key's FINAL VALUE rather than
+# from EXEC's reply, which keeps this free of RESP parsing: `from-txn` means the
+# transaction committed, `from-other` means it aborted and the interloper's
+# write stands.
+#
+# Both servers run the identical sequence and the outcomes are compared, so this
+# asserts Redis parity rather than a hardcoded expectation.
+watch_cas_outcome() {
+    local port="$1" conflict="$2" line=""
+    redis-cli -p "$port" SET cas:k base >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
+    printf 'WATCH cas:k\r\nMULTI\r\nSET cas:k from-txn\r\n' >&3
+    if [[ "$conflict" == "yes" ]]; then
+        redis-cli -p "$port" SET cas:k from-other >/dev/null 2>&1 || true
+    fi
+    # ECHO after EXEC is a round-trip barrier: reading its reply proves EXEC has
+    # been applied before the connection closes, so the GET below cannot race it.
+    printf 'EXEC\r\nECHO cas-done\r\n' >&3
+    while IFS= read -r -t 5 line <&3; do
+        [[ "${line%$'\r'}" == "cas-done" ]] && break
+    done
+    exec 3>&-
+    redis-cli -p "$port" GET cas:k 2>&1
+}
+
+assert_eq "WATCH: conflicting write aborts EXEC" \
+    "$(watch_cas_outcome "$PORT_REDIS" yes)" "$(watch_cas_outcome "$PORT_RUST" yes)"
+assert_eq "WATCH: unconflicted EXEC commits" \
+    "$(watch_cas_outcome "$PORT_REDIS" no)" "$(watch_cas_outcome "$PORT_RUST" no)"
+
+# The ABA hole: versions are per-entry and die with the entry, so before the
+# per-db creation ticket a DEL + re-SET handed the watcher back the exact token
+# WATCH had recorded and EXEC committed on a key that had been destroyed and
+# rebuilt underneath it.
+watch_cas_aba_outcome() {
+    local port="$1" line=""
+    redis-cli -p "$port" SET aba:k base >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
+    printf 'WATCH aba:k\r\nMULTI\r\nSET aba:k from-txn\r\n' >&3
+    redis-cli -p "$port" DEL aba:k >/dev/null 2>&1 || true
+    redis-cli -p "$port" SET aba:k rebuilt >/dev/null 2>&1 || true
+    printf 'EXEC\r\nECHO cas-done\r\n' >&3
+    while IFS= read -r -t 5 line <&3; do
+        [[ "${line%$'\r'}" == "cas-done" ]] && break
+    done
+    exec 3>&-
+    redis-cli -p "$port" GET aba:k 2>&1
+}
+
+assert_eq "WATCH: delete + recreate aborts EXEC (ABA)" \
+    "$(watch_cas_aba_outcome "$PORT_REDIS")" "$(watch_cas_aba_outcome "$PORT_RUST")"
+
+# UNWATCH releases every dependency, so the same conflicting write commits.
+watch_unwatch_outcome() {
+    local port="$1" line=""
+    redis-cli -p "$port" SET uw:k base >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
+    printf 'WATCH uw:k\r\nUNWATCH\r\nMULTI\r\nSET uw:k from-txn\r\n' >&3
+    redis-cli -p "$port" SET uw:k from-other >/dev/null 2>&1 || true
+    printf 'EXEC\r\nECHO cas-done\r\n' >&3
+    while IFS= read -r -t 5 line <&3; do
+        [[ "${line%$'\r'}" == "cas-done" ]] && break
+    done
+    exec 3>&-
+    redis-cli -p "$port" GET uw:k 2>&1
+}
+
+assert_eq "UNWATCH releases the dependency" \
+    "$(watch_unwatch_outcome "$PORT_REDIS")" "$(watch_unwatch_outcome "$PORT_RUST")"
+
+assert_both "WATCH arity" WATCH
+assert_both "UNWATCH outside MULTI" UNWATCH
+
+# ===========================================================================
 # SWAPDB consistency
 # ===========================================================================
 log "=== SWAPDB ==="

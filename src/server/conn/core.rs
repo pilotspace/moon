@@ -277,9 +277,11 @@ pub(crate) struct ConnectionState {
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
 
-    // WATCH/EXEC optimistic locking (handler_single only)
-    #[allow(dead_code)] // Only used by handler_single (tokio feature)
-    pub watched_keys: HashMap<Bytes, u32>,
+    // WATCH/EXEC optimistic locking. Read by all three dispatch paths — the
+    // `handler_single only` note and its dead_code allow were accurate right up
+    // until they described the bug: the two production handlers parsed WATCH,
+    // answered +OK, and never looked at this map again.
+    pub watched_keys: HashMap<Bytes, crate::server::conn::shared::WatchToken>,
 
     // Connection affinity (migration)
     pub affinity_tracker: Option<AffinityTracker>,

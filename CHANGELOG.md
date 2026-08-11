@@ -69,6 +69,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **`WATCH` / `UNWATCH` now actually guard a transaction on the production
+  dispatch paths.** Both commands parsed and answered `+OK`, and the tokio and
+  embedded handlers re-checked the recorded versions at `EXEC` — but the two
+  paths clients really reach (`handler_monoio`, `handler_sharded`) never
+  consulted the watch set at all. A conflicting write from another client
+  committed anyway, so every check-and-set built on `WATCH` (inventory
+  decrement, balance transfer, leader election) silently degraded to
+  last-writer-wins. Four defects, all fixed together because a partial fix is
+  indistinguishable from none:
+
+  1. **The watch set was not consulted at `EXEC`** on the monoio and sharded
+     handlers. `EXEC` now aborts with a RESP null array on any version
+     mismatch, and clears the watch set on *both* outcomes by construction
+     (`mem::take`) rather than by a `clear()` each exit path has to remember.
+  2. **A watched key on another shard was read from the local slice** — a
+     different database entirely, so the version compared was some unrelated
+     key's or zero. `WATCH` now snapshots versions where the keys live, via a
+     new `ShardMessage::ReadVersions` (one hop per owning shard, not per key),
+     and a watch set spanning shards is classified and refused `CROSSSLOT`
+     like a cross-shard `MULTI` body already was.
+  3. **`WATCH` inside `MULTI` was queued** as an ordinary command instead of
+     being refused, and `WATCH` with no arguments answered "unknown command"
+     instead of an arity error.
+  4. **Delete + recreate was invisible (ABA).** Versions are per-entry and die
+     with the entry, so every incarnation of a key started at
+     `INITIAL_VERSION`: `DEL k` + `SET k` handed the watcher back the exact
+     token it had recorded and `EXEC` committed on a key that had been
+     destroyed and rebuilt underneath it — where Redis aborts. Entries are now
+     stamped from a per-database creation ticket, so a recreated key is
+     observably a different incarnation. Restored keys draw tickets too:
+     versions are not persisted, so otherwise the first key created after a
+     restart would collide with the whole restored population.
+
+  Residual risk, stated rather than buried: the ticket shares the entry's
+  24-bit version field and so wraps at 16,777,216 creations (~18s of saturated
+  single-database insert at the measured 914K/s). A miss now needs that wrap to
+  land inside one client's open `WATCH`..`EXEC` window *and* hit the one
+  watched key — ~1 in 16.7M, against the pre-fix certainty. Only a wider
+  incarnation field removes it entirely; `WatchToken` stays a named struct so
+  adding one later does not churn the call sites.
+
+  New suite `tests/watch_cas_transactions.rs` (10 wire-level tests, raw-byte
+  assertions, two connections, run at both `--shards 1` and `--shards 4`),
+  plus WATCH/CAS entries in `scripts/test-consistency.sh` and
+  `scripts/test-commands.sh`.
+
 - **RESP3 reply types now match Redis, and no longer change with the calling
   context.** A live sweep against `redis-server` 8.6.1 found the conversion
   table wrong in both directions and, structurally, unable to be right: it keyed

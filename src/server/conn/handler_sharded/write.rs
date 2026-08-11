@@ -531,11 +531,20 @@ pub(super) async fn try_handle_mq_command(
 /// nothing, so every transactional write was lost on restart).
 pub(super) async fn try_handle_multi_exec(
     cmd: &[u8],
+    args: &[Frame],
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
 ) -> bool {
+    // --- WATCH / UNWATCH ---
+    // Before the MULTI queueing step below, so `WATCH` inside MULTI is refused
+    // rather than queued. Shared with the other production handler on purpose:
+    // two copies of this arm is how the paths drifted in the first place.
+    if crate::server::conn::watch::try_handle_watch_unwatch(cmd, args, conn, ctx, responses).await {
+        return true;
+    }
+
     // --- MULTI ---
     if cmd.eq_ignore_ascii_case(b"MULTI") {
         if conn.in_cross_txn() {
@@ -558,6 +567,10 @@ pub(super) async fn try_handle_multi_exec(
             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
         } else {
             conn.in_multi = false;
+            // Taken, not borrowed: EXEC must clear its watches on BOTH the
+            // committed and the aborted outcome, and a stale watch surviving
+            // an abort is how a CAS retry loop livelocks.
+            let watched = std::mem::take(&mut conn.watched_keys);
             // The body runs on THIS shard with no per-key routing, so a
             // foreign-owned key would be silently misplaced. Classify locality:
             //  - CrossShard: genuinely spans shards — a shared-nothing engine
@@ -567,9 +580,15 @@ pub(super) async fn try_handle_multi_exec(
             //    on the owner (instead of the Phase-A CROSSSLOT rejection).
             //  - Keyless / SingleShard(self): fall through to local execution.
             if ctx.num_shards > 1 {
-                match crate::server::conn::shared::analyze_txn_locality(
-                    &conn.command_queue,
-                    ctx.num_shards,
+                match crate::server::conn::shared::merge_locality(
+                    crate::server::conn::shared::analyze_txn_locality(
+                        &conn.command_queue,
+                        ctx.num_shards,
+                    ),
+                    // A watched key owned by another shard cannot be validated
+                    // where the body commits — refuse rather than fabricate a
+                    // conflict the client can never clear.
+                    crate::server::conn::shared::analyze_watch_locality(&watched, ctx.num_shards),
                 ) {
                     crate::server::conn::shared::TxnLocality::SingleShard(s)
                         if s != ctx.shard_id =>
@@ -589,6 +608,8 @@ pub(super) async fn try_handle_multi_exec(
                             conn.selected_db,
                             commands,
                             conn.protocol_version,
+                            // The CAS check runs where the body runs.
+                            watched.clone(),
                             &ctx.dispatch_tx,
                             &ctx.spsc_notifiers,
                         )
@@ -692,6 +713,7 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
                 &mut exec_flushes,
+                &watched,
             );
             // task #52: flush the graph-leg wal-v3 records collected by the
             // txn executor. Replication is monoio-only by design (see
@@ -777,6 +799,7 @@ pub(super) async fn try_handle_multi_exec(
         } else {
             conn.in_multi = false;
             conn.command_queue.clear();
+            conn.watched_keys.clear();
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         return true;

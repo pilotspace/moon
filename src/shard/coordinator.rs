@@ -254,6 +254,8 @@ pub(crate) async fn execute_txn_on_owner(
     db_index: usize,
     commands: Vec<Frame>,
     proto: u8,
+    // WATCH tokens travel with the body: the CAS check runs on the owner.
+    watched: std::collections::HashMap<Bytes, crate::server::conn::shared::WatchToken>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Option<crate::shard::dispatch::TxnExecReply> {
@@ -264,10 +266,70 @@ pub(crate) async fn execute_txn_on_owner(
         commands,
         reply_tx,
         proto,
+        watched,
     };
     let msg = ShardMessage::TxnExecute(Box::new(payload));
     let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
     recv_reply_bounded(reply_rx).await.ok()
+}
+
+/// Snapshot the versions of `keys` from whichever shards own them (WATCH).
+///
+/// Returns versions positionally aligned with `keys`; `0` means absent, which
+/// is a real token (watching a key that does not exist and seeing it created
+/// IS a conflict). Local keys are read inline; remote keys are grouped per
+/// owner so a WATCH of N keys costs at most one hop per shard, not per key.
+///
+/// A dead owner yields `0` for its keys, which is fail-SAFE in the only
+/// direction that matters: `0` almost never matches a live key's version, so
+/// the transaction aborts rather than committing on an unverified dependency.
+pub(crate) async fn snapshot_versions(
+    keys: &[Bytes],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Vec<u32> {
+    let mut out = vec![0u32; keys.len()];
+    // owner -> (original indices, keys)
+    let mut groups: std::collections::HashMap<usize, (Vec<usize>, Vec<Bytes>)> =
+        std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        let owner = key_to_shard(k, num_shards);
+        let e = groups.entry(owner).or_default();
+        e.0.push(i);
+        e.1.push(k.clone());
+    }
+
+    for (owner, (idxs, group_keys)) in groups {
+        if owner == my_shard {
+            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
+                group_keys
+                    .iter()
+                    .map(|k| db.get_version(k))
+                    .collect::<Vec<u32>>()
+            });
+            for (slot, v) in idxs.iter().zip(versions) {
+                out[*slot] = v;
+            }
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let payload = crate::shard::dispatch::ReadVersionsPayload {
+            db_index,
+            keys: group_keys,
+            reply_tx,
+        };
+        let msg = ShardMessage::ReadVersions(Box::new(payload));
+        let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
+        if let Ok(versions) = recv_reply_bounded(reply_rx).await {
+            for (slot, v) in idxs.iter().zip(versions) {
+                out[*slot] = v;
+            }
+        }
+    }
+    out
 }
 
 /// Run one full command on whichever shard owns `routing_key`.

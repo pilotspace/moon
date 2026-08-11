@@ -214,6 +214,30 @@ pub struct DocFreqPayload {
     pub db_index: u8,
 }
 
+/// Payload for [`ShardMessage::ReadVersions`] (WATCH snapshot, task
+/// `watch-cas-transactions`).
+///
+/// `WATCH k` must record `k`'s version AT WATCH TIME — that snapshot is the
+/// whole CAS token. At `--shards > 1` the watched key may be owned by a shard
+/// the connection is not on, and `with_shard_db` reads the LOCAL slice, which
+/// for a remote key is simply the wrong database. Reading it where it lives is
+/// the only honest option: refusing non-local watches would make WATCH
+/// near-unusable above one shard, since which shard a connection lands on is
+/// unrelated to which shard its keys hash to.
+///
+/// Cheap by construction: WATCH is rare, and this hop happens once per WATCH,
+/// never on the command hot path.
+pub struct ReadVersionsPayload {
+    /// Target database index (the connection's `selected_db`).
+    pub db_index: usize,
+    /// The keys to snapshot — only those this shard owns; the caller groups.
+    pub keys: Vec<Bytes>,
+    /// Versions in the SAME order as `keys`. `0` means absent, which is a real
+    /// token: watching a key that does not exist and seeing it created is a
+    /// conflict.
+    pub reply_tx: channel::OneshotSender<Vec<u32>>,
+}
+
 /// Boxed payload for `ShardMessage::TextAggregate` (Phase 152 D-05/D-07).
 ///
 /// Kept as a separate struct so the enum variant stays small (single
@@ -719,6 +743,11 @@ pub enum ShardMessage {
     /// variant pushed `ShardMessage` past the 64-byte cap asserted at module
     /// bottom — boxing collapses it back to a single pointer.
     DocFreq(Box<DocFreqPayload>),
+    /// Snapshot key versions on the shard that owns them (WATCH).
+    ///
+    /// Boxed to keep `ShardMessage` within the 64-byte cap, like its siblings.
+    ReadVersions(Box<ReadVersionsPayload>),
+
     /// DFS Phase 2: execute BM25 text search with injected global IDF.
     ///
     /// Returns `Frame::Array` in the same format as `ft_text_search` response:
@@ -955,6 +984,13 @@ pub struct TxnExecutePayload {
     /// EXEC would answer RESP2 shapes to a RESP3 client — the same
     /// context-dependent shape defect, reached over a shard hop.
     pub proto: u8,
+    /// The ORIGINATING connection's WATCH tokens. The CAS check runs where the
+    /// body runs — on the owner shard — so the tokens must make the hop with
+    /// it. Leaving them behind would mean WATCH silently stops guarding as soon
+    /// as the transaction is owner-routed, i.e. at every `--shards > 1`
+    /// deployment: the exact silent-guarantee failure this task exists to
+    /// remove. Empty for non-WATCH transactions, which is nearly all of them.
+    pub watched: std::collections::HashMap<Bytes, crate::server::conn::shared::WatchToken>,
 }
 
 /// Reply for [`ShardMessage::TxnExecute`].

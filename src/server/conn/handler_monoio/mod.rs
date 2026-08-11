@@ -1700,6 +1700,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
             if write::try_handle_multi_exec(
                 cmd,
+                cmd_args,
                 &mut conn,
                 ctx,
                 &mut responses,

@@ -80,7 +80,11 @@ impl Database {
         if !self.data.contains_key(key) {
             self.promote_cold_if_present(key, now_ms);
             if !self.data.contains_key(key) {
-                let entry = K::new_entry();
+                let mut entry = K::new_entry();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
                 let k = CompactKey::from(key);
                 self.used_memory += entry_overhead(key, &entry);
                 self.data.insert(k, entry);
@@ -204,7 +208,11 @@ impl Database {
             // callers (e.g. SADD) to `get_or_create_set` — no fabrication.
             self.promote_cold_if_present(key, now_ms);
             if !self.data.contains_key(key) {
-                let entry = Entry::new_set_intset();
+                let mut entry = Entry::new_set_intset();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
                 let k = CompactKey::from(key);
                 self.used_memory += entry_overhead(key, &entry);
                 self.data.insert(k, entry);
@@ -261,7 +269,11 @@ impl Database {
             // callers (e.g. HSET) to `get_or_create_hash` — no fabrication.
             self.promote_cold_if_present(key, now_ms);
             if !self.data.contains_key(key) {
-                let entry = Entry::new_hash_listpack();
+                let mut entry = Entry::new_hash_listpack();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
                 let k = CompactKey::from(key);
                 self.used_memory += entry_overhead(key, &entry);
                 self.data.insert(k, entry);
@@ -320,7 +332,11 @@ impl Database {
             // callers (e.g. LPUSH) to `get_or_create_list` — no fabrication.
             self.promote_cold_if_present(key, now_ms);
             if !self.data.contains_key(key) {
-                let entry = Entry::new_list_listpack();
+                let mut entry = Entry::new_list_listpack();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
                 let k = CompactKey::from(key);
                 self.used_memory += entry_overhead(key, &entry);
                 self.data.insert(k, entry);
