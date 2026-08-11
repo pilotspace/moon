@@ -1100,7 +1100,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
                     let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
-                    if write::try_handle_multi_exec(cmd, &mut conn, ctx, &mut responses, &mut exec_publishes).await {
+                    if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes).await {
                         // C2: PUBLISH queued inside MULTI fans out only now — after the
                         // transaction body has been applied — and its placeholder in the
                         // EXEC reply array is patched with the real receiver count.

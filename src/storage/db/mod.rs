@@ -243,6 +243,23 @@ pub struct Database {
     /// large, or it would evict in a runaway loop chasing memory that cannot
     /// drop yet — a design change, deliberately out of scope for #459.
     spill_inflight: std::collections::HashMap<bytes::Bytes, PendingSpill>,
+    /// Ticket dispenser for the version stamped on a NEWLY CREATED entry.
+    ///
+    /// Versions are per-entry and die with the entry. Before this counter every
+    /// creation started at `INITIAL_VERSION`, so `DEL k` + `SET k` handed a
+    /// WATCHing client back the exact token it had recorded and EXEC committed
+    /// on a key that had been destroyed and rebuilt underneath it — the ABA
+    /// hole (Redis aborts there). Stamping each creation with the next value of
+    /// a per-db counter makes recreation observably distinct instead.
+    ///
+    /// Monotonic per database, bumped on every `set` and every `get_or_create`
+    /// fabrication; gaps are harmless (it is a ticket, not a count). Shares the
+    /// entry's 24-bit version field, so it wraps at 16,777,216 — a miss now
+    /// needs that wrap to land inside one client's open WATCH..EXEC window AND
+    /// hit the one watched key, ~1 in 16.7M versus the pre-fix certainty. Only
+    /// a full incarnation field (a wider `Entry`) removes the residue entirely;
+    /// see the task's §7.
+    birth_counter: u32,
 }
 
 /// A spill that has left hot RAM but has not yet landed in `cold_index`.
@@ -275,6 +292,7 @@ impl Database {
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
+            birth_counter: 0,
         }
     }
 
@@ -300,6 +318,7 @@ impl Database {
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
+            birth_counter: 0,
         }
     }
 
@@ -925,11 +944,96 @@ mod tests {
         // 0 is reserved for "key absent" so WATCH detects creation.
         assert_eq!(db.get_version(b"key"), 0);
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
-        assert_eq!(db.get_version(b"key"), 1); // first set: INITIAL_VERSION
+        assert_eq!(db.get_version(b"key"), 1); // first creation draws ticket 1
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
         assert_eq!(db.get_version(b"key"), 2); // overwrite bumps
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
         assert_eq!(db.get_version(b"key"), 3);
+    }
+
+    /// The ABA hole: before the birth counter every creation started at
+    /// `INITIAL_VERSION`, so DEL + re-SET handed a WATCHing client back the
+    /// exact token it had recorded and EXEC committed on a key that had been
+    /// destroyed and rebuilt underneath it.
+    #[test]
+    fn test_recreated_key_never_reuses_its_old_version() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v0"));
+        let watched = db.get_version(b"k");
+
+        db.remove(b"k");
+        assert_eq!(db.get_version(b"k"), 0, "removed key must read as absent");
+        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v1"));
+
+        assert_ne!(
+            db.get_version(b"k"),
+            watched,
+            "recreated key presented the version WATCH recorded"
+        );
+    }
+
+    /// The ticket is per-database, not per-key: two keys created in sequence
+    /// must not both read as version 1, or the counter has degenerated back
+    /// into a per-entry constant.
+    #[test]
+    fn test_birth_tickets_are_distinct_across_keys() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"v"));
+        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"v"));
+        assert_ne!(db.get_version(b"a"), db.get_version(b"b"));
+    }
+
+    /// Containers fabricated by `get_or_create` take tickets too — HSET on a
+    /// deleted-and-rebuilt hash is the same ABA hole as SET on a string.
+    #[test]
+    fn test_fabricated_containers_take_birth_tickets() {
+        let mut db = Database::new();
+        db.get_or_create_hash(b"h")
+            .unwrap()
+            .insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let watched = db.get_version(b"h");
+
+        db.remove(b"h");
+        db.get_or_create_hash(b"h")
+            .unwrap()
+            .insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+
+        assert_ne!(
+            db.get_version(b"h"),
+            watched,
+            "recreated hash presented the version WATCH recorded"
+        );
+    }
+
+    /// Restored entries carry tickets as well. Versions are not persisted, so
+    /// without this every restored key would read `INITIAL_VERSION` and the
+    /// first key created after the restore would collide with all of them.
+    #[test]
+    fn test_restored_keys_do_not_collide_with_the_first_new_key() {
+        let mut db = Database::new();
+        db.insert_for_load(
+            Bytes::from_static(b"restored"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        let restored = db.get_version(b"restored");
+        assert_ne!(restored, 0, "a loaded key must not read as absent");
+
+        db.set_string(Bytes::from_static(b"fresh"), Bytes::from_static(b"v"));
+        assert_ne!(db.get_version(b"fresh"), restored);
+    }
+
+    /// The counter shares the entry's 24-bit version field, so it wraps —
+    /// and must skip 0, which is the "key absent" sentinel. A wrapped ticket
+    /// reading as 0 would make a live key invisible to WATCH.
+    #[test]
+    fn test_birth_ticket_wraps_without_ever_yielding_zero() {
+        let mut db = Database::new();
+        db.birth_counter = 0xFF_FFFE;
+        assert_eq!(db.next_birth_version(), 0xFF_FFFF);
+        assert_eq!(
+            db.next_birth_version(),
+            crate::storage::entry::INITIAL_VERSION
+        );
     }
 
     #[test]

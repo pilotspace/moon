@@ -1,4 +1,5 @@
-#[cfg(feature = "runtime-tokio")]
+// Both runtimes need this now: `execute_transaction_sharded` carries the
+// WATCH token map, and that path is the one the monoio build ships.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -112,6 +113,35 @@ pub(crate) fn handle_config(
     }
 }
 
+/// What `WATCH k` recorded about `k`, and what `EXEC` re-checks.
+///
+/// `version` is `Database::get_version`, which is `0` exactly when the key is
+/// absent (creation tickets start at 1 and the counter never yields 0), so
+/// absent-vs-present needs no separate flag.
+///
+/// A struct rather than a bare `u32`: the ABA hole (delete + recreate handing
+/// back the token WATCH recorded) is closed inside this one field by the per-db
+/// creation ticket — see `Database::birth_counter` — but that ticket shares the
+/// entry's 24 version bits and so still wraps at 16.7M creations. A true
+/// incarnation field is the only way to retire the residue, and it would live
+/// here; keeping the named type means adding it never churns the call sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchToken {
+    pub version: u32,
+}
+
+/// True when any watched key's version no longer matches what WATCH recorded.
+///
+/// Caller must have checked `!watched.is_empty()` — this takes the shard slice,
+/// which is not free, and the empty case is the overwhelming majority.
+fn watch_conflict(db_index: usize, watched: &HashMap<Bytes, WatchToken>) -> bool {
+    crate::shard::slice::with_shard_db(db_index, |db| {
+        watched
+            .iter()
+            .any(|(key, tok)| db.get_version(key) != tok.version)
+    })
+}
+
 /// Execute a queued transaction atomically under a single database lock.
 ///
 /// Checks WATCH versions first -- if any watched key's version has changed since
@@ -123,7 +153,7 @@ pub(crate) fn handle_config(
 pub(crate) fn execute_transaction(
     db: &SharedDatabases,
     command_queue: &[Frame],
-    watched_keys: &HashMap<Bytes, u32>,
+    watched_keys: &HashMap<Bytes, WatchToken>,
     selected_db: &mut usize,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
 ) -> (Frame, Vec<Bytes>) {
@@ -134,7 +164,7 @@ pub(crate) fn execute_transaction(
     // Check WATCH versions -- if any key's version changed, abort
     for (key, watched_version) in watched_keys {
         let current_version = guard.get_version(key);
-        if current_version != *watched_version {
+        if current_version != watched_version.version {
             return (Frame::Null, Vec::new()); // Transaction aborted
         }
     }
@@ -232,8 +262,23 @@ pub(crate) fn execute_transaction_sharded(
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
+    // WATCH/CAS (task `watch-cas-transactions`): the versions this connection
+    // recorded at WATCH time. Empty for the overwhelming majority of
+    // transactions, which is why the check below early-outs on `is_empty`
+    // before touching the shard at all.
+    watched_keys: &HashMap<Bytes, WatchToken>,
 ) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
+
+    // The CAS gate. This runs synchronously on the shard thread, BEFORE the
+    // first body command and with no `.await` between it and the body — that
+    // adjacency is the whole guarantee. `execute_transaction` (the embedded
+    // path) does the same thing at the top of its locked section; this path
+    // had no equivalent, so a transaction that declared a dependency on a key
+    // committed straight over a conflicting write.
+    if !watched_keys.is_empty() && watch_conflict(selected_db, watched_keys) {
+        return (Frame::Null, Vec::new(), Vec::new());
+    }
 
     let mut results = Vec::with_capacity(command_queue.len());
     // Per-entry db (PR #282 review): this executor re-dispatches each body
@@ -919,6 +964,52 @@ pub(crate) enum TxnLocality {
     CrossShard,
 }
 
+/// Classify the WATCHed keys by the shard(s) they hash to.
+///
+/// Same lattice as the body's: no keys is `Keyless`, all on one shard is
+/// `SingleShard`, anything else is `CrossShard`.
+pub(crate) fn analyze_watch_locality(
+    watched: &HashMap<Bytes, WatchToken>,
+    num_shards: usize,
+) -> TxnLocality {
+    let mut owner: Option<usize> = None;
+    for key in watched.keys() {
+        let s = crate::shard::dispatch::key_to_shard(key, num_shards);
+        match owner {
+            None => owner = Some(s),
+            Some(existing) if existing == s => {}
+            Some(_) => return TxnLocality::CrossShard,
+        }
+    }
+    match owner {
+        None => TxnLocality::Keyless,
+        Some(s) => TxnLocality::SingleShard(s),
+    }
+}
+
+/// Combine the body's locality with the WATCH set's.
+///
+/// The CAS check runs where the body runs, reading that shard's slice — so a
+/// watched key owned by a DIFFERENT shard reads version 0 there and fabricates
+/// a conflict. That is safe (it aborts) but wrong, and a retry loop that can
+/// never succeed is a livelock. Refusing loudly is the contract.
+///
+/// `Keyless` is the identity: a keyless body inherits the watch set's shard,
+/// and an unwatched body inherits the body's.
+pub(crate) fn merge_locality(body: TxnLocality, watch: TxnLocality) -> TxnLocality {
+    match (body, watch) {
+        (TxnLocality::CrossShard, _) | (_, TxnLocality::CrossShard) => TxnLocality::CrossShard,
+        (TxnLocality::Keyless, other) | (other, TxnLocality::Keyless) => other,
+        (TxnLocality::SingleShard(a), TxnLocality::SingleShard(b)) => {
+            if a == b {
+                TxnLocality::SingleShard(a)
+            } else {
+                TxnLocality::CrossShard
+            }
+        }
+    }
+}
+
 /// Classify a queued transaction body by the shard(s) its keys hash to.
 ///
 /// Uses the command-metadata key specs (`command_keys`) so multi-key commands
@@ -1324,5 +1415,131 @@ mod txn_locality_tests {
             &dst,
         ])];
         assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
+}
+
+#[cfg(test)]
+mod watch_locality_tests {
+    use super::{TxnLocality, WatchToken, analyze_watch_locality, merge_locality};
+    use bytes::Bytes;
+    use std::collections::HashMap;
+
+    fn watched(keys: &[&str]) -> HashMap<Bytes, WatchToken> {
+        keys.iter()
+            .map(|k| {
+                (
+                    Bytes::copy_from_slice(k.as_bytes()),
+                    WatchToken { version: 1 },
+                )
+            })
+            .collect()
+    }
+
+    /// Find two keys that hash to different shards, so the cross-shard case is
+    /// asserted against the real hash rather than an assumed key layout.
+    fn cross_shard_pair(num_shards: usize) -> (String, String) {
+        let first = "wk0".to_string();
+        let s0 = crate::shard::dispatch::key_to_shard(first.as_bytes(), num_shards);
+        for i in 1..4096 {
+            let cand = format!("wk{i}");
+            if crate::shard::dispatch::key_to_shard(cand.as_bytes(), num_shards) != s0 {
+                return (first, cand);
+            }
+        }
+        panic!("no cross-shard key pair found in 4096 candidates at {num_shards} shards");
+    }
+
+    #[test]
+    fn no_watched_keys_is_keyless() {
+        assert_eq!(
+            analyze_watch_locality(&watched(&[]), 4),
+            TxnLocality::Keyless
+        );
+    }
+
+    #[test]
+    fn keys_on_one_shard_classify_to_that_shard() {
+        let k = "solo";
+        let expect = crate::shard::dispatch::key_to_shard(k.as_bytes(), 4);
+        assert_eq!(
+            analyze_watch_locality(&watched(&[k]), 4),
+            TxnLocality::SingleShard(expect)
+        );
+    }
+
+    #[test]
+    fn keys_on_different_shards_are_cross_shard() {
+        let (a, b) = cross_shard_pair(4);
+        assert_eq!(
+            analyze_watch_locality(&watched(&[&a, &b]), 4),
+            TxnLocality::CrossShard
+        );
+    }
+
+    /// A single shard is degenerate: every key lands on shard 0, so a watch set
+    /// can never be cross-shard there. Worth pinning — the CROSSSLOT refusal
+    /// must not fire at `--shards 1`, the default for most deployments.
+    #[test]
+    fn one_shard_never_classifies_cross_shard() {
+        assert_eq!(
+            analyze_watch_locality(&watched(&["a", "b", "c"]), 1),
+            TxnLocality::SingleShard(0)
+        );
+    }
+
+    // --- the merge lattice: all nine combinations ---
+
+    #[test]
+    fn keyless_is_the_identity() {
+        assert_eq!(
+            merge_locality(TxnLocality::Keyless, TxnLocality::Keyless),
+            TxnLocality::Keyless
+        );
+        assert_eq!(
+            merge_locality(TxnLocality::Keyless, TxnLocality::SingleShard(2)),
+            TxnLocality::SingleShard(2)
+        );
+        assert_eq!(
+            merge_locality(TxnLocality::SingleShard(2), TxnLocality::Keyless),
+            TxnLocality::SingleShard(2)
+        );
+    }
+
+    #[test]
+    fn cross_shard_absorbs_everything() {
+        for other in [
+            TxnLocality::Keyless,
+            TxnLocality::SingleShard(0),
+            TxnLocality::CrossShard,
+        ] {
+            assert_eq!(
+                merge_locality(TxnLocality::CrossShard, other),
+                TxnLocality::CrossShard
+            );
+            assert_eq!(
+                merge_locality(other, TxnLocality::CrossShard),
+                TxnLocality::CrossShard
+            );
+        }
+    }
+
+    #[test]
+    fn agreeing_shards_stay_single() {
+        assert_eq!(
+            merge_locality(TxnLocality::SingleShard(3), TxnLocality::SingleShard(3)),
+            TxnLocality::SingleShard(3)
+        );
+    }
+
+    /// The case the whole merge exists for: the body commits on one shard and
+    /// the watch set lives on another, so the CAS check would read the wrong
+    /// slice and fabricate a conflict the client can never clear. Refusing is
+    /// the contract; silently aborting forever is a livelock.
+    #[test]
+    fn disagreeing_shards_become_cross_shard() {
+        assert_eq!(
+            merge_locality(TxnLocality::SingleShard(1), TxnLocality::SingleShard(2)),
+            TxnLocality::CrossShard
+        );
     }
 }

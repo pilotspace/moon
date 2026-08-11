@@ -720,6 +720,57 @@ if should_run "transaction"; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: MULTI/DISCARD"
     fi
+
+    # --- WATCH / UNWATCH optimistic locking -------------------------------
+    #
+    # A CAS conflict needs TWO connections interleaved: the transaction must
+    # stay open while a second client writes the watched key. `redis-cli`
+    # one-shot mode cannot express that (each invocation is its own connection,
+    # closed on exit), so bash's /dev/tcp holds the transaction connection open
+    # and drives it with inline commands. The verdict is read from the key's
+    # FINAL VALUE, not from EXEC's reply, which keeps this free of RESP parsing.
+    watch_cas_outcome() {
+        local port="$1" conflict="$2" line=""
+        redis-cli -p "$port" SET cas:k base >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
+        printf 'WATCH cas:k\r\nMULTI\r\nSET cas:k from-txn\r\n' >&3
+        if [[ "$conflict" == "yes" ]]; then
+            redis-cli -p "$port" SET cas:k from-other >/dev/null 2>&1 || true
+        fi
+        # ECHO after EXEC is a round-trip barrier: reading its reply proves EXEC
+        # was applied before the connection closes, so the GET cannot race it.
+        printf 'EXEC\r\nECHO cas-done\r\n' >&3
+        while IFS= read -r -t 5 line <&3; do
+            [[ "${line%$'\r'}" == "cas-done" ]] && break
+        done
+        exec 3>&-
+        redis-cli -p "$port" GET cas:k 2>/dev/null
+    }
+
+    TOTAL=$((TOTAL + 1))
+    cas_moon=$(watch_cas_outcome "$PORT_RUST" yes)
+    if [[ "$cas_moon" == "from-other" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: WATCH conflicting write did not abort EXEC"
+        echo "    EXPECTED: from-other (transaction aborted)"
+        echo "    GOT:      $cas_moon"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    cas_clean=$(watch_cas_outcome "$PORT_RUST" no)
+    if [[ "$cas_clean" == "from-txn" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: unconflicted WATCH/EXEC did not commit"
+        echo "    EXPECTED: from-txn"
+        echo "    GOT:      $cas_clean"
+    fi
+
+    assert_moon_contains "WATCH arity error" "wrong number of arguments" WATCH
+    assert_moon "UNWATCH outside MULTI" "OK" UNWATCH
 fi
 
 # ===========================================================================

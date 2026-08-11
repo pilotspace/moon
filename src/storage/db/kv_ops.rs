@@ -333,6 +333,11 @@ impl Database {
         // Exactly one closure runs (FnOnce), so the take() is safe.
         let entry_cell = std::cell::Cell::new(Some(entry));
 
+        // Drawn before the closures because both borrow `self.data`. Wasted on
+        // the hit path, which is deliberate: the counter is a ticket dispenser,
+        // not a count, and a gap costs nothing.
+        let birth = self.next_birth_version();
+
         // `insert_or_update` invariant: exactly one of the two closures fires
         // exactly once per call, so the `Cell::take()` below cannot observe
         // a None value. Annotated for the hot-path unwrap ratchet.
@@ -348,9 +353,12 @@ impl Database {
                 existing.set_version(new_version);
             },
             || {
-                // Miss path: insert entry as-is (constructors start versions
-                // at INITIAL_VERSION=1 so WATCH can detect creation).
-                entry_cell.take().expect("make closure called once on miss")
+                // Miss path: stamp the creation ticket. Constructors all start
+                // at INITIAL_VERSION, which made every incarnation of a key
+                // indistinguishable from its first — the WATCH ABA hole.
+                let mut new_entry = entry_cell.take().expect("make closure called once on miss");
+                new_entry.set_version(birth);
+                new_entry
             },
         );
 
@@ -425,15 +433,23 @@ impl Database {
         &self.hot_keys
     }
 
-    /// Bulk-load insert: skip duplicate check, version tracking, and per-key memory accounting.
+    /// Bulk-load insert: skip duplicate check and per-key memory accounting.
     ///
     /// Used exclusively during RDB/AOF restore where keys are guaranteed unique and
     /// we recalculate `used_memory` once after the entire load completes.
+    ///
+    /// Still draws a creation ticket, unlike the rest of the fast path it skips.
+    /// Versions are not persisted, so every restored entry would otherwise carry
+    /// `INITIAL_VERSION`, and the FIRST key created after a restore would draw
+    /// ticket 1 and collide with them — reopening the ABA hole for exactly the
+    /// window right after a restart. One u32 increment per restored key against
+    /// a decode is not measurable.
     #[inline]
-    pub fn insert_for_load(&mut self, key: Bytes, entry: Entry) {
+    pub fn insert_for_load(&mut self, key: Bytes, mut entry: Entry) {
         if entry.has_expiry() {
             self.maybe_has_expiring_keys = true;
         }
+        entry.set_version(self.next_birth_version());
         self.data.insert(CompactKey::from(key), entry);
     }
 
@@ -920,6 +936,20 @@ impl Database {
         Frame::Error(Bytes::from_static(
             b"WRONGTYPE Operation against a key holding the wrong kind of value",
         ))
+    }
+
+    /// Take the next creation ticket from the per-db birth counter.
+    ///
+    /// Stamped on every entry this database fabricates so a delete+recreate is
+    /// observably a different incarnation rather than a fresh `INITIAL_VERSION`
+    /// that a WATCHing client mistakes for its own recorded token. See
+    /// `Database::birth_counter` for the wrap analysis.
+    ///
+    /// Consuming a ticket without using it is fine — gaps carry no meaning.
+    #[inline]
+    pub(crate) fn next_birth_version(&mut self) -> u32 {
+        self.birth_counter = Entry::bump_version(self.birth_counter);
+        self.birth_counter
     }
 
     /// Get the version of a key. Returns 0 if not found. No expiry check (WATCH needs raw version).

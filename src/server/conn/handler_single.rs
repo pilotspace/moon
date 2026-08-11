@@ -1569,7 +1569,12 @@ pub async fn handle_connection(
                                 for arg in cmd_args {
                                     if let Frame::BulkString(key) = arg {
                                         let version = guard.get_version(key);
-                                        conn.watched_keys.insert(key.clone(), version);
+                                        conn.watched_keys.insert(
+                                            key.clone(),
+                                            crate::server::conn::shared::WatchToken {
+                                                version,
+                                            },
+                                        );
                                     }
                                 }
                                 // guard dropped here

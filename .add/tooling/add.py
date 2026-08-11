@@ -1722,6 +1722,23 @@ def _missing_captures(root: Path) -> list[str]:
             if not any((cap_dir / f"{n}.{ext}").is_file() for ext in _CAPTURE_EXTS)]
 
 
+def _contract_status(root: Path, slug: str) -> str | None:
+    """First word of the task's `Status:` line, upper-cased, emphasis stripped.
+
+    `**FROZEN @ v1**` and `FROZEN @ v1` are the same state; only the marker
+    differs. Returns None when the task declares no Status line at all.
+    """
+    task_md = root / "tasks" / slug / "TASK.md"
+    try:
+        for line in task_md.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Status:"):
+                body = line[len("Status:"):].strip().lstrip("*").strip()
+                return body.split()[0].rstrip("*").upper() if body.split() else ""
+    except OSError:
+        return None
+    return None
+
+
 def cmd_check(args: argparse.Namespace) -> None:
     """Read-only integrity check of the .add project. Exit 1 if anything fails."""
     as_json = getattr(args, "json", False)
@@ -1750,6 +1767,17 @@ def cmd_check(args: argparse.Namespace) -> None:
         marker, want = _read_task_phase(root, slug), t.get("phase")
         checks.append((marker == want, f"task '{slug}' marker matches state",
                        f"marker={marker!r} state={want!r}"))
+        # phase/Status drift: this engine has no `freeze` subcommand, so §3
+        # `Status:` is hand-maintained and can silently lag the phase marker —
+        # a task can sit at `build` with its contract still DRAFT, i.e. built
+        # against an unapproved shape. Only DRAFT-past-contract is red;
+        # `INHERITED` (contract adopted from a sibling task) is a real state,
+        # and emphasis markers are cosmetic.
+        if want in PHASES[PHASES.index("tests"):]:
+            _cstat = _contract_status(root, slug)
+            checks.append((_cstat in ("FROZEN", "INHERITED"),
+                           f"task '{slug}' contract is frozen for phase '{want}'",
+                           f"Status is {_cstat or 'absent'!s} — freeze §3 before leaving contract"))
         # drift: milestone + dependency references must resolve
         ms = t.get("milestone")
         if ms is not None:

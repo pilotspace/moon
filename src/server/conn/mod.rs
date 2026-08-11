@@ -12,6 +12,7 @@ pub mod shared;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
 pub mod util;
+pub mod watch;
 
 // Re-export for internal use
 #[allow(unused_imports)]
