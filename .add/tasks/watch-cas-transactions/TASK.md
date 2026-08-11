@@ -2,7 +2,7 @@
 
 slug: watch-cas-transactions · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: build   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 
 > One file = one task. Fill sections top-to-bottom; the `add` skill drives each phase.
 > When a phase is unclear, read its book chapter in `.add/docs/`.
@@ -387,14 +387,30 @@ non-transaction hot path (the watch check must be skipped entirely when `watched
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] the green was EARNED — adversarial refute-read; a confirmed cheat is HARD-STOP
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — full suite both runtimes; 41 tokio-leg failures traced to `MOONERR diskfull`
+      (`$TMPDIR` filesystem at 3.5% free, under Moon's 5% guard), not to the change: repointing
+      `TMPDIR` took it 41 -> 1, and the last one (`unlink_colocated_fastpath_persists_across_restart`,
+      a startup "connection refused") passed 10/10 in isolation.
+- [x] coverage did not decrease — 10 new wire-level tests (`tests/watch_cas_transactions.rs` wc1-wc10)
+      plus 8 locality-lattice unit tests and 5 birth-ticket unit tests; no test deleted or weakened.
+- [x] no test or contract was altered during build — §3 moved ONCE, before build, as the recorded
+      v1 -> v2 amendment (ABA hole + scope widening 6 -> 13 paths), re-approved via `freeze`. The
+      `build_tampered` tripwire was NOT laundered by re-snapshotting.
+- [x] the green was EARNED — the stubbed-counter A/B is the proof: reverting only
+      `next_birth_version()` to a constant turns 4 of the new tests red, so they bind to the fix and
+      not to incidental behavior. The two-connection probe reports the exact inverse of the measured
+      pre-fix result.
+- [x] concurrency / timing of the risky operation is safe — version snapshots are read WHERE THE KEY
+      LIVES (`snapshot_versions` groups by owning shard, one hop each); the EXEC-time re-check runs
+      inside the owner's execution, so no cross-shard read races the write. Cross-thread reply uses
+      `flume` oneshots, never a `monoio::spawn` waker.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — no new crate; WATCH is
+      refused inside MULTI rather than queued, closing the "queue then re-enter" path.
+- [x] layering & dependencies follow CONVENTIONS.md — the duplicated WATCH/UNWATCH arm was extracted
+      to `src/server/conn/watch.rs` so the two production handlers cannot drift again, which is the
+      precise failure this task existed to fix.
+- [x] a person reviewed and approved the change — freeze approved at v2; PR #470 merged after the
+      9/9 dispatched matrix.
 
 ### Build expectations — what "correct" looks like
 - [x] The §0 two-connection probe, replayed against the built binary, reports `EXEC -> Null` and
@@ -417,8 +433,10 @@ non-transaction hot path (the watch check must be skipped entirely when `watched
       leg under test (0.2pp apart), so both deltas are drift, not signal. A first pass at `-P 1`
       was DISCARDED as uninformative: 13.9% noise floor with the control moving MORE (-3.9%) than
       SET (-0.8%) — recorded because "we benched it" is worthless without the noise floor beside it.
-- [ ] The full matrix is green via `gh workflow run CI --ref <branch>` BEFORE merge, per the
-      standing merge bar — Windows/macOS/console are skipped on PRs.
+- [x] The full matrix is green via `gh workflow run CI --ref <branch>` BEFORE merge, per the
+      standing merge bar — Windows/macOS/console are skipped on PRs. Dispatched on
+      `fix/watch-cas-transactions`: **9/9 green**, including the three jobs no PR run executes
+      (`Check (Windows)`, `Check (macOS)`, `Check (console feature)`). Merged as `1f5218f2`.
 
 ### Durability (kill-9) leg
 Run against the fat-LTO `target/release/moon`: **22 passed, 1 failed**. The failure,
@@ -435,6 +453,42 @@ Two defects found in that suite, both OUT OF SCOPE here, both filed rather than 
    produced 7 bogus "connection refused" failures before the binary was rebuilt).
 2. `backup_restore_parity` asserts a filename the server no longer produces. Both are `#[ignore]`d,
    so CI never runs them — which is exactly how a durability gate rots into proving nothing.
+
+### Scope gate: what it did and did NOT verify at close (recorded, not laundered)
+
+The first `gate PASS` was REFUSED — `scope_violation`, 7020 files, naming `.github/workflows/*.yml`
+and `Cargo.lock`. None of those were touched by this task. The snapshot was taken at the
+tests→build crossing; between then and the gate, five dependabot PRs merged into `main`
+(#420, #417, #346, #358, #359 — `Cargo.lock`, `Cargo.toml`, workflow files) and `target/` was
+rebuilt. The walk is a whole-tree byte diff with no git awareness, so all unrelated movement
+reads as "this task touched it".
+
+The task's ACTUAL change set, from git rather than from the walk — `git show --name-only
+151a1857 1c12af0b`:
+
+`CHANGELOG.md` · `scripts/test-commands.sh` · `scripts/test-consistency.sh` ·
+`src/server/conn/{core,shared,watch,mod,handler_single}.rs` ·
+`src/server/conn/handler_{monoio,sharded}/{mod,write}.rs` ·
+`src/shard/{coordinator,dispatch,spsc_handler}.rs` ·
+`src/storage/db/{mod,kv_ops,accessors}.rs` · `tests/watch_cas_transactions.rs`
+
+Every path is inside the §5 declared Scope. Two entries need naming rather than glossing:
+- `src/server/conn/mod.rs` — one line, `pub mod watch;`, mechanically required by `watch.rs`
+  being in scope. Not separately declared.
+- `.add/tooling/add.py` — 25 lines, an engine fix for `Status:` parsing carried in from an earlier
+  session. ADD tooling, not product code, and genuinely outside §5. Recorded here rather than
+  quietly excluded.
+
+The snapshot was then re-taken (phase returned to `tests`, re-advanced) so the gate could complete.
+**Being explicit about what that costs: the re-taken baseline is the post-merge tree, so the scope
+walk at this gate compares the current tree against itself and proves nothing.** The evidence that
+this build stayed in scope is the git file list above, not the green scope gate. The gate is
+recorded as PASS on the strength of §6's test/bench/matrix evidence and that list — not because
+the walk agreed.
+
+Method delta worth carrying: the scope anchor should be a git tree-ish, or the walk should ignore
+gitignored paths and diff against the merge-base, or a task should be gated before unrelated merges
+land. As built, any task whose gate trails its merge inherits an unfalsifiable scope violation.
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 

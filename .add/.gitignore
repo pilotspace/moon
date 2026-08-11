@@ -1,0 +1,9 @@
+# ADD engine transient artifacts — local working state, never committed.
+# (Body matches what `add.py init` scaffolds; this project predates that step.)
+# scope-snapshot.json is the tests->build touch baseline the verify scope-gate
+# reads from disk — the DURABLE scope declaration is the state.json anchor, so
+# the sidecar is regenerable working state. They run 40MB here because the walk
+# covers the whole tree including target/.
+scope-snapshot.json
+pre-archive-state.bak.json
+.update-cache.json
