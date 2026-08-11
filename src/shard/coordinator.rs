@@ -253,6 +253,7 @@ pub(crate) async fn execute_txn_on_owner(
     my_shard: usize,
     db_index: usize,
     commands: Vec<Frame>,
+    proto: u8,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Option<crate::shard::dispatch::TxnExecReply> {
@@ -262,6 +263,7 @@ pub(crate) async fn execute_txn_on_owner(
         db_index,
         commands,
         reply_tx,
+        proto,
     };
     let msg = ShardMessage::TxnExecute(Box::new(payload));
     let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;

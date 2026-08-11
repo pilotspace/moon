@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **CI now tests the runtime Moon actually ships (`check-monoio`).** Every CI job that *executed*
+  tests did so under `--no-default-features --features runtime-tokio,…`, while Moon's default
+  feature set — and what ships on Linux — is `runtime-monoio`. 26 monoio integration test files and
+  30 monoio-gated `src/` files were unreachable by CI. That is how the v0.8.6 inline-GET ACL bypass
+  shipped green: it was wrong only on the monoio dispatch path, which no CI job could see. The new
+  job runs on the self-hosted Linux runner (the only place monoio's io_uring driver executes at
+  all), uses the default feature set, and invokes `cargo nextest run --profile ci` so the repo's
+  existing flake policy applies — a bare `cargo test` has no retries, and an intermittently-red
+  required job gets disabled, which is worse than no job because it still looks like coverage.
+  Measured before landing: **5145 passed, 1 flaky, 244 skipped, exit 0, 80.3s**.
+
+  Proven by negative control rather than asserted: a deliberate defect on the monoio-only
+  `try_inline_dispatch` path **passes** the tokio suite 6/6 and **fails** the new job 3/6.
+  `tests/ci_covers_monoio.rs` guards the job against being silently weakened — wrong feature set,
+  `continue-on-error`, a bare `cargo test`, or a shared `CARGO_TARGET_DIR` all fail the suite.
+
+  The job's first cut proved the premise but not the driver: `MOON_NO_URING: "1"` lived in the
+  workflow-level `env:`, which merges into every job and cannot be unset by one, so the job whose
+  whole point is io_uring ran with io_uring force-disabled. `monoio_yield_overhead_is_microscopic`
+  caught it at 1.45ms/yield (the `sleep(ZERO)` timer-park signature). That variable is now per-job,
+  and `ci_covers_monoio.rs` asserts **both** scopes. The guard suite itself then failed on
+  Windows — it matched `"\n  <job>:\n"` against a CRLF checkout — so it now normalizes line
+  endings and carries a platform-independent CRLF regression test (Windows is skipped on every
+  PR, so that class is invisible until a main push).
+
 - **Client-compat harness: raw-RESP diff against a real `redis-server`
   (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
   (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
@@ -44,6 +69,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **RESP3 reply types now match Redis, and no longer change with the calling
+  context.** A live sweep against `redis-server` 8.6.1 found the conversion
+  table wrong in both directions and, structurally, unable to be right: it keyed
+  only on the command NAME, while `WITHSCORES`, `WITHVALUES` and a `<count>`
+  argument are what actually decide the reply shape. `ZRANGE … WITHSCORES`
+  arrived as a flat array of bulk strings instead of pair-wrapped `[member,
+  Double]` — enough to make an unmodified redis-py raise
+  `ValueError: not enough values to unpack`, so every RESP3 application using
+  sorted-set scores was broken outright. `HRANDFIELD WITHVALUES` and
+  `ZRANDMEMBER WITHSCORES` answered a Map where Redis answers an array of pairs.
+  In the other direction the server over-converted: all seven of `SISMEMBER`,
+  `HEXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `SETNX` and `MSETNX` returned
+  Boolean where Redis returns Integer, and `INCRBYFLOAT`/`HINCRBYFLOAT` returned
+  a lossy Double (`,10.6`) where Redis returns the exact Bulk
+  `"10.59999999999999964"`.
+
+  The conversion is now decided by `(command, args)` at one policy choke point
+  (`Resp3Shape` in `src/protocol/resp3.rs`) instead of by 11 call sites across
+  three handlers. Because the cross-shard reply loop no longer has the command's
+  args by the time its batch returns, the shape is classified at ENQUEUE time
+  and the 1-byte `Copy` tag travels in `RemoteMeta` — no per-command allocation
+  on the shard hot path. `execute_transaction_sharded` now takes the connection's
+  protocol version and converts each inner reply with its own command, so a
+  command answers the same shape standalone, inside `MULTI/EXEC` and inside a
+  pipeline; previously `SMEMBERS` was a Set outside a transaction and a flat
+  Array inside one. `CONFIG GET` (Map) and `CLIENT INFO` (Verbatim) are fixed at
+  their intercepts, which short-circuit the dispatch exit entirely — the reason
+  `CONFIG` could never be fixed before. Also added: `ZMSCORE` and `GEOPOS`
+  Doubles with Null preserved, `SPOP <count>` as a Set, `ZPOPMIN`/`ZPOPMAX`
+  Double scores (flat with no count, wrapped with one), and `XINFO STREAM` as a
+  Map.
+
+  Emptiness no longer changes the reply type either: `HGETALL` and `CONFIG GET`
+  on a miss answered `*0` where Redis answers `%0`, so a client dispatching on
+  the type byte broke on exactly the path it hits most. Every case in the
+  harness populated its key first, which is how that survived a full green run —
+  five miss-path cases were added so it stays diffed against the live oracle.
+
+  RESP2 is byte-identical — pinned by a test written before the fix. Harness
+  result vs Redis 8.6.1: **157 pass / 0 fail / 25 waived**, up from 98 / 0 / 54,
+  with all 13 now-stale waivers deleted and `--strict` green. New suite
+  `tests/resp3_type_fidelity.rs` (13 tests) asserts the wire type byte directly.
+  Known remainder, waived and reasoned: `XINFO STREAM` is now the right TYPE but
+  still reports 7 fields to Redis's 16 — the missing ones need real stream
+  bookkeeping and are tracked separately rather than fabricated.
+- **A key whose disk-offload spill was in flight was invisible to the whole
+  server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
+  freed the hot entry the moment the `SpillRequest` was queued, and the key
+  was only registered in `cold_index` when the completion landed. In between
+  it existed in no plane the database consults: `spill_inflight` held only a
+  request id and was read solely by the completion path. The eviction code
+  documented the window as an acceptable "brief read-miss" backstopped by the
+  AOF — but the AOF backstops *durability*, not *visibility*, and nothing
+  considered a write landing inside the window. Measured on 400 × 4 KiB keys
+  against a 512 KiB cap: `DBSIZE` answered 124 for 400 acked keys and then
+  climbed to 400 on its own; `GET`/`EXISTS` denied live keys that returned
+  unaided 250 ms later; and 277 of 400 `DEL`s answered `:0` and were then
+  reversed by the completion — which publishes into `cold_index`
+  unconditionally, so those resurrections reached the manifest and survived
+  restart. A client that deleted data got it back.
+
+  `spill_inflight` is now a real third storage plane carrying the payload
+  (the same refcounted `Bytes` the queued request already pins — a refcount,
+  not a copy, and no extra peak memory). Reads promote from it with no disk
+  read at all, across all three dispatch paths (`promote_cold_if_present` for
+  collections and Lua/MULTI, the monoio async GET pre-warm, and the inline
+  `GET` fast path). `EXISTS`/`DEL` count it, `DBSIZE`/`logical_len` count it,
+  and `KEYS`/`RANDOMKEY` enumerate it. `DEL`, an overwriting `SET`, and a
+  promoting read each retire the record, which withdraws the completion's
+  authorization to publish — that is what makes a delete inside the window
+  final. Unpublished completions are counted as `spill_completion_superseded`
+  in INFO. Non-spilling servers pay one `is_empty()` load on the affected
+  paths. Known remaining gap, documented at the call site: `SCAN`'s ordered
+  cursor does not merge the unordered in-flight plane, so it may skip a key
+  for the milliseconds its spill is queued — within SCAN's contract, unlike
+  `KEYS`.
 - **`GET` inside `MULTI` was executed instead of queued (monoio).** Third
   defect from the same ungated inline read path, and the one most visible to a
   working client: `MULTI; GET k; EXEC` answered `+OK`, `$1 v`, `*0` where Redis

@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "client-compat-harness",
+  "active_task": "monoio-ci-coverage",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -200,12 +200,12 @@
     },
     "monoio-ci-coverage": {
       "title": "CI runs the test suite on a monoio build (and clippy --all-targets)",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [],
       "created": "2026-08-09T07:32:03+00:00",
-      "updated": "2026-08-09T07:32:03+00:00"
+      "updated": "2026-08-10T08:35:14+00:00"
     },
     "client-identity-introspection": {
       "title": "HELLO/COMMAND/ROLE/RESET identity + registry-dispatch reconciliation",
@@ -220,14 +220,14 @@
     },
     "resp3-type-fidelity": {
       "title": "RESP3 reply-type parity, applied at one conversion choke point",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-09T07:32:04+00:00"
+      "updated": "2026-08-10T06:47:03+00:00"
     },
     "pubsub-resp3-push": {
       "title": "Pub/sub Push frames, subscriber-mode rules, and sharded pub/sub",
@@ -272,6 +272,39 @@
       ],
       "created": "2026-08-09T07:32:04+00:00",
       "updated": "2026-08-09T07:32:04+00:00"
+    },
+    "watch-cas-transactions": {
+      "title": "WATCH/UNWATCH optimistic locking on both production dispatch paths",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T16:42:29+00:00",
+      "updated": "2026-08-09T16:42:29+00:00"
+    },
+    "protocol-error-lifetime": {
+      "title": "Protocol errors reply and close cleanly, never stall or eat the valid prefix",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T16:42:35+00:00",
+      "updated": "2026-08-09T16:42:35+00:00"
+    },
+    "multi-exec-queue-semantics": {
+      "title": "MULTI queues every command, and EXEC answers correctly on every shard count",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-09T16:46:23+00:00",
+      "updated": "2026-08-09T16:46:23+00:00"
     }
   },
   "milestones": {
@@ -377,7 +410,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-09T09:17:12+00:00",
+  "updated": "2026-08-10T08:35:14+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

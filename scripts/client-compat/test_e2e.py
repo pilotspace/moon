@@ -125,21 +125,35 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(report.tally()["fail"], 0)
 
     def test_a_diverging_entry_exits_one_and_names_the_divergence(self):
-        # SISMEMBER under RESP3: Redis answers Integer :1, Moon over-converts
-        # to Boolean #t. The harness must surface this as a failure naming TYPE,
-        # not swallow it.
+        # COMMAND COUNT: Redis answers Integer :274, Moon answers an empty
+        # Array *0 (it ignores the COUNT subcommand). The harness must surface
+        # this as a failure naming TYPE, not swallow it.
         #
-        # This deliberately does NOT use GET-inside-MULTI any more: that
-        # divergence was real when the harness first ran and is now fixed, so
-        # asserting on it would be asserting a bug rather than harness
-        # behaviour. Replace this entry too if SISMEMBER is ever fixed — a test
-        # that needs a live defect to pass is a maintenance debt, and saying so
-        # here is cheaper than rediscovering it.
+        # THIRD fixture for this test. The rotation is the point, so read it
+        # before picking a fourth:
+        #   1. GET-inside-MULTI  — fixed by the v0.8.6 inline-GET hotfix (#457)
+        #   2. SISMEMBER RESP3   — fixed by resp3-type-fidelity (#463); Moon no
+        #      longer over-converts Integer to Boolean, so this test began
+        #      failing with `0 != 1` the moment that landed
+        #   3. COMMAND COUNT     — open, owned by `client-identity-introspection`
+        #
+        # A test that needs a live defect to pass fails as a REWARD for fixing
+        # something, which is exactly backwards. #3 is chosen because it is
+        # owned by a different task than the reply-type work, so that line of
+        # work cannot silently retire it again — but that is damage control,
+        # not a fix.
+        #
+        # No permanent-by-construction TYPE divergence exists today: Moon's
+        # proprietary commands (TXN.ABORT, MQ PUSH) return an Error on BOTH
+        # servers, so they diverge in text but not in type; and redis 8.6.1
+        # turns out to implement `hotkeys` too. The durable fix is a test-only
+        # injection hook that fabricates a divergence rather than borrowing a
+        # real one — tracked in #461 alongside the harness's other
+        # self-honesty gaps.
         report = Runner(cfg(manifest_path=manifest("""
 entries:
-  - name: sismember_resp3_type
-    setup: ["DEL s", "SADD s a"]
-    command: "SISMEMBER s a"
+  - name: command_count_type
+    command: "COMMAND COUNT"
     policy: exact
     protocols: [resp3]
     contexts: [standalone]
