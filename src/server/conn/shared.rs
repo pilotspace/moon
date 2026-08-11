@@ -964,6 +964,114 @@ pub(crate) enum TxnLocality {
     CrossShard,
 }
 
+/// Tear down every subscription a connection holds, abstracting ONLY the lock
+/// the registry happens to sit behind.
+///
+/// `ConnectionContext` holds it in an `RwLock`; `handler_single` holds it in a
+/// `Mutex`. That difference is the sole reason `try_handle_reset` cannot simply
+/// take a `&ConnectionContext`, and it is not worth a second copy of RESET.
+pub(crate) trait PubSubTeardown {
+    /// Drop every channel AND pattern subscription held by `subscriber_id`.
+    fn unsubscribe_all_for(&self, subscriber_id: u64);
+}
+
+impl PubSubTeardown for parking_lot::RwLock<crate::pubsub::PubSubRegistry> {
+    fn unsubscribe_all_for(&self, subscriber_id: u64) {
+        let mut reg = self.write();
+        reg.unsubscribe_all(subscriber_id);
+        reg.punsubscribe_all(subscriber_id);
+    }
+}
+
+impl PubSubTeardown for parking_lot::Mutex<crate::pubsub::PubSubRegistry> {
+    fn unsubscribe_all_for(&self, subscriber_id: u64) {
+        let mut reg = self.lock();
+        reg.unsubscribe_all(subscriber_id);
+        reg.punsubscribe_all(subscriber_id);
+    }
+}
+
+/// Handle `RESET`, returning `true` when the command was consumed.
+///
+/// MUST be called BEFORE the MULTI queueing step. Measured against
+/// redis-server 8.6.1: with a transaction open, `RESET` replies `+RESET` and
+/// the following `EXEC` errors `without MULTI` — it is executed immediately,
+/// never queued. Moon's red run caught this by replying `+QUEUED`.
+///
+/// Shared by all THREE handlers for the same reason `WATCH` is: this surface
+/// already drifted once. A partial RESET existed only inside
+/// `handler_sharded`'s subscribe-mode loop, so RESET worked if you happened to
+/// be subscribed on one runtime and was an unknown command everywhere else.
+///
+/// "Default state" is deliberately taken from `restore_migrated_state(None, …)`
+/// — the SAME function `ConnectionState::new` uses — so RESET's idea of default
+/// cannot drift from connection setup's idea of default.
+pub(crate) fn try_handle_reset(
+    cmd: &[u8],
+    args: &[Frame],
+    client_id: u64,
+    conn: &mut super::core::ConnectionState,
+    // Taken as three pieces rather than a `&ConnectionContext` so the embedded
+    // handler — which has no such struct and holds the registry behind a
+    // `Mutex` where the context uses an `RwLock` — can share this exact body
+    // instead of growing a second, drifting copy of "what RESET restores".
+    requirepass: &Option<String>,
+    tracking_table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    pubsub: &dyn PubSubTeardown,
+    responses: &mut Vec<Frame>,
+    // `None` on the sharded handler, which does direct buffer I/O with no
+    // codec object — there `conn.protocol_version` is itself authoritative.
+    codec: Option<&mut crate::server::codec::RespCodec>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"RESET") {
+        return false;
+    }
+    if !args.is_empty() {
+        // Registry arity is 1. A rejected RESET must not half-apply: return
+        // before touching any state.
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'reset' command",
+        )));
+        return true;
+    }
+
+    // Transaction
+    conn.in_multi = false;
+    conn.command_queue.clear();
+    conn.watched_keys.clear();
+
+    // Client-side caching
+    conn.tracking_state = Default::default();
+    conn.tracking_rx = None;
+    tracking_table.lock().untrack_all(client_id);
+
+    // Pub/Sub — exit subscribe mode entirely.
+    if conn.subscription_count > 0 {
+        pubsub.unsubscribe_all_for(conn.subscriber_id);
+    }
+    conn.subscription_count = 0;
+
+    // Identity + protocol, from the one definition of "default".
+    let (proto, db, authed, user, name) =
+        crate::server::conn::util::restore_migrated_state(None, requirepass);
+    conn.protocol_version = proto;
+    conn.selected_db = db;
+    conn.authenticated = authed;
+    conn.current_user = user;
+    conn.client_name = name;
+    // The wire codec must move with the connection, or the very next reply is
+    // serialized in a protocol the client is no longer speaking.
+    if let Some(codec) = codec {
+        codec.set_protocol_version(proto);
+    }
+    crate::client_registry::update(client_id, |e| {
+        e.name = None;
+    });
+
+    responses.push(Frame::SimpleString(Bytes::from_static(b"RESET")));
+    true
+}
+
 /// Classify the WATCHed keys by the shard(s) they hash to.
 ///
 /// Same lattice as the body's: no keys is `Keyless`, all on one shard is

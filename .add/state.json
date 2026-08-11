@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "watch-cas-transactions",
+  "active_task": "client-identity-introspection",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -209,14 +209,37 @@
     },
     "client-identity-introspection": {
       "title": "HELLO/COMMAND/ROLE/RESET identity + registry-dispatch reconciliation",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:03+00:00",
-      "updated": "2026-08-09T07:32:03+00:00"
+      "updated": "2026-08-11T18:20:42+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "783b47c7b6e4897eaf7f049c3da5e3f2",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/command/connection.rs",
+          "src/command/metadata.rs",
+          "src/command/mod.rs"
+        ],
+        "snapshot_md5": "d52700ba46d139e4de65276f8c64477d"
+      },
+      "heal": {
+        "attempts": 1,
+        "history": [
+          {
+            "at": "2026-08-11T18:02:08+00:00",
+            "reason": "tamper_detected:contract_tampered",
+            "source": "tamper"
+          }
+        ]
+      }
     },
     "resp3-type-fidelity": {
       "title": "RESP3 reply-type parity, applied at one conversion choke point",
@@ -328,6 +351,26 @@
       ],
       "created": "2026-08-09T16:46:23+00:00",
       "updated": "2026-08-09T16:46:23+00:00"
+    },
+    "monitor-command-feed": {
+      "title": "MONITOR command feed \u2014 stream executed commands, redacted, zero-cost when unattached",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [
+        "client-compat-harness"
+      ],
+      "created": "2026-08-11T16:13:33+00:00",
+      "updated": "2026-08-11T16:13:33+00:00"
+    },
+    "batch-protocol-version-fidelity": {
+      "title": "Response batch must be encoded in the protocol in effect when each reply was produced",
+      "phase": "ground",
+      "gate": "none",
+      "milestone": "v0-9-client-compat",
+      "depends_on": [],
+      "created": "2026-08-11T17:33:52+00:00",
+      "updated": "2026-08-11T17:33:52+00:00"
     }
   },
   "milestones": {
@@ -433,7 +476,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-11T15:25:45+00:00",
+  "updated": "2026-08-11T18:20:42+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

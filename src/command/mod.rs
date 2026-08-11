@@ -10,7 +10,9 @@ pub mod graph;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
+pub mod identity;
 pub mod info_reclamation;
+pub mod introspect;
 pub mod key;
 pub mod key_extra;
 pub mod keyspace;
@@ -638,7 +640,7 @@ fn dispatch_inner(
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
-                return resp(connection::command(args));
+                return resp(introspect::command(args));
             }
         }
         (7, b'f') => {
@@ -1367,7 +1369,7 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
-                return resp(connection::command(args));
+                return resp(introspect::command(args));
             }
         }
         (7, b'h') => {

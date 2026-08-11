@@ -389,6 +389,25 @@ pub async fn handle_connection(
                                             client_id,
                                             &acl_table,
                                             &mut conn.authenticated,
+                                            // Derived, never assumed. This
+                                            // handler is reached only via
+                                            // `listener::run_with_shutdown`
+                                            // (tokio-only; `main.rs` and
+                                            // `embedded.rs` both route through
+                                            // `run_sharded`), and THAT listener
+                                            // passes a real ReplicationState —
+                                            // `Some(rs)` at listener.rs:315.
+                                            // So a replica here would announce
+                                            // itself a master if this were the
+                                            // constant it used to be, which is
+                                            // the exact defect class this task
+                                            // exists to close. No cluster state
+                                            // reaches this handler, so the mode
+                                            // is standalone.
+                                            crate::command::identity::hello_role_and_mode(
+                                                repl_state.as_ref(),
+                                                false,
+                                            ),
                                         );
                                         if !matches!(&response, Frame::Error(_)) {
                                             framed.codec_mut().set_protocol_version(new_proto);
@@ -541,6 +560,12 @@ pub async fn handle_connection(
                                     client_id,
                                     &acl_table,
                                     &mut conn.authenticated,
+                                    // Derived from repl_state, never assumed
+                                    // — see the HELLO site above.
+                                    crate::command::identity::hello_role_and_mode(
+                                        repl_state.as_ref(),
+                                        false,
+                                    ),
                                 );
                                 // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                                 if !matches!(&response, Frame::Error(_)) {
@@ -588,6 +613,12 @@ pub async fn handle_connection(
                                 client_id,
                                 &acl_table,
                                 &mut conn.authenticated,
+                                // Derived from repl_state, never assumed —
+                                // see the HELLO site above.
+                                crate::command::identity::hello_role_and_mode(
+                                    repl_state.as_ref(),
+                                    false,
+                                ),
                             );
                             // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                             if !matches!(&response, Frame::Error(_)) {
@@ -1636,6 +1667,40 @@ pub async fn handle_connection(
                                 ))));
                                 continue;
                             }
+                        }
+
+                        // === ROLE ===
+                        // Connection-layer, like the monoio/sharded handlers:
+                        // the answer lives on the replication state, not in the
+                        // keyspace, so `dispatch()` (which only receives a
+                        // Database) cannot produce it.
+                        if cmd.eq_ignore_ascii_case(b"ROLE") {
+                            responses.push(if cmd_args.is_empty() {
+                                crate::command::identity::role(repl_state.as_ref())
+                            } else {
+                                Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'role' command",
+                                ))
+                            });
+                            continue;
+                        }
+
+                        // === RESET ===
+                        // Shares `try_handle_reset` with the other two handlers
+                        // rather than re-deriving "default state" here, so the
+                        // three paths cannot drift on what RESET restores.
+                        if crate::server::conn::shared::try_handle_reset(
+                            cmd,
+                            cmd_args,
+                            client_id,
+                            &mut conn,
+                            &requirepass,
+                            &tracking_table,
+                            &*pubsub_registry,
+                            &mut responses,
+                            Some(framed.codec_mut()),
+                        ) {
+                            continue;
                         }
 
                         // === CLIENT PAUSE check ===

@@ -394,6 +394,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 crate::client_registry::register(
                     client_id,
                     peer_addr.clone(),
+                    ctx.local_addr_string(),
                     conn.current_user.clone(),
                     ctx.shard_id,
                     kill_fd,
@@ -405,6 +406,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             crate::client_registry::register(
                 client_id,
                 peer_addr.clone(),
+                ctx.local_addr_string(),
                 conn.current_user.clone(),
                 ctx.shard_id,
                 kill_fd,
@@ -1401,6 +1403,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
+            // RESET sits ABOVE the ACL gate deliberately: the registry marks it
+            // NO_AUTH|LOADING|STALE, and returning a connection to its default
+            // (unauthenticated) state is exactly what a client does when it has
+            // lost track of that state. It is also above the MULTI queueing
+            // step below — measured on redis-server 8.6.1, RESET inside MULTI
+            // executes immediately and discards the transaction.
+            if cmd_len == 5
+                && crate::server::conn::shared::try_handle_reset(
+                    cmd,
+                    cmd_args,
+                    client_id,
+                    &mut conn,
+                    &ctx.requirepass,
+                    &ctx.tracking_table,
+                    &*ctx.pubsub_registry,
+                    &mut responses,
+                    Some(&mut codec),
+                )
+            {
+                continue;
+            }
 
             // === ACL GATE - every privileged intercept MUST sit below this ===
             //
@@ -1631,6 +1654,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
+                continue;
+            }
+            // ROLE — connection-layer because the answer lives on
+            // ConnectionContext.repl_state, not in the keyspace. Post-ACL like
+            // the other server-introspection intercepts around it.
+            if cmd_len == 4 && cmd.eq_ignore_ascii_case(b"ROLE") {
+                responses.push(if cmd_args.is_empty() {
+                    crate::command::identity::role(ctx.repl_state.as_ref())
+                } else {
+                    Frame::Error(Bytes::from_static(
+                        b"ERR wrong number of arguments for 'role' command",
+                    ))
+                });
                 continue;
             }
             // CLIENT TRACKING mutates server-side invalidation state — post-ACL

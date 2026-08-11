@@ -638,6 +638,11 @@ pub fn hello_acl(
     client_id: u64,
     acl_table: &std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>>,
     authenticated: &mut bool,
+    // (role, mode) read from ReplicationState/ClusterState by the caller.
+    // Previously these were `Bytes::from_static` literals — "master" and
+    // "standalone" — so a replica told HELLO it was a master while telling
+    // INFO replication it was a slave, on the same connection.
+    role_mode: (&'static str, &'static str),
 ) -> (Frame, u8, Option<Bytes>, Option<String>) {
     let mut proto = current_proto;
     let mut client_name: Option<Bytes> = None;
@@ -778,11 +783,11 @@ pub fn hello_acl(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"mode")),
-            Frame::BulkString(Bytes::from_static(b"standalone")),
+            Frame::BulkString(Bytes::from_static(role_mode.1.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"role")),
-            Frame::BulkString(Bytes::from_static(b"master")),
+            Frame::BulkString(Bytes::from_static(role_mode.0.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"modules")),
@@ -925,6 +930,9 @@ pub fn hello(
     client_id: u64,
     requirepass: &Option<String>,
     authenticated: &mut bool,
+    // Same (role, mode) contract as `hello_acl`: kept in lockstep so the two
+    // HELLO variants cannot report different identities.
+    role_mode: (&'static str, &'static str),
 ) -> (Frame, u8, Option<Bytes>) {
     let mut proto = current_proto;
     let mut client_name: Option<Bytes> = None;
@@ -1020,11 +1028,11 @@ pub fn hello(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"mode")),
-            Frame::BulkString(Bytes::from_static(b"standalone")),
+            Frame::BulkString(Bytes::from_static(role_mode.1.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"role")),
-            Frame::BulkString(Bytes::from_static(b"master")),
+            Frame::BulkString(Bytes::from_static(role_mode.0.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"modules")),
@@ -1229,7 +1237,7 @@ mod tests {
     #[test]
     fn test_hello_no_args_returns_current_proto() {
         let mut auth = true;
-        let (resp, proto, name) = hello(&[], 2, 1, &None, &mut auth);
+        let (resp, proto, name) = hello(&[], 2, 1, &None, &mut auth, ("master", "standalone"));
         assert!(matches!(resp, Frame::Map(_)));
         assert_eq!(get_proto_from_hello_response(&resp), Some(2));
         assert_eq!(proto, 2);
@@ -1245,6 +1253,7 @@ mod tests {
             1,
             &None,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 3);
         assert_eq!(get_proto_from_hello_response(&resp), Some(3));
@@ -1259,6 +1268,7 @@ mod tests {
             1,
             &None,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 2);
         assert_eq!(get_proto_from_hello_response(&resp), Some(2));
@@ -1279,6 +1289,7 @@ mod tests {
             1,
             &pass,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 3);
         assert!(matches!(resp, Frame::Map(_)));
@@ -1300,6 +1311,7 @@ mod tests {
             1,
             &pass,
             &mut auth,
+            ("master", "standalone"),
         );
         // Auth failed: proto stays at current, response is error
         assert_eq!(proto, 2);
@@ -1320,6 +1332,7 @@ mod tests {
             1,
             &None,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(name, Some(Bytes::from_static(b"myclient")));
     }
@@ -1333,6 +1346,7 @@ mod tests {
             1,
             &None,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 2); // unchanged
         assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"NOPROTO")));
@@ -1581,7 +1595,8 @@ mod tests {
     fn test_hello_acl_no_args() {
         let table = make_acl_table();
         let mut auth = true;
-        let (resp, proto, name, user) = hello_acl(&[], 2, 1, &table, &mut auth);
+        let (resp, proto, name, user) =
+            hello_acl(&[], 2, 1, &table, &mut auth, ("master", "standalone"));
         assert!(matches!(resp, Frame::Map(_)));
         assert_eq!(proto, 2);
         assert!(name.is_none());
@@ -1603,6 +1618,7 @@ mod tests {
             1,
             &table,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 3);
         assert!(matches!(resp, Frame::Map(_)));
@@ -1625,6 +1641,7 @@ mod tests {
             1,
             &table,
             &mut auth,
+            ("master", "standalone"),
         );
         assert_eq!(proto, 2); // unchanged
         assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
