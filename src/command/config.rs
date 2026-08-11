@@ -41,6 +41,17 @@ pub fn config_get(
         ),
         (b"appendonly", runtime_config.appendonly.clone()),
         (b"appendfsync", runtime_config.appendfsync.clone()),
+        (
+            b"auto-aof-rewrite-percentage",
+            server_config.auto_aof_rewrite_percentage.to_string(),
+        ),
+        (
+            // Redis reports this in bytes; normalize the "64mb"-style input.
+            b"auto-aof-rewrite-min-size",
+            crate::config::ServerConfig::parse_size(&server_config.auto_aof_rewrite_min_size)
+                .unwrap_or(64 * 1024 * 1024)
+                .to_string(),
+        ),
         (b"databases", server_config.databases.to_string()),
         (b"bind", server_config.bind.clone()),
         (b"port", server_config.port.to_string()),

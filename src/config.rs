@@ -117,25 +117,31 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,
 
-    /// [EXPERIMENTAL] Enable per-shard BGREWRITEAOF (compaction) for the
-    /// `--shards >= 2 + --appendonly yes` PerShard layout.
-    ///
-    /// Default `false`: BGREWRITEAOF stays gated in PerShard mode (the
-    /// shipped, crash-safe "append-only, no in-place compaction" behavior).
-    /// When `true`, BGREWRITEAOF fans the rewrite out to every per-shard
-    /// writer (synchronized seq bump + single manifest commit). This path is
-    /// validated by `tests/crash_matrix_per_shard_bgrewriteaof.rs` and is
-    /// opt-in until the both-runtime crash matrix is green by default.
-    ///
-    /// The flag only takes effect alongside `per_shard_aof_active`; it is a
-    /// no-op for `--shards 1` (TopLevel rewrite already works) and for
-    /// `--appendonly no`.
+    /// [DEPRECATED — no-op] Per-shard BGREWRITEAOF is the DEFAULT since #433
+    /// (the fan-out compaction path is validated by
+    /// `tests/crash_matrix_per_shard_bgrewriteaof.rs` and the auto-rewrite
+    /// suite). Passing this flag only emits a deprecation warning. Remove it
+    /// from launch commands; it will be deleted in a future release.
     #[arg(long, default_value_t = false)]
     pub experimental_per_shard_rewrite: bool,
 
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
+
+    /// Automatic AOF rewrite trigger: rewrite when the AOF has grown by this
+    /// percentage over its size after the last rewrite (Redis parity:
+    /// `auto-aof-rewrite-percentage`). `0` disables automatic rewrites;
+    /// manual `BGREWRITEAOF` still works. Default 100 (= rewrite at 2× the
+    /// post-rewrite size), same as Redis.
+    #[arg(long = "auto-aof-rewrite-percentage", default_value_t = 100)]
+    pub auto_aof_rewrite_percentage: u64,
+
+    /// Automatic AOF rewrite floor: never auto-rewrite while the total AOF
+    /// size is below this (Redis parity: `auto-aof-rewrite-min-size`).
+    /// Accepts size strings ("64mb", "1gb") or raw bytes. Default "64mb".
+    #[arg(long = "auto-aof-rewrite-min-size", default_value = "64mb")]
+    pub auto_aof_rewrite_min_size: String,
 
     /// Max time (ms) a write may block awaiting the `appendfsync=always`
     /// fsync ack before the write is failed instead of parking the
@@ -259,6 +265,58 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub timeout: u64,
 
+    /// Maximum size in bytes a single connection's query (input) buffer may
+    /// reach before the connection is closed (0 = unlimited). Redis parity:
+    /// `client-query-buffer-limit`, default 1gb.
+    ///
+    /// c10k hardening C2. Without this the input buffer grows to whatever a
+    /// frame header declares, bounded only by the parser's 512 MiB bulk
+    /// ceiling — and the auth gate runs AFTER parsing, so an
+    /// unauthenticated client can pin half a gigabyte per connection with
+    /// `$536870911` plus a dribble of bytes. That memory sits outside
+    /// `used_memory`, so `maxmemory` never sees it.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    pub client_query_buffer_limit: usize,
+
+    /// Give up on a reply write that has made no progress for this many
+    /// milliseconds and close the connection (0 = wait forever).
+    ///
+    /// c10k hardening C1. Reply writes were unbounded: a client that
+    /// pipelines a huge response and then simply stops reading parks the
+    /// handler inside `write_all` holding the entire serialized reply —
+    /// hundreds of MB — plus its maxclients slot, for as long as it likes.
+    /// N such clients is an OOM, and it is invisible while it happens because
+    /// `obl`/`oll`/`omem` in CLIENT LIST are hardcoded to 0.
+    ///
+    /// 60s is far beyond any legitimate client's stall (replication does not
+    /// use this path — PSYNC hijacks the connection before it) and far below
+    /// "forever".
+    #[arg(long, default_value_t = 60_000)]
+    pub client_write_timeout_ms: u64,
+
+    /// Refuse to buffer a command reply larger than this many bytes and
+    /// close the connection instead (0 = unlimited).
+    ///
+    /// c10k hardening C1, Redis's `client-output-buffer-limit normal <hard>`.
+    /// This DIVERGES from Redis deliberately: Redis defaults the normal class
+    /// to unlimited, which is why an unread-socket OOM is reachable there too.
+    /// A client that asks for more than this in one batch is disconnected —
+    /// including a single value larger than the cap, which is therefore
+    /// undeliverable. Raise it for workloads that legitimately stream very
+    /// large replies.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    pub client_output_buffer_limit_normal: usize,
+
+    /// Query-buffer ceiling applied to connections that have NOT yet
+    /// authenticated, in bytes (0 = use `--client-query-buffer-limit`).
+    ///
+    /// No legitimate pre-auth command is large: AUTH, HELLO and the inline
+    /// forms all fit in well under a kilobyte. Keeping the unauthenticated
+    /// ceiling small is what makes C2 unreachable without credentials; the
+    /// full limit applies from the moment a client authenticates.
+    #[arg(long, default_value_t = 64 * 1024)]
+    pub client_query_buffer_limit_preauth: usize,
+
     /// TCP keepalive interval in seconds (0 = disabled). Sets SO_KEEPALIVE on accepted sockets.
     #[arg(long = "tcp-keepalive", default_value_t = 300)]
     pub tcp_keepalive: u64,
@@ -295,6 +353,22 @@ pub struct ServerConfig {
     #[arg(long = "uring-sqpoll")]
     pub uring_sqpoll_ms: Option<u32>,
 
+    /// io_uring submission-queue entries per shard ring (default: monoio's
+    /// 1024; CQ is sized 2x by the kernel). Raise for high-connection shards
+    /// under bursty pipelines — 1024 in-flight ops per shard is small at 10k+
+    /// conns/shard. Values below 256 are raised to 256 (monoio's floor).
+    /// Also sizes the legacy (epoll/kqueue) driver's event batch. Applies to
+    /// the monoio runtime only.
+    #[arg(long = "uring-entries")]
+    pub uring_entries: Option<u32>,
+
+    /// c1M P1: seconds a downshifted idle connection waits before its handler
+    /// task exits entirely, leaving only a tiny readiness watcher (task-exit
+    /// parking; plain-TCP monoio connections only — TLS and the tokio runtime
+    /// keep the buffer-downshift behavior). 0 disables task parking.
+    #[arg(long = "conn-park-secs", default_value_t = 60)]
+    pub conn_park_secs: u64,
+
     /// I/O driver for the monoio runtime. "auto" lets FusionDriver pick
     /// (io_uring on Linux when available, else epoll/kqueue); "epoll" forces
     /// the legacy poller. Measured on GCE ARM (c4a Axion, 2026-07): epoll is
@@ -311,6 +385,14 @@ pub struct ServerConfig {
     /// low-pipeline request/response workloads on dedicated cores; costs up to
     /// ~N µs of CPU per idle park. Measured (GCE c1 GET p=1, 2026-07):
     /// ARM c4a 0.95→1.21× vs Redis, x86 c3 1.06→1.66×. monoio runtime only.
+    ///
+    /// Deploy-safe by default (O3): each shard thread watches its own
+    /// involuntary-preemption rate (Linux) and self-gates the spin while its
+    /// core is shared with other runnable threads — the shared-core
+    /// regression that previously made this flag pinned-cores-only judgment
+    /// no longer applies (one >25-preempts/s window gates the spin; 5
+    /// consecutive quiet windows re-enable it). `MOON_SPIN_ADAPTIVE=0`
+    /// restores unconditional spinning (bench A/B knob).
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
 
@@ -320,11 +402,18 @@ pub struct ServerConfig {
     ///
     /// Currently supported: `standalone` — single dedicated instance, tuned
     /// for the "beat Redis at p=1" latency path (`--shards 1`,
-    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). REQUIRES
-    /// pinned/dedicated CPU cores: the busy-poll park REGRESSES throughput on
-    /// shared or unpinned cores (OrbStack default, laptops, noisy-neighbor
-    /// cloud VMs) — see docs/guides/tuning.md#profiles. Unknown profile names
-    /// are a startup error.
+    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). On jemalloc
+    /// builds, passing `--profile standalone` on the **command line** also
+    /// drops the arena cap to `2` (single-shard allocator footprint); that
+    /// happens in the pre-clap allocator re-spawn, not here, so a conf-file
+    /// `profile standalone` sets only the three flags above.
+    /// Safe on any host as of the O3 contention governor: `--io-busy-poll-us`
+    /// now auto-gates the busy-poll on shared/oversubscribed cores (per-shard
+    /// involuntary-preemption sampling), so the preset no longer requires
+    /// pinned CPUs — it simply delivers its full win on dedicated cores and
+    /// costs at most ~one window of spin on a contended one. See
+    /// docs/guides/tuning.md#profiles. Unknown profile names are a startup
+    /// error.
     #[arg(long)]
     pub profile: Option<String>,
 
@@ -481,8 +570,38 @@ pub struct ServerConfig {
     /// Reduces VSZ on multi-core hosts (4*ncpus default -> 8). No-op for
     /// non-jemalloc builds. Implemented via MALLOC_CONF env-var injection
     /// at process start (re-spawn before jemalloc init).
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
     #[arg(long = "memory-arenas-cap", value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub memory_arenas_cap: u32,
+
+    /// Opt jemalloc into `thp:always` for the value heap (distinct from the
+    /// always-on `metadata_thp:auto`, which only huge-pages jemalloc's own
+    /// bookkeeping). Real-PMU measured on GCE (tmp/GCE-PMU-RESULTS.md,
+    /// 2026-07-18): GET +24.4% (ARM Axion) / +12.1% (x86 Emerald Rapids),
+    /// dTLB MPKI -35% / -98.4%, RSS +4.2% on both. No-op for non-jemalloc
+    /// builds (warns). Implemented via the same MALLOC_CONF env-var re-spawn
+    /// as `--memory-arenas-cap` -- passing both together produces exactly one
+    /// re-exec with one composed conf string. **Linux-only in effect**:
+    /// jemalloc has no THP support outside Linux, and with the baked-in
+    /// `abort_conf:true` it does not silently ignore `thp:always` on other
+    /// platforms -- it aborts at init (verified experimentally on macOS,
+    /// 2026-07-18). This flag warns and no-ops on non-Linux jemalloc builds
+    /// rather than risk that abort; `--memory-arenas-cap` still applies
+    /// normally if both flags are given together. Permanently opt-in: the
+    /// RSS-drift soak (2026-07-19) disqualified a default flip -- after
+    /// mixed-size churn goes idle, khugepaged collapses the heap into 2M
+    /// pages and re-materializes jemalloc's purged 4K holes, settling RSS
+    /// ~+31% above the non-THP baseline at identical used_memory (bounded,
+    /// but permanent -- jemalloc never re-purges those ranges), which also
+    /// erodes maxmemory eviction headroom. Best for uniform-value-size
+    /// fleets with RSS headroom; avoid under mixed-size churn.
+    /// CLI-only: a value in moon.conf cannot reach jemalloc (its config is
+    /// read at process start, before the conf file is parsed) and triggers a
+    /// startup warning instead of taking effect.
+    #[arg(long = "memory-thp", default_value_t = false)]
+    pub memory_thp: bool,
 
     /// DEPRECATED, no-op: DiskANN beam width for the removed cold-tier
     /// disk-resident search path.
@@ -943,7 +1062,7 @@ impl ServerConfig {
     /// (`--appendonly yes`) nor RDB (`--save`) durability is on (GCP
     /// benchmark finding, 2026-07-10).
     ///
-    /// The durable-spill eviction path (`evict_batch_durable_no_aof`) needs
+    /// The durable-spill eviction path (`evict_batch_durable`) needs
     /// a `ShardManifest`, which today is only threaded through the
     /// tick-driven memory-pressure cascade
     /// (`shard::persistence_tick::handle_memory_pressure`) — itself gated on
@@ -954,7 +1073,7 @@ impl ServerConfig {
     /// cannot durably spill — cold data is NOT tiered to disk regardless of
     /// policy. What happens to the *write* itself is now policy-aware
     /// (`src/storage/eviction.rs`, the `manifest is None` branch of
-    /// `try_evict_if_needed_async_spill_with_total_budget`): an evicting
+    /// `storage::eviction::EvictionSink::AsyncSpill`): an evicting
     /// policy (`allkeys-*`/`volatile-*`) still honors `--maxmemory` by
     /// DROPPING victims outright (Redis cache semantics, no tiering, no
     /// crash-durability claim needed since nothing needs to survive a
@@ -1302,6 +1421,19 @@ impl ServerConfig {
             self.io_driver = "epoll".to_string();
             fields.push("--io-driver=epoll (implied by io-busy-poll-us)");
         }
+        // NOTE: the standalone profile ALSO drops the jemalloc arena cap to 2
+        // on jemalloc builds, but that is applied entirely in the pre-clap
+        // allocator re-spawn (`malloc_respawn::scan_argv` sees `--profile
+        // standalone` in the raw CLI argv and re-execs with narenas:2, long
+        // before this method runs). It is deliberately NOT mirrored into
+        // `self.memory_arenas_cap` here: this method cannot tell a CLI-sourced
+        // `--profile` from a conf-file-sourced one (clap reports both as
+        // `CommandLine` on the merged argv), but the re-spawn — which only sees
+        // raw pre-merge argv — only honors the CLI form. Mirroring it here
+        // would falsely claim "arena cap applied" for the conf-file form, where
+        // jemalloc actually stays at 8 (and would even trip
+        // `warn_if_conf_only_overrides`). The re-spawn is the single source of
+        // truth for the arena cap; we stay out of it.
         Ok(ProfileOutcome::Applied {
             profile: name,
             fields,
@@ -1343,6 +1475,10 @@ impl ServerConfig {
             lazyfree_threshold: 64,
             maxclients: self.maxclients,
             timeout: self.timeout,
+            client_query_buffer_limit: self.client_query_buffer_limit,
+            client_query_buffer_limit_preauth: self.client_query_buffer_limit_preauth,
+            client_write_timeout_ms: self.client_write_timeout_ms,
+            client_output_buffer_limit_normal: self.client_output_buffer_limit_normal,
             tcp_keepalive: self.tcp_keepalive,
             // Default to single-shard (no division). The server overwrites this
             // on the shared RuntimeConfig with the resolved shard count once it
@@ -1711,6 +1847,18 @@ pub struct RuntimeConfig {
     pub maxclients: usize,
     /// Close connections idle for more than N seconds (0 = disabled).
     pub timeout: u64,
+    /// Per-connection query (input) buffer ceiling in bytes (0 = unlimited).
+    /// c10k C2; Redis parity `client-query-buffer-limit`.
+    pub client_query_buffer_limit: usize,
+    /// Query-buffer ceiling for not-yet-authenticated connections, in bytes
+    /// (0 = fall back to `client_query_buffer_limit`).
+    pub client_query_buffer_limit_preauth: usize,
+    /// Abandon a reply write that stalls for this many ms (0 = wait forever).
+    /// c10k C1 — see `ServerConfig::client_write_timeout_ms`.
+    pub client_write_timeout_ms: u64,
+    /// Reply-size ceiling for normal clients, in bytes (0 = unlimited).
+    /// c10k C1 — see `ServerConfig::client_output_buffer_limit_normal`.
+    pub client_output_buffer_limit_normal: usize,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
     /// Resolved shard count — used only to derive the per-shard eviction budget.
@@ -1786,6 +1934,10 @@ impl Default for RuntimeConfig {
             lazyfree_threshold: 64,
             maxclients: 10000,
             timeout: 0,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             tcp_keepalive: 300,
             num_shards: 1,
         }
@@ -1944,6 +2096,18 @@ mod tests {
     }
 
     #[test]
+    fn test_uring_entries_flag() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(
+            config.uring_entries, None,
+            "default must be None (monoio's built-in 1024)"
+        );
+        let config = ServerConfig::parse_from(["moon", "--uring-entries", "4096"]);
+        assert_eq!(config.uring_entries, Some(4096));
+        assert!(ServerConfig::try_parse_from(["moon", "--uring-entries", "x"]).is_err());
+    }
+
+    #[test]
     fn test_ft_search_workers_flag() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
         assert_eq!(
@@ -1981,10 +2145,20 @@ mod tests {
         assert_eq!(config.shards, 1);
         assert_eq!(config.io_busy_poll_us, 40);
         assert_eq!(config.io_driver, "epoll");
+        // The jemalloc arena cap is NOT filled here (it is applied by the
+        // pre-clap allocator re-spawn, not this method — see apply_profile's
+        // NOTE and malloc_respawn::scan_argv coverage). apply_profile must
+        // leave memory_arenas_cap at its parsed default so it never falsely
+        // claims a cap that a conf-file-sourced profile can't actually apply.
+        assert_eq!(config.memory_arenas_cap, 8);
         match outcome {
             ProfileOutcome::Applied { profile, fields } => {
                 assert_eq!(profile, "standalone");
                 assert!(!fields.is_empty(), "must report what it set");
+                assert!(
+                    !fields.iter().any(|f| f.contains("arenas-cap")),
+                    "arena cap is owned by the re-spawn, not the profile fields log"
+                );
             }
             ProfileOutcome::None => panic!("expected Applied outcome"),
         }
@@ -2352,8 +2526,10 @@ mod tests {
 
     #[test]
     fn maxmemory_per_shard_unlimited_stays_zero() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 0;
+        let mut rt = RuntimeConfig {
+            maxmemory: 0,
+            ..Default::default()
+        };
         for n in [1, 2, 4, 16] {
             rt.num_shards = n;
             assert_eq!(
@@ -2366,26 +2542,32 @@ mod tests {
 
     #[test]
     fn maxmemory_per_shard_single_shard_is_whole_instance() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1_000;
-        rt.num_shards = 1;
+        let rt = RuntimeConfig {
+            maxmemory: 1_000,
+            num_shards: 1,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 1_000);
     }
 
     #[test]
     fn maxmemory_per_shard_divides_by_shard_count() {
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 400;
-        rt.num_shards = 4;
+        let rt = RuntimeConfig {
+            maxmemory: 400,
+            num_shards: 4,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 100);
     }
 
     #[test]
     fn maxmemory_per_shard_div_ceil_never_undershoots() {
         // 10 / 3 = 3.33 -> ceil 4 so the summed per-shard budgets (12) >= cap (10).
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 10;
-        rt.num_shards = 3;
+        let rt = RuntimeConfig {
+            maxmemory: 10,
+            num_shards: 3,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 4);
         assert!(rt.maxmemory_per_shard() * rt.num_shards >= rt.maxmemory);
     }
@@ -2393,9 +2575,11 @@ mod tests {
     #[test]
     fn maxmemory_per_shard_guards_zero_shard_count() {
         // A mis-set num_shards == 0 must not divide-by-zero; treat as 1 shard.
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 500;
-        rt.num_shards = 0;
+        let rt = RuntimeConfig {
+            maxmemory: 500,
+            num_shards: 0,
+            ..Default::default()
+        };
         assert_eq!(rt.maxmemory_per_shard(), 500);
     }
 
@@ -2803,17 +2987,21 @@ mod tests {
 
     #[test]
     fn db_maxmemory_per_shard_divides_like_global_maxmemory() {
-        let mut rt = RuntimeConfig::default();
-        rt.db_maxmemory = vec![1000];
-        rt.num_shards = 4;
+        let rt = RuntimeConfig {
+            db_maxmemory: vec![1000],
+            num_shards: 4,
+            ..Default::default()
+        };
         assert_eq!(rt.db_maxmemory_per_shard(0), 250);
     }
 
     #[test]
     fn db_maxmemory_per_shard_zero_entry_is_unlimited() {
-        let mut rt = RuntimeConfig::default();
-        rt.db_maxmemory = vec![0, 500];
-        rt.num_shards = 1;
+        let rt = RuntimeConfig {
+            db_maxmemory: vec![0, 500],
+            num_shards: 1,
+            ..Default::default()
+        };
         assert_eq!(rt.db_maxmemory_per_shard(0), 0);
         assert_eq!(rt.db_maxmemory_per_shard(1), 500);
     }

@@ -131,6 +131,188 @@ fn is_hexpire_family_write(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"HPERSIST")
 }
 
+/// Trait that abstracts command dispatch for AOF/WAL replay.
+///
+/// This decouples persistence replay from `command::dispatch`, allowing
+/// replay logic to work through a trait object on the cold startup path.
+pub trait CommandReplayEngine {
+    /// Replay a single parsed command against the database slice.
+    ///
+    /// `selected_db` may be mutated by SELECT commands during replay.
+    /// The response is intentionally discarded -- replay cares only about
+    /// side effects on the databases.
+    fn replay_command(
+        &self,
+        databases: &mut [Database],
+        cmd: &[u8],
+        args: &[Frame],
+        selected_db: &mut usize,
+    );
+}
+
+/// Concrete implementation that delegates to `command::dispatch`.
+///
+/// This is the **only** place that imports `command::dispatch` for replay
+/// purposes, centralizing the dependency. When the `graph` feature is
+/// enabled, graph WAL commands (GRAPH.CREATE, GRAPH.ADDNODE, etc.) are
+/// collected into a `GraphReplayCollector` instead of being dispatched
+/// to the KV command path. After replay, call `replay_graph_commands()`
+/// to apply them to a `GraphStore`.
+pub struct DispatchReplayEngine {
+    #[cfg(feature = "graph")]
+    graph_collector: std::cell::RefCell<crate::graph::replay::GraphReplayCollector>,
+}
+
+impl DispatchReplayEngine {
+    /// Create a new replay engine.
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "graph")]
+            graph_collector: std::cell::RefCell::new(
+                crate::graph::replay::GraphReplayCollector::new(),
+            ),
+        }
+    }
+
+    /// Replay collected graph commands into a `GraphStore`.
+    ///
+    /// Must be called after WAL/AOF replay completes. Returns the number
+    /// of graph commands successfully replayed.
+    #[cfg(feature = "graph")]
+    pub fn replay_graph_commands(&self, store: &mut crate::graph::store::GraphStore) -> usize {
+        self.graph_collector.borrow().replay_into(store)
+    }
+
+    /// Number of graph commands collected during replay.
+    #[cfg(feature = "graph")]
+    pub fn graph_command_count(&self) -> usize {
+        self.graph_collector.borrow().command_count()
+    }
+}
+
+impl CommandReplayEngine for DispatchReplayEngine {
+    fn replay_command(
+        &self,
+        databases: &mut [Database],
+        cmd: &[u8],
+        args: &[Frame],
+        selected_db: &mut usize,
+    ) {
+        // Intercept graph commands and route to the collector instead of KV dispatch.
+        // Graph WAL records are collected during the first pass, then replayed in
+        // correct order (creates -> nodes -> edges -> removes -> drops) via
+        // replay_graph_commands() after all KV replay completes.
+        #[cfg(feature = "graph")]
+        {
+            if crate::graph::replay::GraphReplayCollector::is_graph_command(cmd) {
+                // Check if any args are Integer frames (node/edge IDs may be
+                // encoded as RESP integers). If so, convert to string bytes
+                // for GraphReplayCollector which expects all-text args.
+                let has_integers = args.iter().any(|f| matches!(f, Frame::Integer(_)));
+                let collected = if has_integers {
+                    let owned: smallvec::SmallVec<[Vec<u8>; 8]> = args
+                        .iter()
+                        .filter_map(|f| match f {
+                            Frame::BulkString(b) => Some(b.to_vec()),
+                            Frame::Integer(i) => Some(i.to_string().into_bytes()),
+                            _ => None,
+                        })
+                        .collect();
+                    let refs: smallvec::SmallVec<[&[u8]; 8]> =
+                        owned.iter().map(|v| v.as_slice()).collect();
+                    self.graph_collector
+                        .borrow_mut()
+                        .collect_command(cmd, &refs)
+                } else {
+                    let bulk_args: smallvec::SmallVec<[&[u8]; 8]> = args
+                        .iter()
+                        .filter_map(|f| match f {
+                            Frame::BulkString(b) => Some(b.as_ref()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.graph_collector
+                        .borrow_mut()
+                        .collect_command(cmd, &bulk_args)
+                };
+                if !collected {
+                    tracing::warn!(
+                        "WAL replay: malformed graph command {:?} with {} args — skipping",
+                        std::str::from_utf8(cmd).unwrap_or("<non-utf8>"),
+                        args.len()
+                    );
+                }
+                return;
+            }
+        }
+
+        // SWAPDB requires access to the full database slice — intercept before
+        // calling `command::dispatch` which only sees a single `&mut Database`.
+        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+            let a = args.first().and_then(|f| match f {
+                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+                Frame::Integer(n) => usize::try_from(*n).ok(),
+                _ => None,
+            });
+            let b_idx = args.get(1).and_then(|f| match f {
+                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+                Frame::Integer(n) => usize::try_from(*n).ok(),
+                _ => None,
+            });
+            match (a, b_idx) {
+                (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
+                    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                    // Split the slice to get two non-overlapping mutable references.
+                    let (left, right) = databases.split_at_mut(lo + 1);
+                    std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
+                }
+                _ => {
+                    // Out-of-range or same-index — silently skip (same as Redis).
+                }
+            }
+            return;
+        }
+
+        let db_count = databases.len();
+        if *selected_db >= db_count {
+            tracing::warn!(
+                "WAL replay: selected_db {} out of range (have {} databases), resetting to 0",
+                *selected_db,
+                db_count
+            );
+            *selected_db = 0;
+        }
+
+        // Phase 200 — HEXPIRE-family replay shims.
+        //
+        // The user-facing command handlers for HEXPIRE / HPEXPIRE / HEXPIREAT
+        // / HPEXPIREAT / HPERSIST land in phase 196 (issue #107). Until then,
+        // replay has to honor commands that BGREWRITEAOF already emits for
+        // every TTL'd field (`feat(persistence): RDB v2 — per-field TTL
+        // trailer for hashes`, commit 9713b63). We route those commands
+        // directly to the storage primitive `Database::hash_set_field_ttl` /
+        // `hash_persist_field` so a SIGKILL between an HEXPIRE call and the
+        // next snapshot still recovers the TTL sidecar.
+        if is_hexpire_family_write(cmd) {
+            let db = &mut databases[*selected_db];
+            if cmd.eq_ignore_ascii_case(b"HPERSIST") {
+                let _ = replay_hpersist(db, args);
+            } else {
+                let _ = replay_hexpire_family(db, cmd, args);
+            }
+            return;
+        }
+
+        let _ = crate::command::dispatch(
+            &mut databases[*selected_db],
+            cmd,
+            args,
+            selected_db,
+            db_count,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,188 +585,6 @@ mod tests {
             databases[0].hash_get_field_ttl_ms(b"h", b"f"),
             Some(abs_ms),
             "replay must accept the recorded TTL irrespective of NX/XX/GT/LT"
-        );
-    }
-}
-
-/// Trait that abstracts command dispatch for AOF/WAL replay.
-///
-/// This decouples persistence replay from `command::dispatch`, allowing
-/// replay logic to work through a trait object on the cold startup path.
-pub trait CommandReplayEngine {
-    /// Replay a single parsed command against the database slice.
-    ///
-    /// `selected_db` may be mutated by SELECT commands during replay.
-    /// The response is intentionally discarded -- replay cares only about
-    /// side effects on the databases.
-    fn replay_command(
-        &self,
-        databases: &mut [Database],
-        cmd: &[u8],
-        args: &[Frame],
-        selected_db: &mut usize,
-    );
-}
-
-/// Concrete implementation that delegates to `command::dispatch`.
-///
-/// This is the **only** place that imports `command::dispatch` for replay
-/// purposes, centralizing the dependency. When the `graph` feature is
-/// enabled, graph WAL commands (GRAPH.CREATE, GRAPH.ADDNODE, etc.) are
-/// collected into a `GraphReplayCollector` instead of being dispatched
-/// to the KV command path. After replay, call `replay_graph_commands()`
-/// to apply them to a `GraphStore`.
-pub struct DispatchReplayEngine {
-    #[cfg(feature = "graph")]
-    graph_collector: std::cell::RefCell<crate::graph::replay::GraphReplayCollector>,
-}
-
-impl DispatchReplayEngine {
-    /// Create a new replay engine.
-    pub fn new() -> Self {
-        Self {
-            #[cfg(feature = "graph")]
-            graph_collector: std::cell::RefCell::new(
-                crate::graph::replay::GraphReplayCollector::new(),
-            ),
-        }
-    }
-
-    /// Replay collected graph commands into a `GraphStore`.
-    ///
-    /// Must be called after WAL/AOF replay completes. Returns the number
-    /// of graph commands successfully replayed.
-    #[cfg(feature = "graph")]
-    pub fn replay_graph_commands(&self, store: &mut crate::graph::store::GraphStore) -> usize {
-        self.graph_collector.borrow().replay_into(store)
-    }
-
-    /// Number of graph commands collected during replay.
-    #[cfg(feature = "graph")]
-    pub fn graph_command_count(&self) -> usize {
-        self.graph_collector.borrow().command_count()
-    }
-}
-
-impl CommandReplayEngine for DispatchReplayEngine {
-    fn replay_command(
-        &self,
-        databases: &mut [Database],
-        cmd: &[u8],
-        args: &[Frame],
-        selected_db: &mut usize,
-    ) {
-        // Intercept graph commands and route to the collector instead of KV dispatch.
-        // Graph WAL records are collected during the first pass, then replayed in
-        // correct order (creates -> nodes -> edges -> removes -> drops) via
-        // replay_graph_commands() after all KV replay completes.
-        #[cfg(feature = "graph")]
-        {
-            if crate::graph::replay::GraphReplayCollector::is_graph_command(cmd) {
-                // Check if any args are Integer frames (node/edge IDs may be
-                // encoded as RESP integers). If so, convert to string bytes
-                // for GraphReplayCollector which expects all-text args.
-                let has_integers = args.iter().any(|f| matches!(f, Frame::Integer(_)));
-                let collected = if has_integers {
-                    let owned: smallvec::SmallVec<[Vec<u8>; 8]> = args
-                        .iter()
-                        .filter_map(|f| match f {
-                            Frame::BulkString(b) => Some(b.to_vec()),
-                            Frame::Integer(i) => Some(i.to_string().into_bytes()),
-                            _ => None,
-                        })
-                        .collect();
-                    let refs: smallvec::SmallVec<[&[u8]; 8]> =
-                        owned.iter().map(|v| v.as_slice()).collect();
-                    self.graph_collector
-                        .borrow_mut()
-                        .collect_command(cmd, &refs)
-                } else {
-                    let bulk_args: smallvec::SmallVec<[&[u8]; 8]> = args
-                        .iter()
-                        .filter_map(|f| match f {
-                            Frame::BulkString(b) => Some(b.as_ref()),
-                            _ => None,
-                        })
-                        .collect();
-                    self.graph_collector
-                        .borrow_mut()
-                        .collect_command(cmd, &bulk_args)
-                };
-                if !collected {
-                    tracing::warn!(
-                        "WAL replay: malformed graph command {:?} with {} args — skipping",
-                        std::str::from_utf8(cmd).unwrap_or("<non-utf8>"),
-                        args.len()
-                    );
-                }
-                return;
-            }
-        }
-
-        // SWAPDB requires access to the full database slice — intercept before
-        // calling `command::dispatch` which only sees a single `&mut Database`.
-        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
-            let a = args.first().and_then(|f| match f {
-                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
-                Frame::Integer(n) => usize::try_from(*n).ok(),
-                _ => None,
-            });
-            let b_idx = args.get(1).and_then(|f| match f {
-                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
-                Frame::Integer(n) => usize::try_from(*n).ok(),
-                _ => None,
-            });
-            match (a, b_idx) {
-                (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
-                    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-                    // Split the slice to get two non-overlapping mutable references.
-                    let (left, right) = databases.split_at_mut(lo + 1);
-                    std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
-                }
-                _ => {
-                    // Out-of-range or same-index — silently skip (same as Redis).
-                }
-            }
-            return;
-        }
-
-        let db_count = databases.len();
-        if *selected_db >= db_count {
-            tracing::warn!(
-                "WAL replay: selected_db {} out of range (have {} databases), resetting to 0",
-                *selected_db,
-                db_count
-            );
-            *selected_db = 0;
-        }
-
-        // Phase 200 — HEXPIRE-family replay shims.
-        //
-        // The user-facing command handlers for HEXPIRE / HPEXPIRE / HEXPIREAT
-        // / HPEXPIREAT / HPERSIST land in phase 196 (issue #107). Until then,
-        // replay has to honor commands that BGREWRITEAOF already emits for
-        // every TTL'd field (`feat(persistence): RDB v2 — per-field TTL
-        // trailer for hashes`, commit 9713b63). We route those commands
-        // directly to the storage primitive `Database::hash_set_field_ttl` /
-        // `hash_persist_field` so a SIGKILL between an HEXPIRE call and the
-        // next snapshot still recovers the TTL sidecar.
-        if is_hexpire_family_write(cmd) {
-            let db = &mut databases[*selected_db];
-            if cmd.eq_ignore_ascii_case(b"HPERSIST") {
-                let _ = replay_hpersist(db, args);
-            } else {
-                let _ = replay_hexpire_family(db, cmd, args);
-            }
-            return;
-        }
-
-        let _ = crate::command::dispatch(
-            &mut databases[*selected_db],
-            cmd,
-            args,
-            selected_db,
-            db_count,
         );
     }
 }

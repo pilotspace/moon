@@ -171,6 +171,27 @@ fn moon_spin_note_event() {
     MOON_SPIN_LAST_EVENT.with(|c| c.set(Some(std::time::Instant::now())));
 }
 
+// moon patch (O3): per-thread contention gate for the spin-poll. The spin
+// is a measured WIN only on an effectively-dedicated core; on a shared core
+// the burned budget steals time from the contending thread and the win
+// inverts (documented OrbStack/laptop regression). The host's per-shard
+// governor watches this thread's involuntary-preemption rate and flips this
+// gate; while contended, parks fall back to plain blocking polls exactly as
+// if the budget were 0. Default: not contended (spin allowed) — preserves
+// pre-O3 behavior until the governor observes otherwise, and leaves
+// deployments without a governor (non-Linux, tokio) untouched.
+thread_local! {
+    static MOON_SPIN_CONTENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_spin_contended(contended: bool) {
+    MOON_SPIN_CONTENDED.with(|c| c.set(contended));
+}
+
+fn moon_spin_contended() -> bool {
+    MOON_SPIN_CONTENDED.with(|c| c.get())
+}
+
 #[allow(dead_code)]
 impl LegacyDriver {
     const DEFAULT_ENTRIES: u32 = 1024;
@@ -280,8 +301,10 @@ impl LegacyDriver {
         if need_wait {
             let spin_us = moon_epoll_spin_budget_us();
             // Idle disengage (see MOON_SPIN_LAST_EVENT above): only pay the
-            // spin budget while events have arrived recently.
-            if spin_us > 0 && moon_spin_engaged() {
+            // spin budget while events have arrived recently. Contention
+            // gate (O3, see MOON_SPIN_CONTENDED): don't burn budget while
+            // the host governor says this core is being fought over.
+            if spin_us > 0 && !moon_spin_contended() && moon_spin_engaged() {
                 let budget = match timeout {
                     Some(d) => d.min(Duration::from_micros(spin_us)),
                     None => Duration::from_micros(spin_us),

@@ -17,14 +17,16 @@
 //! With the master-side rewrite to `PEXPIREAT k <abs>`, both sides carry the
 //! **identical** absolute deadline — asserted here by exact equality.
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-fn moon_bin() -> String {
-    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+fn moon_bin() -> std::path::PathBuf {
+    common::find_moon_binary()
 }
 
 fn start_moon(port: u16, dir: &str) -> Child {

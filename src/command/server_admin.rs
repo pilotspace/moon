@@ -463,6 +463,33 @@ fn memory_doctor() -> Frame {
         + lua_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
+    // Task #56 (used_memory truthfulness) + adversarial-review finding #3
+    // (parity delta): three figures, not two, now that `used_memory` and
+    // the eviction gate have deliberately diverged:
+    //
+    //   1. `elastic_budget_bytes` -- KV (+ ColdIndex) + vector + text +
+    //      graph, the EXACT terms `ShardDatabases::recompute_elastic_budget`
+    //      gates `--maxmemory` eviction on. Nothing else is ever evicted to
+    //      make room.
+    //   2. `used_memory_reported` -- what `INFO`'s `used_memory` field and
+    //      the `moon_used_memory_bytes` gauge actually report: the elastic
+    //      budget PLUS the Lua script cache and replication backlog, to
+    //      match real Redis's `used_memory` semantics (it also counts
+    //      script cache + backlog as allocator-attributed memory, even
+    //      though neither is evictable data). See
+    //      `admin::metrics_setup::logical_used_memory_bytes`'s doc comment
+    //      for the full reasoning.
+    //   3. `rss` -- true OS-level footprint: adds allocator overhead, page
+    //      cache, WAL writer buffers, sealed segments, the binary image,
+    //      and thread stacks on top of (2).
+    //
+    // Called out here explicitly because conflating (1)/(2) with (3) is
+    // exactly what made a healthy disk-offload deployment look permanently
+    // over-budget in the original G2 acceptance run.
+    let elastic_budget_bytes = dashtable_bytes + hnsw_bytes + text_bytes + csr_bytes;
+    let used_memory_reported = elastic_budget_bytes + lua_bytes + repl_bytes;
+    let outside_cap_bytes = rss.saturating_sub(used_memory_reported);
+
     // ── VSZ ratio recommendation ─────────────────────────────────────────
     let vsz_ratio = if rss > 0 { vsz / rss } else { 0 };
     let vsz_recommendation = if vsz_ratio > 100 {
@@ -492,6 +519,31 @@ fn memory_doctor() -> Frame {
     let mut out = String::with_capacity(1024);
 
     let _ = writeln!(out, "Sample of Moon memory usage at {now}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Memory accounting (task #56):");
+    let _ = writeln!(
+        out,
+        "  used_memory (INFO / moon_used_memory_bytes): {}  -- elastic budget \
+         + Lua script cache + replication backlog (Redis parity)",
+        humanize_bytes(used_memory_reported)
+    );
+    let _ = writeln!(
+        out,
+        "  elastic budget (gated by --maxmemory):       {}  -- KV+ColdIndex+vector+text+graph \
+         only; the exact terms eviction acts on",
+        humanize_bytes(elastic_budget_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "  used_memory_rss (process footprint):         {}",
+        humanize_bytes(rss)
+    );
+    let _ = writeln!(
+        out,
+        "  outside used_memory (RSS - used_memory):     {}  -- allocator overhead, \
+         page cache, WAL writer buffers, sealed segments, binary+stacks",
+        humanize_bytes(outside_cap_bytes)
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Process:");
     let _ = writeln!(out, "  RSS:                    {}", humanize_bytes(rss));
@@ -1374,6 +1426,301 @@ pub fn debug_reclamation(
     Frame::BulkString(Bytes::from(buf.into_bytes()))
 }
 
+// ── VACUUM VECTOR <idx> (P2) ──────────────────────────────────────────────────
+
+/// `VACUUM VECTOR <idx>` — merge immutable segments for a named vector index.
+///
+/// Forces a graph-union merge of all immutable segments in the named index.
+/// Returns a human-readable summary with segment counts and live vector counts.
+///
+/// Return format:
+///   "+Merged N segments into 1 (live_vectors=M)"  — merge ran
+///   "+OK no merge needed (segments=N)"             — below trigger threshold
+///   "+OK merge skipped (mode=none)"                — MERGE_MODE is NONE
+///   error if index not found or merge fails
+///
+/// Wire this from the dispatch path that has access to `VectorStore`.
+///
+/// `db_index` (WS5a round 2, adversarial review finding 3): an index owned
+/// by a different db is invisible — VACUUM VECTOR must not let a connection
+/// merge/compact/probe (existence oracle) another db's index. Index names
+/// are globally unique per shard (one name = exactly one db), so once the
+/// name is confirmed to belong to `db_index` via the scoped lookups below,
+/// the remaining unscoped `VectorStore` helpers (`needs_merge`,
+/// `immutable_segment_count`, `force_merge_index`) are safe to call by name
+/// — they cannot resolve to a different db's index.
+pub fn vacuum_vector(
+    vector_store: &mut crate::vector::store::VectorStore,
+    args: &[Frame],
+    db_index: u8,
+) -> Frame {
+    // Args: [index_name] or [index_name WEIGHT <n>]
+    let name = match args.first() {
+        Some(Frame::BulkString(b)) => b.clone(),
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR usage: VACUUM VECTOR <index_name> [WEIGHT <n>]",
+            ));
+        }
+    };
+
+    // W3-deep: intercept `VACUUM VECTOR <idx> WEIGHT <n>` before merge logic.
+    // args[1] = "WEIGHT", args[2] = value
+    if args.len() >= 3 {
+        if let Some(Frame::BulkString(sub)) = args.get(1) {
+            if sub.eq_ignore_ascii_case(b"WEIGHT") {
+                let val_bytes = match args.get(2) {
+                    Some(Frame::BulkString(b)) => b.as_ref(),
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR WEIGHT requires a numeric value",
+                        ));
+                    }
+                };
+                let parsed: f32 = match std::str::from_utf8(val_bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        return Frame::Error(Bytes::from_static(b"ERR WEIGHT must be a number"));
+                    }
+                };
+                let set_result = {
+                    let idx = match vector_store.get_index_mut_for_db(name.as_ref(), db_index) {
+                        Some(i) => i,
+                        None => {
+                            return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
+                        }
+                    };
+                    idx.try_set_compaction_weight(parsed)
+                    // `idx` borrow released here
+                };
+                return match set_result {
+                    Ok(()) => {
+                        // Persist the new weight so it survives a server restart.
+                        vector_store.save_index_meta_sidecar();
+                        let msg =
+                            format!("OK weight set to {parsed} for index {:?}", name.as_ref());
+                        Frame::SimpleString(Bytes::from(msg))
+                    }
+                    Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
+                };
+            }
+        }
+    }
+
+    // Check the index exists AND is owned by the caller's db.
+    if vector_store
+        .get_index_for_db(name.as_ref(), db_index)
+        .is_none()
+    {
+        return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
+    }
+
+    // Check if merge mode is NONE.
+    if let Some(idx) = vector_store.get_index_for_db(name.as_ref(), db_index) {
+        if idx.meta.merge_mode == crate::vector::segment::compaction::MergeMode::None {
+            return Frame::SimpleString(Bytes::from_static(b"OK merge skipped (mode=none)"));
+        }
+    }
+
+    // Check if merge is needed.
+    let needs = vector_store.needs_merge(name.as_ref()).unwrap_or(false);
+    let seg_count = vector_store
+        .immutable_segment_count(name.as_ref())
+        .unwrap_or(0);
+
+    if !needs && seg_count < 2 {
+        let msg = format!("OK no merge needed (segments={seg_count})");
+        return Frame::SimpleString(Bytes::from(msg));
+    }
+
+    // Run merge.
+    match vector_store.force_merge_index(name.as_ref()) {
+        Ok(stats) => {
+            if stats.segments_merged == 0 {
+                let msg = format!("OK no merge needed (segments={seg_count})");
+                Frame::SimpleString(Bytes::from(msg))
+            } else {
+                let msg = format!(
+                    "Merged {} segments into 1 (live_vectors={})",
+                    stats.segments_merged, stats.live_vectors
+                );
+                Frame::SimpleString(Bytes::from(msg))
+            }
+        }
+        Err(_) => Frame::Error(Bytes::from_static(b"ERR merge failed (check logs)")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VACUUM GRAPH <name> — P7 graph segment auto-merge
+// ---------------------------------------------------------------------------
+
+/// `VACUUM GRAPH <name>`
+///
+/// Manually trigger a graph segment merge pass for a named graph.
+///
+/// Intercepted in `spsc_handler` before main dispatch because it needs
+/// mutable `GraphStore` access (not available in `cmd_dispatch`).
+///
+/// ## Returns
+/// - `+OK no merge needed (segments=N)` when no merge was triggered.
+/// - `+Merged N segments into 1 (live_edges=E, dead_dropped=D)` on success.
+/// - `-ERR unknown graph '<name>'` when the graph does not exist.
+#[cfg(feature = "graph")]
+pub fn vacuum_graph(
+    graph_store: &mut crate::graph::store::GraphStore,
+    args: &[Frame],
+    graph_merge_max_segments: usize,
+    graph_dead_edge_trigger: f64,
+) -> Frame {
+    let name = match args.first() {
+        Some(Frame::BulkString(b)) => b.clone(),
+        _ => return Frame::Error(Bytes::from_static(b"ERR usage: VACUUM GRAPH <graph_name>")),
+    };
+
+    if graph_store.get_graph(name.as_ref()).is_none() {
+        return Frame::Error(Bytes::from(
+            format!("ERR unknown graph '{}'", String::from_utf8_lossy(&name)).into_bytes(),
+        ));
+    }
+
+    // Check current segment count before merge.
+    let seg_count_before = graph_store
+        .get_graph(name.as_ref())
+        .map(|g| g.segments.load().immutable.len())
+        .unwrap_or(0);
+
+    let stats = crate::graph::compaction::run_graph_vacuum_pass(
+        graph_store,
+        &name,
+        graph_merge_max_segments,
+        graph_dead_edge_trigger,
+    );
+
+    if stats.segments_reclaimed == 0 {
+        let msg = format!("OK no merge needed (segments={seg_count_before})");
+        Frame::SimpleString(Bytes::from(msg))
+    } else {
+        let msg = format!(
+            "Merged {} segments into 1 (live_edges={}, dead_dropped={})",
+            stats.segments_reclaimed + 1,
+            stats.live_edges,
+            stats.dead_edges_dropped
+        );
+        Frame::SimpleString(Bytes::from(msg))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RECLAMATION SCHEDULE — MA5 maintenance-window scheduler commands
+// ---------------------------------------------------------------------------
+
+/// `RECLAMATION SCHEDULE <cron_expr> <multiplier>`
+/// `RECLAMATION SCHEDULE LIST`
+/// `RECLAMATION SCHEDULE CLEAR`
+///
+/// Manage the per-shard maintenance-window schedule that controls autovacuum
+/// budget multipliers at different times of day/week.
+///
+/// ## Subcommands
+///
+/// | Syntax | Description |
+/// |---|---|
+/// | `RECLAMATION SCHEDULE <cron> <mult>` | Add a window |
+/// | `RECLAMATION SCHEDULE LIST` | List all windows |
+/// | `RECLAMATION SCHEDULE CLEAR` | Remove all windows |
+///
+/// `cron` is a 5-field UNIX cron expression (`* * * * *` format).
+/// `mult` is a float multiplier (e.g. `2.0` for 2x budget, `0.1` for 10%).
+///
+/// ## Examples
+/// ```text
+/// RECLAMATION SCHEDULE "0 2 * * *" 2.0
+/// RECLAMATION SCHEDULE "* 9-17 * * 1-5" 0.1
+/// RECLAMATION SCHEDULE LIST
+/// RECLAMATION SCHEDULE CLEAR
+/// ```
+pub fn reclamation_schedule(
+    schedule: &mut crate::shard::maintenance_schedule::MaintenanceSchedule,
+    args: &[Frame],
+) -> Frame {
+    let sub = match args
+        .first()
+        .and_then(|f| crate::command::helpers::extract_bytes(f))
+    {
+        Some(s) => s,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR usage: RECLAMATION SCHEDULE <cron> <mult> | LIST | CLEAR",
+            ));
+        }
+    };
+
+    if sub.eq_ignore_ascii_case(b"LIST") {
+        // Return array of alternating [cron, multiplier_string] pairs.
+        let windows = schedule.list();
+        let mut pairs: Vec<Frame> = Vec::with_capacity(windows.len() * 2);
+        for (expr, mult) in &windows {
+            pairs.push(Frame::BulkString(Bytes::from(expr.clone())));
+            pairs.push(Frame::BulkString(Bytes::from(format!("{mult}"))));
+        }
+        return Frame::Array(crate::protocol::FrameVec::from_vec(pairs));
+    }
+
+    if sub.eq_ignore_ascii_case(b"CLEAR") {
+        schedule.clear();
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    }
+
+    // Add: RECLAMATION SCHEDULE <cron_expr> <multiplier>
+    // args[0] = cron expression, args[1] = multiplier
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR usage: RECLAMATION SCHEDULE <cron> <mult>",
+        ));
+    }
+
+    let cron_bytes = match crate::command::helpers::extract_bytes(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid cron expression")),
+    };
+    let mult_bytes = match crate::command::helpers::extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid multiplier")),
+    };
+
+    let cron_str = match std::str::from_utf8(cron_bytes.as_ref()) {
+        Ok(s) => s,
+        Err(_) => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR cron expression is not valid UTF-8",
+            ));
+        }
+    };
+
+    let multiplier: f32 = match std::str::from_utf8(mult_bytes.as_ref())
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        Some(v) if v.is_finite() && v >= 0.0 => v,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR multiplier must be a non-negative finite float",
+            ));
+        }
+    };
+
+    match schedule.add(cron_str, multiplier) {
+        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Err(e) => Frame::Error(Bytes::from(
+            format!("ERR invalid cron expression: {e}").into_bytes(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1987,300 +2334,5 @@ mod tests {
             "no control file yet => floor 0 => recycle nothing"
         );
         assert_eq!(count_wal_segments(&wal_dir), before_segments);
-    }
-}
-
-// ── VACUUM VECTOR <idx> (P2) ──────────────────────────────────────────────────
-
-/// `VACUUM VECTOR <idx>` — merge immutable segments for a named vector index.
-///
-/// Forces a graph-union merge of all immutable segments in the named index.
-/// Returns a human-readable summary with segment counts and live vector counts.
-///
-/// Return format:
-///   "+Merged N segments into 1 (live_vectors=M)"  — merge ran
-///   "+OK no merge needed (segments=N)"             — below trigger threshold
-///   "+OK merge skipped (mode=none)"                — MERGE_MODE is NONE
-///   error if index not found or merge fails
-///
-/// Wire this from the dispatch path that has access to `VectorStore`.
-///
-/// `db_index` (WS5a round 2, adversarial review finding 3): an index owned
-/// by a different db is invisible — VACUUM VECTOR must not let a connection
-/// merge/compact/probe (existence oracle) another db's index. Index names
-/// are globally unique per shard (one name = exactly one db), so once the
-/// name is confirmed to belong to `db_index` via the scoped lookups below,
-/// the remaining unscoped `VectorStore` helpers (`needs_merge`,
-/// `immutable_segment_count`, `force_merge_index`) are safe to call by name
-/// — they cannot resolve to a different db's index.
-pub fn vacuum_vector(
-    vector_store: &mut crate::vector::store::VectorStore,
-    args: &[Frame],
-    db_index: u8,
-) -> Frame {
-    // Args: [index_name] or [index_name WEIGHT <n>]
-    let name = match args.first() {
-        Some(Frame::BulkString(b)) => b.clone(),
-        _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR usage: VACUUM VECTOR <index_name> [WEIGHT <n>]",
-            ));
-        }
-    };
-
-    // W3-deep: intercept `VACUUM VECTOR <idx> WEIGHT <n>` before merge logic.
-    // args[1] = "WEIGHT", args[2] = value
-    if args.len() >= 3 {
-        if let Some(Frame::BulkString(sub)) = args.get(1) {
-            if sub.eq_ignore_ascii_case(b"WEIGHT") {
-                let val_bytes = match args.get(2) {
-                    Some(Frame::BulkString(b)) => b.as_ref(),
-                    _ => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR WEIGHT requires a numeric value",
-                        ));
-                    }
-                };
-                let parsed: f32 = match std::str::from_utf8(val_bytes)
-                    .ok()
-                    .and_then(|s| s.parse::<f32>().ok())
-                {
-                    Some(v) => v,
-                    None => {
-                        return Frame::Error(Bytes::from_static(b"ERR WEIGHT must be a number"));
-                    }
-                };
-                let set_result = {
-                    let idx = match vector_store.get_index_mut_for_db(name.as_ref(), db_index) {
-                        Some(i) => i,
-                        None => {
-                            return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
-                        }
-                    };
-                    idx.try_set_compaction_weight(parsed)
-                    // `idx` borrow released here
-                };
-                return match set_result {
-                    Ok(()) => {
-                        // Persist the new weight so it survives a server restart.
-                        vector_store.save_index_meta_sidecar();
-                        let msg =
-                            format!("OK weight set to {parsed} for index {:?}", name.as_ref());
-                        Frame::SimpleString(Bytes::from(msg))
-                    }
-                    Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
-                };
-            }
-        }
-    }
-
-    // Check the index exists AND is owned by the caller's db.
-    if vector_store
-        .get_index_for_db(name.as_ref(), db_index)
-        .is_none()
-    {
-        return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
-    }
-
-    // Check if merge mode is NONE.
-    if let Some(idx) = vector_store.get_index_for_db(name.as_ref(), db_index) {
-        if idx.meta.merge_mode == crate::vector::segment::compaction::MergeMode::None {
-            return Frame::SimpleString(Bytes::from_static(b"OK merge skipped (mode=none)"));
-        }
-    }
-
-    // Check if merge is needed.
-    let needs = vector_store.needs_merge(name.as_ref()).unwrap_or(false);
-    let seg_count = vector_store
-        .immutable_segment_count(name.as_ref())
-        .unwrap_or(0);
-
-    if !needs && seg_count < 2 {
-        let msg = format!("OK no merge needed (segments={seg_count})");
-        return Frame::SimpleString(Bytes::from(msg));
-    }
-
-    // Run merge.
-    match vector_store.force_merge_index(name.as_ref()) {
-        Ok(stats) => {
-            if stats.segments_merged == 0 {
-                let msg = format!("OK no merge needed (segments={seg_count})");
-                Frame::SimpleString(Bytes::from(msg))
-            } else {
-                let msg = format!(
-                    "Merged {} segments into 1 (live_vectors={})",
-                    stats.segments_merged, stats.live_vectors
-                );
-                Frame::SimpleString(Bytes::from(msg))
-            }
-        }
-        Err(_) => Frame::Error(Bytes::from_static(b"ERR merge failed (check logs)")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VACUUM GRAPH <name> — P7 graph segment auto-merge
-// ---------------------------------------------------------------------------
-
-/// `VACUUM GRAPH <name>`
-///
-/// Manually trigger a graph segment merge pass for a named graph.
-///
-/// Intercepted in `spsc_handler` before main dispatch because it needs
-/// mutable `GraphStore` access (not available in `cmd_dispatch`).
-///
-/// ## Returns
-/// - `+OK no merge needed (segments=N)` when no merge was triggered.
-/// - `+Merged N segments into 1 (live_edges=E, dead_dropped=D)` on success.
-/// - `-ERR unknown graph '<name>'` when the graph does not exist.
-#[cfg(feature = "graph")]
-pub fn vacuum_graph(
-    graph_store: &mut crate::graph::store::GraphStore,
-    args: &[Frame],
-    graph_merge_max_segments: usize,
-    graph_dead_edge_trigger: f64,
-) -> Frame {
-    let name = match args.first() {
-        Some(Frame::BulkString(b)) => b.clone(),
-        _ => return Frame::Error(Bytes::from_static(b"ERR usage: VACUUM GRAPH <graph_name>")),
-    };
-
-    if graph_store.get_graph(name.as_ref()).is_none() {
-        return Frame::Error(Bytes::from(
-            format!("ERR unknown graph '{}'", String::from_utf8_lossy(&name)).into_bytes(),
-        ));
-    }
-
-    // Check current segment count before merge.
-    let seg_count_before = graph_store
-        .get_graph(name.as_ref())
-        .map(|g| g.segments.load().immutable.len())
-        .unwrap_or(0);
-
-    let stats = crate::graph::compaction::run_graph_vacuum_pass(
-        graph_store,
-        &name,
-        graph_merge_max_segments,
-        graph_dead_edge_trigger,
-    );
-
-    if stats.segments_reclaimed == 0 {
-        let msg = format!("OK no merge needed (segments={seg_count_before})");
-        Frame::SimpleString(Bytes::from(msg))
-    } else {
-        let msg = format!(
-            "Merged {} segments into 1 (live_edges={}, dead_dropped={})",
-            stats.segments_reclaimed + 1,
-            stats.live_edges,
-            stats.dead_edges_dropped
-        );
-        Frame::SimpleString(Bytes::from(msg))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RECLAMATION SCHEDULE — MA5 maintenance-window scheduler commands
-// ---------------------------------------------------------------------------
-
-/// `RECLAMATION SCHEDULE <cron_expr> <multiplier>`
-/// `RECLAMATION SCHEDULE LIST`
-/// `RECLAMATION SCHEDULE CLEAR`
-///
-/// Manage the per-shard maintenance-window schedule that controls autovacuum
-/// budget multipliers at different times of day/week.
-///
-/// ## Subcommands
-///
-/// | Syntax | Description |
-/// |---|---|
-/// | `RECLAMATION SCHEDULE <cron> <mult>` | Add a window |
-/// | `RECLAMATION SCHEDULE LIST` | List all windows |
-/// | `RECLAMATION SCHEDULE CLEAR` | Remove all windows |
-///
-/// `cron` is a 5-field UNIX cron expression (`* * * * *` format).
-/// `mult` is a float multiplier (e.g. `2.0` for 2x budget, `0.1` for 10%).
-///
-/// ## Examples
-/// ```text
-/// RECLAMATION SCHEDULE "0 2 * * *" 2.0
-/// RECLAMATION SCHEDULE "* 9-17 * * 1-5" 0.1
-/// RECLAMATION SCHEDULE LIST
-/// RECLAMATION SCHEDULE CLEAR
-/// ```
-pub fn reclamation_schedule(
-    schedule: &mut crate::shard::maintenance_schedule::MaintenanceSchedule,
-    args: &[Frame],
-) -> Frame {
-    let sub = match args
-        .first()
-        .and_then(|f| crate::command::helpers::extract_bytes(f))
-    {
-        Some(s) => s,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR usage: RECLAMATION SCHEDULE <cron> <mult> | LIST | CLEAR",
-            ));
-        }
-    };
-
-    if sub.eq_ignore_ascii_case(b"LIST") {
-        // Return array of alternating [cron, multiplier_string] pairs.
-        let windows = schedule.list();
-        let mut pairs: Vec<Frame> = Vec::with_capacity(windows.len() * 2);
-        for (expr, mult) in &windows {
-            pairs.push(Frame::BulkString(Bytes::from(expr.clone())));
-            pairs.push(Frame::BulkString(Bytes::from(format!("{mult}"))));
-        }
-        return Frame::Array(crate::protocol::FrameVec::from_vec(pairs));
-    }
-
-    if sub.eq_ignore_ascii_case(b"CLEAR") {
-        schedule.clear();
-        return Frame::SimpleString(Bytes::from_static(b"OK"));
-    }
-
-    // Add: RECLAMATION SCHEDULE <cron_expr> <multiplier>
-    // args[0] = cron expression, args[1] = multiplier
-    if args.len() < 2 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR usage: RECLAMATION SCHEDULE <cron> <mult>",
-        ));
-    }
-
-    let cron_bytes = match crate::command::helpers::extract_bytes(&args[0]) {
-        Some(b) => b,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid cron expression")),
-    };
-    let mult_bytes = match crate::command::helpers::extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid multiplier")),
-    };
-
-    let cron_str = match std::str::from_utf8(cron_bytes.as_ref()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR cron expression is not valid UTF-8",
-            ));
-        }
-    };
-
-    let multiplier: f32 = match std::str::from_utf8(mult_bytes.as_ref())
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-    {
-        Some(v) if v.is_finite() && v >= 0.0 => v,
-        _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR multiplier must be a non-negative finite float",
-            ));
-        }
-    };
-
-    match schedule.add(cron_str, multiplier) {
-        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
-        Err(e) => Frame::Error(Bytes::from(
-            format!("ERR invalid cron expression: {e}").into_bytes(),
-        )),
     }
 }

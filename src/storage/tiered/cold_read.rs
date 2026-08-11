@@ -130,6 +130,11 @@ pub(crate) fn read_cold_entry(
     now_ms: u64,
     page_cache: Option<&PageCache>,
 ) -> ColdReadOutcome {
+    // Task #59 lever 2: any cold read — including the synchronous MGET /
+    // MULTI / Lua paths that never go through the async pool — signals the
+    // spill writer to briefly yield the device. Double-counting with the
+    // async path's own guard is harmless (the signal is "readers > 0").
+    let _inflight = super::cold_read_pool::ColdReadInflightGuard::new();
     #[cfg(test)]
     {
         let delay_ms = TEST_INJECT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -260,6 +265,7 @@ mod tests {
             20,
             b"myhash",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -309,6 +315,7 @@ mod tests {
             21,
             b"cachekey",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -382,13 +389,14 @@ mod tests {
 
         let mut entry = Entry::new_string(Bytes::copy_from_slice(value));
         if let Some(ttl) = ttl_ms {
-            entry.set_expires_at_ms(0, ttl);
+            entry.set_expires_at_ms(ttl);
         }
         spill_to_datafile(
             shard_dir,
             40,
             key,
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -518,11 +526,9 @@ mod tests {
         assert!(file_path.exists(), "precondition: spill file must exist");
 
         // Sweep at a time strictly after expiry, WITHOUT ever reading the key.
-        // NOTE: `Entry::set_expires_at_ms` quantizes to whole seconds
-        // (`ttl_secs = (ms / 1000).max(1)`), so the `Some(1)` passed to
-        // `db_with_spilled_key` above round-trips through the on-disk
-        // `KvEntry` as an absolute `ttl_ms` of 1000, not 1 — sweep strictly
-        // after that.
+        // The `Some(1)` passed to `db_with_spilled_key` above round-trips
+        // through the on-disk `KvEntry` as an absolute `ttl_ms` of 1 (exact
+        // since W3 ms fidelity) — sweeping at 1_001 is strictly after it.
         let stats = db
             .cold_index
             .as_mut()
@@ -581,6 +587,7 @@ mod tests {
             30,
             b"big_key",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )

@@ -27,7 +27,7 @@ use crc32fast::Hasher;
 use crate::error::{MoonError, SnapshotError};
 use crate::persistence::rdb;
 use crate::storage::db::Database;
-use crate::storage::entry::{Entry, current_secs, current_time_ms};
+use crate::storage::entry::{Entry, current_time_ms};
 
 // Per-shard snapshot format constants
 const SHARD_RDB_MAGIC: &[u8] = b"RRDSHARD";
@@ -88,8 +88,6 @@ pub struct SnapshotState {
     num_databases: usize,
     /// Segment counts per database, captured at epoch start.
     segment_counts: Vec<usize>,
-    /// Base timestamps per database.
-    base_timestamps: Vec<u32>,
     /// Output buffer accumulating serialized bytes.
     output_buf: Vec<u8>,
     /// COW overflow buffer: (db_index, segment_storage_idx, key, entry) for entries
@@ -117,22 +115,14 @@ pub struct SnapshotState {
 impl SnapshotState {
     /// Create a new snapshot state machine.
     ///
-    /// Captures segment counts and base timestamps from each database at epoch start.
+    /// Captures segment counts from each database at epoch start.
     pub fn new(shard_id: u16, epoch: u64, databases: &[Database], file_path: PathBuf) -> Self {
         let num_databases = databases.len();
         let segment_counts: Vec<usize> = databases
             .iter()
             .map(|db| db.data().segment_count())
             .collect();
-        let base_timestamps: Vec<u32> = databases.iter().map(|db| db.base_timestamp()).collect();
-        Self::new_from_metadata(
-            shard_id,
-            epoch,
-            num_databases,
-            segment_counts,
-            base_timestamps,
-            file_path,
-        )
+        Self::new_from_metadata(shard_id, epoch, num_databases, segment_counts, file_path)
     }
 
     /// Create from pre-collected metadata (for Arc<ShardDatabases> path).
@@ -141,7 +131,6 @@ impl SnapshotState {
         epoch: u64,
         num_databases: usize,
         segment_counts: Vec<usize>,
-        base_timestamps: Vec<u32>,
         file_path: PathBuf,
     ) -> Self {
         let serialized_segments: Vec<Vec<bool>> = segment_counts
@@ -157,7 +146,6 @@ impl SnapshotState {
             segments_in_current_db,
             num_databases,
             segment_counts,
-            base_timestamps,
             output_buf: Vec::with_capacity(4096),
             overflow: Vec::new(),
             serialized_segments,
@@ -277,7 +265,6 @@ impl SnapshotState {
     }
 
     fn advance_segment_inner(&mut self, db: &Database) -> bool {
-        let base_ts = self.base_timestamps[self.current_db];
         let now_ms = current_time_ms();
 
         // Write DB selector if this is the first segment of a new database
@@ -310,10 +297,10 @@ impl SnapshotState {
 
         // Write overflow entries first (these represent old values before modification)
         for (key, entry) in &overflow_entries {
-            if entry.has_expiry() && entry.is_expired_at(base_ts, now_ms) {
+            if entry.has_expiry() && entry.is_expired_at(now_ms) {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry, base_ts) {
+            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry) {
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
@@ -325,10 +312,10 @@ impl SnapshotState {
             if overflow_keys.contains(key.as_bytes()) {
                 continue;
             }
-            if entry.has_expiry() && entry.is_expired_at(base_ts, now_ms) {
+            if entry.has_expiry() && entry.is_expired_at(now_ms) {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key.as_bytes(), entry, base_ts) {
+            if let Err(e) = rdb::write_entry(&mut segment_entries, key.as_bytes(), entry) {
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
@@ -855,7 +842,7 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
 
                 // Insert non-expired entries into the database
                 for (key, entry) in entries {
-                    if entry.has_expiry() && entry.is_expired_at(current_secs(), now_ms) {
+                    if entry.has_expiry() && entry.is_expired_at(now_ms) {
                         continue;
                     }
                     if current_db < databases.len() {
@@ -1062,10 +1049,9 @@ mod tests {
         );
         // Key with past TTL (should be skipped)
         let past_ms = current_time_ms() - 1000;
-        let base_ts = dbs[0].base_timestamp();
         dbs[0].set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();

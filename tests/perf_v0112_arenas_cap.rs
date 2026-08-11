@@ -78,6 +78,21 @@ fn run_memory_doctor(port: u16) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Kill-on-drop guard: `wait_ready` and `run_memory_doctor`'s panics below
+/// can leak the server before the old manual `child.kill()` ran (task:
+/// test/harness-hygiene-sweep). See tests/bgsave_startup_race.rs for the
+/// same pattern.
+struct MoonGuard(Option<std::process::Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[test]
 fn default_arenas_is_eight() {
     if !redis_cli_available() {
@@ -85,11 +100,11 @@ fn default_arenas_is_eight() {
         return;
     }
     let port = 16399;
-    let mut child = spawn_moon(&[], port);
+    let child = spawn_moon(&[], port);
+    let child = MoonGuard(Some(child));
     wait_ready(port);
     let output = run_memory_doctor(port);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child); // MoonGuard SIGKILLs + reaps
 
     let arenas = parse_arenas(&output).unwrap_or_else(|| {
         panic!(
@@ -110,11 +125,11 @@ fn override_via_cli_flag() {
         return;
     }
     let port = 16400;
-    let mut child = spawn_moon(&["--memory-arenas-cap", "4"], port);
+    let child = spawn_moon(&["--memory-arenas-cap", "4"], port);
+    let child = MoonGuard(Some(child));
     wait_ready(port);
     let output = run_memory_doctor(port);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child); // MoonGuard SIGKILLs + reaps
 
     let arenas = parse_arenas(&output).expect("MEMORY DOCTOR missing Arenas line");
     assert_eq!(

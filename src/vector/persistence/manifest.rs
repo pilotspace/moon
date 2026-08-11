@@ -597,6 +597,11 @@ impl SnapshotPool {
                 std::thread::Builder::new()
                     .name(format!("moon-vec-snapshot-{i}"))
                     .spawn(move || {
+                        // O5: lazily spawned from a pinned shard thread —
+                        // escape the inherited single-core mask.
+                        crate::shard::numa::pin_current_aux_thread(&format!(
+                            "moon-vec-snapshot-{i}"
+                        ));
                         loop {
                             let next_job = {
                                 let mut guard = pending.lock();

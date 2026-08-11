@@ -29,8 +29,8 @@ mod common;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-fn moon_bin() -> String {
-    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+fn moon_bin() -> std::path::PathBuf {
+    common::find_moon_binary()
 }
 
 fn start_moon(port: u16, dir: &str) -> Child {
@@ -77,12 +77,28 @@ fn assert_readonly<T: std::fmt::Debug>(result: redis::RedisResult<T>, label: &st
     );
 }
 
+/// Kill-on-drop guard: the many `assert_eq!`/`.expect()` calls below used to
+/// run entirely before the manual `child.kill()` at the end of the test, so
+/// any one of them panicking orphaned the server (task:
+/// test/harness-hygiene-sweep). See tests/bgsave_startup_race.rs for the
+/// same pattern.
+struct MoonGuard(Option<Child>);
+
+impl Drop for MoonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real moon binary — set MOON_BIN, see module docs"]
 async fn test_readonly_replica_blocks_writing_eval_and_evalsha() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, port) =
-        common::spawn_listening(|p| start_moon(p, dir.path().to_str().unwrap()));
+    let (child, port) = common::spawn_listening(|p| start_moon(p, dir.path().to_str().unwrap()));
+    let child = MoonGuard(Some(child));
     let mut con = connect(port).await;
 
     // --- Master: a writing EVAL succeeds, proving the harness/script path
@@ -180,6 +196,5 @@ async fn test_readonly_replica_blocks_writing_eval_and_evalsha() {
         "read-only EVAL must still be served on a read-only replica, got: {eval_read_on_replica:?}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child); // MoonGuard SIGKILLs + reaps
 }

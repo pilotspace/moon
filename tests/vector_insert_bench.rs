@@ -53,8 +53,8 @@ fn bench_raw_append_128d() {
     }
 
     let start = Instant::now();
-    for i in 0..n {
-        seg.append(i as u64, &vectors[i], 0);
+    for (i, v) in vectors.iter().enumerate() {
+        seg.append(i as u64, v, 0);
     }
     let elapsed = start.elapsed();
 
@@ -107,8 +107,8 @@ fn bench_raw_append_768d() {
     }
 
     let start = Instant::now();
-    for i in 0..n {
-        seg.append(i as u64, &vectors[i], 0);
+    for (i, v) in vectors.iter().enumerate() {
+        seg.append(i as u64, v, 0);
     }
     let elapsed = start.elapsed();
 

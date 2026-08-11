@@ -674,6 +674,9 @@ mod tests {
         // Includes the worst-case Display lengths: f64::MAX (~309 digits)
         // and the smallest subnormal (~326 chars), which guard the stack
         // buffer capacity in F64Display.
+        // Test data literal picked for its 16 significant digits, not for its
+        // mathematical identity — not a candidate for f64::consts::PI.
+        #[allow(clippy::approx_constant)]
         let cases = [
             0.0,
             -0.0,

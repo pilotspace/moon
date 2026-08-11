@@ -4,6 +4,7 @@
 //! These are RED until §5 BUILD defines the symbols:
 //!   - `moon::shard::slice::xshard_may_spin` / `XshardWaitGuard` / `XSHARD_SPIN_GATE`
 //!   - `moon::shard::dispatch::CoalescedReadBatch`
+//!
 //! Before build the imports below are UNRESOLVED → this test crate fails to compile.
 //! That compile failure IS the red signal for this file (the other test crates are
 //! independent and still build). After build, the crate compiles and the asserts pass.

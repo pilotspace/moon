@@ -76,6 +76,7 @@ async fn start_server() -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -181,6 +182,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -1408,6 +1410,7 @@ async fn start_server_with_persistence(
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -2319,6 +2322,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -2735,6 +2739,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -3952,6 +3957,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -3997,7 +4003,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config.port).parse().unwrap();
         let node_id = moon::replication::state::generate_repl_id();
         let state = moon::cluster::ClusterState::new(node_id, self_addr);
-        let cluster_state = Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
+        let cluster_state = Some(std::sync::Arc::new(parking_lot::RwLock::new(state)));
 
         let all_notifiers = mesh.all_notifiers();
         let all_pubsub_registries: Vec<
@@ -4633,6 +4639,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,

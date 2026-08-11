@@ -10,7 +10,7 @@ keywords = ["redis", "vector-search", "graph", "database", "async"]
 categories = ["database", "asynchronous", "network-programming"]
 
 [dependencies]
-redis = { version = "1.1", features = ["tokio-comp", "aio"] }
+redis = { version = "1.1", features = ["tokio-comp", "aio", "connection-manager"] }
 tokio = { version = "1", features = ["rt", "net", "macros"] }
 thiserror = "2"
 bytes = "1"

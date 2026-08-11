@@ -11,7 +11,7 @@ use crate::util::{parse_cache_search_results, parse_index_info, parse_search_res
 /// use moondb::{MoonClient, types::{VectorIndexOptions, DistanceMetric}};
 ///
 /// #[tokio::main]
-/// async fn main() -> moon::Result<()> {
+/// async fn main() -> moondb::Result<()> {
 ///     let client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     let mut v = client.vector();
 ///     v.create_index("idx", VectorIndexOptions::new(384, DistanceMetric::Cosine)).await?;
@@ -20,7 +20,7 @@ use crate::util::{parse_cache_search_results, parse_index_info, parse_search_res
 /// }
 /// ```
 pub struct VectorClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl VectorClient {

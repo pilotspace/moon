@@ -34,8 +34,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-fn moon_bin() -> String {
-    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+fn moon_bin() -> std::path::PathBuf {
+    common::find_moon_binary()
 }
 
 /// Spawn moon with explicit `--shards` plus arbitrary extra CLI args (mirrors

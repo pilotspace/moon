@@ -21,8 +21,12 @@ pub struct CheckpointTrigger {
     max_wal_bytes: u64,
     /// Fraction of checkpoint interval to spread dirty page flushes (default 0.9).
     completion_fraction: f64,
-    /// Timestamp of the last completed checkpoint.
-    last_checkpoint_time: Instant,
+    /// Epoch-ms timestamp of the last completed checkpoint, read from the
+    /// shard's cached clock. Second-granularity timeout does not need
+    /// `Instant` precision, and `should_checkpoint` runs every 1ms tick —
+    /// the cached read avoids a `clock_gettime` per tick per shard
+    /// (issue #373 idle-CPU work).
+    last_checkpoint_ms: u64,
 }
 
 impl CheckpointTrigger {
@@ -32,7 +36,7 @@ impl CheckpointTrigger {
             timeout_secs,
             max_wal_bytes,
             completion_fraction,
-            last_checkpoint_time: Instant::now(),
+            last_checkpoint_ms: crate::storage::entry::current_time_ms(),
         }
     }
 
@@ -45,12 +49,16 @@ impl CheckpointTrigger {
         if wal_bytes_since_checkpoint >= self.max_wal_bytes {
             return true;
         }
-        self.last_checkpoint_time.elapsed().as_secs() >= self.timeout_secs
+        // saturating_sub: a wall-clock step backwards (NTP) reads as "no time
+        // elapsed" and merely delays the timeout leg; the WAL-bytes leg above
+        // is unaffected.
+        crate::storage::entry::current_time_ms().saturating_sub(self.last_checkpoint_ms)
+            >= self.timeout_secs.saturating_mul(1000)
     }
 
     /// Reset the trigger timer (called after checkpoint completes).
     pub fn reset(&mut self) {
-        self.last_checkpoint_time = Instant::now();
+        self.last_checkpoint_ms = crate::storage::entry::current_time_ms();
     }
 
     /// Return the timeout in seconds.
@@ -287,7 +295,7 @@ mod tests {
             timeout_secs: 0, // Immediate trigger
             max_wal_bytes: u64::MAX,
             completion_fraction: 0.9,
-            last_checkpoint_time: Instant::now() - std::time::Duration::from_secs(1),
+            last_checkpoint_ms: crate::storage::entry::current_time_ms().saturating_sub(1000),
         };
         assert!(trigger.should_checkpoint(0));
     }

@@ -38,7 +38,7 @@ impl AofManifest {
             seq: 1,
             layout: AofLayout::PerShard,
             shards: (0..num_shards)
-                .map(|id| ShardManifest {
+                .map(|id| AofShardManifest {
                     shard_id: id,
                     max_lsn: 0,
                 })
@@ -292,8 +292,8 @@ mod tests {
         fs::create_dir_all(&aof_dir).unwrap();
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
             .expect("empty rdb");
-        let shards: Vec<ShardManifest> = (0..num_shards)
-            .map(|id| ShardManifest {
+        let shards: Vec<AofShardManifest> = (0..num_shards)
+            .map(|id| AofShardManifest {
                 shard_id: id,
                 max_lsn: 0,
             })

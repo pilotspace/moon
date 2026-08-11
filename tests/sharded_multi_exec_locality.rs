@@ -27,11 +27,21 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "graph")]
 use moon::shard::dispatch::graph_to_shard;
+#[cfg(feature = "graph")]
 use moon::shard::dispatch::key_to_shard;
 
 fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
         return Some(std::path::PathBuf::from(p));
+    }
+    // CARGO_BIN_EXE_moon is the binary cargo built for THIS test run (right
+    // profile, right CARGO_TARGET_DIR); cargo guarantees it exists whenever
+    // this env!() macro is referenced, so check it before falling back to a
+    // bare target/{release,debug}/moon guess that risks a stale binary of
+    // unknown provenance on a shared checkout (task: harness-hygiene-sweep).
+    let cargo_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    if cargo_bin.exists() {
+        return Some(cargo_bin);
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for rel in ["target/release/moon", "target/debug/moon"] {
@@ -94,10 +104,11 @@ fn spawn_moon(shards: &str) -> Option<Moon> {
             let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
             if c.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 64];
-                if let Ok(n) = c.read(&mut buf) {
-                    if n > 0 && buf.starts_with(b"+PONG") {
-                        return Some(moon);
-                    }
+                if let Ok(n) = c.read(&mut buf)
+                    && n > 0
+                    && buf.starts_with(b"+PONG")
+                {
+                    return Some(moon);
                 }
             }
         }

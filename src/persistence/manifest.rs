@@ -94,7 +94,7 @@ impl StorageTier {
 /// 12..16  4     page_count (u32 LE)
 /// 16..24  8     byte_size (u64 LE)
 /// 24..32  8     created_lsn (u64 LE)
-/// 32..40  8     min_key_hash (u64 LE)
+/// 32..40  8     db_index (u64 LE; formerly min_key_hash, always written 0 — see field doc)
 /// 40..48  8     max_key_hash (u64 LE)
 /// 48..56  8     last_modified_lsn (u64 LE)  -- v2 only
 /// ```
@@ -108,7 +108,18 @@ pub struct FileEntry {
     pub page_count: u32,
     pub byte_size: u64,
     pub created_lsn: u64,
-    pub min_key_hash: u64,
+    /// Logical database index every entry in this file belongs to (#139:
+    /// cold recovery must re-attach spilled keys to the database they were
+    /// evicted from, not unconditionally db 0).
+    ///
+    /// Byte-compatible repurpose of the former `min_key_hash` field, which
+    /// every writer in the codebase's history serialized as 0 — so v1/v2
+    /// manifests written before this field existed read back as db 0,
+    /// which is exactly correct for them (the spill buffer was db-blind
+    /// and recovery attached everything to db 0). The spill path
+    /// guarantees single-db files by cutting flush chunks at db
+    /// boundaries (`spill_thread::flush_buffer`).
+    pub db_index: u64,
     pub max_key_hash: u64,
     /// LSN of the last mutation to this file (v2). For files imported from
     /// a v1 manifest this is set equal to `created_lsn`. Used by PITR to
@@ -144,7 +155,7 @@ impl FileEntry {
         buf[12..16].copy_from_slice(&self.page_count.to_le_bytes());
         buf[16..24].copy_from_slice(&self.byte_size.to_le_bytes());
         buf[24..32].copy_from_slice(&self.created_lsn.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.min_key_hash.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.db_index.to_le_bytes());
         buf[40..48].copy_from_slice(&self.max_key_hash.to_le_bytes());
         buf[48..56].copy_from_slice(&self.last_modified_lsn.to_le_bytes());
     }
@@ -187,7 +198,7 @@ impl FileEntry {
         let created_lsn = u64::from_le_bytes([
             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
         ]);
-        let min_key_hash = u64::from_le_bytes([
+        let db_index = u64::from_le_bytes([
             buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
         ]);
         let max_key_hash = u64::from_le_bytes([
@@ -203,7 +214,7 @@ impl FileEntry {
             page_count,
             byte_size,
             created_lsn,
-            min_key_hash,
+            db_index,
             max_key_hash,
             // v1 fallback — synthesize from created_lsn so existing manifests
             // remain readable and PITR target_lsn comparisons stay sane.
@@ -281,27 +292,53 @@ pub struct ManifestRoot {
 /// process restart implies no in-flight readers holding old snapshot views.
 /// After the configured retention period both tombstone entries are
 /// physically removed from `active_root.entries` by `gc_tombstones`.
+/// Test-only injected delay inside [`ManifestIo::persist`], mirroring the
+/// `cold_read::TEST_INJECT_DELAY_MS` pattern: simulates a slow/contended
+/// device so tests can prove which thread pays for the sync.
+#[cfg(test)]
+pub(crate) static TEST_INJECT_SYNC_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only count of [`ManifestIo::persist`] executions (for coalescing
+/// assertions).
+#[cfg(test)]
+pub(crate) static TEST_PERSIST_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: make [`ManifestIo::persist`] fail with an injected I/O error
+/// (simulates ENOSPC/EIO on the manifest device) so the sync agent's
+/// failure latch can be exercised.
+#[cfg(test)]
+pub(crate) static TEST_INJECT_PERSIST_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes tests that use the injected sync delay / persist counter —
+/// `cargo test`'s default parallelism otherwise lets one test's injected
+/// delay leak into an unrelated concurrently-running test (same pattern as
+/// `cold_read::TEST_DELAY_LOCK`).
+#[cfg(test)]
+pub(crate) static TEST_SYNC_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The file-I/O half of the manifest: the handle, the dual-slot alternation
+/// state, and the reopen bookkeeping that `persist`/`compact` maintain.
+///
+/// Owned inline by [`ShardManifest`] (synchronous commits on the caller
+/// thread — the default everywhere outside the shard event loop), or moved
+/// onto the per-shard manifest-sync thread by
+/// [`ShardManifest::enable_deferred_sync`] so commit fsyncs never run on the
+/// shard event loop (task #59).
 #[derive(Debug)]
-pub struct ShardManifest {
+pub(crate) struct ManifestIo {
     /// File handle opened for read/write.
     file: std::fs::File,
     /// Path to the manifest file on disk.
     path: PathBuf,
-    /// Currently active root (the last successfully committed state).
-    active_root: ManifestRoot,
     /// Which slot is currently active: 0 = Root A (offset 0), 1 = Root B (offset 4096).
     active_slot: u8,
-    /// In-memory registry of tombstoned files: file_id → (tombstone_epoch, tombstoned_at).
-    ///
-    /// `tombstone_epoch` is the `active_root.epoch` at the moment `remove_file` was called
-    /// (i.e. the epoch of the root that will be committed next, which equals current + 1
-    /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
-    /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
-    tombstone_registry: HashMap<u64, (u64, Instant)>,
     /// Set when `compact()` rewrote+renamed the manifest durably but then failed
     /// to reopen `self.file` against the new inode. The old handle now refers to
     /// the pre-rename (orphaned) inode, so writing through it would silently
-    /// discard every subsequent commit. While set, `commit()` reattaches to
+    /// discard every subsequent commit. While set, `persist()` reattaches to
     /// `self.path` BEFORE writing (or fails loudly if that reopen also fails).
     needs_reopen: bool,
     /// Test-only fault injection: when true, `compact()` simulates the
@@ -310,6 +347,37 @@ pub struct ShardManifest {
     /// recovery path without needing real fd/permission failures.
     #[cfg(test)]
     fail_compact_reopen: bool,
+}
+
+/// Where a [`ShardManifest`]'s file I/O runs.
+#[derive(Debug)]
+enum IoBackend {
+    /// Commits persist synchronously on the calling thread (the historical
+    /// behavior; used by recovery, tests, and every non-shard-loop caller).
+    Inline(ManifestIo),
+    /// Commits are shipped to the per-shard manifest-sync thread; deferred
+    /// commits return immediately, durable commits block on an ack.
+    Deferred(crate::persistence::manifest_sync::ManifestSyncAgent),
+    /// Transient placeholder during backend swaps, and the terminal state if
+    /// the sync thread died holding the file handle. Commits fail loudly.
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub struct ShardManifest {
+    /// File-I/O backend (see [`IoBackend`]).
+    io: IoBackend,
+    /// Path to the manifest file on disk.
+    path: PathBuf,
+    /// Currently active root (the last successfully committed state).
+    active_root: ManifestRoot,
+    /// In-memory registry of tombstoned files: file_id → (tombstone_epoch, tombstoned_at).
+    ///
+    /// `tombstone_epoch` is the `active_root.epoch` at the moment `remove_file` was called
+    /// (i.e. the epoch of the root that will be committed next, which equals current + 1
+    /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
+    /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
+    tombstone_registry: HashMap<u64, (u64, Instant)>,
 }
 
 impl ShardManifest {
@@ -349,14 +417,17 @@ impl ShardManifest {
         }
 
         Ok(Self {
-            file,
+            io: IoBackend::Inline(ManifestIo {
+                file,
+                path: path.to_path_buf(),
+                active_slot: 0,
+                needs_reopen: false,
+                #[cfg(test)]
+                fail_compact_reopen: false,
+            }),
             path: path.to_path_buf(),
             active_root: root,
-            active_slot: 0,
             tombstone_registry: HashMap::new(),
-            needs_reopen: false,
-            #[cfg(test)]
-            fail_compact_reopen: false,
         })
     }
 
@@ -420,14 +491,17 @@ impl ShardManifest {
         }
 
         Ok(Self {
-            file,
+            io: IoBackend::Inline(ManifestIo {
+                file,
+                path: path.to_path_buf(),
+                active_slot,
+                needs_reopen: false,
+                #[cfg(test)]
+                fail_compact_reopen: false,
+            }),
             path: path.to_path_buf(),
             active_root,
-            active_slot,
             tombstone_registry,
-            needs_reopen: false,
-            #[cfg(test)]
-            fail_compact_reopen: false,
         })
     }
 
@@ -438,87 +512,91 @@ impl ShardManifest {
     /// 3. `sync_data()` — this is the atomic commit point
     /// 4. Flip active_slot
     pub fn commit(&mut self) -> std::io::Result<()> {
-        // A prior compaction renamed a fresh manifest into place durably but then
-        // failed to reopen our handle, so `self.file` still points at the
-        // pre-rename (orphaned) inode. Reattach to the live file BEFORE any write;
-        // writing through the stale handle would silently discard this and every
-        // later commit. If the reopen still fails, surface the error (this commit
-        // genuinely cannot be persisted) rather than losing data silently.
-        if self.needs_reopen {
-            self.file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.path)?;
-            self.active_slot = 0;
-            self.needs_reopen = false;
+        let snapshot = self.snapshot_for_commit();
+        match &mut self.io {
+            IoBackend::Inline(io) => io.persist(snapshot),
+            IoBackend::Deferred(agent) => agent.commit_durable(snapshot),
+            IoBackend::Poisoned => Err(std::io::Error::other(
+                "manifest io backend lost (sync thread died holding the handle)",
+            )),
         }
+    }
+
+    /// Commit without waiting for durability: the snapshot is handed to the
+    /// manifest-sync thread and this returns immediately (task #59). Falls
+    /// back to a synchronous inline persist when deferred sync is not
+    /// enabled, so semantics degrade to `commit()` — never to a silent no-op.
+    ///
+    /// ONLY correct for callers whose durability backstop is elsewhere (the
+    /// async-spill completion path runs exclusively under `--appendonly yes`,
+    /// where AOF replay + the orphan sweep reconstruct anything a lost
+    /// manifest commit would have recorded). Paths where the manifest IS the
+    /// durability record must call `commit()`.
+    pub fn commit_deferred(&mut self) -> std::io::Result<()> {
+        let snapshot = self.snapshot_for_commit();
+        match &mut self.io {
+            IoBackend::Inline(io) => io.persist(snapshot),
+            IoBackend::Deferred(agent) => agent.commit_deferred(snapshot),
+            IoBackend::Poisoned => Err(std::io::Error::other(
+                "manifest io backend lost (sync thread died holding the handle)",
+            )),
+        }
+    }
+
+    /// Advance the epoch and clone the root for a commit. Each snapshot is a
+    /// COMPLETE manifest state: the sync agent may coalesce a run of queued
+    /// snapshots down to the newest one with no loss.
+    fn snapshot_for_commit(&mut self) -> ManifestRoot {
         self.active_root.epoch += 1;
-        let total = self.active_root.entries.len();
-        self.active_root.file_count = total as u32;
+        self.active_root.file_count = self.active_root.entries.len() as u32;
+        self.active_root.clone()
+    }
 
-        // Entries beyond the inline cap go into append-only overflow pages.
-        // ORDER IS THE CRASH-SAFETY INVARIANT: overflow pages are appended at
-        // EOF and `sync_data`'d BEFORE the root that references them. Because
-        // the run is appended (never overwriting the currently-active slot's
-        // older overflow), a crash before the root's atomic commit leaves the
-        // previously-committed state — its root AND its overflow run — fully
-        // intact, so `open()` falls back to it. Partial loss, never corruption.
-        let inline_count = total.min(MAX_INLINE_ENTRIES);
-        let overflow = &self.active_root.entries[inline_count..];
-        let npages = overflow.len().div_ceil(ENTRIES_PER_OVERFLOW_PAGE);
-
-        let overflow_start_page: u32 = if npages > 0 {
-            let eof = self.file.seek(SeekFrom::End(0))?;
-            // The manifest is always a whole number of 4 KB pages.
-            debug_assert_eq!(eof % PAGE_4K as u64, 0);
-            let start_page = (eof / PAGE_4K as u64) as u32;
-            let mut buf = vec![0u8; npages * PAGE_4K];
-            for (pi, chunk) in overflow.chunks(ENTRIES_PER_OVERFLOW_PAGE).enumerate() {
-                Self::serialize_overflow_page(chunk, &mut buf[pi * PAGE_4K..(pi + 1) * PAGE_4K]);
-            }
-            self.file.seek(SeekFrom::Start(eof))?;
-            self.file.write_all(&buf)?;
-            self.file.sync_data()?; // overflow durable BEFORE the root points at it
-            start_page
-        } else {
-            0
-        };
-
-        self.active_root.entry_page_count = npages as u32;
-
-        let mut page = [0u8; PAGE_4K];
-        Self::serialize_root(&self.active_root, overflow_start_page, &mut page);
-
-        // Write to the inactive slot
-        let write_offset = if self.active_slot == 0 {
-            ROOT_B_OFFSET
-        } else {
-            ROOT_A_OFFSET
-        };
-
-        self.file.seek(SeekFrom::Start(write_offset))?;
-        self.file.write_all(&page)?;
-        self.file.sync_data()?; // ATOMIC COMMIT POINT
-
-        // Flip active slot
-        self.active_slot = if self.active_slot == 0 { 1 } else { 0 };
-
-        // Bound append-only growth: when the file is mostly dead overflow from
-        // superseded commits, rewrite it compactly. Best-effort — the commit is
-        // already durable, so a compaction failure must not fail the commit.
-        if npages > 0 {
-            if let Ok(file_len) = self.file.seek(SeekFrom::End(0)) {
-                let live_pages = 2 + npages as u64;
-                let live_bytes = live_pages * PAGE_4K as u64;
-                if file_len > live_bytes.saturating_mul(4) && file_len > 16 * PAGE_4K as u64 {
-                    if let Err(e) = self.compact() {
-                        tracing::warn!(error = %e, "manifest compaction failed (commit already durable)");
+    /// Move the file-I/O half onto a dedicated `manifest-sync-{shard_id}`
+    /// thread. From here on, `commit()` blocks on an ack from that thread
+    /// (unchanged durability) while `commit_deferred()` returns immediately.
+    /// Idempotent.
+    pub fn enable_deferred_sync(&mut self, shard_id: usize) {
+        let cur = std::mem::replace(&mut self.io, IoBackend::Poisoned);
+        self.io = match cur {
+            IoBackend::Inline(io) => {
+                match crate::persistence::manifest_sync::ManifestSyncAgent::spawn(io, shard_id) {
+                    Ok(agent) => IoBackend::Deferred(agent),
+                    // Degrade, don't destroy: a failed thread spawn keeps the
+                    // working inline backend (commits fsync on the shard
+                    // thread again — slow, but durable and loud about it).
+                    Err((io, e)) => {
+                        tracing::error!(
+                            shard_id, error = %e,
+                            "manifest-sync: thread spawn failed — staying inline \
+                             (manifest commits fsync on the shard thread)"
+                        );
+                        IoBackend::Inline(io)
                     }
                 }
             }
-        }
+            other => other,
+        };
+    }
 
-        Ok(())
+    /// Flush every pending deferred commit, stop the sync thread, and take
+    /// the file handle back inline so later commits (e.g. during shutdown
+    /// finalization) persist synchronously again. Idempotent.
+    pub fn shutdown_deferred(&mut self) {
+        let cur = std::mem::replace(&mut self.io, IoBackend::Poisoned);
+        self.io = match cur {
+            IoBackend::Deferred(agent) => match agent.shutdown() {
+                Some(io) => IoBackend::Inline(io),
+                None => {
+                    tracing::error!(
+                        "manifest-sync thread lost the manifest file handle; \
+                         further commits on this shard will fail"
+                    );
+                    IoBackend::Poisoned
+                }
+            },
+            other => other,
+        };
     }
 
     /// Add a file entry to the manifest (in-memory only until commit).
@@ -663,8 +741,38 @@ impl ShardManifest {
     }
 
     /// Return the currently active slot (0 = Root A, 1 = Root B).
+    ///
+    /// Only meaningful while the io backend is inline (tests, recovery); the
+    /// slot lives on the sync thread once deferred sync is enabled.
     pub fn active_slot(&self) -> u8 {
-        self.active_slot
+        match &self.io {
+            IoBackend::Inline(io) => io.active_slot,
+            IoBackend::Deferred(_) | IoBackend::Poisoned => 0,
+        }
+    }
+
+    /// Test-only: arm/disarm the compact-reopen fault injection on the inline io.
+    #[cfg(test)]
+    pub(crate) fn set_fail_compact_reopen(&mut self, armed: bool) {
+        if let IoBackend::Inline(io) = &mut self.io {
+            io.fail_compact_reopen = armed;
+        }
+    }
+
+    /// Test-only: whether the inline io is flagged for reattach.
+    #[cfg(test)]
+    pub(crate) fn needs_reopen(&self) -> bool {
+        matches!(&self.io, IoBackend::Inline(io) if io.needs_reopen)
+    }
+
+    /// Test-only: run a compaction of the current state through the inline io.
+    #[cfg(test)]
+    pub(crate) fn compact_for_test(&mut self) -> std::io::Result<()> {
+        let mut root = self.active_root.clone();
+        match &mut self.io {
+            IoBackend::Inline(io) => io.compact(&mut root),
+            _ => Err(std::io::Error::other("compact_for_test requires inline io")),
+        }
     }
 
     /// Return the path to the manifest file.
@@ -816,33 +924,132 @@ impl ShardManifest {
         }
         Some(root)
     }
+}
+
+impl ManifestIo {
+    /// Persist a complete root snapshot: append+sync its overflow run, write
+    /// the root to the inactive slot, sync (the atomic commit point), flip
+    /// slots, then opportunistically compact. This is the historical body of
+    /// `ShardManifest::commit()`, made independent of the in-RAM manifest
+    /// state so it can run on the manifest-sync thread (task #59).
+    pub(crate) fn persist(&mut self, mut root: ManifestRoot) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            TEST_PERSIST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ms = TEST_INJECT_SYNC_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if TEST_INJECT_PERSIST_ERROR.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected persist failure (test)"));
+            }
+        }
+        // A prior compaction renamed a fresh manifest into place durably but then
+        // failed to reopen our handle, so `self.file` still points at the
+        // pre-rename (orphaned) inode. Reattach to the live file BEFORE any write;
+        // writing through the stale handle would silently discard this and every
+        // later commit. If the reopen still fails, surface the error (this commit
+        // genuinely cannot be persisted) rather than losing data silently.
+        if self.needs_reopen {
+            self.file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)?;
+            self.active_slot = 0;
+            self.needs_reopen = false;
+        }
+        let total = root.entries.len();
+
+        // Entries beyond the inline cap go into append-only overflow pages.
+        // ORDER IS THE CRASH-SAFETY INVARIANT: overflow pages are appended at
+        // EOF and `sync_data`'d BEFORE the root that references them. Because
+        // the run is appended (never overwriting the currently-active slot's
+        // older overflow), a crash before the root's atomic commit leaves the
+        // previously-committed state — its root AND its overflow run — fully
+        // intact, so `open()` falls back to it. Partial loss, never corruption.
+        let inline_count = total.min(MAX_INLINE_ENTRIES);
+        let overflow = &root.entries[inline_count..];
+        let npages = overflow.len().div_ceil(ENTRIES_PER_OVERFLOW_PAGE);
+
+        let overflow_start_page: u32 = if npages > 0 {
+            let eof = self.file.seek(SeekFrom::End(0))?;
+            // The manifest is always a whole number of 4 KB pages.
+            debug_assert_eq!(eof % PAGE_4K as u64, 0);
+            let start_page = (eof / PAGE_4K as u64) as u32;
+            let mut buf = vec![0u8; npages * PAGE_4K];
+            for (pi, chunk) in overflow.chunks(ENTRIES_PER_OVERFLOW_PAGE).enumerate() {
+                ShardManifest::serialize_overflow_page(
+                    chunk,
+                    &mut buf[pi * PAGE_4K..(pi + 1) * PAGE_4K],
+                );
+            }
+            self.file.seek(SeekFrom::Start(eof))?;
+            self.file.write_all(&buf)?;
+            self.file.sync_data()?; // overflow durable BEFORE the root points at it
+            start_page
+        } else {
+            0
+        };
+
+        root.entry_page_count = npages as u32;
+
+        let mut page = [0u8; PAGE_4K];
+        ShardManifest::serialize_root(&root, overflow_start_page, &mut page);
+
+        // Write to the inactive slot
+        let write_offset = if self.active_slot == 0 {
+            ROOT_B_OFFSET
+        } else {
+            ROOT_A_OFFSET
+        };
+
+        self.file.seek(SeekFrom::Start(write_offset))?;
+        self.file.write_all(&page)?;
+        self.file.sync_data()?; // ATOMIC COMMIT POINT
+
+        // Flip active slot
+        self.active_slot = if self.active_slot == 0 { 1 } else { 0 };
+
+        // Bound append-only growth: when the file is mostly dead overflow from
+        // superseded commits, rewrite it compactly. Best-effort — the commit is
+        // already durable, so a compaction failure must not fail the commit.
+        if npages > 0 {
+            if let Ok(file_len) = self.file.seek(SeekFrom::End(0)) {
+                let live_pages = 2 + npages as u64;
+                let live_bytes = live_pages * PAGE_4K as u64;
+                if file_len > live_bytes.saturating_mul(4) && file_len > 16 * PAGE_4K as u64 {
+                    if let Err(e) = self.compact(&mut root) {
+                        tracing::warn!(error = %e, "manifest compaction failed (commit already durable)");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     /// Rewrite the manifest compactly, reclaiming dead overflow pages from
     /// superseded commits. Layout becomes `[Root A][Root B][fresh overflow]`
     /// with the active root written to BOTH slots (same epoch) so either is a
     /// valid recovery target. Crash-safe via temp-file + atomic rename: the
     /// live manifest stays valid until the rename completes.
-    fn compact(&mut self) -> std::io::Result<()> {
-        let total = self.active_root.entries.len();
+    fn compact(&mut self, root: &mut ManifestRoot) -> std::io::Result<()> {
+        let total = root.entries.len();
         let inline_count = total.min(MAX_INLINE_ENTRIES);
-        let overflow = &self.active_root.entries[inline_count..];
+        let overflow = &root.entries[inline_count..];
         let npages = overflow.len().div_ceil(ENTRIES_PER_OVERFLOW_PAGE);
 
         // Overflow starts immediately after the two root pages.
         let overflow_start_page: u32 = if npages > 0 { 2 } else { 0 };
-        self.active_root.entry_page_count = npages as u32;
+        root.entry_page_count = npages as u32;
 
         let mut buf = vec![0u8; (2 + npages) * PAGE_4K];
         for (pi, chunk) in overflow.chunks(ENTRIES_PER_OVERFLOW_PAGE).enumerate() {
             let o = (2 + pi) * PAGE_4K;
-            Self::serialize_overflow_page(chunk, &mut buf[o..o + PAGE_4K]);
+            ShardManifest::serialize_overflow_page(chunk, &mut buf[o..o + PAGE_4K]);
         }
-        Self::serialize_root(&self.active_root, overflow_start_page, &mut buf[0..PAGE_4K]);
-        Self::serialize_root(
-            &self.active_root,
-            overflow_start_page,
-            &mut buf[PAGE_4K..2 * PAGE_4K],
-        );
+        ShardManifest::serialize_root(root, overflow_start_page, &mut buf[0..PAGE_4K]);
+        ShardManifest::serialize_root(root, overflow_start_page, &mut buf[PAGE_4K..2 * PAGE_4K]);
 
         let tmp = self.path.with_extension("manifest.compact.tmp");
         std::fs::write(&tmp, &buf)?;
@@ -897,7 +1104,9 @@ impl ShardManifest {
             }
         }
     }
+}
 
+impl ShardManifest {
     /// Try to parse a root page from a 4KB buffer.
     ///
     /// Returns `None` if magic/type mismatch or CRC32C fails. Recognizes both
@@ -1006,7 +1215,7 @@ mod tests {
             page_count: 1000,
             byte_size: 4_096_000,
             created_lsn: 42,
-            min_key_hash: 0x1111_2222_3333_4444,
+            db_index: 0x1111_2222_3333_4444,
             max_key_hash: 0xAAAA_BBBB_CCCC_DDDD,
             last_modified_lsn: 4242,
         };
@@ -1029,7 +1238,7 @@ mod tests {
             page_count: 500,
             byte_size: 32_768_000,
             created_lsn: 100,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 200,
         };
@@ -1054,7 +1263,7 @@ mod tests {
             page_count: 10,
             byte_size: 40960,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 99_999,
         };
@@ -1129,7 +1338,7 @@ mod tests {
             page_count: 100,
             byte_size: 409_600,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 1,
         };
@@ -1171,7 +1380,7 @@ mod tests {
             page_count: 100,
             byte_size: 409_600,
             created_lsn: id,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: id,
         }
@@ -1243,21 +1452,21 @@ mod tests {
 
         // Simulate the race: compaction rewrote + renamed durably (data safe on
         // disk) but then failed to reopen the handle.
-        m.fail_compact_reopen = true;
-        let err = m.compact().unwrap_err();
+        m.set_fail_compact_reopen(true);
+        let err = m.compact_for_test().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(
-            m.needs_reopen,
+            m.needs_reopen(),
             "compact() must flag needs_reopen when it loses the file handle"
         );
-        m.fail_compact_reopen = false;
+        m.set_fail_compact_reopen(false);
 
         // The next commit MUST reattach to the real manifest first. Without the
         // guard this write lands in the orphaned inode and is lost on recovery.
         m.add_file(make_entry(999));
         m.commit().unwrap();
         assert!(
-            !m.needs_reopen,
+            !m.needs_reopen(),
             "commit() must clear needs_reopen after reattaching to self.path"
         );
 

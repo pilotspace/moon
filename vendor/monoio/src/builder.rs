@@ -33,7 +33,6 @@ scoped_thread_local!(pub(crate) static BUILD_THREAD_ID: usize);
 
 impl<T> Default for RuntimeBuilder<T> {
     /// Create a default runtime builder
-    #[must_use]
     fn default() -> Self {
         RuntimeBuilder::<T>::new()
     }

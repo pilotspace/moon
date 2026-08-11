@@ -120,10 +120,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -185,20 +186,20 @@ fn info(s: &mut TcpStream) -> String {
         let n = s.read(&mut buf).expect("read INFO");
         assert!(n > 0, "connection closed during INFO");
         acc.extend_from_slice(&buf[..n]);
-        if expected_total.is_none() {
-            if let Some(pos) = acc.windows(2).position(|w| w == b"\r\n") {
-                assert_eq!(acc[0], b'$', "INFO must be a bulk string");
-                let len: usize = std::str::from_utf8(&acc[1..pos])
-                    .expect("utf8 len")
-                    .parse()
-                    .expect("bulk len");
-                expected_total = Some(pos + 2 + len + 2);
-            }
+        if expected_total.is_none()
+            && let Some(pos) = acc.windows(2).position(|w| w == b"\r\n")
+        {
+            assert_eq!(acc[0], b'$', "INFO must be a bulk string");
+            let len: usize = std::str::from_utf8(&acc[1..pos])
+                .expect("utf8 len")
+                .parse()
+                .expect("bulk len");
+            expected_total = Some(pos + 2 + len + 2);
         }
-        if let Some(t) = expected_total {
-            if acc.len() >= t {
-                break;
-            }
+        if let Some(t) = expected_total
+            && acc.len() >= t
+        {
+            break;
         }
         assert!(Instant::now() < deadline, "INFO read timed out");
     }

@@ -34,12 +34,7 @@ fn redis_cli_available() -> bool {
 /// 30s accept timeout with no obvious cause). See
 /// `gotcha_orbstack_macho_binary_trap`.
 fn release_binary() -> std::path::PathBuf {
-    if let Ok(bin) = std::env::var("MOON_BIN") {
-        if !bin.trim().is_empty() {
-            return std::path::PathBuf::from(bin);
-        }
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    common::find_moon_binary()
 }
 
 /// Running moon instance. Auto-killed on drop.
@@ -47,14 +42,17 @@ struct Moon {
     child: Child,
     port: u16,
     admin_port: u16,
-    tmp_dir: std::path::PathBuf,
+    /// RAII tempdir (test-hygiene sweep): random unique name, removed on
+    /// drop (after the child is killed in `Drop` above the field drop).
+    /// The old pid-only name resurrected stale dirs after a crashed run
+    /// once the pid was reused, reloading stale persistence state.
+    _tmp_dir: tempfile::TempDir,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
@@ -72,8 +70,7 @@ fn spawn_moon() -> Option<Moon> {
         return None;
     }
     let admin_port = common::reserve_port();
-    let tmp_dir = std::env::temp_dir().join(format!("moon-test-prom-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
     let (child, port) = common::spawn_listening(|port| {
         Command::new(&bin)
             .args([
@@ -86,7 +83,7 @@ fn spawn_moon() -> Option<Moon> {
                 "--appendonly",
                 "no",
                 "--dir",
-                tmp_dir.to_str().unwrap(),
+                tmp_dir.path().to_str().unwrap(),
                 "--disk-offload",
                 "disable",
             ])
@@ -99,7 +96,7 @@ fn spawn_moon() -> Option<Moon> {
         child,
         port,
         admin_port,
-        tmp_dir,
+        _tmp_dir: tmp_dir,
     };
 
     // Wait up to ~5s for PING to succeed.
@@ -156,16 +153,16 @@ fn parse_memory_bytes(body: &str) -> HashMap<String, f64> {
             continue;
         }
         // Match: moon_memory_bytes{kind="<label>"} <value>
-        if let Some(rest) = line.strip_prefix("moon_memory_bytes{kind=\"") {
-            if let Some(close) = rest.find('"') {
-                let kind = &rest[..close];
-                // After `"}` there is `} <value>`
-                let after = &rest[close..];
-                if let Some(space) = after.find(' ') {
-                    let val_str = after[space..].trim();
-                    if let Ok(val) = val_str.parse::<f64>() {
-                        map.insert(kind.to_string(), val);
-                    }
+        if let Some(rest) = line.strip_prefix("moon_memory_bytes{kind=\"")
+            && let Some(close) = rest.find('"')
+        {
+            let kind = &rest[..close];
+            // After `"}` there is `} <value>`
+            let after = &rest[close..];
+            if let Some(space) = after.find(' ') {
+                let val_str = after[space..].trim();
+                if let Ok(val) = val_str.parse::<f64>() {
+                    map.insert(kind.to_string(), val);
                 }
             }
         }
@@ -229,12 +226,12 @@ fn metrics_endpoint_emits_ten_memory_kinds() {
         if let Some(body) = scrape_metrics(m.admin_port) {
             last_body = body.clone();
             let parsed = parse_memory_bytes(&body);
-            if let Some(&dt) = parsed.get("dashtable") {
-                if dt > 0.0 {
-                    kinds = parsed;
-                    rss_gauge = parse_rss_bytes(&body).unwrap_or(0.0);
-                    break;
-                }
+            if let Some(&dt) = parsed.get("dashtable")
+                && dt > 0.0
+            {
+                kinds = parsed;
+                rss_gauge = parse_rss_bytes(&body).unwrap_or(0.0);
+                break;
             }
         }
         thread::sleep(Duration::from_secs(2));
@@ -302,7 +299,7 @@ fn metrics_endpoint_emits_ten_memory_kinds() {
         // Wide tolerance: memory publisher and shard timer read RSS at different
         // times, and with small test workloads RSS can double between reads.
         assert!(
-            ratio >= 0.2 && ratio <= 5.0,
+            (0.2..=5.0).contains(&ratio),
             "Sum/RSS ratio {ratio:.4} is outside [0.2, 5.0] — likely broken. sum={sum}, rss={rss_gauge}"
         );
     } else {

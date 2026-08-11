@@ -760,7 +760,7 @@ fn geosearch_core(
 // Read-only twins for the shared-lock (dispatch_read) path
 // ---------------------------------------------------------------------------
 //
-// GEO data is stored as a sorted set: all twins use `get_sorted_set_if_alive`.
+// GEO data is stored as a sorted set: all twins use `get_sorted_set_ref_if_alive`.
 
 /// GEOPOS key member [member …] — read-only twin.
 pub fn geopos_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
