@@ -6,6 +6,747 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CI now tests the runtime Moon actually ships (`check-monoio`).** Every CI job that *executed*
+  tests did so under `--no-default-features --features runtime-tokio,…`, while Moon's default
+  feature set — and what ships on Linux — is `runtime-monoio`. 26 monoio integration test files and
+  30 monoio-gated `src/` files were unreachable by CI. That is how the v0.8.6 inline-GET ACL bypass
+  shipped green: it was wrong only on the monoio dispatch path, which no CI job could see. The new
+  job runs on the self-hosted Linux runner (the only place monoio's io_uring driver executes at
+  all), uses the default feature set, and invokes `cargo nextest run --profile ci` so the repo's
+  existing flake policy applies — a bare `cargo test` has no retries, and an intermittently-red
+  required job gets disabled, which is worse than no job because it still looks like coverage.
+  Measured before landing: **5145 passed, 1 flaky, 244 skipped, exit 0, 80.3s**.
+
+  Proven by negative control rather than asserted: a deliberate defect on the monoio-only
+  `try_inline_dispatch` path **passes** the tokio suite 6/6 and **fails** the new job 3/6.
+  `tests/ci_covers_monoio.rs` guards the job against being silently weakened — wrong feature set,
+  `continue-on-error`, a bare `cargo test`, or a shared `CARGO_TARGET_DIR` all fail the suite.
+
+  The job's first cut proved the premise but not the driver: `MOON_NO_URING: "1"` lived in the
+  workflow-level `env:`, which merges into every job and cannot be unset by one, so the job whose
+  whole point is io_uring ran with io_uring force-disabled. `monoio_yield_overhead_is_microscopic`
+  caught it at 1.45ms/yield (the `sleep(ZERO)` timer-park signature). That variable is now per-job,
+  and `ci_covers_monoio.rs` asserts **both** scopes. The guard suite itself then failed on
+  Windows — it matched `"\n  <job>:\n"` against a CRLF checkout — so it now normalizes line
+  endings and carries a platform-independent CRLF regression test (Windows is skipped on every
+  PR, so that class is invisible until a main push).
+
+- **Client-compat harness: raw-RESP diff against a real `redis-server`
+  (`scripts/test-client-compat.sh`).** Moon's existing Redis comparison
+  (`scripts/test-commands.sh`) goes through `redis-cli`, which renders replies
+  to text before any assertion can see them — it even strips `(integer) ` — and
+  never sends `-3`, so the entire RESP3 surface was uncompared. That blindness
+  is why ~22 type-level compatibility defects survived into v0.8.5. The new
+  harness speaks RESP on a raw socket and compares in a fixed order — TYPE, then
+  SHAPE, then VALUE — across the full {RESP2, RESP3} × {standalone, MULTI/EXEC,
+  pipeline} matrix, so a finding says which of the three diverged and whether a
+  reply changes shape by context. A missing `redis-server` FAILS
+  (`ERR_NO_ORACLE`) rather than skipping. New CI job `client-compat` on the
+  self-hosted runner; the manifest carries a recorded baseline of reasoned
+  waivers so the job is a ratchet — a new divergence fails it, and `--strict`
+  fails the moment a waived divergence is fixed and its waiver goes stale.
+  First full run vs Redis 8.6.1: 152 comparisons, 94 pass, 58 waived, plus 34
+  named missing `INFO` fields via `--info-manifest`.
+
+### Security
+- **ACL bypass on the inline GET fast path (monoio runtime).** An
+  authenticated but restricted user could read any key with plain `GET`:
+  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
+  map, running neither the ACL command check nor the ACL key-pattern check.
+  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
+  its pattern; no ACL LOG entry was produced. Writes were already gated on
+  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
+  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
+  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
+  suite); `--shards 1` — the config recommended for non-pipelined workloads —
+  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
+  so a restricted connection falls through to generic dispatch where both ACL
+  checks run. The tokio handlers were never affected (they gate correctly at
+  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
+  caught this: every CI test job builds tokio. New suite:
+  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
+  `--shards 1` and `--shards 4`).
+
+### Fixed
+- **RESP3 reply types now match Redis, and no longer change with the calling
+  context.** A live sweep against `redis-server` 8.6.1 found the conversion
+  table wrong in both directions and, structurally, unable to be right: it keyed
+  only on the command NAME, while `WITHSCORES`, `WITHVALUES` and a `<count>`
+  argument are what actually decide the reply shape. `ZRANGE … WITHSCORES`
+  arrived as a flat array of bulk strings instead of pair-wrapped `[member,
+  Double]` — enough to make an unmodified redis-py raise
+  `ValueError: not enough values to unpack`, so every RESP3 application using
+  sorted-set scores was broken outright. `HRANDFIELD WITHVALUES` and
+  `ZRANDMEMBER WITHSCORES` answered a Map where Redis answers an array of pairs.
+  In the other direction the server over-converted: all seven of `SISMEMBER`,
+  `HEXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `SETNX` and `MSETNX` returned
+  Boolean where Redis returns Integer, and `INCRBYFLOAT`/`HINCRBYFLOAT` returned
+  a lossy Double (`,10.6`) where Redis returns the exact Bulk
+  `"10.59999999999999964"`.
+
+  The conversion is now decided by `(command, args)` at one policy choke point
+  (`Resp3Shape` in `src/protocol/resp3.rs`) instead of by 11 call sites across
+  three handlers. Because the cross-shard reply loop no longer has the command's
+  args by the time its batch returns, the shape is classified at ENQUEUE time
+  and the 1-byte `Copy` tag travels in `RemoteMeta` — no per-command allocation
+  on the shard hot path. `execute_transaction_sharded` now takes the connection's
+  protocol version and converts each inner reply with its own command, so a
+  command answers the same shape standalone, inside `MULTI/EXEC` and inside a
+  pipeline; previously `SMEMBERS` was a Set outside a transaction and a flat
+  Array inside one. `CONFIG GET` (Map) and `CLIENT INFO` (Verbatim) are fixed at
+  their intercepts, which short-circuit the dispatch exit entirely — the reason
+  `CONFIG` could never be fixed before. Also added: `ZMSCORE` and `GEOPOS`
+  Doubles with Null preserved, `SPOP <count>` as a Set, `ZPOPMIN`/`ZPOPMAX`
+  Double scores (flat with no count, wrapped with one), and `XINFO STREAM` as a
+  Map.
+
+  Emptiness no longer changes the reply type either: `HGETALL` and `CONFIG GET`
+  on a miss answered `*0` where Redis answers `%0`, so a client dispatching on
+  the type byte broke on exactly the path it hits most. Every case in the
+  harness populated its key first, which is how that survived a full green run —
+  five miss-path cases were added so it stays diffed against the live oracle.
+
+  RESP2 is byte-identical — pinned by a test written before the fix. Harness
+  result vs Redis 8.6.1: **157 pass / 0 fail / 25 waived**, up from 98 / 0 / 54,
+  with all 13 now-stale waivers deleted and `--strict` green. New suite
+  `tests/resp3_type_fidelity.rs` (13 tests) asserts the wire type byte directly.
+  Known remainder, waived and reasoned: `XINFO STREAM` is now the right TYPE but
+  still reports 7 fields to Redis's 16 — the missing ones need real stream
+  bookkeeping and are tracked separately rather than fabricated.
+- **A key whose disk-offload spill was in flight was invisible to the whole
+  server — `DEL` on it was silently undone (#459).** `evict_one_async_spill`
+  freed the hot entry the moment the `SpillRequest` was queued, and the key
+  was only registered in `cold_index` when the completion landed. In between
+  it existed in no plane the database consults: `spill_inflight` held only a
+  request id and was read solely by the completion path. The eviction code
+  documented the window as an acceptable "brief read-miss" backstopped by the
+  AOF — but the AOF backstops *durability*, not *visibility*, and nothing
+  considered a write landing inside the window. Measured on 400 × 4 KiB keys
+  against a 512 KiB cap: `DBSIZE` answered 124 for 400 acked keys and then
+  climbed to 400 on its own; `GET`/`EXISTS` denied live keys that returned
+  unaided 250 ms later; and 277 of 400 `DEL`s answered `:0` and were then
+  reversed by the completion — which publishes into `cold_index`
+  unconditionally, so those resurrections reached the manifest and survived
+  restart. A client that deleted data got it back.
+
+  `spill_inflight` is now a real third storage plane carrying the payload
+  (the same refcounted `Bytes` the queued request already pins — a refcount,
+  not a copy, and no extra peak memory). Reads promote from it with no disk
+  read at all, across all three dispatch paths (`promote_cold_if_present` for
+  collections and Lua/MULTI, the monoio async GET pre-warm, and the inline
+  `GET` fast path). `EXISTS`/`DEL` count it, `DBSIZE`/`logical_len` count it,
+  and `KEYS`/`RANDOMKEY` enumerate it. `DEL`, an overwriting `SET`, and a
+  promoting read each retire the record, which withdraws the completion's
+  authorization to publish — that is what makes a delete inside the window
+  final. Unpublished completions are counted as `spill_completion_superseded`
+  in INFO. Non-spilling servers pay one `is_empty()` load on the affected
+  paths. Known remaining gap, documented at the call site: `SCAN`'s ordered
+  cursor does not merge the unordered in-flight plane, so it may skip a key
+  for the milliseconds its spill is queued — within SCAN's contract, unlike
+  `KEYS`.
+- **`GET` inside `MULTI` was executed instead of queued (monoio).** Third
+  defect from the same ungated inline read path, and the one most visible to a
+  working client: `MULTI; GET k; EXEC` answered `+OK`, `$1 v`, `*0` where Redis
+  answers `+OK`, `+QUEUED`, `*1[$1 v]`. The client receives a value where it
+  expects `+QUEUED`, and then an `EXEC` that silently omits the read — a
+  redis-py/go-redis transaction returns an empty result set for an exchange it
+  believes succeeded. `can_inline_writes` already carried `!conn.in_multi`
+  (so `SET` queued correctly); `can_inline_reads` now carries it too. `MGET`,
+  not being inline-eligible, queued correctly throughout, which is what
+  isolated the path. Found by the new `scripts/test-client-compat.sh` raw-RESP
+  harness on its first run against a real redis-server. New suite:
+  `tests/multi_queues_inline_get.rs`, including controls pinning that `MGET`
+  and `SET` still queue and that a plain `GET` outside a transaction still
+  takes the fast path (measured: 2000/2000 GETs still `local_inline`, before
+  and after a completed transaction).
+- **`CLIENT TRACKING` answered `+OK` and then never invalidated (monoio).**
+  Same root cause: the inline GET path also skips
+  `tracking::invalidation::track_read_keys`, so a client-side-caching client's
+  own `GET`s were never registered and nothing ever invalidated them — the
+  cache served stale data indefinitely. At `--shards 1` this was total; at
+  `--shards 4` it depended on whether the key hashed to the reader's own
+  shard, which also made the existing `mset_invalidates_every_second_arg_key`
+  test flaky (observed failing 2 of 3 runs on 0.8.5). Reads from a connection
+  with tracking enabled now take the generic path. Deliberately gated on this
+  connection's own `tracking_state.enabled`, not the process-global
+  `tracking_active()`: only a connection's own reads populate its invalidation
+  set, so one caching client must not push every other connection off the fast
+  path.
+- **`CLIENT TRACKING ON BCAST` with no `PREFIX` never invalidated anything.**
+  Redis treats prefix-less BCAST as "invalidate me for every key", but the
+  handlers only registered broadcast interest inside
+  `for prefix in &config_parsed.prefixes`, so a prefix-less BCAST client
+  registered nothing — at any shard count, and regardless of what it read
+  (BCAST does not depend on reads). `parse_tracking_args` now normalises
+  prefix-less BCAST to the empty prefix, which `TrackingTable`'s
+  `key.starts_with(prefix)` match treats as "all keys"; one change fixes all
+  three handlers.
+
+  The default (unrestricted, non-tracking) connection keeps the inline fast
+  path byte-for-byte, verified against
+  `moon_dispatch_path_total{path="local_inline"}`: 2000/2000 GETs still
+  inlined with and without `--requirepass`, 0/2000 for restricted and
+  tracking connections.
+
+## [0.8.5] — 2026-08-08
+
+### Added
+- **Cluster mode now works on the default (monoio) runtime — v0.9 W0/C-1
+  (#405).** The cluster control plane (bus listener, gossip ticker, failover
+  election) runs on a dedicated `cluster-ctl` std thread hosting a
+  current-thread tokio runtime, on BOTH server runtimes. Before this the
+  monoio startup path never spawned the bus or the ticker: `--cluster-enabled`
+  accepted `CLUSTER MEET` but no peer ever learned anything. Under tokio the
+  control plane previously shared the listener runtime with the accept loop
+  and every connection, so gossip starved under load (observed as PFAIL
+  detection stalling); the dedicated thread fixes that too. The unused,
+  untested monoio duplicates of the bus/gossip/election code were deleted —
+  one control-plane implementation on both runtimes. New e2e suite
+  `tests/cluster_formation.rs` proves a real 3-node cluster forms via
+  MEET + gossip and flags a killed node, per runtime.
+
+### Fixed
+- **Deep-review wave (2026-08): long-uptime and large-scale correctness.**
+  Eight fix groups from a six-dimension architecture review (durability
+  ordering, long-uptime resource growth, concurrency, cluster correctness,
+  long-horizon arithmetic, silent degradation):
+  - *Eviction/metadata*: `CompactEntry` now stores a full-width u32
+    `last_access` (repurposed padding — zero size cost) and a 24-bit entry
+    version starting at 1. Fixes LFU decay that was effectively random
+    (u16/u32 domain mix truncated `as u8`), LRU inversion for idle gaps
+    beyond ~9.1h, `OBJECT IDLETIME` wrapping at 18.2h, and WATCH/EXEC's
+    8-bit version ABA (wrap now needs 16.7M writes; version 0 reliably
+    means "absent" so WATCH detects creation).
+  - *AOF everysec*: tokio deadline-fsync paths no longer swallow errors and
+    record success; all four sites (both runtimes/layouts) latch
+    `aof_last_fsync_status:ok|err` + `aof_fsync_failures` into INFO.
+  - *Spill*: a failed background spill pwrite re-inserts the already-evicted
+    key into the hot table (payload carried back in the completion) instead
+    of silently serving nil until restart; counted as
+    `spill_failed_reinserted` in INFO.
+  - *AOF rewrite prune*: the old generation is deleted only after a new
+    manifest-sync flush barrier (pending deferred ShardManifest commits
+    made durable — they relied on the old incr as their crash backstop) and
+    an explicit durable dir-fsync of the manifest flip.
+  - *CLIENT TRACKING*: the documented `max_keys` bound is enforced (evict +
+    invalidate instead of unbounded growth).
+  - *Cluster*: inline GET/SET fast path is disabled in cluster mode (was
+    bypassing MOVED/ASK entirely); election acks are now actually received
+    (read back on the request stream), epoch-bound and voter-deduped; the
+    election winner no longer claims an unvoted epoch; graceful `CLUSTER
+    FAILOVER` errors instead of permanently wedging automatic failover;
+    `ClusterState` migrated to `parking_lot::RwLock` (no poisoning, ~25
+    `.unwrap()` sites removed from the per-command path).
+  - *Fail-loud + bounds*: vector background-compaction failures now log at
+    every layer; CDC reaps disconnected subscribers on write-idle shards;
+    `TemporalRegistry` is bounded (262K bindings/shard, oldest evicted).
+- **Durability wave 1 (#452, #54): AOF rewrite-window append drops, degraded-state
+  visibility, escalated reason-DEL backpressure, and a fail-loud WAL mid-chain
+  tear policy.** (1) While a rewrite fold ran, the writer thread was out of its
+  recv loop, so under sustained pipelined writes the bounded (10k) append
+  channel saturated and acked records were dropped — lost even on a clean
+  restart, and default-on since #433 made rewrites automatic. A per-writer
+  `RewriteOverflow` spill buffer (aof_rewrite_buf equivalent; 256 MiB cap,
+  strict ordering, all six fold arms on both runtimes) now buffers the
+  overflow and drains it into the committed incr right after the fold;
+  `INFO persistence` gains `aof_rewrite_overflow_spilled`. Merge-base A/B
+  (tests/recovery_matrix_w1.rs): main lost/error-failed ~5.6k acked writes per
+  hit; fixed is exact across SIGKILL + recovery. (2) Any dropped acked append
+  now latches sticky `aof_last_append_status:err` (INFO) via a single
+  accounting helper. (3) Eviction/expiry reason-DELs get a 100× escalated
+  backpressure bound (500ms) plus a dedicated `aof_reason_del_dropped`
+  counter — a dropped reason-DEL means restart replay resurrects data clients
+  were told was gone. (4) WAL v3 replay now REFUSES to continue past a
+  corrupt record when later segments exist (mid-chain tear = on-disk
+  corruption; applying later segments silently replays operations from after
+  a hole) — `MOON_WAL_SALVAGE=1` is the explicit operator override; a torn
+  FINAL segment stays the benign crash-tail it always was.
+
+  Adversarial-review hardening round (pre-merge): the rewrite fold's
+  exactly-once contract now extends to the overflow buffer — a snapshot
+  **cut** (`mark_cut`, recorded at the fold's atomic snapshot instant)
+  splits spilled entries so a COMMITTED fold discards pre-snapshot spills
+  (their effects are in the new base; replaying them would double-apply
+  INCR/APPEND/LPUSH) while an aborted fold still writes everything.
+  Producer paths are fully gated (`spill_first` on every enqueue leg,
+  including backpressure/AppendSync parks) so mid-fold channel drains can
+  never invert same-key replay order, and the finish drain is two-phase
+  (channel before buffer, disarm under the buffer lock). Arming is
+  unwind-safe: a panicking fold disarms with drop accounting instead of
+  leaving producers spilling into a dead buffer forever. Boot paths now
+  actually ABORT (exit 70) on a fatal mid-chain tear instead of falling
+  back to legacy recovery, reason-DEL backpressure shares ONE bound per
+  eviction/expiry sweep (was one 500ms bound per victim key), and every
+  cap/shutdown drop path routes through the loss-accounting latch.
+
+- **Cluster formation actually converges (pre-existing, both runtimes).**
+  A 3-node cluster could never complete its mesh: (1) `CLUSTER MEET`'s
+  random-id placeholder was never retired when the peer's handshake arrived
+  under its real id, double-counting every met peer (`known_nodes` 5 in a
+  3-node cluster); (2) gossip sections were only consumed for PFAIL/FAIL
+  reports, so nodes MEET-ed into a common peer never learned about EACH
+  OTHER; (3) nodes adopted from rumors started with `pong_recv_ms = 0`,
+  which `check_failure_states` skips — a rumored node that died before
+  first direct contact could NEVER be marked PFAIL. Placeholders are now
+  retired on handshake (same-address, different-id), healthy rumors are
+  adopted (with self/known-address guards), and adoption stamps a freshness
+  baseline so the staleness clock always runs. Review round: `CLUSTER MEET`
+  is idempotent by ADDRESS (repeats no longer stack one placeholder per
+  call) and refuses the node's own address; a cluster-bus bind failure now
+  aborts startup loudly instead of leaving a node serving clients while
+  invisible to every peer; `--cluster-enabled` refuses ports > 55535 (bus
+  port would wrap past 65535); a `cluster-ctl` thread panic aborts the
+  process via the same hook that guards shard threads.
+- **The AOF now compacts itself (#433): Redis-parity automatic rewrite.**
+  `--auto-aof-rewrite-percentage` (default 100, `0` disables) and
+  `--auto-aof-rewrite-min-size` (default `64mb`, size strings accepted)
+  trigger a background rewrite once the AOF has grown the given percentage
+  over its size after the last rewrite. Before this, the AOF grew with write
+  volume rather than dataset size — observed 4.8 GB on disk for a 2.43 GB
+  dataset, ~1 GB/day — until the diskfull guard paused writes. A monitor
+  thread samples the on-disk size once a second and dispatches the same
+  entry point as `BGREWRITEAOF`; a failed dispatch backs off 60 s instead of
+  hot-retrying. Both knobs appear in `CONFIG GET`.
+- **Multi-shard `BGREWRITEAOF` is un-gated.** The per-shard fan-out rewrite
+  (cooperative snapshot + synchronized manifest commit) is now the default —
+  the historical gate dated from a pre-C4 design that lost ~38% of keys, and
+  the current path holds exact INCR recovery across a rewrite straddling a
+  live write stream plus SIGKILL (crash matrix, 5/5 repeat runs).
+  `--experimental-per-shard-rewrite` is deprecated (warns, no-op).
+
+### Fixed
+- **Test-hygiene sweep: pid-only temp dirs + timing-race asserts.** Eight
+  spawn sites across six integration suites named their data dirs by pid
+  only, so a crashed run's leftover dir was silently resurrected once the
+  pid was reused — the server then reloaded stale persistence state and the
+  suite failed on ghosts (the documented stale-reload trap). All eight now
+  use `tempfile` (RAII where a single owner exists; unique `keep()` dirs
+  where the restart flow shares one dir between two server handles).
+  `parked_idle_parity` additionally gets deadline-polled asserts: CLIENT
+  KILL's registry removal is polled instead of read once (the CI
+  assert-too-soon race that fired 3/3 on a starved 2-vCPU runner),
+  connects retry against a listening-but-backlogged server, and read
+  deadlines widened 10s→30s (deadline-bound — green runs are unaffected).
+  The `client_tracking_invalidation` multikey second-key push flake is
+  product-side, not harness-side, and is now tracked as #448.
+- **Central accept loop no longer head-of-line blocks on one wedged shard
+  (#438 F3).** Every central-listener delivery (tokio plain/TLS, monoio
+  plain/TLS — the monoio sends were *synchronous*, stalling the whole
+  listener thread) previously blocked on the routed shard's bounded conn
+  channel; one shard wedged at its 4096-conn cap froze accepts for every
+  other shard. Deliveries now `try_send` and rotate to the next shard with
+  room; only when every shard's channel is full does the loop fall back to
+  the blocking send (server-wide saturation, where back-pressure is
+  correct).
+- **Connection-migration fds can no longer leak (#438 F4).**
+  `MigrateConnectionPayload` carried the socket as a raw `i32` with no drop
+  semantics: a migration message still queued when a shard shut down — or
+  drained but never spawned — leaked the fd and stranded the client on a
+  connection no task would ever serve. The payload now owns the socket as an
+  `OwnedFd` end to end (producer → SPSC ring → pending-migrations queue →
+  target-shard spawn), so every undelivered path closes the socket and the
+  client sees a FIN. Three `unsafe from_raw_fd` blocks became safe
+  ownership conversions in the process. (Resumed-parked connections remain
+  deliberately `can_migrate:false`; rationale documented at the spawn site.)
+- **Migrated connections now carry the real `requirepass` (#438 F5, sec
+  L3).** The target-shard `ConnectionContext` was built with
+  `requirepass: None`; the session's auth state was unaffected (it travels
+  in `MigratedConnectionState`), but a later `AUTH` on a migrated
+  connection wrongly answered "no password is set", and any future code
+  deriving auth from the context would have failed open.
+- **Unauthenticated connections never task-park (#438 F6, sec L2).** On an
+  auth-enabled server, a client could open sockets and never authenticate
+  nor speak; each one downshifted and task-parked into the ~3.3 KB watcher
+  state, letting an attacker hold a maxclients-worth of silent connections
+  indefinitely at near-zero cost. Pre-AUTH connections now stay un-parked
+  (full handler task — visible in monitoring, still reaped by `timeout N`);
+  no-auth servers are unaffected.
+- **Idle-park cancel provenance + registry counter hygiene (#438
+  conn-secondary).** A bare `ECANCELED` (errno 125) from any non-sweep
+  source was indistinguishable from the idle sweep's cancel and re-parked
+  the connection — for a dead fd that is a permanent park→wake→park spin at
+  100% CPU. Park arms now require the sweep/drain to have marked the slot
+  (`was_swept_cancel`, consume-once) before treating 125 as a park signal.
+  Separately, a re-register over a still-present client id double-counted
+  `TOTAL_CLIENTS`/shard gauges permanently (skewing `shard_overloaded`
+  routing); `register` now balances against the replaced entry and the
+  `kept_registration` miss-arm logs the invariant violation loudly. (The
+  third secondary finding — `timeout` read once at connection setup — was
+  already fixed by the D1 chore-sweep rework, which re-reads the config
+  every second.)
+- **Graceful shutdown now drains connections (#438 F1, conn#8).** On
+  SIGTERM/SIGINT each shard previously tore its runtime down the moment its
+  event loop observed the cancellation, dropping every pending connection
+  task mid-poll: in-flight replies were truncated and the blocking/subscriber
+  shutdown arms (`-ERR server shutting down`) never ran — measured 19/50
+  BLPOP-blocked clients losing their shutdown reply on Linux io_uring
+  (macOS passed only by scheduler luck). Shards now run a bounded drain
+  before persistence teardown: parked stage-1/2 reads are woken through
+  their cancellers (re-fired per tick to close the re-park race), token arms
+  cover the tracking/subscriber/blocking parks, and the loop waits for the
+  shard's live connection tasks to exit through the normal flush+FIN
+  epilogue, up to a 5 s ceiling so a wedged peer cannot hold up shutdown.
+  Writing the drain's red test surfaced a second, tokio-only leak in the
+  same class: connections accepted by the CENTRAL listener were io-bound to
+  the MAIN runtime's driver (tokio io resources bind at creation), so their
+  reads/writes died with main's runtime no matter what the shard drained —
+  with SO_REUSEPORT splitting accepts roughly evenly, about half of all
+  tokio connections failed their final writes with "A Tokio 1.x context was
+  found, but it is being shutdown". Forwarded streams are now re-registered
+  with the owning shard's runtime driver at spawn (the monoio path already
+  did this by forwarding std streams).
+- **Parked-connection teardown can no longer close a reused fd out from
+  under a kill scan (#438 F2, conn#9 / sec L1).** `kill_clients`'
+  fd-liveness invariant (registry deregister strictly before fd close) held
+  in handler tasks by local-before-parameter drop order, but a task-parked
+  connection's watcher co-owned guard and stream as future upvars, whose
+  drop order is merely capture order — and the F1 drain makes dropping that
+  future a routine path. Both are now wrapped in a `ParkedSession` whose
+  hand-written `Drop` deregisters before closing, with the invariant
+  restated at the kill site.
+- **Remotely-triggerable shard-thread crash on pipelined batch tails
+  (#438 follow-on).** On any `--shards >= 2` deployment, one pipelined write
+  shaped `[<remote-key cmd>…, SUBSCRIBE|BLPOP|…]` aborted the whole server:
+  the early-flush arm flushed the remote commands' placeholder replies,
+  cleared the response vec, and the batch-end remote-reply drain then
+  indexed into it out of bounds — shard-thread panic, process abort (both
+  runtimes). Early-flush commands (blocking / SUBSCRIBE / PSUBSCRIBE /
+  PSYNC) now defer themselves and the unconsumed batch tail to the next
+  iteration when remote-slotted work is pending, so every prior reply
+  resolves and flushes first.
+- **Migration no longer discards MULTI / subscriptions latched mid-batch
+  (#438 D4).** The affinity sampler latched `migration_target` mid-batch,
+  but migration executed at batch end with no re-check — a tail like
+  `[…GETs, MULTI, SET]` migrated with the transaction queued and
+  `MigratedConnectionState` carries none of that state (queued txn
+  discarded, EXEC answered `-ERR EXEC without MULTI`; a tail SUBSCRIBE was
+  orphaned). `ConnectionState::migration_eligible()` (not in MULTI, no
+  cross-store txn, no subscriptions, no CLIENT TRACKING, not a replica) is
+  now evaluated at BOTH the latch and the batch-end execution point; an
+  ineligible batch end keeps the latch and migrates at the first clean one.
+- **Migrated connections no longer stall on their carried remainder.** A
+  resumed migrated handler received the source's unparsed bytes in its read
+  buffer but awaited a fresh socket read before parsing them — a pipelined
+  tail crossing a migration sat unanswered until the client happened to
+  send more. The resumed handler now parses the carried remainder
+  immediately.
+- **The parsed batch tail after SUBSCRIBE/blocking is no longer swallowed.**
+  `[SUBSCRIBE ch, PING]` in one pipelined write silently dropped the PING
+  (the frame iterator discarded the remainder on break); the tail is now
+  re-encoded and carried into the next iteration (subscriber mode answers
+  it in order).
+- **`INFO persistence` reports real AOF state (#432).** `aof_enabled` and
+  `aof_rewrite_in_progress` were hardcoded `0` even with `--appendonly yes`
+  (the default) and a rewrite running; they now reflect reality, and new
+  `aof_base_size` / `aof_current_size` fields expose the growth the
+  auto-rewrite trigger acts on — an operator can finally see the
+  AOF-vs-dataset ratio the diskfull incident hid.
+- **The per-shard BGREWRITEAOF crash matrix no longer reports phantom data
+  loss on nearly-full hosts.** The harness lacked `--disk-free-min-pct 0`
+  and parsed `MOONERR diskfull` INCR rejections as silently-dropped writes
+  (the host root volume hovers at ~4% free, making it intermittent). The
+  suite now disables the guard, panics on any non-numeric INCR reply, and is
+  green 5/5 consecutive runs.
+- **Replicas now apply streamed `SWAPDB` (#386), and the record reaches the
+  wire exactly once per client call.** Two stacked defects: (1) the replica's
+  apply path had no SWAPDB intercept — generic dispatch hard-errors ("must be
+  issued at the connection handler level") and the error was only logged, so
+  every streamed SWAPDB silently no-op'd and the replica served pre-swap data
+  for both databases until a full resync; (2) a multi-shard master emitted the
+  record once per REMOTE shard leg and never for the coordinator's own leg —
+  against today's single merged replica stream that means N−1 swaps, a net
+  no-op whenever N−1 is even (e.g. `--shards 3`). The coordinator now emits
+  the replication record exactly once, after the durability gate and the
+  local swap (an aborted SWAPDB can never ship to replicas); remote SPSC legs
+  keep their per-shard AOF/WAL writes but stay off the replication plane; the
+  tokio single-shard handler emits it too. Replicas apply it with the same
+  slice-split swap as WAL replay, skipping (with a warning) indexes outside
+  their own `--databases` range instead of poisoning the stream.
+  (c10k E1/E3), and cross-shard reply awaits are bounded (E4).** PUBLISH
+  fan-out (immediate, batched, and EXEC-queued) and SCRIPT LOAD propagation
+  used a single `try_push` — a transiently-full ring lost the message with no
+  log or metric: subscribers on that shard silently missed the publish, or its
+  script cache diverged (NOSCRIPT for a sha the server had just returned).
+  All five sites now retry with the same bounded, shutdown-aware backpressure
+  as the command dispatch path, and a final give-up is loud
+  (`moon_xshard_fanout_drop_total`). Reply awaits on the slotted dispatch and
+  publish paths — previously unbounded, so one wedged shard could hang a
+  client task forever — now share the coordinator's 30 s bound: publish counts
+  degrade (under-report, counted by `moon_xshard_reply_timeout_total`), while
+  a slotted-dispatch timeout errors the batch and closes the connection,
+  because the per-connection reply slot cannot be safely reused after an
+  abandoned await. Rehydrated connection handlers (park wake / migration)
+  also start with 512 B I/O buffers instead of 3×8 KiB, shrinking the memory
+  spike of fleet-synchronized wakes; buffers grow back on first real traffic
+  (c10k D3).
+
+### Added
+- **`INFO memory` can now explain a `used_memory`-vs-RSS gap.** Build with
+  `--features jemalloc-stats` and `INFO memory` reports Redis's `allocator_*`
+  fields: `allocator_allocated`, `allocator_active`, `allocator_resident`,
+  `allocator_retained`, `allocator_frag_bytes`, `allocator_frag_ratio`, and
+  `allocator_unreturned_bytes`. `active - allocated` is fragmentation,
+  `resident - active` is dirty pages jemalloc holds but has not returned, and
+  anything the OS charges beyond `resident` belongs to something other than the
+  allocator. Motivated by a real instance reporting `used_memory` 2.43 GB while
+  the OS charged it 7.3 GB (7.2 GB of that swapped) with no way to tell which.
+  OFF by default — jemalloc's stats add bookkeeping to every allocation. Fields
+  are absent rather than zero-filled when not built in, because a zero would
+  read as "no fragmentation", which is worse than "not measured".
+- **`INFO clients` reports `parked_clients`.** How many connections are
+  currently held only by a task-exit park watcher — real operational
+  visibility into how much of the fleet is actually parked, and a direct
+  signal for tests instead of inferring parking from process RSS.
+
+### Known issues
+- **An idle moon may not return freed memory to the OS on Apple platforms, and
+  there is no in-process fix.** jemalloc's `background_thread` is compiled out
+  when `abi == macho` (`JEMALLOC_BACKGROUND_THREAD` is only defined otherwise),
+  so the `background_thread:true` moon bakes into its malloc conf is a silent
+  no-op there and decay runs only as a side effect of allocator activity. The
+  same 384 MiB churn-and-free reclaimed to a 3.7 MiB physical footprint on one
+  Apple Silicon machine and retained all 386 MiB indefinitely on a GitHub macOS
+  runner, so the behaviour varies by machine. A `--memory-decay-interval-ms`
+  timer calling `mallctl("arena.4096.decay")` — the same call jemalloc's own
+  background thread makes — was implemented and then **removed after it failed
+  to reclaim anything on the runner that reproduces the retention**, across 30
+  seconds of driving it and three independent retries, while the ctl itself
+  returned success. Production targets Linux, where the background thread is
+  compiled in and the retention has not been observed; on macOS, build with
+  `--features jemalloc-stats` and watch `allocator_unreturned_bytes` to tell
+  whether a given host is affected.
+
+### Security
+- **One byte made a connection invisible to the idle sweep (c10k D2).** The
+  stage-2 park predicate required an EMPTY `read_buf`, so a single `*` — the
+  first character of every RESP array — kept it non-empty permanently, made the
+  connection unparkable, and dropped it into the handler's UNREGISTERED plain
+  read. Nothing on that path carries a sweep handle, so the connection held its
+  full stage-2 working set for as long as the attacker left the socket open,
+  with no authentication and no further traffic. One byte and one socket per
+  connection; at 1M connections roughly 10-15 GB that no amount of idle time
+  reclaims. Unparsed input no longer blocks a park: the remainder is carried in
+  `read_buf_remainder` and re-parsed on resume, exactly as a migrating
+  connection already did. Deliberately NOT capped — `read_buf` is already
+  bounded by `client_query_buffer_limit`, and a second threshold would only
+  move the attack past it (send 513 bytes instead of 1). A pending `write_buf`
+  still blocks the park, because a reply the client is owed is carried nowhere
+  and would be silently dropped.
+
+- **Reply writes were unbounded — a client that stops reading held the whole
+  reply forever (c10k C1).** `write_all` on a socket whose receive window is
+  closed never returns. A client could pipeline a large response and then
+  simply stop reading, parking the handler inside that write while it held the
+  ENTIRE serialized reply — the monoio handler coalesces a whole batch into one
+  `Bytes` before its single write syscall, so a deep pipeline is hundreds of MB
+  — plus its `maxclients` slot, for as long as the attacker cared to wait. N
+  such clients is an OOM that costs the attacker nothing: no reads, no CPU,
+  just a TCP window it refuses to open. New `--client-write-timeout-ms`
+  (default `60000`, `0` = the previous wait-forever behaviour) bounds every
+  reply-carrying write in all three handlers — monoio top-level, sharded, and
+  the tokio single-shard `Framed` path — closing the connection and dropping
+  the reply when a write makes no progress for that long. 60s is far beyond any
+  healthy client's stall and replication does not use this path (PSYNC hijacks
+  the connection before it), but operators streaming very large replies over
+  very slow links should raise it: the budget covers the whole write call, not
+  each byte. Verified at 1 and 4 shards on both runtimes, with the `0` case as
+  a differential control proving the mechanism rather than the harness
+  (`tests/write_timeout.rs`). **Unverified on Windows**: the tests need the
+  server's write to actually block, and two attempts to force that under
+  Winsock failed (a 25 MB reply was absorbed by send/receive autotuning, and
+  clamping the victim's `SO_RCVBUF` to 8 KiB did not change it), so they are
+  skipped there rather than weakened until they pass. The code path is shared
+  and compiles on Windows, but nothing proves the timeout fires; Windows is not
+  a target platform (Linux and macOS are).
+- **`CLIENT LIST` reported `obl=0 oll=0 omem=0` unconditionally (c10k C1).**
+  The held-output counters were hardcoded, so an operator watching a
+  slow-client output-buffer OOM in progress saw every client reporting zero
+  bytes held — the attack above left no trace anywhere. `obl`/`omem` now report
+  the reply bytes a connection has in an in-flight write, and `tot-net-out`
+  counts reply bytes that actually reached the peer. `oll` stays 0: moon has
+  one contiguous output buffer, not Redis's static-buffer + reply-list pair, so
+  there is no list whose length it could report. Wired in the two handlers that
+  own a client-registry entry (monoio top-level and sharded); the legacy tokio
+  `handler_single` path bounds its writes but does not register, so it has
+  nothing to report through.
+- **No size ceiling on a reply (c10k C1).** Adds
+  `--client-output-buffer-limit-normal`, Redis's
+  `client-output-buffer-limit normal <hard>`, and ships it at **256 MiB rather
+  than Redis's unlimited default** — that default is exactly why an unread
+  socket can OOM Redis too. A reply exceeding the cap is refused and the
+  connection closed instead of buffering it. Consequence, intended and worth
+  knowing: the cap covers the whole serialized reply, so a single value larger
+  than the cap is undeliverable, not merely a long pipeline. No pub/sub-class
+  knob ships: moon's only subscriber write is already hard-capped at 64 KiB by
+  `MAX_COALESCE_BYTES`, so such a knob could never fire, and the real pub/sub
+  backpressure is the 4096-slot bounded channel (`CONN_CHANNEL_CAPACITY`) —
+  which bounds message COUNT, not bytes, and is a genuine follow-up.
+- **The write watchdog no longer arms on the hot path.** A timer per batch
+  flush would land once per command at pipeline depth 1, the path this project
+  spent a milestone winning against Redis. A reply that fits in the socket
+  buffer cannot block, so only writes ≥ 256 KiB arm the watchdog now
+  (`util::arm_write_timeout`). Residual, stated rather than hidden: a small
+  write to a genuinely wedged socket is still unbounded — it holds at most
+  256 KiB instead of hundreds of MB, but keeps its `maxclients` slot. It is now
+  visible (`omem` > 0) and killable (`CLIENT KILL` shuts the fd down), which it
+  was not before.
+- **Privileged commands ran BEFORE the ACL permission check (c10k B1).**
+  Both connection handlers intercepted `EVAL`/`EVALSHA`/`SCRIPT`, `ACL`, and
+  `CLUSTER` above the ACL gate, and each intercept `continue`s on a match, so
+  the gate below it never ran — even though the comment attached to that gate
+  claimed it "must run before any command-specific handlers ... so that
+  low-privilege users cannot reach admin commands". Any authenticated account
+  could escalate to full admin: a user holding nothing but `~app:* +get` was
+  correctly refused a plain `SET` yet could run
+  `ACL SETUSER evil on nopass ~* +@all` (persisted), `CONFIG SET` (persisted),
+  arbitrary Lua via `EVAL`, `SCRIPT LOAD`, `REPLICAOF` and `BGSAVE`. The gate
+  now sits above every privileged intercept in both handlers, with `AUTH` and
+  `HELLO` lifted above it as Redis's `NO_AUTH` commands. Verified end-to-end at
+  1 and 4 shards (`tests/acl_privileged_intercepts.rs`).
+- **Unknown ACL users failed OPEN (c10k B2).** All three permission checks
+  started with `users.get(username)?`, and `None` is their "allowed" answer, so
+  a username missing from the table was granted everything. Nothing closes a
+  live session when its account disappears, so `ACL DELUSER alice` / `ACL LOAD`
+  silently PROMOTED every connection alice still had open to `~* +@all`.
+  Unknown users are now denied; `default` is guaranteed present after any load
+  (`ensure_default_user`) so a server whose ACL file omits it is not bricked.
+- **`CLIENT KILL USER` was inert and `CLIENT LIST` reported `user=default` for
+  everyone (c10k B3).** The client registry captured the username once, at
+  accept time; AUTH/HELLO updated only the connection-local copy. The primary
+  incident-response lever for a compromised credential matched nothing. AUTH
+  and HELLO now publish the adopted identity to the registry, and — matching
+  Redis — `ACL DELUSER` disconnects the sessions the deleted user still holds.
+- **The experimental io_uring bridge served commands with no auth (c10k B4).**
+  `MOON_URING=1` (tokio, Linux) binds a second `SO_REUSEPORT` listener on the
+  server's own port whose accept path has no auth gate, no ACL check and no
+  client registry — so on a server with `requirepass`/`aclfile` configured the
+  kernel load-balanced roughly half of all new connections onto a listener that
+  skipped authentication entirely. The documented limitation named maxclients
+  and `CLIENT LIST`/`KILL`, not this. The bridge now refuses to arm (loudly)
+  when authentication is configured and the shard stays on the tokio path.
+
+### Fixed
+- **`FLUSHALL`/`FLUSHDB` inside `MULTI`/`EXEC` cleared one shard and reported
+  success (c10k E2).** The transactional executor runs the queued body against
+  the LOCAL slice with no fan-out, so a queued flush emptied a single shard of
+  N while `EXEC` still answered `+OK`. Measured at `--shards 4`: 45 of 64 keys
+  survived a transaction that reported the database emptied — a silent wrong
+  answer to a destructive command, typically noticed much later via a non-zero
+  `DBSIZE`. The live (non-`MULTI`) path has broadcast since D-2; the
+  transactional path now does the same. The executor records each flush and the
+  ORIGINATOR fans it out — it cannot fan out itself, being synchronous while
+  the broadcast awaits, and for a routed transaction it runs on the owner
+  shard, where broadcasting from inside that shard's own message loop risks a
+  shard-to-shard wait cycle. A failed leg replaces that entry of the `EXEC`
+  result array with an explicit partial-flush error, so a `+OK` for a flush
+  inside a transaction can be trusted exactly as on the live path. Both
+  handlers and both transaction shapes are covered, and a queued `SELECT`
+  before the flush is honoured. Cross-shard atomicity is unchanged and
+  unchangeable: a concurrent reader can still see shard A flushed before shard
+  B — `MULTI` bounds the report, not the visibility, in a shared-nothing
+  engine.
+
+- **TLS park veto samples `wants_write()` after processing, not before (c10k
+  B5).** `Stream::task_park_safe` read `wants_write()` before
+  `process_new_packets()`, which can queue outbound bytes and still return
+  `Ok` — reachable in rustls 0.23 via the TLS 1.2 renegotiation rebuff
+  (`NoRenegotiation` warning alert) — so the connection could park owing the
+  peer a reply. (The TLS 1.3 KeyUpdate variant is *not* reachable: rustls
+  defers that reply until the next outbound record; `tests/tls_park_keyupdate.rs`
+  pins the behaviour so a future rustls change is caught.)
+- **A client that disconnects while blocked is now reaped (c10k hardening
+  A1).** The infinite-wait `select!` behind `BLPOP`/`BRPOP`/`BLMOVE`/
+  `BZPOPMIN`/`BZPOPMAX`/`BLMPOP`/`BZMPOP`/`BRPOPLPUSH` had exactly two arms,
+  `reply_rx` and `shutdown` — nothing watched the socket. `BLPOP key 0`
+  followed by a disconnect therefore leaked the handler task, the
+  `WaitEntry`, the client-registry entry and the maxclients slot *forever*:
+  infinite waiters carry `deadline: None` so the deadline sweep skips them,
+  and `timeout` exempts blocked clients by design (Redis parity). A few
+  thousand throwaway connections wedged the server until restart, using one
+  unauthenticated command. The wait now also watches the peer, and a
+  vanished client tears down every registration it held (local and remote)
+  before closing. `CLIENT KILL` of a blocked client works through the same
+  path, since it closes the fd with `shutdown(2)`. Bytes a client legally
+  pipelines behind its blocking command are carried into the parse stream
+  rather than consumed and dropped — they used to wait in the kernel, so
+  the handler now skips exactly one read to drain them. **Known gap:** TLS
+  connections keep the old behaviour; the vendored monoio-rustls read loops
+  internally until rustls yields plaintext, so a post-readiness read can
+  park inside a partial record, which the cancel-free design must never do.
+- **A timed-out cross-shard `BLPOP` no longer eats the next push to that
+  key (c10k hardening A2/A3).** Two defects compounded into silent data
+  loss at `--shards > 1`. First, the tokio single-key cleanup condition
+  `is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_))`
+  parses as `(is_remote && !Null) || Error`, so on a **timeout** — where
+  the result *is* `Frame::Null` — the `BlockCancel` was never sent and the
+  owning shard kept the `WaitEntry` forever (remote entries carry
+  `deadline: None`, so the deadline sweep never reaps them). Second, when
+  a later push found that ghost waiter, every wake path popped the element
+  and then did `let _ = reply_tx.send(...)`: the receiver was long gone, so
+  the value was neither delivered, nor requeued, nor offered to the next
+  FIFO waiter — it simply vanished. Wakes now skip waiters whose client has
+  disconnected *before* touching the datastore, and restore anything popped
+  if the receiver drops in the remaining race window (including BLMOVE's
+  destination push and BLMPOP's multi-element pops, in order). The same
+  boolean bug also sent a local waiter's shutdown cleanup through
+  `target_index(shard, shard)`, which underflows to a panic on shard 0.
+- **Blocking registrations are no longer silently dropped or retried
+  forever (c10k hardening A4/A5/A6).** Cross-shard `BlockRegister` /
+  `BlockCancel` messages were pushed with a bare `try_push` (tokio) or an
+  uncapped `loop { try_push; sleep(10µs) }` with no shutdown arm (monoio).
+  A dropped `BlockRegister` drops the reply sender with it, so `BLPOP key 0`
+  returned nil at t=0 — a protocol violation; a dropped `BlockCancel` leaked
+  the owner-side waiter permanently; and the uncapped retry turned a
+  saturated owner shard into a zombie connection that also blocked graceful
+  shutdown. All four call sites now use the plane-wide bounded,
+  shutdown-aware push, notify the owning shard on success, and fail the
+  command loudly (`MOONERR blocking registration failed`) rather than
+  blocking on a key nobody is watching.
+- **`timeout N` no longer silently disables the c1M connection park.** The
+  idle timeout was enforced by a per-connection `select!` arm racing the read
+  against `sleep(timeout)`, and that arm sat FIRST in the read loop's if/else
+  chain — so setting `timeout` made the stage-1 buffer downshift, the stage-2
+  park and task-exit parking all structurally unreachable. Every connection
+  reverted from the parked footprint to its full working set, silently, in
+  exactly the deployments that use the only slowloris knob moon ships. The
+  same arm also read its config once at connection setup (so `CONFIG SET
+  timeout` never reached a live connection) and had no exemption for
+  replication links. Enforcement now runs from each shard's existing 1 s
+  chore (`client_registry::kill_idle_clients`), which needs no per-connection
+  timer and additionally reaches connections whose handler task has exited —
+  matching how Redis enforces `timeout` from `serverCron`. The registry is
+  striped by client id rather than by shard, so each shard sweeps a disjoint
+  subset of stripes: total cost stays at one full pass per second regardless
+  of shard count, instead of `O(num_shards × total_clients)`. A parked
+  connection closed by the sweep (or by `CLIENT KILL`) is now torn down by
+  its watcher directly rather than rehydrating a full handler task purely to
+  observe the kill and exit. Idle clients are closed within one sweep
+  interval of the deadline rather than exactly at it. Blocked clients,
+  subscribers and replication links are exempt, as in Redis.
+- **`CLIENT LIST`'s blocked flag was dead code.** `ClientFlags::blocked` was
+  hardcoded `false` at every call site, so a client parked in `BLPOP key 0`
+  never showed `flags=b` — and would have been treated as idle by the new
+  timeout sweep. The flag is now set for the duration of a blocking command
+  on both runtimes.
+- **Warm-tier transitions leaked their staging directory on every failure
+  (#435).** `transition_to_warm` has ~10 fallible steps between creating
+  `.segment-{id}.staging` and renaming it to its final name, and every early
+  return in that stretch abandoned the whole directory. Found on a live
+  instance: a 27 GB data directory against 2.53 GB of `used_memory`, 20 GB of
+  which was 14,499 orphaned staging directories versus 174 MB in the 94 real
+  segments — 99% of the vector store was abandoned scratch, written in a single
+  three-minute window and already survived a restart. The dot prefix kept them
+  out of `ls` and out of every `vectors/*` glob, so nothing surfaced them. A
+  `Drop` guard now covers every early return, and `sweep_orphan_staging` runs
+  at recovery for orphans no in-process guard can catch (a `kill -9` between
+  the manifest commit and the rename, or anything left by an older build). The
+  sweep is safe by construction: staging paths are produced in exactly one
+  place and read by nothing — every reader opens the final `segment-{id}` name.
+  `transition_to_warm` also removes a stale staging directory for the same id
+  before creating it, so a retry cannot inherit a previous attempt's partial
+  files.
+
 ## [0.8.4] — 2026-07-29
 
 ### Added

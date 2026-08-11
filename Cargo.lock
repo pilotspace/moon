@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "moon"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1890,6 +1890,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",

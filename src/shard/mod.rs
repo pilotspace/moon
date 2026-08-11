@@ -350,6 +350,12 @@ impl Shard {
                     total_keys += n;
                 }
                 Err(e) => {
+                    // #452.2: mid-chain tear ⇒ refuse to boot.
+                    if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                        crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(
+                            self.id, &e,
+                        );
+                    }
                     tracing::error!("Shard {}: WAL v3 fallback replay failed: {}", self.id, e);
                 }
             }

@@ -54,6 +54,15 @@ struct SyncShared {
     /// Set once by `shutdown()`; the thread gives back its [`ManifestIo`]
     /// on this and exits after a final flush of the slot.
     shutdown: Option<flume::Sender<ManifestIo>>,
+    /// True while the NEWEST snapshot handed to this agent is known to NOT
+    /// be durable: the last `persist` failed and no newer snapshot has
+    /// succeeded since. An empty-slot round must ack `Err` while this is
+    /// set — the [`flush_all_agents`] barrier's "empty slot ⇒ something at
+    /// least as new already persisted" premise is false after a failed
+    /// persist (the failed root was consumed from the slot), and acking Ok
+    /// would let the AOF rewrite prune the very records that back-stop the
+    /// missing placements. Cleared only by a subsequent successful persist.
+    last_persist_failed: bool,
 }
 
 /// Handle to the per-shard manifest-sync thread. Owned by `ShardManifest`
@@ -67,6 +76,59 @@ pub(crate) struct ManifestSyncAgent {
     /// loudly, never a silent no-op.
     wake: flume::Sender<()>,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Process-global registry of live sync agents, for [`flush_all_agents`].
+/// Entries hold `Weak` shared-state refs plus a wake-sender clone; `spawn`
+/// registers, `shutdown` (and dead-`Weak` pruning) deregisters.
+static AGENT_REGISTRY: Mutex<Vec<(std::sync::Weak<Mutex<SyncShared>>, flume::Sender<()>)>> =
+    Mutex::new(Vec::new());
+
+/// Barrier: block until every live agent's pending deferred snapshot (if any)
+/// is durable (deep-review D1).
+///
+/// The AOF rewrite's commit path deletes the old incr generation — the very
+/// records that back-stop spill placements whose ShardManifest commit is
+/// still sitting in an agent's deferred slot ("AOF replay + orphan sweep
+/// reconstruct anything a lost manifest commit would have recorded"). Pruning
+/// while a deferred commit is pending re-opens the crash window that
+/// justification closed. Callers MUST invoke this before pruning and skip
+/// the prune on error.
+///
+/// Implementation: push an ack-only waiter into each agent (the run loop
+/// fires acks after persisting whatever is in the slot; an empty slot means a
+/// previous round already persisted something at least as new — it acks
+/// immediately with Ok). Bounded wait so a wedged agent fails the barrier
+/// instead of hanging the rewrite.
+pub(crate) fn flush_all_agents() -> io::Result<()> {
+    let mut waiters = Vec::new();
+    {
+        let mut reg = AGENT_REGISTRY.lock();
+        reg.retain(|(shared, _)| shared.strong_count() > 0);
+        for (weak_shared, wake) in reg.iter() {
+            let Some(shared) = weak_shared.upgrade() else {
+                continue;
+            };
+            let (ack_tx, ack_rx) = flume::bounded::<io::Result<()>>(1);
+            shared.lock().acks.push(ack_tx);
+            match wake.try_send(()) {
+                Ok(()) | Err(flume::TrySendError::Full(())) => {}
+                Err(flume::TrySendError::Disconnected(())) => {
+                    return Err(io::Error::other(
+                        "manifest-sync barrier: an agent thread is gone with commits possibly pending",
+                    ));
+                }
+            }
+            waiters.push(ack_rx);
+        }
+    }
+    for rx in waiters {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|_| {
+                io::Error::other("manifest-sync barrier: timed out waiting for a persist ack")
+            })??;
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for ManifestSyncAgent {
@@ -89,6 +151,7 @@ impl ManifestSyncAgent {
             latest: None,
             acks: Vec::new(),
             shutdown: None,
+            last_persist_failed: false,
         }));
         let (wake, rx) = flume::bounded(1);
         let (io_tx, io_rx) = flume::bounded::<ManifestIo>(1);
@@ -107,11 +170,16 @@ impl ManifestSyncAgent {
                 run(io, thread_shared, rx)
             }) {
             Ok(join) => match io_tx.send(io) {
-                Ok(()) => Ok(Self {
-                    shared,
-                    wake,
-                    join: Some(join),
-                }),
+                Ok(()) => {
+                    AGENT_REGISTRY
+                        .lock()
+                        .push((Arc::downgrade(&shared), wake.clone()));
+                    Ok(Self {
+                        shared,
+                        wake,
+                        join: Some(join),
+                    })
+                }
                 // Thread died before its recv (can only be a panic in thread
                 // start-up glue) — flume returns the unsent io in the error.
                 Err(flume::SendError(io)) => {
@@ -153,9 +221,20 @@ impl ManifestSyncAgent {
             .map_err(|_| io::Error::other("manifest-sync thread died before ack"))?
     }
 
+    /// Remove this agent's entry from [`AGENT_REGISTRY`]. Idempotent.
+    fn deregister(&self) {
+        AGENT_REGISTRY
+            .lock()
+            .retain(|(shared, _)| !std::sync::Weak::ptr_eq(shared, &Arc::downgrade(&self.shared)));
+    }
+
     /// Flush any pending commit and reclaim the file-I/O state. Returns
     /// `None` only if the thread died abnormally (its panic already logged).
     pub(crate) fn shutdown(mut self) -> Option<ManifestIo> {
+        // Deregister BEFORE the final flush: a flush_all_agents barrier
+        // racing this shutdown must not push an ack the exiting thread will
+        // never fire.
+        self.deregister();
         let (gb_tx, gb_rx) = flume::bounded::<ManifestIo>(1);
         self.shared.lock().shutdown = Some(gb_tx);
         let _ = self.notify();
@@ -164,6 +243,20 @@ impl ManifestSyncAgent {
             let _ = j.join();
         }
         io
+    }
+}
+
+impl Drop for ManifestSyncAgent {
+    /// A handle dropped WITHOUT `shutdown()` (shard-loop panic unwind, early
+    /// teardown) must not leave a zombie: the registry's wake-sender clone
+    /// would otherwise keep the wake channel connected forever, parking the
+    /// sync thread (and its manifest fd) permanently — and the thread's own
+    /// strong `Arc` keeps the `strong_count` pruning from ever collecting
+    /// the entry. Deregistering here drops that last outside sender, so the
+    /// thread's `rx.recv()` disconnects, it flushes the slot, and exits.
+    /// Runs after `shutdown()` too (idempotent retain).
+    fn drop(&mut self) {
+        self.deregister();
     }
 }
 
@@ -185,14 +278,30 @@ fn run(mut io: ManifestIo, shared: Arc<Mutex<SyncShared>>, rx: flume::Receiver<(
         let res = match latest {
             Some(root) => {
                 let r = io.persist(root);
+                // Latch the outcome BEFORE firing acks so a barrier waiter
+                // pushed mid-persist (its ack lands in the NEXT round) can
+                // never observe a stale "ok" empty-slot answer.
+                shared.lock().last_persist_failed = r.is_err();
                 if let Err(ref e) = r {
                     tracing::warn!(error = %e, "manifest-sync: commit failed (placement metadata only; AOF replay + orphan sweep recover on restart)");
                 }
                 r
             }
             // Empty slot: a previous round already persisted a snapshot at
-            // least as new as anything these (necessarily-raced) wakes saw.
-            None => Ok(()),
+            // least as new as anything these (necessarily-raced) wakes saw —
+            // UNLESS that previous round failed, in which case the newest
+            // snapshot is known non-durable and the ack must say so (the
+            // rewrite-prune barrier skips the prune on this error).
+            None => {
+                if shared.lock().last_persist_failed {
+                    Err(io::Error::other(
+                        "manifest-sync: newest snapshot is not durable (last persist failed \
+                         and nothing newer has superseded it)",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         };
         for ack in acks {
             let mirrored = match &res {
@@ -263,6 +372,44 @@ mod tests {
         drop(m);
         let reopened = ShardManifest::open(&path).expect("reopen");
         assert_eq!(reopened.files().len(), 1, "deferred commit must reach disk");
+    }
+
+    /// D1 (deep review): the AOF rewrite prunes the old incr — the durability
+    /// backstop for spill placements whose manifest commit is still sitting
+    /// in this agent's deferred slot. The prune path needs a barrier that
+    /// forces every registered agent's pending snapshot durable first.
+    #[test]
+    fn flush_all_agents_forces_pending_deferred_commit_durable() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("shard-9.manifest");
+        let mut m = ShardManifest::create(&path).expect("create");
+        m.enable_deferred_sync(9);
+
+        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        m.add_file(make_entry(41));
+        m.commit_deferred().expect("deferred send");
+        // Barrier must block until the deferred snapshot (or newer) is durable.
+        super::flush_all_agents().expect("flush barrier");
+        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // No shutdown flush — the barrier alone must have persisted it.
+        let reopened = ShardManifest::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.files().len(),
+            1,
+            "flush_all_agents must persist the pending deferred snapshot"
+        );
+        m.shutdown_deferred();
+    }
+
+    /// The barrier must not hang (and must succeed) when agents are idle.
+    #[test]
+    fn flush_all_agents_is_noop_when_idle() {
+        super::flush_all_agents().expect("idle barrier must succeed");
     }
 
     #[test]
@@ -385,6 +532,75 @@ mod tests {
             101,
             "the final (superset) snapshot must land despite coalescing"
         );
+    }
+
+    /// Deep-review P1: a FAILED deferred persist must fail the
+    /// `flush_all_agents` barrier (empty-slot rounds included) until a newer
+    /// snapshot persists successfully — otherwise the AOF rewrite prunes the
+    /// old incr while the on-disk manifest is missing spill placements.
+    #[test]
+    fn failed_persist_latches_flush_barrier_until_superseded() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("shard-5.manifest");
+        let mut m = ShardManifest::create(&path).expect("create");
+        m.enable_deferred_sync(5);
+
+        super::super::manifest::TEST_INJECT_PERSIST_ERROR
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        m.add_file(make_entry(1));
+        m.commit_deferred().expect("deferred send");
+        // Whether the failing round has already consumed the slot or the
+        // barrier's own round persists (and fails) it, the barrier must
+        // report the newest snapshot as non-durable.
+        assert!(
+            super::flush_all_agents().is_err(),
+            "barrier must fail while the newest snapshot is not durable"
+        );
+        // Still latched on a second, empty-slot barrier round.
+        assert!(
+            super::flush_all_agents().is_err(),
+            "empty-slot rounds must stay latched after a failed persist"
+        );
+
+        // A newer snapshot that persists successfully heals the latch.
+        super::super::manifest::TEST_INJECT_PERSIST_ERROR
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        m.add_file(make_entry(2));
+        m.commit_deferred().expect("deferred send");
+        assert!(
+            super::flush_all_agents().is_ok(),
+            "a successful newer persist must clear the latch"
+        );
+        m.shutdown_deferred();
+    }
+
+    /// Deep-review P2: dropping a deferred-mode manifest WITHOUT
+    /// `shutdown_deferred` (panic unwind, early teardown) must deregister
+    /// the agent and let its thread exit — the registry's wake-sender clone
+    /// must not park the thread (and its manifest fd) forever.
+    #[test]
+    fn dropped_agent_without_shutdown_deregisters() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let before = super::AGENT_REGISTRY.lock().len();
+        {
+            let path = tmp.path().join("shard-6.manifest");
+            let mut m = ShardManifest::create(&path).expect("create");
+            m.enable_deferred_sync(6);
+            m.add_file(make_entry(1));
+            m.commit_deferred().expect("deferred send");
+            // No shutdown_deferred: the agent handle drops with the manifest.
+        }
+        assert_eq!(
+            super::AGENT_REGISTRY.lock().len(),
+            before,
+            "agent drop must deregister its registry entry"
+        );
+        // The barrier must not hang or error on the departed agent.
+        assert!(super::flush_all_agents().is_ok());
     }
 
     #[test]

@@ -109,10 +109,11 @@ fn main() -> anyhow::Result<()> {
             default_hook(info);
             let thread = std::thread::current();
             let name = thread.name().unwrap_or("");
-            if name.starts_with("shard-") {
+            if name.starts_with("shard-") || name == "cluster-ctl" {
                 eprintln!(
-                    "FATAL: shard thread '{name}' panicked; aborting the whole \
-                     process rather than serving with a dead shard"
+                    "FATAL: thread '{name}' panicked; aborting the whole \
+                     process rather than serving with a dead shard or a \
+                     dead cluster control plane"
                 );
                 std::process::abort();
             }
@@ -968,40 +969,18 @@ fn main() -> anyhow::Result<()> {
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
-    // FIX-W1-4: gate BGREWRITEAOF whenever per-shard AOF is active
-    // (num_shards >= 2 + appendonly=yes). The original gate was too narrow:
-    // it required disk_offload to be enabled, missing the plain AOF case.
-    // Per-shard rewrite is not yet implemented (AofPoolSendError::
-    // RewriteUnsupportedInPerShard); the pool already refuses the message,
-    // but this early gate provides a stable, documented error to operators
-    // BEFORE the channel send so no in-progress flag is flipped.
-    // Verified 2026-05-26: multi-shard BGREWRITEAOF loses ~38% of keys on
-    // restart. Gate lifted only when multi-part AOF replay ships (v2.0+).
-    // See docs/runbooks/multi-shard-aof-rewrite.md.
-    // [F6] When `--experimental-per-shard-rewrite` is set, leave the gate OPEN
-    // so BGREWRITEAOF routes to the per-shard fan-out coordinator
-    // (try_send_rewrite_per_shard): synchronized seq bump + single manifest
-    // commit across all per-shard writers, validated by
-    // tests/crash_matrix_per_shard_bgrewriteaof.rs. Default (flag off) keeps
-    // the gate closed — the shipped, crash-safe "no in-place compaction"
-    // behavior that avoided the historical ~38%-key-loss-on-restart.
-    if config.per_shard_aof_active(num_shards) {
-        if config.experimental_per_shard_rewrite {
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF per-shard rewrite ENABLED (--experimental-per-shard-rewrite). \
-                 Per-shard fan-out compaction is active; this path is experimental."
-            );
-        } else {
-            moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, or --experimental-per-shard-rewrite to enable per-shard compaction."
-            );
-        }
+    // #433: per-shard BGREWRITEAOF is the DEFAULT — the gate that refused it
+    // (historical ~38%-key-loss era, pre-C4 cooperative snapshot) is retired.
+    // The fan-out path is validated by tests/crash_matrix_per_shard_bgrewriteaof.rs
+    // (exact INCR recovery across a straddling rewrite + SIGKILL) and
+    // tests/aof_auto_rewrite.rs. `MULTI_SHARD_AOF_REWRITE_UNSAFE` is never set
+    // at boot anymore; the refusal branch it guards stays as dead-man code for
+    // tests and any future re-gate.
+    if config.experimental_per_shard_rewrite {
+        tracing::warn!(
+            "--experimental-per-shard-rewrite is deprecated and now a no-op: \
+             per-shard BGREWRITEAOF is the default (#433)."
+        );
     }
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
@@ -1029,19 +1008,27 @@ fn main() -> anyhow::Result<()> {
     moon::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 
     // Cluster mode initialization
-    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
+    let cluster_state: Option<std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>> =
         if config.cluster_enabled {
+            // Redis convention: cluster bus port = port + 10000. Refuse ports
+            // where that wraps past u16::MAX instead of silently binding the
+            // bus on a truncated port no peer would ever compute.
+            if config.port.checked_add(10000).is_none() {
+                eprintln!(
+                    "REFUSING TO START: --cluster-enabled with --port {} — the cluster \
+                     bus port (port + 10000) exceeds 65535. Use a port <= 55535.",
+                    config.port
+                );
+                std::process::exit(2);
+            }
             moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
                 .parse()
                 .expect("invalid bind address");
             let node_id = moon::replication::state::generate_repl_id();
             let state = moon::cluster::ClusterState::new(node_id, self_addr);
-            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
-            info!(
-                "Cluster mode enabled, node ID: {}",
-                cs.read().unwrap().node_id
-            );
+            let cs = std::sync::Arc::new(parking_lot::RwLock::new(state));
+            info!("Cluster mode enabled, node ID: {}", cs.read().node_id);
             Some(cs)
         } else {
             None
@@ -1764,6 +1751,31 @@ fn main() -> anyhow::Result<()> {
         moon::shard::shared_databases::replay_mq_wal(&mut slice_inits, dir_path);
     }
 
+    // #433: AOF auto-rewrite monitor + INFO size statics. Init AFTER recovery
+    // (the just-replayed generation is the growth baseline), spawn regardless
+    // of percentage so `INFO persistence` sizes stay fresh; percentage 0
+    // disables only the trigger.
+    if let Some(ref pool) = aof_pool {
+        moon::persistence::aof::auto_rewrite::init(
+            std::path::Path::new(&config.dir),
+            &config.appendfilename,
+        );
+        let min_size =
+            ServerConfig::parse_size(&config.auto_aof_rewrite_min_size).unwrap_or_else(|| {
+                tracing::warn!(
+                    "unparseable --auto-aof-rewrite-min-size {:?}; using 64mb",
+                    config.auto_aof_rewrite_min_size
+                );
+                64 * 1024 * 1024
+            });
+        moon::persistence::aof::auto_rewrite::spawn_monitor(
+            pool.clone(),
+            shard_databases.clone(),
+            config.auto_aof_rewrite_percentage,
+            min_size,
+        );
+    }
+
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
     // Register global ShardDatabases for MEMORY DOCTOR + Prometheus per-kind gauges.
@@ -1888,10 +1900,48 @@ fn main() -> anyhow::Result<()> {
 
     let listener_cancel = cancel_token.clone();
 
+    // v0.9 C-1 (#405): the cluster control plane (bus + gossip + election) is
+    // tokio-native and runs on a dedicated `cluster-ctl` std thread hosting a
+    // current-thread tokio runtime — on BOTH server runtimes. Under monoio
+    // there is no tokio runtime to share; under tokio, sharing the listener
+    // runtime made gossip compete with the accept loop and every connection,
+    // which starved the 100ms ticker under load (observed as PFAIL detection
+    // stalling in the formation e2e). The control plane is not
+    // latency-critical, and monoio's !Send task model makes a port high-risk
+    // for zero payoff.
+    if let Some(ref cs) = cluster_state {
+        let ctl_cs = cs.clone();
+        let ctl_bind = config.bind.clone();
+        let ctl_port = config.port;
+        let ctl_node_timeout = config.cluster_node_timeout;
+        let ctl_cancel = cancel_token.child_token();
+        let ctl_repl_state = repl_state.clone();
+        std::thread::Builder::new()
+            .name("cluster-ctl".to_string())
+            .spawn(move || {
+                // O5: escape the shard-core mask this thread would otherwise
+                // inherit from its spawning thread.
+                moon::shard::numa::pin_current_aux_thread("cluster-ctl");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build cluster control-plane runtime");
+                // Runs until the shutdown token cancels the gossip ticker.
+                rt.block_on(run_cluster_control_plane(
+                    ctl_cs,
+                    ctl_bind,
+                    ctl_port,
+                    ctl_node_timeout,
+                    ctl_cancel,
+                    ctl_repl_state,
+                ));
+            })
+            .expect("failed to spawn cluster control-plane thread");
+    }
+
     // Run the sharded listener on the main thread.
     // Under tokio: uses current_thread runtime with tokio::spawn for background tasks.
-    // Under monoio: uses monoio RuntimeFactory with simplified startup (cluster/gossip
-    //   not yet supported under monoio).
+    // Under monoio: uses monoio RuntimeFactory (auto-save on its own thread).
     #[cfg(feature = "runtime-tokio")]
     {
         let listener_rt = tokio::runtime::Builder::new_current_thread()
@@ -1920,57 +1970,6 @@ fn main() -> anyhow::Result<()> {
                     ));
                     info!("Auto-save timer started (sharded mode)");
                 }
-            }
-
-            // Start cluster bus and gossip ticker when cluster mode is enabled
-            if let Some(ref cs) = cluster_state {
-                let cluster_port = (config.port as u32 + 10000) as u16;
-                let cs_clone = cs.clone();
-                let bus_cancel = cancel_token.child_token();
-                let bind2 = config.bind.clone();
-                let self_addr: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-
-                // Shared vote channel: gossip ticker sets sender when election starts,
-                // bus handler forwards FailoverAuthAck votes through it.
-                let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
-                    std::sync::Arc::new(parking_lot::Mutex::new(None));
-
-                let bus_vote_tx = failover_vote_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = moon::cluster::bus::run_cluster_bus(
-                        &bind2,
-                        cluster_port,
-                        self_addr,
-                        cs_clone,
-                        bus_cancel,
-                        bus_vote_tx,
-                    )
-                    .await
-                    {
-                        tracing::error!("Cluster bus error: {}", e);
-                    }
-                });
-
-                let cs_gossip = cs.clone();
-                let gossip_cancel = cancel_token.child_token();
-                let node_timeout = config.cluster_node_timeout;
-                let self_addr2: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-                let gossip_vote_tx = failover_vote_tx.clone();
-                let gossip_repl_state = repl_state.clone();
-                tokio::spawn(async move {
-                    moon::cluster::gossip::run_gossip_ticker(
-                        self_addr2,
-                        cs_gossip,
-                        node_timeout,
-                        gossip_cancel,
-                        gossip_vote_tx,
-                        gossip_repl_state,
-                    )
-                    .await;
-                });
-                info!("Cluster bus and gossip ticker started");
             }
 
             // The central tokio listener plain-binds the port (no SO_REUSEPORT,
@@ -2003,9 +2002,6 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "runtime-monoio")]
     {
-        // Monoio listener: simplified startup. Cluster bus and gossip not yet
-        // supported under monoio.
-
         // Auto-save runs on a dedicated thread (same pattern as AOF writer).
         if config.save.is_some() {
             let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
@@ -2077,6 +2073,81 @@ fn main() -> anyhow::Result<()> {
 
     info!("Server shut down");
     Ok(())
+}
+
+/// Run the cluster control plane — bus listener, gossip ticker, and (via the
+/// ticker) failover elections — on the CURRENT tokio runtime, until the
+/// cancellation token fires.
+///
+/// v0.9 C-1 (#405): the control plane is tokio-native on BOTH runtimes. The
+/// tokio server spawns this onto its listener runtime; the monoio server runs
+/// it on a dedicated `cluster-ctl` std thread hosting a current-thread tokio
+/// runtime. All I/O here is gossip-rate (100ms ticks), never on shard threads.
+async fn run_cluster_control_plane(
+    cluster_state: std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>,
+    bind: String,
+    port: u16,
+    node_timeout: u64,
+    cancel_token: moon::runtime::cancel::CancellationToken,
+    repl_state: std::sync::Arc<parking_lot::RwLock<moon::replication::state::ReplicationState>>,
+) {
+    // Overflow is refused at startup (cluster init hard-exits on ports >
+    // 55535); the else arm is unreachable defense.
+    let Some(cluster_port) = port.checked_add(10000) else {
+        tracing::error!("Cluster control plane disabled: port {port} + 10000 overflows u16");
+        return;
+    };
+    let self_addr: std::net::SocketAddr = match format!("{bind}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                "Cluster control plane disabled: invalid bind address {bind}:{port}: {e}"
+            );
+            return;
+        }
+    };
+
+    // Bind the bus BEFORE spawning anything, and abort on failure: a cluster
+    // node whose bus is not listening keeps serving clients while being
+    // invisible to every peer — fail loud instead of running half-alive.
+    let bus_addr = format!("{bind}:{cluster_port}");
+    let listener = match tokio::net::TcpListener::bind(&bus_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "FATAL: cluster bus failed to bind {bus_addr}: {e} — a cluster \
+                 node without its bus is invisible to every peer; exiting"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Shared vote channel: gossip ticker sets sender when election starts,
+    // bus handler forwards FailoverAuthAck votes through it.
+    let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+
+    let bus_cs = cluster_state.clone();
+    let bus_cancel = cancel_token.child_token();
+    let bus_vote_tx = failover_vote_tx.clone();
+    tokio::spawn(moon::cluster::bus::run_cluster_bus(
+        listener,
+        self_addr,
+        bus_cs,
+        bus_cancel,
+        bus_vote_tx,
+    ));
+
+    info!("Cluster bus and gossip ticker started");
+    moon::cluster::gossip::run_gossip_ticker(
+        self_addr,
+        cluster_state,
+        node_timeout,
+        cancel_token.child_token(),
+        failover_vote_tx,
+        repl_state,
+    )
+    .await;
 }
 
 /// Resolve the automatic shard count, optionally capped to the empirical

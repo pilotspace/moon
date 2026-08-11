@@ -256,7 +256,7 @@ pub fn bgrewriteaof_start(pool: &AofWriterPool, db: SharedDatabases) -> Frame {
             b"ERR Background AOF rewrite already in progress",
         ));
     }
-    match pool.try_send_rewrite(AofMessage::Rewrite(db)) {
+    match pool.try_send_rewrite(AofMessage::Rewrite(db, pool.overflow_for(0).clone())) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),
@@ -324,7 +324,10 @@ pub fn bgrewriteaof_start_sharded(
         }
     }
 
-    match pool.try_send_rewrite(AofMessage::RewriteSharded(shard_databases)) {
+    match pool.try_send_rewrite(AofMessage::RewriteSharded(
+        shard_databases,
+        pool.overflow_for(0).clone(),
+    )) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),

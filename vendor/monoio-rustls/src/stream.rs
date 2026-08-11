@@ -101,16 +101,33 @@ where
     /// waiting on our write). A partial record in the deframer is fine:
     /// completing it requires more socket bytes, which fire readability.
     pub fn task_park_safe(&mut self) -> bool {
-        if !self.r_buffer.is_drained() || !self.w_buffer.is_drained() || self.session.wants_write()
-        {
+        if !self.r_buffer.is_drained() || !self.w_buffer.is_drained() {
             return false;
         }
-        match self.session.process_new_packets() {
-            Ok(state) => state.plaintext_bytes_to_read() == 0 && !state.peer_has_closed(),
+        // moon patch (c10k B5): `process_new_packets` must run BEFORE the
+        // `wants_write` check, not after it. Processing a buffered record can
+        // itself queue outbound bytes AND still return `Ok`, and sampling
+        // `wants_write()` first read the state from before those bytes
+        // existed — so the veto passed and the connection parked owing the
+        // peer a reply it will never send until someone writes again.
+        //
+        // The reachable case in rustls 0.23 is the TLS 1.2 renegotiation
+        // rebuff (`common_state.rs`: a post-handshake ClientHello →
+        // `send_warning_alert(NoRenegotiation)` → `Ok`); moon builds rustls
+        // with `tls12` enabled, so a 1.2 client can reach it. Note the c10k
+        // review named TLS 1.3 KeyUpdate(update_requested) instead — that one
+        // is NOT reachable: rustls parks its KeyUpdate reply in
+        // `queued_key_update_message` and only moves it into `sendable_tls`
+        // on the next outbound record, so `wants_write()` is false either way
+        // (see tests/tls_park_keyupdate.rs, which pins that behaviour).
+        let state = match self.session.process_new_packets() {
+            Ok(state) => state,
             // Corrupt/unexpected TLS state: don't park; the next read
             // surfaces the error and tears down cleanly.
-            Err(_) => false,
-        }
+            Err(_) => return false,
+        };
+        let (plaintext, closed) = (state.plaintext_bytes_to_read(), state.peer_has_closed());
+        plaintext == 0 && !closed && !self.session.wants_write()
     }
 }
 

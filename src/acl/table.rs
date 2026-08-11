@@ -299,6 +299,26 @@ impl AclTable {
         self.bump_version();
     }
 
+    /// Guarantee the `default` user exists, creating it from `requirepass`
+    /// (or nopass) if an ACL file did not define it. No-op when present.
+    ///
+    /// c10k hardening B2 support. The permission checks below now DENY an
+    /// unknown user instead of falling open, so `default` missing from the
+    /// table would lock out every connection on a server with no auth
+    /// configured at all. Redis likewise guarantees `default` always exists.
+    /// Call after any load that can produce an arbitrary user set (startup
+    /// aclfile load, `ACL LOAD`).
+    pub fn ensure_default_user(&mut self, requirepass: Option<&str>) {
+        if self.users.contains_key("default") {
+            return;
+        }
+        let user = match requirepass {
+            Some(p) if !p.is_empty() => AclUser::new_default_with_password(p),
+            _ => AclUser::new_default_nopass(),
+        };
+        self.set_user("default".to_string(), user);
+    }
+
     /// Bootstrap from ServerConfig. Loads aclfile if configured, otherwise creates
     /// the default user from requirepass (or nopass).
     pub fn load_or_default(config: &ServerConfig) -> Self {
@@ -386,7 +406,16 @@ impl AclTable {
         cmd: &[u8],
         _args: &[Frame],
     ) -> Option<String> {
-        let user = self.users.get(username)?;
+        // c10k hardening B2: an unknown user is DENIED, never allowed.
+        // This used to be `self.users.get(username)?` - `None` means
+        // "allowed", so a user that vanished from the table fell open to
+        // full `~* +@all`. `ACL DELUSER alice` / `ACL LOAD` do not close
+        // alice's live sessions, so revoking her account silently
+        // PROMOTED every connection she still had open. `default` is
+        // guaranteed present by `ensure_default_user`.
+        let Some(user) = self.users.get(username) else {
+            return Some(format!("user {} no longer exists", username));
+        };
         // Hot path: unrestricted user (default `on nopass ~* &* +@all`)
         // short-circuits before any per-command allocation. Profile showed
         // ~1% of CPU here for the lowercasing + HashSet probe; the
@@ -416,7 +445,16 @@ impl AclTable {
         args: &[Frame],
         is_write: bool,
     ) -> Option<String> {
-        let user = self.users.get(username)?;
+        // c10k hardening B2: an unknown user is DENIED, never allowed.
+        // This used to be `self.users.get(username)?` - `None` means
+        // "allowed", so a user that vanished from the table fell open to
+        // full `~* +@all`. `ACL DELUSER alice` / `ACL LOAD` do not close
+        // alice's live sessions, so revoking her account silently
+        // PROMOTED every connection she still had open. `default` is
+        // guaranteed present by `ensure_default_user`.
+        let Some(user) = self.users.get(username) else {
+            return Some(format!("user {} no longer exists", username));
+        };
         // Hot path: unrestricted user skips extract_command_keys + the
         // O(patterns*keys) glob match loop. Profile showed ~1.2% of CPU
         // here, most of it in glob_match and Vec allocation for the
@@ -456,7 +494,16 @@ impl AclTable {
 
     /// Check channel access for pub/sub.
     pub fn check_channel_permission(&self, username: &str, channel: &[u8]) -> Option<String> {
-        let user = self.users.get(username)?;
+        // c10k hardening B2: an unknown user is DENIED, never allowed.
+        // This used to be `self.users.get(username)?` - `None` means
+        // "allowed", so a user that vanished from the table fell open to
+        // full `~* +@all`. `ACL DELUSER alice` / `ACL LOAD` do not close
+        // alice's live sessions, so revoking her account silently
+        // PROMOTED every connection she still had open. `default` is
+        // guaranteed present by `ensure_default_user`.
+        let Some(user) = self.users.get(username) else {
+            return Some(format!("user {} no longer exists", username));
+        };
         if user.unrestricted {
             return None;
         }
@@ -569,6 +616,66 @@ mod tests {
             args.push(p);
         }
         ServerConfig::parse_from(args)
+    }
+
+    /// c10k hardening B2. All three permission checks used to start with
+    /// `self.users.get(username)?` — and `None` is their "allowed" answer, so
+    /// a username that is not in the table was granted everything. Nothing
+    /// closes a live session when its account goes away (`ACL DELUSER`, `ACL
+    /// LOAD` dropping a user), so revoking an account silently PROMOTED every
+    /// connection it had already authenticated to full `~* +@all`.
+    #[test]
+    fn unknown_user_is_denied_by_every_check() {
+        let table = AclTable::new(); // no users at all
+        let args: Vec<Frame> = vec![Frame::BulkString(Bytes::from_static(b"k"))];
+
+        assert!(
+            table
+                .check_command_permission("ghost", b"SET", &args)
+                .is_some(),
+            "unknown user must be denied commands, not allowed"
+        );
+        assert!(
+            table
+                .check_key_permission("ghost", b"SET", &args, true)
+                .is_some(),
+            "unknown user must be denied keys, not allowed"
+        );
+        assert!(
+            table.check_channel_permission("ghost", b"news").is_some(),
+            "unknown user must be denied channels, not allowed"
+        );
+    }
+
+    /// The flip side of the fail-closed change: `default` must always be
+    /// present, or a server whose ACL file never mentions it would refuse
+    /// every connection.
+    #[test]
+    fn ensure_default_user_creates_only_when_missing() {
+        let mut table = AclTable::new();
+        table.ensure_default_user(None);
+        let user = table.get_user("default").expect("default was created");
+        assert!(user.unrestricted(), "nopass default must be unrestricted");
+
+        // With requirepass, the created default carries the password.
+        let mut table = AclTable::new();
+        table.ensure_default_user(Some("hunter2"));
+        assert_eq!(
+            table.authenticate("default", "hunter2"),
+            Some("default".to_string())
+        );
+        assert_eq!(table.authenticate("default", "wrong"), None);
+
+        // Present already: left exactly as the file defined it.
+        let mut table = AclTable::new();
+        table.apply_setuser("default", &["on", "~app:*", "-@all", "+get"]);
+        table.ensure_default_user(Some("hunter2"));
+        assert!(
+            table
+                .check_command_permission("default", b"SET", &[])
+                .is_some(),
+            "an existing restricted default must not be overwritten by a fresh unrestricted one"
+        );
     }
 
     #[test]

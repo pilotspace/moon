@@ -1,0 +1,73 @@
+# INFO fields a standard Redis monitoring stack reads.
+#
+# Pinned list, checked by `--info-manifest`. A field here that Moon's INFO does
+# not emit is reported as a named finding: the monitoring agent silently loses
+# that series, which is worse than an error because the dashboard just goes
+# blank. Sourced from the redis_exporter / datadog / Grafana Redis dashboards.
+
+# server
+redis_version
+redis_mode
+os
+arch_bits
+process_id
+run_id
+tcp_port
+uptime_in_seconds
+uptime_in_days
+
+# clients
+connected_clients
+blocked_clients
+client_recent_max_input_buffer
+client_recent_max_output_buffer
+
+# memory
+used_memory
+used_memory_rss
+used_memory_peak
+used_memory_lua
+maxmemory
+maxmemory_policy
+mem_fragmentation_ratio
+
+# persistence
+loading
+rdb_changes_since_last_save
+rdb_bgsave_in_progress
+rdb_last_save_time
+rdb_last_bgsave_status
+aof_enabled
+aof_rewrite_in_progress
+aof_last_bgrewrite_status
+aof_last_write_status
+
+# stats
+total_connections_received
+total_commands_processed
+instantaneous_ops_per_sec
+total_net_input_bytes
+total_net_output_bytes
+rejected_connections
+sync_full
+sync_partial_ok
+sync_partial_err
+expired_keys
+evicted_keys
+keyspace_hits
+keyspace_misses
+pubsub_channels
+pubsub_patterns
+latest_fork_usec
+
+# replication
+role
+connected_slaves
+master_repl_offset
+
+# cpu
+used_cpu_sys
+used_cpu_user
+
+# cluster
+cluster_enabled

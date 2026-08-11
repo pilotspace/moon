@@ -305,6 +305,13 @@ pub(crate) static TEST_INJECT_SYNC_DELAY_MS: std::sync::atomic::AtomicU64 =
 pub(crate) static TEST_PERSIST_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only: make [`ManifestIo::persist`] fail with an injected I/O error
+/// (simulates ENOSPC/EIO on the manifest device) so the sync agent's
+/// failure latch can be exercised.
+#[cfg(test)]
+pub(crate) static TEST_INJECT_PERSIST_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Serializes tests that use the injected sync delay / persist counter —
 /// `cargo test`'s default parallelism otherwise lets one test's injected
 /// delay leak into an unrelated concurrently-running test (same pattern as
@@ -932,6 +939,9 @@ impl ManifestIo {
             let ms = TEST_INJECT_SYNC_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
             if ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if TEST_INJECT_PERSIST_ERROR.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected persist failure (test)"));
             }
         }
         // A prior compaction renamed a fresh manifest into place durably but then

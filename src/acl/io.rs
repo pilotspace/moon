@@ -113,7 +113,12 @@ pub fn acl_load(path: &str) -> std::io::Result<AclTable> {
 pub fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclTable {
     if let Some(ref path) = config.aclfile {
         match acl_load(path) {
-            Ok(table) => {
+            Ok(mut table) => {
+                // c10k B2: the permission checks now DENY an unknown user, so
+                // an ACL file that never defines `default` would lock out
+                // every connection. Redis guarantees `default` exists; so do
+                // we, seeded from requirepass exactly as the no-file path below.
+                table.ensure_default_user(config.requirepass.as_deref());
                 return table;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

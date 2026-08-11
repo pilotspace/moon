@@ -65,7 +65,7 @@ pub(crate) struct ConnectionContext {
     /// dispatch by `try_enforce_readonly` to avoid the per-command RwLock CAS.
     /// `None` when replication is disabled entirely.
     pub is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
-    pub cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    pub cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     pub config_port: u16,
@@ -108,7 +108,7 @@ impl ConnectionContext {
         aof_pool: Option<Arc<AofWriterPool>>,
         tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
         repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
-        cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+        cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
         lua: Rc<mlua::Lua>,
         script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
         config_port: u16,
@@ -360,6 +360,30 @@ impl ConnectionState {
         }
     }
 
+    /// Adopt a new authenticated identity — the ONLY way to change
+    /// `current_user`.
+    ///
+    /// c10k hardening B3. Beyond the ACL cache refresh, this publishes the
+    /// new username to the client registry. `register` captures `user` once,
+    /// at accept time, when it is always `default`; every AUTH/HELLO success
+    /// used to update only the connection-local copy. The registry's copy is
+    /// what `CLIENT LIST` reports and what `CLIENT KILL USER <name>` matches
+    /// on, so both lied about every authenticated session: `CLIENT LIST`
+    /// showed `user=default` for everyone and `CLIENT KILL USER alice`
+    /// returned 0 — the primary incident-response lever for a compromised
+    /// credential, inert. It is also what makes revocation reachable, since
+    /// dropping a user from the table cannot by itself close their live
+    /// sessions.
+    ///
+    /// The registry write takes a stripe lock, which is fine here: AUTH and
+    /// HELLO are per-session events, never the steady-state batch loop.
+    pub fn adopt_user(&mut self, username: String, acl_table: &StdRwLock<crate::acl::AclTable>) {
+        self.current_user = username;
+        self.refresh_acl_cache(acl_table);
+        let user = self.current_user.clone();
+        crate::client_registry::update(self.client_id, move |e| e.user = user);
+    }
+
     /// Resolve and cache the unrestricted flag from the AclTable.
     /// Called once on connection init and after AUTH / HELLO.
     ///
@@ -418,6 +442,26 @@ impl ConnectionState {
     #[inline]
     pub fn in_cross_txn(&self) -> bool {
         self.active_cross_txn.is_some()
+    }
+
+    /// D4 (#438): whether this connection may migrate to another shard
+    /// RIGHT NOW. `MigratedConnectionState` carries none of the state
+    /// checked here (queued MULTI txn, cross-store txn, subscriptions,
+    /// CLIENT TRACKING registration, replica handshake), so migrating
+    /// while any of it is live silently discards it. Evaluated at BOTH
+    /// the affinity-sampler latch point and the batch-end execution
+    /// point — commands later in the same batch can flip any of these
+    /// after the latch, so the execution-point check is authoritative.
+    /// An ineligible batch end keeps `migration_target` latched; the
+    /// migration runs at the first batch end where the connection is
+    /// clean again (e.g. after EXEC/UNSUBSCRIBE).
+    #[inline]
+    pub fn migration_eligible(&self) -> bool {
+        !self.in_multi
+            && self.active_cross_txn.is_none()
+            && self.subscription_count == 0
+            && !self.tracking_state.enabled
+            && !self.saw_replconf
     }
 
     /// Get the active transaction's ID, if any.

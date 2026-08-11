@@ -363,13 +363,27 @@ pub type RawSocketFd = std::os::unix::io::RawFd;
 #[cfg(not(unix))]
 pub type RawSocketFd = i32;
 
+/// Owned socket fd carried by a connection-migration message (#438 F4).
+///
+/// On Unix this is `std::os::fd::OwnedFd`, so an undelivered or dropped
+/// `MigrateConnectionPayload` — SPSC ring torn down at shutdown, message
+/// drained but never spawned — CLOSES the socket instead of leaking the fd
+/// and stranding the client on a connection no task will ever serve again.
+/// On non-unix targets (where the migration path is compiled out and the
+/// payload is never constructed) it stays the raw alias so the types compile.
+#[cfg(unix)]
+pub type MigrateFd = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+pub type MigrateFd = RawSocketFd;
+
 /// Boxed payload for `ShardMessage::MigrateConnection` (Phase 177, hot-path split).
 ///
 /// `MigratedConnectionState` already holds heap-backed strings/bytes but still
 /// exceeds 120 B inline. Moving it behind a Box keeps the enum slot in the
 /// cache-line budget set by the slotted variants.
 pub struct MigrateConnectionPayload {
-    pub fd: RawSocketFd,
+    /// Owned by the message (#438 F4): dropping the payload closes the socket.
+    pub fd: MigrateFd,
     pub state: crate::server::conn::affinity::MigratedConnectionState,
 }
 
@@ -935,6 +949,12 @@ pub struct TxnExecutePayload {
     /// Oneshot channel: the owner sends the executed result + deferred
     /// PUBLISH fan-out back to the caller.
     pub reply_tx: channel::OneshotSender<TxnExecReply>,
+    /// The ORIGINATING connection's protocol version. RESP3 reply conversion
+    /// happens on the owner shard, where each inner reply is produced, so the
+    /// owner must know how the caller negotiated. Without it a cross-shard
+    /// EXEC would answer RESP2 shapes to a RESP3 client — the same
+    /// context-dependent shape defect, reached over a shard hop.
+    pub proto: u8,
 }
 
 /// Reply for [`ShardMessage::TxnExecute`].
@@ -948,6 +968,15 @@ pub struct TxnExecutePayload {
 pub struct TxnExecReply {
     pub result: crate::protocol::Frame,
     pub exec_publishes: Vec<(usize, Bytes, Bytes)>,
+    /// c10k E2: keyless FLUSHDB/FLUSHALL executed in the body, as
+    /// `(result_index, command, db)`. The owner shard clears only its OWN
+    /// slice, so the ORIGINATOR must broadcast each of these to the remaining
+    /// shards and patch `result[result_index]` with an explicit partial-flush
+    /// error if any leg fails — otherwise EXEC answers +OK having emptied one
+    /// shard of N. Deferred to the originator for the same reason as
+    /// `exec_publishes`: the fan-out awaits, and doing it inside the owner's
+    /// message loop risks a shard-to-shard wait cycle.
+    pub exec_flushes: Vec<(usize, crate::protocol::Frame, usize)>,
     pub wrote: bool,
     /// `true` iff an AOF append could not be enqueued on the owner (bounded
     /// backpressure exhausted) — the originator surfaces `AOF_APPEND_LOST_ERR`
@@ -1086,6 +1115,57 @@ pub(crate) async fn push_with_backpressure(
         }
     }
     PushOutcome::Backpressure
+}
+
+/// One shared bound for every cross-shard reply await on the connection
+/// handlers (E4 — design-for-failure), mirroring the coordinator's
+/// [`crate::shard::coordinator::recv_reply_bounded`]: a wedged owner shard
+/// must never hang a client task forever. 30s is far beyond any legitimate
+/// drain latency, so expiry means "the owner is not coming back".
+pub(crate) const XSHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Await a [`PubSubResponseSlot`] with a bounded timeout (E4).
+///
+/// Returns `true` when every pending shard responded within `timeout`,
+/// `false` on expiry. The slot is per-call (freshly allocated by every
+/// publish fan-out), so abandoning it on timeout is SAFE: a late `add()`
+/// lands on the Arc'd slot and is simply never read — unlike the reusable
+/// per-connection `ResponseSlot` (see [`await_response_slot_bounded`]).
+pub(crate) async fn await_pubsub_slot_bounded(
+    slot: &std::sync::Arc<PubSubResponseSlot>,
+    timeout: std::time::Duration,
+) -> bool {
+    use crate::runtime::race::{Arm, race2};
+    use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+    let fut = std::pin::pin!(PubSubResponseFuture::new(slot.clone()));
+    let sleep = std::pin::pin!(TimerImpl::sleep(timeout));
+    // race2 polls the first arm first: a ready slot always wins the tie.
+    matches!(race2(fut, sleep).await, Arm::First(_))
+}
+
+/// Await a [`crate::server::response_slot::ResponseSlotFuture`] with a
+/// bounded timeout (E4). `None` means the owner shard never filled the slot
+/// within `timeout`.
+///
+/// # Caller contract — `None` is FATAL for the connection
+///
+/// Unlike the per-call pubsub slot, a connection's `ResponseSlot` is REUSED
+/// across batches. After a timeout the wedged owner may still fill the slot
+/// late, and the next batch to that shard would read the stale reply as its
+/// own. Callers MUST error the affected entries and close the connection —
+/// never continue dispatching to the timed-out slot.
+pub(crate) async fn await_response_slot_bounded(
+    fut: crate::server::response_slot::ResponseSlotFuture,
+    timeout: std::time::Duration,
+) -> Option<Vec<Frame>> {
+    use crate::runtime::race::{Arm, race2};
+    use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+    let fut = std::pin::pin!(fut);
+    let sleep = std::pin::pin!(TimerImpl::sleep(timeout));
+    match race2(fut, sleep).await {
+        Arm::First(frames) => Some(frames),
+        Arm::Second(()) => None,
+    }
 }
 
 #[cfg(test)]
@@ -1495,6 +1575,116 @@ mod tests {
         assert!(
             payload_sz > 0 && payload_sz < 4096,
             "FtHybridPayload size sanity: {payload_sz}",
+        );
+    }
+
+    // ── E4: bounded cross-shard reply awaits ──
+    // Tokio-gated like the F3 suite: these drive the runtime timer.
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn pubsub_slot_bounded_completes_when_all_shards_respond() {
+        let slot = Arc::new(PubSubResponseSlot::new(1));
+        slot.add(3);
+        assert!(
+            await_pubsub_slot_bounded(&slot, std::time::Duration::from_secs(5)).await,
+            "a fully-responded slot must complete, not time out"
+        );
+        assert_eq!(slot.get(), 3);
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn pubsub_slot_bounded_times_out_on_a_wedged_shard() {
+        // 2 pending, only 1 ever responds — pre-E4 this await hung forever.
+        let slot = Arc::new(PubSubResponseSlot::new(2));
+        slot.add(1);
+        let start = std::time::Instant::now();
+        assert!(
+            !await_pubsub_slot_bounded(&slot, std::time::Duration::from_millis(50)).await,
+            "a slot with a missing shard response must time out"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must be bounded by the requested duration, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn response_slot_bounded_returns_frames_when_filled() {
+        let pool = crate::server::response_slot::ResponseSlotPool::new(2, 0);
+        pool.slot_arc(1).fill(vec![Frame::Integer(7)]);
+        let frames =
+            await_response_slot_bounded(pool.future_for(1), std::time::Duration::from_secs(5))
+                .await
+                .expect("filled slot must resolve");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn response_slot_bounded_times_out_on_a_wedged_owner() {
+        let pool = crate::server::response_slot::ResponseSlotPool::new(2, 0);
+        let start = std::time::Instant::now();
+        let got =
+            await_response_slot_bounded(pool.future_for(1), std::time::Duration::from_millis(50))
+                .await;
+        assert!(got.is_none(), "an unfilled slot must time out with None");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must be bounded, took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod migrate_fd_tests {
+    use super::MigrateConnectionPayload;
+    use std::os::fd::OwnedFd;
+
+    /// F4 (#438): an undelivered `MigrateConnectionPayload` (SPSC ring torn
+    /// down at shutdown, drain exited before spawn) must CLOSE its socket on
+    /// drop — the pre-F4 raw-i32 field leaked the fd and stranded the client.
+    /// The `OwnedFd` field makes this a type-level guarantee; this test pins
+    /// the type so a revert to a raw fd cannot land silently.
+    ///
+    /// #446 review: verified through the PEER's eyes (read → EOF) instead of
+    /// probing the raw fd number, which another thread could reuse between
+    /// close and probe under the parallel test runner.
+    #[test]
+    fn dropped_payload_closes_socket() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let mut client =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        let payload = MigrateConnectionPayload {
+            fd: OwnedFd::from(server_side),
+            state: crate::server::conn::affinity::MigratedConnectionState {
+                selected_db: 0,
+                authenticated: true,
+                client_name: None,
+                protocol_version: 2,
+                current_user: "default".to_string(),
+                flags: 0,
+                read_buf_remainder: bytes::BytesMut::new(),
+                client_id: 1,
+                peer_addr: "t".to_string(),
+                workspace_id: None,
+            },
+        };
+        drop(payload);
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set timeout");
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).expect("read after payload drop");
+        assert_eq!(
+            n, 0,
+            "peer must observe EOF once dropping the payload closes the socket"
         );
     }
 }

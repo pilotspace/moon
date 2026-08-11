@@ -11,6 +11,82 @@ mod read;
 mod txn;
 mod write;
 
+/// c10k C1 — bound a reply write so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `write_all` on a socket whose receive window is closed never returns. The
+/// handler is then stuck holding the whole serialized reply (this handler
+/// coalesces an entire batch into ONE `Bytes` before its single write syscall,
+/// so a deep pipeline is hundreds of MB) plus its `maxclients` slot, for as
+/// long as the client cares to wait. N such clients is an OOM that costs the
+/// attacker nothing but an unread socket.
+///
+/// `monoio::select!` drops the losing future — the same pattern the idle
+/// timeout already uses on the read side — which takes the reply buffer with
+/// it. That is exactly what we want here: we are tearing the connection down,
+/// so there is nobody left to deliver it to.
+///
+/// Evaluates to `true` when the write completed, `false` when it failed or
+/// stalled (both meaning "close this connection"). `$wt` is an
+/// `Option<Duration>`; `None` keeps the pre-C1 wait-forever behaviour.
+macro_rules! write_all_bounded {
+    ($stream:expr, $data:expr, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
+        // Bind first: `$data` is typically a `split().freeze()` and must be
+        // evaluated exactly once, before we can measure it.
+        let data = $data;
+        let pending = data.len();
+        if $cap != 0 && pending > $cap {
+            // c10k C1: `client-output-buffer-limit`. Redis leaves the normal
+            // class unlimited by default, which is exactly why an unread
+            // socket can OOM it; moon ships a real ceiling instead. Refuse the
+            // reply rather than buffer it, and close — Redis's own behaviour
+            // once a hard limit is crossed.
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            // Publish what this connection is holding, so a stalled reply is
+            // visible in CLIENT LIST (`obl`/`omem`) while it happens.
+            $live.begin_write(pending);
+            // c10k C1: only a write big enough to actually block arms the
+            // watchdog. A timer per batch flush would land once per command
+            // at pipeline depth 1 and buy nothing there — a reply that fits
+            // in the socket buffer never blocks. See `util::arm_write_timeout`.
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => {
+                    let (r, _): (std::io::Result<usize>, bytes::Bytes) =
+                        $stream.write_all(data).await;
+                    r.is_ok()
+                }
+                Some(dur) => {
+                    let mut ok = false;
+                    monoio::select! {
+                        res = $stream.write_all(data) => {
+                            let (r, _): (std::io::Result<usize>, bytes::Bytes) = res;
+                            ok = r.is_ok();
+                        }
+                        _ = monoio::time::sleep(dur) => {
+                            tracing::warn!(
+                                "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                                $client_id,
+                                dur.as_millis(),
+                                pending,
+                            );
+                        }
+                    }
+                    ok
+                }
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
+    }};
+}
+
 use crate::runtime::cancel::CancellationToken;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
@@ -31,8 +107,8 @@ use super::affinity::MigratedConnectionState;
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, propagate_subscription, try_inline_dispatch_loop,
-    unpropagate_subscription,
+    handle_config, is_multi_key_command, propagate_subscription, resp3_shape_for,
+    try_inline_dispatch_loop, unpropagate_subscription,
 };
 use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
@@ -257,14 +333,31 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // NOTE: do NOT call record_connection_opened() here — the caller
     // (conn_accept.rs) already increments via try_accept_connection().
 
+    // c10k D3 (lazy resumed-buffer sizing): a fresh connection warms up with
+    // the full 8 KiB per buffer (no growth stall on its first pipeline). A
+    // REHYDRATED handler (park wake / migration) starts at 512 B: wakes
+    // arrive in fleet-sized bursts (synchronized keepalives), and 2×8 KiB
+    // per wake dominated the burst working set before the first byte was
+    // even parsed. BytesMut grows on demand — a busy resumed conn pays one
+    // amortized regrow; the idle majority never pays the 16 KiB at all.
+    let rehydrated = migrated_state.is_some();
+    let init_cap = if rehydrated { 512 } else { 8192 };
     let mut read_buf = if initial_read_buf.is_empty() {
-        BytesMut::with_capacity(8192)
+        BytesMut::with_capacity(init_cap)
     } else {
         let mut buf = initial_read_buf;
-        buf.reserve(8192);
+        buf.reserve(init_cap);
         buf
     };
-    let mut write_buf = BytesMut::with_capacity(8192);
+    let mut write_buf = BytesMut::with_capacity(init_cap);
+    // c10k A1: set when a blocking command leaves unparsed input in
+    // `read_buf` (see the read-skip guard in the main loop).
+    // #438: a resumed MIGRATED (or task-park-resumed) connection starts with
+    // the source handler's unparsed remainder already in read_buf — without
+    // arming the flag its first iteration awaited a fresh socket read and
+    // the carried bytes sat unprocessed until the client happened to send
+    // more (pipelined tails crossing a migration stalled indefinitely).
+    let mut carried_input = !read_buf.is_empty();
     let mut codec = RespCodec::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -289,6 +382,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let (client_live, registry_guard) = match park.kept_registration {
         Some(guard) => {
             let live = crate::client_registry::live_handle(client_id).unwrap_or_else(|| {
+                // #438 conn-secondary: reaching here means the entry vanished
+                // while its guard was alive — an invariant violation, not a
+                // code path. Fail open (re-register so the conn stays served
+                // and killable) but LOUDLY; register() itself now balances
+                // the counters if the entry raced back into existence.
+                tracing::warn!(
+                    "client {}: registry entry missing on park resume despite live guard; re-registering",
+                    client_id
+                );
                 crate::client_registry::register(
                     client_id,
                     peer_addr.clone(),
@@ -322,7 +424,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
-    let mut tmp_buf = vec![0u8; 8192];
+    // D3: same lazy sizing as read_buf/write_buf — the first read of a
+    // rehydrated conn is usually a probe-sized frame (keepalive PING); the
+    // shrink logic at the loop tail governs the steady state either way.
+    let mut tmp_buf = vec![0u8; init_cap];
 
     // c10k W11: two-stage idle park (see idle_park.rs). Cancel-capable
     // streams register for the shard chore's ≥1s sweep; `downshifted` tracks
@@ -330,22 +435,49 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let idle_reg = S::SUPPORTS_IDLE_PARK.then(|| idle_park::register(client_id));
     let mut downshifted = false;
 
-    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
-    let idle_timeout_secs = ctx.runtime_config.read().timeout;
-    let idle_timeout = if idle_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(idle_timeout_secs))
-    } else {
-        None
+    // Client idle timeout (`timeout N`) is NOT enforced here — see
+    // `client_registry::kill_idle_clients`, run by the 1 s shard chore.
+    //
+    // c10k hardening D1: this used to be a `select!` arm racing the read
+    // against `sleep(timeout)`, sitting FIRST in the read loop's if/else
+    // chain below. That made the stage-1 downshift, the stage-2 park and
+    // task-exit parking all structurally unreachable whenever `timeout` was
+    // set — every connection silently reverted from the parked ~3.3 KB to
+    // its full ~46 KB working set, in exactly the deployments that use the
+    // only slowloris knob we ship. It also read the config once at setup, so
+    // `CONFIG SET timeout` never reached a live connection, and it had no
+    // exemption for replication links. The sweep has none of those problems
+    // and additionally reaches connections whose handler task has exited.
+
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    // Read once, like the idle timeout above — this must not touch the lock on
+    // the hot path.
+    let (write_timeout, out_cap_normal) = {
+        let rt = ctx.runtime_config.read();
+        (
+            match rt.client_write_timeout_ms {
+                0 => None,
+                ms => Some(std::time::Duration::from_millis(ms)),
+            },
+            rt.client_output_buffer_limit_normal,
+        )
     };
 
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    // The trailing `Resp3Shape` is the reply shape, classified at ENQUEUE time
+    // where the command's args are still in scope. The batch reply carries only
+    // the command NAME, so without this tag a cross-shard reply could not be
+    // converted at all — and skipping it would re-create the exact
+    // "shape changes by context" defect. It is `Copy` and one byte, so it costs
+    // no allocation on the shard hot path (task `resp3-type-fidelity` §3).
     type RemoteMeta = (
         usize,
         Option<Bytes>,
         Bytes,
         Option<crate::tracking::invalidation::TrackedWriteKeys>,
+        crate::protocol::resp3::Resp3Shape,
     );
     let mut remote_groups: HashMap<
         usize,
@@ -355,6 +487,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             Option<Bytes>,
             Bytes,
             Option<crate::tracking::invalidation::TrackedWriteKeys>,
+            crate::protocol::resp3::Resp3Shape,
         )>,
     > = HashMap::with_capacity(ctx.num_shards);
     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(ctx.num_shards);
@@ -395,8 +528,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 tmp_buf.resize(8192, 0);
             }
             let sub_tmp_buf = std::mem::take(&mut tmp_buf);
+            // #438: a deferred batch tail (subscribe/blocking carry) already
+            // sits re-encoded in read_buf — parse it without awaiting the
+            // socket. CARRY_READY is an impossible real read length (reads
+            // are bounded by the 8 KiB buffer), used as an in-band "no new
+            // bytes, just parse" marker so the arm's parse loop is shared.
+            // The flag is only CLEARED inside the read arm's body — if the
+            // pubsub or shutdown arm wins this select round, the carry stays
+            // armed and retries next iteration (a take() here would eat the
+            // flag on a lost race and re-introduce the stall).
+            const CARRY_READY: usize = usize::MAX;
+            let have_carry = !read_buf.is_empty() && carried_input;
             monoio::select! {
-                read_result = stream.read(sub_tmp_buf) => {
+                read_result = async {
+                    if have_carry {
+                        (Ok(CARRY_READY), sub_tmp_buf)
+                    } else {
+                        stream.read(sub_tmp_buf).await
+                    }
+                } => {
+                    // Read arm won: the carry (if any) is being consumed now.
+                    carried_input = false;
                     let (result, buf) = read_result;
                     tmp_buf = buf;
                     let buf = &tmp_buf;
@@ -407,7 +559,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             break;
                         }
                         Ok(n) => {
-                            read_buf.extend_from_slice(&buf[..n]);
+                            if n != CARRY_READY {
+                                read_buf.extend_from_slice(&buf[..n]);
+                            }
                             // Parse frames from buffer
                             loop {
                                 match codec.decode_frame(&mut read_buf) {
@@ -663,8 +817,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 agg.freeze()
                             };
-                            let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(payload).await;
-                            if result.is_err() { break; }
+                            if !write_all_bounded!(stream, payload, write_timeout, out_cap_normal, client_live, client_id) { break; }
                         }
                         Err(_) => break, // all senders dropped
                     }
@@ -686,34 +839,36 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if tmp_buf.len() != park_len {
             tmp_buf.resize(park_len, 0);
         }
-        if let Some(dur) = idle_timeout {
-            // Timeout-aware read: select between read and sleep.
-            // monoio::select! drops the losing future, so tmp_buf ownership transfers.
-            // We allocate a fresh buffer when timeout is enabled (safety feature, not hot path).
-            let timeout_buf = std::mem::take(&mut tmp_buf);
-            monoio::select! {
-                read_result = stream.read(timeout_buf) => {
-                    let (result, returned_buf) = read_result;
-                    tmp_buf = returned_buf;
-                    match result {
-                        Ok(0) => break,
-                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
-                        Err(_) => break,
-                    }
-                }
-                _ = monoio::time::sleep(dur) => {
-                    tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
-                    break;
-                }
-            }
+        // c10k A1: a blocking command's peer watch may have pulled bytes the
+        // client pipelined behind it out of the kernel and into `read_buf`.
+        // Pre-A1 those bytes stayed in the socket, so the read below returned
+        // them at once; now they are already here, and parking in read() first
+        // would hang the pipelined command until the client happened to send
+        // more. Skip exactly one read and let the parser drain them. A carry
+        // that is only a partial frame parses to nothing, `frames.is_empty()`
+        // sends us straight back here, and the flag is already cleared.
+        //
+        // c10k D1: there is deliberately no `idle_timeout` arm here. `timeout N`
+        // is enforced out-of-band by `client_registry::kill_idle_clients` (the
+        // 1 s shard chore), which also reaches task-parked connections — an
+        // in-loop `select!` on `sleep(timeout)` used to sit ahead of the park
+        // and made stage-1 downshift, stage-2 park and task-exit parking all
+        // structurally unreachable whenever `timeout` was set.
+        if std::mem::take(&mut carried_input) {
+            // Nothing to read: `read_buf` already holds unparsed input.
         } else if conn.tracking_rx.is_some() {
             // CLIENT TRACKING: deliver invalidation Push frames while parked
             // in read(). Only tracking connections take this select — the
             // hot path below is untouched for everyone else. Losing-future
-            // buffer semantics mirror the idle-timeout arm above.
+            // buffer semantics mirror the other parked reads in this loop.
             let track_buf = std::mem::take(&mut tmp_buf);
             let mut push_frame: Option<Frame> = None;
             monoio::select! {
+                // F1 (#438): tracking conns park in this select (not the
+                // cancel-registered reads below), so the shutdown drain
+                // reaches them via the token. Losing the read future drops
+                // `track_buf` — acceptable, the connection is exiting.
+                _ = shutdown.cancelled() => { break; }
                 read_result = stream.read(track_buf) => {
                     let (result, returned_buf) = read_result;
                     tmp_buf = returned_buf;
@@ -735,9 +890,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let Some(frame) = push_frame {
                 let mut push_buf = BytesMut::new();
                 crate::protocol::serialize_resp3(&frame, &mut push_buf);
-                let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
-                    stream.write_all(push_buf.freeze()).await;
-                if wr.is_err() {
+                if !write_all_bounded!(
+                    stream,
+                    push_buf.freeze(),
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                ) {
                     break;
                 }
                 continue;
@@ -754,15 +914,38 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // readiness watcher (conn_accept::spawn_parked_idle_watcher).
             // The predicate is stable while parked in read (no commands can
             // execute), and reaching this arm already excludes subscriber /
-            // tracking / idle-timeout connections (each takes its own arm).
+            // tracking connections (each takes its own arm). Connections with
+            // `timeout N` set DO reach here now (D1): the idle deadline is
+            // enforced by the shard chore's registry sweep, which reaches a
+            // task-parked connection just as CLIENT KILL does.
             let parkable = park.can_park
                 && S::SUPPORTS_TASK_PARK
                 && idle_park::park_after_ms() > 0
-                && read_buf.is_empty()
-                && write_buf.is_empty()
+                // c10k D2: unparsed input must NOT block the park. Requiring an
+                // EMPTY read_buf here let one byte (`*`) pin a connection into
+                // the unregistered plain read below, out of the sweep's reach
+                // forever. The remainder rides along in `read_buf_remainder`
+                // and is re-parsed on resume; its size is already bounded by
+                // `client_query_buffer_limit` upstream, so no second cap
+                // belongs here (one would just be an escape hatch to size
+                // past — see `park_policy`).
+                && crate::server::conn::park_policy::remainder_allows_park(
+                    read_buf.len(),
+                    write_buf.len(),
+                )
                 && !conn.in_multi
                 && conn.command_queue.is_empty()
                 && conn.active_cross_txn.is_none()
+                // F6 (#438, sec L2): unauthenticated conns never task-park.
+                // On an auth-enabled server, parking a pre-AUTH conn would
+                // let an attacker hold a maxclients-worth of silent sockets
+                // at ~3.3 KB each, indefinitely and invisibly cheap. Keeping
+                // them un-parked leaves each one pinned to a full handler
+                // task — costly enough to surface in CPU/RSS monitoring —
+                // and `timeout N` (the slowloris knob) still reaps them. On
+                // no-auth servers `authenticated` is true from accept, so
+                // this changes nothing there.
+                && conn.authenticated
                 // Replica-handshake conns (sent REPLCONF) never park: PSYNC
                 // on a resumed parked conn is unsupported (warn+close).
                 && !conn.saw_replconf
@@ -785,11 +968,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // Real socket/TLS error (EOF without close_notify,
                     // ECONNRESET, …): terminate. Parking instead would spin
                     // park→wake→park forever — the dead fd stays readable.
-                    Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                    // #438 conn-secondary: `was_swept_cancel` also demands
+                    // sweep provenance — a bare errno 125 that no sweep of
+                    // ours produced is a real error too.
+                    Err(ref e) if !reg.slot.was_swept_cancel(e) => break,
+                    // F1 (#438): cancelled by the shutdown drain, not the
+                    // stage-2 sweep — exit through the flush+FIN epilogue
+                    // instead of task-parking into a watcher that would just
+                    // be dropped.
+                    Err(_) if shutdown.is_cancelled() => break,
                     Err(_) => {
                         // Cancelled by the stage-2 sweep: exit the task.
-                        // read_buf is empty (predicate), so no partial frame
-                        // is at risk.
+                        // read_buf holds at most MAX_PARKED_REMAINDER bytes
+                        // (predicate) and `read_buf.split()` below carries
+                        // them into the parked state, so a partial frame
+                        // resumes exactly where it left off rather than being
+                        // dropped or pinning the connection awake (D2).
                         let state = Box::new(MigratedConnectionState {
                             selected_db: conn.selected_db,
                             authenticated: conn.authenticated,
@@ -842,7 +1036,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // always performed a read that re-surfaced them; the
                 // task-park path parks WITHOUT reading, so a mistaken
                 // downshift here would feed the park→wake→park spin.)
-                Err(ref e) if !idle_park::is_sweep_cancel(e) => break,
+                // #438 conn-secondary: provenance-checked — see stage 2.
+                Err(ref e) if !reg.slot.was_swept_cancel(e) => break,
+                // F1 (#438): cancelled by the shutdown drain, not the idle
+                // sweep — exit through the flush+FIN epilogue instead of
+                // re-parking a read nothing will ever complete.
+                Err(_) if shutdown.is_cancelled() => break,
                 Err(_) => {
                     // Cancelled by the idle sweep: shed the working set,
                     // re-park small.
@@ -861,6 +1060,42 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     read_buf.extend_from_slice(&tmp_buf[..n]);
                 }
                 Err(_) => break,
+            }
+        }
+
+        // D3: a rehydrated conn starts with a small (512 B) owned read buffer;
+        // the moment a read saturates it (real traffic, not a keepalive-sized
+        // probe), restore the full 8 KiB so bulk transfers aren't capped at
+        // 512 B per syscall. Sited with the C2 check below: after every read
+        // arm, once per iteration.
+        if tmp_buf.len() < 8192 && read_buf.len() >= tmp_buf.len() {
+            tmp_buf = vec![0u8; 8192];
+        }
+
+        // c10k C2: query-buffer ceiling. One check per read iteration, sited
+        // after every read arm and ahead of both parse paths — an incomplete
+        // frame is exactly what makes `read_buf` grow, and an incomplete
+        // frame decodes to nothing, so the loop would otherwise come straight
+        // back here and read more. `$536870911` plus a dribble of bytes pins
+        // half a gigabyte per connection this way, invisible to
+        // `used_memory`, and the auth gate runs after parsing — so it costs
+        // no credentials. Unauthenticated connections get the much smaller
+        // pre-auth ceiling; see `util::query_buf_limit`.
+        {
+            let (limit, preauth) = {
+                let rt = ctx.runtime_config.read();
+                (
+                    rt.client_query_buffer_limit,
+                    rt.client_query_buffer_limit_preauth,
+                )
+            };
+            if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                let (_r, _b): (std::io::Result<usize>, bytes::Bytes) = stream
+                    .write_all(bytes::Bytes::from_static(
+                        super::util::QUERY_BUF_LIMIT_ERROR,
+                    ))
+                    .await;
+                break;
             }
         }
 
@@ -896,10 +1131,39 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // for the rest of the process once any replica has ever begun
             // attaching, matching the existing `ctx.spill_sender.is_none()`
             // precedent of "fall back to the full path when it must do more
-            // than this fast path knows how to do". GET inlining is
-            // unaffected (`is_get` in `try_inline_dispatch` doesn't check
-            // `can_inline_writes`).
-            let can_inline_writes = conn.acl_skip_allowed()
+            // than this fast path knows how to do". These write-only
+            // conditions do not gate GET, which has its own `can_inline_reads`
+            // gate below — reads must never be inlined for a restricted or
+            // tracking connection, but a replica/spill/fanout master may still
+            // serve them from the fast path.
+            //
+            // Hoisted: both gates need it, and it is one Acquire load plus a
+            // compare (`cached_acl_unrestricted && acl_cache_fresh()`), so
+            // computing it once keeps the read gate free relative to the
+            // pre-fix code, which already paid for it on the write gate.
+            let acl_unrestricted = conn.acl_skip_allowed();
+            // Reads may be inlined only when this connection can provably skip
+            // the ACL check AND is not itself a client-side-caching client:
+            // the inline path calls neither the ACL gate nor `track_read_keys`.
+            // A restricted user, or a `CLIENT TRACKING ON` connection, falls
+            // back to generic dispatch where both run. Deliberately NOT gated
+            // on the process-global `tracking_active()` — only THIS
+            // connection's own reads populate its invalidation set, so one
+            // tracking client must not push every other connection off the
+            // fast path (writes still use the global gate, since a
+            // non-tracking writer must invalidate everyone else).
+            //
+            // `!conn.in_multi` is shared with the write gate and is not
+            // optional: inside an open transaction a command must be QUEUED,
+            // and the inline path answers it instead. A client then receives
+            // the value where it expects `+QUEUED`, and `EXEC` omits the read
+            // entirely — `MULTI; GET k; EXEC` returned `*0` rather than
+            // `*1[$1 v]`. `MGET`, not being inline-eligible, queued correctly
+            // all along, which is what isolated the path.
+            // See `tests/multi_queues_inline_get.rs`.
+            let can_inline_reads =
+                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
+            let can_inline_writes = acl_unrestricted
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
                 && !crate::tracking::tracking_active()
@@ -916,7 +1180,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &ctx.repl_state,
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
+                can_inline_reads,
                 can_inline_writes,
+                // R6: cluster mode disables the inline fast path entirely —
+                // GET/SET must reach try_handle_cluster_routing for MOVED/ASK.
+                crate::cluster::cluster_enabled(),
                 &ctx.runtime_config,
             );
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
@@ -924,9 +1192,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {
                     let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
-                        stream.write_all(data).await;
-                    if result.is_err() {
+                    if !write_all_bounded!(
+                        stream,
+                        data,
+                        write_timeout,
+                        out_cap_normal,
+                        client_live,
+                        client_id
+                    ) {
                         break;
                     }
                 }
@@ -1004,7 +1277,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         let mut auth_delay_ms: u64 = 0;
 
-        for frame in frames.drain(..) {
+        // #438 batch-tail hardening: index-based iteration (not
+        // `frames.drain(..)`) so early-flush arms (blocking / SUBSCRIBE /
+        // PSYNC) can defer themselves plus the unconsumed tail to the next
+        // batch iteration, and so subscribe/blocking breaks carry the parsed
+        // tail forward instead of silently dropping it (Drain::drop discarded
+        // the remainder on break).
+        let num_frames = frames.len();
+        let mut deferred_tail_from: Option<usize> = None;
+        let mut frame_idx = 0usize;
+        while frame_idx < num_frames {
+            let frame = std::mem::replace(&mut frames[frame_idx], Frame::Null);
+            frame_idx += 1;
             // --- AUTH gate ---
             match dispatch::check_auth_gate(
                 &frame,
@@ -1052,6 +1336,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 continue;
             }
+            // #438 batch-tail crash class: an early-flush command (blocking /
+            // SUBSCRIBE / PSUBSCRIBE / PSYNC) while remote-slotted commands
+            // are pending would flush their Frame::Null placeholders to the
+            // client (wrong replies) and clear `responses`, leaving phase 2's
+            // drain to index into an empty vec — shard-thread panic, whole
+            // process aborts. Defer this command and the unconsumed tail to
+            // the next batch iteration; phase 2 resolves the pending replies
+            // and the epilogue flushes them first. The two `is_empty()`
+            // loads keep the common local-only batch at zero name compares.
+            if (!remote_groups.is_empty() || !publish_batches.is_empty())
+                && (crate::server::conn::blocking::is_blocking_command(cmd)
+                    || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+                    || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+                    || cmd.eq_ignore_ascii_case(b"PSYNC"))
+            {
+                frames[frame_idx - 1] = frame;
+                deferred_tail_from = Some(frame_idx - 1);
+                break;
+            }
             // --- Connection-level commands (dispatched to dispatch.rs) ---
             //
             // Length-gated dispatch: each `try_handle_*` starts with a
@@ -1062,24 +1365,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // connection-level command names. Cut per-command dispatch cost
             // from ~14 non-matching function calls to ~1 on SET/GET workloads.
             let cmd_len = cmd.len();
-            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
-                continue;
-            }
-            if cmd_len == 7
-                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
-            {
-                continue;
-            }
-            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
-            {
-                continue;
-            }
-            if cmd_len == 6 && dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
-                continue;
-            }
-            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
-                continue;
-            }
+            // === ACL-EXEMPT COMMANDS ===
+            //
+            // AUTH and HELLO carry Redis's `NO_AUTH` flag and are permitted
+            // regardless of the current user's permissions - a restricted user
+            // must always be able to re-authenticate as somebody else, and
+            // gating HELLO would break the RESP3 handshake. `check_auth_gate`
+            // above only handles them while UNauthenticated, so these are the
+            // post-authentication path and must stay ahead of the gate.
             if cmd_len == 4
                 && dispatch::try_handle_auth(
                     cmd,
@@ -1108,6 +1401,50 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
+
+            // === ACL GATE - every privileged intercept MUST sit below this ===
+            //
+            // c10k hardening B1. This gate used to sit ~200 lines further
+            // down, below the script/ACL/CONFIG/REPLICAOF/BGSAVE/SHUTDOWN
+            // intercepts, while the comment attached to it claimed the
+            // opposite invariant. Because those intercepts `continue` on a
+            // match, they returned before any permission check ever ran: a
+            // user holding nothing but `~app:* +get` was correctly refused a
+            // plain SET yet could still run `ACL SETUSER evil on nopass ~*
+            // +@all`, `CONFIG SET`, arbitrary Lua, `REPLICAOF` and `BGSAVE`
+            // - verified end-to-end, see tests/acl_privileged_intercepts.rs.
+            // Authenticated-restricted-user escalation to full admin.
+            //
+            // The auth gate runs earlier still, so unauthenticated clients
+            // get NOAUTH rather than NOPERM; only AUTH/HELLO above are exempt
+            // (Redis marks both NO_AUTH).
+            //
+            // If you add a privileged intercept, add it BELOW this line.
+            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
+            {
+                continue;
+            }
+
+            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
+                continue;
+            }
+            if cmd_len == 7
+                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
+                continue;
+            }
+            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
+                continue;
+            }
+            if cmd_len == 6
+                && dispatch::try_handle_script(cmd, cmd_args, ctx, &shutdown, &mut responses).await
+            {
+                continue;
+            }
+            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+                continue;
+            }
             if cmd_len == 3
                 && dispatch::try_handle_acl(
                     cmd,
@@ -1120,7 +1457,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 6 && dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 6
+                && dispatch::try_handle_config(
+                    cmd,
+                    cmd_args,
+                    ctx,
+                    conn.protocol_version,
+                    &mut responses,
+                )
+            {
                 continue;
             }
             // REPLICAOF (9) or SLAVEOF (7)
@@ -1157,9 +1502,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     if !write_buf.is_empty() {
                         let data = write_buf.split().freeze();
-                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
-                            stream.write_all(data).await;
-                        if wr.is_err() {
+                        if !write_all_bounded!(
+                            stream,
+                            data,
+                            write_timeout,
+                            out_cap_normal,
+                            client_live,
+                            client_id
+                        ) {
                             return (MonoioHandlerResult::Done, None);
                         }
                     }
@@ -1239,7 +1589,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 pubsub::SubscribeResult::NotSubscribe => {}
                 pubsub::SubscribeResult::ArgError => continue,
-                pubsub::SubscribeResult::Subscribed => break,
+                pubsub::SubscribeResult::Subscribed => {
+                    // #438: carry the parsed-but-unconsumed batch tail into
+                    // the next iteration (subscriber mode) instead of
+                    // dropping it — `[SUBSCRIBE ch, PING]` in one pipelined
+                    // write used to swallow the PING.
+                    if frame_idx < num_frames {
+                        deferred_tail_from = Some(frame_idx);
+                    }
+                    break;
+                }
                 pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
             }
             if pubsub::try_handle_unsubscribe(cmd, &mut responses) {
@@ -1264,13 +1623,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
             }
-            // ACL gate MUST run before any privileged intercept (SWAPDB included)
-            // — otherwise unauthenticated clients can mutate cross-DB state.
-            // handler_sharded already enforces this ordering; this matches it.
-            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
-            {
-                continue;
-            }
+            // (B1) The ACL gate that used to sit here now runs far above, ahead
+            // of every privileged intercept. Its old comment claimed exactly
+            // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
             if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
                 continue;
@@ -1367,7 +1722,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ) {
                             Some(err) => err,
                             None => Frame::Integer(
-                                crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                                crate::server::conn::shared::publish_post_txn(
+                                    ctx, &shutdown, &ch, &msg,
+                                )
+                                .await,
                             ),
                         };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
@@ -1400,15 +1758,32 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
+                &mut read_buf,
                 &mut stream,
                 &shutdown,
+                &client_live,
             )
             .await
             {
                 dispatch::BlockingResult::NotBlocking => {}
                 dispatch::BlockingResult::Queued => continue,
-                dispatch::BlockingResult::Handled => break,
+                dispatch::BlockingResult::Handled => {
+                    // A1: anything left in read_buf is either this batch's
+                    // unparsed tail or bytes the peer watch carried; parse
+                    // before the next read either way.
+                    carried_input = !read_buf.is_empty();
+                    // #438: parsed-but-unconsumed frames after the blocking
+                    // command used to be dropped by the drain-on-break; carry
+                    // them into the next iteration.
+                    if frame_idx < num_frames {
+                        deferred_tail_from = Some(frame_idx);
+                    }
+                    break;
+                }
                 dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
+                // c10k A1: peer vanished mid-block. Nothing to write; the
+                // registry entry and maxclients slot are released by returning.
+                dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---
@@ -1565,10 +1940,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             .write()
                             .register_key(addr.ip(), migrate_to);
                     }
-                    if !conn.in_multi
-                        && conn.subscription_count == 0
-                        && !conn.tracking_state.enabled
-                    {
+                    // Migration preconditions (D4 #438): shared gate —
+                    // MULTI / cross-txn / subs / tracking / replica state
+                    // doesn't transfer. Re-checked at the batch-end
+                    // execution point, which is authoritative.
+                    if conn.migration_eligible() {
                         conn.migration_target = Some(migrate_to);
                     }
                 }
@@ -2107,7 +2483,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             client_id,
                         );
                     }
-                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response =
+                        apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                     }
@@ -2165,9 +2542,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // (`Database::promote_cold_if_present`), unchanged.
                     if cmd.eq_ignore_ascii_case(b"GET") {
                         if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                            let peek_now_ms = ctx.cached_clock.ms();
                             let cold_loc =
                                 crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                     if db.is_hot(key.as_ref()) {
+                                        None
+                                    } else if db
+                                        .promote_inflight_if_present(key.as_ref(), peek_now_ms)
+                                    {
+                                        // #459: mid-spill, payload still in
+                                        // RAM. Now hot, so `dispatch_read`
+                                        // below answers it — and no disk read
+                                        // was needed. Without this the key is
+                                        // in no plane this peek consults and
+                                        // GET answers nil for a key EXISTS
+                                        // reports as present.
                                         None
                                     } else {
                                         db.cold_lookup_location(key.as_ref())
@@ -2262,7 +2651,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             conn.tracking_state.noloop,
                         );
                     }
-                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response =
+                        apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                     }
@@ -2335,15 +2725,40 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         conn.tracking_state.noloop,
                     );
                 }
+                // Classify HERE: this is the last point at which the command's
+                // args exist. The reply loop below only ever sees `cmd_name`.
+                let resp3_shape = if conn.protocol_version >= 3 {
+                    resp3_shape_for(cmd, cmd_args)
+                } else {
+                    crate::protocol::resp3::Resp3Shape::None
+                };
                 remote_groups.entry(target).or_default().push((
                     resp_idx,
                     std::sync::Arc::new(dispatch_frame),
                     aof_bytes,
                     cmd_bytes,
                     track_keys,
+                    resp3_shape,
                 ));
                 crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
+        }
+
+        // #438: re-encode any deferred batch tail back into the FRONT of
+        // read_buf and skip the next socket read — the frames re-parse on the
+        // next loop iteration, AFTER phase 2 below resolves every pending
+        // remote reply and the epilogue flushes them. RESP command arrays
+        // (arrays of bulk strings) round-trip losslessly through
+        // serialize_resp3. If a migration executes at this batch's end, the
+        // carried bytes ride along in `read_buf_remainder`.
+        if let Some(from) = deferred_tail_from {
+            let mut carry = BytesMut::with_capacity(64 + read_buf.len());
+            for f in &frames[from..num_frames] {
+                crate::protocol::serialize_resp3(f, &mut carry);
+            }
+            carry.extend_from_slice(&read_buf);
+            read_buf = carry;
+            carried_input = true;
         }
 
         // Phase 2a: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
@@ -2352,33 +2767,75 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>,
                 Vec<usize>,
             )> = Vec::new();
-            {
-                let mut producers = ctx.dispatch_tx.borrow_mut();
-                for (target, entries) in publish_batches.drain() {
-                    let n = entries.len();
-                    let slot = std::sync::Arc::new(
-                        crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
-                    );
-                    let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                    let pairs: Vec<(Bytes, Bytes)> =
-                        entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+            for (target, entries) in publish_batches.drain() {
+                let n = entries.len();
+                let slot = std::sync::Arc::new(
+                    crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
+                );
+                let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                let pairs: Vec<(Bytes, Bytes)> =
+                    entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
 
-                    let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                    let batch_msg = ShardMessage::PubSubPublishBatch {
-                        pairs,
-                        slot: slot.clone(),
-                    };
-                    if producers[idx].try_push(batch_msg).is_ok() {
+                let idx = ChannelMesh::target_index(ctx.shard_id, target);
+                // E1: bounded backpressure retry instead of one bare try_push
+                // — a transiently-full ring no longer loses the batch. Borrow
+                // taken+released per attempt, never held across the backoff
+                // await (tokio parity — handler_sharded).
+                let mut pending = Some(ShardMessage::PubSubPublishBatch {
+                    pairs,
+                    slot: slot.clone(),
+                });
+                let outcome = crate::shard::dispatch::push_with_backpressure(
+                    &shutdown,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                    || match pending.take() {
+                        None => true,
+                        Some(m) => {
+                            let mut producers = ctx.dispatch_tx.borrow_mut();
+                            match producers[idx].try_push(m) {
+                                Ok(()) => true,
+                                Err(back) => {
+                                    pending = Some(back);
+                                    false
+                                }
+                            }
+                        }
+                    },
+                )
+                .await;
+                match outcome {
+                    crate::shard::dispatch::PushOutcome::Pushed => {
                         ctx.spsc_notifiers[target].notify_one();
-                    } else {
-                        slot.add(0); // push failed, mark as done
                     }
-                    batch_slots.push((slot, resp_indices));
+                    outcome => {
+                        // Give-up: deliver-to-zero so the reply can't hang —
+                        // but loudly (was a silent drop pre-E1).
+                        tracing::warn!(
+                            "Shard {}: PUBLISH batch fan-out to shard {target} dropped ({outcome:?})",
+                            ctx.shard_id
+                        );
+                        crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
+                        slot.add(0);
+                    }
                 }
+                batch_slots.push((slot, resp_indices));
             }
-            // Resolve all batch slots
+            // Resolve all batch slots (E4: bounded — a wedged shard degrades
+            // to an under-reported count, never a hung client).
             for (slot, resp_indices) in &batch_slots {
-                crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+                if !crate::shard::dispatch::await_pubsub_slot_bounded(
+                    slot,
+                    crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Shard {}: PUBLISH batch reply timed out awaiting remote shard",
+                        ctx.shard_id
+                    );
+                    crate::admin::metrics_setup::record_xshard_reply_timeout("publish");
+                }
                 for (i, resp_idx) in resp_indices.iter().enumerate() {
                     let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
                     if remote_count > 0 {
@@ -2389,6 +2846,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
         }
+
+        // E4: set when a cross-shard reply await times out. The per-connection
+        // ResponseSlot is REUSED across batches — a late fill after a timeout
+        // would be read by the NEXT batch as its own reply — so a timeout is
+        // fatal: error the affected entries, flush, then close the connection.
+        let mut xshard_reply_fatal = false;
 
         // Phase 2b: Dispatch all deferred remote commands as batched
         // PipelineBatchSlotted messages (one per target shard), await all in parallel.
@@ -2403,7 +2866,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let slot_arc = response_pool.slot_arc(target);
                 let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) = entries
                     .into_iter()
-                    .map(|(idx, arc_frame, aof, cmd, tk)| ((idx, aof, cmd, tk), arc_frame))
+                    .map(|(idx, arc_frame, aof, cmd, tk, shape)| {
+                        ((idx, aof, cmd, tk, shape), arc_frame)
+                    })
                     .unzip();
 
                 let msg = ShardMessage::PipelineBatchSlotted {
@@ -2460,7 +2925,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             target,
                             outcome
                         );
-                        for (resp_idx, _, _, _) in &meta {
+                        for (resp_idx, _, _, _, _) in &meta {
                             responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                 b"ERR cross-shard dispatch backpressure",
                             ));
@@ -2482,10 +2947,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // keeps the slot alive until the last handle drops. (This replaced the
             // old raw-pointer-into-stack-pool design, whose contract required the
             // await to run to completion to avoid a panic-unwind UAF; see the
-            // `ResponseSlotPtr` doc + PR review.) The await is still unbounded here
-            // for simplicity — the target shard always fills every message it
-            // drains — but a shutdown-aware bound is now a safe, tracked follow-up.
-            // The tokio handler carries the identical await.
+            // `ResponseSlotPtr` doc + PR review.) Since E4 the await is BOUNDED
+            // (XSHARD_REPLY_TIMEOUT) — expiry errors the batch and closes the
+            // connection, because the reused slot could otherwise hand a late
+            // fill to the next batch. The tokio handler carries the identical
+            // bounded await.
             //
             // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
             // commands in THIS batch. The reply-side spin may engage only for a singleton
@@ -2513,14 +2979,38 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
                     match spun {
-                        Some(r) => r,
-                        None => response_pool.future_for(target).await,
+                        Some(r) => Some(r),
+                        // E4: bounded await — a wedged owner shard can no
+                        // longer hang this client task forever.
+                        None => {
+                            crate::shard::dispatch::await_response_slot_bounded(
+                                response_pool.future_for(target),
+                                crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                            )
+                            .await
+                        }
                     }
+                };
+                let Some(shard_responses) = shard_responses else {
+                    tracing::error!(
+                        "Shard {}: cross-shard reply from shard {target} timed out; \
+                         failing the batch and closing the connection (slot unsafe to reuse)",
+                        ctx.shard_id
+                    );
+                    crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
+                    for (resp_idx, _, _, _, _) in &meta {
+                        responses[*resp_idx] =
+                            Frame::Error(Bytes::from_static(b"ERR cross-shard reply timeout"));
+                    }
+                    xshard_reply_fatal = true;
+                    // Skip the fsync barrier too: with no reply there is
+                    // nothing durable to confirm for these entries.
+                    continue;
                 };
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
                 let mut write_resp_idxs: Vec<usize> = Vec::new();
-                for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in
+                for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in
                     meta.into_iter().zip(shard_responses)
                 {
                     // C4-FOLD-FIX: AOF append for cross-shard writes is now done
@@ -2530,7 +3020,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // makes AofFold's pending_aof_count undercount it → escape to
                     // new incr → double-apply on restart. The SPSC arm now owns the
                     // AOF write; aof_bytes below is used only for the barrier check.
-                    let resp = apply_resp3_conversion(&cmd_name, resp, conn.protocol_version);
+                    // Shape was classified at enqueue, where the args still existed.
+                    let resp = crate::protocol::resp3::apply_shape(
+                        resp3_shape,
+                        resp,
+                        conn.protocol_version,
+                    );
                     if aof_bytes.is_some() && !matches!(resp, Frame::Error(_)) {
                         write_resp_idxs.push(resp_idx);
                     }
@@ -2596,11 +3091,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {
             let data = write_buf.split().freeze();
-            let (result, _data): (std::io::Result<usize>, bytes::Bytes) =
-                stream.write_all(data).await;
-            if result.is_err() {
+            if !write_all_bounded!(
+                stream,
+                data,
+                write_timeout,
+                out_cap_normal,
+                client_live,
+                client_id
+            ) {
                 break;
             }
+        }
+
+        // E4: a timed-out cross-shard reply slot must never be reused — the
+        // error replies are flushed above, now close.
+        if xshard_reply_fatal {
+            break;
         }
 
         // Update live state after each batch — lock-free (QW8, 2026-06
@@ -2611,7 +3117,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             crate::client_registry::ClientFlags {
                 subscriber: conn.subscription_count > 0,
                 in_multi: conn.in_multi,
+                // A batch just completed, so this connection is by definition
+                // not blocked right now; the blocked bit is owned by
+                // `set_blocked` around the blocking await.
                 blocked: false,
+                replica: conn.saw_replconf,
             },
             ctx.cached_clock.ms(),
         );
@@ -2619,7 +3129,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Check if migration was triggered during frame processing.
         // All responses for the current batch have been written, so the
         // client sees no interruption -- TCP socket stays open.
-        if let Some(target_shard) = conn.migration_target {
+        // D4 (#438): re-evaluate eligibility HERE — the latch fired
+        // mid-batch and the batch tail may have entered MULTI,
+        // subscribed, or enabled tracking since. Ineligible → keep the
+        // latch and retry at the next clean batch end.
+        if let Some(target_shard) = conn.migration_target
+            && conn.migration_eligible()
+        {
             let migrated_state = MigratedConnectionState {
                 selected_db: conn.selected_db,
                 authenticated: conn.authenticated,

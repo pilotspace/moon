@@ -367,6 +367,17 @@ pub(crate) fn apply_local(
             return apply_temporal_invalidate(s, cmd, args);
         }
 
+        // SWAPDB (#386): the wire carries exactly ONE record per client
+        // SWAPDB (emitted by the master's coordinator after its durability
+        // gate; remote SPSC legs write AOF/WAL only). Generic `dispatch()`
+        // hard-errors on SWAPDB ("must be issued at the connection handler
+        // level") and `warn_on_error` only logs — so without this intercept
+        // every streamed SWAPDB silently no-ops on the replica.
+        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+            apply_swapdb(cmd, args, &mut s.databases);
+            return true;
+        }
+
         // MOVE / cross-db COPY touch two databases at once and are intercepted
         // BEFORE generic dispatch on the master (see `spsc_two_db`). Generic
         // `dispatch()` cannot apply them — it returns an error for MOVE and
@@ -783,6 +794,39 @@ fn warn_on_error(cmd: &[u8], resp: &Frame) {
             String::from_utf8_lossy(cmd),
             String::from_utf8_lossy(e)
         );
+    }
+}
+
+/// Apply a streamed `SWAPDB a b` (#386) against the replica's full database
+/// slice — same slice-split swap as the WAL replay intercept
+/// (`persistence/replay.rs`). Out-of-range / same-index / malformed args skip
+/// with a warn: the replica must never poison its stream over an index the
+/// master accepted (e.g. a replica configured with fewer `--databases`), it
+/// just can't honor it.
+fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &mut [crate::storage::Database]) {
+    let parse_idx = |f: &Frame| match f {
+        Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+        Frame::Integer(n) => usize::try_from(*n).ok(),
+        _ => None,
+    };
+    match (
+        args.first().and_then(parse_idx),
+        args.get(1).and_then(parse_idx),
+    ) {
+        (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            // Split the slice to get two non-overlapping mutable references.
+            let (left, right) = databases.split_at_mut(lo + 1);
+            std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
+        }
+        (Some(a), Some(b)) if a == b => {} // same-index: no-op, matches Redis
+        _ => {
+            tracing::warn!(
+                "replication apply: skipping {} with unusable args (out of range for {} local dbs)",
+                String::from_utf8_lossy(cmd),
+                databases.len()
+            );
+        }
     }
 }
 
@@ -1481,6 +1525,74 @@ mod tests {
         assert_eq!(r.consumed, 0);
         assert!(!r.fatal);
         assert_eq!(db, 3);
+    }
+
+    // ── #386: streamed SWAPDB apply ─────────────────────────────────────
+
+    /// Marker key in db `i` so a swap is observable.
+    fn dbs_with_markers(n: usize) -> Vec<crate::storage::Database> {
+        (0..n)
+            .map(|i| {
+                let mut db = crate::storage::Database::new();
+                db.set(
+                    Bytes::copy_from_slice(format!("marker:{i}").as_bytes()),
+                    crate::storage::Entry::new_string(Bytes::copy_from_slice(
+                        format!("from-db-{i}").as_bytes(),
+                    )),
+                );
+                db
+            })
+            .collect()
+    }
+
+    fn has_marker(db: &mut crate::storage::Database, origin: usize) -> bool {
+        db.get(format!("marker:{origin}").as_bytes()).is_some()
+    }
+
+    #[test]
+    fn apply_swapdb_swaps_databases() {
+        let mut dbs = dbs_with_markers(4);
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::BulkString(Bytes::from_static(b"2")),
+        ];
+        apply_swapdb(b"SWAPDB", &args, &mut dbs);
+        assert!(has_marker(&mut dbs[0], 2), "db0 must now hold db2's data");
+        assert!(has_marker(&mut dbs[2], 0), "db2 must now hold db0's data");
+        assert!(has_marker(&mut dbs[1], 1), "db1 untouched");
+        assert!(has_marker(&mut dbs[3], 3), "db3 untouched");
+    }
+
+    #[test]
+    fn apply_swapdb_integer_args_and_reversed_order() {
+        let mut dbs = dbs_with_markers(3);
+        // Integer frames + b > a ordering must both work.
+        let args = [Frame::Integer(2), Frame::Integer(1)];
+        apply_swapdb(b"SWAPDB", &args, &mut dbs);
+        assert!(has_marker(&mut dbs[1], 2));
+        assert!(has_marker(&mut dbs[2], 1));
+    }
+
+    #[test]
+    fn apply_swapdb_out_of_range_and_same_index_are_noops() {
+        let mut dbs = dbs_with_markers(2);
+        // Out of range for this replica's db_count — skip, don't panic.
+        let oor = [Frame::Integer(0), Frame::Integer(9)];
+        apply_swapdb(b"SWAPDB", &oor, &mut dbs);
+        assert!(has_marker(&mut dbs[0], 0));
+        // Same index — no-op.
+        let same = [Frame::Integer(1), Frame::Integer(1)];
+        apply_swapdb(b"SWAPDB", &same, &mut dbs);
+        assert!(has_marker(&mut dbs[1], 1));
+        // Malformed (missing / non-numeric args) — skip, don't panic.
+        apply_swapdb(b"SWAPDB", &[], &mut dbs);
+        let junk = [
+            Frame::BulkString(Bytes::from_static(b"x")),
+            Frame::Integer(1),
+        ];
+        apply_swapdb(b"SWAPDB", &junk, &mut dbs);
+        assert!(has_marker(&mut dbs[0], 0));
+        assert!(has_marker(&mut dbs[1], 1));
     }
 
     #[test]

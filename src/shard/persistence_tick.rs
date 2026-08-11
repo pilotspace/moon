@@ -629,10 +629,73 @@ fn apply_completion_vec(
     let mut manifest_dirty = false;
     for c in completions {
         if !c.success {
-            tracing::warn!(
-                file_id = c.file_entry.file_id,
-                "Spill pwrite failed on background thread"
-            );
+            // Deep-review F1: the hot entry was removed at evict time on the
+            // promise this completion would land the key in the cold index.
+            // A failed pwrite breaks that promise — without re-insert the key
+            // exists in NEITHER plane and reads nil until an AOF-replay
+            // restart (and permanently under --appendonly no sync paths).
+            // Fail-closed: put the value back in RAM, mirroring the
+            // enqueue-failure path which retains the hot value. Under a
+            // persistently failing disk this re-arms eviction for the same
+            // key — bounded per tick and loudly counted, which beats silent
+            // wrong answers.
+            if let Some(req) = c.failed_request {
+                crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    // Deep-review P2 stale-shadow guard: if the key was
+                    // re-created and re-evicted while this pwrite was in
+                    // flight, a NEWER spill request supersedes this one —
+                    // re-inserting this older payload would shadow the newer
+                    // cold value in the hot plane (and the next eviction
+                    // would spill the stale copy as authoritative).
+                    let newest = db.spill_inflight_is_newest(&req.key, req.file_id);
+                    db.spill_inflight_clear(&req.key, req.file_id);
+                    if !newest {
+                        tracing::warn!(
+                            file_id = c.file_entry.file_id,
+                            key_len = req.key.len(),
+                            "Spill pwrite failed for a request that no longer owns this \
+                             key; skipping re-insert (a newer spill is in flight or \
+                             landed, or the key was deleted / overwritten / read-promoted \
+                             while this write was in flight — #459)"
+                        );
+                        return;
+                    }
+                    if db.get_version(&req.key) != 0 {
+                        // A newer write recreated the key while the spill was
+                        // in flight; the failed payload is stale — drop it.
+                        return;
+                    }
+                    match crate::storage::eviction::rehydrate_spill_payload(
+                        req.value_type,
+                        &req.value_bytes,
+                        req.ttl_ms,
+                    ) {
+                        Some(entry) => {
+                            db.set(req.key.clone(), entry);
+                            crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed; evicted key re-inserted into hot table \
+                                 (spill volume is failing writes)"
+                            );
+                        }
+                        None => {
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed AND payload does not rehydrate — key lost \
+                                 until AOF-replay restart"
+                            );
+                        }
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    file_id = c.file_entry.file_id,
+                    "Spill pwrite failed on background thread (no payload carried back)"
+                );
+            }
             continue;
         }
 
@@ -657,9 +720,23 @@ fn apply_completion_vec(
             };
 
             crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                // The in-flight record is this completion's AUTHORIZATION to
+                // publish, not just a stale-shadow guard (#459). It is gone
+                // when the key was deleted, overwritten, or read-promoted
+                // while the spill was in flight; publishing anyway resurrects
+                // a deleted key — and because this insert reaches the
+                // manifest, the resurrection survives restart. Measured
+                // pre-fix: 277 of 400 DELs undone this way.
+                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+                    return;
+                }
                 if let Some(ref mut ci) = db.cold_index {
                     ci.insert(entry.key.clone(), location);
                 }
+                // Retire this request's record; a newer request's is left
+                // for its own completion.
+                db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
         }
     }
@@ -840,6 +917,10 @@ pub(crate) fn handle_memory_pressure(
             };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();
+                // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                // (per-key minting could stall the shard bound x victim-count).
+                let mut reason_del_budget =
+                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                 // task/issue #45: `offload_shard_dir` is precomputed at shard
                 // init. `spill_thread` and `shard_manifest` share its
                 // disk-offload gate, so both branches below pair their
@@ -889,6 +970,7 @@ pub(crate) fn handle_memory_pressure(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     },
                                 ),
@@ -942,6 +1024,7 @@ pub(crate) fn handle_memory_pressure(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     }),
                                 );
@@ -965,6 +1048,7 @@ pub(crate) fn handle_memory_pressure(
                                                 shard_id,
                                                 aof_pool,
                                                 wal_kv_log,
+                                                &mut reason_del_budget,
                                             );
                                         }),
                                 );

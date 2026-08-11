@@ -110,7 +110,9 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -128,13 +130,21 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
-                responses.push(Frame::BulkString(Bytes::from(info)));
+                // RESP3 sends CLIENT INFO as a Verbatim string. This intercept
+                // never reaches the generic dispatch exit, so it converts here.
+                responses.push(crate::protocol::resp3::apply_shape(
+                    crate::protocol::resp3::Resp3Shape::Verbatim,
+                    Frame::BulkString(Bytes::from(info)),
+                    conn.protocol_version,
+                ));
                 return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"KILL") {
@@ -228,12 +238,20 @@ pub(super) fn try_handle_config(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    proto: u8,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CONFIG") {
         return false;
     }
-    responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
+    // This intercept short-circuits the generic dispatch exit, so it must
+    // apply the RESP3 conversion itself — otherwise `CONFIG GET` reaches the
+    // wire as a flat Array where Redis sends a Map. That omission is exactly
+    // why CONFIG was the one command the old converter could never fix.
+    let reply = handle_config(cmd_args, &ctx.runtime_config, &ctx.config);
+    responses.push(crate::server::conn::util::apply_resp3_conversion(
+        cmd, cmd_args, reply, proto,
+    ));
     true
 }
 

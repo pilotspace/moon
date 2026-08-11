@@ -139,8 +139,13 @@ impl CdcSubscriberRegistry {
 
         for (idx, sub) in self.subscribers.iter_mut().enumerate() {
             let mut drained = 0usize;
-            let mut disconnect = false;
-            while drained < MAX_EVENTS_PER_SUBSCRIBER_PER_TICK {
+            // G3 (deep review): reap dead consumers even on write-idle
+            // shards. Without this, a disconnected receiver was only
+            // detected via a failed try_send driven by a NEW record, so
+            // idle shards accumulated dead subscribers (and their tail
+            // readers) indefinitely.
+            let mut disconnect = sub.tx.is_disconnected();
+            while !disconnect && drained < MAX_EVENTS_PER_SUBSCRIBER_PER_TICK {
                 match sub.tail.read_next() {
                     Ok(Some(rec)) => {
                         if rec.lsn < sub.from_lsn {
@@ -246,6 +251,34 @@ mod tests {
         let delivered = reg.fanout_tick(0);
         assert_eq!(delivered, 5);
         assert_eq!(rx.len(), 5);
+    }
+
+    /// G3 (deep review): a subscriber whose consumer disconnected must be
+    /// reaped even when NO new WAL records arrive — previously the dead
+    /// sender was only detected via a failed try_send driven by a fresh
+    /// record, so write-idle shards accumulated dead subscribers (each
+    /// holding a tail reader) indefinitely.
+    #[test]
+    fn test_cdc_fanout_reaps_disconnected_subscriber_when_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        write_kv_records(&wal_dir, 2);
+
+        let mut reg = CdcSubscriberRegistry::new(0);
+        let (sub, rx) = CdcSubscriber::new(&wal_dir, 1);
+        reg.add(sub);
+        // Drain the backlog so the WAL is fully consumed (idle from now on).
+        reg.fanout_tick(0);
+        assert_eq!(reg.len(), 1);
+
+        // Consumer goes away; no further writes ever happen on this shard.
+        drop(rx);
+        reg.fanout_tick(0);
+        assert_eq!(
+            reg.len(),
+            0,
+            "disconnected subscriber must be reaped without needing a new record"
+        );
     }
 
     /// C3b-1 — slow-consumer policy: bounded(1) channel fills, the next

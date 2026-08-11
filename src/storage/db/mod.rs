@@ -198,6 +198,67 @@ pub struct Database {
     pub cold_shard_dir: Option<std::path::PathBuf>,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
+    /// Keys whose async spill is IN FLIGHT: enqueued to the spill thread,
+    /// hot entry already freed, not yet registered in `cold_index`.
+    ///
+    /// This is the THIRD storage plane, not a bookkeeping side table (#459).
+    /// It began as a write-only supersession guard holding just the request
+    /// id, which left the in-flight window visible to nobody: reads, deletes
+    /// and `logical_len` consult hot and cold only, so for the length of the
+    /// window an acked key was denied by `GET`/`EXISTS`, `DEL` answered `:0`
+    /// and then the completion resurrected it, and `DBSIZE` under-counted.
+    /// It therefore carries the PAYLOAD as well, so every plane-aware path
+    /// can answer from RAM with no disk read and no promotion.
+    ///
+    /// Costs nothing to hold: `value_bytes` is the very same refcounted
+    /// `Bytes` the queued `SpillRequest` already pins for the whole window,
+    /// so this is one refcount, not a copy.
+    ///
+    /// Empty for every server not actively spilling, which is what makes the
+    /// `is_empty()` fast bail on the hot paths below honest rather than a
+    /// hopeful guess. Size is bounded by the spill channel's capacity:
+    /// `evict_one_async_spill` marks only after a successful `try_send`, and
+    /// a full channel makes it bail.
+    ///
+    /// Retention note: a record is retired by its completion, by DEL, by an
+    /// overwriting SET, or by a promoting read. A LOST completion (see
+    /// `spill_completion_dropped_total` — the rare shutdown-with-full-channel
+    /// edge) therefore now strands a payload rather than the bare u64 it used
+    /// to, so the value stays charged to RAM until the key is next written or
+    /// deleted. Reads stay correct throughout; the cost is that the eviction
+    /// did not actually reclaim that key's memory.
+    ///
+    /// ACCOUNTING (pre-existing, tracked in #466): the payload is resident RAM that
+    /// `used_memory` does not count. `evict_one_async_spill` calls
+    /// `db.remove()`, whose `remove_hot` credits back the whole
+    /// `entry_overhead`, while the queued `SpillRequest` still holds a full
+    /// `Bytes::copy_from_slice` of the value — so for the length of the
+    /// window the eviction loop believes it reclaimed memory it has not.
+    /// That was equally true before this plane existed (the request has
+    /// always owned that copy); what is added here is the key `Bytes` plus
+    /// this struct per in-flight key, and a retention window that now ends
+    /// when the event loop APPLIES the completion rather than when the spill
+    /// thread drains the channel. Charging the pending bytes honestly would
+    /// require teaching `evict_to_budget` to stop when pending bytes are
+    /// large, or it would evict in a runaway loop chasing memory that cannot
+    /// drop yet — a design change, deliberately out of scope for #459.
+    spill_inflight: std::collections::HashMap<bytes::Bytes, PendingSpill>,
+}
+
+/// A spill that has left hot RAM but has not yet landed in `cold_index`.
+///
+/// Holds enough to answer a read without touching disk — the window is short
+/// but it is not free, and serving a stale-or-nil answer inside it was #459.
+#[derive(Clone)]
+pub struct PendingSpill {
+    /// The `SpillRequest.file_id` this record belongs to. A completion only
+    /// applies when it is still the newest (stale-shadow guard, deep-review
+    /// P2): a newer eviction of the same key supersedes it.
+    pub req_id: u64,
+    pub value_type: crate::persistence::kv_page::ValueType,
+    /// Refcounted handle to the queued request's payload — never a copy.
+    pub value_bytes: bytes::Bytes,
+    pub ttl_ms: Option<u64>,
 }
 
 impl Database {
@@ -213,6 +274,7 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+            spill_inflight: std::collections::HashMap::new(),
         }
     }
 
@@ -237,7 +299,116 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
+            spill_inflight: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record `key` as in-flight, carrying the payload so reads answered
+    /// during the window are correct.
+    ///
+    /// Called AFTER the hot entry is removed (`evict_one_async_spill`). The
+    /// remove and this call are one synchronous run on the shard thread with
+    /// no `.await` between them, so no reader can observe the key absent from
+    /// every plane.
+    pub fn spill_inflight_mark(&mut self, key: bytes::Bytes, pending: PendingSpill) {
+        self.spill_inflight.insert(key, pending);
+    }
+
+    /// True when `req_id` is still the newest recorded spill request for
+    /// `key` — i.e. no later eviction re-enqueued it, and no `DEL`/overwrite
+    /// retired the record while this request was in flight.
+    pub fn spill_inflight_is_newest(&self, key: &[u8], req_id: u64) -> bool {
+        self.spill_inflight.get(key).map(|p| p.req_id) == Some(req_id)
+    }
+
+    /// Consume the in-flight record for `key` if (and only if) it belongs
+    /// to `req_id`; a newer request's record is left for its own completion.
+    pub fn spill_inflight_clear(&mut self, key: &[u8], req_id: u64) {
+        if self.spill_inflight.get(key).map(|p| p.req_id) == Some(req_id) {
+            self.spill_inflight.remove(key);
+        }
+    }
+
+    /// Retire any in-flight record for `key`, whatever request it belongs to.
+    /// Returns `true` if one existed.
+    ///
+    /// This is what makes a `DEL` (or an overwriting `SET`) inside the window
+    /// FINAL: the record is the only thing that authorizes the completion to
+    /// insert into `cold_index`, so dropping it here is what stops the key
+    /// coming back when the spill lands.
+    #[inline]
+    pub fn spill_inflight_forget(&mut self, key: &[u8]) -> bool {
+        if self.spill_inflight.is_empty() {
+            return false;
+        }
+        self.spill_inflight.remove(key).is_some()
+    }
+
+    /// Cheap (no disk I/O, no promotion) liveness probe for the in-flight
+    /// plane — the pending-spill sibling of `cold_contains_alive`.
+    #[inline]
+    pub fn spill_inflight_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        if self.spill_inflight.is_empty() {
+            return false;
+        }
+        self.spill_inflight
+            .get(key)
+            .is_some_and(|p| p.ttl_ms.is_none_or(|ttl| now_ms <= ttl))
+    }
+
+    /// Rehydrate the pending payload for `key` into an `Entry`, if one is
+    /// in flight and not TTL-expired. Pure RAM — the payload is right here,
+    /// so this never reads disk.
+    ///
+    /// `None` when the payload cannot be rehydrated (corrupt encoding); the
+    /// caller then falls through to its normal path rather than serving a
+    /// wrong value.
+    pub fn spill_inflight_entry(&self, key: &[u8], now_ms: u64) -> Option<Entry> {
+        if self.spill_inflight.is_empty() {
+            return None;
+        }
+        let p = self.spill_inflight.get(key)?;
+        if p.ttl_ms.is_some_and(|ttl| now_ms > ttl) {
+            return None;
+        }
+        crate::storage::eviction::rehydrate_spill_payload(p.value_type, &p.value_bytes, p.ttl_ms)
+    }
+
+    /// Decode the pending payload for `key` into a `RedisValue` without
+    /// touching hot RAM or the cold index — the `&self` sibling of
+    /// [`Self::spill_inflight_entry`].
+    ///
+    /// This is what the RwLock-shared-read dispatch path needs: it holds only
+    /// `&Database` and so cannot promote, exactly as it cannot promote a cold
+    /// hit. Unlike the cold case there is no disk read to pay for — the
+    /// payload is already in RAM.
+    pub fn spill_inflight_value(&self, key: &[u8], now_ms: u64) -> Option<RedisValue> {
+        if self.spill_inflight.is_empty() {
+            return None;
+        }
+        let p = self.spill_inflight.get(key)?;
+        if p.ttl_ms.is_some_and(|ttl| now_ms > ttl) {
+            return None;
+        }
+        match p.value_type {
+            crate::persistence::kv_page::ValueType::String => {
+                Some(RedisValue::String(p.value_bytes.clone()))
+            }
+            vt => crate::storage::tiered::kv_serde::deserialize_collection(&p.value_bytes, vt),
+        }
+    }
+
+    /// Keys currently in flight — used to count them as the logical keys they
+    /// are (`logical_len`) and to keep them enumerable.
+    pub fn spill_inflight_keys(&self) -> impl Iterator<Item = &bytes::Bytes> {
+        self.spill_inflight.keys()
+    }
+
+    /// True when nothing is in flight — the fast bail every plane-aware
+    /// caller takes on a server that is not spilling.
+    #[inline]
+    pub fn spill_inflight_is_empty(&self) -> bool {
+        self.spill_inflight.is_empty()
     }
 
     /// Fast-path predicate for the active-expiry tick. Returns `false` only
@@ -751,22 +922,23 @@ mod tests {
     #[test]
     fn test_version_tracking() {
         let mut db = Database::new();
+        // 0 is reserved for "key absent" so WATCH detects creation.
         assert_eq!(db.get_version(b"key"), 0);
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
-        assert_eq!(db.get_version(b"key"), 0); // first set, version 0
+        assert_eq!(db.get_version(b"key"), 1); // first set: INITIAL_VERSION
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
-        assert_eq!(db.get_version(b"key"), 1); // second set, version 0+1=1
+        assert_eq!(db.get_version(b"key"), 2); // overwrite bumps
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
-        assert_eq!(db.get_version(b"key"), 2);
+        assert_eq!(db.get_version(b"key"), 3);
     }
 
     #[test]
     fn test_increment_version() {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
-        assert_eq!(db.get_version(b"key"), 0);
-        db.increment_version(b"key");
         assert_eq!(db.get_version(b"key"), 1);
+        db.increment_version(b"key");
+        assert_eq!(db.get_version(b"key"), 2);
         // non-existent key is a no-op
         db.increment_version(b"missing");
     }
@@ -1148,5 +1320,130 @@ mod tests {
         assert!(!db.exists(b"nope"));
         let now_ms = db.now_ms();
         assert!(!db.exists_if_alive(b"nope", now_ms));
+    }
+
+    /// Deep-review P2 stale-shadow guard: a failed spill completion for a
+    /// SUPERSEDED request (key re-created and re-evicted while the failed
+    /// pwrite was in flight) must be detectable, and the superseded
+    /// completion's cleanup must not drop the newer request's record.
+    #[test]
+    fn spill_inflight_supersession_guard() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k.clone(), pending(7, b"v7"));
+        assert!(db.spill_inflight_is_newest(b"k", 7));
+        // Key re-evicted with a newer request: 7 is now superseded — its
+        // failure arm must NOT re-insert its stale payload.
+        db.spill_inflight_mark(k, pending(9, b"v9"));
+        assert!(!db.spill_inflight_is_newest(b"k", 7));
+        // The superseded completion's clear leaves the newer record intact.
+        db.spill_inflight_clear(b"k", 7);
+        assert!(db.spill_inflight_is_newest(b"k", 9));
+        // The newest completion consumes its own record.
+        db.spill_inflight_clear(b"k", 9);
+        assert!(!db.spill_inflight_is_newest(b"k", 9));
+    }
+
+    fn pending(req_id: u64, value: &'static [u8]) -> PendingSpill {
+        PendingSpill {
+            req_id,
+            value_type: crate::persistence::kv_page::ValueType::String,
+            value_bytes: bytes::Bytes::from_static(value),
+            ttl_ms: None,
+        }
+    }
+
+    /// #459: the in-flight plane must answer reads. A key mid-spill is in
+    /// neither hot nor cold, and before this it was invisible to everything
+    /// except the completion path.
+    #[test]
+    fn an_inflight_key_is_readable_and_counted_while_it_is_in_flight() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k, pending(1, b"hello"));
+
+        assert!(
+            db.spill_inflight_alive(b"k", 0),
+            "a queued spill still holds a live key"
+        );
+        assert_eq!(
+            db.logical_len(),
+            1,
+            "the key was acked to a client, so it must be counted"
+        );
+        let entry = db
+            .spill_inflight_entry(b"k", 0)
+            .expect("payload rehydrates from RAM");
+        assert_eq!(entry.value.as_bytes(), Some(&b"hello"[..]));
+    }
+
+    /// The half that turned a transient miss into permanent data loss: DEL
+    /// must retire the record, because the record is the completion's
+    /// authorization to publish into `cold_index`.
+    #[test]
+    fn deleting_an_inflight_key_withdraws_the_completions_authorization() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k, pending(1, b"hello"));
+
+        let (removed, _) = db.remove_counting_cold(b"k");
+        assert!(removed, "DEL of a mid-spill key must answer 1, not 0");
+        assert!(
+            !db.spill_inflight_is_newest(b"k", 1),
+            "the completion must no longer be authorized to publish this key — \
+             otherwise the spill lands in cold_index and the delete is undone"
+        );
+        assert_eq!(db.logical_len(), 0, "the key is gone from every plane");
+    }
+
+    /// An overwrite makes the queued payload stale; publishing it would
+    /// leave the OLD value as a cold shadow behind the new hot one.
+    #[test]
+    fn overwriting_an_inflight_key_also_withdraws_authorization() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k.clone(), pending(1, b"old"));
+
+        db.set(k, Entry::new_string(bytes::Bytes::from_static(b"new")));
+
+        assert!(
+            !db.spill_inflight_is_newest(b"k", 1),
+            "the queued payload is stale after an overwrite"
+        );
+        assert_eq!(db.logical_len(), 1, "one key, counted once, not twice");
+    }
+
+    /// A promoting read pulls the payload back from RAM and likewise cancels
+    /// the pending publish — the key is hot again, so a cold entry would
+    /// only shadow it.
+    #[test]
+    fn a_read_promotes_an_inflight_key_out_of_the_window() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(k, pending(1, b"hello"));
+
+        assert!(db.promote_inflight_if_present(b"k", 0));
+        assert!(db.is_hot(b"k"), "promotion puts the key back in hot RAM");
+        assert!(!db.spill_inflight_is_newest(b"k", 1));
+        assert_eq!(db.logical_len(), 1, "still exactly one key");
+    }
+
+    /// An in-flight record whose TTL has passed is not a live key.
+    #[test]
+    fn an_expired_inflight_payload_is_not_alive() {
+        let mut db = Database::new();
+        let k = bytes::Bytes::from_static(b"k");
+        db.spill_inflight_mark(
+            k,
+            PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::String,
+                value_bytes: bytes::Bytes::from_static(b"v"),
+                ttl_ms: Some(1_000),
+            },
+        );
+        assert!(db.spill_inflight_alive(b"k", 999), "not yet expired");
+        assert!(!db.spill_inflight_alive(b"k", 1_001), "past its TTL");
+        assert!(db.spill_inflight_entry(b"k", 1_001).is_none());
     }
 }

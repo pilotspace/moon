@@ -97,6 +97,9 @@ impl Database {
         if self.data.contains_key(key) {
             return true;
         }
+        if self.promote_inflight_if_present(key, now_ms) {
+            return true;
+        }
         // Look up the location first (cheap, in-memory) so the outcome below
         // can be paired with the location it was read from -- required by
         // `promote_cold_outcome`'s revalidation (see its doc comment). This
@@ -110,6 +113,33 @@ impl Database {
         let outcome =
             crate::storage::tiered::cold_read::read_cold_entry(&shard_dir, location, now_ms, None);
         self.promote_cold_outcome(key, now_ms, location, outcome)
+    }
+
+    /// Pull `key` back into hot RAM from the IN-FLIGHT spill plane, if it is
+    /// there and not TTL-expired. Returns `true` if the key is hot after this
+    /// call because of it.
+    ///
+    /// Cheaper than the cold path it precedes: the payload is already in RAM
+    /// (it is the queued `SpillRequest`'s own refcounted buffer), so this
+    /// costs a rehydrate and no disk read at all.
+    ///
+    /// Retiring the in-flight record is not merely tidy — it withdraws the
+    /// completion's authorization to publish into `cold_index`, which is
+    /// correct here: the key is hot again, and publishing would leave a
+    /// stale cold shadow behind it (#459).
+    ///
+    /// Every read path that can reach a cold key must call this first, or it
+    /// will answer nil for a key that was only ever mid-spill.
+    pub fn promote_inflight_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
+        if self.spill_inflight_is_empty() {
+            return false;
+        }
+        let Some(entry) = self.spill_inflight_entry(key, now_ms) else {
+            return false;
+        };
+        self.spill_inflight_forget(key);
+        self.set(Bytes::copy_from_slice(key), entry);
+        true
     }
 
     /// Apply an already-computed [`cold_read::ColdReadOutcome`] to hot RAM +
@@ -217,6 +247,13 @@ impl Database {
     /// promoting paths handle reclamation.
     #[inline]
     pub(super) fn cold_contains_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        // A key whose spill is still in flight is in neither hot nor cold,
+        // but it exists — the client's write was acked and nothing deleted
+        // it. Answering `false` here is what made EXISTS deny live keys and
+        // DEL answer :0 inside the window (#459).
+        if self.spill_inflight_alive(key, now_ms) {
+            return true;
+        }
         let Some(ci) = self.cold_index.as_ref() else {
             return false;
         };
@@ -241,6 +278,9 @@ impl Database {
     /// mutate `self` to promote a cold hit into hot RAM, so the safe fix is
     /// "decode it from disk every time it's cold" rather than "silently
     /// report the key absent" (same P0 as [`Self::promote_cold_if_present`]).
+    ///
+    /// [`Self::get_cold_value`] consults the in-flight plane before the cold
+    /// one (#459), so these accessors inherit it and see a key mid-spill.
     #[inline]
     pub(super) fn cold_read_only(&self, key: &[u8], now_ms: u64) -> Option<RedisValue> {
         self.get_cold_value(key, now_ms)
@@ -275,6 +315,15 @@ impl Database {
     /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
     /// miss (PERF-08).
     pub fn set(&mut self, key: Bytes, entry: Entry) {
+        // An overwrite makes any in-flight spill payload for this key stale.
+        // Retiring the record here stops its completion publishing the OLD
+        // value into `cold_index`, where it would sit as a shadow behind the
+        // new hot value and become authoritative again after a restart
+        // demoted the hot copy (#459). One `is_empty()` load on the write
+        // hot path when nothing is spilling, which is the normal case.
+        if !self.spill_inflight_is_empty() {
+            self.spill_inflight_forget(&key);
+        }
         let new_cost = entry_overhead(&key, &entry);
         let has_expiry = entry.has_expiry();
         let mut old_cost: usize = 0;
@@ -294,12 +343,13 @@ impl Database {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");
                 old_cost = entry_overhead(&key, existing);
-                let new_version = existing.version() + 1;
+                let new_version = Entry::bump_version(existing.version());
                 *existing = new_entry;
                 existing.set_version(new_version);
             },
             || {
-                // Miss path: insert entry as-is (version defaults to 0).
+                // Miss path: insert entry as-is (constructors start versions
+                // at INITIAL_VERSION=1 so WATCH can detect creation).
                 entry_cell.take().expect("make closure called once on miss")
             },
         );
@@ -449,13 +499,26 @@ impl Database {
             .as_ref()
             .and_then(|ci| ci.lookup(key))
             .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
+        // An in-flight key counts as removed for the same reason it counts as
+        // existing: the write was acked and nothing has deleted it yet.
+        let inflight_alive = self.spill_inflight_alive(key, now_ms);
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot(key);
-        (hot.is_some() || (had_cold && cold_alive), hot)
+        (
+            hot.is_some() || (had_cold && cold_alive) || inflight_alive,
+            hot,
+        )
     }
 
+    /// Drops the cold copy AND any in-flight spill record.
+    ///
+    /// Retiring the in-flight record is the load-bearing half (#459): it is
+    /// the completion's authorization to insert into `cold_index`, so
+    /// without this a DEL issued during the spill window was undone when the
+    /// spill landed — and committed to the manifest, so it survived restart.
     #[inline]
     fn remove_cold_only(&mut self, key: &[u8]) -> bool {
+        self.spill_inflight_forget(key);
         self.cold_index.as_mut().is_some_and(|ci| ci.remove(key))
     }
 
@@ -574,7 +637,7 @@ impl Database {
     /// (hot or cold) are counted.
     pub fn logical_len(&self) -> usize {
         let hot = self.data.len();
-        match &self.cold_index {
+        let hot_and_cold = match &self.cold_index {
             None => hot,
             Some(ci) => {
                 let overlap = ci
@@ -583,7 +646,27 @@ impl Database {
                     .count();
                 hot + ci.len() - overlap
             }
+        };
+        if self.spill_inflight_is_empty() {
+            return hot_and_cold;
         }
+        // Keys mid-spill are in neither plane above but are logically
+        // present (#459): counting only hot+cold made DBSIZE answer 124 for
+        // 400 acked keys and then climb to 400 on its own. Same
+        // count-each-key-once discipline as the cold overlap — a key can be
+        // in flight while a fresh SET has already re-created it hot, or
+        // while a superseded cold entry still exists.
+        let inflight_only = self
+            .spill_inflight_keys()
+            .filter(|k| {
+                !self.data.contains_key(k)
+                    && !self
+                        .cold_index
+                        .as_ref()
+                        .is_some_and(|ci| ci.lookup(k).is_some())
+            })
+            .count();
+        hot_and_cold + inflight_only
     }
 
     /// Iterator over all keys (caller does glob filtering).
@@ -663,11 +746,29 @@ impl Database {
     /// is classified hot; a hot entry that is TTL-expired above a live
     /// cold entry is classified cold.
     pub fn cold_only_keys(&self, now_ms: u64) -> impl Iterator<Item = &Bytes> + '_ {
-        self.cold_index.as_ref().into_iter().flat_map(move |ci| {
+        let cold = self.cold_index.as_ref().into_iter().flat_map(move |ci| {
             ci.iter()
                 .filter(move |(key, loc)| self.is_cold_only_alive(key, loc, now_ms))
                 .map(|(key, _)| key)
-        })
+        });
+        // Keys mid-spill are in neither plane but exist (#459) — KEYS and
+        // RANDOMKEY promise a point-in-time view of the keyspace, so
+        // omitting them would hide a live key for the length of the window.
+        // Same partition discipline as the cold half: skip anything a hot
+        // entry or a cold entry already accounts for.
+        let inflight = self
+            .spill_inflight
+            .iter()
+            .filter(move |(key, p)| {
+                p.ttl_ms.is_none_or(|ttl| now_ms <= ttl)
+                    && !self.data.contains_key(key)
+                    && !self
+                        .cold_index
+                        .as_ref()
+                        .is_some_and(|ci| ci.lookup(key).is_some())
+            })
+            .map(|(key, _)| key);
+        cold.chain(inflight)
     }
 
     /// The cold-only liveness predicate shared by [`Self::cold_only_keys`]
@@ -698,6 +799,16 @@ impl Database {
     /// [`Self::is_cold_only_alive`]. SCAN takes the first COUNT — since the
     /// order is ascending, those are exactly the smallest cold candidates —
     /// instead of filtering the entire index on every page.
+    ///
+    /// KNOWN GAP (#459): unlike [`Self::cold_only_keys`], this does NOT
+    /// include keys whose spill is still in flight. The in-flight map is
+    /// unordered, so merging it into an ascending `hash48` walk needs a
+    /// merge-sort against a plane that mutates under the cursor — real work,
+    /// deliberately not done here. A key can therefore be skipped by SCAN
+    /// for the milliseconds its spill is queued. That stays within SCAN's
+    /// contract (only keys present for the WHOLE iteration are guaranteed),
+    /// and `KEYS`/`RANDOMKEY`, whose contracts are point-in-time, do include
+    /// them.
     pub fn cold_only_keys_from(
         &self,
         from_h48: u64,

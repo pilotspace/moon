@@ -66,6 +66,12 @@ pub(super) struct IdleSlot {
     /// read — the sweep then applies [`park_after_ms`] instead of
     /// [`IDLE_DOWNSHIFT_MS`], and the woken handler exits its task.
     stage2: Cell<bool>,
+    /// #438 conn-secondary: provenance for the cancel errno. Set by
+    /// [`sweep`]/[`cancel_all_parked`] when THEY fire this slot's canceller,
+    /// consumed by the handler's error check ([`IdleSlot::was_swept_cancel`]).
+    /// A bare `ECANCELED` (125) that no sweep produced is a REAL error and
+    /// must terminate the connection, not park it.
+    swept: Cell<bool>,
 }
 
 impl IdleSlot {
@@ -78,6 +84,7 @@ impl IdleSlot {
     /// cached clock; clamped to ≥1 so 0 stays the "not parked" sentinel.
     pub(super) fn mark_parked(&self, now_ms: u64) {
         self.stage2.set(false);
+        self.swept.set(false);
         self.parked_since_ms.set(now_ms.max(1));
     }
 
@@ -85,12 +92,25 @@ impl IdleSlot {
     /// verified parkable, cancel = task exit.
     pub(super) fn mark_parked_stage2(&self, now_ms: u64) {
         self.stage2.set(true);
+        self.swept.set(false);
         self.parked_since_ms.set(now_ms.max(1));
     }
 
     /// Mark the connection no longer parked (woke or is processing).
     pub(super) fn mark_unparked(&self) {
         self.parked_since_ms.set(0);
+    }
+
+    /// #438 conn-secondary: was this error produced by a sweep/drain cancel
+    /// of THIS slot? Checks the errno shape AND consumes the provenance flag
+    /// the cancelling chore set. A raw 125 without the flag (some non-sweep
+    /// `ECANCELED` source) reads as a real error — the caller terminates
+    /// instead of parking a connection nothing will ever cancel-wake again.
+    /// The flag is re-armed `false` at every park, so a raced data delivery
+    /// (cancel fired, bytes won) cannot leave a stale `true` behind past the
+    /// next park.
+    pub(super) fn was_swept_cancel(&self, e: &std::io::Error) -> bool {
+        is_sweep_cancel(e) && self.swept.replace(false)
     }
 }
 
@@ -118,6 +138,7 @@ pub(super) fn register(client_id: u64) -> IdleParkRegistration {
         canceller: RefCell::new(Canceller::new()),
         parked_since_ms: Cell::new(0),
         stage2: Cell::new(false),
+        swept: Cell::new(false),
     });
     REGISTRY.with(|r| r.borrow_mut().insert(client_id, slot.clone()));
     IdleParkRegistration { slot, client_id }
@@ -148,6 +169,9 @@ pub(crate) fn sweep(now_ms: u64) -> usize {
                 IDLE_DOWNSHIFT_MS
             };
             if parked != 0 && now_ms.saturating_sub(parked) >= threshold {
+                // Provenance BEFORE the cancel fires: the woken handler may
+                // check `was_swept_cancel` on this same thread's next poll.
+                slot.swept.set(true);
                 // Consume-and-replace: cancel() fires every associated op and
                 // returns a fresh canceller for the connection's next park.
                 let old = slot.canceller.replace(Canceller::new());
@@ -156,6 +180,36 @@ pub(crate) fn sweep(now_ms: u64) -> usize {
                 // One-shot: the waking handler also clears this, but resetting
                 // here keeps a slow-to-wake connection from being re-cancelled
                 // by the next sweep.
+                slot.parked_since_ms.set(0);
+                cancelled += 1;
+            }
+        }
+        cancelled
+    })
+}
+
+/// F1 (#438): cancel EVERY currently-parked stage-1/2 read, regardless of
+/// age. Called from the shard event loop's shutdown drain — the parked
+/// reads are plain awaits (not selects), so the shutdown token alone cannot
+/// wake them; the canceller is the only same-thread wake the design has.
+/// The woken handler sees the sweep-cancel error, checks the shutdown token
+/// and exits through the normal flush+FIN epilogue instead of re-parking.
+///
+/// Re-fired every drain tick: a connection that was mid-batch at the first
+/// call parks again only if it raced the token check, and the next tick
+/// catches it. Idempotent on unparked slots.
+pub(crate) fn cancel_all_parked() -> usize {
+    REGISTRY.with(|r| {
+        let mut cancelled = 0usize;
+        for slot in r.borrow().values() {
+            if slot.parked_since_ms.get() != 0 {
+                // Same provenance mark as `sweep` — the drained handler's
+                // shutdown-token arm exits either way, but the errno check
+                // runs first and must classify this 125 as sweep-produced.
+                slot.swept.set(true);
+                let old = slot.canceller.replace(Canceller::new());
+                let fresh = old.cancel();
+                slot.canceller.replace(fresh);
                 slot.parked_since_ms.set(0);
                 cancelled += 1;
             }
@@ -234,6 +288,27 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
     /// stage-1 read. Default: nothing (plain TCP has no stream-owned
     /// buffers); TLS releases its drained wrapper buffers here.
     fn on_idle_downshift(&mut self) {}
+
+    /// c10k A1: await read-readiness WITHOUT consuming anything.
+    ///
+    /// Two properties make this the right primitive for watching a blocked
+    /// client's socket:
+    ///   * it is cancel-safe by construction — a readiness poll owns no
+    ///     buffer, so losing the `select!` race cannot lose client bytes
+    ///     (`spawn_parked_idle_watcher` relies on the same property);
+    ///   * once it fires, the fd is level-triggered ready, so the follow-up
+    ///     read completes immediately with data, EOF or an error and can be
+    ///     issued OUTSIDE the `select!`, where nothing can cancel it.
+    ///
+    /// The default never resolves, which leaves streams without a race-free
+    /// standalone readiness await on exactly the pre-A1 behaviour. TLS
+    /// deliberately keeps that default: `Stream::read_inner` loops on
+    /// `read_io` until rustls yields plaintext, so a post-readiness read can
+    /// park inside a partial record — the one thing the design above must
+    /// never do. See the module docs on `blocking.rs` for the consequence.
+    fn peer_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::pending()
+    }
 }
 
 impl IdleParkRead for monoio::net::TcpStream {
@@ -246,6 +321,13 @@ impl IdleParkRead for monoio::net::TcpStream {
         c: CancelHandle,
     ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
+    }
+
+    /// `relaxed = false`: a real `poll(2)`, no false positives. A spurious
+    /// wake would cost a wasted read, not correctness, but the blocked-client
+    /// watcher must never mistake one for EOF.
+    fn peer_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        self.readable(false)
     }
 }
 
@@ -325,6 +407,62 @@ mod idle_park_tests {
         // A later stage-1 park on the same slot reverts to the 1s threshold.
         reg.slot.mark_parked(300_000);
         assert_eq!(sweep(300_000 + IDLE_DOWNSHIFT_MS), 1);
+    }
+
+    #[test]
+    fn cancel_all_parked_ignores_age_and_unparked() {
+        let reg_young = register(90_010);
+        let reg_old = register(90_011);
+        let reg_idle = register(90_012);
+        reg_young.slot.mark_parked(10_000); // just parked — sweep would skip
+        reg_old.slot.mark_parked_stage2(1); // ancient stage-2 park
+        // reg_idle: not parked at all.
+        assert_eq!(cancel_all_parked(), 2, "both parked slots, any age/stage");
+        assert_eq!(reg_young.slot.parked_since_ms.get(), 0);
+        assert_eq!(reg_old.slot.parked_since_ms.get(), 0);
+        assert_eq!(cancel_all_parked(), 0, "idempotent once unparked");
+        drop(reg_idle);
+    }
+
+    /// #438 conn-secondary: a bare errno 125 the sweep did not produce must
+    /// read as a REAL error; a swept cancel reads as sweep exactly once.
+    #[test]
+    fn was_swept_cancel_requires_sweep_provenance() {
+        let e125 = std::io::Error::from_raw_os_error(125);
+        let reg = register(90_020);
+        reg.slot.mark_parked(10_000);
+        // No sweep ran: a raw ECANCELED is NOT a sweep cancel.
+        assert!(!reg.slot.was_swept_cancel(&e125));
+        // Sweep fires → provenance set → consumed exactly once.
+        reg.slot.mark_parked(20_000);
+        assert_eq!(sweep(20_000 + IDLE_DOWNSHIFT_MS), 1);
+        assert!(reg.slot.was_swept_cancel(&e125));
+        assert!(!reg.slot.was_swept_cancel(&e125), "flag is consume-once");
+        // Non-125 errors never match even right after a sweep.
+        reg.slot.mark_parked(40_000);
+        assert_eq!(sweep(40_000 + IDLE_DOWNSHIFT_MS), 1);
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(!reg.slot.was_swept_cancel(&reset));
+    }
+
+    /// A sweep whose cancel raced a data delivery leaves the flag set; the
+    /// next park must re-arm it to false so it cannot mask a later real 125.
+    #[test]
+    fn stale_sweep_flag_cleared_on_next_park() {
+        let e125 = std::io::Error::from_raw_os_error(125);
+        let reg = register(90_021);
+        reg.slot.mark_parked_stage2(10_000);
+        assert_eq!(sweep(10_000 + park_after_ms()), 1);
+        // Handler woke with DATA (raced) — flag never consumed. Re-park:
+        reg.slot.mark_parked(50_000);
+        assert!(
+            !reg.slot.was_swept_cancel(&e125),
+            "re-park must clear stale provenance"
+        );
+        // Drain cancel marks provenance too.
+        reg.slot.mark_parked(60_000);
+        assert_eq!(cancel_all_parked(), 1);
+        assert!(reg.slot.was_swept_cancel(&e125));
     }
 
     #[test]

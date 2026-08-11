@@ -5,6 +5,61 @@
 //! Contains `handle_connection_sharded` (thin wrapper) and
 //! `handle_connection_sharded_inner` (generic inner handler).
 
+/// c10k C1 — bound a reply write so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `write_all` on a socket whose receive window is closed never returns, so
+/// the handler sits there holding the whole serialized batch plus its
+/// `maxclients` slot for as long as the client cares to wait. N such clients
+/// is an OOM that costs the attacker nothing but an unread socket.
+///
+/// Cancelling the write may leave a partial reply on the wire; that is
+/// correct here, because the only thing we do afterwards is close the
+/// connection. Evaluates to `true` when the write completed, `false` when it
+/// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
+/// wait-forever behaviour.
+macro_rules! write_all_bounded {
+    ($stream:expr, $buf:expr, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
+        let buf = $buf;
+        let pending = buf.len();
+        if $cap != 0 && pending > $cap {
+            // c10k C1: see the monoio handler's copy of this macro.
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            // Publish what this connection is holding, so a stalled reply is
+            // visible in CLIENT LIST (`obl`/`omem`) while it happens.
+            $live.begin_write(pending);
+            // c10k C1: only a write big enough to actually block arms the
+            // watchdog. A timer per batch flush would land once per command
+            // at pipeline depth 1 and buy nothing there — a reply that fits
+            // in the socket buffer never blocks. See `util::arm_write_timeout`.
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => $stream.write_all(buf).await.is_ok(),
+                Some(dur) => match tokio::time::timeout(dur, $stream.write_all(buf)).await {
+                    Ok(r) => r.is_ok(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                            $client_id,
+                            dur.as_millis(),
+                            pending,
+                        );
+                        false
+                    }
+                },
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
+    }};
+}
+
 use crate::runtime::TcpStream;
 use crate::runtime::cancel::CancellationToken;
 use bumpalo::Bump;
@@ -53,7 +108,7 @@ pub enum HandlerResult {
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, unpropagate_subscription,
+    is_multi_key_command, resp3_shape_for, unpropagate_subscription,
 };
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -79,10 +134,15 @@ pub(crate) async fn handle_connection_sharded(
 ) {
     let maxclients = ctx.runtime_config.read().maxclients;
     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+        // c10k C3: bounded. Unbounded, a zero-window peer holds this task and
+        // its fd open for as long as it likes, so live fds climb past
+        // maxclients without limit.
         use tokio::io::AsyncWriteExt;
-        let _ = stream
-            .write_all(b"-ERR max number of clients reached\r\n")
-            .await;
+        let _ = tokio::time::timeout(
+            super::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+            stream.write_all(b"-ERR max number of clients reached\r\n"),
+        )
+        .await;
         return;
     }
     let peer_addr = stream
@@ -132,12 +192,17 @@ pub(crate) async fn handle_connection_sharded(
         Some(stream),
     ) = (result.0, result.1)
     {
-        use std::os::unix::io::IntoRawFd;
         match stream.into_std() {
             Ok(std_stream) => {
-                let raw_fd = std_stream.into_raw_fd();
+                // F4 (#438): the fd rides the channel as an OwnedFd — an
+                // undelivered message (ring torn down at shutdown) closes the
+                // socket on drop instead of leaking it with a stranded client.
+                let owned_fd = std::os::fd::OwnedFd::from(std_stream);
                 let msg = ShardMessage::MigrateConnection(Box::new(
-                    crate::shard::dispatch::MigrateConnectionPayload { fd: raw_fd, state },
+                    crate::shard::dispatch::MigrateConnectionPayload {
+                        fd: owned_fd,
+                        state,
+                    },
                 ));
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target_shard);
                 let push_result = {
@@ -190,12 +255,12 @@ pub(crate) async fn handle_connection_sharded(
                             // serving the client on this shard with the state
                             // recovered from the undelivered message, instead of
                             // dropping the connection. Migration disabled so the
-                            // affinity tracker cannot loop.
-                            use std::os::unix::io::FromRawFd;
-                            // SAFETY: fd is a valid, uniquely-owned descriptor from
-                            // into_raw_fd(); the failed push left ownership with us.
-                            let std_stream =
-                                unsafe { std::net::TcpStream::from_raw_fd(payload.fd) };
+                            // affinity tracker cannot loop. F4 (#438): the fd
+                            // comes back as an OwnedFd; the safe From conversion
+                            // replaces the old unsafe from_raw_fd.
+                            use std::os::fd::AsRawFd;
+                            let raw_kill_fd = payload.fd.as_raw_fd();
+                            let std_stream = std::net::TcpStream::from(payload.fd);
                             match tokio::net::TcpStream::from_std(std_stream) {
                                 Ok(tcp_stream) => {
                                     let _ = handle_connection_sharded_inner(
@@ -207,7 +272,7 @@ pub(crate) async fn handle_connection_sharded(
                                         false, // can_migrate
                                         BytesMut::new(),
                                         Some(&payload.state),
-                                        payload.fd,
+                                        raw_kill_fd,
                                     )
                                     .await;
                                 }
@@ -299,6 +364,14 @@ pub(crate) async fn handle_connection_sharded_inner<
         buf
     };
     let mut write_buf = BytesMut::with_capacity(8192);
+    // c10k A1: set when a blocking command leaves unparsed input in
+    // `read_buf` (see the read-skip guard in the main select).
+    // #438: a resumed MIGRATED connection starts with the source handler's
+    // unparsed remainder already in read_buf — without arming the flag its
+    // first select awaited a fresh socket read and the carried bytes sat
+    // unprocessed until the client happened to send more (pipelined tails
+    // crossing a migration stalled indefinitely).
+    let mut carried_input = !read_buf.is_empty();
     let parse_config = crate::protocol::ParseConfig::default();
     let mut conn = super::core::ConnectionState::new(
         client_id,
@@ -345,12 +418,26 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
-    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
-    let idle_timeout_secs = ctx.runtime_config.read().timeout;
-    let idle_timeout = if idle_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(idle_timeout_secs))
-    } else {
-        None
+    // Client idle timeout (`timeout N`) is NOT enforced here any more — see
+    // `client_registry::kill_idle_clients`, which the 1 s shard chore runs.
+    // The old per-connection `tokio::time::timeout` wrapper read the config
+    // exactly once at connection setup, so `CONFIG SET timeout` never applied
+    // to live connections, and it had no exemption for replication links
+    // (Redis exempts them). Its monoio twin additionally shadowed the entire
+    // c1M connection park. One sweep now enforces the same policy on both
+    // runtimes, live-reconfigurable, with Redis's exemption set.
+
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    // Read once at connection setup — never on the hot path.
+    let (write_timeout, out_cap_normal) = {
+        let rt = ctx.runtime_config.read();
+        (
+            match rt.client_write_timeout_ms {
+                0 => None,
+                ms => Some(std::time::Duration::from_millis(ms)),
+            },
+            rt.client_output_buffer_limit_normal,
+        )
     };
 
     let mut break_outer = false;
@@ -362,6 +449,9 @@ pub(crate) async fn handle_connection_sharded_inner<
 
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
+            // #438: a deferred batch tail from the subscribe break sits in
+            // read_buf; run_subscriber_step parses it before awaiting the
+            // socket, clearing the flag only when its read arm actually wins.
             match pubsub::run_subscriber_step(
                 &mut stream,
                 &mut read_buf,
@@ -371,6 +461,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 ctx,
                 &peer_addr,
                 &shutdown,
+                &mut carried_input,
             )
             .await
             {
@@ -387,23 +478,53 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
         tokio::select! {
             result = async {
-                if let Some(dur) = idle_timeout {
-                    match tokio::time::timeout(dur, stream.read_buf(&mut read_buf)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
-                    }
+                // c10k A1: a blocking command's peer watch may have pulled
+                // bytes the client pipelined behind it out of the kernel and
+                // into `read_buf`. Pre-A1 they stayed in the socket, so this
+                // read returned them at once; now they are already here and
+                // awaiting a read would hang the pipelined command. Report
+                // them as if just read — a carry that is only a partial frame
+                // parses to nothing and the loop comes straight back with the
+                // flag already cleared.
+                //
+                // c10k D1: no `idle_timeout` arm here — `timeout N` is enforced
+                // out-of-band by `client_registry::kill_idle_clients`.
+                // #438: read (don't take) the flag — it is cleared in the
+                // arm BODY below, so a select round lost to the tracking or
+                // shutdown arm keeps the carry armed instead of eating it
+                // (the old take() here could drop carried input on the race).
+                if carried_input && !read_buf.is_empty() {
+                    Ok(read_buf.len())
                 } else {
                     stream.read_buf(&mut read_buf).await
                 }
             } => {
+                // Read arm won: the carry (if any) is being consumed now.
+                carried_input = false;
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
+                    Err(_) => break,
+                }
+
+                // c10k C2: query-buffer ceiling. Sited after the read and
+                // ahead of the parse, because an incomplete frame is exactly
+                // what makes `read_buf` grow and it decodes to nothing — the
+                // loop would otherwise come straight back and read more.
+                // `$536870911` plus a dribble pins half a gigabyte per
+                // connection, invisible to `used_memory`, and the auth gate
+                // runs after parsing so it costs no credentials. See
+                // `util::query_buf_limit` for the pre-auth ceiling.
+                {
+                    let (limit, preauth) = {
+                        let rt = ctx.runtime_config.read();
+                        (rt.client_query_buffer_limit, rt.client_query_buffer_limit_preauth)
+                    };
+                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(super::util::QUERY_BUF_LIMIT_ERROR).await;
                         break;
                     }
-                    Err(_) => break,
                 }
 
                 // Parse all complete frames from buffer
@@ -435,7 +556,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>)>> = HashMap::with_capacity(ctx.num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
@@ -448,7 +569,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut local_dispatches: u32 = 0;
                 let mut cross_spsc_dispatches: u32 = 0;
 
-                for frame in batch {
+                // #438 batch-tail hardening: index-based iteration (not a
+                // consuming `for`) so early-flush arms (blocking / SUBSCRIBE)
+                // can defer themselves plus the unconsumed tail to the next
+                // batch iteration, and so subscribe/blocking breaks carry the
+                // parsed tail forward instead of silently dropping it.
+                let num_frames = batch.len();
+                let mut deferred_tail_from: Option<usize> = None;
+                let mut frame_idx = 0usize;
+                while frame_idx < num_frames {
+                    let frame = std::mem::replace(&mut batch[frame_idx], Frame::Null);
+                    frame_idx += 1;
                     // --- AUTH gate ---
                     if !conn.authenticated {
                         match extract_command(&frame) {
@@ -456,8 +587,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&ctx.acl_table);
+                                    conn.adopt_user(uname, &ctx.acl_table);
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                         crate::auth_ratelimit::record_success(addr.ip());
                                     }
@@ -494,8 +624,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     conn.client_name = Some(name);
                                 }
                                 if let Some(ref uname) = opt_user {
-                                    conn.current_user = uname.clone();
-                                    conn.refresh_acl_cache(&ctx.acl_table);
+                                    conn.adopt_user(uname.clone(), &ctx.acl_table);
                                 }
                                 // HELLO AUTH rate limiting (same as AUTH gate)
                                 if matches!(&response, Frame::Error(_)) {
@@ -548,6 +677,117 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // #438 batch-tail crash class: an early-flush command
+                    // (blocking / SUBSCRIBE / PSUBSCRIBE) while remote-slotted
+                    // commands are pending would flush their Frame::Null
+                    // placeholders (wrong replies) and drop/clear `responses`,
+                    // leaving phase 2's drain to index a stale/short vec —
+                    // shard-thread panic aborts the whole process. Defer this
+                    // command and the unconsumed tail to the next batch
+                    // iteration; phase 2 resolves the pending replies first.
+                    if (!remote_groups.is_empty() || !publish_batches.is_empty())
+                        && (crate::server::conn::blocking::is_blocking_command(cmd)
+                            || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+                            || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"))
+                    {
+                        batch[frame_idx - 1] = frame;
+                        deferred_tail_from = Some(frame_idx - 1);
+                        break;
+                    }
+
+                    // === ACL-EXEMPT COMMANDS ===
+                    //
+                    // AUTH and HELLO carry Redis's `NO_AUTH` flag and are
+                    // allowed whatever the current user's permissions are: a
+                    // restricted user must always be able to re-authenticate,
+                    // and gating HELLO would break the RESP3 handshake. The
+                    // pre-auth gate above handles them only while
+                    // UNauthenticated; this is the post-authentication path.
+                    // --- AUTH (already conn.authenticated) ---
+                    if cmd.eq_ignore_ascii_case(b"AUTH") {
+                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
+                        if let Some(uname) = opt_user {
+                            conn.adopt_user(uname, &ctx.acl_table);
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- HELLO ---
+                    if cmd.eq_ignore_ascii_case(b"HELLO") {
+                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
+                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
+                        );
+                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
+                        if let Some(name) = new_name { conn.client_name = Some(name); }
+                        if let Some(ref uname) = opt_user {
+                            conn.adopt_user(uname.clone(), &ctx.acl_table);
+                        }
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // === ACL GATE - every privileged intercept MUST sit below ===
+                    //
+                    // c10k hardening B1. This gate used to sit ~180 lines
+                    // further down, below the scripting and ACL intercepts,
+                    // while its own comment claimed it ran "before any
+                    // command-specific handlers". That held for CONFIG and
+                    // REPLICAOF, but the Lua and ACL intercepts `continue`d
+                    // above it and so never reached a permission check: a user
+                    // holding only `~app:* +get` was correctly refused a plain
+                    // SET yet could run `ACL SETUSER evil on nopass ~* +@all`
+                    // and arbitrary Lua. See tests/acl_privileged_intercepts.rs.
+                    //
+                    // If you add a privileged intercept, add it BELOW this line.
+                    //
+                    // Fast path: skip RwLock + HashMap for unrestricted users
+                    // with a fresh cache.  Stale caches (after ACL SETUSER /
+                    // DELUSER / LOAD) fall through to the full check.
+                    if !conn.acl_skip_allowed() {
+                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+                        let acl_guard = ctx.acl_table.read().unwrap();
+                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
+                            drop(acl_guard);
+                            conn.acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: conn.current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
+                        let is_write_for_acl = metadata::is_write(cmd);
+                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
+                            drop(acl_guard);
+                            conn.acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: conn.current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
+                    }
+
                     // --- CLUSTER subcommands ---
                     if cmd.eq_ignore_ascii_case(b"CLUSTER") {
                         if let Some(ref cs) = ctx.cluster_state {
@@ -593,16 +833,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if cmd.eq_ignore_ascii_case(b"SCRIPT") {
                         let (response, fanout) = crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
                         if let Some((sha1, script_bytes)) = fanout {
-                            let mut producers = ctx.dispatch_tx.borrow_mut();
-                            for target in 0..ctx.num_shards {
-                                if target == ctx.shard_id { continue; }
-                                let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                                let msg = ShardMessage::ScriptLoad { sha1: sha1.clone(), script: script_bytes.clone() };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    ctx.spsc_notifiers[target].notify_one();
-                                }
-                            }
-                            drop(producers);
+                            // E3: bounded fan-out — a full ring no longer
+                            // silently diverges that shard's script cache.
+                            crate::server::conn::shared::script_fanout_bounded(
+                                ctx, &shutdown, &sha1, &script_bytes,
+                            )
+                            .await;
                         }
                         responses.push(response);
                         continue;
@@ -616,8 +852,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let maybe_key = extract_primary_key(cmd, cmd_args);
                             if let Some(key) = maybe_key {
                                 let slot = crate::cluster::slots::slot_for_key(key);
-                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let route = cs.read().unwrap().route_slot(slot, was_asking);
+                                let route = cs.read().route_slot(slot, was_asking);
                                 match route {
                                     crate::cluster::SlotRoute::Local => {}
                                     other => {
@@ -657,50 +892,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // --- AUTH (already conn.authenticated) ---
-                    if cmd.eq_ignore_ascii_case(b"AUTH") {
-                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user {
-                            conn.current_user = uname;
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                        }
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- HELLO ---
-                    if cmd.eq_ignore_ascii_case(b"HELLO") {
-                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
-                        );
-                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
-                        if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(ref uname) = opt_user {
-                            conn.current_user = uname.clone();
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                        }
-                        if matches!(&response, Frame::Error(_)) {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                            }
-                        } else if opt_user.is_some() {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        }
-                        responses.push(response);
-                        continue;
-                    }
+                    // (B1) The ACL gate that used to sit here now runs far above,
+                    // ahead of every privileged intercept. Its old comment claimed
+                    // exactly the invariant the code above it violated.
 
                     // --- ACL ---
                     if cmd.eq_ignore_ascii_case(b"ACL") {
                         let response = crate::command::acl::handle_acl(
-                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config,
+                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config, client_id,
                         );
                         responses.push(response);
                         continue;
@@ -749,41 +948,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // === ACL permission check ===
-                    // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
-                    // so that low-privilege users cannot reach admin commands.
-                    // Fast path: skip RwLock + HashMap for unrestricted users
-                    // with a fresh cache.  Stale caches (after ACL SETUSER /
-                    // DELUSER / LOAD) fall through to the full check.
-                    if !conn.acl_skip_allowed() {
-                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                        let acl_guard = ctx.acl_table.read().unwrap();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
-                            drop(acl_guard);
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
-                        let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
-                            drop(acl_guard);
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
-                    }
 
                     // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
                     // Placed AFTER ACL check. Respects MULTI queue — if conn.in_multi,
@@ -840,7 +1004,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CONFIG ---
-                    if dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
+                    if dispatch::try_handle_config(cmd, cmd_args, ctx, conn.protocol_version, &mut responses) {
                         continue;
                     }
 
@@ -953,7 +1117,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ) {
                                     Some(err) => err,
                                     None => Frame::Integer(
-                                        crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &ch, &msg).await,
                                     ),
                                 };
                                 if let Frame::Array(items) = &mut responses[exec_idx] {
@@ -977,12 +1141,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
 
                     // --- BLOCKING COMMANDS ---
-                    if cmd.eq_ignore_ascii_case(b"BLPOP") || cmd.eq_ignore_ascii_case(b"BRPOP")
-                        || cmd.eq_ignore_ascii_case(b"BLMOVE") || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
-                        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
-                        || cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
-                        || cmd.eq_ignore_ascii_case(b"BZMPOP")
-                    {
+                    if crate::server::conn::blocking::is_blocking_command(cmd) {
                         if conn.in_multi {
                             let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
                             conn.command_queue.push(nb_frame);
@@ -1008,14 +1167,49 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
-                        let blocking_response = handle_blocking_command(
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
+                        // c10k A1: `read_buf` doubles as the carry buffer — it
+                        // holds only the unparsed tail of this batch here, so
+                        // bytes the client pipelines while blocked append in
+                        // wire order.
+                        // D1: exempt this connection from the idle-timeout sweep
+                        // while it is blocked (Redis does the same). RAII, not a
+                        // set/clear pair: a leaked `blocked` bit exempts the
+                        // client from `timeout` permanently.
+                        let blocked_guard = client_live.blocked_guard();
+                        let blocking_outcome = handle_blocking_command(
                             cmd, cmd_args, conn.selected_db, &ctx.shard_databases, &ctx.blocking_registry,
                             ctx.shard_id, ctx.num_shards, &ctx.dispatch_tx, &shutdown,
+                            &mut stream, &mut read_buf,
                         ).await;
-                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, conn.protocol_version);
+                        drop(blocked_guard);
+                        let blocking_response = match blocking_outcome {
+                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+                            // Peer vanished mid-block: registrations are torn
+                            // down, nothing to reply to, close the connection.
+                            crate::server::conn::blocking::BlockingOutcome::PeerGone => {
+                                arena.reset();
+                                return (HandlerResult::Done, None);
+                            }
+                        };
+                        let blocking_response = apply_resp3_conversion(
+                            cmd,
+                            cmd_args,
+                            blocking_response,
+                            conn.protocol_version,
+                        );
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
+                        // A1: anything left in read_buf is either this batch's
+                        // unparsed tail or bytes the peer watch carried; parse
+                        // before awaiting the next read either way.
+                        carried_input = !read_buf.is_empty();
+                        // #438: parsed-but-unconsumed frames after the blocking
+                        // command used to be dropped on break; carry them into
+                        // the next iteration.
+                        if frame_idx < num_frames {
+                            deferred_tail_from = Some(frame_idx);
+                        }
                         break;
                     }
 
@@ -1037,7 +1231,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     ).await {
                         match action {
                             pubsub::SubscriberAction::Continue => { continue; }
-                            pubsub::SubscriberAction::BreakOuter => { break; }
+                            pubsub::SubscriberAction::BreakOuter => {
+                                // #438: carry the parsed-but-unconsumed batch
+                                // tail into subscriber mode instead of
+                                // dropping it.
+                                if frame_idx < num_frames {
+                                    deferred_tail_from = Some(frame_idx);
+                                }
+                                break;
+                            }
                             pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, None); }
                         }
                     }
@@ -1247,9 +1449,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                 ctx.pubsub_affinity.write().register_key(addr.ip(), migrate_to);
                             }
-                            // Migration preconditions: not in MULTI, no active CLIENT TRACKING
-                            // (tracking connections need untrack_all cleanup which doesn't transfer)
-                            if !conn.in_multi && !conn.tracking_state.enabled {
+                            // Migration preconditions (D4 #438): shared gate —
+                            // MULTI / cross-txn / subs / tracking / replica state
+                            // doesn't transfer. Re-checked at the batch-end
+                            // execution point, which is authoritative.
+                            if conn.migration_eligible() {
                                 conn.migration_target = Some(migrate_to);
                             }
                         }
@@ -1778,7 +1982,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     client_id,
                                 );
                             }
-                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(
+                                cmd,
+                                cmd_args,
+                                response,
+                                conn.protocol_version,
+                            );
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
@@ -1870,7 +2079,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     conn.tracking_state.noloop,
                                 );
                             }
-                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(
+                                cmd,
+                                cmd_args,
+                                response,
+                                conn.protocol_version,
+                            );
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
@@ -1918,6 +2132,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 conn.tracking_state.noloop,
                             );
                         }
+                        // Classify BEFORE `frame` is moved below: this is the last
+                        // point at which `cmd_args` (which borrows `frame`) is alive.
+                        // The reply loop sees only cmd_name. 1-byte Copy tag, no alloc.
+                        let resp3_shape = if conn.protocol_version >= 3 {
+                            resp3_shape_for(cmd, cmd_args)
+                        } else {
+                            crate::protocol::resp3::Resp3Shape::None
+                        };
                         let dispatch_frame = if rewritten.is_some() {
                             let mut parts = Vec::with_capacity(1 + cmd_args.len());
                             parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
@@ -1933,7 +2155,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys, resp3_shape));
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
                 }
@@ -1943,17 +2165,40 @@ pub(crate) async fn handle_connection_sharded_inner<
                 crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
 
+                // #438: re-encode any deferred batch tail back into the FRONT
+                // of read_buf and skip the next socket read — the frames
+                // re-parse on the next loop iteration, AFTER phase 2 below
+                // resolves every pending remote reply and the epilogue
+                // flushes them. RESP command arrays round-trip losslessly
+                // through serialize_resp3.
+                if let Some(from) = deferred_tail_from {
+                    let mut carry = BytesMut::with_capacity(64 + read_buf.len());
+                    for f in &batch[from..num_frames] {
+                        crate::protocol::serialize_resp3(f, &mut carry);
+                    }
+                    carry.extend_from_slice(&read_buf);
+                    read_buf = carry;
+                    carried_input = true;
+                }
+
+                // E4: set when a cross-shard reply await times out. The
+                // per-connection ResponseSlot is REUSED across batches — a
+                // late fill after a timeout would be read by the NEXT batch
+                // as its own reply — so a timeout is fatal: error the
+                // affected entries, flush, then close the connection.
+                let mut xshard_reply_fatal = false;
+
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>);
+                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
                     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, _, db, _)| *db).unwrap_or(conn.selected_db);
+                        let batch_db = entries.first().map(|(_, _, _, _, db, _, _)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk)| ((idx, aof, cmd, tk), arc_frame)).unzip();
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk, shape)| ((idx, aof, cmd, tk, shape), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
@@ -1994,7 +2239,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (resp_idx, _, _, _) in &meta {
+                                for (resp_idx, _, _, _, _) in &meta {
                                     responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                         b"ERR cross-shard dispatch backpressure",
                                     ));
@@ -2029,16 +2274,39 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                             }
                             match spun {
-                                Some(r) => r,
-                                None => response_pool.future_for(target).await,
+                                Some(r) => Some(r),
+                                // E4: bounded await — a wedged owner shard
+                                // can no longer hang this client task forever.
+                                None => crate::shard::dispatch::await_response_slot_bounded(
+                                    response_pool.future_for(target),
+                                    crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                                )
+                                .await,
                             }
+                        };
+                        let Some(shard_responses) = shard_responses else {
+                            tracing::error!(
+                                "Shard {}: cross-shard reply from shard {target} timed out; \
+                                 failing the batch and closing the connection (slot unsafe to reuse)",
+                                ctx.shard_id
+                            );
+                            crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
+                            for (resp_idx, _, _, _, _) in &meta {
+                                responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                    b"ERR cross-shard reply timeout",
+                                ));
+                            }
+                            xshard_reply_fatal = true;
+                            // Skip the fsync barrier too: with no reply there
+                            // is nothing durable to confirm for these entries.
+                            continue;
                         };
 
                         // H1-BARRIER: collect (resp_idx, had_aof_bytes) pairs so
                         // we can overwrite write responses on fsync failure below.
                         // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
                             // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                             // inside the SPSC arm (PipelineBatchSlotted / PipelineBatch),
                             // BEFORE the response slot is filled. Appending here (after
@@ -2047,7 +2315,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // pending_aof_count undercount it → escape to new incr →
                             // double-apply on restart. The SPSC arm now owns the AOF
                             // write; aof_bytes below is used only for the barrier check.
-                            let converted = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                            // Shape classified at enqueue, where the args still existed.
+                            let converted = crate::protocol::resp3::apply_shape(resp3_shape, resp, proto_ver);
                             if aof_bytes.is_some() && !matches!(converted, Frame::Error(_)) {
                                 write_resp_idxs.push(resp_idx);
                             }
@@ -2103,30 +2372,72 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Phase 3: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
                 if !publish_batches.is_empty() {
                     let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, Vec<usize>)> = Vec::new();
-                    {
-                        let mut producers = ctx.dispatch_tx.borrow_mut();
-                        for (target, entries) in publish_batches.drain() {
-                            let n = entries.len();
-                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
-                            let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                            let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+                    for (target, entries) in publish_batches.drain() {
+                        let n = entries.len();
+                        let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
+                        let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                        let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
 
-                            let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                            let batch_msg = ShardMessage::PubSubPublishBatch {
-                                pairs,
-                                slot: slot.clone(),
-                            };
-                            if producers[idx].try_push(batch_msg).is_ok() {
+                        let idx = ChannelMesh::target_index(ctx.shard_id, target);
+                        // E1: bounded backpressure retry instead of one bare
+                        // try_push — a transiently-full ring no longer loses
+                        // the batch. Borrow taken+released per attempt, never
+                        // held across the backoff await.
+                        let mut pending = Some(ShardMessage::PubSubPublishBatch {
+                            pairs,
+                            slot: slot.clone(),
+                        });
+                        let outcome = crate::shard::dispatch::push_with_backpressure(
+                            &shutdown,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                            || match pending.take() {
+                                None => true,
+                                Some(m) => {
+                                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                                    match producers[idx].try_push(m) {
+                                        Ok(()) => true,
+                                        Err(back) => {
+                                            pending = Some(back);
+                                            false
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            crate::shard::dispatch::PushOutcome::Pushed => {
                                 ctx.spsc_notifiers[target].notify_one();
-                            } else {
-                                slot.add(0); // push failed, mark as done
                             }
-                            batch_slots.push((slot, resp_indices));
+                            outcome => {
+                                // Give-up: deliver-to-zero so the reply can't
+                                // hang — but loudly (was a silent drop pre-E1).
+                                tracing::warn!(
+                                    "Shard {}: PUBLISH batch fan-out to shard {target} dropped ({outcome:?})",
+                                    ctx.shard_id
+                                );
+                                crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
+                                slot.add(0);
+                            }
                         }
+                        batch_slots.push((slot, resp_indices));
                     }
-                    // Resolve all batch slots
+                    // Resolve all batch slots (E4: bounded — a wedged shard
+                    // degrades to an under-reported count, never a hung client).
                     for (slot, resp_indices) in &batch_slots {
-                        crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+                        if !crate::shard::dispatch::await_pubsub_slot_bounded(
+                            slot,
+                            crate::shard::dispatch::XSHARD_REPLY_TIMEOUT,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Shard {}: PUBLISH batch reply timed out awaiting remote shard",
+                                ctx.shard_id
+                            );
+                            crate::admin::metrics_setup::record_xshard_reply_timeout("publish");
+                        }
                         for (i, resp_idx) in resp_indices.iter().enumerate() {
                             let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
                             if remote_count > 0 {
@@ -2159,7 +2470,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if stream.write_all(&write_buf).await.is_err() {
+                if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
+                    return (HandlerResult::Done, None);
+                }
+
+                // E4: a timed-out cross-shard reply slot must never be reused
+                // — the error replies are flushed above, now close.
+                if xshard_reply_fatal {
                     return (HandlerResult::Done, None);
                 }
 
@@ -2171,7 +2488,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                     crate::client_registry::ClientFlags {
                         subscriber: conn.subscription_count > 0,
                         in_multi: conn.in_multi,
+                        // A batch just completed, so this connection is by
+                        // definition not blocked right now; the blocked bit is
+                        // owned by `set_blocked` around the blocking await.
                         blocked: false,
+                        replica: conn.saw_replconf,
                     },
                     ctx.cached_clock.ms(),
                 );
@@ -2179,7 +2500,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Check if migration was triggered during frame processing.
                 // All responses for the current batch have been written, so the
                 // client sees no interruption -- TCP socket stays open.
-                if let Some(target_shard) = conn.migration_target {
+                // D4 (#438): re-evaluate eligibility HERE — the latch fired
+                // mid-batch and the batch tail may have entered MULTI,
+                // subscribed, or enabled tracking since. Ineligible → keep the
+                // latch and retry at the next clean batch end.
+                if let Some(target_shard) = conn.migration_target
+                    && conn.migration_eligible()
+                {
                     let migrated_state = MigratedConnectionState {
                         selected_db: conn.selected_db,
                         authenticated: conn.authenticated,
@@ -2223,7 +2550,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(push_frame) = push {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if stream.write_all(&write_buf).await.is_err() {
+                    if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                         break;
                     }
                 }

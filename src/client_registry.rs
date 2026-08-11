@@ -113,6 +113,18 @@ pub struct ClientLiveState {
     /// non-unix). Set once at registration; only read by `kill_clients` while
     /// holding the registry lock (see the drop-ordering safety note there).
     pub kill_fd: i32,
+    /// Bytes of reply currently held in an in-flight write (c10k C1).
+    ///
+    /// This is the memory a client that stops reading is pinning: the handler
+    /// serializes a whole batch into one buffer before its single write
+    /// syscall, so a deep pipeline against a closed receive window parks
+    /// hundreds of MB here. `CLIENT LIST` reported `obl=0 oll=0 omem=0`
+    /// unconditionally, which made the attack invisible while it happened.
+    /// Reported as `obl`/`omem` — moon has one contiguous output buffer, not
+    /// Redis's static-buffer + reply-list pair, so `oll` stays 0.
+    pub pending_out_bytes: AtomicU64,
+    /// Cumulative reply bytes successfully written — `tot-net-out`.
+    pub tot_net_out: AtomicU64,
 }
 
 impl ClientLiveState {
@@ -132,10 +144,80 @@ impl ClientLiveState {
         self.flags.store(flags.to_bits(), Ordering::Relaxed);
     }
 
+    /// Mark a reply write as in flight. One relaxed store, on a path that is
+    /// about to make a syscall — the cost is not measurable there.
+    #[inline]
+    pub fn begin_write(&self, bytes: usize) {
+        self.pending_out_bytes
+            .store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Clear the in-flight marker. `completed` distinguishes a delivered reply
+    /// from one abandoned by `--client-write-timeout-ms` or a socket error, so
+    /// `tot-net-out` counts only bytes that actually reached the peer.
+    #[inline]
+    pub fn end_write(&self, bytes: usize, completed: bool) {
+        self.pending_out_bytes.store(0, Ordering::Relaxed);
+        if completed {
+            self.tot_net_out.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Lock-free CLIENT KILL check for the connection's own loop.
     #[inline]
     pub fn is_killed(&self) -> bool {
         self.kill_flag.load(Ordering::Relaxed)
+    }
+
+    /// Set or clear the blocked bit, leaving the other flags and the idle
+    /// clock alone.
+    ///
+    /// Only the connection's own task writes `flags`, so the read-modify-write
+    /// is not a race — same relaxed, single-writer discipline as [`touch`].
+    ///
+    /// Needed because every `touch` call site hardcodes `blocked: false`: the
+    /// bit existed but was never set, so `CLIENT LIST`'s `b` flag was dead
+    /// code, and — the reason this matters now — [`kill_idle_clients`] would
+    /// see a client parked in `BLPOP key 0` as idle and close it. Redis
+    /// exempts blocked clients from `timeout`, and so did moon implicitly
+    /// (a blocked client never reached the old per-connection timeout arm).
+    #[inline]
+    pub fn set_blocked(&self, blocked: bool) {
+        const BLOCKED_BIT: u8 = 1 << 2;
+        let cur = self.flags.load(Ordering::Relaxed);
+        let next = if blocked {
+            cur | BLOCKED_BIT
+        } else {
+            cur & !BLOCKED_BIT
+        };
+        self.flags.store(next, Ordering::Relaxed);
+    }
+
+    /// Mark the client blocked for the lifetime of the returned guard.
+    ///
+    /// Prefer this over a manual `set_blocked(true)` / `set_blocked(false)`
+    /// pair around an await: the pair leaks the exemption if the await panics
+    /// or its future is dropped before completing (connection migration,
+    /// task cancellation), and a client stuck with `blocked` set is exempt
+    /// from `timeout` FOREVER — the same immortal-connection shape the
+    /// timeout sweep exists to prevent.
+    #[inline]
+    pub fn blocked_guard(self: &Arc<Self>) -> BlockedGuard {
+        self.set_blocked(true);
+        BlockedGuard {
+            live: Arc::clone(self),
+        }
+    }
+}
+
+/// RAII `blocked` flag, cleared on drop however the scope is left.
+pub struct BlockedGuard {
+    live: Arc<ClientLiveState>,
+}
+
+impl Drop for BlockedGuard {
+    fn drop(&mut self) {
+        self.live.set_blocked(false);
     }
 }
 
@@ -155,6 +237,14 @@ pub struct ClientFlags {
     pub subscriber: bool,
     pub in_multi: bool,
     pub blocked: bool,
+    /// Replication link (this connection sent REPLCONF/PSYNC).
+    ///
+    /// Exemption bit only — deliberately NOT surfaced by [`to_flag_str`], so
+    /// `CLIENT LIST` output is byte-identical to before. Redis's
+    /// `clientsCronHandleTimeout` skips `CLIENT_SLAVE`/`CLIENT_MASTER`, and
+    /// [`kill_idle_clients`] needs the same exemption: a replica link is
+    /// idle between writes by design and must never be idle-closed.
+    pub replica: bool,
 }
 
 impl ClientFlags {
@@ -174,7 +264,10 @@ impl ClientFlags {
     /// Pack into one byte for `ClientLiveState::flags`.
     #[inline]
     pub fn to_bits(self) -> u8 {
-        (self.subscriber as u8) | ((self.in_multi as u8) << 1) | ((self.blocked as u8) << 2)
+        (self.subscriber as u8)
+            | ((self.in_multi as u8) << 1)
+            | ((self.blocked as u8) << 2)
+            | ((self.replica as u8) << 3)
     }
 
     /// Unpack from `ClientLiveState::flags`.
@@ -184,6 +277,7 @@ impl ClientFlags {
             subscriber: bits & 1 != 0,
             in_multi: bits & 2 != 0,
             blocked: bits & 4 != 0,
+            replica: bits & 8 != 0,
         }
     }
 }
@@ -204,6 +298,8 @@ pub fn register(
         connected_at_epoch_ms: crate::storage::entry::current_time_ms(),
         db: AtomicUsize::new(0),
         last_cmd_ms: AtomicU64::new(0),
+        pending_out_bytes: AtomicU64::new(0),
+        tot_net_out: AtomicU64::new(0),
         flags: AtomicU8::new(ClientFlags::default().to_bits()),
         kill_flag: AtomicBool::new(false),
         kill_fd,
@@ -216,8 +312,25 @@ pub fn register(
         shard,
         live: Arc::clone(&live),
     };
-    stripe(id).write().insert(id, entry);
-    TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    // #438 conn-secondary: a re-register over a still-present id (the
+    // `kept_registration` miss-arm fail-safe firing while the entry somehow
+    // survived, or any future double-register bug) must not double-count —
+    // the single eventual deregister would then leave TOTAL_CLIENTS and the
+    // shard gauges permanently high, skewing `shard_overloaded` routing.
+    // Balance against whatever the insert replaced.
+    let replaced = stripe(id).write().insert(id, entry);
+    if let Some(old) = replaced {
+        tracing::warn!(
+            "client registry: id {} re-registered while present (shard {} -> {})",
+            id,
+            old.shard,
+            shard
+        );
+        shard_conns_delta(old.shard, false);
+        crate::admin::metrics_setup::record_shard_connection_delta(old.shard, -1.0);
+    } else {
+        TOTAL_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    }
     shard_conns_delta(shard, true);
     crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
@@ -314,14 +427,23 @@ pub fn client_info(id: u64) -> Option<String> {
 /// self-kill, then closes).
 pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
     // Lock ordering / fd-liveness invariant, per stripe (c10k W5): the raw-fd
-    // `shutdown` is race-free because a connection's `RegistryGuard` (a local)
-    // drops — calling `deregister`, which needs its OWN stripe's WRITE lock —
-    // strictly before its `stream` (a parameter) drops and closes the fd. So
-    // while we hold a stripe's READ lock and an entry is present in it,
-    // `deregister` for that entry is blocked, its `stream` has not dropped,
-    // and `kill_fd` is still an open socket. The invariant only ever involves
-    // one entry and its own stripe, so striping preserves it; entries in
-    // other stripes are simply not visited while their lock is free.
+    // `shutdown` is race-free because a connection's `RegistryGuard` drops —
+    // calling `deregister`, which needs its OWN stripe's WRITE lock —
+    // strictly before its `stream` drops and closes the fd. So while we hold
+    // a stripe's READ lock and an entry is present in it, `deregister` for
+    // that entry is blocked, its `stream` has not dropped, and `kill_fd` is
+    // still an open socket. The invariant only ever involves one entry and
+    // its own stripe, so striping preserves it; entries in other stripes are
+    // simply not visited while their lock is free.
+    //
+    // WHO upholds guard-before-stream (F2, #438): in a handler task it falls
+    // out of drop order — the guard is a local, the stream a parameter, and
+    // locals drop first. A task-parked connection has NO handler task; its
+    // watcher co-owns both as future upvars (drop order = capture order, no
+    // language guarantee that helps), so they are wrapped in
+    // `conn_accept::ParkedSession`, whose hand-written Drop deregisters
+    // before closing. Any future owner of a {guard, stream} pair must
+    // preserve this order or wrap in ParkedSession.
     let mut count = 0u64;
     let kill_entry = |entry: &ClientEntry, count: &mut u64| {
         entry.live.kill_flag.store(true, Ordering::Relaxed);
@@ -359,6 +481,131 @@ pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
                         kill_entry(entry, &mut count);
                     }
                 }
+            }
+        }
+    }
+    count
+}
+
+/// Connections whose handler task has exited and which are held only by a
+/// readiness watcher (c1M task-exit parking).
+///
+/// Exposed as `parked_clients` in `INFO clients`. Operators get to see how
+/// much of the connection fleet is actually parked; tests get a direct,
+/// non-flaky assertion that parking engaged, instead of inferring it from
+/// process RSS.
+static PARKED_CLIENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a connection entering (`+1`) or leaving (`-1`) task-exit parking.
+pub fn parked_delta(entering: bool) {
+    if entering {
+        PARKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PARKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Number of connections currently task-parked.
+pub fn parked_clients() -> u64 {
+    PARKED_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// Close connections idle for at least `timeout_secs` — Redis's `timeout`
+/// config. Returns the number closed.
+///
+/// Called once per second from each shard's chore, which visits only the
+/// entries it owns (`entry.shard == shard`), so the work is distributed and
+/// no shard walks another's connections.
+///
+/// **Why this is not a per-connection timer (c10k hardening D1).** `timeout`
+/// used to be enforced by a `select!` arm racing the connection's idle read
+/// against `sleep(timeout)`. That arm sat FIRST in the read loop's if/else
+/// chain, which made the entire c1M connection park structurally unreachable
+/// whenever `timeout` was set: every connection reverted from the parked
+/// ~3.3 KB to its full ~46 KB working set, silently, in exactly the
+/// deployments that use the only slowloris knob we ship. Enforcing from the
+/// chore instead costs no per-connection timer or allocation, and reaches
+/// connections the handler cannot: ones parked in `read()`, and ones whose
+/// handler TASK has exited entirely (task-exit parking) and are held only by
+/// a readiness watcher. Redis enforces `timeout` from `serverCron` the same
+/// way, so enforcement being up to one sweep interval late matches upstream
+/// rather than diverging from it.
+///
+/// Exemptions mirror Redis's `clientsCronHandleTimeout`: subscribers,
+/// blocked clients, and replication links are never idle-closed.
+pub fn kill_idle_clients(
+    shard: usize,
+    num_shards: usize,
+    timeout_secs: u64,
+    now_epoch_ms: u64,
+) -> u64 {
+    sweep_idle_clients(shard, num_shards, timeout_secs, now_epoch_ms, None)
+}
+
+/// Core of [`kill_idle_clients`], with a test-only shard filter.
+///
+/// The registry is striped by `id % STRIPES`, NOT by shard, so a stripe holds
+/// clients belonging to every shard. Each shard therefore sweeps a DISJOINT
+/// SUBSET OF STRIPES (`i % num_shards == shard`) rather than the whole
+/// registry filtered by `entry.shard`: the latter is what the first version
+/// did, and because the chore runs once per shard per second it made the
+/// total cost `O(num_shards × total_clients)` per second — 12× the necessary
+/// work at `--shards 12`, all of it holding stripe read locks that contend
+/// with the write locks `register`/`deregister` need on accept and close.
+/// Partitioning keeps the cost at one full pass per second no matter how many
+/// shards there are, and genuinely distributes it. Shards ≥ `STRIPES` sweep
+/// nothing, which is correct: stripes 0..STRIPES are still fully covered.
+///
+/// Killing is deliberately shard-agnostic — `kill_flag` is an atomic and
+/// `force_close_fd` is a `shutdown(2)`, both safe from any thread. This is
+/// exactly what `CLIENT KILL` already does cross-shard.
+///
+/// `only_shard` is `Some` only from unit tests: the registry is process-global
+/// and cargo runs tests in parallel, so each test scopes its assertions to its
+/// own synthetic shard id.
+fn sweep_idle_clients(
+    shard: usize,
+    num_shards: usize,
+    timeout_secs: u64,
+    now_epoch_ms: u64,
+    only_shard: Option<usize>,
+) -> u64 {
+    if timeout_secs == 0 || num_shards == 0 {
+        return 0;
+    }
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    let mut count = 0u64;
+    // Same per-stripe fd-liveness invariant as `kill_clients`: while this
+    // stripe's READ lock is held and an entry is present, that connection's
+    // `deregister` (which needs the stripe's WRITE lock) cannot have run, so
+    // its stream has not dropped and `kill_fd` is still an open socket.
+    for (idx, lock) in REGISTRY.iter().enumerate() {
+        if idx % num_shards != shard {
+            continue;
+        }
+        let guard = lock.read();
+        for entry in guard.values() {
+            if entry.live.is_killed() {
+                continue;
+            }
+            if only_shard.is_some_and(|s| entry.shard != s) {
+                continue;
+            }
+            let flags = ClientFlags::from_bits(entry.live.flags.load(Ordering::Relaxed));
+            if flags.subscriber || flags.blocked || flags.replica {
+                continue;
+            }
+            // `last_cmd_ms` is ms-since-connect of the last completed batch,
+            // so a connection that has never completed one reads 0 and is
+            // idle since it connected — which is what we want for a client
+            // that opens a socket and never speaks.
+            let idle_ms = now_epoch_ms
+                .saturating_sub(entry.live.connected_at_epoch_ms)
+                .saturating_sub(entry.live.last_cmd_ms.load(Ordering::Relaxed));
+            if idle_ms >= timeout_ms {
+                entry.live.kill_flag.store(true, Ordering::Relaxed);
+                force_close_fd(entry.live.kill_fd);
+                count += 1;
             }
         }
     }
@@ -449,13 +696,21 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
     let name = entry.name.as_deref().unwrap_or("");
     let flags = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed)).to_flag_str();
     let db = live.db.load(Ordering::Relaxed);
+    // c10k C1: `obl`/`omem` report the reply bytes this connection is holding
+    // in an in-flight write. A client that stops reading pins that memory for
+    // as long as `--client-write-timeout-ms` allows, and with these hardcoded
+    // to 0 there was no way to see it happening. `oll` stays 0: moon has one
+    // contiguous output buffer, not Redis's static-buffer + reply-list pair,
+    // so there is no list whose length it could report.
+    let omem = live.pending_out_bytes.load(Ordering::Relaxed);
+    let tot_net_out = live.tot_net_out.load(Ordering::Relaxed);
     let _ = writeln!(
         buf,
         "id={} addr={} laddr=127.0.0.1:0 fd=0 name={} age={} idle={} flags={} db={} \
          sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
-         tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r \
+         tot-net-in=0 tot-net-out={} rbs=1024 rbp=0 obl={} oll=0 omem={} tot-mem={} events=r \
          cmd=NULL user={} redir=-1 resp=2 lib-name= lib-ver=",
-        entry.id, entry.addr, name, age, idle, flags, db, entry.user,
+        entry.id, entry.addr, name, age, idle, flags, db, tot_net_out, omem, omem, omem, entry.user,
     );
 }
 
@@ -770,5 +1025,314 @@ mod overload_gate_tests {
     #[test]
     fn zero_shards_is_safe() {
         assert!(!overload_threshold_exceeded(0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+
+    /// Sweep EVERY stripe but act only on `shard`'s entries.
+    ///
+    /// Production partitions stripes across shards and does not filter by
+    /// `entry.shard` at all (see [`sweep_idle_clients`]), so tests cannot use
+    /// `kill_idle_clients` directly: a test's clients land in stripes by
+    /// `id % STRIPES` and would only be visited by whichever shard owns that
+    /// stripe. This walks all stripes — the pre-partition behaviour — and
+    /// keeps the shard filter purely as test isolation.
+    fn sweep_for_test_shard(shard: usize, timeout_secs: u64, now_epoch_ms: u64) -> u64 {
+        sweep_idle_clients(0, 1, timeout_secs, now_epoch_ms, Some(shard))
+    }
+
+    /// The registry is process-global and `cargo test` runs these in
+    /// parallel, so every test gets its own synthetic shard id, applied via
+    /// `sweep_for_test_shard` above.
+    /// (`SHARD_CONNS` is unset in unit tests, so the per-shard counters are
+    /// inert for these ids.)
+    fn client(id: u64, shard: usize) -> Arc<ClientLiveState> {
+        register(id, format!("127.0.0.1:{id}"), "default".into(), shard, -1)
+    }
+
+    /// `kill_fd` is -1 here, so `force_close_fd` is a no-op and the observable
+    /// effect is the cooperative kill flag — which is what the handler loop
+    /// checks anyway.
+    fn killed(id: u64) -> bool {
+        is_killed(id)
+    }
+
+    /// The stripe partition is the whole point of the sweep's shape: each
+    /// shard must visit a DISJOINT subset of stripes, and the union across
+    /// shards must cover every stripe exactly once. Without this the chore
+    /// re-scans the entire registry once per shard per second.
+    #[test]
+    fn stripe_partition_is_disjoint_and_total() {
+        for num_shards in [1usize, 2, 3, 4, 12, 16, 24] {
+            let mut seen = vec![0usize; STRIPES];
+            for shard in 0..num_shards {
+                for stripe in 0..STRIPES {
+                    if stripe % num_shards == shard {
+                        seen[stripe] += 1;
+                    }
+                }
+            }
+            assert!(
+                seen.iter().all(|&n| n == 1),
+                "num_shards={num_shards}: every stripe must be swept exactly \
+                 once per round, got {seen:?}"
+            );
+        }
+    }
+
+    /// A shard only sweeps its own stripes, so an idle client is reaped by
+    /// exactly ONE shard — never by all of them, and never by none.
+    #[test]
+    fn idle_client_is_reaped_by_exactly_one_shard() {
+        const SHARD: usize = 908;
+        const NUM_SHARDS: usize = 4;
+        let live = client(9_080, SHARD);
+        let now = live.connected_at_epoch_ms + 30_000;
+
+        // Which stripe holds it, and therefore which shard owns the sweep.
+        let owner = (9_080usize % STRIPES) % NUM_SHARDS;
+        for shard in 0..NUM_SHARDS {
+            if shard == owner {
+                continue;
+            }
+            assert_eq!(
+                sweep_idle_clients(shard, NUM_SHARDS, 5, now, Some(SHARD)),
+                0,
+                "shard {shard} must not sweep another shard's stripes"
+            );
+        }
+        assert!(!killed(9_080), "no non-owner shard may have killed it");
+        assert_eq!(
+            sweep_idle_clients(owner, NUM_SHARDS, 5, now, Some(SHARD)),
+            1,
+            "the owning shard must reap it"
+        );
+        assert!(killed(9_080));
+        deregister(9_080);
+    }
+
+    /// The `blocked` exemption must survive an early return: a leaked bit
+    /// would exempt the client from `timeout` forever.
+    #[test]
+    fn blocked_guard_clears_on_drop() {
+        const SHARD: usize = 909;
+        let live = client(9_090, SHARD);
+        let now = live.connected_at_epoch_ms + 30_000;
+        {
+            let _g = live.blocked_guard();
+            assert_eq!(
+                sweep_for_test_shard(SHARD, 5, now),
+                0,
+                "a blocked client is exempt while the guard is alive"
+            );
+        }
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 5, now),
+            1,
+            "once the guard drops the exemption must be gone"
+        );
+        deregister(9_090);
+    }
+
+    #[test]
+    fn idle_past_timeout_is_killed_and_active_is_not() {
+        const SHARD: usize = 900;
+        let live_idle = client(9_001, SHARD);
+        let live_active = client(9_002, SHARD);
+        let now = live_idle.connected_at_epoch_ms + 30_000;
+
+        // The active client completed a batch 1s ago; the idle one never has.
+        live_active.touch(0, ClientFlags::default(), now - 1_000);
+
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 10, now),
+            1,
+            "only the idle client"
+        );
+        assert!(killed(9_001));
+        assert!(!killed(9_002));
+
+        deregister(9_001);
+        deregister(9_002);
+    }
+
+    #[test]
+    fn timeout_zero_never_kills() {
+        const SHARD: usize = 901;
+        let live = client(9_003, SHARD);
+        let now = live.connected_at_epoch_ms + 3_600_000;
+        assert_eq!(sweep_for_test_shard(SHARD, 0, now), 0);
+        assert!(!killed(9_003));
+        deregister(9_003);
+    }
+
+    /// Redis's `clientsCronHandleTimeout` exempts blocked clients,
+    /// subscribers and replication links. Before D1 these were exempt only by
+    /// accident of control flow (each took a different arm of the read loop);
+    /// a sweep has to exempt them explicitly.
+    #[test]
+    fn blocked_subscriber_and_replica_are_exempt() {
+        const SHARD: usize = 902;
+        let blocked = client(9_010, SHARD);
+        let subscriber = client(9_011, SHARD);
+        let replica = client(9_012, SHARD);
+        let now = blocked.connected_at_epoch_ms + 60_000;
+
+        blocked.set_blocked(true);
+        subscriber.touch(
+            0,
+            ClientFlags {
+                subscriber: true,
+                ..Default::default()
+            },
+            blocked.connected_at_epoch_ms,
+        );
+        replica.touch(
+            0,
+            ClientFlags {
+                replica: true,
+                ..Default::default()
+            },
+            blocked.connected_at_epoch_ms,
+        );
+
+        assert_eq!(
+            sweep_for_test_shard(SHARD, 5, now),
+            0,
+            "all three are exempt"
+        );
+        assert!(!killed(9_010));
+        assert!(!killed(9_011));
+        assert!(!killed(9_012));
+
+        deregister(9_010);
+        deregister(9_011);
+        deregister(9_012);
+    }
+
+    /// A blocked client becomes eligible again once it unblocks — the bit is
+    /// an exemption, not permanent immunity.
+    #[test]
+    fn unblocking_restores_eligibility() {
+        const SHARD: usize = 903;
+        let live = client(9_020, SHARD);
+        let now = live.connected_at_epoch_ms + 60_000;
+
+        live.set_blocked(true);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 0);
+
+        live.set_blocked(false);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 1);
+        assert!(killed(9_020));
+        deregister(9_020);
+    }
+
+    /// `set_blocked` must not disturb the other flag bits.
+    #[test]
+    fn set_blocked_preserves_other_flags() {
+        const SHARD: usize = 904;
+        let live = client(9_030, SHARD);
+        live.touch(
+            3,
+            ClientFlags {
+                subscriber: true,
+                in_multi: true,
+                blocked: false,
+                replica: true,
+            },
+            live.connected_at_epoch_ms,
+        );
+
+        live.set_blocked(true);
+        let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
+        assert!(f.subscriber && f.in_multi && f.replica && f.blocked);
+
+        live.set_blocked(false);
+        let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
+        assert!(f.subscriber && f.in_multi && f.replica && !f.blocked);
+        deregister(9_030);
+    }
+
+    /// Each shard sweeps only the connections it owns, so N shards do not do
+    /// N times the work — and never close another shard's clients.
+    #[test]
+    fn sweep_only_touches_its_own_shard() {
+        const MINE: usize = 905;
+        const THEIRS: usize = 906;
+        let mine = client(9_040, MINE);
+        let _theirs = client(9_041, THEIRS);
+        let now = mine.connected_at_epoch_ms + 60_000;
+
+        assert_eq!(sweep_for_test_shard(MINE, 5, now), 1);
+        assert!(killed(9_040));
+        assert!(
+            !killed(9_041),
+            "shard 906's client is not shard 905's business"
+        );
+
+        deregister(9_040);
+        deregister(9_041);
+    }
+
+    /// An already-killed client is not counted twice by a later sweep.
+    #[test]
+    fn already_killed_is_not_recounted() {
+        const SHARD: usize = 907;
+        let live = client(9_050, SHARD);
+        let now = live.connected_at_epoch_ms + 60_000;
+
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 1);
+        assert_eq!(sweep_for_test_shard(SHARD, 5, now), 0, "idempotent");
+        deregister(9_050);
+    }
+
+    #[test]
+    fn parked_gauge_tracks_deltas() {
+        let before = parked_clients();
+        parked_delta(true);
+        parked_delta(true);
+        assert_eq!(parked_clients(), before + 2);
+        parked_delta(false);
+        parked_delta(false);
+        assert_eq!(parked_clients(), before);
+    }
+
+    /// #438 conn-secondary: a re-register of a still-present id (the
+    /// kept_registration miss-arm fail-safe racing an entry back into
+    /// existence) must NOT increment TOTAL_CLIENTS again — the single
+    /// eventual deregister would then leave the count permanently +1,
+    /// skewing `shard_overloaded` routing.
+    ///
+    /// TOTAL_CLIENTS is process-global and other tests mutate it
+    /// concurrently, so the bracket retries with a fresh id when an
+    /// unrelated registration lands inside the two-load window (#446
+    /// review): with the fix, one undisturbed attempt reads t2 == t1; with
+    /// the pre-fix unconditional fetch_add, EVERY attempt reads t1+1.
+    /// Cleanup runs before the verdict so a failure cannot leak entries
+    /// into later tests.
+    #[test]
+    fn replacing_register_does_not_double_count() {
+        use std::sync::atomic::Ordering;
+        let mut clean_attempt_seen = false;
+        for attempt in 0..5u64 {
+            let id = 9_060 + attempt;
+            let _a = register(id, "t:1".into(), "default".into(), 908, -1);
+            let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            let _b = register(id, "t:1".into(), "default".into(), 909, -1);
+            let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
+            deregister(id);
+            assert!(live_handle(id).is_none(), "single deregister must clear");
+            if t2 == t1 {
+                clean_attempt_seen = true;
+                break;
+            }
+        }
+        assert!(
+            clean_attempt_seen,
+            "replacing insert added to TOTAL_CLIENTS on every attempt — double-count"
+        );
     }
 }

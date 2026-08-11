@@ -117,7 +117,15 @@ pub fn track_read_keys(
     }
     let mut table = table.lock();
     for key in &keys {
-        table.track_key(client_id, key, noloop);
+        if let Some((evicted_key, senders)) = table.track_key(client_id, key, noloop) {
+            // Cap eviction (G1): tell the evicted key's trackers to drop
+            // their cached copy — silently forgetting the tracking entry
+            // would leave client-side caches permanently stale.
+            let push = invalidation_push(std::slice::from_ref(&evicted_key));
+            for tx in senders {
+                let _ = tx.try_send(push.clone());
+            }
+        }
     }
 }
 

@@ -40,6 +40,43 @@ type StdRwLock<T> = std::sync::RwLock<T>;
 /// and release the slot via `record_connection_closed()`.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+thread_local! {
+    /// F1 (#438): connection-scoped tasks alive on THIS shard thread —
+    /// handler tasks, park watchers, resumed and migrated handlers. Both
+    /// runtimes pin connection tasks to their shard thread (`monoio::spawn`
+    /// / `tokio::task::spawn_local`), so a thread-local suffices and each
+    /// shard's shutdown drain waits only on its own connections. Excludes
+    /// deliberately short-lived tasks (maxclients-reject writer) and PSYNC
+    /// hijack tasks (replication links have their own shutdown handling and
+    /// must not be able to pin a shard's drain past its deadline… they can
+    /// still eat the bounded deadline — see `SHUTDOWN_DRAIN` in event_loop).
+    static LIVE_CONN_TASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of live connection tasks on this shard thread (shutdown drain).
+pub(crate) fn live_conn_tasks() -> usize {
+    LIVE_CONN_TASKS.with(|c| c.get())
+}
+
+/// RAII increment of [`LIVE_CONN_TASKS`]. Created OUTSIDE the spawned
+/// future and moved into it, so the count is visible the moment the spawn
+/// call returns — a drain that runs between spawn and first poll must see
+/// the task, not conclude the shard is idle.
+pub(crate) struct ConnTaskGuard(());
+
+impl ConnTaskGuard {
+    pub(crate) fn enter() -> Self {
+        LIVE_CONN_TASKS.with(|c| c.set(c.get() + 1));
+        ConnTaskGuard(())
+    }
+}
+
+impl Drop for ConnTaskGuard {
+    fn drop(&mut self) {
+        LIVE_CONN_TASKS.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 /// Process-wide TCP listen backlog (S-5, `--tcp-backlog`). Set once at
 /// startup before any listener binds; 1024 is the historical hardcoded
 /// value. A process-wide static (rather than threading a param through the
@@ -143,7 +180,7 @@ pub(crate) fn spawn_tokio_connection(
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
     repl_state: &Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    cluster_state: &Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
@@ -164,6 +201,30 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
+    // F1 (#438): re-register the stream with THIS shard's runtime io driver.
+    // A connection accepted by the central listener arrives bound to the MAIN
+    // runtime's driver (tokio io resources bind at creation); its io then
+    // dies the moment main's runtime drops — during shutdown every drained
+    // reply write on such a connection failed with "A Tokio 1.x context was
+    // found, but it is being shutdown" while the shard's drain was still
+    // running, and no shard-side ordering can save a foreign-driver stream.
+    // (SO_REUSEPORT splits accepts roughly evenly between the central and
+    // per-shard listeners on Linux, so about half of all connections were
+    // affected.) The monoio path is immune: it forwards STD streams and
+    // registers them on the shard's ring right here. `from_std` in this
+    // function's (shard-thread) runtime context is the tokio equivalent.
+    let tcp_stream = match tcp_stream
+        .into_std()
+        .and_then(tokio::net::TcpStream::from_std)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Shard {shard_id}: shard-driver re-registration failed: {e}; dropping connection"
+            );
+            return;
+        }
+    };
     let aff = affinity_tracker.clone();
     let rsm = remote_subscriber_map.clone();
     let sdbs = shard_databases.clone();
@@ -265,20 +326,33 @@ pub(crate) fn spawn_tokio_connection(
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
         let maxclients = maxclients_tokio;
+        let conn_task = ConnTaskGuard::enter();
         tokio::task::spawn_local(async move {
+            let _conn_task = conn_task; // F1: counted until task exit
             // maxclients check for TLS connections (plain TCP checks in handle_connection_sharded)
             if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                tracing::warn!(
-                    "Shard {}: TLS connection rejected: maxclients reached",
-                    shard_id
-                );
+                // c10k C3: rate-limited (see the plaintext site below).
+                if let Some(suppressed) = crate::server::conn::util::maxclients_warn_due(
+                    crate::storage::entry::current_time_ms(),
+                ) {
+                    tracing::warn!(
+                        "Shard {}: TLS connection rejected: maxclients reached                          ({} further rejections suppressed since the last line)",
+                        shard_id,
+                        suppressed
+                    );
+                }
                 // c10k W3 Redis parity: loud rejection. The plaintext write
                 // surfaces client-side as a handshake failure (best effort).
+                // c10k C3: bounded — this one awaits INLINE on the accept
+                // path, so an unbounded write parks every subsequent accept
+                // on this shard behind one zero-window peer.
                 use tokio::io::AsyncWriteExt;
                 let mut rejected = tcp_stream;
-                let _ = rejected
-                    .write_all(b"-ERR max number of clients reached\r\n")
-                    .await;
+                let _ = tokio::time::timeout(
+                    crate::server::conn::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+                    rejected.write_all(b"-ERR max number of clients reached\r\n"),
+                )
+                .await;
                 return;
             }
             // R-3: capture the underlying TCP fd before the handshake moves the
@@ -323,7 +397,9 @@ pub(crate) fn spawn_tokio_connection(
         });
     } else {
         // Plain TCP connection
+        let conn_task = ConnTaskGuard::enter();
         tokio::task::spawn_local(async move {
+            let _conn_task = conn_task; // F1: counted until task exit
             handle_connection_sharded(tcp_stream, &conn_ctx, sd, cid).await;
         });
     }
@@ -331,29 +407,24 @@ pub(crate) fn spawn_tokio_connection(
 
 /// Spawn a migrated connection handler on the target shard (Tokio runtime).
 ///
-/// Reconstructs a `TcpStream` from a raw FD transferred via `ShardMessage::MigrateConnection`,
-/// prepends synthetic RESP commands for state restoration (SELECT, CLIENT SETNAME), and
-/// spawns a handler with `requirepass = None` (pre-authenticated).
-///
-/// # Safety
-///
-/// The caller must ensure `fd` is a valid, open file descriptor representing a connected
-/// TCP socket. Ownership is transferred: this function consumes the FD (via `from_raw_fd`).
+/// Reconstructs a `TcpStream` from the `OwnedFd` transferred via
+/// `ShardMessage::MigrateConnection` (#438 F4: ownership is in the type — the
+/// conversion chain is entirely safe, and an undelivered fd closes on drop),
+/// prepends synthetic RESP commands for state restoration (SELECT, CLIENT
+/// SETNAME), and spawns the handler.
 ///
 /// # Limitations
 ///
 /// TLS connections cannot be migrated because TLS session state lives in userspace and
 /// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
-// `unix`-gated alongside `runtime-tokio`: the signature takes a
-// `std::os::unix::io::RawFd` and reconstructs the socket via `from_raw_fd`,
-// both of which only exist on Unix. Moon targets Linux + macOS (both Unix), so
-// on every supported build `unix` is always true; the extra predicate just makes
-// the platform coupling explicit (CodeRabbit PR #144). Full non-Unix support
-// would also require gating `MigrateConnectionPayload.fd` — out of scope.
+// `unix`-gated alongside `runtime-tokio`: the signature takes an `OwnedFd`
+// (`MigrateFd` aliases it on Unix only). Moon targets Linux + macOS (both
+// Unix), so on every supported build `unix` is always true; the extra
+// predicate just makes the platform coupling explicit (CodeRabbit PR #144).
 #[cfg(all(feature = "runtime-tokio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_tokio_connection(
-    fd: std::os::unix::io::RawFd,
+    fd: crate::shard::dispatch::MigrateFd,
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -370,7 +441,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
     repl_state: &Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    cluster_state: &Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
@@ -383,24 +454,15 @@ pub(crate) fn spawn_migrated_tokio_connection(
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
-    use std::os::unix::io::FromRawFd;
-
     use crate::server::connection::handle_connection_sharded_inner;
 
-    // `fd` was produced by `libc::dup()` on the source shard before being pushed
-    // through the SPSC channel. That dup is a fresh, owned kernel fd, distinct from
-    // any other open fd. Ownership is transferred exactly once through the channel —
-    // the source shard drops the original stream immediately after `dup`, and on
-    // SPSC push failure the producer reconstructs an `OwnedFd` to close the dup.
-    // Here on the consumer side we take ownership by wrapping it in `TcpStream`,
-    // whose `Drop` closes the fd exactly once. No aliasing, no double-close.
-    // SAFETY: fd is a valid, uniquely-owned dup'd socket transferred via SPSC.
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // F4 (#438): ownership rode the channel as an OwnedFd, so the conversion
+    // to TcpStream is the safe From impl — no raw-fd reasoning left here.
+    let std_stream = std::net::TcpStream::from(fd);
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(
-            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            "Shard {}: migrated fd set_nonblocking failed: {}",
             shard_id,
-            fd,
             e
         );
         return; // std_stream Drop closes FD
@@ -449,6 +511,8 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let sc = script_cache_rc.clone();
             let acl = acl_table.clone();
             let rtcfg = runtime_config.clone();
+            // F5 (#438): read before rtcfg moves into ConnectionContext::new.
+            let reqpass = rtcfg.read().requirepass.clone();
             let scfg = server_config.clone();
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
@@ -472,7 +536,14 @@ pub(crate) fn spawn_migrated_tokio_connection(
                 num_shards,
                 psr,
                 blk,
-                None, // requirepass: None = pre-authenticated
+                // F5 (#438, sec L3): carry the REAL requirepass. The conn's
+                // auth state comes from MigratedConnectionState (a migrated
+                // conn is already authenticated), so this is inert for the
+                // session itself — but a later AUTH on the migrated conn now
+                // validates against the actual password instead of erroring
+                // with "no password is set", and any future code that
+                // re-derives auth from ctx.requirepass sees the truth.
+                reqpass,
                 pool_for_ctx,
                 trk,
                 rs,
@@ -506,7 +577,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
             };
             #[cfg(not(unix))]
             let kill_fd = -1;
+            let conn_task = ConnTaskGuard::enter();
             tokio::task::spawn_local(async move {
+                let _conn_task = conn_task; // F1: counted until task exit
                 let _ = handle_connection_sharded_inner(
                     tcp_stream,
                     peer_addr,
@@ -552,7 +625,7 @@ pub(crate) fn spawn_monoio_connection(
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
     repl_state: &Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    cluster_state: &Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
@@ -597,18 +670,38 @@ pub(crate) fn spawn_monoio_connection(
             // close. The slot was never taken, so no record_connection_closed.
             let maxclients = runtime_config.read().maxclients;
             if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                tracing::warn!(
-                    "Shard {}: connection rejected: maxclients reached",
-                    shard_id
-                );
+                // c10k C3: one line per second, carrying the count it stands
+                // for. Being at maxclients is exactly when connections arrive
+                // fastest, so a line per rejection floods the log with the
+                // symptom and competes for the I/O needed to diagnose it.
+                if let Some(suppressed) = crate::server::conn::util::maxclients_warn_due(
+                    crate::storage::entry::current_time_ms(),
+                ) {
+                    tracing::warn!(
+                        "Shard {}: connection rejected: maxclients reached                          ({} further rejections suppressed since the last line)",
+                        shard_id,
+                        suppressed
+                    );
+                }
                 monoio::spawn(async move {
                     use monoio::io::AsyncWriteRentExt;
                     let mut rejected = tcp_stream;
-                    let (_res, _buf) = rejected
-                        .write_all(bytes::Bytes::from_static(
-                            b"-ERR max number of clients reached\r\n",
-                        ))
-                        .await;
+                    // c10k C3: bounded. This 36-byte write was untimed, so a
+                    // zero-window peer parked the task and held the rejected
+                    // fd open indefinitely — live fds climb past maxclients
+                    // without limit, defeating the gate and the RLIMIT_NOFILE
+                    // reconciliation behind it.
+                    let _ = monoio::time::timeout(
+                        crate::server::conn::util::MAXCLIENTS_REJECT_WRITE_TIMEOUT,
+                        async {
+                            let (_res, _buf) = rejected
+                                .write_all(bytes::Bytes::from_static(
+                                    b"-ERR max number of clients reached\r\n",
+                                ))
+                                .await;
+                        },
+                    )
+                    .await;
                     // drop closes the fd
                 });
                 return;
@@ -705,7 +798,9 @@ pub(crate) fn spawn_monoio_connection(
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
                 // Load current TLS config from ArcSwap — new connections see reloaded certs
                 let tls_cfg = tls_swap.load_full();
+                let conn_task = ConnTaskGuard::enter();
                 monoio::spawn(async move {
+                    let _conn_task = conn_task; // F1: counted until task exit
                     // maxclients slot already taken by the pre-spawn gate above
                     // (still BEFORE the handshake, preserving #17's stalled-
                     // ClientHello bound); released by record_connection_closed
@@ -778,7 +873,9 @@ pub(crate) fn spawn_monoio_connection(
                 let dtx2 = dispatch_tx.clone();
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
+                let conn_task = ConnTaskGuard::enter();
                 monoio::spawn(async move {
+                    let _conn_task = conn_task; // F1: counted until task exit
                     // maxclients slot already taken by the pre-spawn gate above;
                     // released by the migration-aware decrement at task end.
                     // R-6 fail-open: keep what we need to re-serve the client
@@ -921,9 +1018,15 @@ pub(crate) fn spawn_monoio_connection(
                             )
                             .await;
                         } else {
+                            // F4 (#438): wrap the dup immediately — from here on
+                            // the fd is closed by Drop on every path (undelivered
+                            // message, ring torn down at shutdown), never leaked.
+                            // SAFETY: dup_fd is the fresh, uniquely-owned fd
+                            // libc::dup returned above; nothing else closes it.
+                            let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(dup_fd) };
                             let mut pending_msg = Some(ShardMessage::MigrateConnection(Box::new(
                                 crate::shard::dispatch::MigrateConnectionPayload {
-                                    fd: dup_fd,
+                                    fd: owned_fd,
                                     state,
                                 },
                             )));
@@ -958,11 +1061,8 @@ pub(crate) fn spawn_monoio_connection(
                             if _migrated {
                                 drop(stream); // hand-off confirmed: target owns dup_fd
                             } else if let Some(ShardMessage::MigrateConnection(payload)) = pending_msg {
-                                // SAFETY: dup_fd is a valid dup'd socket from libc::dup
-                                // above; the push never succeeded so we still own it.
-                                drop(unsafe {
-                                    std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
-                                });
+                                // F4 (#438): dropping the payload closes the
+                                // dup'd fd (OwnedFd) — no manual reclaim needed.
                                 tracing::warn!(
                                     "Shard {}: migration SPSC full, keeping connection {} local (monoio)",
                                     shard_id, cid
@@ -1034,6 +1134,75 @@ impl ParkWatchable for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
 /// this future, so it must stay small and measurable; and it breaks the
 /// park→resume→park type cycle (the resumed handler task constructs this
 /// watcher again on re-park).
+/// RAII counter for connections currently held only by a park watcher.
+#[cfg(all(feature = "runtime-monoio", unix))]
+struct ParkedCount;
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl ParkedCount {
+    fn enter() -> Self {
+        crate::client_registry::parked_delta(true);
+        ParkedCount
+    }
+}
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl Drop for ParkedCount {
+    fn drop(&mut self) {
+        crate::client_registry::parked_delta(false);
+    }
+}
+
+/// F2 (#438, conn#9 / sec L1): a parked connection's registry guard and
+/// stream, co-owned by one watcher future. `kill_clients`' per-stripe
+/// fd-liveness invariant requires the guard (whose drop deregisters under
+/// the stripe WRITE lock) to drop STRICTLY BEFORE the stream (whose drop
+/// closes the fd): while a kill scan holds a stripe READ lock and sees an
+/// entry, that entry's fd must still be an open socket, or the scan's
+/// `shutdown(2)` lands on a reused fd of an unrelated connection. Inside a
+/// handler task the ordering falls out of locals (guard) dropping before
+/// parameters (stream); in this watcher both were co-captured upvars, whose
+/// drop order is capture order — never violated in practice, but one
+/// refactor away from it, and the F1 shutdown drain makes dropping this
+/// future a routine path rather than a teardown-only one. The hand-written
+/// Drop makes the order explicit and refactor-proof.
+/// Generic over the guard type so the drop-order contract is unit-testable
+/// under BOTH runtimes (monoio-only unit tests are invisible to CI — every
+/// CI test job runs the tokio feature set). Production use instantiates
+/// `G = RegistryGuard`.
+///
+/// FIELD ORDER IS THE CONTRACT: struct fields drop in declaration order
+/// (RFC 1857), so `guard` (deregister, serializing against any in-flight
+/// kill scan on this entry's stripe) drops strictly before `stream` (fd
+/// close). Do not reorder these fields — the
+/// `parked_session_drops_guard_before_stream` unit test pins the order,
+/// and it lets the wake path destructure without `Option`s or a manual
+/// `Drop` (which would forbid moving the parts back out).
+pub(crate) struct ParkedSession<G, S> {
+    guard: G,
+    stream: S,
+}
+
+#[cfg_attr(not(all(feature = "runtime-monoio", unix)), allow(dead_code))]
+impl<G, S> ParkedSession<G, S> {
+    pub(crate) fn new(guard: G, stream: S) -> Self {
+        ParkedSession { guard, stream }
+    }
+
+    /// Wake path: hand both back to the resumed handler, where the
+    /// local-before-parameter drop ordering holds again.
+    pub(crate) fn into_parts(self) -> (G, S) {
+        (self.guard, self.stream)
+    }
+}
+
+#[cfg(all(feature = "runtime-monoio", unix))]
+impl<G, S: ParkWatchable> ParkedSession<G, S> {
+    fn park_readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        self.stream.park_readable()
+    }
+}
+
 #[cfg(all(feature = "runtime-monoio", unix))]
 fn spawn_parked_idle_watcher<S>(
     stream: S,
@@ -1050,9 +1219,19 @@ fn spawn_parked_idle_watcher<S>(
         + ParkWatchable
         + 'static,
 {
+    // F1: counted so the shutdown drain waits for this watcher to run its
+    // shutdown arm (clean close + accounting) instead of dropping it cold.
+    let conn_task = ConnTaskGuard::enter();
+    // F2: guard-first drop order, whichever way this future ends.
+    let session = ParkedSession::new(registry_guard, stream);
     let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
+        let _conn_task = conn_task;
+        // Observability for `INFO clients.parked_clients`. RAII so the gauge
+        // stays accurate even when this future is dropped outright (runtime
+        // teardown), where neither select arm runs.
+        let _parked = ParkedCount::enter();
         let woke = monoio::select! {
-            res = stream.park_readable() => {
+            res = session.park_readable() => {
                 // Err (fd error) also resumes: the handler's first read
                 // surfaces the real error and tears down cleanly.
                 let _ = res;
@@ -1062,8 +1241,18 @@ fn spawn_parked_idle_watcher<S>(
         };
         if !woke {
             // Server shutdown: this watcher owns the close accounting.
-            drop(registry_guard);
-            drop(stream);
+            drop(session);
+            crate::admin::metrics_setup::record_connection_closed();
+            return;
+        }
+        // Woken by an out-of-band kill rather than client traffic: the idle
+        // -timeout sweep and CLIENT KILL both `shutdown(2)` the fd purely to
+        // break the park. Rehydrating a full handler task just so its first
+        // read can observe `kill_flag` and exit is pure overhead, and a
+        // fleet-wide `timeout` expiry wakes them in a burst. Close here
+        // instead — this watcher already owns the close accounting.
+        if crate::client_registry::is_killed(client_id) {
+            drop(session);
             crate::admin::metrics_setup::record_connection_closed();
             return;
         }
@@ -1071,6 +1260,7 @@ fn spawn_parked_idle_watcher<S>(
         // handoff) — the entry is never dropped, so there is no window where
         // a racing CLIENT LIST misses the conn or CLIENT KILL ID returns 0,
         // and name/connected_at/kill state persist across the wake.
+        let (registry_guard, stream) = session.into_parts();
         spawn_resumed_parked_conn(
             stream,
             state,
@@ -1106,7 +1296,9 @@ fn spawn_resumed_parked_conn<S>(
         + 'static,
 {
     use crate::server::connection::handle_connection_sharded_monoio;
+    let conn_task = ConnTaskGuard::enter();
     monoio::spawn(async move {
+        let _conn_task = conn_task; // F1: counted until task exit
         let initial = std::mem::take(&mut state.read_buf_remainder);
         let peer = state.peer_addr.clone();
         let (outcome, stream_back) = handle_connection_sharded_monoio(
@@ -1115,6 +1307,13 @@ fn spawn_resumed_parked_conn<S>(
             &conn_ctx,
             shutdown.clone(),
             client_id,
+            // can_migrate=false is DELIBERATE (#438 F4 review): this wrapper
+            // has no MigrateConnection arm — enabling migration here would
+            // need the full dup/SPSC/fail-open plumbing of the primary spawn
+            // site. The affinity value is also marginal: a conn only reaches
+            // this path by idling past --conn-park-secs, and migration
+            // sampling exists for HOT connections. A resumed conn that turns
+            // hot simply stays on the shard the affinity router first chose.
             false, // can_migrate
             initial,
             Some(&state),
@@ -1167,25 +1366,21 @@ fn spawn_resumed_parked_conn<S>(
 
 /// Spawn a migrated connection handler on the target shard (monoio runtime).
 ///
-/// Reconstructs a `monoio::net::TcpStream` from a raw FD transferred via
-/// `ShardMessage::MigrateConnection`, prepends synthetic RESP commands for state
-/// restoration, and spawns a handler with `requirepass = None` (pre-authenticated).
-///
-/// # Safety
-///
-/// Same safety requirements as `spawn_migrated_tokio_connection`: the caller must
-/// ensure `fd` is a valid, open file descriptor for a connected TCP socket.
+/// Reconstructs a `monoio::net::TcpStream` from the `OwnedFd` transferred via
+/// `ShardMessage::MigrateConnection` (#438 F4: safe ownership transfer, drop
+/// closes), prepends synthetic RESP commands for state restoration, and
+/// spawns the handler.
 ///
 /// # Limitations
 ///
 /// TLS connections cannot be migrated (TLS session state is in userspace).
 // `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
-// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
-// supported targets (Linux + macOS).
+// above: `MigrateFd` is `OwnedFd` on Unix only. Always true on supported
+// targets (Linux + macOS).
 #[cfg(all(feature = "runtime-monoio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_monoio_connection(
-    fd: std::os::unix::io::RawFd,
+    fd: crate::shard::dispatch::MigrateFd,
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -1202,7 +1397,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
     repl_state: &Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+    cluster_state: &Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
@@ -1215,19 +1410,15 @@ pub(crate) fn spawn_migrated_monoio_connection(
     spill_file_id: &Rc<std::cell::Cell<u64>>,
     disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
-    use std::os::unix::io::FromRawFd;
-
     use crate::server::connection::handle_connection_sharded_monoio;
 
-    // Same ownership chain as `spawn_migrated_tokio_connection`: `fd` is a dup'd
-    // socket transferred exactly once through SPSC, source already dropped its handle.
-    // SAFETY: fd is a valid, uniquely-owned dup'd socket; TcpStream is sole close-owner.
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // F4 (#438): same as the tokio twin — OwnedFd in, safe From conversion,
+    // TcpStream is sole close-owner from here.
+    let std_stream = std::net::TcpStream::from(fd);
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(
-            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            "Shard {}: migrated fd set_nonblocking failed: {}",
             shard_id,
-            fd,
             e
         );
         // Source shard's `try_accept_connection` already counted this
@@ -1276,6 +1467,8 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let sc = script_cache_rc.clone();
             let acl = acl_table.clone();
             let rtcfg = runtime_config.clone();
+            // F5 (#438): read before rtcfg moves into ConnectionContext::new.
+            let reqpass = rtcfg.read().requirepass.clone();
             let scfg = server_config.clone();
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
@@ -1299,7 +1492,14 @@ pub(crate) fn spawn_migrated_monoio_connection(
                 num_shards,
                 psr,
                 blk,
-                None, // requirepass: None = pre-authenticated
+                // F5 (#438, sec L3): carry the REAL requirepass. The conn's
+                // auth state comes from MigratedConnectionState (a migrated
+                // conn is already authenticated), so this is inert for the
+                // session itself — but a later AUTH on the migrated conn now
+                // validates against the actual password instead of erroring
+                // with "no password is set", and any future code that
+                // re-derives auth from ctx.requirepass sees the truth.
+                reqpass,
                 pool_for_ctx,
                 trk,
                 rs,
@@ -1331,7 +1531,9 @@ pub(crate) fn spawn_migrated_monoio_connection(
             };
             #[cfg(not(unix))]
             let kill_fd = -1;
+            let conn_task = ConnTaskGuard::enter();
             monoio::spawn(async move {
+                let _conn_task = conn_task; // F1: counted until task exit
                 // c1M P1: kept for the ParkIdle routing below (`sd` moves
                 // into the handler call).
                 let sd_park = sd.clone();
@@ -1388,5 +1590,69 @@ pub(crate) fn spawn_migrated_monoio_connection(
             // so we own the balancing decrement.
             crate::admin::metrics_setup::record_connection_closed();
         }
+    }
+}
+
+#[cfg(test)]
+mod conn_accept_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// F2 (#438): the whole point of ParkedSession — guard drops strictly
+    /// before stream, however the session ends.
+    struct DropRecorder(&'static str, Rc<RefCell<Vec<&'static str>>>);
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    #[test]
+    fn parked_session_drops_guard_before_stream() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let session = ParkedSession::new(
+            DropRecorder("guard", order.clone()),
+            DropRecorder("stream", order.clone()),
+        );
+        drop(session);
+        assert_eq!(
+            &*order.borrow(),
+            &["guard", "stream"],
+            "kill_clients fd-liveness invariant: deregister before fd close"
+        );
+    }
+
+    #[test]
+    fn parked_session_into_parts_transfers_without_dropping() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let session = ParkedSession::new(
+            DropRecorder("guard", order.clone()),
+            DropRecorder("stream", order.clone()),
+        );
+        let (guard, stream) = session.into_parts();
+        assert!(
+            order.borrow().is_empty(),
+            "into_parts must not drop either part (registration handoff)"
+        );
+        // The caller re-establishes local-before-parameter ordering; here we
+        // just verify both came back live.
+        drop(guard);
+        drop(stream);
+        assert_eq!(&*order.borrow(), &["guard", "stream"]);
+    }
+
+    /// F1 (#438): the drain's stop condition — live count tracks guard
+    /// lifetimes, visible immediately at enter (pre-spawn).
+    #[test]
+    fn conn_task_guard_counts_immediately_and_saturates() {
+        let base = live_conn_tasks();
+        let g1 = ConnTaskGuard::enter();
+        let g2 = ConnTaskGuard::enter();
+        assert_eq!(live_conn_tasks(), base + 2);
+        drop(g1);
+        assert_eq!(live_conn_tasks(), base + 1);
+        drop(g2);
+        assert_eq!(live_conn_tasks(), base);
     }
 }

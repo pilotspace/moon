@@ -117,25 +117,31 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,
 
-    /// [EXPERIMENTAL] Enable per-shard BGREWRITEAOF (compaction) for the
-    /// `--shards >= 2 + --appendonly yes` PerShard layout.
-    ///
-    /// Default `false`: BGREWRITEAOF stays gated in PerShard mode (the
-    /// shipped, crash-safe "append-only, no in-place compaction" behavior).
-    /// When `true`, BGREWRITEAOF fans the rewrite out to every per-shard
-    /// writer (synchronized seq bump + single manifest commit). This path is
-    /// validated by `tests/crash_matrix_per_shard_bgrewriteaof.rs` and is
-    /// opt-in until the both-runtime crash matrix is green by default.
-    ///
-    /// The flag only takes effect alongside `per_shard_aof_active`; it is a
-    /// no-op for `--shards 1` (TopLevel rewrite already works) and for
-    /// `--appendonly no`.
+    /// [DEPRECATED — no-op] Per-shard BGREWRITEAOF is the DEFAULT since #433
+    /// (the fan-out compaction path is validated by
+    /// `tests/crash_matrix_per_shard_bgrewriteaof.rs` and the auto-rewrite
+    /// suite). Passing this flag only emits a deprecation warning. Remove it
+    /// from launch commands; it will be deleted in a future release.
     #[arg(long, default_value_t = false)]
     pub experimental_per_shard_rewrite: bool,
 
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
+
+    /// Automatic AOF rewrite trigger: rewrite when the AOF has grown by this
+    /// percentage over its size after the last rewrite (Redis parity:
+    /// `auto-aof-rewrite-percentage`). `0` disables automatic rewrites;
+    /// manual `BGREWRITEAOF` still works. Default 100 (= rewrite at 2× the
+    /// post-rewrite size), same as Redis.
+    #[arg(long = "auto-aof-rewrite-percentage", default_value_t = 100)]
+    pub auto_aof_rewrite_percentage: u64,
+
+    /// Automatic AOF rewrite floor: never auto-rewrite while the total AOF
+    /// size is below this (Redis parity: `auto-aof-rewrite-min-size`).
+    /// Accepts size strings ("64mb", "1gb") or raw bytes. Default "64mb".
+    #[arg(long = "auto-aof-rewrite-min-size", default_value = "64mb")]
+    pub auto_aof_rewrite_min_size: String,
 
     /// Max time (ms) a write may block awaiting the `appendfsync=always`
     /// fsync ack before the write is failed instead of parking the
@@ -258,6 +264,58 @@ pub struct ServerConfig {
     /// Close connections idle for more than N seconds (0 = disabled)
     #[arg(long, default_value_t = 0)]
     pub timeout: u64,
+
+    /// Maximum size in bytes a single connection's query (input) buffer may
+    /// reach before the connection is closed (0 = unlimited). Redis parity:
+    /// `client-query-buffer-limit`, default 1gb.
+    ///
+    /// c10k hardening C2. Without this the input buffer grows to whatever a
+    /// frame header declares, bounded only by the parser's 512 MiB bulk
+    /// ceiling — and the auth gate runs AFTER parsing, so an
+    /// unauthenticated client can pin half a gigabyte per connection with
+    /// `$536870911` plus a dribble of bytes. That memory sits outside
+    /// `used_memory`, so `maxmemory` never sees it.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    pub client_query_buffer_limit: usize,
+
+    /// Give up on a reply write that has made no progress for this many
+    /// milliseconds and close the connection (0 = wait forever).
+    ///
+    /// c10k hardening C1. Reply writes were unbounded: a client that
+    /// pipelines a huge response and then simply stops reading parks the
+    /// handler inside `write_all` holding the entire serialized reply —
+    /// hundreds of MB — plus its maxclients slot, for as long as it likes.
+    /// N such clients is an OOM, and it is invisible while it happens because
+    /// `obl`/`oll`/`omem` in CLIENT LIST are hardcoded to 0.
+    ///
+    /// 60s is far beyond any legitimate client's stall (replication does not
+    /// use this path — PSYNC hijacks the connection before it) and far below
+    /// "forever".
+    #[arg(long, default_value_t = 60_000)]
+    pub client_write_timeout_ms: u64,
+
+    /// Refuse to buffer a command reply larger than this many bytes and
+    /// close the connection instead (0 = unlimited).
+    ///
+    /// c10k hardening C1, Redis's `client-output-buffer-limit normal <hard>`.
+    /// This DIVERGES from Redis deliberately: Redis defaults the normal class
+    /// to unlimited, which is why an unread-socket OOM is reachable there too.
+    /// A client that asks for more than this in one batch is disconnected —
+    /// including a single value larger than the cap, which is therefore
+    /// undeliverable. Raise it for workloads that legitimately stream very
+    /// large replies.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    pub client_output_buffer_limit_normal: usize,
+
+    /// Query-buffer ceiling applied to connections that have NOT yet
+    /// authenticated, in bytes (0 = use `--client-query-buffer-limit`).
+    ///
+    /// No legitimate pre-auth command is large: AUTH, HELLO and the inline
+    /// forms all fit in well under a kilobyte. Keeping the unauthenticated
+    /// ceiling small is what makes C2 unreachable without credentials; the
+    /// full limit applies from the moment a client authenticates.
+    #[arg(long, default_value_t = 64 * 1024)]
+    pub client_query_buffer_limit_preauth: usize,
 
     /// TCP keepalive interval in seconds (0 = disabled). Sets SO_KEEPALIVE on accepted sockets.
     #[arg(long = "tcp-keepalive", default_value_t = 300)]
@@ -1417,6 +1475,10 @@ impl ServerConfig {
             lazyfree_threshold: 64,
             maxclients: self.maxclients,
             timeout: self.timeout,
+            client_query_buffer_limit: self.client_query_buffer_limit,
+            client_query_buffer_limit_preauth: self.client_query_buffer_limit_preauth,
+            client_write_timeout_ms: self.client_write_timeout_ms,
+            client_output_buffer_limit_normal: self.client_output_buffer_limit_normal,
             tcp_keepalive: self.tcp_keepalive,
             // Default to single-shard (no division). The server overwrites this
             // on the shared RuntimeConfig with the resolved shard count once it
@@ -1785,6 +1847,18 @@ pub struct RuntimeConfig {
     pub maxclients: usize,
     /// Close connections idle for more than N seconds (0 = disabled).
     pub timeout: u64,
+    /// Per-connection query (input) buffer ceiling in bytes (0 = unlimited).
+    /// c10k C2; Redis parity `client-query-buffer-limit`.
+    pub client_query_buffer_limit: usize,
+    /// Query-buffer ceiling for not-yet-authenticated connections, in bytes
+    /// (0 = fall back to `client_query_buffer_limit`).
+    pub client_query_buffer_limit_preauth: usize,
+    /// Abandon a reply write that stalls for this many ms (0 = wait forever).
+    /// c10k C1 — see `ServerConfig::client_write_timeout_ms`.
+    pub client_write_timeout_ms: u64,
+    /// Reply-size ceiling for normal clients, in bytes (0 = unlimited).
+    /// c10k C1 — see `ServerConfig::client_output_buffer_limit_normal`.
+    pub client_output_buffer_limit_normal: usize,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
     /// Resolved shard count — used only to derive the per-shard eviction budget.
@@ -1860,6 +1934,10 @@ impl Default for RuntimeConfig {
             lazyfree_threshold: 64,
             maxclients: 10000,
             timeout: 0,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             tcp_keepalive: 300,
             num_shards: 1,
         }

@@ -43,6 +43,17 @@ impl<T> OneshotSender<T> {
     pub fn send(self, value: T) -> Result<(), T> {
         self.tx.send(value).map_err(|e| e.into_inner())
     }
+
+    /// True once the receiving half is gone (client disconnected, timed out,
+    /// or was cancelled), so `send` is guaranteed to fail.
+    ///
+    /// Used by the blocking-wakeup path to skip abandoned waiters BEFORE
+    /// mutating the datastore on their behalf: popping first and only then
+    /// discovering the dead receiver is what silently destroyed the popped
+    /// element (c10k hardening A2).
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_disconnected()
+    }
 }
 
 pub struct OneshotReceiver<T> {
