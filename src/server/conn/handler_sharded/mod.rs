@@ -108,7 +108,7 @@ pub enum HandlerResult {
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, unpropagate_subscription,
+    is_multi_key_command, resp3_shape_for, unpropagate_subscription,
 };
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -556,7 +556,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>)>> = HashMap::with_capacity(ctx.num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
@@ -1004,7 +1004,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CONFIG ---
-                    if dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
+                    if dispatch::try_handle_config(cmd, cmd_args, ctx, conn.protocol_version, &mut responses) {
                         continue;
                     }
 
@@ -1192,7 +1192,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 return (HandlerResult::Done, None);
                             }
                         };
-                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, conn.protocol_version);
+                        let blocking_response = apply_resp3_conversion(
+                            cmd,
+                            cmd_args,
+                            blocking_response,
+                            conn.protocol_version,
+                        );
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
                         // A1: anything left in read_buf is either this batch's
@@ -1977,7 +1982,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     client_id,
                                 );
                             }
-                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(
+                                cmd,
+                                cmd_args,
+                                response,
+                                conn.protocol_version,
+                            );
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
@@ -2069,7 +2079,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     conn.tracking_state.noloop,
                                 );
                             }
-                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(
+                                cmd,
+                                cmd_args,
+                                response,
+                                conn.protocol_version,
+                            );
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
@@ -2117,6 +2132,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 conn.tracking_state.noloop,
                             );
                         }
+                        // Classify BEFORE `frame` is moved below: this is the last
+                        // point at which `cmd_args` (which borrows `frame`) is alive.
+                        // The reply loop sees only cmd_name. 1-byte Copy tag, no alloc.
+                        let resp3_shape = if conn.protocol_version >= 3 {
+                            resp3_shape_for(cmd, cmd_args)
+                        } else {
+                            crate::protocol::resp3::Resp3Shape::None
+                        };
                         let dispatch_frame = if rewritten.is_some() {
                             let mut parts = Vec::with_capacity(1 + cmd_args.len());
                             parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
@@ -2132,7 +2155,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys, resp3_shape));
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
                 }
@@ -2167,15 +2190,15 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>);
+                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
                     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, _, db, _)| *db).unwrap_or(conn.selected_db);
+                        let batch_db = entries.first().map(|(_, _, _, _, db, _, _)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk)| ((idx, aof, cmd, tk), arc_frame)).unzip();
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk, shape)| ((idx, aof, cmd, tk, shape), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
@@ -2216,7 +2239,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (resp_idx, _, _, _) in &meta {
+                                for (resp_idx, _, _, _, _) in &meta {
                                     responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                         b"ERR cross-shard dispatch backpressure",
                                     ));
@@ -2268,7 +2291,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx.shard_id
                             );
                             crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                            for (resp_idx, _, _, _) in &meta {
+                            for (resp_idx, _, _, _, _) in &meta {
                                 responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                     b"ERR cross-shard reply timeout",
                                 ));
@@ -2283,7 +2306,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // we can overwrite write responses on fsync failure below.
                         // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
                             // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                             // inside the SPSC arm (PipelineBatchSlotted / PipelineBatch),
                             // BEFORE the response slot is filled. Appending here (after
@@ -2292,7 +2315,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // pending_aof_count undercount it → escape to new incr →
                             // double-apply on restart. The SPSC arm now owns the AOF
                             // write; aof_bytes below is used only for the barrier check.
-                            let converted = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                            // Shape classified at enqueue, where the args still existed.
+                            let converted = crate::protocol::resp3::apply_shape(resp3_shape, resp, proto_ver);
                             if aof_bytes.is_some() && !matches!(converted, Frame::Error(_)) {
                                 write_resp_idxs.push(resp_idx);
                             }

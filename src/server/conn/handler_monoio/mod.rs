@@ -107,8 +107,8 @@ use super::affinity::MigratedConnectionState;
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, propagate_subscription, try_inline_dispatch_loop,
-    unpropagate_subscription,
+    handle_config, is_multi_key_command, propagate_subscription, resp3_shape_for,
+    try_inline_dispatch_loop, unpropagate_subscription,
 };
 use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
@@ -466,11 +466,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    // The trailing `Resp3Shape` is the reply shape, classified at ENQUEUE time
+    // where the command's args are still in scope. The batch reply carries only
+    // the command NAME, so without this tag a cross-shard reply could not be
+    // converted at all — and skipping it would re-create the exact
+    // "shape changes by context" defect. It is `Copy` and one byte, so it costs
+    // no allocation on the shard hot path (task `resp3-type-fidelity` §3).
     type RemoteMeta = (
         usize,
         Option<Bytes>,
         Bytes,
         Option<crate::tracking::invalidation::TrackedWriteKeys>,
+        crate::protocol::resp3::Resp3Shape,
     );
     let mut remote_groups: HashMap<
         usize,
@@ -480,6 +487,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             Option<Bytes>,
             Bytes,
             Option<crate::tracking::invalidation::TrackedWriteKeys>,
+            crate::protocol::resp3::Resp3Shape,
         )>,
     > = HashMap::with_capacity(ctx.num_shards);
     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(ctx.num_shards);
@@ -1449,7 +1457,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 6 && dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 6
+                && dispatch::try_handle_config(
+                    cmd,
+                    cmd_args,
+                    ctx,
+                    conn.protocol_version,
+                    &mut responses,
+                )
+            {
                 continue;
             }
             // REPLICAOF (9) or SLAVEOF (7)
@@ -2467,7 +2483,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             client_id,
                         );
                     }
-                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response =
+                        apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                     }
@@ -2525,9 +2542,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // (`Database::promote_cold_if_present`), unchanged.
                     if cmd.eq_ignore_ascii_case(b"GET") {
                         if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                            let peek_now_ms = ctx.cached_clock.ms();
                             let cold_loc =
                                 crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                     if db.is_hot(key.as_ref()) {
+                                        None
+                                    } else if db
+                                        .promote_inflight_if_present(key.as_ref(), peek_now_ms)
+                                    {
+                                        // #459: mid-spill, payload still in
+                                        // RAM. Now hot, so `dispatch_read`
+                                        // below answers it — and no disk read
+                                        // was needed. Without this the key is
+                                        // in no plane this peek consults and
+                                        // GET answers nil for a key EXISTS
+                                        // reports as present.
                                         None
                                     } else {
                                         db.cold_lookup_location(key.as_ref())
@@ -2622,7 +2651,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             conn.tracking_state.noloop,
                         );
                     }
-                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response =
+                        apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                     }
@@ -2695,12 +2725,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         conn.tracking_state.noloop,
                     );
                 }
+                // Classify HERE: this is the last point at which the command's
+                // args exist. The reply loop below only ever sees `cmd_name`.
+                let resp3_shape = if conn.protocol_version >= 3 {
+                    resp3_shape_for(cmd, cmd_args)
+                } else {
+                    crate::protocol::resp3::Resp3Shape::None
+                };
                 remote_groups.entry(target).or_default().push((
                     resp_idx,
                     std::sync::Arc::new(dispatch_frame),
                     aof_bytes,
                     cmd_bytes,
                     track_keys,
+                    resp3_shape,
                 ));
                 crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
@@ -2828,7 +2866,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let slot_arc = response_pool.slot_arc(target);
                 let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) = entries
                     .into_iter()
-                    .map(|(idx, arc_frame, aof, cmd, tk)| ((idx, aof, cmd, tk), arc_frame))
+                    .map(|(idx, arc_frame, aof, cmd, tk, shape)| {
+                        ((idx, aof, cmd, tk, shape), arc_frame)
+                    })
                     .unzip();
 
                 let msg = ShardMessage::PipelineBatchSlotted {
@@ -2885,7 +2925,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             target,
                             outcome
                         );
-                        for (resp_idx, _, _, _) in &meta {
+                        for (resp_idx, _, _, _, _) in &meta {
                             responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                 b"ERR cross-shard dispatch backpressure",
                             ));
@@ -2958,7 +2998,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ctx.shard_id
                     );
                     crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                    for (resp_idx, _, _, _) in &meta {
+                    for (resp_idx, _, _, _, _) in &meta {
                         responses[*resp_idx] =
                             Frame::Error(Bytes::from_static(b"ERR cross-shard reply timeout"));
                     }
@@ -2970,7 +3010,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
                 let mut write_resp_idxs: Vec<usize> = Vec::new();
-                for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in
+                for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in
                     meta.into_iter().zip(shard_responses)
                 {
                     // C4-FOLD-FIX: AOF append for cross-shard writes is now done
@@ -2980,7 +3020,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // makes AofFold's pending_aof_count undercount it → escape to
                     // new incr → double-apply on restart. The SPSC arm now owns the
                     // AOF write; aof_bytes below is used only for the barrier check.
-                    let resp = apply_resp3_conversion(&cmd_name, resp, conn.protocol_version);
+                    // Shape was classified at enqueue, where the args still existed.
+                    let resp = crate::protocol::resp3::apply_shape(
+                        resp3_shape,
+                        resp,
+                        conn.protocol_version,
+                    );
                     if aof_bytes.is_some() && !matches!(resp, Frame::Error(_)) {
                         write_resp_idxs.push(resp_idx);
                     }
