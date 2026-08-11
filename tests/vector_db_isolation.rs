@@ -81,12 +81,12 @@ impl Drop for Moon {
 fn wait_ready(port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(client) = Client::open(format!("redis://127.0.0.1:{port}/0")) {
-            if let Ok(mut conn) = client.get_connection() {
-                let pong: Result<String, _> = redis::cmd("PING").query(&mut conn);
-                if pong.as_deref() == Ok("PONG") {
-                    return true;
-                }
+        if let Ok(client) = Client::open(format!("redis://127.0.0.1:{port}/0"))
+            && let Ok(mut conn) = client.get_connection()
+        {
+            let pong: Result<String, _> = redis::cmd("PING").query(&mut conn);
+            if pong.as_deref() == Ok("PONG") {
+                return true;
             }
         }
         thread::sleep(Duration::from_millis(100));
@@ -147,9 +147,15 @@ fn spawn_moon(shards: usize, tag: &str) -> Option<Moon> {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let tmp_dir =
-        std::env::temp_dir().join(format!("moon-db-isolation-{tag}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    // Test-hygiene sweep: unique random dir via tempfile, then `keep()` so the
+    // EXISTING PathBuf ownership + manual cleanup keep working (the restart
+    // flow shares one dir between two Moon values, so TempDir RAII does not
+    // fit). Pid-only names resurrected stale dirs on pid reuse after crashes.
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(&format!("moon-db-isolation-{tag}-"))
+        .tempdir()
+        .expect("tempdir")
+        .keep();
     spawn_moon_first(&tmp_dir, shards)
 }
 
@@ -380,9 +386,12 @@ fn restart_round_trip_preserves_db_binding() {
         "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
         bin.display()
     );
-    let tmp_dir =
-        std::env::temp_dir().join(format!("moon-db-isolation-restart-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    // Test-hygiene sweep: unique random dir (see spawn_moon for rationale).
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("moon-db-isolation-restart-")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
 
     let mut moon = match spawn_moon_first(&tmp_dir, 1) {
         Some(m) => m,
@@ -484,7 +493,9 @@ fn ft_create_text(conn: &mut Connection, idx: &str, prefix: &str) -> redis::Redi
 
 /// Bare (non-KNN) `FT.SEARCH` — the plain-text BM25 path that
 /// `scatter_text_search` implements, as distinct from `ft_search_knn`'s
-/// `*=>[KNN ...]` vector clause.
+/// `*=>[KNN ...]` vector clause. Only used by the `text-index`-gated test
+/// below.
+#[cfg(feature = "text-index")]
 fn ft_search_text(
     conn: &mut Connection,
     idx: &str,
@@ -675,13 +686,13 @@ fn ft_info_num_docs(conn: &mut Connection, idx: &str) -> i64 {
         panic!("FT.INFO must return an array, got {info:?}");
     };
     for pair in items.windows(2) {
-        if let redis::Value::BulkString(k) = &pair[0] {
-            if k == b"num_docs" {
-                return match &pair[1] {
-                    redis::Value::Int(n) => *n,
-                    other => panic!("num_docs must be an integer, got {other:?}"),
-                };
-            }
+        if let redis::Value::BulkString(k) = &pair[0]
+            && k == b"num_docs"
+        {
+            return match &pair[1] {
+                redis::Value::Int(n) => *n,
+                other => panic!("num_docs must be an integer, got {other:?}"),
+            };
         }
     }
     panic!("FT.INFO reply had no top-level num_docs field: {items:?}");

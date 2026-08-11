@@ -38,6 +38,8 @@
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,7 +80,7 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 }
 
 fn start_moon(port: u16, dir: &std::path::Path, off_dir: &std::path::Path) -> Child {
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),
@@ -112,14 +114,13 @@ fn wait_for_ping_within(port: u16, bound: Duration) -> Duration {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
-        if let Ok(out) = out {
-            if out.status.success()
-                && String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .eq_ignore_ascii_case("PONG")
-            {
-                return start.elapsed();
-            }
+        if let Ok(out) = out
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .eq_ignore_ascii_case("PONG")
+        {
+            return start.elapsed();
         }
         if start.elapsed() > bound {
             panic!(

@@ -92,13 +92,11 @@ mod tests {
     fn test_fx_hasher_distributes() {
         // Sequential keys must not collapse to a few buckets: distinct
         // hashes for distinct inputs (sanity, not a statistical test).
-        use std::hash::{BuildHasher, Hash};
+        use std::hash::BuildHasher;
         let bh = FxBuildHasher::default();
         let mut hashes: FxHashSet<u64> = FxHashSet::default();
         for i in 0..10_000u64 {
-            let mut h = bh.build_hasher();
-            i.hash(&mut h);
-            hashes.insert(h.finish());
+            hashes.insert(bh.hash_one(i));
         }
         assert_eq!(hashes.len(), 10_000, "no collisions on 10k sequential u64");
     }

@@ -360,10 +360,10 @@ pub fn ft_info_sidecar_recovered_indexes(c: &mut Conn, idx: &str) -> i64 {
     let items = as_array(&r);
     let mut i = 0;
     while i + 1 < items.len() {
-        if let Resp::Bulk(Some(k)) = &items[i] {
-            if k == b"sidecar_recovered_indexes" {
-                return as_int(&items[i + 1]);
-            }
+        if let Resp::Bulk(Some(k)) = &items[i]
+            && k == b"sidecar_recovered_indexes"
+        {
+            return as_int(&items[i + 1]);
         }
         i += 2;
     }

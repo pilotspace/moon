@@ -223,9 +223,12 @@ classic gaps too:
 
 - **Unpipelined (p=1) single-connection** — historically Redis's best case —
   now a Moon **win on both GCE architectures** with the shipped
-  `--io-busy-poll-us 40` poll-mode park (`--profile standalone` sets it for
-  you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86 (c3),
-  same-instance A/Bs, n=3.
+  `--io-busy-poll-us 40` poll-mode park (`--profile standalone`, or the
+  annotated [`conf/moon-standalone.conf`](conf/moon-standalone.conf), sets it
+  for you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86
+  (c3), same-instance A/Bs, n=3. As of v0.8.1 the busy-poll **auto-gates on
+  shared cores** (per-shard contention governor), so the preset is safe on any
+  host — not just pinned ones.
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
   **0.91× Redis** via per-batch group commit + coalesced writes, while
   `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.
@@ -344,16 +347,39 @@ pipeline ≥ 16); bill on **RSS, not VSZ** (see
 for fair Redis/Valkey comparisons add `--disk-offload disable --appendonly no`.
 Full list in [CLAUDE.md](CLAUDE.md) "Gotchas".
 
+### The journey
+
+Moon's goal from day one: a Redis-compatible server whose thread-per-core
+architecture **measurably** out-scales Redis on multi-core hardware — without
+giving up protocol compatibility or durability. The path there, release by
+release and measurement by measurement (including the ideas that were
+[benchmarked and thrown out](docs/journey.md#the-discipline-efficiency-is-what-survives-measurement)),
+is written up in **[The Moon Journey](docs/journey.md)**.
+
+![Moon vs Redis — the efficiency journey](docs/assets/journey-efficiency.png)
+
+*Three efficiency curves that each crossed Redis parity — single-connection
+p=1 latency (Redis's home turf) and `fsync=always` durable throughput — landing
+with the v0.5.x busy-poll + group-commit work and held through v0.8.1, where the
+O3 governor made the p=1 spin safe to deploy anywhere. Same-instance A/B vs
+Redis 8.6.1.*
+
 ### Roadmap
 
 | Milestone | Focus | Status |
 |---|---|---|
-| **v0.5.x** (shipped) | KV p=1 win (busy-poll park), durability write-path 2× campaign, WAL v3-only, sharded MULTI/EXEC hardening | **GA** |
-| **v0.6.0** (this release) | Multi-db isolation (db-scoped indexes + per-db quotas + workspace hardening), tiered engine offload (WARM/COLD), truthful container-growth accounting, `--profile standalone`, command-parity audit | **GA** |
-| **v0.6.x** | Multi-node cluster soak (PSYNC2 + atomic slot migration), CDC push, GPU vectors, SLO lock-in | planned |
+| **v0.6.0** | Multi-db isolation (db-scoped indexes + per-db quotas + workspace hardening), tiered engine offload (WARM/COLD), `--profile standalone`, command-parity audit | **GA** |
+| **v0.7.x** | Replication GA for multi-shard masters — `WAIT`/`ACK` across all six planes, 24 h kill-9 soak (zero acked-write loss) | **GA** |
+| **v0.8.0** | One Storage Kernel — kill-9-lossless on every plane (46-cell crash matrix) + 10× RAM datasets under disk offload | **GA** |
+| **v0.8.1** | Deploy-safe busy-poll (O3 contention governor auto-gates on shared cores) + single-shard tuning preset | **GA** |
+| **v0.8.2** | Storage kernel unification — one value codec / spill pipeline / eviction entry point / accessor skeleton, millisecond-TTL fidelity fix, batched sync-eviction manifest fsyncs | **GA** |
+| **v0.8.3** | Connection plane at scale — idle conns 56.5 → 3.25 KB (−94%, task-exit parking + idle downshift + TLS diet), loud maxclients, striped registry, c1M-ready (1 M idle ≈ 3.3 GB) | **GA** |
+| **v0.8.4** | c1M follow-ups — TLS task-parking (47 → 26 KB idle), park/wake registry handoff, park-vs-error spin fix (RST'd parked conn no longer pins a shard) | **GA** |
+| **v0.8.5** (current) | Durability hardening — AOF rewrites never drop acked writes (overflow spill + exactly-once snapshot cut, adversarially verified), fail-loud WAL mid-chain tears, sticky append/fsync degraded latches, deep-review wave (LFU/LRU arithmetic, cluster election, silent-failure hardening) | **GA** |
+| **v0.9** | Horizontal scale — cluster-on-monoio + multi-shard replicas | planned |
 | **v1.0** | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA box ticked | gate |
 
-Full release history: [CHANGELOG.md](CHANGELOG.md).
+Full history: [The Moon Journey](docs/journey.md) · [RELEASES.md](RELEASES.md) · [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
 
@@ -362,7 +388,7 @@ Full release history: [CHANGELOG.md](CHANGELOG.md).
 Start at [docs/index.md](docs/index.md), then follow the trail:
 
 - **Get running** — [Quick start](docs/quickstart.md) · [Configuration](docs/configuration.md) · [Docker](docs/guides/docker.md) · [TLS](docs/guides/tls.md)
-- **Understand it** — [Architecture](docs/architecture.md) · [Commands](docs/commands.md) · [Benchmarks](BENCHMARK.md) · [Storage format](docs/STORAGE-FORMAT-V1.md)
+- **Understand it** — [The journey](docs/journey.md) · [Architecture](docs/architecture.md) · [Commands](docs/commands.md) · [Benchmarks](BENCHMARK.md) · [Storage format](docs/STORAGE-FORMAT-V1.md)
 - **Build with it** — [SDKs](docs/guides/sdk.md) · [Full-text + vector search](docs/guides/full-text-search.md) · [Transactions](docs/guides/transactions.md) · [Workspaces](docs/guides/workspaces.md) · [Message queues](docs/guides/message-queues.md) · [Temporal](docs/guides/temporal.md)
 - **Operate it** — [Operator guide](docs/OPERATOR-GUIDE.md) · [Production contract](docs/PRODUCTION-CONTRACT.md) · [Persistence](docs/guides/persistence.md) · [PITR](docs/guides/pitr.md) · [CDC](docs/guides/cdc.md) · [Clustering](docs/guides/clustering.md) · [Monitoring](docs/guides/monitoring.md) · [Runbooks](docs/runbooks/)
 - **Trust it** — [Threat model](docs/THREAT-MODEL.md) · [Unsafe policy](UNSAFE_POLICY.md) · [References & papers](docs/references.md)

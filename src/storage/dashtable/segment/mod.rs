@@ -144,6 +144,20 @@ pub(super) fn prefetch_ptr(_ptr: *const u8) {
     // No-op on non-x86_64 (macOS aarch64, etc.)
 }
 
+// NOTE (O1 dead end, 2026-07-18): a VALUE-line prefetch at the first H2
+// match (`values[slot]` is ~1.4KB from `keys[slot]`; the key memcmp sits
+// between issue and use) was implemented and A/B'd on GCE pinned cores
+// with `benches/dashtable_probe.rs`. It is a NO-WIN on both arches:
+// - x86_64 (c3): an initial "3-6% faster" verdict was a harness artifact —
+//   the bench never dereferenced the returned value (`black_box` does not
+//   force a load through a reference; disassembly-verified). With a forced
+//   value load the prefetch measured ~1-2% SLOWER or noise at 1M keys
+//   across 3 interleaved rounds.
+// - aarch64 (t2a, `prfm pldl1keep` variant): consistent regression
+//   (get_hit/100K +14%, get_miss/1M +3.5%) — same LSU back-pressure
+//   verdict as the key-prefetch NOTE on `prefetch_ptr` above.
+// Do not reintroduce without a forced-load harness win on the target arch.
+
 impl<K, V> Segment<K, V> {
     /// Create a new empty segment with the given local depth.
     pub fn new(depth: u32) -> Self {

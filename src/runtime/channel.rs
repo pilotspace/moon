@@ -43,6 +43,17 @@ impl<T> OneshotSender<T> {
     pub fn send(self, value: T) -> Result<(), T> {
         self.tx.send(value).map_err(|e| e.into_inner())
     }
+
+    /// True once the receiving half is gone (client disconnected, timed out,
+    /// or was cancelled), so `send` is guaranteed to fail.
+    ///
+    /// Used by the blocking-wakeup path to skip abandoned waiters BEFORE
+    /// mutating the datastore on their behalf: popping first and only then
+    /// discovering the dead receiver is what silently destroyed the popped
+    /// element (c10k hardening A2).
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_disconnected()
+    }
 }
 
 pub struct OneshotReceiver<T> {
@@ -166,6 +177,20 @@ impl<T: Clone> WatchReceiver<T> {
 
 // --- Notify ---
 // Simple async notify using flume bounded(1) for signal coalescing.
+//
+// NOTE (O2 dead end, 2026-07-19): replacing this flume bounded(1) with a
+// lock-free AtomicBool token + AtomicWaker was implemented and fully
+// validated (loom lost-wake model, 209/209 consistency at 1/4/12 shards,
+// monoio shards=4 smoke incl. the busy-poll skip-wake interplay — branch
+// perf/o2-notify-atomic-waker, commit 6973d092) but measured NEUTRAL
+// end-to-end: GCE t2a shards=4, 5 leg-order-alternating rounds, SET p1
+// +0.08% / GET p1 +1.6% medians — inside noise. The `pull_pending`
+// LL-misses the cachegrind digest attributed here (tmp/CPU-CACHE-DIGEST.md
+// finding 2) do not buy wall-clock: the cross-shard wake cost is dominated
+// by the eventfd+epoll delivery syscalls, not flume's internals, and under
+// --io-busy-poll-us the skip-wake gate elides flume entirely anyway. Kept
+// flume (simpler, battle-tested against the swf0 cross-thread hang class).
+// Do not re-attempt without an A/B showing a real win on the target arch.
 pub struct Notify {
     tx: flume::Sender<()>,
     rx: flume::Receiver<()>,

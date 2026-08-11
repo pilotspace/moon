@@ -96,6 +96,12 @@ fn spawn_moon_mem(
             "no",
             "--mem-full-pct",
             &mem_full_pct.to_string(),
+            // This suite tests the RSS watchdog, not the disk guard; on
+            // near-full dev volumes the 5%-free write pause would shadow
+            // every assertion with MOONERR diskfull (see
+            // gotcha_diskfull_guard_gutted_crash_tests).
+            "--disk-free-min-pct",
+            "0",
         ]);
         if let Some(limit) = limit_bytes_override {
             cmd.env("MOON_MEM_LIMIT_BYTES", limit.to_string());

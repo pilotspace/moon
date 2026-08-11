@@ -62,12 +62,16 @@ use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh, create_aof_fold_channe
 use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
+mod malloc_respawn;
+
 fn main() -> anyhow::Result<()> {
-    // Re-spawn self with MALLOC_CONF if --memory-arenas-cap differs from the
-    // baked-in default (8). Sentinel env var prevents infinite recursion.
-    // Must run BEFORE tracing init and clap parse — jemalloc reads MALLOC_CONF
-    // at process start, so the env var must be set before exec.
-    maybe_respawn_with_arena_override()?;
+    // Re-spawn self with MALLOC_CONF if --memory-arenas-cap and/or
+    // --memory-thp differ from the baked-in default (narenas:8, no thp
+    // opt). Sentinel env var prevents infinite recursion. Must run BEFORE
+    // tracing init and clap parse — jemalloc reads MALLOC_CONF at process
+    // start, so the env var must be set before exec. Both flags compose
+    // into ONE re-spawn with ONE conf string (see `build_malloc_conf`).
+    malloc_respawn::maybe_respawn_with_memory_overrides()?;
 
     // Block SIGTERM in the main thread BEFORE any child threads are spawned
     // (TLS reload thread, Prometheus admin thread, ctrlc internal thread,
@@ -105,10 +109,11 @@ fn main() -> anyhow::Result<()> {
             default_hook(info);
             let thread = std::thread::current();
             let name = thread.name().unwrap_or("");
-            if name.starts_with("shard-") {
+            if name.starts_with("shard-") || name == "cluster-ctl" {
                 eprintln!(
-                    "FATAL: shard thread '{name}' panicked; aborting the whole \
-                     process rather than serving with a dead shard"
+                    "FATAL: thread '{name}' panicked; aborting the whole \
+                     process rather than serving with a dead shard or a \
+                     dead cluster control plane"
                 );
                 std::process::abort();
             }
@@ -122,10 +127,13 @@ fn main() -> anyhow::Result<()> {
     // merged vector.  CLI args come *after* conf tokens so clap last-wins gives
     // CLI priority.
     //
-    // NOTE: `maybe_respawn_with_arena_override()` above only scans *raw*
-    // argv — it will NOT see a `memory-arenas-cap` value that comes from the
-    // conf file.  That setting must be given on the CLI if the jemalloc
-    // respawn is needed.  This is documented behaviour.
+    // NOTE: `malloc_respawn::maybe_respawn_with_memory_overrides()` above
+    // only scans *raw* argv — it will NOT see a `memory-arenas-cap` /
+    // `memory-thp` value that comes from the conf file, so conf-file values
+    // for those two options can never reach jemalloc (its config is read
+    // once, at process start). They are effectively CLI-only;
+    // `warn_if_conf_only_overrides` below turns a conf-file attempt into a
+    // loud startup warning instead of a silent no-op.
     let (mut config, arg_matches) = match merge_conf_argv(std::env::args_os()) {
         Ok(Some(merged)) => ServerConfig::parse_from_with_matches(merged),
         Ok(None) => ServerConfig::parse_from_with_matches(std::env::args_os()),
@@ -253,13 +261,29 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
+    // and/or --memory-thp -- both are jemalloc-only knobs (mimalloc has no
+    // equivalent narenas/THP tuning surface in this codebase).
     #[cfg(not(feature = "jemalloc"))]
-    if config.memory_arenas_cap != 8 {
-        tracing::warn!(
-            "--memory-arenas-cap={} is a no-op for non-jemalloc builds",
-            config.memory_arenas_cap
-        );
+    {
+        if config.memory_arenas_cap != 8 {
+            tracing::warn!(
+                "--memory-arenas-cap={} is a no-op for non-jemalloc builds",
+                config.memory_arenas_cap
+            );
+        }
+        if config.memory_thp {
+            tracing::warn!(
+                "--memory-thp is a no-op for non-jemalloc builds \
+                 (requires --features jemalloc)"
+            );
+        }
     }
+
+    // jemalloc builds: warn loudly if either allocator override came from the
+    // conf file only — jemalloc's config was read (and any re-spawn already
+    // happened) before the conf file was parsed, so such values silently
+    // never reach the allocator. CLI-only by design; see malloc_respawn.rs.
+    malloc_respawn::warn_if_conf_only_overrides(config.memory_arenas_cap, config.memory_thp);
 
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
@@ -386,6 +410,41 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Instance lock: refuse a second moon on the same data dir BEFORE any
+    // listener binds or data file opens — two writers on the same WAL/AOF/
+    // manifests corrupt silently. flock-based, so kill -9 releases it (no
+    // stale-pidfile failure mode). Held for the life of the process. Also
+    // covers a custom --disk-offload-dir when it differs from --dir.
+    let _dir_lock = moon::persistence::dir_lock::acquire(std::path::Path::new(&config.dir))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _offload_dir_lock = if config.disk_offload_enabled() {
+        let offload_dir = config.effective_disk_offload_dir();
+        if let Err(e) = std::fs::create_dir_all(&offload_dir) {
+            return Err(anyhow::anyhow!(
+                "failed to create disk-offload directory {:?}: {}",
+                offload_dir,
+                e
+            ));
+        }
+        // Compare CANONICAL paths: flock conflicts are per open-file-
+        // description, so a second acquire on the same directory reached via
+        // a different spelling (`.`, `..`, symlink) would self-conflict and
+        // falsely abort startup as "another instance". Canonicalization can
+        // only run after create_dir_all (both dirs exist now); a failure to
+        // canonicalize falls back to the textual path rather than erroring.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if canon(&offload_dir) != canon(std::path::Path::new(&config.dir)) {
+            Some(
+                moon::persistence::dir_lock::acquire(&offload_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
     // Build the auth + CORS policies BEFORE the admin listener binds so
     // misconfiguration (wildcard CORS + auth required, empty secret) fails
@@ -485,6 +544,19 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // O5: record the non-shard core set BEFORE any auxiliary thread spawns
+    // (AOF writers, the vector pools below, and — indirectly — the
+    // manifest-sync/spill/wal-sync threads each shard spawns internally).
+    //
+    // Deliberately NOT re-pinning the main thread here: threads spawned from
+    // main inherit its affinity mask at spawn time, and the vector
+    // search/reload pools just below must stay scheduler-placed across ALL
+    // cores (see src/vector/reload_pool.rs) — pinning main first would have
+    // them born wearing one aux core's mask with no escape. Main re-pins
+    // itself as "main-listener" at the LAST moment instead, right before it
+    // enters the accept loop, after every child thread has been spawned.
+    moon::shard::numa::init_aux_pinning(num_shards);
+
     // FT.SEARCH intra-query worker pool: fan per-segment HNSW searches of one
     // query across workers (threads spawn eagerly here — the pool is tiny and
     // parks on its channel when vector search is unused). Default OFF: each
@@ -545,6 +617,57 @@ fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("{msg}");
     }
+
+    // c10k W3: make maxclients honest against RLIMIT_NOFILE (Redis parity —
+    // Redis raises the soft limit to fit maxclients or shrinks maxclients
+    // loudly; moon previously never looked, so a 10k-conn target on a 1024-fd
+    // shell died in silent EMFILE accept-backoff loops). Non-unix: no-op.
+    #[cfg(unix)]
+    {
+        let reserved = rlimit_reserved_fds(num_shards);
+        // SAFETY: getrlimit/setrlimit with a valid resource constant and a
+        // pointer to a properly initialized rlimit struct — plain libc FFI
+        // with no aliasing or lifetime concerns.
+        unsafe {
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                // rlim_t is u64 on every supported unix; `reserved` is u64.
+                let need: libc::rlim_t = config.maxclients as libc::rlim_t + reserved;
+                if config.maxclients > 0 && rl.rlim_cur < need {
+                    let want = need.min(rl.rlim_max);
+                    let mut raised = rl;
+                    raised.rlim_cur = want;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                        tracing::info!(
+                            "Raised RLIMIT_NOFILE soft limit {} -> {} to fit maxclients {} (+{} reserved fds)",
+                            rl.rlim_cur,
+                            want,
+                            config.maxclients,
+                            reserved
+                        );
+                    }
+                    if want < need {
+                        tracing::warn!(
+                            "RLIMIT_NOFILE hard limit {} cannot fit maxclients {} (+{} reserved fds): \
+                             accepts beyond ~{} clients will fail with EMFILE. Raise `ulimit -n` \
+                             or lower --maxclients.",
+                            rl.rlim_max,
+                            config.maxclients,
+                            reserved,
+                            want.saturating_sub(reserved)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // c10k W8: readable per-shard connection counters — feeds the listener's
+    // IP-affinity load gate.
+    moon::client_registry::init_shard_conn_counts(num_shards);
 
     // Create channel mesh for inter-shard communication
     let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
@@ -762,6 +885,9 @@ fn main() -> anyhow::Result<()> {
                 std::thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
+                        // O5: escape the shard-core mask this thread would
+                        // otherwise inherit from its spawning thread.
+                        moon::shard::numa::pin_current_aux_thread(&thread_name_inner);
                         RuntimeFactoryImpl::block_on_local(
                             thread_name_inner,
                             aof::per_shard_aof_writer_task(
@@ -808,6 +934,9 @@ fn main() -> anyhow::Result<()> {
             std::thread::Builder::new()
                 .name("aof-writer".to_string())
                 .spawn(move || {
+                    // O5: escape the shard-core mask this thread would
+                    // otherwise inherit from its spawning thread.
+                    moon::shard::numa::pin_current_aux_thread("aof-writer");
                     RuntimeFactoryImpl::block_on_local(
                         "aof-writer".to_string(),
                         aof::aof_writer_task(
@@ -840,40 +969,18 @@ fn main() -> anyhow::Result<()> {
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
-    // FIX-W1-4: gate BGREWRITEAOF whenever per-shard AOF is active
-    // (num_shards >= 2 + appendonly=yes). The original gate was too narrow:
-    // it required disk_offload to be enabled, missing the plain AOF case.
-    // Per-shard rewrite is not yet implemented (AofPoolSendError::
-    // RewriteUnsupportedInPerShard); the pool already refuses the message,
-    // but this early gate provides a stable, documented error to operators
-    // BEFORE the channel send so no in-progress flag is flipped.
-    // Verified 2026-05-26: multi-shard BGREWRITEAOF loses ~38% of keys on
-    // restart. Gate lifted only when multi-part AOF replay ships (v2.0+).
-    // See docs/runbooks/multi-shard-aof-rewrite.md.
-    // [F6] When `--experimental-per-shard-rewrite` is set, leave the gate OPEN
-    // so BGREWRITEAOF routes to the per-shard fan-out coordinator
-    // (try_send_rewrite_per_shard): synchronized seq bump + single manifest
-    // commit across all per-shard writers, validated by
-    // tests/crash_matrix_per_shard_bgrewriteaof.rs. Default (flag off) keeps
-    // the gate closed — the shipped, crash-safe "no in-place compaction"
-    // behavior that avoided the historical ~38%-key-loss-on-restart.
-    if config.per_shard_aof_active(num_shards) {
-        if config.experimental_per_shard_rewrite {
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF per-shard rewrite ENABLED (--experimental-per-shard-rewrite). \
-                 Per-shard fan-out compaction is active; this path is experimental."
-            );
-        } else {
-            moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                shards = num_shards,
-                appendonly = %config.appendonly,
-                "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, or --experimental-per-shard-rewrite to enable per-shard compaction."
-            );
-        }
+    // #433: per-shard BGREWRITEAOF is the DEFAULT — the gate that refused it
+    // (historical ~38%-key-loss era, pre-C4 cooperative snapshot) is retired.
+    // The fan-out path is validated by tests/crash_matrix_per_shard_bgrewriteaof.rs
+    // (exact INCR recovery across a straddling rewrite + SIGKILL) and
+    // tests/aof_auto_rewrite.rs. `MULTI_SHARD_AOF_REWRITE_UNSAFE` is never set
+    // at boot anymore; the refusal branch it guards stays as dead-man code for
+    // tests and any future re-gate.
+    if config.experimental_per_shard_rewrite {
+        tracing::warn!(
+            "--experimental-per-shard-rewrite is deprecated and now a no-op: \
+             per-shard BGREWRITEAOF is the default (#433)."
+        );
     }
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
@@ -901,19 +1008,27 @@ fn main() -> anyhow::Result<()> {
     moon::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 
     // Cluster mode initialization
-    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
+    let cluster_state: Option<std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>> =
         if config.cluster_enabled {
+            // Redis convention: cluster bus port = port + 10000. Refuse ports
+            // where that wraps past u16::MAX instead of silently binding the
+            // bus on a truncated port no peer would ever compute.
+            if config.port.checked_add(10000).is_none() {
+                eprintln!(
+                    "REFUSING TO START: --cluster-enabled with --port {} — the cluster \
+                     bus port (port + 10000) exceeds 65535. Use a port <= 55535.",
+                    config.port
+                );
+                std::process::exit(2);
+            }
             moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
                 .parse()
                 .expect("invalid bind address");
             let node_id = moon::replication::state::generate_repl_id();
             let state = moon::cluster::ClusterState::new(node_id, self_addr);
-            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
-            info!(
-                "Cluster mode enabled, node ID: {}",
-                cs.read().unwrap().node_id
-            );
+            let cs = std::sync::Arc::new(parking_lot::RwLock::new(state));
+            info!("Cluster mode enabled, node ID: {}", cs.read().node_id);
             Some(cs)
         } else {
             None
@@ -945,6 +1060,43 @@ fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "runtime-monoio"))]
         tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
+    }
+    if let Some(entries) = config.uring_entries {
+        // Same before-shard-spawn contract as force_legacy_driver above.
+        moon::runtime::set_uring_entries(entries);
+        #[cfg(feature = "runtime-monoio")]
+        {
+            let effective = entries.max(moon::runtime::MIN_URING_ENTRIES);
+            if effective != entries {
+                tracing::warn!(
+                    "--uring-entries {} below the {} floor; using {}",
+                    entries,
+                    moon::runtime::MIN_URING_ENTRIES,
+                    effective
+                );
+            }
+            tracing::info!(
+                "I/O ring size: {} SQ entries per shard (--uring-entries)",
+                effective
+            );
+        }
+        #[cfg(not(feature = "runtime-monoio"))]
+        tracing::warn!("--uring-entries has no effect under the tokio runtime");
+    }
+
+    // c1M P1: stage-2 task-parking threshold — set BEFORE shard threads spawn
+    // (same contract as set_uring_entries above). Default 60s; 0 disables.
+    moon::runtime::set_conn_park_secs(config.conn_park_secs);
+    #[cfg(feature = "runtime-monoio")]
+    if config.conn_park_secs > 0 {
+        tracing::info!(
+            "Idle task-parking: downshifted connections park after {}s (--conn-park-secs)",
+            config.conn_park_secs
+        );
+    }
+    #[cfg(not(feature = "runtime-monoio"))]
+    if config.conn_park_secs != 60 {
+        tracing::warn!("--conn-park-secs has no effect under the tokio runtime");
     }
 
     // Graph traversal timeout default — set BEFORE shard threads spawn so every
@@ -990,10 +1142,19 @@ fn main() -> anyhow::Result<()> {
 
     // MA12: Initialise disk free-space monitor.
     // Monitors the WAL/persistence volume. When disk_free_min_pct == 0, the
-    // monitor is inactive (poll_global is a no-op, is_write_paused always false).
+    // free-space guard is inactive, but a persistence-enabled server still
+    // polls so the dir-lost latch (#366) can refuse writes and quiesce the
+    // persistence tick if the data directory is deleted out from under it.
     {
         let monitor_path = persistence_dir.as_deref().unwrap_or(&config.dir);
-        moon::shard::disk_monitor::init_global(config.disk_free_min_pct, monitor_path);
+        // Arm the dir-lost latch for any config that writes to the data dir:
+        // AOF/save persistence, OR disk-offload (spill + vector warm tier
+        // write there even with appendonly=no).
+        moon::shard::disk_monitor::init_global(
+            config.disk_free_min_pct,
+            monitor_path,
+            persistence_dir.is_some() || config.disk_offload_enabled(),
+        );
     }
 
     // Wave 3: Initialise proactive RSS memory watchdog ("mem-full guard").
@@ -1223,6 +1384,36 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Task #56 (used_memory truthful under disk-offload + AOF restart):
+    // AOF replay has no cold-tier awareness -- a key evicted-and-spilled
+    // BEFORE a crash gets no AOF DEL record (a spilled entry stays
+    // cold-readable, never deleted, so `record_reason_del` never fires for
+    // it), so replaying the AOF's full command history unconditionally
+    // re-applies that key's original SET and lands it back in hot RAM.
+    // Call this immediately after each replay branch below finishes: any
+    // key still present in `cold_index` at that point was cold-and-
+    // untouched as of the crash (the index was rebuilt from the
+    // crash-consistent manifest by `restore_from_persistence`'s v3 path
+    // BEFORE this AOF replay ran), so a hot copy replay produced for it is
+    // provably redundant -- see `Database::demote_replayed_cold_shadows`
+    // for the full correctness proof. Cheap no-op per db when disk-offload
+    // isn't active (no `cold_index` to check).
+    fn demote_replay_cold_shadows(shards: &mut [moon::shard::Shard]) {
+        let mut total_demoted = 0usize;
+        for shard in shards.iter_mut() {
+            for db in shard.databases.iter_mut() {
+                total_demoted += db.demote_replayed_cold_shadows();
+            }
+        }
+        if total_demoted > 0 {
+            info!(
+                "Disk-offload: demoted {} AOF-replay hot shadow(s) back to cold-only \
+                 stubs (used_memory truthful after restart, task #56)",
+                total_demoted
+            );
+        }
+    }
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -1263,6 +1454,7 @@ fn main() -> anyhow::Result<()> {
                         "AOF multi-part loaded (seq {}): {} entries",
                         manifest.seq, loaded
                     );
+                    demote_replay_cold_shadows(&mut shards);
 
                     // Retire legacy appendonly.aof so future boots don't double-
                     // replay it via restore_from_persistence's fallback path.
@@ -1378,6 +1570,7 @@ fn main() -> anyhow::Result<()> {
                     global_max_lsn,
                     ordered_count
                 );
+                demote_replay_cold_shadows(&mut shards);
 
                 // RFC § 2 Rule 3 — seed master_repl_offset before accepting
                 // client traffic so the next write doesn't reissue an LSN
@@ -1558,6 +1751,31 @@ fn main() -> anyhow::Result<()> {
         moon::shard::shared_databases::replay_mq_wal(&mut slice_inits, dir_path);
     }
 
+    // #433: AOF auto-rewrite monitor + INFO size statics. Init AFTER recovery
+    // (the just-replayed generation is the growth baseline), spawn regardless
+    // of percentage so `INFO persistence` sizes stay fresh; percentage 0
+    // disables only the trigger.
+    if let Some(ref pool) = aof_pool {
+        moon::persistence::aof::auto_rewrite::init(
+            std::path::Path::new(&config.dir),
+            &config.appendfilename,
+        );
+        let min_size =
+            ServerConfig::parse_size(&config.auto_aof_rewrite_min_size).unwrap_or_else(|| {
+                tracing::warn!(
+                    "unparseable --auto-aof-rewrite-min-size {:?}; using 64mb",
+                    config.auto_aof_rewrite_min_size
+                );
+                64 * 1024 * 1024
+            });
+        moon::persistence::aof::auto_rewrite::spawn_monitor(
+            pool.clone(),
+            shard_databases.clone(),
+            config.auto_aof_rewrite_percentage,
+            min_size,
+        );
+    }
+
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
     // Register global ShardDatabases for MEMORY DOCTOR + Prometheus per-kind gauges.
@@ -1682,16 +1900,60 @@ fn main() -> anyhow::Result<()> {
 
     let listener_cancel = cancel_token.clone();
 
+    // v0.9 C-1 (#405): the cluster control plane (bus + gossip + election) is
+    // tokio-native and runs on a dedicated `cluster-ctl` std thread hosting a
+    // current-thread tokio runtime — on BOTH server runtimes. Under monoio
+    // there is no tokio runtime to share; under tokio, sharing the listener
+    // runtime made gossip compete with the accept loop and every connection,
+    // which starved the 100ms ticker under load (observed as PFAIL detection
+    // stalling in the formation e2e). The control plane is not
+    // latency-critical, and monoio's !Send task model makes a port high-risk
+    // for zero payoff.
+    if let Some(ref cs) = cluster_state {
+        let ctl_cs = cs.clone();
+        let ctl_bind = config.bind.clone();
+        let ctl_port = config.port;
+        let ctl_node_timeout = config.cluster_node_timeout;
+        let ctl_cancel = cancel_token.child_token();
+        let ctl_repl_state = repl_state.clone();
+        std::thread::Builder::new()
+            .name("cluster-ctl".to_string())
+            .spawn(move || {
+                // O5: escape the shard-core mask this thread would otherwise
+                // inherit from its spawning thread.
+                moon::shard::numa::pin_current_aux_thread("cluster-ctl");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build cluster control-plane runtime");
+                // Runs until the shutdown token cancels the gossip ticker.
+                rt.block_on(run_cluster_control_plane(
+                    ctl_cs,
+                    ctl_bind,
+                    ctl_port,
+                    ctl_node_timeout,
+                    ctl_cancel,
+                    ctl_repl_state,
+                ));
+            })
+            .expect("failed to spawn cluster control-plane thread");
+    }
+
     // Run the sharded listener on the main thread.
     // Under tokio: uses current_thread runtime with tokio::spawn for background tasks.
-    // Under monoio: uses monoio RuntimeFactory with simplified startup (cluster/gossip
-    //   not yet supported under monoio).
+    // Under monoio: uses monoio RuntimeFactory (auto-save on its own thread).
     #[cfg(feature = "runtime-tokio")]
     {
         let listener_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build listener runtime");
+
+        // O5: every child thread is spawned by now — safe to confine the
+        // accept/dispatch loop (this thread) to the non-shard core set. The
+        // tokio::spawn calls inside the block_on run on this same
+        // current-thread runtime, not on new OS threads.
+        moon::shard::numa::pin_current_aux_thread("main-listener");
 
         listener_rt.block_on(async {
             // Set up auto-save timer if save rules are configured (sharded mode)
@@ -1708,57 +1970,6 @@ fn main() -> anyhow::Result<()> {
                     ));
                     info!("Auto-save timer started (sharded mode)");
                 }
-            }
-
-            // Start cluster bus and gossip ticker when cluster mode is enabled
-            if let Some(ref cs) = cluster_state {
-                let cluster_port = (config.port as u32 + 10000) as u16;
-                let cs_clone = cs.clone();
-                let bus_cancel = cancel_token.child_token();
-                let bind2 = config.bind.clone();
-                let self_addr: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-
-                // Shared vote channel: gossip ticker sets sender when election starts,
-                // bus handler forwards FailoverAuthAck votes through it.
-                let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
-                    std::sync::Arc::new(parking_lot::Mutex::new(None));
-
-                let bus_vote_tx = failover_vote_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = moon::cluster::bus::run_cluster_bus(
-                        &bind2,
-                        cluster_port,
-                        self_addr,
-                        cs_clone,
-                        bus_cancel,
-                        bus_vote_tx,
-                    )
-                    .await
-                    {
-                        tracing::error!("Cluster bus error: {}", e);
-                    }
-                });
-
-                let cs_gossip = cs.clone();
-                let gossip_cancel = cancel_token.child_token();
-                let node_timeout = config.cluster_node_timeout;
-                let self_addr2: std::net::SocketAddr =
-                    format!("{}:{}", config.bind, config.port).parse().unwrap();
-                let gossip_vote_tx = failover_vote_tx.clone();
-                let gossip_repl_state = repl_state.clone();
-                tokio::spawn(async move {
-                    moon::cluster::gossip::run_gossip_ticker(
-                        self_addr2,
-                        cs_gossip,
-                        node_timeout,
-                        gossip_cancel,
-                        gossip_vote_tx,
-                        gossip_repl_state,
-                    )
-                    .await;
-                });
-                info!("Cluster bus and gossip ticker started");
             }
 
             // The central tokio listener plain-binds the port (no SO_REUSEPORT,
@@ -1791,9 +2002,6 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "runtime-monoio")]
     {
-        // Monoio listener: simplified startup. Cluster bus and gossip not yet
-        // supported under monoio.
-
         // Auto-save runs on a dedicated thread (same pattern as AOF writer).
         if config.save.is_some() {
             let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
@@ -1804,6 +2012,9 @@ fn main() -> anyhow::Result<()> {
                 std::thread::Builder::new()
                     .name("auto-save".to_string())
                     .spawn(move || {
+                        // O5: escape the shard-core mask this thread would
+                        // otherwise inherit from its spawning thread.
+                        moon::shard::numa::pin_current_aux_thread("auto-save");
                         RuntimeFactoryImpl::block_on_local(
                             "auto-save".to_string(),
                             moon::persistence::auto_save::run_auto_save_sharded(
@@ -1826,6 +2037,9 @@ fn main() -> anyhow::Result<()> {
         // kernel distributes connections across all bound sockets, per-shard handles some
         // directly (no MPSC hop), central forwards the rest via conn_txs.
         let per_shard_accept = false;
+        // O5: every child thread is spawned by now — safe to confine the
+        // accept/dispatch loop (this thread) to the non-shard core set.
+        moon::shard::numa::pin_current_aux_thread("main-listener");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
             if let Err(e) = server::listener::run_sharded(
                 config,
@@ -1861,90 +2075,79 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-spawn the current process with `_RJEM_MALLOC_CONF=narenas:N` when the
-/// operator passes `--memory-arenas-cap N` and N differs from the baked-in
-/// default (8).
+/// Run the cluster control plane — bus listener, gossip ticker, and (via the
+/// ticker) failover elections — on the CURRENT tokio runtime, until the
+/// cancellation token fires.
 ///
-/// tikv-jemallocator uses prefixed symbols (`_rjem_malloc_conf`), so the env
-/// var that overrides the config is `_RJEM_MALLOC_CONF` (with `JEMALLOC_CPREFIX`
-/// = `_rjem_`). jemalloc reads `opt.narenas` exactly once at init from the
-/// symbol **or** the env var (env wins). Calling `mallctl` after init is a
-/// documented no-op. Re-spawning via `execve` is the only correct path for a
-/// CLI override.
-///
-/// Sentinel `MOON_ARENAS_CAP_APPLIED=1` prevents infinite re-spawn.
-#[cfg(all(feature = "jemalloc", unix))]
-fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
-    use std::env;
-    use std::os::unix::process::CommandExt;
-    const SENTINEL: &str = "MOON_ARENAS_CAP_APPLIED";
-    // tikv-jemalloc-sys builds with prefix "_rjem_", so the env var is prefixed.
-    const MALLOC_CONF_ENV: &str = "_RJEM_MALLOC_CONF";
-
-    if env::var_os(SENTINEL).is_some() {
-        return Ok(());
-    }
-
-    // Lightweight scan of argv for --memory-arenas-cap N or --memory-arenas-cap=N.
-    // We can't use clap here because clap::parse() requires the full struct, and
-    // we need to inject env vars BEFORE jemalloc reads the config.
-    // Use args_os() to avoid panicking on non-UTF-8 argv and to preserve the
-    // original OsString argv for the re-spawn below (CodeRabbit).
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStrExt;
-    let args: Vec<OsString> = env::args_os().collect();
-    let mut requested: Option<u32> = None;
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_os_str().as_bytes();
-        if let Some(rest) = a.strip_prefix(b"--memory-arenas-cap=") {
-            requested = std::str::from_utf8(rest).ok().and_then(|s| s.parse().ok());
-            break;
-        }
-        if a == b"--memory-arenas-cap" && i + 1 < args.len() {
-            requested = args[i + 1]
-                .as_os_str()
-                .to_str()
-                .and_then(|s| s.parse().ok());
-            break;
-        }
-        i += 1;
-    }
-
-    // No flag passed -> static _rjem_malloc_conf (narenas:8) is already in effect.
-    let Some(n) = requested else {
-        return Ok(());
+/// v0.9 C-1 (#405): the control plane is tokio-native on BOTH runtimes. The
+/// tokio server spawns this onto its listener runtime; the monoio server runs
+/// it on a dedicated `cluster-ctl` std thread hosting a current-thread tokio
+/// runtime. All I/O here is gossip-rate (100ms ticks), never on shard threads.
+async fn run_cluster_control_plane(
+    cluster_state: std::sync::Arc<parking_lot::RwLock<moon::cluster::ClusterState>>,
+    bind: String,
+    port: u16,
+    node_timeout: u64,
+    cancel_token: moon::runtime::cancel::CancellationToken,
+    repl_state: std::sync::Arc<parking_lot::RwLock<moon::replication::state::ReplicationState>>,
+) {
+    // Overflow is refused at startup (cluster init hard-exits on ports >
+    // 55535); the else arm is unreachable defense.
+    let Some(cluster_port) = port.checked_add(10000) else {
+        tracing::error!("Cluster control plane disabled: port {port} + 10000 overflows u16");
+        return;
     };
-    if n == 8 {
-        return Ok(()); // matches default; no override required.
-    }
+    let self_addr: std::net::SocketAddr = match format!("{bind}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                "Cluster control plane disabled: invalid bind address {bind}:{port}: {e}"
+            );
+            return;
+        }
+    };
 
-    if env::var_os(MALLOC_CONF_ENV).is_some() {
-        // Operator-controlled env var wins; do not clobber.
-        eprintln!(
-            "WARN: --memory-arenas-cap ignored because {} is already set",
-            MALLOC_CONF_ENV
-        );
-        return Ok(());
-    }
+    // Bind the bus BEFORE spawning anything, and abort on failure: a cluster
+    // node whose bus is not listening keeps serving clients while being
+    // invisible to every peer — fail loud instead of running half-alive.
+    let bus_addr = format!("{bind}:{cluster_port}");
+    let listener = match tokio::net::TcpListener::bind(&bus_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "FATAL: cluster bus failed to bind {bus_addr}: {e} — a cluster \
+                 node without its bus is invisible to every peer; exiting"
+            );
+            std::process::exit(1);
+        }
+    };
 
-    // Rebuild the full config with the requested narenas override.
-    let conf_val = format!(
-        "narenas:{},background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true",
-        n,
-    );
+    // Shared vote channel: gossip ticker sets sender when election starts,
+    // bus handler forwards FailoverAuthAck votes through it.
+    let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
 
-    let exe = env::current_exe()?;
-    // unix-only: replaces current process image via execve; never returns on success.
-    let err = std::process::Command::new(&exe)
-        .args(args.iter().skip(1))
-        .env(MALLOC_CONF_ENV, &conf_val)
-        .env(SENTINEL, "1")
-        .exec();
-    Err(anyhow::anyhow!(
-        "re-spawn for --memory-arenas-cap failed: {}",
-        err
-    ))
+    let bus_cs = cluster_state.clone();
+    let bus_cancel = cancel_token.child_token();
+    let bus_vote_tx = failover_vote_tx.clone();
+    tokio::spawn(moon::cluster::bus::run_cluster_bus(
+        listener,
+        self_addr,
+        bus_cs,
+        bus_cancel,
+        bus_vote_tx,
+    ));
+
+    info!("Cluster bus and gossip ticker started");
+    moon::cluster::gossip::run_gossip_ticker(
+        self_addr,
+        cluster_state,
+        node_timeout,
+        cancel_token.child_token(),
+        failover_vote_tx,
+        repl_state,
+    )
+    .await;
 }
 
 /// Resolve the automatic shard count, optionally capped to the empirical
@@ -1998,14 +2201,27 @@ pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Op
     }
 }
 
-#[cfg(not(all(feature = "jemalloc", unix)))]
-fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
-    Ok(())
+/// Fds moon needs beyond client sockets (c10k W3 rlimit check): listeners
+/// (per-shard SO_REUSEPORT + central), per-shard WAL/AOF segments + spill +
+/// manifest handles, io_uring fds, logs. Deliberately generous — the cost of
+/// over-reserving is a slightly earlier warning, the cost of under-reserving
+/// is EMFILE on the persistence path mid-flight.
+pub fn rlimit_reserved_fds(num_shards: usize) -> u64 {
+    64 + (num_shards as u64) * 16
 }
 
 #[cfg(test)]
 mod tests {
+    use super::rlimit_reserved_fds;
     use super::should_warn_undersubscription;
+
+    #[test]
+    fn reserved_fds_scale_with_shards() {
+        assert_eq!(rlimit_reserved_fds(1), 80);
+        assert_eq!(rlimit_reserved_fds(16), 320);
+        // Never zero — listeners + logs always exist.
+        assert!(rlimit_reserved_fds(0) >= 64);
+    }
 
     #[test]
     fn no_warn_single_shard() {

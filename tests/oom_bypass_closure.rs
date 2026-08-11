@@ -99,6 +99,11 @@ fn spawn_moon_oom(dir: &std::path::Path, shards: u32, maxmemory_bytes: u64) -> (
                 &maxmemory_bytes.to_string(),
                 "--maxmemory-policy",
                 "noeviction",
+                // Under test here is the -OOM eviction gate, not the disk
+                // guard; a near-full dev volume would otherwise shadow every
+                // write with MOONERR diskfull.
+                "--disk-free-min-pct",
+                "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
             .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
@@ -287,10 +292,10 @@ fn wait_ready(guard: &mut ServerGuard, dir: &std::path::Path, port: u16) -> Clie
         }
         // Any I/O error (or a non-PONG answer, which would desync the
         // framing) drops this connection and probes again on a new one.
-        if let Some(mut c) = Client::try_connect(port, Duration::from_secs(1)) {
-            if let Ok(true) = c.try_ping() {
-                return c;
-            }
+        if let Some(mut c) = Client::try_connect(port, Duration::from_secs(1))
+            && let Ok(true) = c.try_ping()
+        {
+            return c;
         }
         assert!(
             start.elapsed() < deadline,
@@ -500,7 +505,7 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
 // same-db copy, a data-correctness bug, not an eviction one; see the CHANGELOG
 // and the Gap A commit body). Moon's eviction gate is per-DATABASE (whichever
 // db a write targets — `db.estimated_memory()` alone, not a shard-wide
-// aggregate across all 16 dbs; see `try_evict_if_needed_budget`'s doc
+// aggregate across all 16 dbs; see `evict_to_budget`'s doc
 // comment), consistently across every write path including this one — so
 // db 1 (the COPY destination) needs its OWN pre-existing memory pressure to
 // demonstrate the gate; ballast keys below give it that.
@@ -687,6 +692,10 @@ fn spawn_moon_no_maxmemory(dir: &std::path::Path, shards: u32) -> (ServerGuard, 
                 // explicit, Redis-compatible "unlimited" escape hatch — it
                 // starts the atomic definitively unset.
                 "--maxmemory",
+                "0",
+                // Same rationale as spawn_moon_oom: keep the disk guard from
+                // shadowing the maxmemory-publish behavior under test.
+                "--disk-free-min-pct",
                 "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))

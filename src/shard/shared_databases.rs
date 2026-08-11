@@ -1202,6 +1202,10 @@ pub fn replay_graph_wal_v3(
                 }
             }
             Err(e) => {
+                // #452.2: mid-chain tear ⇒ refuse to boot (see recovery.rs).
+                if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                    crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(shard_id, &e);
+                }
                 tracing::error!("Shard {}: graph WAL v3 replay failed: {}", shard_id, e);
             }
         }
@@ -1442,10 +1446,11 @@ mod tests {
     // ── GAP-1: elastic budget publish/recompute ──────────────────────────
 
     fn rt_config(maxmemory: usize, num_shards: usize) -> crate::config::RuntimeConfig {
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = maxmemory;
-        rt.num_shards = num_shards;
-        rt
+        crate::config::RuntimeConfig {
+            maxmemory,
+            num_shards,
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -35,12 +35,17 @@ Unlike Redis's single global AOF file, Moon writes a separate WAL per shard. Thi
 
 The advantage grows with pipeline depth because each shard appends independently with no lock contention.
 
-### WAL v2 format
+### WAL v3 format
 
-Moon uses WAL v2 with:
+Moon uses WAL v3 (`src/persistence/wal_v3/`; v2 was removed) with:
+- **Segmented files** (16MB default, `--wal-segment-size`) with a 64-byte
+  header carrying epoch, redo LSN, and base LSN
+- **Per-record LSNs** — the foundation for PITR and CDC cursors
 - **Checksums** for corruption detection
-- **Block framing** for crash recovery
+- **Full-page images (FPI)** with lz4 compression for torn-page recovery
 - **Corruption isolation** per shard (one shard's corruption does not affect others)
+- **Off-loop fsync** — a per-shard sync agent thread owns the fsync so the
+  shard event loop never blocks on durability waits
 
 The hot-path cost of WAL append is ~5ns (`buf.extend_from_slice()`), with batch `write_all` every 1ms tick and fsync on the configured schedule.
 

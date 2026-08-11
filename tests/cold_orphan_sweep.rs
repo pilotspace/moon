@@ -31,6 +31,7 @@ fn test_orphan_sweep_removes_hot_shadowed_key() {
         1,
         b"k1",
         &make_string_entry("cold_value"),
+        0,
         &mut manifest,
         Some(&mut cold_index),
     )
@@ -82,6 +83,7 @@ fn test_orphan_sweep_preserves_cold_only_key() {
         2,
         b"k2",
         &make_string_entry("cold_only_value"),
+        0,
         &mut manifest,
         Some(&mut cold_index),
     )
@@ -123,6 +125,7 @@ fn test_orphan_sweep_mixed_hot_and_cold_only() {
         10,
         b"k1",
         &make_string_entry("v1_cold"),
+        0,
         &mut manifest,
         Some(&mut cold_index),
     )
@@ -132,6 +135,7 @@ fn test_orphan_sweep_mixed_hot_and_cold_only() {
         11,
         b"k2",
         &make_string_entry("v2_cold"),
+        0,
         &mut manifest,
         Some(&mut cold_index),
     )
@@ -186,6 +190,7 @@ fn test_orphan_sweep_manifests_tombstone() {
         20,
         b"kx",
         &make_string_entry("val"),
+        0,
         &mut manifest,
         Some(&mut cold_index),
     )

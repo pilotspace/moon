@@ -13,6 +13,8 @@
 //!
 //! Requires the release binary at ./target/release/moon.
 
+mod common;
+
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -70,7 +72,7 @@ fn toplevel_manifest_with_multishard_exits_2_and_prints_refusing_to_start() {
     let stderr_log = dir.join("moon.stderr.log");
     let stdout_log = dir.join("moon.stdout.log");
 
-    let mut child = Command::new("./target/release/moon")
+    let mut child = Command::new(common::find_moon_binary())
         .args([
             "--port",
             "17399", // high port unlikely to clash
@@ -156,7 +158,7 @@ fn toplevel_manifest_with_single_shard_is_allowed() {
     let stderr_log = dir.join("moon.stderr.log");
     let stdout_log = dir.join("moon.stdout.log");
 
-    let mut child = Command::new("./target/release/moon")
+    let mut child = Command::new(common::find_moon_binary())
         .args([
             "--port",
             "17400",

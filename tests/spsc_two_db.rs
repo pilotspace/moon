@@ -94,6 +94,11 @@ fn spawn_moon(dir: &std::path::Path, shards: u32) -> (ServerGuard, u16) {
                 &shards.to_string(),
                 "--appendonly",
                 "no",
+                // COPY/MOVE routing is under test, not the disk guard; a
+                // near-full dev volume would otherwise fail every setup SET
+                // with MOONERR diskfull.
+                "--disk-free-min-pct",
+                "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
             .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
@@ -326,7 +331,7 @@ fn test_pipelined_cross_shard_copy_db_n() {
     }
 
     // Verify per key: the copy landed in db 1, NOT db 0.
-    for i in 0..N {
+    for (i, val) in values.iter().enumerate() {
         let dst = dst_key(i);
 
         assert_eq!(
@@ -337,7 +342,7 @@ fn test_pipelined_cross_shard_copy_db_n() {
         let in_db1 = c.cmd(&[b"GET", dst.as_bytes()]);
         assert_eq!(
             in_db1,
-            V::Bulk(values[i].clone()),
+            V::Bulk(val.clone()),
             "{dst} missing/wrong value in db 1 (target db) — the two-db \
              intercept did not run on the SPSC arm this pipeline used"
         );
@@ -359,7 +364,7 @@ fn test_pipelined_cross_shard_copy_db_n() {
         let src_still_present = c.cmd(&[b"GET", src_key(i).as_bytes()]);
         assert_eq!(
             src_still_present,
-            V::Bulk(values[i].clone()),
+            V::Bulk(val.clone()),
             "COPY must not remove the source key {} from db 0",
             src_key(i)
         );
@@ -416,7 +421,7 @@ fn test_pipelined_cross_shard_move() {
         );
     }
 
-    for i in 0..N {
+    for (i, val) in values.iter().enumerate() {
         let key = format!("mv:{i}");
 
         assert_eq!(
@@ -440,7 +445,7 @@ fn test_pipelined_cross_shard_move() {
         let in_db1 = c.cmd(&[b"GET", key.as_bytes()]);
         assert_eq!(
             in_db1,
-            V::Bulk(values[i].clone()),
+            V::Bulk(val.clone()),
             "mv:{i} missing/wrong value in db 1 after MOVE"
         );
     }
@@ -495,12 +500,12 @@ fn test_pipelined_same_db_copy_control() {
         );
     }
 
-    for i in 0..N {
+    for (i, val) in values.iter().enumerate() {
         let dst = format!("sd:{i}:copy");
         let got = c.cmd(&[b"GET", dst.as_bytes()]);
         assert_eq!(
             got,
-            V::Bulk(values[i].clone()),
+            V::Bulk(val.clone()),
             "same-db COPY control regressed: sd:{i}:copy missing/wrong value"
         );
     }

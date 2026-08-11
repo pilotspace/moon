@@ -28,6 +28,15 @@ fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
         return Some(std::path::PathBuf::from(p));
     }
+    // CARGO_BIN_EXE_moon is the binary cargo built for THIS test run (right
+    // profile, right CARGO_TARGET_DIR); cargo guarantees it exists whenever
+    // this env!() macro is referenced, so check it before falling back to a
+    // bare target/{release,debug}/moon guess that risks a stale binary of
+    // unknown provenance on a shared checkout (task: harness-hygiene-sweep).
+    let cargo_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    if cargo_bin.exists() {
+        return Some(cargo_bin);
+    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for rel in ["target/release/moon", "target/debug/moon"] {
         let p = root.join(rel);
@@ -45,6 +54,17 @@ struct Moon {
 
 impl Moon {
     fn kill9(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Moon {
+    /// `kill9` only runs on the happy path — a failed assertion unwinds past
+    /// it and strands the server. One such leak ran for four hours before it
+    /// was noticed, holding its port and its data dir the whole time. Killing
+    /// again after `kill9` has already reaped is a harmless no-op error.
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -79,10 +99,11 @@ fn wait_moon_ready(moon: Moon) -> Option<Moon> {
             let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
             if c.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = [0u8; 64];
-                if let Ok(n) = c.read(&mut buf) {
-                    if n > 0 && buf.starts_with(b"+PONG") {
-                        return Some(moon);
-                    }
+                if let Ok(n) = c.read(&mut buf)
+                    && n > 0
+                    && buf.starts_with(b"+PONG")
+                {
+                    return Some(moon);
                 }
             }
         }
@@ -355,4 +376,86 @@ fn multi_shard_span_still_rejected() {
         other => panic!("20-key span must be rejected, got: {other:?}"),
     }
     m.kill9();
+}
+
+/// c10k E2: `FLUSHALL` inside MULTI/EXEC must clear EVERY shard, not just the
+/// one the transaction executed on.
+///
+/// The live (non-MULTI) path already broadcasts: a keyless FLUSHDB/FLUSHALL
+/// routed local-only used to clear just its own shard, and `D-2` fixed that
+/// with `coordinate_flush_broadcast`, turning any failed leg into an explicit
+/// partial-flush error rather than a silent `+OK`.
+///
+/// The MULTI/EXEC executor never got the same treatment.
+/// `execute_transaction_sharded` runs the queued body against the LOCAL slice
+/// with no per-key routing and no fan-out, so a queued FLUSHALL clears one
+/// shard of N and `EXEC` still answers `+OK`. At `--shards 4` that leaves
+/// roughly three quarters of the keyspace alive after the client was told the
+/// database was emptied — a silent wrong answer to a destructive command, and
+/// the kind that is only noticed later via a non-zero DBSIZE.
+///
+/// Asserted through DBSIZE rather than per-key GETs so the test fails on ANY
+/// surviving key, not just the ones it thought to name.
+#[test]
+fn flushall_inside_multi_clears_every_shard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(moon) = spawn_moon_first(dir.path(), false) else {
+        return; // binary missing — skip
+    };
+
+    let mut c = Client::connect(moon.port);
+
+    // Spread keys across all 4 shards. Untagged keys hash-route by full key,
+    // so a spread of distinct names covers every shard with high probability;
+    // 64 makes an all-on-one-shard fluke effectively impossible.
+    for i in 0..64 {
+        let key = format!("e2key:{i}");
+        assert_eq!(
+            c.cmd(&["SET", &key, "v"]),
+            Reply::Simple("OK".into()),
+            "SET {key} must succeed"
+        );
+    }
+    let before = c.cmd(&["DBSIZE"]);
+    assert_eq!(
+        before,
+        Reply::Int(64),
+        "all 64 keys must be visible before the flush (DBSIZE scatter-gathers)"
+    );
+
+    // The whole point: FLUSHALL queued inside a transaction.
+    assert_eq!(c.cmd(&["MULTI"]), Reply::Simple("OK".into()));
+    assert_eq!(
+        c.cmd(&["FLUSHALL"]),
+        Reply::Simple("QUEUED".into()),
+        "FLUSHALL must queue inside MULTI"
+    );
+    let exec = c.cmd(&["EXEC"]);
+
+    // If EXEC reports success it MUST have flushed everything. An explicit
+    // partial-flush error would also be acceptable behaviour (that is what the
+    // live path does on a failed leg) — what is not acceptable is +OK with
+    // keys still present.
+    let claimed_success = matches!(&exec, Reply::Array(v)
+        if v.len() == 1 && matches!(&v[0], Reply::Simple(s) if s == "OK"));
+
+    let after = c.cmd(&["DBSIZE"]);
+    if claimed_success {
+        assert_eq!(
+            after,
+            Reply::Int(0),
+            "EXEC answered +OK for FLUSHALL but keys survive: DBSIZE={after:?}. \
+             A transaction that reports a successful FLUSHALL must have cleared \
+             every shard, not just the one it executed on."
+        );
+    } else {
+        assert!(
+            matches!(&exec, Reply::Array(v) if v.len() == 1 && matches!(&v[0], Reply::Error(_)))
+                || matches!(&exec, Reply::Error(_)),
+            "EXEC must either flush everything or say so explicitly; got {exec:?} \
+             with DBSIZE={after:?}"
+        );
+    }
+
+    moon.kill9();
 }

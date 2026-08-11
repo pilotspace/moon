@@ -142,10 +142,11 @@ fn wait_ready(port: u16) -> TcpStream {
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
         let mut buf = [0u8; 64];
-        if let Ok(n) = s.read(&mut buf) {
-            if n > 0 && buf[..n].windows(4).any(|w| w == b"PONG") {
-                return s;
-            }
+        if let Ok(n) = s.read(&mut buf)
+            && n > 0
+            && buf[..n].windows(4).any(|w| w == b"PONG")
+        {
+            return s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(15),
@@ -319,10 +320,10 @@ fn read_log(dir: &std::path::Path) -> String {
 
 fn compacted_base_exists(dir: &std::path::Path) -> bool {
     let is_seq_gt1 = |name: &str| -> bool {
-        if let Some(rest) = name.strip_prefix("moon.aof.") {
-            if let Some(seq_str) = rest.strip_suffix(".base.rdb") {
-                return seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false);
-            }
+        if let Some(rest) = name.strip_prefix("moon.aof.")
+            && let Some(seq_str) = rest.strip_suffix(".base.rdb")
+        {
+            return seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false);
         }
         false
     };
@@ -385,10 +386,10 @@ fn aof_manifest_seq(dir: &std::path::Path) -> u64 {
         Err(_) => return 0,
     };
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("seq ") {
-            if let Ok(n) = rest.trim().parse::<u64>() {
-                return n;
-            }
+        if let Some(rest) = line.strip_prefix("seq ")
+            && let Ok(n) = rest.trim().parse::<u64>()
+        {
+            return n;
         }
     }
     0

@@ -118,10 +118,9 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
 
-    let base_ts = db.base_timestamp();
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
                 Some(v) => (Some(v.to_vec()), expiry),
                 None => {
@@ -152,7 +151,7 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
 
     let new_val = Bytes::from(buf);
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
     } else {
         Entry::new_string(new_val)
     };
@@ -783,10 +782,9 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("BITFIELD"),
     };
 
-    let base_ts = db.base_timestamp();
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms(base_ts);
+            let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
                 Some(v) => (v.to_vec(), expiry),
                 None => {
@@ -914,7 +912,7 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
     if modified {
         let new_val = Bytes::from(buf);
         let mut entry = if existing_expiry_ms > 0 {
-            Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+            Entry::new_string_with_expiry(new_val, existing_expiry_ms)
         } else {
             Entry::new_string(new_val)
         };

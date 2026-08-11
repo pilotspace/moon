@@ -30,7 +30,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         for (key, entry) in data {
             // Skip expired entries
-            if entry.is_expired_at(base_ts, now_ms) {
+            if entry.is_expired_at(now_ms) {
                 continue;
             }
 
@@ -224,7 +224,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
             // Generate PEXPIRE for keys with TTL
             if entry.has_expiry() {
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if exp_ms > now_ms {
                     let remaining_ms = exp_ms - now_ms;
                     let pexpire_frame = Frame::Array(framevec![
@@ -246,22 +246,21 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Shared by both the async (tokio) and sync (monoio) rewrite paths.
 #[allow(dead_code)]
 fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
-    let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
+    let snapshot: Vec<Vec<(CompactKey, Entry)>> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            let base_ts = guard.base_timestamp();
             let entries = guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            (entries, base_ts)
+            entries
         })
         .collect();
 
     let mut temp_dbs: Vec<Database> = Vec::with_capacity(snapshot.len());
-    for (entries, _base_ts) in &snapshot {
+    for entries in &snapshot {
         let mut db = Database::new();
         for (key, entry) in entries {
             db.set(key.to_bytes(), entry.clone());
@@ -283,7 +282,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 #[derive(Default)]
 pub(crate) struct DrainOutcome {
     pub(crate) drained: usize,
-    shutdown_requested: bool,
+    pub(crate) shutdown_requested: bool,
     /// AppendSync ack senders for entries drained during a rewrite. Under
     /// `appendfsync=always` the client must NOT be told `Synced` until the
     /// post-drain boundary `sync_data()` makes those bytes durable, so the acks
@@ -342,6 +341,8 @@ pub(crate) fn sync_and_fulfill_drain(
     }
 }
 
+pub use super::rewrite_overflow::{AOF_REWRITE_OVERFLOW_SPILLED, RewriteOverflow};
+
 /// Bounded variant of [`drain_pending_appends`]: drain at most `max_drain`
 /// messages (RAW RESP, no framing).  Pass [`usize::MAX`] for unbounded.
 ///
@@ -358,7 +359,7 @@ pub(crate) fn sync_and_fulfill_drain(
 /// record whose db differs from `*db_ctx` gets a raw `SELECT <db>` record
 /// written first (same rule as the live writer loops); `*db_ctx` is updated
 /// in place so the caller can read back the final context after the drain.
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
@@ -409,8 +410,8 @@ pub(crate) fn drain_pending_appends_bounded(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {
                     // Already rewriting — drop redundant request.
                 }
@@ -520,8 +521,8 @@ pub(crate) fn drain_pending_appends_framed(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {
                     // Already rewriting this shard — drop redundant request.
                 }
@@ -581,24 +582,20 @@ pub(crate) fn drain_pending_appends_framed(
 /// thread cannot lock another thread's `!Send` `Rc<RefCell<Shard>>`, so the
 /// per-shard rewrite would need a different snapshot-coordination mechanism.
 ///
-/// # Known limitation — channel saturation during the fold
+/// # Channel saturation during the fold — closed by [`RewriteOverflow`] (#452.1)
 ///
-/// Exactly-once holds *absent append-channel saturation during the fold*. While
-/// this function runs (phases 2-6, including the base-RDB serialize + write +
-/// fsync of phase 6, which is hundreds of ms on a large shard) the writer is
-/// NOT in its recv loop, so it is not draining the bounded
-/// `mpsc_bounded::<AofMessage>(10_000)` append channel. Post-snapshot appends
-/// queue there for the new incr; the event loop enqueues them with
-/// `try_send_append` (drop-on-full, return ignored — `spsc_handler.rs`). Under
-/// *sustained concurrent* writes on a large dataset, > 10_000 appends can pile
-/// up during the window and the overflow is silently dropped — lost even on a
-/// clean restart (worse than the everysec contract, which only loses on crash).
-/// The single-client crash matrix cannot surface this (serialized `redis-cli`
-/// never pressures the channel). This window is *pre-existing*: the shipped
-/// `do_rewrite_sharded` has the identical non-draining gap. Tracked as a
-/// known limitation (F6 is behind `--experimental-per-shard-rewrite`); the fix
-/// (keep draining during phase 6, or block-on-full for the rewrite's duration)
-/// is a separate scoped task. See `tmp/F6-known-limitations.md`.
+/// While this function runs (phases 2-6, including the base-RDB serialize +
+/// write + fsync of phase 6, hundreds of ms on a large shard) the writer is
+/// NOT in its recv loop, so the bounded `mpsc_bounded::<AofMessage>(10_000)`
+/// append channel can saturate under sustained write load. Historically the
+/// overflow was silently dropped (acked writes lost even on a clean restart —
+/// worse than the everysec contract). The writer task now arms this writer's
+/// [`RewriteOverflow`] around the fold: producers spill channel-overflow
+/// appends into the buffer (capped, fail-loud beyond the cap), and the writer
+/// drains channel-then-buffer into the committed incr immediately after the
+/// fold, before resuming its recv loop. See [`RewriteOverflow`]'s ordering
+/// invariant. The single-client crash matrix cannot pressure the channel;
+/// the recovery-test matrix (#54) covers rewrite-under-sustained-load.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn do_rewrite_per_shard(
     shard_id: u16,
@@ -609,7 +606,7 @@ pub(crate) fn do_rewrite_per_shard(
     fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
     fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
     last_db: &mut usize,
-) -> Result<(), MoonError> {
+) -> Result<bool, MoonError> {
     use ringbuf::traits::Producer;
     // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
     // (success via `complete()`, `?`-error or panic-unwind via `Drop`). The
@@ -825,8 +822,15 @@ pub(crate) fn do_rewrite_per_shard(
              committed seq {} (no restart needed)",
             shard_id, committed_seq
         );
+        // Re-verify P0: an abort is NOT a commit — the new base this shard's
+        // snapshot cut refers to was PRUNED. Returning Ok(true) here would
+        // make finish_* discard pre-cut spills (their effects exist only in
+        // the discarded base) and resolve their acks Synced — permanent,
+        // acked data loss. The caller must drain the overflow
+        // write-everything into the rolled-back OLD incr instead.
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
@@ -856,6 +860,7 @@ pub(crate) fn do_rewrite_single(
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
     last_db: &mut usize,
+    overflow: &super::rewrite_overflow::RewriteOverflow,
 ) -> Result<(), MoonError> {
     // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
     // resolve their parked AppendSync acks (issue #140). task #35: continues
@@ -874,25 +879,35 @@ pub(crate) fn do_rewrite_single(
     let mut mid_drain = drain_pending_appends(rx, file, last_db)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
+    // #452.1 snapshot cut (P0 fix): while we hold EVERY db write lock no NEW
+    // mutation can start, so everything spilled so far is pre-snapshot (its
+    // effect will be in the phase-4 snapshot below) and must not be
+    // re-written into the new incr. Known residual gap (re-verify Q1,
+    // tracked as a follow-up issue): paths that enqueue AFTER releasing the
+    // db guard (deferred batch flush, a producer parked in send_async) can
+    // suspend between mutation and enqueue — such a record can land past
+    // this cut (and past `pending_aof_count` on the sharded fold, a gap that
+    // predates the overflow) although its effect is in the snapshot. The
+    // exposure needs channel-full + a fold arriving inside that gap.
+    overflow.mark_cut();
+
     // Phase 4: snapshot under the write locks. No mutation is possible.
     let now_ms = current_time_ms();
-    let snapshot: Vec<(
+    let snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> = guards
+    > = guards
         .iter()
         .map(|guard| {
-            let base_ts = guard.base_timestamp();
             let entries: Vec<_> = guard
                 .data()
                 .iter()
-                .filter(|(_, v)| !v.is_expired_at(base_ts, now_ms))
+                .filter(|(_, v)| !v.is_expired_at(now_ms))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            (entries, base_ts)
+            entries
         })
         .collect();
 
@@ -1116,7 +1131,7 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
             let mut temp = Database::new();
             let now_ms = current_time_ms();
             for (k, v) in guard.data().iter() {
-                if !v.is_expired_at(guard.base_timestamp(), now_ms) {
+                if !v.is_expired_at(now_ms) {
                     temp.set(k.to_bytes(), v.clone());
                 }
             }
@@ -1245,8 +1260,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
                 AofMessage::Shutdown => {
                     pre_shutdown_requested = true;
                 }
-                AofMessage::Rewrite(_)
-                | AofMessage::RewriteSharded(_)
+                AofMessage::Rewrite(..)
+                | AofMessage::RewriteSharded(..)
                 | AofMessage::RewritePerShard { .. } => {}
             }
         }
@@ -1374,8 +1389,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     AofMessage::Shutdown => {
                         mid_shutdown_requested = true;
                     }
-                    AofMessage::Rewrite(_)
-                    | AofMessage::RewriteSharded(_)
+                    AofMessage::Rewrite(..)
+                    | AofMessage::RewriteSharded(..)
                     | AofMessage::RewritePerShard { .. } => {}
                 },
                 Err(_) => break,

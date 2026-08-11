@@ -50,6 +50,12 @@ pub(crate) fn set_legacy_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn
     legacy::set_spin_hooks(advertise, probe);
 }
 
+// moon patch (O3): per-thread spin contention gate. See legacy::MOON_SPIN_CONTENDED.
+#[cfg(feature = "legacy")]
+pub(crate) fn set_legacy_spin_contended(contended: bool) {
+    legacy::set_spin_contended(contended);
+}
+
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
     #[allow(unreachable_pub)]

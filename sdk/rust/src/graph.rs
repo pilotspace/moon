@@ -11,7 +11,7 @@ use crate::util::{parse_query_result, value_to_i64};
 /// use moondb::MoonClient;
 ///
 /// #[tokio::main]
-/// async fn main() -> moon::Result<()> {
+/// async fn main() -> moondb::Result<()> {
 ///     let client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     let mut g = client.graph();
 ///     g.create("social").await?;
@@ -26,7 +26,7 @@ use crate::util::{parse_query_result, value_to_i64};
 /// }
 /// ```
 pub struct GraphClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl GraphClient {

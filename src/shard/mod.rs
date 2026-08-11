@@ -6,6 +6,8 @@ pub mod coordinator;
 pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
+#[cfg(feature = "runtime-monoio")]
+pub(crate) mod idle_park;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
 pub mod maintenance_schedule;
 /// Wave 3: proactive RSS memory watchdog ("mem-full guard") — analogue of
@@ -26,6 +28,10 @@ pub mod segment_stall;
 pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
+/// O3 adaptive busy-poll governor — the spin it gates exists only in the
+/// vendored monoio legacy driver, so the module is monoio-only.
+#[cfg(feature = "runtime-monoio")]
+pub(crate) mod spin_governor;
 pub mod spsc_handler;
 /// Shared MOVE/COPY-DB two-database intercept for every `ShardMessage` SPSC
 /// arm (Gap A). Split out of `spsc_handler.rs` per the repo's file-size
@@ -192,11 +198,12 @@ impl Shard {
                         );
                         // Initialize cold_index + cold_shard_dir on all databases
                         // so cold_read_through can find keys spilled to NVMe.
-                        // The recovered index itself was already attached to
-                        // databases[0] BEFORE Phase 4 replay (inside
-                        // recover_shard_v3_pitr) so replayed DEL/FLUSH/EXPIRE
-                        // tombstone the cold plane; here we only backfill empty
-                        // indexes on the remaining databases.
+                        // The recovered indexes were already attached to their
+                        // OWN databases (per-file `FileEntry::db_index`, #139)
+                        // BEFORE Phase 4 replay (inside recover_shard_v3_pitr)
+                        // so replayed DEL/FLUSH/EXPIRE tombstone the cold
+                        // plane; here we only backfill empty indexes on the
+                        // databases that recovered nothing.
                         {
                             let cold_dir = shard_dir.clone();
                             for db in &mut self.databases {
@@ -343,6 +350,12 @@ impl Shard {
                     total_keys += n;
                 }
                 Err(e) => {
+                    // #452.2: mid-chain tear ⇒ refuse to boot.
+                    if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                        crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(
+                            self.id, &e,
+                        );
+                    }
                     tracing::error!("Shard {}: WAL v3 fallback replay failed: {}", self.id, e);
                 }
             }

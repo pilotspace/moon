@@ -27,6 +27,14 @@ pub struct TemporalRegistry {
     entries: BTreeMap<i64, u64>,
 }
 
+/// Upper bound on retained wall-clock->LSN bindings per shard (deep-review
+/// G4: the registry was insert-only, growing one entry per
+/// `TEMPORAL.SNAPSHOT_AT` call for the life of the process). At 16 bytes a
+/// binding this caps the registry at ~4 MB/shard; when full, the OLDEST
+/// binding is evicted — bounding how far back `AS_OF` resolves rather than
+/// growing without limit.
+const MAX_TEMPORAL_BINDINGS: usize = 262_144;
+
 impl TemporalRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
@@ -37,8 +45,13 @@ impl TemporalRegistry {
     ///
     /// Both `wall_ms` and `lsn` MUST be captured by the caller at the
     /// handler level before calling this method.
+    ///
+    /// Bounded: at [`MAX_TEMPORAL_BINDINGS`] the oldest binding is evicted.
     pub fn record(&mut self, wall_ms: i64, lsn: u64) {
         self.entries.insert(wall_ms, lsn);
+        while self.entries.len() > MAX_TEMPORAL_BINDINGS {
+            self.entries.pop_first();
+        }
     }
 
     /// Find the LSN that was active at wall-clock time T.
@@ -127,6 +140,24 @@ mod tests {
     fn test_registry_empty_returns_none() {
         let reg = TemporalRegistry::new();
         assert!(reg.lsn_at(1000).is_none());
+    }
+
+    /// G4 (deep review): the registry must stay bounded — one binding per
+    /// TEMPORAL.SNAPSHOT_AT for the life of the process was unbounded
+    /// growth. Overflow evicts the OLDEST binding; recent bindings resolve.
+    #[test]
+    fn test_registry_bounded_evicts_oldest() {
+        let mut reg = TemporalRegistry::new();
+        let overflow = 10;
+        for i in 0..(MAX_TEMPORAL_BINDINGS + overflow) {
+            reg.record(i as i64, i as u64);
+        }
+        assert_eq!(reg.len(), MAX_TEMPORAL_BINDINGS, "cap must hold");
+        // The oldest `overflow` bindings are gone...
+        assert!(reg.lsn_at(overflow as i64 - 1).is_none());
+        // ...and the newest still resolves exactly.
+        let last = (MAX_TEMPORAL_BINDINGS + overflow - 1) as i64;
+        assert_eq!(reg.lsn_at(last), Some(last as u64));
     }
 
     #[test]

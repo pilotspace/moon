@@ -65,6 +65,21 @@ impl ValueType {
             _ => None,
         }
     }
+
+    /// Redis TYPE-command name for this value type. Must stay in sync with
+    /// `RedisValue::type_name` — SCAN's TYPE filter compares the two
+    /// case-insensitively when judging cold (spilled) keys (#364).
+    #[inline]
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::ZSet => "zset",
+            Self::Stream => "stream",
+        }
+    }
 }
 
 // ── Entry flags (bitfield) ──────────────────────────────
@@ -75,7 +90,10 @@ pub mod entry_flags {
     pub const HAS_TTL: u8 = 0x01;
     /// Value payload is LZ4-compressed.
     pub const COMPRESSED: u8 = 0x02;
-    /// Value is an overflow pointer (file_id:u64 + page_id:u32 = 12 bytes).
+    /// Value is an overflow pointer: a raw 4-byte LE `u32` file-absolute
+    /// `start_page_idx` (the overflow chain always lives in the SAME
+    /// physical file as this leaf's stub entry, so no `file_id` needs to be
+    /// stored alongside it — see `read_overflow_chain` / `build_overflow_chain`).
     pub const OVERFLOW: u8 = 0x04;
     /// Entry is a tombstone (pending compaction). value_len = 0.
     pub const TOMBSTONE: u8 = 0x08;
@@ -501,9 +519,21 @@ impl KvOverflowPage {
 
 /// Build a chain of overflow pages for data that exceeds inline KvLeaf capacity.
 ///
-/// Returns a `Vec` of overflow page buffers. The caller writes them to the DataFile
-/// after the KvLeaf page. Page IDs are sequential starting at `start_page_id`.
-/// Chain links: `page[i].next_page = i+1` (1-based), last page `next_page = 0`.
+/// Returns a `Vec` of overflow page buffers. The caller writes them to the
+/// DataFile starting at file-absolute page index `start_page_id` (immediately
+/// following the KvLeaf page holding this chain's overflow-pointer stub).
+/// Page IDs are sequential starting at `start_page_id`. Chain links
+/// (`prev_page`/`next_page`, read by [`read_overflow_chain`] as raw
+/// `file_data` chunk offsets) are FILE-ABSOLUTE page indices, i.e.
+/// `start_page_id + i`, NOT chain-local ordinals — `start_page_id` is not
+/// always `1`: a spill batch file (`kv_spill::build_kv_spill_batch`) gives
+/// each oversized entry its own dedicated leaf + chain later in the same
+/// file, so the second, third, and later such entries' chains start well
+/// past page one. Before this generalization every caller happened to pass
+/// `start_page_id == 1` (a single-entry file always has its one leaf at page
+/// 0), so a chain-local `i+1`/`i+2` formula was silently indistinguishable
+/// from the correct file-absolute one — it produced dangling/wrong links the
+/// moment a caller passed any other `start_page_id`.
 pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Vec<KvOverflowPage> {
     let chunk_count = (data.len() + OVERFLOW_PAYLOAD_CAP - 1) / OVERFLOW_PAYLOAD_CAP;
     let mut pages = Vec::with_capacity(chunk_count);
@@ -513,11 +543,17 @@ pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Ve
         let mut page = KvOverflowPage::new(page_id, file_id);
         page.write_payload(chunk);
 
-        // prev_page: 0 for first, otherwise i (1-based index of previous overflow page)
-        let prev = if i == 0 { 0 } else { i as u32 };
-        // next_page: i+2 for non-last (1-based index of next overflow page), 0 for last
-        let next = if i + 1 < chunk_count {
-            (i + 2) as u32
+        // prev_page/next_page: file-absolute page indices (0 is the sentinel
+        // for "no such page" -- always safe since page 0 of any spill file
+        // is a leaf, never an overflow page, so no real chain page ever has
+        // file-absolute index 0).
+        let prev: u32 = if i == 0 {
+            0
+        } else {
+            (start_page_id + i as u64 - 1) as u32
+        };
+        let next: u32 = if i + 1 < chunk_count {
+            (start_page_id + i as u64 + 1) as u32
         } else {
             0
         };

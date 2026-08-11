@@ -44,10 +44,10 @@ fn wait_for_ready(port: u16, deadline: Duration) -> bool {
             s.set_write_timeout(Some(Duration::from_millis(500))).ok();
             if s.write_all(b"PING\r\n").is_ok() {
                 let mut buf = [0u8; 16];
-                if let Ok(n) = s.read(&mut buf) {
-                    if buf[..n].windows(4).any(|w| w == b"PONG") {
-                        return true;
-                    }
+                if let Ok(n) = s.read(&mut buf)
+                    && buf[..n].windows(4).any(|w| w == b"PONG")
+                {
+                    return true;
                 }
             }
         }

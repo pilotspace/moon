@@ -19,12 +19,14 @@ use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::error::{MoonError, RdbError};
+use crate::persistence::kv_page::ValueType;
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::db::Database;
 use crate::storage::entry::{Entry, RedisValue, current_secs, current_time_ms};
 use crate::storage::stream::{Stream as StreamData, StreamId};
+use crate::storage::value_codec::{self, HashTtlTrailer};
 
 // Format constants
 const RDB_MAGIC: &[u8] = b"MOON";
@@ -69,11 +71,10 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
 
     // Databases
     for (db_idx, db) in databases.iter().enumerate() {
-        let base_ts = db.base_timestamp();
         let data = db.data();
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
+            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -83,7 +84,7 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -115,9 +116,9 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
 
 /// Save from pre-cloned snapshot data (used by BGSAVE to avoid holding the lock).
 ///
-/// Each element in `snapshot` is a Vec of (key, entry, base_ts) for a database index.
+/// Each element in `snapshot` is a Vec of (key, entry) for a database index.
 pub fn save_from_snapshot(
-    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
+    snapshot: &[Vec<(CompactKey, Entry)>],
     path: &Path,
 ) -> Result<(), MoonError> {
     let mut buf = Vec::new();
@@ -128,11 +129,11 @@ pub fn save_from_snapshot(
 
     let now_ms = current_time_ms();
 
-    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+    for (db_idx, entries) in snapshot.iter().enumerate() {
         // Filter expired and skip empty
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .filter(|(_, e)| !e.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -142,7 +143,7 @@ pub fn save_from_snapshot(
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -164,12 +165,9 @@ pub fn save_from_snapshot(
 
 /// Serialize snapshot data (with correct base_ts per database) to RDB bytes in memory.
 ///
-/// Unlike `save_to_bytes(&[Database])` which reads base_ts from each Database,
-/// this takes explicit (entries, base_ts) tuples — critical for AOF rewrite where
-/// entries are cloned into temporary storage and the original base_ts must be preserved.
-pub fn save_snapshot_to_bytes(
-    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
-) -> Result<Vec<u8>, MoonError> {
+/// Unlike `save_to_bytes(&[Database])`, this takes pre-cloned entry Vecs —
+/// used by AOF rewrite where entries are cloned into temporary storage.
+pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     buf.write_all(RDB_MAGIC)?;
@@ -177,10 +175,10 @@ pub fn save_snapshot_to_bytes(
 
     let now_ms = current_time_ms();
 
-    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+    for (db_idx, entries) in snapshot.iter().enumerate() {
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .filter(|(_, e)| !e.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -190,7 +188,7 @@ pub fn save_snapshot_to_bytes(
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry)?;
         }
     }
 
@@ -325,7 +323,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
                             continue;
                         }
                         if current_db < db_count {
@@ -590,7 +588,7 @@ fn read_entry_zero_copy(
             let mut entry = Entry::new_string(Bytes::new());
             entry.value = cv;
             if expires_at_ms > 0 {
-                entry.set_expires_at_ms(cached_secs, expires_at_ms);
+                entry.set_expires_at_ms(expires_at_ms);
             }
             entry.set_last_access(cached_secs);
             entry.set_access_counter(5);
@@ -793,7 +791,7 @@ fn read_entry_zero_copy(
     let mut entry = Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
     if expires_at_ms > 0 {
-        entry.set_expires_at_ms(cached_secs, expires_at_ms);
+        entry.set_expires_at_ms(expires_at_ms);
     }
     entry.set_last_access(cached_secs);
     entry.set_access_counter(5);
@@ -938,7 +936,7 @@ pub fn load_from_bytes(
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
                             continue;
                         }
                         if current_db < db_count {
@@ -996,52 +994,17 @@ pub fn distribute_loaded_to_shards(
     }
 }
 
-/// Merge per-shard snapshots into a single snapshot suitable for `save_from_snapshot()`.
-///
-/// Each shard provides `Vec<(Vec<(Bytes, Entry)>, u32)>` -- one entry per database.
-/// This function merges all shards' data for each database index into a combined snapshot.
-pub fn merge_shard_snapshots(
-    shard_snapshots: Vec<Vec<(Vec<(Bytes, Entry)>, u32)>>,
-    num_databases: usize,
-) -> Vec<(Vec<(Bytes, Entry)>, u32)> {
-    let mut merged: Vec<(Vec<(Bytes, Entry)>, u32)> =
-        (0..num_databases).map(|_| (Vec::new(), 0u32)).collect();
+pub(crate) fn write_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) -> Result<(), MoonError> {
+    let val_ref = entry.value.as_redis_value();
 
-    for shard_snap in shard_snapshots {
-        for (db_idx, (entries, base_ts)) in shard_snap.into_iter().enumerate() {
-            if db_idx < merged.len() {
-                // Use the base_ts from the first shard that provides data for this db
-                if merged[db_idx].0.is_empty() {
-                    merged[db_idx].1 = base_ts;
-                }
-                merged[db_idx].0.extend(entries);
-            }
-        }
-    }
-
-    merged
-}
-
-pub(crate) fn write_entry(
-    buf: &mut Vec<u8>,
-    key: &[u8],
-    entry: &Entry,
-    base_ts: u32,
-) -> Result<(), MoonError> {
     // Type tag -- compact variants serialize as the same type as their full-size counterparts
-    let type_tag = match entry.value.as_redis_value() {
-        RedisValueRef::String(_) => TYPE_STRING,
-        RedisValueRef::Hash(_)
-        | RedisValueRef::HashListpack(_)
-        | RedisValueRef::HashWithTtl { .. } => TYPE_HASH,
-        RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => TYPE_LIST,
-        RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
-            TYPE_SET
-        }
-        RedisValueRef::SortedSet { .. }
-        | RedisValueRef::SortedSetBPTree { .. }
-        | RedisValueRef::SortedSetListpack(_) => TYPE_SORTED_SET,
-        RedisValueRef::Stream(_) => TYPE_STREAM,
+    let type_tag = match value_codec::value_type_of(&val_ref) {
+        ValueType::String => TYPE_STRING,
+        ValueType::Hash => TYPE_HASH,
+        ValueType::List => TYPE_LIST,
+        ValueType::Set => TYPE_SET,
+        ValueType::ZSet => TYPE_SORTED_SET,
+        ValueType::Stream => TYPE_STREAM,
     };
     buf.write_all(&[type_tag])?;
 
@@ -1050,154 +1013,25 @@ pub(crate) fn write_entry(
 
     // TTL as unix millis (0 = no expiry)
     let ttl_ms: i64 = if entry.has_expiry() {
-        entry.expires_at_ms(base_ts) as i64
+        entry.expires_at_ms() as i64
     } else {
         0
     };
     buf.write_all(&ttl_ms.to_le_bytes())?;
 
-    // Value data -- compact variants expand to element-level format for persistence
-    match entry.value.as_redis_value() {
+    // Value data -- strings inline, collections via the shared value codec
+    // (compact variants expand to the canonical element-level format).
+    match val_ref {
         RedisValueRef::String(s) => {
             write_bytes(buf, s)?;
         }
-        RedisValueRef::Hash(map) => {
-            buf.write_all(&(map.len() as u32).to_le_bytes())?;
-            for (field, val) in map.iter() {
-                write_bytes(buf, field)?;
-                write_bytes(buf, val)?;
-            }
-            // v2 trailer: no per-field TTLs for plain Hash. Emit ttl_count=0.
-            buf.write_all(&0u32.to_le_bytes())?;
-        }
-        RedisValueRef::HashWithTtl { fields, ttls, .. } => {
-            buf.write_all(&(fields.len() as u32).to_le_bytes())?;
-            for (field, val) in fields.iter() {
-                write_bytes(buf, field)?;
-                write_bytes(buf, val)?;
-            }
-            // v2 trailer: per-field TTL sidecar.
-            buf.write_all(&(ttls.len() as u32).to_le_bytes())?;
-            for (field, ttl_ms) in ttls.iter() {
-                write_bytes(buf, field)?;
-                buf.write_all(&ttl_ms.to_le_bytes())?;
-            }
-        }
-        RedisValueRef::HashListpack(lp) => {
-            let map = lp.to_hash_map();
-            buf.write_all(&(map.len() as u32).to_le_bytes())?;
-            for (field, val) in &map {
-                write_bytes(buf, field)?;
-                write_bytes(buf, val)?;
-            }
-            // v2 trailer: listpack-encoded hashes never carry TTLs.
-            buf.write_all(&0u32.to_le_bytes())?;
-        }
-        RedisValueRef::List(list) => {
-            buf.write_all(&(list.len() as u32).to_le_bytes())?;
-            for elem in list.iter() {
-                write_bytes(buf, elem)?;
-            }
-        }
-        RedisValueRef::ListListpack(lp) => {
-            let list = lp.to_vec_deque();
-            buf.write_all(&(list.len() as u32).to_le_bytes())?;
-            for elem in &list {
-                write_bytes(buf, elem)?;
-            }
-        }
-        RedisValueRef::Set(set) => {
-            buf.write_all(&(set.len() as u32).to_le_bytes())?;
-            for member in set.iter() {
-                write_bytes(buf, member)?;
-            }
-        }
-        RedisValueRef::SetListpack(lp) => {
-            let set = lp.to_hash_set();
-            buf.write_all(&(set.len() as u32).to_le_bytes())?;
-            for member in &set {
-                write_bytes(buf, member)?;
-            }
-        }
-        RedisValueRef::SetIntset(is) => {
-            let set = is.to_hash_set();
-            buf.write_all(&(set.len() as u32).to_le_bytes())?;
-            for member in &set {
-                write_bytes(buf, member)?;
-            }
-        }
-        RedisValueRef::SortedSet { members, .. }
-        | RedisValueRef::SortedSetBPTree { members, .. } => {
-            buf.write_all(&(members.len() as u32).to_le_bytes())?;
-            for (member, score) in members.iter() {
-                write_bytes(buf, member)?;
-                buf.write_all(&score.to_le_bytes())?;
-            }
-        }
-        RedisValueRef::SortedSetListpack(lp) => {
-            // Listpack stores sorted set as [member, score, member, score, ...]
-            let mut count: u32 = 0;
-            let pairs: Vec<_> = lp.iter_pairs().collect();
-            // Write count placeholder, then entries
-            let count_pos = buf.len();
-            buf.write_all(&0u32.to_le_bytes())?;
-            for (member_entry, score_entry) in &pairs {
-                let member_bytes = member_entry.as_bytes();
-                let score_bytes = score_entry.as_bytes();
-                let score: f64 = std::str::from_utf8(&score_bytes)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
-                write_bytes(buf, &member_bytes)?;
-                buf.write_all(&score.to_le_bytes())?;
-                count += 1;
-            }
-            // Patch count
-            let count_bytes = count.to_le_bytes();
-            buf[count_pos..count_pos + 4].copy_from_slice(&count_bytes);
-        }
-        RedisValueRef::Stream(stream) => {
-            // Entry count + last_id
-            buf.write_all(&(stream.entries.len() as u64).to_le_bytes())?;
-            buf.write_all(&stream.last_id.ms.to_le_bytes())?;
-            buf.write_all(&stream.last_id.seq.to_le_bytes())?;
-            // Entries
-            for (id, fields) in &stream.entries {
-                buf.write_all(&id.ms.to_le_bytes())?;
-                buf.write_all(&id.seq.to_le_bytes())?;
-                buf.write_all(&(fields.len() as u32).to_le_bytes())?;
-                for (field, value) in fields {
-                    write_bytes(buf, field)?;
-                    write_bytes(buf, value)?;
-                }
-            }
-            // Consumer groups
-            buf.write_all(&(stream.groups.len() as u32).to_le_bytes())?;
-            for (group_name, group) in &stream.groups {
-                write_bytes(buf, group_name)?;
-                buf.write_all(&group.last_delivered_id.ms.to_le_bytes())?;
-                buf.write_all(&group.last_delivered_id.seq.to_le_bytes())?;
-                // PEL
-                buf.write_all(&(group.pel.len() as u32).to_le_bytes())?;
-                for (id, pe) in &group.pel {
-                    buf.write_all(&id.ms.to_le_bytes())?;
-                    buf.write_all(&id.seq.to_le_bytes())?;
-                    write_bytes(buf, &pe.consumer)?;
-                    buf.write_all(&pe.delivery_time.to_le_bytes())?;
-                    buf.write_all(&pe.delivery_count.to_le_bytes())?;
-                }
-                // Consumers
-                buf.write_all(&(group.consumers.len() as u32).to_le_bytes())?;
-                for (cname, consumer) in &group.consumers {
-                    write_bytes(buf, cname)?;
-                    buf.write_all(&consumer.seen_time.to_le_bytes())?;
-                    buf.write_all(&(consumer.pending.len() as u32).to_le_bytes())?;
-                    for (id, _) in &consumer.pending {
-                        buf.write_all(&id.ms.to_le_bytes())?;
-                        buf.write_all(&id.seq.to_le_bytes())?;
-                    }
-                }
-            }
+        ref other => {
+            value_codec::encode_value_body(other, buf).map_err(|e| RdbError::Corrupted {
+                detail: format!(
+                    "encoding value for key {}: {e}",
+                    String::from_utf8_lossy(key)
+                ),
+            })?;
         }
     }
 
@@ -1220,216 +1054,34 @@ pub(crate) fn read_entry(
     // expires_at_ms: if ttl_ms > 0 it's already absolute unix millis
     let expires_at_ms = if ttl_ms > 0 { ttl_ms as u64 } else { 0 };
 
-    // Value
+    // Value -- strings inline, collections via the shared value codec.
     let value = match type_tag {
         TYPE_STRING => {
             let data = read_bytes(cursor)?;
             RedisValue::String(data)
         }
-        TYPE_HASH => {
-            let count = read_u32(cursor)? as usize;
-            validate_count(cursor, count, 8, "hash")?; // min 4+4 bytes per field+value length
-            let mut map = HashMap::with_capacity(count);
-            for _ in 0..count {
-                let field = read_bytes(cursor)?;
-                let val = read_bytes(cursor)?;
-                map.insert(field, val);
-            }
-            if has_hash_ttl_trailer {
-                let ttl_count = read_u32(cursor)? as usize;
-                validate_count(cursor, ttl_count, 12, "hash_ttls")?;
-                if ttl_count > 0 {
-                    let mut ttls = HashMap::with_capacity(ttl_count);
-                    for _ in 0..ttl_count {
-                        let field = read_bytes(cursor)?;
-                        let mut ttl_buf = [0u8; 8];
-                        cursor.read_exact(&mut ttl_buf)?;
-                        let ttl_ms = u64::from_le_bytes(ttl_buf);
-                        ttls.insert(field, ttl_ms);
-                    }
-                    // min_expiry_ms is purely in-memory; recompute from the
-                    // decoded ttls map (not stored in the RDB file).
-                    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
-                    RedisValue::HashWithTtl {
-                        fields: map,
-                        ttls,
-                        min_expiry_ms,
-                    }
-                } else {
-                    RedisValue::Hash(map)
-                }
-            } else {
-                RedisValue::Hash(map)
-            }
-        }
-        TYPE_LIST => {
-            let count = read_u32(cursor)? as usize;
-            validate_count(cursor, count, 4, "list")?; // min 4 bytes per element length
-            let mut list = VecDeque::with_capacity(count);
-            for _ in 0..count {
-                list.push_back(read_bytes(cursor)?);
-            }
-            RedisValue::List(list)
-        }
-        TYPE_SET => {
-            let count = read_u32(cursor)? as usize;
-            validate_count(cursor, count, 4, "set")?; // min 4 bytes per element length
-            let mut set = HashSet::with_capacity(count);
-            for _ in 0..count {
-                set.insert(read_bytes(cursor)?);
-            }
-            RedisValue::Set(set)
-        }
-        TYPE_SORTED_SET => {
-            let count = read_u32(cursor)? as usize;
-            validate_count(cursor, count, 12, "sorted_set")?; // min 4 (member len) + 8 (f64 score)
-            let mut members = HashMap::with_capacity(count);
-            let mut tree = BPTree::new();
-            for _ in 0..count {
-                let member = read_bytes(cursor)?;
-                let mut score_buf = [0u8; 8];
-                cursor.read_exact(&mut score_buf)?;
-                let score = f64::from_le_bytes(score_buf);
-                members.insert(member.clone(), score);
-                tree.insert(OrderedFloat(score), member);
-            }
-            RedisValue::SortedSetBPTree { tree, members }
-        }
-        TYPE_STREAM => {
-            let mut entry_count_buf = [0u8; 8];
-            cursor.read_exact(&mut entry_count_buf)?;
-            let entry_count = u64::from_le_bytes(entry_count_buf) as usize;
-
-            let mut last_id_ms_buf = [0u8; 8];
-            let mut last_id_seq_buf = [0u8; 8];
-            cursor.read_exact(&mut last_id_ms_buf)?;
-            cursor.read_exact(&mut last_id_seq_buf)?;
-            let last_id = StreamId {
-                ms: u64::from_le_bytes(last_id_ms_buf),
-                seq: u64::from_le_bytes(last_id_seq_buf),
+        _ => {
+            let value_type = match type_tag {
+                TYPE_HASH => ValueType::Hash,
+                TYPE_LIST => ValueType::List,
+                TYPE_SET => ValueType::Set,
+                TYPE_SORTED_SET => ValueType::ZSet,
+                TYPE_STREAM => ValueType::Stream,
+                _ => return Err(RdbError::UnsupportedType { type_tag }.into()),
             };
-
-            let mut stream = StreamData::new();
-            stream.last_id = last_id;
-
-            validate_count(cursor, entry_count, 20, "stream_entries")?; // min 16 (id) + 4 (field_count)
-            for _ in 0..entry_count {
-                let mut ms_buf = [0u8; 8];
-                let mut seq_buf = [0u8; 8];
-                cursor.read_exact(&mut ms_buf)?;
-                cursor.read_exact(&mut seq_buf)?;
-                let id = StreamId {
-                    ms: u64::from_le_bytes(ms_buf),
-                    seq: u64::from_le_bytes(seq_buf),
-                };
-                let field_count = read_u32(cursor)? as usize;
-                validate_count(cursor, field_count, 8, "stream_fields")?;
-                let mut fields = Vec::with_capacity(field_count);
-                for _ in 0..field_count {
-                    let field = read_bytes(cursor)?;
-                    let value = read_bytes(cursor)?;
-                    fields.push((field, value));
-                }
-                stream.entries.insert(id, fields);
-                stream.length += 1;
-            }
-
-            // Consumer groups
-            let group_count = read_u32(cursor)? as usize;
-            // min 4 (name len) + 16 (last_delivered_id) + 4 (pel_count) + 4 (consumer_count)
-            validate_count(cursor, group_count, 28, "stream_groups")?;
-            for _ in 0..group_count {
-                let group_name = read_bytes(cursor)?;
-                let mut gld_ms = [0u8; 8];
-                let mut gld_seq = [0u8; 8];
-                cursor.read_exact(&mut gld_ms)?;
-                cursor.read_exact(&mut gld_seq)?;
-                let last_delivered_id = StreamId {
-                    ms: u64::from_le_bytes(gld_ms),
-                    seq: u64::from_le_bytes(gld_seq),
-                };
-
-                let pel_count = read_u32(cursor)? as usize;
-                // min 16 (StreamId) + 4 (consumer name len) + 16 (delivery_time+delivery_count)
-                validate_count(cursor, pel_count, 36, "stream_pel")?;
-                let mut pel = BTreeMap::new();
-                for _ in 0..pel_count {
-                    let mut pid_ms = [0u8; 8];
-                    let mut pid_seq = [0u8; 8];
-                    cursor.read_exact(&mut pid_ms)?;
-                    cursor.read_exact(&mut pid_seq)?;
-                    let pid = StreamId {
-                        ms: u64::from_le_bytes(pid_ms),
-                        seq: u64::from_le_bytes(pid_seq),
-                    };
-                    let consumer_name = read_bytes(cursor)?;
-                    let mut dt_buf = [0u8; 8];
-                    let mut dc_buf = [0u8; 8];
-                    cursor.read_exact(&mut dt_buf)?;
-                    cursor.read_exact(&mut dc_buf)?;
-                    pel.insert(
-                        pid,
-                        crate::storage::stream::PendingEntry {
-                            consumer: consumer_name,
-                            delivery_time: u64::from_le_bytes(dt_buf),
-                            delivery_count: u64::from_le_bytes(dc_buf),
-                        },
-                    );
-                }
-
-                let consumer_count = read_u32(cursor)? as usize;
-                // min 4 (name len) + 8 (seen_time) + 4 (pending_count)
-                validate_count(cursor, consumer_count, 16, "stream_consumers")?;
-                let mut consumers = HashMap::new();
-                for _ in 0..consumer_count {
-                    let cname = read_bytes(cursor)?;
-                    let mut st_buf = [0u8; 8];
-                    cursor.read_exact(&mut st_buf)?;
-                    let seen_time = u64::from_le_bytes(st_buf);
-                    let pending_count = read_u32(cursor)? as usize;
-                    // min 16 (StreamId)
-                    validate_count(cursor, pending_count, 16, "stream_pending")?;
-                    let mut pending = BTreeMap::new();
-                    for _ in 0..pending_count {
-                        let mut cid_ms = [0u8; 8];
-                        let mut cid_seq = [0u8; 8];
-                        cursor.read_exact(&mut cid_ms)?;
-                        cursor.read_exact(&mut cid_seq)?;
-                        pending.insert(
-                            StreamId {
-                                ms: u64::from_le_bytes(cid_ms),
-                                seq: u64::from_le_bytes(cid_seq),
-                            },
-                            (),
-                        );
-                    }
-                    consumers.insert(
-                        cname.clone(),
-                        crate::storage::stream::Consumer {
-                            name: cname,
-                            pending,
-                            seen_time,
-                        },
-                    );
-                }
-
-                stream.groups.insert(
-                    group_name,
-                    crate::storage::stream::ConsumerGroup {
-                        last_delivered_id,
-                        pel,
-                        consumers,
-                    },
-                );
-            }
-
-            RedisValue::Stream(Box::new(stream))
+            // v1 files predate the hash-TTL trailer; v2 requires it.
+            let trailer = if has_hash_ttl_trailer {
+                HashTtlTrailer::Required
+            } else {
+                HashTtlTrailer::Absent
+            };
+            value_codec::decode_value_body(cursor, value_type, trailer).map_err(|e| {
+                MoonError::from(RdbError::Corrupted {
+                    detail: e.to_string(),
+                })
+            })?
         }
-        _ => return Err(RdbError::UnsupportedType { type_tag }.into()),
     };
-
-    // Use current_secs() as base_ts for loaded entries (matches Database::new())
-    let base_ts = current_secs();
     let mut entry = if expires_at_ms > 0 {
         Entry::new_string(Bytes::new()) // placeholder, we'll replace value below
     } else {
@@ -1438,7 +1090,7 @@ pub(crate) fn read_entry(
     // Replace value with the correct one via CompactValue
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
     if expires_at_ms > 0 {
-        entry.set_expires_at_ms(base_ts, expires_at_ms);
+        entry.set_expires_at_ms(expires_at_ms);
     }
     entry.set_last_access(current_secs());
     entry.set_access_counter(5);
@@ -1568,13 +1220,15 @@ mod tests {
         let mut loaded = vec![Database::new()];
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
-        let base_ts = loaded[0].base_timestamp();
         let entry = loaded[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
-        // TTL should be approximately 3600 seconds in the future (allow 5s tolerance)
-        let now_ms = current_time_ms();
-        let remaining_secs = (entry.expires_at_ms(base_ts) - now_ms) / 1000;
-        assert!(remaining_secs > 3580 && remaining_secs <= 3600);
+        // W3: expiry round-trips with full millisecond fidelity — the old
+        // seconds-truncated storage needed a 5s tolerance here.
+        assert_eq!(
+            entry.expires_at_ms(),
+            future_ms,
+            "RDB round-trip must preserve the exact millisecond expiry"
+        );
     }
 
     #[test]
@@ -1748,10 +1402,9 @@ mod tests {
         dbs[0].set_string(Bytes::from_static(b"live"), Bytes::from_static(b"yes"));
         // Expired key
         let past_ms = current_time_ms() - 1000;
-        let base_ts = dbs[0].base_timestamp();
         dbs[0].set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
         save(&dbs, &path).unwrap();

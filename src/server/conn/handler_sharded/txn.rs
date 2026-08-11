@@ -34,11 +34,11 @@ pub(super) fn try_handle_txn_begin(
             // Unconditional slice path: ShardSlice is always initialized.
             let active =
                 crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
-            conn.active_cross_txn = Some(CrossStoreTxn::new(
+            conn.active_cross_txn = Some(Box::new(CrossStoreTxn::new(
                 active.txn_id,
                 active.snapshot_lsn,
                 conn.selected_db,
-            ));
+            )));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),
@@ -268,15 +268,18 @@ pub(super) async fn try_handle_txn_abort(
                 // src/transaction/abort.rs for lock ordering.
                 // Multi-shard: graph legs route to the shards owning
                 // each graph name via ShardMessage::GraphRollback.
-                crate::transaction::abort::abort_cross_store_txn_routed(
+                // Box::pin (c10k future diet): keeps the ~5.4 KB rollback
+                // state machine out of the per-connection future; the alloc
+                // only happens when TXN.ABORT actually executes.
+                Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
                     &ctx.shard_databases,
                     ctx.shard_id,
                     conn.selected_db,
                     ctx.num_shards,
                     &ctx.dispatch_tx,
                     &ctx.spsc_notifiers,
-                    txn,
-                )
+                    *txn,
+                ))
                 .await;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
             } else {

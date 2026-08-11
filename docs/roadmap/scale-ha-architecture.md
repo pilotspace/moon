@@ -40,7 +40,7 @@ Moon's primary scaling axis. Guidance and invariants:
 | Lever | Effect | Caveat |
 |---|---|---|
 | `--shards N` (thread-per-core) | Linear for pipelined + hash-tagged workloads | Cross-shard hop ≈10µs structural residual; non-pipelined random-key workloads prefer fewer shards until L4 lands |
-| `--io-busy-poll-us 40` | p=1 win vs Redis (x86 1.66×) | Only on pinned, disjoint cores; regression on shared cores |
+| `--io-busy-poll-us 40` | p=1 win vs Redis (x86 1.66×) | Full win on pinned, disjoint cores; auto-gates on shared cores (O3 contention governor) — safe to leave on |
 | Hash tags `{tenant}` | Removes cross-shard dispatch for MGET/MSET | Application key-design discipline |
 | NUMA pinning + `numa::system_parallelism()` | Avoids the pinned-thread parallelism trap | Never trust `available_parallelism()` from a pinned thread |
 | jemalloc decay tuning (baked `_rjem_malloc_conf`) | RSS returns to OS quickly | `--memory-arenas-cap` no-ops if operator env sets `_RJEM_MALLOC_CONF` |

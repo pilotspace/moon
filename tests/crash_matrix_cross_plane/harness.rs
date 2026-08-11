@@ -157,6 +157,22 @@ impl Drop for ServerGuard {
         } else {
             let _ = self.child.wait();
         }
+        // #365 diagnostic: the child is already reaped above, so ANY process
+        // still matching the dir marker is either a leaked respawn or a
+        // substring collision about to be collateral-killed. Log it before
+        // the backstop fires so a cross-test kill is provable, not a theory.
+        if let Ok(out) = Command::new("pgrep")
+            .args(["-fl"])
+            .arg(&self.dir_marker)
+            .output()
+            && !out.stdout.is_empty()
+        {
+            eprintln!(
+                "[ServerGuard] pkill backstop for marker {:?} will hit:\n{}",
+                self.dir_marker,
+                String::from_utf8_lossy(&out.stdout).trim_end()
+            );
+        }
         let _ = Command::new("pkill")
             .args(["-9", "-f"])
             .arg(&self.dir_marker)

@@ -1,6 +1,6 @@
 # Moon Product Roadmap — v0.7 → v1.0 → Enterprise
 
-**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.7.1 (2026-07-15, PR #336)
+**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.8.1 (2026-07-19)
 **Companion docs:** [Scale & HA architecture](scale-ha-architecture.md) · [Standalone horizontal scale](standalone-horizontal-scale.md)
 *(The commercial Enterprise Edition plan is maintained privately.)*
 
@@ -35,11 +35,18 @@ architecture with a unified WAL v3 log and 6-phase crash recovery.
 real WAIT/ACK, cold-tier TTL leak, ACL early-intercept hole, shardslice waiver (retired at
 v0.7.0), and the hygiene ledger. Remaining gaps below.)*
 
+*(2026-07-16 correction: this Rev 2 pass had re-listed "atomic-write stragglers (task #49)" as
+an open v0.8 gap below and as v0.8 item 1 in §4. Verified against the code during v0.8 close-out
+work: all 7 sites (ACL SAVE, nodes.conf, CONFIG REWRITE, replication state, native BGSAVE,
+clog, kv_page) were already converted to `atomic_write_durable` in PR #304 — merged 2026-07-13,
+*before* this Rev 2 pass, and its CHANGELOG entry landed under the v0.7.0 release section, not
+Unreleased. Task #49 was never actually an open v0.8 item; the row below and the item in §4 have
+been removed/struck accordingly.)*
+
 | Gap | Detail | Impact |
 |---|---|---|
 | **Streaming replica is single-shard only** | Multi-shard work in v0.7 is master-side (merged N-shard PSYNC feed); replicas run `--shards 1` | Disclosed v0.7 limitation; replica can't use thread-per-core — slotted v0.9 |
 | **Cluster mode is alpha, tokio-only** | Bus/gossip spawn only in the tokio startup block; monoio (production) startup omits it (`main.rs`) | Cluster mode does not run on the production runtime — slotted v0.9 |
-| Atomic-write stragglers (task #49) | 7 bare-write sites remain: **ACL SAVE has no atomicity**, nodes.conf, CONFIG REWRITE, repl state, native BGSAVE, clog/kv_page | Torn-file windows outside the kernel contract — v0.8 close-out |
 | `used_memory` accounting under offload (task #56) | Reports 406–762MB against a 256MB cap during 10×-RAM runs (worse post-restart) | Undermines the 10×-RAM claim's operator story — v0.8 close-out |
 | Spill format scale | One-file-per-key heap spill → O(keys) file counts; sweep/manifest scale with it | v0.8 close-out (batch into segments) |
 | No encryption at rest | WAL/AOF/RDB plaintext | Blocks regulated buyers — v0.10 |
@@ -175,7 +182,8 @@ deliberately aggressive but each release has a **single headline** and hard exit
 | ~~v0.6.1~~ | *folded into v0.7.0* | Hygiene + reliability hotfix | Shipped inside the v0.7.0 train (tag hygiene, TTL leak, ACL audit, doc reconciliation) |
 | **v0.7.0** | ✅ **shipped 2026-07-14** | **Replication GA for multi-shard masters** | The HA unblock; also absorbed storage-kernel M0–M4 |
 | **v0.7.1** | ✅ **shipped 2026-07-15** | SQ8 CPU-storm fix + deterministic replica TTL | Patch |
-| **v0.8.0** | 2026-08 | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
+| **v0.8.0** | ✅ **shipped 2026-07-16** | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
+| **v0.8.1** | ✅ **shipped 2026-07-19** | Deploy-safe busy-poll (O3 governor) + single-shard tuning preset; CPU-cache digest closed | Patch — folds the post-v0.8.0 perf/correctness train (#361–#392) + `conf/moon-standalone.conf` |
 | **v0.9.0** | 2026-10 | **Horizontal scale: cluster GA-hardened on monoio + multi-shard replicas** | Re-slotted from v0.8; adds the replica-side shard gap |
 | **v0.10.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem (re-slotted from v0.9) |
 | **v1.0.0** | 2027-Q1 | **GA / production contract fulfilled** | Stability promise, LTS |
@@ -195,26 +203,36 @@ MONITOR (R5), `moon://` URI implementation (R6 — spec doc H-7 shipped). v0.7.1
 master-side absolute-TTL rewrite + role-gated replica expiry (task #71b) and the SQ8/TQ
 CPU-error-storm fix (task #73).
 
-### v0.8.0 — One Storage Kernel GA (close-out + verification)
+### v0.8.0 — One Storage Kernel GA — SHIPPED (2026-07-16)
 
-Exit criterion: *the 42-cell cross-plane kill-9 crash matrix runs green in scheduled CI on both
-shard configs; the 10×-RAM acceptance re-passes on real disk with truthful `used_memory`; the
-benchmark report and PRODUCTION-CONTRACT rows are published.* The kernel itself is built — this
-release converts it into a verifiable public claim.
+Exit criterion (met): *the cross-plane kill-9 crash matrix (46 cells — grew from the 42 planned)
+runs green in scheduled CI on both shard configs; the 10×-RAM acceptance re-passes on real disk
+with truthful `used_memory`; the benchmark report and PRODUCTION-CONTRACT rows are published.*
+The kernel itself was built during the v0.7.0 cycle — this release converted it into a
+verifiable public claim.
 
-1. **Task #49 — atomic-write straggler sweep**: adopt `atomic_write_durable` at the 7 remaining
-   bare-write sites (ACL SAVE — worst, no atomicity today —, nodes.conf, CONFIG REWRITE,
-   replication state, native BGSAVE, clog/kv_page).
-2. **Task #56 — `used_memory` truth under offload**: reconcile accounting so a 256MB-cap
-   10×-RAM run reports ≤ cap (or documents exactly what the overage is); fix the post-restart
-   regression.
-3. **Spill-file batching**: one-file-per-key heap spill → segment files (≤N keys/file already
-   exists for batches; make it the only shape), shrinking orphan-sweep and manifest scale.
-4. **Crash-matrix CI**: wire `tests/crash_matrix_cross_plane.rs` (+ `MOON_CRASH_MATRIX_ITERS`
-   soak) into a scheduled workflow; confirmation run proving all former RED cells stay green.
-5. **G2 re-run on real disk** (post-#323 async cold-read fix): re-measure the cold-GET-during-
-   spill tail that previously hit 1.91s; publish the 10×-RAM benchmark report.
-6. PRODUCTION-CONTRACT: tick CRASH-02 / MEM-10X rows with evidence links.
+1. ~~**Task #49 — atomic-write straggler sweep**~~: ✅ already shipped (PR #304, merged
+   2026-07-13, released as part of v0.7.0) — all 7 bare-write sites (ACL SAVE, nodes.conf,
+   CONFIG REWRITE, replication state, native BGSAVE, clog, kv_page) route through
+   `atomic_write_durable`. Verified against HEAD during v0.8 close-out (2026-07-16): no
+   regression, no new bare-write site introduced since (roadmap correction PR #347).
+2. ~~**Task #56 — `used_memory` truth under offload**~~: ✅ PR #349 — logical ledger replaces
+   RSS; 256MB-cap 10×-RAM run reports exactly 1.00× cap steady-state; post-restart transient
+   (AOF-replay re-heat) drains to < cap in ≤5s (demote pass + eviction), documented in
+   `docs/guides/monitoring.md`.
+3. ~~**Spill-file batching**~~: ✅ PR #350 — segment files are the only spill shape; the G2
+   dataset produces 840 files instead of ~236K, and file count is out of the restart path.
+4. ~~**Crash-matrix CI**~~: ✅ PR #352 — `.github/workflows/crash-matrix.yml` (nightly full
+   matrix 03:17 UTC + Saturday `ITERS=20` soak + dispatch); 46 cells green ungated (zero
+   `red_guard` sites); both modes re-run green on the RC as the tag gate.
+5. ~~**G2 re-run on real disk**~~: ✅ published as `docs/perf/2026-07-16-g2-10x-ram-rerun.md`
+   (PR #356) — cold-GET-during-spill tail 1,910ms → 205ms (task #59 stays open for sub-10ms).
+6. ~~PRODUCTION-CONTRACT~~: ✅ CRASH-02 / MEM-10X-01 rows ticked with evidence links.
+
+Also shipped in the train: vector GraphUnion auto-merge CPU-livelock fix (PR #353) and CI
+hygiene (recall canaries → nightly job, PR #354). Disclosed follow-ups: task #59
+(read-vs-spill fairness), issue #355 (`DBSIZE` resident-only under offload), AOF-rewrite
+cadence bounds restart time.
 
 ### v0.9.0 — Horizontal scale: cluster hardening + multi-shard replicas
 
@@ -269,7 +287,7 @@ Exit criterion: *a security-conscious enterprise can run Moon and pass an infose
 |---|---|---|
 | ~~shardslice cross-shard-read waiver~~ | ✅ retired at v0.7.0 (L4 validated, PR #325) | done |
 | ~~v0.6.0 tag + RELEASES.md · PRODUCTION-CONTRACT refresh · cold-tier TTL leak · ACL registry bypass · doc contradictions~~ | ✅ closed in the v0.6.1/v0.7.0 cycle | done |
-| Task #49 bare-write sites (ACL SAVE et al.) | v0.8 | atomic-write sweep (v0.8 item 1) |
+| ~~Task #49 bare-write sites (ACL SAVE et al.)~~ | ✅ shipped v0.7.0 (PR #304, merged 2026-07-13) | done — mis-listed as open in Rev 2, corrected 2026-07-16 |
 | Task #56 `used_memory` under offload | v0.8 | accounting reconcile (v0.8 item 2) |
 | Spill one-file-per-key scale | v0.8 | segment batching (v0.8 item 3) |
 | rustls-pemfile → rustls-pki-types (task #66, RUSTSEC ignore) | in flight 2026-07-15 | Wave-0 PR |

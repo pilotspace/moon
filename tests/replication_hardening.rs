@@ -8,14 +8,16 @@
 //! ./target/release/moon (⚠ on a shared macOS/Linux checkout the default may
 //! be the other platform's binary; always pin MOON_BIN, repo harness rule).
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-fn moon_bin() -> String {
-    std::env::var("MOON_BIN").unwrap_or_else(|_| "./target/release/moon".to_string())
+fn moon_bin() -> std::path::PathBuf {
+    common::find_moon_binary()
 }
 
 fn start_moon(port: u16, dir: &str, extra: &[&str]) -> Guard {

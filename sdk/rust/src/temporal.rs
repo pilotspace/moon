@@ -7,7 +7,7 @@ use crate::error::Result;
 ///
 /// Obtain via [`MoonClient::temporal`](crate::MoonClient::temporal).
 pub struct TemporalClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl TemporalClient {

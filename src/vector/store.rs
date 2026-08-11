@@ -349,6 +349,55 @@ pub struct VectorIndex {
     /// Mutual exclusion with `bg_compact_inflight`: only one of the two may be
     /// `Some` at a time (both begin_* methods enforce this).
     bg_merge_inflight: Option<InFlightMerge>,
+    /// Backoff state after a rejected unattended merge (recall gate, memory
+    /// ceiling, worker error). `None` = no recent failure. Guards against the
+    /// merge CPU livelock: a rejection keeps the source segments, so every
+    /// `needs_merge` trigger condition stays true and, without this, the next
+    /// autovacuum tick resubmits the identical doomed merge — each attempt
+    /// building and discarding a full union HNSW graph, forever.
+    merge_backoff: Option<MergeBackoff>,
+}
+
+/// See [`VectorIndex::merge_backoff`].
+struct MergeBackoff {
+    /// Identity fingerprint (xxh64 over the source `Arc` pointers, in list
+    /// order) of the segment set whose merge was rejected. Pointer identity is
+    /// the same notion `poll_install_merge` uses for its defensive install
+    /// check (`Arc::ptr_eq`), so any real change to the set — compaction
+    /// appending a segment, a warm-tier transition, an installed merge —
+    /// yields a different fingerprint. (A freed-then-reallocated `Arc` could
+    /// theoretically collide; the only consequence is a merge delayed by one
+    /// backoff window.)
+    fingerprint: u64,
+    /// Consecutive rejections for this fingerprint.
+    failures: u32,
+    /// Do not re-dispatch an unattended merge of the same set before this.
+    /// Manual `FT.COMPACT` (force_merge) is unaffected.
+    retry_after: std::time::Instant,
+}
+
+/// Exponential backoff for rejected unattended merges: 60s base, doubling per
+/// consecutive failure, capped at 1h. The expensive rejection mode (recall
+/// gate) only fires after a full union build, so even the 60s floor cuts the
+/// worst-case waste to one discarded build per minute instead of back-to-back.
+fn merge_backoff_duration(failures: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 60;
+    const CAP_SECS: u64 = 3600;
+    let shift = failures.saturating_sub(1).min(6);
+    std::time::Duration::from_secs((BASE_SECS << shift).min(CAP_SECS))
+}
+
+/// Fingerprint of an immutable-segment set by `Arc` pointer identity.
+fn segment_set_fingerprint(
+    segs: &[Arc<crate::vector::segment::immutable::ImmutableSegment>],
+) -> u64 {
+    let mut buf = [0u8; 8];
+    let mut h = xxhash_rust::xxh64::xxh64(&(segs.len() as u64).to_le_bytes(), 0);
+    for s in segs {
+        buf.copy_from_slice(&(Arc::as_ptr(s) as usize as u64).to_le_bytes());
+        h = xxhash_rust::xxh64::xxh64(&buf, h);
+    }
+    h
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -874,7 +923,17 @@ impl VectorIndex {
                 });
                 true
             }
-            Err(_) => false, // worker queue full — retry next tick
+            Err(e) => {
+                // F4: leave a correlatable trail for a submit loop that never
+                // drains (WorkersBusy also masks a dead pool). Debug level —
+                // benign momentary saturation would spam warn per tick.
+                tracing::debug!(
+                    error = ?e,
+                    mutable_len,
+                    "vector background-compact submit deferred; retry next tick"
+                );
+                false
+            }
         }
     }
 
@@ -942,6 +1001,15 @@ impl VectorIndex {
             Err(flume::TryRecvError::Empty) => return false,
             Err(flume::TryRecvError::Disconnected) => {
                 // Worker panicked or dropped — clear inflight and give up.
+                // F4 (deep review): this used to be silent, so a dead worker
+                // pool meant a permanent compact stall (mutable segment
+                // growing past COMPACT_THRESHOLD, searches degrading to
+                // brute force) with nothing for the operator to correlate.
+                tracing::error!(
+                    "vector background-compact worker died (panic or pool teardown); \
+                     compaction will be resubmitted but may stall permanently — \
+                     mutable segment growth and search latency will degrade"
+                );
                 self.bg_compact_inflight = None;
                 return false;
             }
@@ -952,7 +1020,17 @@ impl VectorIndex {
 
         let mut immutable = match result {
             Ok(imm) => imm,
-            Err(_) => return false, // compaction failed — drop, retry later
+            Err(e) => {
+                // F4: compaction failure (e.g. the B2 disk persist of the
+                // built segment on a full disk) retries next tick — say so
+                // instead of looping silently forever.
+                tracing::warn!(
+                    error = %e,
+                    frozen_len = inflight.frozen_len,
+                    "vector background compaction failed; will retry next tick"
+                );
+                return false;
+            }
         };
 
         // ── Reconciliation ────────────────────────────────────────────────────
@@ -996,26 +1074,32 @@ impl VectorIndex {
 
     /// True when this index satisfies any auto-merge trigger condition:
     /// - `merge_mode != None`
-    /// - AND: `imm_count > MERGE_SEGMENT_THRESHOLD` OR (any segment has >20%
-    ///   dead entries AND all live vectors fit within the memory ceiling).
+    /// - AND all live vectors fit within the merge memory ceiling
+    /// - AND: `imm_count > MERGE_SEGMENT_THRESHOLD` OR any segment has >20%
+    ///   dead entries.
+    ///
+    /// The ceiling applies to BOTH triggers: `merge_immutable` refuses a
+    /// union over `MERGE_MEMORY_CEILING` regardless of why it was dispatched,
+    /// so a count trigger that ignored the ceiling would re-dispatch a merge
+    /// that can never succeed on every tick (see [`Self::merge_backoff`] for
+    /// the second line of defense).
     fn needs_merge(&self) -> bool {
         if self.meta.merge_mode == MergeMode::None {
             return false;
         }
         let snap = self.segments.load();
         let imm_count = snap.immutable.len();
-        if imm_count > compaction::MERGE_SEGMENT_THRESHOLD {
-            return true;
+        let count_trigger = imm_count > compaction::MERGE_SEGMENT_THRESHOLD;
+        let vacuum_trigger = snap.immutable.iter().any(|s| compaction::needs_vacuum(s));
+        if !count_trigger && !vacuum_trigger {
+            return false;
         }
-        if snap.immutable.iter().any(|s| compaction::needs_vacuum(s)) {
-            let live_bytes: usize = snap
-                .immutable
-                .iter()
-                .map(|s| s.live_count() as usize * self.collection.bytes_per_code_per_vector())
-                .sum();
-            return live_bytes < compaction::MERGE_MEMORY_CEILING;
-        }
-        false
+        let live_bytes: usize = snap
+            .immutable
+            .iter()
+            .map(|s| s.live_count() as usize * self.collection.bytes_per_code_per_vector())
+            .sum();
+        live_bytes < compaction::MERGE_MEMORY_CEILING
     }
 
     /// Dispatch a background merge for the default field's immutable segments.
@@ -1084,7 +1168,8 @@ impl VectorIndex {
     }
 
     /// Threshold-gated wrapper over [`begin_background_merge`]: only dispatches
-    /// when [`needs_merge`] returns `true`.
+    /// when [`needs_merge`] returns `true` and the segment set is not in a
+    /// rejected-merge backoff window (see [`Self::merge_backoff`]).
     ///
     /// Non-blocking. Returns `true` if a job was submitted.
     pub fn begin_background_merge_due(
@@ -1094,7 +1179,28 @@ impl VectorIndex {
         if !self.needs_merge() {
             return false;
         }
+        // Rejected-merge backoff: skip only while BOTH the segment set is
+        // unchanged since the rejection AND the window hasn't elapsed. Any
+        // set change (compaction, warm-tier transition, installed merge)
+        // invalidates the doomed-merge assumption immediately.
+        if let Some(b) = &self.merge_backoff {
+            let current = segment_set_fingerprint(&self.segments.load().immutable);
+            if current == b.fingerprint {
+                if std::time::Instant::now() < b.retry_after {
+                    return false;
+                }
+            } else {
+                self.merge_backoff = None;
+            }
+        }
         self.begin_background_merge(compactor)
+    }
+
+    /// Drop any rejected-merge backoff. Called when an operator changes
+    /// `MERGE_RECALL_TOLERANCE` via FT.CONFIG SET — they just changed the very
+    /// parameter the gate fired on, so the next tick should try again.
+    pub fn clear_merge_backoff(&mut self) {
+        self.merge_backoff = None;
     }
 
     /// Poll for a completed background merge and install the result.
@@ -1143,8 +1249,34 @@ impl VectorIndex {
             Ok(imm) => imm,
             Err(e) => {
                 // Recall gate fired or empty / memory ceiling exceeded.
-                // Keep the N source segments unchanged — merge simply didn't happen.
-                tracing::debug!(error = %e, "bg merge skipped (recall gate or ceiling)");
+                // Keep the N source segments unchanged — merge simply didn't
+                // happen. Every needs_merge trigger condition therefore stays
+                // true: without a backoff the next autovacuum tick resubmits
+                // the identical doomed merge, and each recall-gate rejection
+                // costs a full (discarded) union HNSW build — a quiet CPU
+                // livelock that pins the vec-compact workers indefinitely.
+                let fingerprint = segment_set_fingerprint(&inflight.merged_sources);
+                let failures = match &self.merge_backoff {
+                    Some(b) if b.fingerprint == fingerprint => b.failures.saturating_add(1),
+                    _ => 1,
+                };
+                let backoff = merge_backoff_duration(failures);
+                self.merge_backoff = Some(MergeBackoff {
+                    fingerprint,
+                    failures,
+                    retry_after: std::time::Instant::now() + backoff,
+                });
+                // warn, not debug: this can otherwise burn cores invisibly at
+                // the default log level. Naturally rate-limited to once per
+                // backoff window (≥60s).
+                tracing::warn!(
+                    error = %e,
+                    sources = inflight.merged_sources.len(),
+                    consecutive_failures = failures,
+                    backoff_secs = backoff.as_secs(),
+                    "bg merge rejected; backing off — raise MERGE_RECALL_TOLERANCE \
+                     via FT.CONFIG or reduce segment churn if this repeats"
+                );
                 return false;
             }
         };
@@ -1222,6 +1354,9 @@ impl VectorIndex {
         };
         drop(snap);
         self.segments.swap(new_list);
+        // A successful install changes the segment set, so any backoff
+        // fingerprint is stale — drop it eagerly.
+        self.merge_backoff = None;
         // B2 (durability): the worker already wrote the merged segment to
         // disk (if `alloc_persist_target` handed it a target at submit
         // time) — commit the keymap/manifest snapshot now that the install
@@ -1761,6 +1896,7 @@ impl VectorStore {
                 sparse_stores: HashMap::new(),
                 bg_compact_inflight: None,
                 bg_merge_inflight: None,
+                merge_backoff: None,
             },
         );
 
@@ -1889,6 +2025,7 @@ impl VectorStore {
                 sparse_stores: HashMap::new(),
                 bg_compact_inflight: None,
                 bg_merge_inflight: None,
+                merge_backoff: None,
             },
         );
 
@@ -1919,6 +2056,9 @@ impl VectorStore {
         let spawned = std::thread::Builder::new()
             .name("moon-vec-idx-gc".to_owned())
             .spawn(move || {
+                // O5: spawned from the owning (pinned) shard thread —
+                // escape the inherited single-core mask.
+                crate::shard::numa::pin_current_aux_thread("moon-vec-idx-gc");
                 if let Err(e) = std::fs::remove_dir_all(&idx_dir) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(
@@ -2746,33 +2886,13 @@ impl VectorStore {
             .map(|idx| idx.segments.load().immutable.len())
     }
 
-    /// True if the named index satisfies any auto-merge trigger condition:
-    /// - immutable segment count > MERGE_SEGMENT_THRESHOLD (16), OR
-    /// - dead_fraction > 0.20 across any segment AND live vectors fit in 512 MB
+    /// True if the named index satisfies any auto-merge trigger condition —
+    /// same logic as [`VectorIndex::needs_merge`] (count OR dead-fraction
+    /// trigger, both gated by the merge memory ceiling).
     ///
     /// Returns None if the index does not exist.
     pub fn needs_merge(&self, name: &[u8]) -> Option<bool> {
-        let idx = self.indexes.get(name)?;
-        if idx.meta.merge_mode == MergeMode::None {
-            return Some(false);
-        }
-        let snap = idx.segments.load();
-        let imm_count = snap.immutable.len();
-        if imm_count > compaction::MERGE_SEGMENT_THRESHOLD {
-            return Some(true);
-        }
-        // Dead-fraction trigger: any segment with >20% dead AND fits in 512 MB.
-        let has_high_dead = snap.immutable.iter().any(|s| compaction::needs_vacuum(s));
-        if has_high_dead {
-            let live_bytes: usize = snap
-                .immutable
-                .iter()
-                .map(|s| s.live_count() as usize * idx.collection.bytes_per_code_per_vector())
-                .sum();
-            let fits = live_bytes < compaction::MERGE_MEMORY_CEILING;
-            return Some(fits);
-        }
-        Some(false)
+        self.indexes.get(name).map(|idx| idx.needs_merge())
     }
 
     /// Force-compact the mutable segment of a named index into a new immutable segment.
@@ -4032,7 +4152,7 @@ mod bg_compact_tests {
             store.begin_background_compactions(&compactor);
             poll_until_installed(&mut store, 400);
             let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
-            if idx.segments.load().mutable.len() == 0 {
+            if idx.segments.load().mutable.is_empty() {
                 break;
             }
         }
@@ -4215,7 +4335,7 @@ mod bg_compact_tests {
         // Concurrency: a serial (1-worker) run would take ≈ K × single. A
         // K-worker pool should stay well under `K × single × 0.6`. Generous
         // margin avoids flakiness; only a genuinely non-parallel pool fails.
-        if cores >= K + 1 {
+        if cores > K {
             assert!(
                 parallel.as_secs_f64() < single.as_secs_f64() * (K as f64) * 0.6,
                 "K-worker pool not parallelizing: single={single:?}, parallel(K={K})={parallel:?}"
@@ -4721,6 +4841,161 @@ mod bg_compact_tests {
             count, 1,
             "key_x must appear exactly once after merge dedup (got {count})"
         );
+    }
+
+    // ── Merge backoff tests (CPU-livelock guard, 2026-07-16) ─────────────────
+
+    /// Build `n` immutable segments of 3 tiny vectors each.
+    fn build_n_segments(store: &mut VectorStore, n: usize) {
+        for seg in 0..n {
+            for i in 0..3usize {
+                let key = format!("s{seg}d{i}");
+                insert(store, key.as_bytes(), random_vec(64, (seg * 3 + i) as u64));
+            }
+            store.force_compact_index(b"idx").unwrap();
+        }
+    }
+
+    /// Drive poll_install_merge until the in-flight merge reply is consumed
+    /// (installed OR rejected), or `max_iters` elapse.
+    fn drain_inflight_merge(store: &mut VectorStore, max_iters: usize) {
+        for _ in 0..max_iters {
+            let idx = store.get_index_mut(b"idx").unwrap();
+            idx.poll_install_merge();
+            if idx.bg_merge_inflight.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("merge worker reply never arrived");
+    }
+
+    /// A gate-failed unattended merge must NOT be re-dispatched immediately
+    /// for the same segment set: `needs_merge` stays true after a recall-gate
+    /// rejection (the sources are kept), so without a backoff the autovacuum
+    /// tick resubmits the identical doomed merge every pass — each attempt
+    /// builds (and discards) a full union HNSW graph. Observed in production
+    /// as `moon-vec-compact-*` workers pinning ~3 cores indefinitely.
+    #[test]
+    fn bg_merge_gate_failure_backs_off() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        // 17 immutable segments → needs_merge() count trigger (> 16).
+        build_n_segments(&mut store, 17);
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        // Unreachable tolerance (recall ≤ 1.0) → RecallTooLow, deterministically.
+        // Set directly: FT.CONFIG clamps to 0.0..=1.0, where real data could
+        // legitimately pass the gate and flake this test.
+        idx.merge_recall_tolerance = 2.0;
+        assert!(idx.needs_merge(), "count trigger must fire (17 > 16)");
+        assert!(
+            idx.begin_background_merge_due(&compactor),
+            "first dispatch goes through"
+        );
+
+        drain_inflight_merge(&mut store, 500);
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        assert_eq!(
+            idx.segments.load().immutable.len(),
+            17,
+            "gate-failed merge must keep sources unchanged"
+        );
+        assert!(
+            idx.needs_merge(),
+            "trigger condition itself remains true after the failure"
+        );
+        assert!(
+            !idx.begin_background_merge_due(&compactor),
+            "identical gate-failed merge re-dispatched immediately — CPU livelock"
+        );
+    }
+
+    /// The backoff is fingerprinted to the exact source segment set: when the
+    /// set changes (new segment compacted in, warm-tier transition, deletes),
+    /// the doomed-merge assumption no longer holds and dispatch must resume
+    /// immediately.
+    #[test]
+    fn bg_merge_backoff_clears_on_segment_set_change() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        build_n_segments(&mut store, 17);
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        idx.merge_recall_tolerance = 2.0;
+        assert!(idx.begin_background_merge_due(&compactor));
+        drain_inflight_merge(&mut store, 500);
+        {
+            let idx = store.get_index_mut(b"idx").unwrap();
+            assert!(
+                !idx.begin_background_merge_due(&compactor),
+                "backoff active for the failed set"
+            );
+        }
+
+        // Grow the segment set — fingerprint changes.
+        build_n_segments(&mut store, 1);
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        assert!(
+            idx.begin_background_merge_due(&compactor),
+            "changed segment set must clear the backoff and dispatch"
+        );
+        drain_inflight_merge(&mut store, 500);
+    }
+
+    /// Operator intervention via FT.CONFIG SET MERGE_RECALL_TOLERANCE clears
+    /// the backoff: the operator just changed the very parameter the gate
+    /// fired on, so the next tick should try again with the new tolerance.
+    #[test]
+    fn bg_merge_backoff_clears_on_tolerance_change() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        build_n_segments(&mut store, 17);
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        idx.merge_recall_tolerance = 2.0;
+        assert!(idx.begin_background_merge_due(&compactor));
+        drain_inflight_merge(&mut store, 500);
+        {
+            let idx = store.get_index_mut(b"idx").unwrap();
+            assert!(!idx.begin_background_merge_due(&compactor));
+        }
+
+        // What the FT.CONFIG SET MERGE_RECALL_TOLERANCE handler calls.
+        let idx = store.get_index_mut(b"idx").unwrap();
+        idx.merge_recall_tolerance = 0.0;
+        idx.clear_merge_backoff();
+        assert!(
+            idx.begin_background_merge_due(&compactor),
+            "tolerance change must clear the backoff"
+        );
+        // Tolerance 0.0 always passes the gate — merge installs.
+        assert!(poll_until_merged(&mut store, 500), "merge must install");
+        let snap = store.get_index(b"idx").unwrap().segments.load();
+        assert_eq!(snap.immutable.len(), 1, "17 segments merged into one");
+    }
+
+    /// Exponential schedule: 60s base, doubling, capped at 1h.
+    #[test]
+    fn bg_merge_backoff_schedule() {
+        use std::time::Duration;
+        assert_eq!(merge_backoff_duration(1), Duration::from_secs(60));
+        assert_eq!(merge_backoff_duration(2), Duration::from_secs(120));
+        assert_eq!(merge_backoff_duration(3), Duration::from_secs(240));
+        assert_eq!(merge_backoff_duration(7), Duration::from_secs(3600));
+        assert_eq!(merge_backoff_duration(30), Duration::from_secs(3600));
+        assert_eq!(merge_backoff_duration(u32::MAX), Duration::from_secs(3600));
     }
 
     /// A key UPDATED across segments must survive a merge: old copy in seg1
