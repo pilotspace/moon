@@ -45,6 +45,52 @@ pub fn legacy_driver_forced() -> bool {
         || std::env::var_os("MOON_NO_URING").is_some()
 }
 
+/// Process-wide io_uring SQ-entries override (`--uring-entries N`), set ONCE
+/// from main BEFORE any shard thread spawns — same contract as
+/// [`force_legacy_driver`]. 0 = unset (monoio's default 1024). Also sizes the
+/// legacy driver's mio event batch.
+static URING_ENTRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// monoio's `RuntimeBuilder::with_entries` floor; values below are raised so
+/// the operator-visible behavior matches what the ring actually gets.
+pub const MIN_URING_ENTRIES: u32 = 256;
+
+/// Set the per-shard ring size. Values below [`MIN_URING_ENTRIES`] are clamped
+/// up (mirrors monoio's internal floor). Call before shard threads spawn.
+pub fn set_uring_entries(entries: u32) {
+    URING_ENTRIES.store(
+        entries.max(MIN_URING_ENTRIES),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The configured ring size, or `None` when the operator left the default.
+pub fn uring_entries() -> Option<u32> {
+    match URING_ENTRIES.load(std::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// c1M P1: stage-2 idle task-parking threshold (`--conn-park-secs`), in ms.
+/// 0 = task parking disabled. Set once from main BEFORE shard threads spawn
+/// (same contract as [`set_uring_entries`]); read by the monoio idle-park
+/// sweep and stage-2 read arm.
+static CONN_PARK_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60_000);
+
+/// Configure the task-parking threshold from `--conn-park-secs`.
+pub fn set_conn_park_secs(secs: u64) {
+    CONN_PARK_AFTER_MS.store(
+        secs.saturating_mul(1000),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Current task-parking threshold in ms; 0 = disabled.
+pub fn conn_park_after_ms() -> u64 {
+    CONN_PARK_AFTER_MS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// True when the epoll busy-poll park is configured — via the
 /// `--io-busy-poll-us` flag (the caller passes the config value) or the
 /// `MOON_EPOLL_SPIN_US` env fallback the vendored driver also honors. Gates
@@ -410,3 +456,21 @@ pub type RuntimeFactoryImpl = TokioRuntimeFactory;
 
 #[cfg(feature = "runtime-monoio")]
 pub type RuntimeFactoryImpl = MonoioRuntimeFactory;
+
+#[cfg(test)]
+mod uring_entries_tests {
+    // Shared process-global: run assertions in one test to avoid ordering
+    // races between parallel test threads.
+    #[test]
+    fn uring_entries_default_set_and_clamp() {
+        assert_eq!(super::uring_entries(), None, "unset must read as None");
+        super::set_uring_entries(4096);
+        assert_eq!(super::uring_entries(), Some(4096));
+        super::set_uring_entries(64);
+        assert_eq!(
+            super::uring_entries(),
+            Some(super::MIN_URING_ENTRIES),
+            "sub-floor values clamp up to monoio's minimum"
+        );
+    }
+}

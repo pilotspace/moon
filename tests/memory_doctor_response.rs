@@ -23,21 +23,27 @@ fn redis_cli_available() -> bool {
 }
 
 fn release_binary() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    // MOON_BIN-aware: the bare target/release/moon fallback is a stale-binary
+    // trap on shared checkouts (an OrbStack VM exec's a host Mach-O via proxy
+    // and the server never accepts in-VM — 30s spawn_listening timeout).
+    common::find_moon_binary()
 }
 
 /// Running moon instance. Auto-killed on drop.
 struct Moon {
     child: Child,
     port: u16,
-    tmp_dir: std::path::PathBuf,
+    /// RAII tempdir (test-hygiene sweep): random unique name, removed on
+    /// drop (after the child is killed in `Drop` above the field drop).
+    /// The old pid-only name resurrected stale dirs after a crashed run
+    /// once the pid was reused, reloading stale persistence state.
+    _tmp_dir: tempfile::TempDir,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
@@ -54,8 +60,7 @@ fn spawn_moon() -> Option<Moon> {
         );
         return None;
     }
-    let tmp_dir = std::env::temp_dir().join(format!("moon-test-doctor-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
     let (child, port) = common::spawn_listening(|port| {
         Command::new(&bin)
             .args([
@@ -68,7 +73,7 @@ fn spawn_moon() -> Option<Moon> {
                 "--appendonly",
                 "no",
                 "--dir",
-                tmp_dir.to_str().unwrap(),
+                tmp_dir.path().to_str().unwrap(),
                 "--disk-offload",
                 "disable",
             ])
@@ -80,7 +85,7 @@ fn spawn_moon() -> Option<Moon> {
     let moon = Moon {
         child,
         port,
-        tmp_dir,
+        _tmp_dir: tmp_dir,
     };
 
     // Wait up to ~5s for PING to succeed.

@@ -36,6 +36,31 @@ use super::shared_databases::ShardDatabases;
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
+/// F1 (#438): ceiling on the graceful-shutdown connection drain. Normal
+/// drains finish in single-digit milliseconds (parked reads wake instantly,
+/// in-flight batches are already bounded by the C1 write timeout); the
+/// ceiling exists so a wedged peer — zero-window reader with
+/// `client_write_timeout_ms 0`, or a hung cross-shard leg — cannot hold up
+/// process shutdown. On expiry the remaining tasks are dropped, which is
+/// exactly the pre-F1 behaviour for every task.
+const SHUTDOWN_DRAIN_MAX: Duration = Duration::from_secs(5);
+
+/// c10k hardening B4: may the experimental io_uring bridge be armed?
+///
+/// The bridge binds a SECOND `SO_REUSEPORT` listener on the server's own port
+/// and dispatches commands from its own accept path — one with no auth gate,
+/// no ACL check and no client registry. On a server that has configured
+/// authentication the kernel would then load-balance new connections between
+/// a listener that enforces auth and one that does not. Answer `false` there
+/// and stay on the pure-tokio path.
+///
+/// Free function (not `cfg`-gated like its only call site) so the rule is
+/// unit-testable on every platform and under both runtimes.
+#[allow(dead_code)] // Called only under cfg(linux + runtime-tokio); tests use it everywhere.
+pub(crate) fn uring_bridge_allowed(config: &crate::config::ServerConfig) -> bool {
+    config.requirepass.is_none() && config.aclfile.is_none()
+}
+
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
@@ -60,7 +85,7 @@ impl super::Shard {
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
         snapshot_trigger_tx: channel::WatchSender<u64>,
         repl_state_ext: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-        cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
+        cluster_state: Option<std::sync::Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
         acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
@@ -104,6 +129,28 @@ impl super::Shard {
                     self.id
                 );
                 None
+            } else if !uring_bridge_allowed(&server_config) {
+                // c10k hardening B4. The bridge's own accept path
+                // (`uring_handler`) dispatches commands directly — it has no
+                // auth gate, no ACL check and no client registry. On a server
+                // that HAS configured authentication it therefore binds a
+                // second SO_REUSEPORT socket on the very same port that serves
+                // every command unauthenticated: the kernel load-balances new
+                // connections between the two listeners, so roughly half of
+                // them skip auth entirely. The documented limitation named
+                // maxclients and CLIENT LIST/KILL, not this.
+                //
+                // Refusing to arm is the fail-closed answer and leaves the
+                // shard on the stable pure-tokio path (which does enforce
+                // auth), rather than killing a server over an experimental
+                // opt-in.
+                tracing::error!(
+                    "Shard {} REFUSING io_uring bridge: MOON_URING=1 with requirepass/aclfile \
+                     configured would serve unauthenticated commands on the same port. \
+                     Falling back to tokio I/O; unset MOON_URING or remove auth to use it.",
+                    self.id
+                );
+                None
             } else {
                 match UringDriver::new(UringConfig {
                     sqpoll_idle_ms: server_config.uring_sqpoll_ms,
@@ -112,6 +159,16 @@ impl super::Shard {
                     Ok(mut d) => match d.init() {
                         Ok(()) => {
                             info!("Shard {} started (io_uring mode)", self.id);
+                            // c10k T3: known limitation, stated loudly — bridge
+                            // connections bypass maxclients AND the client
+                            // registry (CLIENT LIST/KILL blind); capacity is
+                            // bounded only by the driver's FdTable.
+                            tracing::warn!(
+                                "Shard {} io_uring bridge: connections accepted here bypass \
+                                 maxclients and CLIENT LIST/KILL (experimental path; see \
+                                 .planning/rfcs/c1m-connection-plane.md)",
+                                self.id
+                            );
                             Some(d)
                         }
                         Err(e) => {
@@ -629,6 +686,14 @@ impl super::Shard {
             } else {
                 None
             };
+        // Task #59: manifest commit fsyncs measured up to 1.0s each on this
+        // event-loop thread under spill flood (every connection on the shard
+        // stalls behind them). Move the file-I/O half onto the per-shard
+        // manifest-sync thread: durable commits keep their blocking ack,
+        // spill-completion commits become deferred sends.
+        if let Some(ref mut m) = shard_manifest {
+            m.enable_deferred_sync(shard_id);
+        }
         // Task #55: background reclaim of crash-orphaned heap files that
         // recovery only CLASSIFIED (see `Shard::restore_from_persistence` /
         // `persistence::recovery::recover_shard_v3_pitr`). Classification is
@@ -658,6 +723,13 @@ impl super::Shard {
                 std::thread::Builder::new()
                     .name(format!("moon-heap-orphan-sweep-{shard_id}"))
                     .spawn(move || {
+                        // O5: spawned from the pinned shard thread — escape
+                        // the inherited single-core mask (this sweep can run
+                        // ~40s of I/O; on the shard's own core it would
+                        // contend with command processing the whole time).
+                        crate::shard::numa::pin_current_aux_thread(&format!(
+                            "moon-heap-orphan-sweep-{shard_id}"
+                        ));
                         for path in &pending_heap_orphans {
                             crate::storage::tiered::kv_spill::remove_orphan_heap_file(path);
                         }
@@ -756,7 +828,28 @@ impl super::Shard {
             .map(|rs| rs.read().is_replica_mirror.clone());
 
         // Track last seen snapshot epoch to detect watch channel triggers
-        let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
+        // Test-only fault injection: delay every non-zero shard's loop start so
+        // integration tests can deterministically exercise the startup window
+        // where the listener already answers (fastest shard up) while other
+        // shards are still here. Used by tests/bgsave_startup_race.rs; never
+        // set in production.
+        if shard_id != 0
+            && let Ok(ms) = std::env::var("MOON_TEST_SLOW_SHARD_START_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        // Start the cursor at 0, NOT at the watch channel's current value: the
+        // listener accepts clients as soon as the fastest shard is up, so a
+        // BGSAVE (or auto-save) can broadcast epoch N while a slower shard is
+        // still in this setup code. Seeding the cursor with borrow() would
+        // swallow that pending trigger — this shard never snapshots, the
+        // BGSAVE_SHARDS_REMAINING counter never reaches zero, and every later
+        // BGSAVE reports "already in progress" forever (observed as the
+        // 20s-stuck `rdb_bgsave_in_progress:1` crash-matrix flake; the race
+        // reproduces deterministically with a delayed shard start). Epochs are
+        // per-process and start at 0, so 0 is always a safe "nothing seen yet".
+        let mut last_snapshot_epoch = 0u64;
 
         // Sub-timer intervals: tokio uses separate select! branches for each.
         // monoio uses counter-based dispatch from a single periodic tick to avoid
@@ -837,6 +930,20 @@ impl super::Shard {
         // Each sub-timer fires at its native interval via modular arithmetic.
         #[cfg(feature = "runtime-monoio")]
         let mut monoio_tick_counter: u64 = 0;
+        // #373 phase 2: adaptive idle park. After a proven-quiet streak the
+        // periodic park stretches 1ms -> IDLE_PARK_MS (10ms), stepping the
+        // counter by 10 from an aligned boundary so every counter-based
+        // cadence below (all multiples of 10) still fires exactly on time.
+        #[cfg(feature = "runtime-monoio")]
+        let mut idle_park = crate::shard::idle_park::IdleParkState::new();
+        // O3: adaptive busy-poll contention governor. Only constructed when a
+        // spin budget is actually configured — otherwise there is nothing to
+        // gate and the 1s /proc read would be pure waste.
+        #[cfg(feature = "runtime-monoio")]
+        let mut spin_governor: Option<crate::shard::spin_governor::SpinGovernor> =
+            (crate::runtime::epoll_spin_configured(server_config.io_busy_poll_us)
+                && crate::shard::spin_governor::adaptive_enabled())
+            .then(crate::shard::spin_governor::SpinGovernor::new);
         // Used by tokio select! for event-driven SPSC drain; monoio drains in periodic tick.
         let spsc_notify_local = spsc_notify;
         #[cfg(feature = "runtime-monoio")]
@@ -892,8 +999,11 @@ impl super::Shard {
         let cached_clock = CachedClock::new();
 
         // Pending FD migrations collected from SPSC drain (spawn wired in Plan 50-02).
+        // F4 (#438): the fd is an OwnedFd — entries still queued when the event
+        // loop exits (shutdown) drop here and CLOSE their sockets, giving the
+        // client a FIN instead of a permanently stranded silent connection.
         let mut pending_migrations: Vec<(
-            crate::shard::dispatch::RawSocketFd,
+            crate::shard::dispatch::MigrateFd,
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
@@ -1188,16 +1298,12 @@ impl super::Shard {
             }
         }
 
-        // Waker relay, swept after every drain cycle. HISTORICAL NOTE: this was
-        // built on the belief that monoio's !Send executor cannot receive
-        // cross-thread Waker::wake() — that is FALSE with the `sync` feature
-        // (enabled in Cargo.toml): a remote wake rides a per-thread waker
-        // channel + driver unpark (eventfd/kqueue), proven at runtime by
-        // tests/spsc_wake_floor_red.rs::swf0. The hot cross-shard reply path
-        // now awaits its oneshot directly (handler_monoio, M2); the relay is
-        // kept for future registrants and stays correct either way.
-        #[cfg(feature = "runtime-monoio")]
-        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
+        // NOTE: the old `pending_wakers` relay (register-waker, event-loop
+        // sweeps after SPSC drain) was deleted in the c10k wave — it had zero
+        // registrants since M2 made the cross-shard reply path await its
+        // oneshot directly (cross-thread wake via monoio's `sync` feature,
+        // proven by tests/spsc_wake_floor_red.rs::swf0). For cross-thread
+        // signalling prefer flume oneshots, not a waker relay.
 
         // R-4: backoff for the tokio per-shard SO_REUSEPORT accept branch so an
         // fd-exhaustion storm can't hot-spin this shard's select loop.
@@ -1394,7 +1500,7 @@ impl super::Shard {
                         {
                             tracing::info!(
                                 "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                                shard_id, fd, state.client_id, state.peer_addr
+                                shard_id, std::os::fd::AsRawFd::as_raw_fd(&fd), state.client_id, state.peer_addr
                             );
                             #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
@@ -1418,7 +1524,6 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
-                                &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
@@ -1500,7 +1605,7 @@ impl super::Shard {
                         {
                             tracing::info!(
                                 "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                                shard_id, fd, state.client_id, state.peer_addr
+                                shard_id, std::os::fd::AsRawFd::as_raw_fd(&fd), state.client_id, state.peer_addr
                             );
                             #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
@@ -1524,7 +1629,6 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
-                                &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
@@ -1558,10 +1662,17 @@ impl super::Shard {
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                     &e.to_string(),
                                 );
+                                // Decrement the BGSAVE fan-in counter (same as
+                                // the monoio arm below — this was missing here,
+                                // so tokio BGSAVE left rdb_bgsave_in_progress
+                                // stuck at 1 forever). Safe for auto-save
+                                // snapshots too: the counter ignores calls at 0.
+                                crate::command::persistence::bgsave_shard_done(false);
                             } else {
                                 persistence_tick::finalize_snapshot_success(
                                     &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                 );
+                                crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
                         }
@@ -1638,6 +1749,16 @@ impl super::Shard {
                 // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal_v3(&mut wal_writer);
+                    // D1: idle-timeout enforcement, same policy and cadence as
+                    // the monoio chore (the per-connection timeout wrapper it
+                    // replaces read its config once at connection setup and
+                    // never exempted replication links).
+                    let _ = crate::client_registry::kill_idle_clients(
+                        shard_id,
+                        num_shards,
+                        runtime_config.read().timeout,
+                        crate::storage::entry::current_time_ms(),
+                    );
                     // P3+MA1+MA2: prune committed + sweep zombies + kill old snapshots
                     //             + update RECL_MVCC_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {
@@ -1677,14 +1798,15 @@ impl super::Shard {
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.0.tick() => {
-                    if server_config.disk_offload_enabled() {
+                    // task/issue #45: `disk_offload_dir` (Some iff offload
+                    // enabled) is precomputed at shard init — no per-tick
+                    // format!/join.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config.effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
-                                    &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
@@ -1716,16 +1838,17 @@ impl super::Shard {
                         std::future::pending::<()>().await;
                     }
                 }, if orphan_sweep_interval.is_some() && server_config.disk_offload_enabled() => {
-                    let shard_dir = server_config
-                        .effective_disk_offload_dir()
-                        .join(format!("shard-{}", shard_id));
-                    timers::run_cold_orphan_sweep(
-                        &shard_databases,
-                        shard_id,
-                        &shard_dir,
-                        shard_manifest.as_mut(),
-                        cached_clock.ms(),
-                    );
+                    // task/issue #45: precomputed shard dir; the select guard
+                    // already requires disk-offload, so this is always Some.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
+                        timers::run_cold_orphan_sweep(
+                            &shard_databases,
+                            shard_id,
+                            shard_dir,
+                            shard_manifest.as_mut(),
+                            cached_clock.ms(),
+                        );
+                    }
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.0.tick() => {
@@ -1770,6 +1893,7 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        disk_offload_dir.as_deref(),
                         &repl_backlog, &mut replica_txs, &repl_offsets,
                         aof_pool.as_ref(),
                         match wal_kv_log_mode {
@@ -1820,6 +1944,33 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    // F1 (#438): bounded connection drain BEFORE persistence
+                    // teardown — the `break` below returns from `run`, and
+                    // dropping the LocalSet/runtime kills every connection
+                    // task still pending, truncating in-flight replies and
+                    // skipping the blocking/subscriber shutdown arms. The
+                    // token (already cancelled) wakes the tokio selects'
+                    // shutdown arms; this loop just keeps the thread polling
+                    // until they have all exited through the flush+FIN
+                    // epilogue, or the deadline expires (a wedged peer must
+                    // not hold up shutdown — its task is then dropped, the
+                    // pre-F1 behaviour).
+                    {
+                        let drain_deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_MAX;
+                        loop {
+                            let live = conn_accept::live_conn_tasks();
+                            if live == 0 {
+                                break;
+                            }
+                            if std::time::Instant::now() >= drain_deadline {
+                                tracing::warn!(
+                                    "Shard {shard_id}: shutdown drain timed out with {live} connection task(s) still live; dropping them"
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
                         &mut shard_manifest,
@@ -1853,6 +2004,11 @@ impl super::Shard {
                     }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
+                    }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
                     }
                     break;
                 }
@@ -1890,7 +2046,6 @@ impl super::Shard {
                         shard_id,
                         num_shards,
                         config_port,
-                        &pending_wakers,
                         &spill_sender,
                         &spill_file_id,
                         &disk_offload_dir,
@@ -1932,16 +2087,10 @@ impl super::Shard {
                     shard_id,
                     num_shards,
                     config_port,
-                    &pending_wakers,
                     &spill_sender,
                     &spill_file_id,
                     &disk_offload_dir,
                 );
-            }
-            // Wake cross-shard response tasks that registered during the previous iteration.
-            #[cfg(feature = "runtime-monoio")]
-            for waker in pending_wakers.borrow_mut().drain(..) {
-                waker.wake();
             }
 
             // Monoio runtime: direct-await on 1ms periodic tick.
@@ -1954,6 +2103,51 @@ impl super::Shard {
                 // Check shutdown before awaiting (non-blocking)
                 if shutdown.is_cancelled() {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    // F1 (#438): bounded connection drain BEFORE persistence
+                    // teardown — the `break` below returns from `run`, and
+                    // dropping the monoio runtime kills every connection task
+                    // still pending, truncating in-flight replies and
+                    // skipping the blocking/subscriber shutdown arms (found
+                    // live: 19/50 BLPOP clients lost their shutdown reply on
+                    // Linux io_uring). Stage-1/2 idle-park reads are plain
+                    // awaits the token cannot wake, so fire their cancellers;
+                    // the woken handlers see the cancelled token and exit
+                    // through the flush+FIN epilogue. Re-fired every tick to
+                    // close the mid-batch re-park race. Deadline-bounded: a
+                    // wedged peer must not hold up shutdown — its task is
+                    // then dropped, the pre-F1 behaviour.
+                    {
+                        let drain_deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_MAX;
+                        let mut ticks = 0u32;
+                        loop {
+                            crate::server::conn::handler_monoio::idle_park::cancel_all_parked();
+                            let live = conn_accept::live_conn_tasks();
+                            if live == 0 {
+                                break;
+                            }
+                            if std::time::Instant::now() >= drain_deadline {
+                                tracing::warn!(
+                                    "Shard {shard_id}: shutdown drain timed out with {live} connection task(s) still live; dropping them"
+                                );
+                                break;
+                            }
+                            // Fast ticks catch the one legal re-park race (a
+                            // task that passed its post-batch shutdown check
+                            // before the token cancelled, then parked after
+                            // the first canceller sweep); after that no task
+                            // can park again, so back off — the O(registry)
+                            // canceller scan every 2 ms for the full 5 s
+                            // ceiling would be a shutdown-only CPU spike at
+                            // high connection counts.
+                            let tick = if ticks < 5 {
+                                std::time::Duration::from_millis(2)
+                            } else {
+                                std::time::Duration::from_millis(50)
+                            };
+                            ticks += 1;
+                            monoio::time::sleep(tick).await;
+                        }
+                    }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
                         &mut shard_manifest,
@@ -1994,6 +2188,11 @@ impl super::Shard {
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
+                    // Task #59: flush pending deferred manifest commits and
+                    // stop the manifest-sync thread before the loop exits.
+                    if let Some(ref mut m) = shard_manifest {
+                        m.shutdown_deferred();
+                    }
                     break;
                 }
 
@@ -2008,7 +2207,20 @@ impl super::Shard {
                 // at runtime by tests/spsc_wake_floor_red.rs::swf0 on both drivers.
                 // A losing notified() arm re-queues an undelivered token on drop
                 // (swf_a3), so there is no lost-wake window.
-                let timer_fired = {
+                let timer_fired = if idle_park.is_idle() {
+                    // #373 phase 2: stretched park. A one-shot sleep replaces
+                    // the Interval while idle — the Interval is deliberately
+                    // NOT polled here and is reset on every idle exit, so its
+                    // accumulated missed ticks can never burst-fire chores.
+                    let tick = std::pin::pin!(monoio::time::sleep(Duration::from_millis(
+                        crate::shard::idle_park::IDLE_PARK_MS
+                    )));
+                    let notified = std::pin::pin!(spsc_notify_local.notified());
+                    matches!(
+                        crate::runtime::race::race2(tick, notified).await,
+                        crate::runtime::race::Arm::First(_)
+                    )
+                } else {
                     let tick = std::pin::pin!(periodic_interval.0.tick());
                     let notified = std::pin::pin!(spsc_notify_local.notified());
                     matches!(
@@ -2017,11 +2229,38 @@ impl super::Shard {
                     )
                 };
                 if !timer_fired {
+                    if idle_park.note_notify_wake() {
+                        // Woken out of an idle park by cross-shard work:
+                        // refresh the cached clock before draining (the
+                        // message must never see stretched staleness) and
+                        // reset the interval for the fast cadence.
+                        cached_clock.update();
+                        periodic_interval = TimerImpl::interval(Duration::from_millis(1));
+                    }
                     crate::admin::metrics_setup::bump_spsc_notify_wake();
                 }
 
+                // Adversarial-review fix (#378): cross-shard SPSC commands do
+                // not bump the per-thread command counter (the ORIGIN shard's
+                // handler records them; counting again here would double-count
+                // INFO stats), so the idle gate observes queue occupancy
+                // directly. Checked BEFORE the drain: any pending message —
+                // read or write — makes this tick non-quiet.
+                let spsc_had_work = {
+                    use ringbuf::traits::Observer as _;
+                    consumers.borrow().iter().any(|c| !c.is_empty())
+                };
+                // A timer-win race tie can reach the drain with pending
+                // cross-shard messages while still idle-parked (the notify
+                // token re-queues, but this iteration drains first): refresh
+                // the clock before draining so cross-shard commands never
+                // observe stretched staleness on EITHER race outcome.
+                if timer_fired && spsc_had_work && idle_park.is_idle() {
+                    cached_clock.update();
+                }
+
                 // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
-                //     handle drain outputs, sweep the pending_wakers relay ---
+                //     handle drain outputs ---
                 let mut pending_snapshot = None;
                 // No outer with_shard — each arm takes its own flat borrow.
                 let hit_cap = spsc_handler::drain_spsc_shared(
@@ -2069,9 +2308,6 @@ impl super::Shard {
                     let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                     cdc_registry.register_pending(pending_cdc_subscribes.drain(..), wal_dir);
                 }
-                for waker in pending_wakers.borrow_mut().drain(..) {
-                    waker.wake();
-                }
                 persistence_tick::handle_pending_snapshot(
                     pending_snapshot,
                     &mut snapshot_state,
@@ -2090,7 +2326,7 @@ impl super::Shard {
                         tracing::info!(
                             "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
                             shard_id,
-                            fd,
+                            std::os::fd::AsRawFd::as_raw_fd(&fd),
                             state.client_id,
                             state.peer_addr
                         );
@@ -2121,7 +2357,6 @@ impl super::Shard {
                             shard_id,
                             num_shards,
                             config_port,
-                            &pending_wakers,
                             &spill_sender,
                             &spill_file_id,
                             &disk_offload_dir,
@@ -2144,7 +2379,9 @@ impl super::Shard {
                 if !timer_fired {
                     continue;
                 }
-                monoio_tick_counter = monoio_tick_counter.wrapping_add(1);
+                // Step by the period of the park that just elapsed (1 fast,
+                // 10 idle) so the counter keeps counting nominal milliseconds.
+                monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
                 next_file_id = next_file_id.max(spill_file_id.get());
 
@@ -2298,6 +2535,7 @@ impl super::Shard {
                         &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
+                        disk_offload_dir.as_deref(),
                         &repl_backlog,
                         &mut replica_txs,
                         &repl_offsets,
@@ -2322,7 +2560,40 @@ impl super::Shard {
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
+                    // O3: sample this shard thread's involuntary-preemption
+                    // rate and gate the driver spin while the core is shared.
+                    // The gate is thread-local in the vendored driver, so the
+                    // flip below affects exactly this shard's parks.
+                    if let Some(gov) = spin_governor.as_mut() {
+                        if let Some(contended) = gov.tick() {
+                            monoio::set_legacy_spin_contended(contended);
+                            tracing::info!(
+                                "Shard {}: busy-poll spin {} (involuntary-preemption governor)",
+                                shard_id,
+                                if contended {
+                                    "GATED — core contended"
+                                } else {
+                                    "re-enabled — core quiet"
+                                }
+                            );
+                        }
+                    }
                     timers::sync_wal_v3(&mut wal_writer);
+                    // c10k W11: cancel reads parked ≥1s so idle connections
+                    // downshift to the probe-sized working set. Same thread
+                    // as the connection tasks (thread-per-core), no locks.
+                    let _ =
+                        crate::server::conn::handler_monoio::idle_park::sweep(cached_clock.ms());
+                    // D1: enforce `timeout N` here rather than from a
+                    // per-connection select! arm — that arm shadowed every
+                    // park stage above. Config is re-read each sweep, so
+                    // CONFIG SET timeout applies to live connections.
+                    let _ = crate::client_registry::kill_idle_clients(
+                        shard_id,
+                        num_shards,
+                        runtime_config.read().timeout,
+                        crate::storage::entry::current_time_ms(),
+                    );
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {
@@ -2372,15 +2643,15 @@ impl super::Shard {
                 }
                 // Warm tier check: every warm_poll_ms ticks
                 if monoio_tick_counter % (warm_poll_ms as u64) == 0 {
-                    if server_config.disk_offload_enabled() {
+                    // task/issue #45: `disk_offload_dir` (Some iff offload
+                    // enabled) is precomputed at shard init — no per-tick
+                    // format!/join.
+                    if let Some(shard_dir) = disk_offload_dir.as_deref() {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config
-                                .effective_disk_offload_dir()
-                                .join(format!("shard-{}", shard_id));
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
-                                    &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
@@ -2433,18 +2704,45 @@ impl super::Shard {
                 // Matches the tokio select! branch above. Disabled when interval is 0.
                 if orphan_sweep_interval_secs > 0
                     && monoio_tick_counter % (orphan_sweep_interval_secs * 1000) == 0
-                    && server_config.disk_offload_enabled()
+                    && let Some(shard_dir) = disk_offload_dir.as_deref()
                 {
-                    let shard_dir = server_config
-                        .effective_disk_offload_dir()
-                        .join(format!("shard-{}", shard_id));
                     timers::run_cold_orphan_sweep(
                         &shard_databases,
                         shard_id,
-                        &shard_dir,
+                        shard_dir,
                         shard_manifest.as_mut(),
                         cached_clock.ms(),
                     );
+                }
+
+                // #373 phase 2: decide the next park. Every counter-based
+                // cadence above is a multiple of IDLE_PARK_MS — 10 / 100 /
+                // 1000 / 5000 / warm_poll_ms (secs*1000, clamped ≥1000) /
+                // autovacuum & orphan (secs*1000) — so the 10ms-stepped
+                // counter hits each boundary exactly; entry is additionally
+                // gated on an aligned counter. Any new `% N` dispatch added
+                // here MUST keep N a multiple of IDLE_PARK_MS.
+                let quiet = wal_writer
+                    .as_ref()
+                    .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
+                    && wal_append_rx.is_empty()
+                    && snapshot_state.is_none()
+                    && !bgsave_checkpoint_requested
+                    && checkpoint_manager.as_ref().is_none_or(|m| !m.is_active())
+                    && server_config.appendfsync != "always"
+                    && cdc_registry.is_empty()
+                    && !hit_cap
+                    && !spsc_had_work;
+                let was_idle = idle_park.is_idle();
+                let now_idle = idle_park.on_timer_tick(
+                    crate::admin::metrics_setup::this_thread_commands(),
+                    quiet,
+                    monoio_tick_counter % crate::shard::idle_park::IDLE_PARK_MS == 0,
+                );
+                if was_idle && !now_idle {
+                    // Timer-path idle exit (a condition turned non-quiet):
+                    // reset the interval so its missed ticks can't burst.
+                    periodic_interval = TimerImpl::interval(Duration::from_millis(1));
                 }
             }
         }
@@ -2462,5 +2760,35 @@ impl super::Shard {
         // Databases now live in Arc<ShardDatabases>, no reclaim needed.
         self.databases.clear();
         self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uring_bridge_allowed;
+    use crate::config::ServerConfig;
+    use clap::Parser;
+
+    /// c10k B4. The bridge is only allowed when the server has no
+    /// authentication to bypass in the first place.
+    #[test]
+    fn uring_bridge_is_refused_when_auth_is_configured() {
+        let no_auth = ServerConfig::parse_from(["moon"]);
+        assert!(
+            uring_bridge_allowed(&no_auth),
+            "no auth configured: the bridge has nothing to bypass"
+        );
+
+        let with_pass = ServerConfig::parse_from(["moon", "--requirepass", "hunter2"]);
+        assert!(
+            !uring_bridge_allowed(&with_pass),
+            "requirepass set: the bridge would serve unauthenticated commands on the same port"
+        );
+
+        let with_aclfile = ServerConfig::parse_from(["moon", "--aclfile", "/tmp/users.acl"]);
+        assert!(
+            !uring_bridge_allowed(&with_aclfile),
+            "aclfile set: same bypass, via ACL users instead of requirepass"
+        );
     }
 }

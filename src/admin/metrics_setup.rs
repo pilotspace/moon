@@ -132,6 +132,27 @@ fn bump_total_commands() {
     });
 }
 
+/// This thread's slot of the sharded total-commands counter. Used by the
+/// shard loop's adaptive idle park (#373) as its "commands dispatched on
+/// this shard since the last tick" signal — one relaxed load per tick.
+/// Slot collisions (>64 threads share slots round-robin) can only inflate
+/// the count, which keeps the loop in fast mode: the safe direction.
+#[inline]
+pub fn this_thread_commands() -> u64 {
+    COMMAND_COUNTER_SLOT.with(|&slot| COMMAND_COUNTERS[slot].0.load(Ordering::Relaxed))
+}
+
+/// Count a replica-applied command in this thread's total-commands slot.
+/// Redis parity: replicas include applied master-stream commands in
+/// `total_commands_processed`. Also the adaptive idle park's (#373)
+/// activity signal for the apply path, which bypasses the connection
+/// handlers and would otherwise be invisible to the idle gate — a busy
+/// replica must never be classified idle.
+#[inline]
+pub fn record_replica_apply() {
+    bump_total_commands();
+}
+
 /// Exact sum across all counter slots. O(64) loads — read paths only
 /// (INFO, the 1s server_stats tick), never the command hot path.
 fn total_commands_sum() -> u64 {
@@ -900,6 +921,31 @@ pub fn record_dispatch_cross_spsc() {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
+}
+
+/// Cross-shard fan-out message dropped after bounded retry (c10k E1/E3):
+/// the target shard's SPSC ring stayed full through every backoff. `kind` is
+/// `"publish"` (that shard's subscribers miss the message; PUBLISH count
+/// under-reports) or `"script_load"` (that shard's script cache diverges —
+/// EVALSHA there answers NOSCRIPT until the next SCRIPT LOAD).
+#[inline]
+pub fn record_xshard_fanout_drop(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_fanout_drop_total", "kind" => kind).increment(1);
+}
+
+/// Cross-shard reply await expired (c10k E4): the owner shard did not fill
+/// the reply slot within `XSHARD_REPLY_TIMEOUT`. `kind` `"dispatch"` is
+/// fatal for the connection (the reusable slot may be filled late);
+/// `"publish"` degrades to an under-reported subscriber count.
+#[inline]
+pub fn record_xshard_reply_timeout(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_reply_timeout_total", "kind" => kind).increment(1);
 }
 
 /// Batched variant of `record_dispatch_cross_spsc`.

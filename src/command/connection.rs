@@ -185,6 +185,15 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         "connected_clients:{}\r\n",
         crate::admin::metrics_setup::connected_clients(),
     );
+    // c1M task-exit parking: connections held only by a readiness watcher.
+    // Counted separately rather than folded into connected_clients — a parked
+    // connection is fully live (CLIENT LIST/KILL reach it), just not holding a
+    // handler task or a working set.
+    let _ = write!(
+        sections,
+        "parked_clients:{}\r\n",
+        crate::client_registry::parked_clients(),
+    );
     sections.push_str("\r\n");
 
     sections.push_str("# Memory\r\n");
@@ -231,19 +240,74 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
     );
+
+    // Allocator counters, Redis's `allocator_*` field names so existing
+    // dashboards and exporters read them without translation.
+    //
+    // These are the fields that make a used_memory-vs-RSS gap diagnosable
+    // rather than a guess: `allocator_frag_bytes` is space lost to size-class
+    // rounding, `allocator_unreturned_bytes` is dirty pages jemalloc is
+    // holding instead of giving back, and whatever the OS charges beyond
+    // `allocator_resident` belongs to something other than the allocator
+    // (mmap'd segments, thread stacks, the binary image).
+    //
+    // Only present on `--features jemalloc-stats`; jemalloc's stats cost
+    // bookkeeping on every allocation, so the default build does not pay it.
+    // Absent rather than zero-filled: a zero here would read as "no
+    // fragmentation", which is a worse answer than "not measured".
+    #[cfg(feature = "jemalloc-stats")]
+    if let Some(st) = crate::memory_ctl::jemalloc_stats() {
+        let _ = write!(
+            sections,
+            "allocator_allocated:{}\r\n\
+             allocator_active:{}\r\n\
+             allocator_resident:{}\r\n\
+             allocator_retained:{}\r\n\
+             allocator_frag_bytes:{}\r\n\
+             allocator_frag_ratio:{:.2}\r\n\
+             allocator_unreturned_bytes:{}\r\n",
+            st.allocated,
+            st.active,
+            st.resident,
+            st.retained,
+            st.frag_bytes(),
+            st.frag_ratio(),
+            st.unreturned_bytes(),
+        );
+    }
     sections.push_str("\r\n");
 
     sections.push_str("# Persistence\r\n");
+    // #432: aof_enabled / aof_rewrite_in_progress / sizes are real state, not
+    // hardcoded zeros. Sizes come from the auto-rewrite monitor's statics
+    // (#433); refresh_current_size keeps `aof_current_size` honest when INFO
+    // is read between monitor ticks (one directory walk — INFO is cold path).
+    let aof_enabled = crate::persistence::aof::auto_rewrite::AOF_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let aof_current_size = if aof_enabled {
+        crate::persistence::aof::auto_rewrite::refresh_current_size()
+    } else {
+        0
+    };
     sections.push_str(&format!(
         "loading:0\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
          rdb_last_bgsave_status:{}\r\n\
-         aof_enabled:0\r\n\
-         aof_rewrite_in_progress:0\r\n\
+         aof_enabled:{}\r\n\
+         aof_rewrite_in_progress:{}\r\n\
+         aof_base_size:{}\r\n\
+         aof_current_size:{}\r\n\
          aof_backpressure_dropped:{}\r\n\
+         aof_last_fsync_status:{}\r\n\
+         aof_fsync_failures:{}\r\n\
+         aof_last_append_status:{}\r\n\
+         aof_reason_del_dropped:{}\r\n\
+         aof_rewrite_overflow_spilled:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
+         spill_failed_reinserted:{}\r\n\
+         spill_completion_superseded:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n",
         if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -259,10 +323,34 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         } else {
             "err"
         },
+        u8::from(aof_enabled),
+        u8::from(
+            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                .load(std::sync::atomic::Ordering::SeqCst)
+        ),
+        crate::persistence::aof::auto_rewrite::AOF_BASE_SIZE
+            .load(std::sync::atomic::Ordering::Relaxed),
+        aof_current_size,
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        if crate::persistence::aof::aof_last_fsync_ok() {
+            "ok"
+        } else {
+            "err"
+        },
+        crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed) {
+            "ok"
+        } else {
+            "err"
+        },
+        crate::persistence::aof::AOF_REASON_DEL_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+        crate::persistence::aof::rewrite_overflow::AOF_REWRITE_OVERFLOW_SPILLED
             .load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
         crate::storage::tiered::spill_thread::spill_completion_dropped_total(),
+        crate::storage::tiered::spill_thread::spill_failed_reinserted_total(),
+        crate::storage::tiered::spill_thread::spill_completion_superseded_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
     ));
     sections.push_str("\r\n");
@@ -363,7 +451,11 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# Keyspace\r\n");
-    let key_count = db.len();
+    // Logical count (hot + cold), matching DBSIZE (issue #355). `expires`
+    // remains resident-only: cold TTLs live in ColdLocation.ttl_ms and are
+    // swept by the proactive expiry pass, but counting them here would need
+    // a second O(cold) scan for a field monitoring rarely consumes.
+    let key_count = db.logical_len();
     let expires_count = db.expires_count();
     if key_count > 0 {
         let _ = write!(

@@ -94,6 +94,11 @@ fn spawn_moon(dir: &std::path::Path, shards: u32) -> (ServerGuard, u16) {
                 &shards.to_string(),
                 "--appendonly",
                 "no",
+                // COPY/MOVE routing is under test, not the disk guard; a
+                // near-full dev volume would otherwise fail every setup SET
+                // with MOONERR diskfull.
+                "--disk-free-min-pct",
+                "0",
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
             .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))

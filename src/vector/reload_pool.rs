@@ -79,6 +79,20 @@ impl SegmentReloadPool {
                 let st = Arc::clone(&state);
                 std::thread::Builder::new()
                     .name(format!("moon-vec-reload-{i}"))
+                    // O5: deliberately NOT pinned via
+                    // `numa::pin_current_aux_thread`, unlike every other
+                    // auxiliary thread in this codebase. Segment reloads are
+                    // latency-critical (a query awaits its own reload to
+                    // finish — see SegmentReloadPool's callers) and the
+                    // heaviest reload storm happens exactly when shard
+                    // threads are idle: cold-start / crash recovery, where
+                    // many segments reload in parallel to reach
+                    // time-to-green. Confining that burst to the small
+                    // non-shard remainder (`shards..cores`) instead of
+                    // letting the scheduler spread it across ALL cores
+                    // risks ~3x worse cold-reload latency — the exact
+                    // regression PR #237 (parallel HNSW / time-to-green)
+                    // fixed. Leave this pool scheduler-placed.
                     .spawn(move || worker_loop(&rx, &st))
                     .expect("failed to spawn vector reload worker thread")
             })

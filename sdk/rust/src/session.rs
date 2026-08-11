@@ -9,7 +9,7 @@ use crate::util::parse_search_results;
 ///
 /// Obtain via [`MoonClient::session`](crate::MoonClient::session).
 pub struct SessionClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl SessionClient {

@@ -105,24 +105,37 @@ pub fn write_kv_spill_pages(
     Ok((pages.total_pages as u64) * (PAGE_4K as u64))
 }
 
-/// Spill a single evicted KV entry to a DataFile on disk.
+/// On-disk [`ValueType`] tag for a hot value.
 ///
-/// Creates a single-page `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf`,
-/// writes a `KvLeafPage` containing the entry, and registers the file in the
-/// shard manifest.
+/// Re-exported from the shared value codec (W1 unification) — used by every
+/// spill entry point and by the sync eviction path to populate
+/// `ColdLocation::value_type` (#364).
+pub use crate::storage::value_codec::value_type_of;
+
+/// Spill a single KV entry to its own DataFile on disk.
 ///
-/// String entries are fully supported. Non-string types (hash, list, set, zset,
-/// stream) are skipped with a warning -- overflow serialization is future work.
+/// Creates a `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf` (leaf
+/// page + overflow chain for oversized values), writes the entry, and
+/// registers the file in the shard manifest with a blocking durable commit.
 ///
-/// If the entry does not fit in a single 4KB page, it is skipped (oversized
-/// entries require overflow pages, also future work).
+/// **No longer a production eviction path (W2).** Every eviction spill —
+/// sync and async — now routes through `spill_thread::flush_buffer` batches
+/// (shared multi-entry files, one manifest commit per file). This helper
+/// remains as the single-entry primitive: test fixtures use it to place one
+/// key cold deterministically (same `build_kv_spill_pages` +
+/// `write_kv_spill_pages` layout the batch salvage path emits, so the format
+/// stays production-exercised via `spill_single_entry`).
 ///
-/// Returns `Ok(())` on success, skip, or best-effort failure logging.
+/// `db_index` is the logical database the entry was evicted FROM — it is
+/// stamped into the manifest `FileEntry` so `rebuild_from_manifest_per_db`
+/// re-attaches the key to the right database after a crash (#139). Passing 0
+/// for a db>0 victim silently corrupts recovery attribution.
 pub fn spill_to_datafile(
     shard_dir: &Path,
     file_id: u64,
     key: &[u8],
     entry: &Entry,
+    db_index: usize,
     manifest: &mut ShardManifest,
     cold_index: Option<&mut super::cold_index::ColdIndex>,
 ) -> io::Result<()> {
@@ -133,22 +146,8 @@ pub fn spill_to_datafile(
     let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
         RedisValueRef::String(s) => (ValueType::String, s),
         ref other => {
-            let vt = match other {
-                RedisValueRef::Hash(_)
-                | RedisValueRef::HashListpack(_)
-                | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
-                RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                RedisValueRef::Set(_)
-                | RedisValueRef::SetListpack(_)
-                | RedisValueRef::SetIntset(_) => ValueType::Set,
-                RedisValueRef::SortedSet { .. }
-                | RedisValueRef::SortedSetBPTree { .. }
-                | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
-                RedisValueRef::Stream(_) => ValueType::Stream,
-                RedisValueRef::String(_) => unreachable!(),
-            };
             collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
-            (vt, collection_buf.as_slice())
+            (value_type_of(other), collection_buf.as_slice())
         }
     };
 
@@ -156,7 +155,7 @@ pub fn spill_to_datafile(
     let mut flags: u8 = 0;
     let ttl_ms = if entry.has_expiry() {
         flags |= entry_flags::HAS_TTL;
-        Some(entry.expires_at_ms(0))
+        Some(entry.expires_at_ms())
     } else {
         None
     };
@@ -184,7 +183,7 @@ pub fn spill_to_datafile(
         page_count: pages.total_pages,
         byte_size,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: db_index as u64,
         max_key_hash: 0,
         last_modified_lsn: 0,
     });
@@ -201,6 +200,7 @@ pub fn spill_to_datafile(
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms,
+                value_type,
             },
         );
     }
@@ -585,7 +585,7 @@ mod tests {
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
 
         let entry = Entry::new_string(Bytes::from_static(b"hello world"));
-        spill_to_datafile(shard_dir, 1, b"mykey", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"mykey", &entry, 0, &mut manifest, None).unwrap();
 
         // Verify file was created
         let file_path = shard_dir.join("data/heap-000001.mpf");
@@ -615,7 +615,7 @@ mod tests {
 
         // Registered spill: file 1 in manifest, must survive the sweep.
         let entry = Entry::new_string(Bytes::from_static(b"registered"));
-        spill_to_datafile(shard_dir, 1, b"livekey", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, &mut manifest, None).unwrap();
 
         // Crash orphan: heap file on disk but never registered in the manifest
         // (spill wrote the file, crash before manifest commit).
@@ -664,7 +664,7 @@ mod tests {
 
         // Registered spill: must be classified as NOT orphaned.
         let entry = Entry::new_string(Bytes::from_static(b"registered"));
-        spill_to_datafile(shard_dir, 1, b"livekey", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, &mut manifest, None).unwrap();
 
         let data_dir = shard_dir.join("data");
         // A larger batch of unregistered files, standing in for a
@@ -728,9 +728,9 @@ mod tests {
 
         let mut entry = Entry::new_string(Bytes::from_static(b"expiring"));
         let future_ms = current_time_ms() + 60_000;
-        entry.set_expires_at_ms(0, future_ms);
+        entry.set_expires_at_ms(future_ms);
 
-        spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, 0, &mut manifest, None).unwrap();
 
         let file_path = shard_dir.join("data/heap-000002.mpf");
         let pages = read_datafile(&file_path).unwrap();
@@ -764,7 +764,7 @@ mod tests {
         }
         let entry = Entry::new_string(Bytes::from(big_value));
 
-        spill_to_datafile(shard_dir, 3, b"big_key", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 3, b"big_key", &entry, 0, &mut manifest, None).unwrap();
 
         // File SHOULD now exist with overflow pages
         let file_path = shard_dir.join("data/heap-000003.mpf");
@@ -807,7 +807,7 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::Hash(map));
 
-        spill_to_datafile(shard_dir, 10, b"hash_key", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 10, b"hash_key", &entry, 0, &mut manifest, None).unwrap();
 
         let file_path = shard_dir.join("data/heap-000010.mpf");
         assert!(file_path.exists(), "DataFile should exist for hash entry");
@@ -853,7 +853,7 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::List(list));
 
-        spill_to_datafile(shard_dir, 11, b"list_key", &entry, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 11, b"list_key", &entry, 0, &mut manifest, None).unwrap();
 
         let file_path = shard_dir.join("data/heap-000011.mpf");
         assert!(file_path.exists(), "DataFile should exist for list entry");
@@ -903,6 +903,7 @@ mod tests {
             50,
             b"overflow_key",
             &entry,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -1049,6 +1050,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1101,6 +1103,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1121,6 +1124,77 @@ mod tests {
                 batch.pages.len()
             );
         }
+    }
+
+    /// #139 recovery attribution: two spill files tagged with different
+    /// `FileEntry::db_index` values must rebuild into SEPARATE per-db cold
+    /// indexes, each holding exactly its own file's keys — the db0-only
+    /// attach used to make every SELECT >0 spilled key unreachable after
+    /// restart.
+    #[test]
+    fn test_rebuild_per_db_attributes_files_to_their_databases() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // One batch file per db, registered exactly as apply_spill_completions
+        // would (db attribution at file granularity).
+        for (db, file_id, prefix) in [(0u64, 201u64, "d0:"), (3u64, 202u64, "d3:")] {
+            let entries: Vec<SpillEntry> = (0..10)
+                .map(|i| SpillEntry {
+                    key: Bytes::from(format!("{prefix}{i}")),
+                    value_bytes: Bytes::from(format!("v{i}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+            manifest.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: db,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        manifest.commit().unwrap();
+
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        per_db.sort_by_key(|(db, _)| *db);
+        let dbs: Vec<usize> = per_db.iter().map(|(db, _)| *db).collect();
+        assert_eq!(dbs, vec![0, 3], "one index per db present in the manifest");
+        for (db, index) in &per_db {
+            assert_eq!(index.len(), 10, "db {db}: every entry recovered");
+            let prefix = if *db == 0 { "d0:" } else { "d3:" };
+            for i in 0..10 {
+                assert!(
+                    index.lookup(format!("{prefix}{i}").as_bytes()).is_some(),
+                    "db {db}: missing its own key {prefix}{i}"
+                );
+            }
+            let other = if *db == 0 { "d3:0" } else { "d0:0" };
+            assert!(
+                index.lookup(other.as_bytes()).is_none(),
+                "db {db}: must not contain the other db's keys"
+            );
+        }
+
+        // The merged wrapper still sees everything (single-db callers).
+        let merged = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
+        assert_eq!(merged.len(), 20);
     }
 
     /// RECOVERY-PATH test: prove `ColdIndex::rebuild_from_manifest` reconstructs
@@ -1169,7 +1243,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });
@@ -1265,6 +1339,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1326,6 +1401,7 @@ mod tests {
                 page_idx,
                 slot_idx,
                 ttl_ms: None,
+                value_type: ValueType::String,
             };
             let result = read_cold_entry_at(shard_dir, loc, 0);
             assert!(
@@ -1383,7 +1459,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });
@@ -1462,7 +1538,7 @@ mod tests {
             page_count: batch.pages.len() as u32,
             byte_size,
             created_lsn: 0,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
         });

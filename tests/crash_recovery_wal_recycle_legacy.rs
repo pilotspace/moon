@@ -51,6 +51,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -58,29 +60,14 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// Binary resolution (pattern: crash_recovery_graph_durability.rs)
+// Binary resolution — delegates to common::find_moon_binary (task:
+// test/harness-hygiene-sweep). The old local copy stopped at
+// target/{release,debug}/moon and never checked CARGO_BIN_EXE_moon, the
+// binary cargo actually built for THIS test run.
 // ---------------------------------------------------------------------------
 
 fn find_moon_binary() -> PathBuf {
-    if let Ok(bin) = std::env::var("MOON_BIN") {
-        let p = PathBuf::from(bin);
-        if p.exists() {
-            return p;
-        }
-    }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let release = PathBuf::from(format!("{manifest}/target/release/moon"));
-    if release.exists() {
-        return release;
-    }
-    let debug = PathBuf::from(format!("{manifest}/target/debug/moon"));
-    if debug.exists() {
-        return debug;
-    }
-    panic!(
-        "No moon binary found. Build with `cargo build --release` or set \
-         MOON_BIN=/path/to/moon."
-    );
+    common::find_moon_binary()
 }
 
 fn unique_port() -> u16 {

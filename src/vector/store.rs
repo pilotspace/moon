@@ -923,7 +923,17 @@ impl VectorIndex {
                 });
                 true
             }
-            Err(_) => false, // worker queue full — retry next tick
+            Err(e) => {
+                // F4: leave a correlatable trail for a submit loop that never
+                // drains (WorkersBusy also masks a dead pool). Debug level —
+                // benign momentary saturation would spam warn per tick.
+                tracing::debug!(
+                    error = ?e,
+                    mutable_len,
+                    "vector background-compact submit deferred; retry next tick"
+                );
+                false
+            }
         }
     }
 
@@ -991,6 +1001,15 @@ impl VectorIndex {
             Err(flume::TryRecvError::Empty) => return false,
             Err(flume::TryRecvError::Disconnected) => {
                 // Worker panicked or dropped — clear inflight and give up.
+                // F4 (deep review): this used to be silent, so a dead worker
+                // pool meant a permanent compact stall (mutable segment
+                // growing past COMPACT_THRESHOLD, searches degrading to
+                // brute force) with nothing for the operator to correlate.
+                tracing::error!(
+                    "vector background-compact worker died (panic or pool teardown); \
+                     compaction will be resubmitted but may stall permanently — \
+                     mutable segment growth and search latency will degrade"
+                );
                 self.bg_compact_inflight = None;
                 return false;
             }
@@ -1001,7 +1020,17 @@ impl VectorIndex {
 
         let mut immutable = match result {
             Ok(imm) => imm,
-            Err(_) => return false, // compaction failed — drop, retry later
+            Err(e) => {
+                // F4: compaction failure (e.g. the B2 disk persist of the
+                // built segment on a full disk) retries next tick — say so
+                // instead of looping silently forever.
+                tracing::warn!(
+                    error = %e,
+                    frozen_len = inflight.frozen_len,
+                    "vector background compaction failed; will retry next tick"
+                );
+                return false;
+            }
         };
 
         // ── Reconciliation ────────────────────────────────────────────────────
@@ -2027,6 +2056,9 @@ impl VectorStore {
         let spawned = std::thread::Builder::new()
             .name("moon-vec-idx-gc".to_owned())
             .spawn(move || {
+                // O5: spawned from the owning (pinned) shard thread —
+                // escape the inherited single-core mask.
+                crate::shard::numa::pin_current_aux_thread("moon-vec-idx-gc");
                 if let Err(e) = std::fs::remove_dir_all(&idx_dir) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(

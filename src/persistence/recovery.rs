@@ -263,6 +263,15 @@ pub fn recover_shard_v3_pitr(
     if manifest_path.exists() {
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
             let vectors_dir = shard_dir.join("vectors");
+            // #435: reclaim `.segment-*.staging` leftovers before scanning.
+            // A warm transition that died between its manifest commit and its
+            // rename leaves a fully-written staging dir that nothing reads and
+            // nothing removed — a live instance accumulated 14,499 of them
+            // holding 20 GB against 174 MB of real segments, invisible to `ls`
+            // and to any `vectors/*` glob because of the dot prefix. The
+            // in-process guard covers new failures; this covers orphans from a
+            // kill -9 or an older build.
+            crate::storage::tiered::warm_tier::sweep_orphan_staging(&vectors_dir);
             for entry in manifest.files() {
                 if entry.tier == StorageTier::Warm
                     && entry.status == FileStatus::Active
@@ -309,31 +318,52 @@ pub fn recover_shard_v3_pitr(
     // ONLY place a KvLeaf DataFile is read during recovery now.
     if manifest_path.exists() {
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let cold_idx = crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(
-                shard_dir, &manifest,
-            );
+            let per_db =
+                crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
+                    shard_dir, &manifest,
+                );
             // Observability parity with the removed hot-reload loop's
             // counter: report how many keys the cold tier recovered, NOT
             // how many were loaded into RAM (zero, by design).
-            result.kv_heap_entries_loaded = cold_idx.len();
-            if cold_idx.len() > 0 {
+            result.kv_heap_entries_loaded = per_db.iter().map(|(_, ci)| ci.len()).sum();
+            // Attach each database's index to ITS database (#139 — spilled
+            // SELECT >0 keys used to recover into db0's index, unreachable
+            // from their own db) BEFORE Phase 4 replay. Replayed
+            // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
+            // with `cold_index == None`, `remove_counting_cold()`/`clear()`
+            // are silent no-ops (`as_mut()` on None), so a key deleted in
+            // the WAL tail resurrects via cold read-through after restart
+            // whenever the crash lands inside the pre-orphan-sweep window
+            // (the manifest entry is still Active until the sweep).
+            for (db_index, cold_idx) in per_db {
                 info!(
-                    "Shard {}: rebuilt cold index with {} entries",
+                    "Shard {}: rebuilt cold index for db {} with {} entries",
                     shard_id,
+                    db_index,
                     cold_idx.len()
                 );
-                // Attach to the database BEFORE Phase 4 replay. Replayed
-                // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
-                // with `cold_index == None`, `remove_counting_cold()`/`clear()`
-                // are silent no-ops (`as_mut()` on None), so a key deleted in
-                // the WAL tail resurrects via cold read-through after restart
-                // whenever the crash lands inside the pre-orphan-sweep window
-                // (the manifest entry is still Active until the sweep).
-                if let Some(db0) = databases.first_mut() {
-                    db0.cold_shard_dir = Some(shard_dir.to_path_buf());
-                    match db0.cold_index.as_mut() {
-                        Some(existing) => existing.merge(cold_idx),
-                        None => db0.cold_index = Some(cold_idx),
+                match databases.get_mut(db_index) {
+                    Some(db) => {
+                        db.cold_shard_dir = Some(shard_dir.to_path_buf());
+                        match db.cold_index.as_mut() {
+                            Some(existing) => existing.merge(cold_idx),
+                            None => db.cold_index = Some(cold_idx),
+                        }
+                    }
+                    None => {
+                        // --databases was reduced below what this manifest
+                        // was written under. The keys are unreachable either
+                        // way (their db no longer exists); refuse to attach
+                        // them to a WRONG db and say so loudly instead of
+                        // silently resurrecting them elsewhere.
+                        tracing::warn!(
+                            shard_id,
+                            db_index,
+                            entries = cold_idx.len(),
+                            "cold recovery: manifest references a logical db beyond the \
+                             configured --databases count; its spilled keys are NOT attached \
+                             (unreachable until the server is restarted with enough databases)"
+                        );
                     }
                 }
             }
@@ -597,6 +627,12 @@ pub fn recover_shard_v3_pitr(
                 );
             }
             Err(e) => {
+                // #452.2: a mid-chain tear must ABORT boot, not degrade to a
+                // silently-truncated dataset (pre-tear records are already
+                // applied; post-tear segments were dropped).
+                if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                    crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(shard_id, &e);
+                }
                 tracing::error!("Shard {}: WAL v3 replay failed: {}", shard_id, e);
             }
         }
@@ -689,6 +725,12 @@ pub fn recover_shard_v3_pitr(
                         );
                     }
                     Err(e) => {
+                        // #452.2: mid-chain tear ⇒ refuse to boot.
+                        if crate::persistence::wal_v3::replay::is_mid_chain_tear(&e) {
+                            crate::persistence::wal_v3::replay::abort_boot_on_mid_chain_tear(
+                                shard_id, &e,
+                            );
+                        }
                         tracing::error!(
                             "Shard {}: legacy-mode WAL v3 fallback replay failed: {}",
                             shard_id,
@@ -1103,7 +1145,7 @@ mod tests {
             page_count: 10,
             byte_size: 655360,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 1,
         });
@@ -1116,7 +1158,7 @@ mod tests {
             page_count: 5,
             byte_size: 20480,
             created_lsn: 2,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 2,
         });
@@ -1160,7 +1202,7 @@ mod tests {
             page_count: 1,
             byte_size: 4096,
             created_lsn: 1,
-            min_key_hash: 0,
+            db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 1,
         });

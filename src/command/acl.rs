@@ -27,6 +27,7 @@ pub fn handle_acl(
     current_user: &str,
     _client_addr: &str,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
+    caller_client_id: u64,
 ) -> Frame {
     let sub = match sub_and_args.first().and_then(|f| extract_str(f)) {
         Some(s) => s.to_ascii_uppercase(),
@@ -170,6 +171,7 @@ pub fn handle_acl(
                 ));
             }
             let mut count = 0i64;
+            let mut revoked: Vec<String> = Vec::new();
             let Ok(mut table) = acl_table.write() else {
                 return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
             };
@@ -182,8 +184,31 @@ pub fn handle_acl(
                     }
                     if table.del_user(name) {
                         count += 1;
+                        revoked.push(name.to_string());
                     }
                 }
+            }
+            // c10k B2/B3: Redis disconnects clients authenticated as a deleted
+            // user, and so do we now that the registry tracks the post-AUTH
+            // identity. Deleting the account alone never closed the sessions
+            // it had already granted; the permission checks fail those
+            // sessions closed since B2, but leaving them connected would keep
+            // holding maxclients slots on a credential that no longer exists.
+            // Released before the kill so a self-kill cannot deadlock on it.
+            drop(table);
+            for name in revoked {
+                // `Some(caller_client_id)`: if the caller deleted its OWN
+                // account, self-kill must stay cooperative. `kill_clients`
+                // sets the flag but skips `shutdown(2)` for `self_id`, so this
+                // reply still flushes and the connection closes on the loop's
+                // next `is_killed()` check — reply-then-disconnect, which is
+                // the semantics a client expects. Passing `None` here shut the
+                // caller's own socket mid-command, so a self-DELUSER surfaced
+                // as a connection error instead of its `:1`.
+                crate::client_registry::kill_clients(
+                    &crate::client_registry::KillFilter::User(name),
+                    Some(caller_client_id),
+                );
             }
             Frame::Integer(count)
         }
@@ -318,6 +343,10 @@ pub fn handle_acl(
                                 new_table.set_user(user.username.clone(), user);
                             }
                         }
+                        // c10k B2: unknown users are denied now, so a file
+                        // without a `default` line must not brick the server.
+                        let requirepass = runtime_config.read().requirepass.clone();
+                        new_table.ensure_default_user(requirepass.as_deref());
                         let Ok(mut table) = acl_table.write() else {
                             return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
                         };
@@ -402,7 +431,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"WHOAMI"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"default")));
     }
 
@@ -421,7 +450,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"~*")),
             Frame::BulkString(Bytes::from_static(b"+@all")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // GETUSER alice
@@ -429,7 +458,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"GETUSER")),
             Frame::BulkString(Bytes::from_static(b"alice")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref fields) => {
                 // Should have username, flags, passwords, keys, channels, commands
@@ -453,7 +482,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"GETUSER")),
             Frame::BulkString(Bytes::from_static(b"nonexistent")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::Null);
     }
 
@@ -469,14 +498,14 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"alice")),
             Frame::BulkString(Bytes::from_static(b"on")),
         ];
-        handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
 
         // DELUSER alice
         let args = vec![
             Frame::BulkString(Bytes::from_static(b"DELUSER")),
             Frame::BulkString(Bytes::from_static(b"alice")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::Integer(1));
     }
 
@@ -489,7 +518,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"DELUSER")),
             Frame::BulkString(Bytes::from_static(b"default")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -499,7 +528,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"LIST"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref items) => {
                 assert!(!items.is_empty());
@@ -518,7 +547,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"CAT"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref cats) => {
                 assert!(!cats.is_empty());
@@ -536,7 +565,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"CAT")),
             Frame::BulkString(Bytes::from_static(b"string")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref cmds) => {
                 assert!(!cmds.is_empty());
@@ -554,7 +583,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"CAT")),
             Frame::BulkString(Bytes::from_static(b"nonexistent")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -574,7 +603,7 @@ mod tests {
         });
 
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOG"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref entries) => assert_eq!(entries.len(), 1),
             _ => panic!("Expected Array from LOG"),
@@ -585,12 +614,12 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"LOG")),
             Frame::BulkString(Bytes::from_static(b"RESET")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify log is empty
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOG"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref entries) => assert_eq!(entries.len(), 0),
             _ => panic!("Expected Array from LOG after RESET"),
@@ -617,7 +646,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"LOG")),
             Frame::BulkString(Bytes::from_static(b"5")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::Array(ref entries) => assert_eq!(entries.len(), 5),
             _ => panic!("Expected Array from LOG 5"),
@@ -630,7 +659,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config(); // no aclfile configured
         let args = vec![Frame::BulkString(Bytes::from_static(b"SAVE"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -640,7 +669,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config(); // no aclfile configured
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOAD"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -668,11 +697,11 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"~*")),
             Frame::BulkString(Bytes::from_static(b"+@all")),
         ];
-        handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
 
         // SAVE
         let args = vec![Frame::BulkString(Bytes::from_static(b"SAVE"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify file exists
@@ -680,7 +709,7 @@ mod tests {
 
         // LOAD into a fresh table
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOAD"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify alice still exists after load
@@ -694,7 +723,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"INVALID"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -704,7 +733,7 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"GENPASS"))];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::BulkString(b) => {
                 assert_eq!(b.len(), 64); // 256 bits = 64 hex chars
@@ -723,7 +752,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"GENPASS")),
             Frame::BulkString(Bytes::from_static(b"128")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         match result {
             Frame::BulkString(b) => {
                 assert_eq!(b.len(), 32); // 128 bits = 32 hex chars
@@ -741,7 +770,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"GENPASS")),
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
-        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
 }

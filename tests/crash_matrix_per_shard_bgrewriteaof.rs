@@ -20,11 +20,14 @@
 //!   cargo build --release
 //!   cargo test --release --test crash_matrix_per_shard_bgrewriteaof -- --ignored
 //!
-//! Requires: built release binary (default features = runtime-monoio) and
-//! `redis-cli` on PATH. Per-shard BGREWRITEAOF is monoio-only (the fold uses
-//! synchronous std::fs IO); the tokio build refuses it at the command handler.
+//! Requires: built release binary and `redis-cli` on PATH. Both runtimes run
+//! the same synchronous fold (`do_rewrite_per_shard`): monoio writers inline
+//! it; tokio writers convert their file handle to `std::fs` for its duration
+//! (dedicated block_on_local threads, so blocking is safe).
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+
+mod common;
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -51,7 +54,7 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 }
 
 fn start_moon(port: u16, dir: &std::path::Path) -> Child {
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),
@@ -64,6 +67,14 @@ fn start_moon(port: u16, dir: &std::path::Path) -> Child {
             // F6: open the gate so BGREWRITEAOF routes to the per-shard
             // fan-out coordinator instead of the refusal error.
             "--experimental-per-shard-rewrite",
+            // Diskfull guard guts crash tests: on hosts hovering near the 5%
+            // free-space threshold the guard rejects mid-stream INCRs with
+            // MOONERR diskfull, and recovery then "loses" writes that were in
+            // fact never acked (observed: host at 3.9% free → recovered 191
+            // of 500 with the other 309 rejected). Crash harnesses always
+            // disable it.
+            "--disk-free-min-pct",
+            "0",
             "--dir",
         ])
         .arg(dir)
@@ -87,7 +98,10 @@ fn wait_for_port(port: u16) {
     panic!("moon did not start within 8s on port {}", port);
 }
 
-/// One `INCR key`, returning the new value (or -1 on failure).
+/// One `INCR key`, returning the new value. Panics on a non-numeric reply:
+/// a silently swallowed error (e.g. `MOONERR diskfull` pausing writes
+/// mid-stream) makes the exact-count recovery assertion report phantom
+/// "lost writes" that were in fact never acked.
 fn redis_incr(port: u16, key: &str) -> i64 {
     let out = Command::new("redis-cli")
         .args(["-p", &port.to_string(), "INCR", key])
@@ -95,10 +109,10 @@ fn redis_incr(port: u16, key: &str) -> i64 {
         .stderr(Stdio::piped())
         .output()
         .expect("redis-cli INCR");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(-1)
+    let reply = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    reply.parse().unwrap_or_else(|_| {
+        panic!("INCR {key} was not acked with a number — harness cannot count it: {reply:?}")
+    })
 }
 
 fn redis_get_i64(port: u16, key: &str) -> i64 {

@@ -116,6 +116,11 @@ impl WalSyncAgent {
         let thread = std::thread::Builder::new()
             .name(format!("moon-wal-sync-{shard_id}"))
             .spawn(move || {
+                // O5: this thread is spawned from the shard's own (pinned)
+                // event-loop thread and would otherwise inherit its exact
+                // single-core mask — re-pin to the non-shard core set as the
+                // first act, before anything else runs.
+                crate::shard::numa::pin_current_aux_thread(&format!("moon-wal-sync-{shard_id}"));
                 // Requests arrive in LSN order (single producer); fetch_max
                 // in publish() guards the watermark even if that ever
                 // changes.

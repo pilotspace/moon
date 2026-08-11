@@ -101,7 +101,7 @@ fn encode_filter(cmd: &mut redis::Cmd, filter: &HybridFilter, top_level: bool) {
 ///
 /// Obtain via [`MoonClient::text`](crate::MoonClient::text).
 pub struct TextClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl TextClient {
@@ -174,9 +174,7 @@ impl TextClient {
         // Client-side filter validation (same depth/leaf limits as the server parser).
         if let Some(f) = filter {
             let mut validator = FilterValidator::new();
-            validator
-                .validate(f, 0)
-                .map_err(MoonError::invalid_arg)?;
+            validator.validate(f, 0).map_err(MoonError::invalid_arg)?;
         }
 
         let blob = encode_vector(query_vec);
@@ -222,7 +220,9 @@ impl TextClient {
     ///
     /// # Example
     /// ```no_run
+    /// # use moondb::MoonClient;
     /// use moondb::types::Reducer;
+    /// # async fn demo(client: &mut MoonClient) -> moondb::Result<()> {
     /// let rows = client.text().aggregate(
     ///     "docs",
     ///     "*",
@@ -231,6 +231,8 @@ impl TextClient {
     ///     Some(("count", false)),
     ///     Some(100),
     /// ).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn aggregate(
         &mut self,

@@ -45,9 +45,7 @@ use crate::protocol::Frame;
 use crate::replication::state::ReplicationState;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::engine::StorageEngine;
-use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
-};
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::storage::tiered::spill_thread::SpillRequest;
 
 /// Shard context needed to enforce `--maxmemory` eviction before a Lua
@@ -217,20 +215,23 @@ impl LuaEvictionCtx {
                 .disk_offload_dir
                 .as_deref()
                 .unwrap_or(std::path::Path::new("."));
-            let res = try_evict_if_needed_async_spill_budget_reporting(
+            let res = evict_to_budget(
                 db,
                 &rt,
-                sender,
-                dir,
-                &mut fid,
-                db_index,
-                budget,
-                &mut on_plain_drop,
+                EvictionRun::async_spill(sender, dir, &mut fid, db_index, None)
+                    .budget(budget)
+                    .report(&mut on_plain_drop),
             );
             inner.spill_file_id.set(fid);
             res
         } else {
-            try_evict_if_needed_budget_reporting(db, &rt, budget, &mut on_plain_drop)
+            evict_to_budget(
+                db,
+                &rt,
+                EvictionRun::plain()
+                    .budget(budget)
+                    .report(&mut on_plain_drop),
+            )
         };
         global_result?;
         // WS5b: per-db quota, additive and finer-grained than the
@@ -495,6 +496,10 @@ mod tests {
             client_pause_write_only: false,
             lazyfree_threshold: 64,
             maxclients: 10000,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             timeout: 0,
             tcp_keepalive: 300,
             num_shards: 1,
@@ -509,7 +514,7 @@ mod tests {
     /// `LuaEvictionCtx::gate`, which is what actually changed.
     ///
     /// RED (before the fix): `gate` called the non-reporting
-    /// `try_evict_if_needed_budget`/`try_evict_if_needed_async_spill_budget`,
+    /// `evict_to_budget` with a plain or async-spill `EvictionRun`,
     /// which pass a hardcoded no-op sink all the way down — a bystander key
     /// evicted here to make room for the script's write never reached
     /// `record_reason_del_conn`, so it never reached the AOF pool (nor an
@@ -529,10 +534,10 @@ mod tests {
         // depending on its value here would be flaky under parallel test
         // execution. `manifest` is always `None` at this call site (real
         // production behavior, not a test shortcut — see
-        // `try_evict_if_needed_async_spill_budget_reporting`'s doc comment),
+        // `EvictionSink::AsyncSpill`'s doc comment),
         // and `config.appendonly == "no"` (the `make_config` default), so
         // this deterministically takes the "no manifest reachable" plain-
-        // drop fallback inside `try_evict_if_needed_async_spill_with_total_budget_reporting`
+        // drop fallback inside `evict_to_budget`
         // — the sender/shard_dir below are never actually touched by that
         // branch, just required by the signature.
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);

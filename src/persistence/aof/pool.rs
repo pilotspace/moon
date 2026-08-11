@@ -10,6 +10,11 @@ use super::rewrite::drain_pending_appends;
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
+    /// Per-writer rewrite-window spill buffers (issue #452.1), parallel to
+    /// `senders` (index = writer index, mapped via [`Self::overflow_for`]
+    /// exactly like [`Self::sender`]). Armed only while that writer runs a
+    /// rewrite fold.
+    overflow: Vec<Arc<super::rewrite::RewriteOverflow>>,
     layout: crate::persistence::aof_manifest::AofLayout,
     /// Fsync policy configured at writer-task construction. Read on the
     /// hot append path: `Always` routes through `AppendSync` for
@@ -60,6 +65,9 @@ impl AofWriterPool {
         fsync_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
+            overflow: (0..1)
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders: vec![sender],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
@@ -91,6 +99,10 @@ impl AofWriterPool {
             "per_shard pool needs >=2 writers; use top_level for single-writer"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -116,6 +128,10 @@ impl AofWriterPool {
             "per_shard pool needs >=2 writers; use top_level for single-writer"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -160,6 +176,10 @@ impl AofWriterPool {
             "fold_notifiers must have one entry per shard"
         );
         Arc::new(Self {
+            overflow: senders
+                .iter()
+                .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -448,26 +468,79 @@ impl AofWriterPool {
     /// [`Self::try_send_append_durable`] (async contexts).
     #[inline]
     pub fn try_send_append(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
+        let ovf = self.overflow_for(shard_id);
+        // #452.1 ordering rule 1: while this writer's rewrite overflow holds
+        // spilled appends, every new append must also spill — a `try_send`
+        // that succeeds here would be replayed BEFORE the older spilled ones.
+        if ovf.spill_first() {
+            match ovf.try_spill(AofMessage::Append { lsn, db, bytes }) {
+                Ok(()) => return true,
+                // Drain just completed — the channel is live again.
+                Err(super::rewrite_overflow::SpillReject::Disarmed(AofMessage::Append {
+                    lsn,
+                    db,
+                    bytes,
+                })) => {
+                    return self.try_send_append_no_spill(shard_id, lsn, db, bytes);
+                }
+                // Cap reached with older records buffered: dropping keeps
+                // replay order monotone; the channel would invert it.
+                Err(_) => {
+                    super::record_append_dropped(1);
+                    tracing::error!(
+                        "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
+                        shard_id,
+                        lsn
+                    );
+                    return false;
+                }
+            }
+        }
+        self.try_send_append_no_spill(shard_id, lsn, db, bytes)
+    }
+
+    /// [`Self::try_send_append`] minus the spill-first gate: `try_send`, then
+    /// on Full one spill attempt (rewrite in progress), then the pre-existing
+    /// counted drop.
+    #[inline]
+    fn try_send_append_no_spill(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
         match self
             .sender(shard_id)
             .try_send(AofMessage::Append { lsn, db, bytes })
         {
             Ok(()) => true,
             Err(e) => {
-                if matches!(e, flume::TrySendError::Full(_)) {
-                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reason = match &e {
+                    flume::TrySendError::Full(_) => "full",
+                    flume::TrySendError::Disconnected(_) => "disconnected",
+                };
+                if let flume::TrySendError::Full(msg) = e {
+                    // #452.1: channel saturated — if a rewrite fold is holding
+                    // the writer out of its recv loop, spill instead of drop.
+                    if self.overflow_for(shard_id).try_spill(msg).is_ok() {
+                        return true;
+                    }
                 }
+                // #452.4: EVERY acked-append drop routes through the
+                // accounting helper (counter + sticky degraded latch).
+                super::record_append_dropped(1);
                 warn!(
                     "AOF append dropped for shard {} (lsn {}): channel {}",
-                    shard_id,
-                    lsn,
-                    match e {
-                        flume::TrySendError::Full(_) => "full",
-                        flume::TrySendError::Disconnected(_) => "disconnected",
-                    }
+                    shard_id, lsn, reason
                 );
                 false
             }
+        }
+    }
+
+    /// The rewrite-window overflow slot for `shard_id`'s writer — same
+    /// mapping as [`Self::sender`].
+    #[inline]
+    pub(crate) fn overflow_for(&self, shard_id: usize) -> &Arc<super::rewrite::RewriteOverflow> {
+        use crate::persistence::aof_manifest::AofLayout;
+        match self.layout {
+            AofLayout::TopLevel => &self.overflow[0],
+            AofLayout::PerShard => &self.overflow[shard_id],
         }
     }
 
@@ -503,10 +576,33 @@ impl AofWriterPool {
         bytes: Bytes,
         budget: &mut Duration,
     ) -> bool {
+        use super::rewrite_overflow::SpillReject;
         let mut msg = AofMessage::Append { lsn, db, bytes };
+        // #452.1 ordering rule 1: while the rewrite overflow holds spilled
+        // appends, keep spilling — see `try_send_append`. A cap-exceeded
+        // refusal must DROP (with accounting), never proceed to the channel:
+        // a blocking send that succeeds mid-fold would place this newer
+        // record ahead of the older buffered ones at the post-fold drain.
+        let ovf = self.overflow_for(shard_id);
+        if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return true,
+                Err(SpillReject::Disarmed(returned)) => msg = returned,
+                Err(SpillReject::CapExceeded) => {
+                    super::record_append_dropped(1);
+                    tracing::error!(
+                        "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
+                        shard_id,
+                        lsn
+                    );
+                    return false;
+                }
+            }
+        }
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return true,
             Err(flume::TrySendError::Disconnected(_)) => {
+                super::record_append_dropped(1);
                 warn!(
                     "AOF append dropped for shard {} (lsn {}): channel disconnected",
                     shard_id, lsn
@@ -515,8 +611,23 @@ impl AofWriterPool {
             }
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
+        // #452.1: channel saturated — spill instead of blocking/dropping when
+        // a rewrite fold is holding the writer out of its recv loop.
+        match ovf.try_spill(msg) {
+            Ok(()) => return true,
+            Err(SpillReject::Disarmed(returned)) => msg = returned,
+            Err(SpillReject::CapExceeded) => {
+                super::record_append_dropped(1);
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
+                    shard_id,
+                    lsn
+                );
+                return false;
+            }
+        }
         if budget.is_zero() {
-            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::record_append_dropped(1);
             tracing::error!(
                 "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
                  backpressure_dropped={}",
@@ -537,7 +648,7 @@ impl AofWriterPool {
             Ok(()) => true,
             Err(e) => {
                 if matches!(e, flume::SendTimeoutError::Timeout(_)) {
-                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    super::record_append_dropped(1);
                 }
                 tracing::error!(
                     "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
@@ -571,11 +682,43 @@ impl AofWriterPool {
         db: usize,
         bytes: Bytes,
     ) -> Result<(), AofAck> {
+        use super::rewrite_overflow::SpillReject;
         let mut msg = AofMessage::Append { lsn, db, bytes };
+        // #452.1 ordering rule 1 (P0 fix): this path MUST honor the spill
+        // gate like every other producer — the fold's phase-1/3 drains free
+        // channel slots mid-fold, so an ungated `try_send` here could place
+        // this NEWER append in the channel while OLDER spilled ones sit in
+        // the buffer; the post-fold drain writes channel-before-buffer,
+        // inverting same-key replay order (e.g. SET after a spilled
+        // eviction-DEL replays as DEL-last → acked key deleted).
+        let ovf = self.overflow_for(shard_id);
+        if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return Ok(()),
+                Err(SpillReject::Disarmed(returned)) => msg = returned,
+                Err(SpillReject::CapExceeded) => {
+                    super::record_append_dropped(1);
+                    return Err(AofAck::ChannelFull);
+                }
+            }
+        }
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return Ok(()),
             Err(flume::TrySendError::Disconnected(_)) => return Err(AofAck::WriteFailed),
             Err(flume::TrySendError::Full(returned)) => msg = returned,
+        }
+        // Channel full: if a fold is in progress, spill instead of parking —
+        // a parked `send_async` that completes mid-fold (slot freed by the
+        // fold's own drains) would enter the channel AFTER newer appends
+        // started spilling, and the finish drain would replay it out of
+        // order relative to them.
+        match ovf.try_spill(msg) {
+            Ok(()) => return Ok(()),
+            Err(SpillReject::Disarmed(returned)) => msg = returned,
+            Err(SpillReject::CapExceeded) => {
+                super::record_append_dropped(1);
+                return Err(AofAck::ChannelFull);
+            }
         }
         // Cancel-safety note: flume's `send_async` future is NOT cancel-safe.
         // If the timeout wins the race after the future has already enqueued
@@ -612,7 +755,7 @@ impl AofWriterPool {
             };
         }
         if outcome == Err(AofAck::ChannelFull) {
-            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::record_append_dropped(1);
             warn!(
                 "AOF writer channel full (shard {}): everysec append dropped after {:?} \
                  backpressure bound; backpressure_dropped={}",
@@ -651,20 +794,49 @@ impl AofWriterPool {
         db: usize,
         bytes: Bytes,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
+        use super::rewrite_overflow::SpillReject;
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
-        match self.sender(shard_id).try_send(AofMessage::AppendSync {
+        let mut msg = AofMessage::AppendSync {
             lsn,
             db,
             bytes,
             ack: ack_tx,
-        }) {
+        };
+        // #452.1 ordering rule 1 (P0 fix): AppendSync producers (always-path
+        // appends and zero-length fsync barriers) must honor the spill gate
+        // too — an ungated barrier entering the channel mid-fold would ack
+        // "durable" while older spilled appends are not yet on disk, and an
+        // ungated always-append would invert same-key replay order. A
+        // spilled AppendSync's ack parks until the post-fold boundary fsync
+        // (issue #140 discipline), which is exactly the durability point of
+        // everything buffered before it.
+        let ovf = self.overflow_for(shard_id);
+        if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return ack_rx,
+                Err(SpillReject::Disarmed(returned)) => msg = returned,
+                Err(SpillReject::CapExceeded) => {
+                    super::record_append_dropped(1);
+                    let (pre_tx, pre_rx) = crate::runtime::channel::oneshot::<AofAck>();
+                    let _ = pre_tx.send(AofAck::ChannelFull);
+                    return pre_rx;
+                }
+            }
+        }
+        match self.sender(shard_id).try_send(msg) {
             Ok(()) => {}
-            Err(flume::TrySendError::Full(_)) => {
+            Err(flume::TrySendError::Full(returned)) => {
+                // #452.1: channel saturated — spill if a fold is in
+                // progress (armed) before falling to the counted drop.
+                match self.overflow_for(shard_id).try_spill(returned) {
+                    Ok(()) => return ack_rx,
+                    Err(_) => {}
+                }
                 // Writer channel is at capacity — count the dropped entry and
                 // signal ChannelFull back to the caller via a pre-filled
                 // oneshot so the caller's `.await` resolves immediately to
                 // Err(AofAck::ChannelFull) without a writer round-trip.
-                AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::record_append_dropped(1);
                 warn!(
                     "AOF writer channel full (shard {}): AppendSync dropped; \
                      backpressure_dropped={}",
@@ -722,11 +894,45 @@ impl AofWriterPool {
             lsn,
         );
         let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
-        let _ = self.sender(shard_id).try_send(AofMessage::Append {
+        let msg = AofMessage::Append {
             lsn: tagged_lsn,
             db,
             bytes,
-        });
+        };
+        // #452.1 (re-verify Q2): this leg must honor the same spill-first
+        // gate as every other producer — an ungated try_send during a fold
+        // could place this record ahead of older buffered ones at the
+        // post-fold drain. And its drops must be counted (P2.5), never a
+        // silent `let _ =`.
+        let overflow = self.overflow_for(shard_id);
+        let msg = if overflow.spill_first() {
+            match overflow.try_spill(msg) {
+                Ok(()) => return,
+                Err(super::rewrite_overflow::SpillReject::Disarmed(m)) => m,
+                Err(super::rewrite_overflow::SpillReject::CapExceeded) => {
+                    super::record_append_dropped(1);
+                    tracing::error!("AOF ordered append dropped: rewrite overflow cap exceeded");
+                    return;
+                }
+            }
+        } else {
+            msg
+        };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(m)) => match overflow.try_spill(m) {
+                Ok(()) => {}
+                Err(_) => {
+                    super::record_append_dropped(1);
+                    tracing::error!(
+                        "AOF ordered append dropped: writer channel full and overflow unavailable"
+                    );
+                }
+            },
+            Err(flume::TrySendError::Disconnected(_)) => {
+                super::record_append_dropped(1);
+            }
+        }
     }
 
     /// Issue an LSN for an AOF append at every call site that has the
@@ -761,7 +967,10 @@ impl AofWriterPool {
     pub fn try_send_rewrite(&self, msg: AofMessage) -> Result<(), AofPoolSendError> {
         use crate::persistence::aof_manifest::AofLayout;
         debug_assert!(
-            matches!(msg, AofMessage::Rewrite(_) | AofMessage::RewriteSharded(_)),
+            matches!(
+                msg,
+                AofMessage::Rewrite(..) | AofMessage::RewriteSharded(..)
+            ),
             "try_send_rewrite called with a non-Rewrite variant",
         );
         if self.layout == AofLayout::PerShard {
@@ -873,6 +1082,7 @@ impl AofWriterPool {
                 coord: coord.clone(),
                 fold_producer,
                 fold_notifier,
+                overflow: self.overflow[idx].clone(),
             })
             .is_err()
             {
@@ -1209,7 +1419,10 @@ mod pool_tests {
 
         let dummies: SharedDatabases = Arc::new(vec![]);
         let err = pool
-            .try_send_rewrite(AofMessage::Rewrite(dummies))
+            .try_send_rewrite(AofMessage::Rewrite(
+                dummies,
+                std::sync::Arc::new(crate::persistence::aof::rewrite::RewriteOverflow::new()),
+            ))
             .unwrap_err();
         assert_eq!(err, AofPoolSendError::RewriteUnsupportedInPerShard);
     }
@@ -1220,8 +1433,12 @@ mod pool_tests {
         let pool = AofWriterPool::top_level(tx);
 
         let dummies: SharedDatabases = Arc::new(vec![]);
-        pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap();
-        assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(_))));
+        pool.try_send_rewrite(AofMessage::Rewrite(
+            dummies,
+            std::sync::Arc::new(crate::persistence::aof::rewrite::RewriteOverflow::new()),
+        ))
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(..))));
     }
 
     #[test]
@@ -2234,6 +2451,26 @@ mod pool_tests {
         );
     }
 
+    /// #452.4: any drop must flip the sticky degraded latch.
+    #[test]
+    fn dropped_append_latches_degraded_status() {
+        let (tx, _rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let pool = AofWriterPool::top_level(tx);
+        assert!(pool.try_send_append(0, 1, 0, Bytes::from_static(b"fill")));
+        let mut budget = Duration::ZERO;
+        assert!(!pool.send_append_bounded_blocking(
+            0,
+            2,
+            0,
+            Bytes::from_static(b"lost"),
+            &mut budget
+        ));
+        assert!(
+            !super::super::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
+            "a dropped acked append must latch aof_last_append_status:err"
+        );
+    }
+
     /// Sync SPSC-path variant: `send_append_bounded_blocking` blocks up to
     /// the bound, then reports the loss (false + counter) instead of
     /// pretending success.
@@ -2336,5 +2573,119 @@ mod pool_tests {
             rx0.try_recv(),
             Ok(AofMessage::Append { lsn: 9, .. })
         ));
+    }
+
+    /// P0 fix (adversarial review): the async everysec backpressure path
+    /// (`try_send_append_durable` → `send_append_backpressure`) must honor
+    /// the spill gate. Pre-fix it did a plain `try_send`, so with a fold in
+    /// progress and older spills buffered, a channel slot freed by the
+    /// fold's own phase drains let a NEWER append into the channel — the
+    /// post-fold drain writes channel-before-buffer, inverting same-key
+    /// replay order (e.g. SET entering ahead of a spilled eviction-DEL →
+    /// replay deletes an acked key).
+    /// Re-verify Q2: the ordered (cross-shard TXN) leg must honor the
+    /// spill-first gate like every other producer, and its cap/full drops
+    /// must be counted — the pre-fix body was an ungated silent `let _ =`.
+    #[test]
+    fn ordered_append_spills_while_buffer_nonempty() {
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level(tx);
+        let ovf = pool.overflow_for(0);
+        ovf.arm();
+        assert!(
+            ovf.try_spill(AofMessage::Append {
+                lsn: 1,
+                db: 0,
+                bytes: Bytes::from_static(b"older-buffered"),
+            })
+            .is_ok()
+        );
+        // Channel has room, but the non-empty buffer must win (rule 1).
+        pool.try_send_append_ordered(0, 2, 0, Bytes::from_static(b"newer-ordered"));
+        assert_eq!(
+            rx.len(),
+            0,
+            "ordered append must spill, not enter the channel ahead of older buffered entries"
+        );
+        assert_eq!(ovf.buffered_len_for_test(), 2);
+    }
+
+    #[test]
+    fn backpressure_path_spills_while_buffer_nonempty() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level(tx);
+        let ovf = pool.overflow_for(0);
+        ovf.arm();
+        assert!(
+            ovf.try_spill(AofMessage::Append {
+                lsn: 1,
+                db: 0,
+                bytes: Bytes::from_static(b"older-spilled"),
+            })
+            .is_ok()
+        );
+
+        // Channel has plenty of room — the gate must STILL spill.
+        let result = futures::executor::block_on(pool.try_send_append_durable(
+            0,
+            2,
+            0,
+            Bytes::from_static(b"newer"),
+        ));
+        assert!(result.is_ok(), "spilled append must report enqueued");
+        assert!(
+            rx.is_empty(),
+            "gated backpressure producer must spill, never enter the channel \
+             while older records sit in the overflow buffer"
+        );
+    }
+
+    /// P0 fix (adversarial review): AppendSync producers (always-path
+    /// appends and fsync barriers via `try_send_append_sync`) must honor the
+    /// spill gate too. A spilled AppendSync's ack parks until the post-fold
+    /// boundary fsync — the durability point of everything buffered before
+    /// it — then resolves Synced.
+    #[test]
+    fn append_sync_spills_while_buffer_nonempty_and_acks_after_finish() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level(tx);
+        let ovf = pool.overflow_for(0);
+        ovf.arm();
+        assert!(
+            ovf.try_spill(AofMessage::Append {
+                lsn: 1,
+                db: 0,
+                bytes: Bytes::from_static(b"older-spilled"),
+            })
+            .is_ok()
+        );
+
+        let ack_rx = pool.try_send_append_sync(0, 2, 0, Bytes::from_static(b"durable"));
+        assert!(
+            rx.is_empty(),
+            "gated AppendSync must spill, never enter the channel while older \
+             records sit in the overflow buffer"
+        );
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "spilled AppendSync ack must park until the post-fold fsync"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("incr.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut db_ctx = 0usize;
+        pool.overflow_for(0)
+            .finish_framed(&rx, &mut file, &mut db_ctx, true)
+            .unwrap();
+        assert_eq!(
+            ack_rx.try_recv(),
+            Ok(AofAck::Synced),
+            "post-fold boundary fsync must resolve the parked ack"
+        );
     }
 }

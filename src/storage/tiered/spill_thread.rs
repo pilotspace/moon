@@ -79,6 +79,42 @@ const FLUSH_ENTRY_CAP: usize = 256;
 /// path (one value's worth of pages) rather than a multiplicative one.
 const BATCH_BYTES_CAP: usize = 4 * 1024 * 1024;
 
+/// Request-channel depth (see `SpillThread::new`). Also referenced by the
+/// pacing cutoff below so "deep backlog" stays defined relative to capacity.
+const REQUEST_QUEUE_CAP: usize = 4096;
+
+/// Task #59 lever 2 — read/write device fairness, the pacing decision.
+///
+/// After each durable batch flush (a multi-MB pwrite + fsync), the spill
+/// thread asks whether to briefly YIELD the device before building the next
+/// batch. Under a sustained spill flood the device queue is otherwise
+/// permanently deep with writer traffic, and a cold reader's pread waits
+/// behind all of it (measured p99 208ms for a raw 64KB O_DIRECT read during
+/// the G2-shape flood, vs 6ms idle).
+///
+/// Rules, in priority order:
+/// - Nobody is reading → never pause (zero throughput cost when idle).
+/// - Request backlog ≥ half capacity → never pause: a paced spill thread
+///   must not push eviction into `try_send` failure, which surfaces as -OOM
+///   to write clients. Full-speed drain wins over read latency there.
+/// - Otherwise → one small fixed quantum. 4ms per flush caps the throughput
+///   tax at ~a few percent of a typical flush's own write+fsync time while
+///   giving a queued pread a window in which the device queue is empty.
+///
+/// Pure function of its inputs for unit-testability.
+pub(crate) fn spill_pace_after_flush(
+    reads_inflight: usize,
+    backlog_len: usize,
+) -> std::time::Duration {
+    const PACE_QUANTUM_MS: u64 = 4;
+    const BACKLOG_CUTOFF: usize = REQUEST_QUEUE_CAP / 2;
+    if reads_inflight == 0 || backlog_len >= BACKLOG_CUTOFF {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(PACE_QUANTUM_MS)
+    }
+}
+
 /// Cumulative count of `SpillCompletion`s dropped. Dropping is **data loss**:
 /// the `.mpf` file is on disk but its manifest `add_file` + `cold_index` insert
 /// happen only when the event loop consumes the completion, and the keys are
@@ -115,6 +151,51 @@ pub fn spill_batches_flushed_total() -> u64 {
     SPILL_BATCHES_FLUSHED.load(Ordering::Relaxed)
 }
 
+/// Cumulative keys re-inserted into the hot table after a FAILED spill write
+/// (deep-review F1). Every increment means a pwrite failed (ENOSPC/EIO) after
+/// the key was already evicted from RAM; without the re-insert the key would
+/// read as nil until an AOF-replay restart. Exposed as
+/// `spill_failed_reinserted` in INFO — a nonzero value is an operator signal
+/// that the spill volume is failing writes.
+static SPILL_FAILED_REINSERTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative failed-spill hot re-inserts. Exposed for INFO / metrics.
+#[inline]
+pub fn spill_failed_reinserted_total() -> u64 {
+    SPILL_FAILED_REINSERTED.load(Ordering::Relaxed)
+}
+
+/// Record one failed-spill hot re-insert.
+#[inline]
+pub fn record_spill_failed_reinserted() {
+    SPILL_FAILED_REINSERTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Spill completions that landed on disk but were NOT published to the cold
+/// index because their in-flight record had been retired — the key was
+/// deleted, overwritten, or read-promoted while the spill was in flight
+/// (#459). Publishing those would resurrect a deleted key.
+///
+/// Not an error: it is the normal, correct outcome of a write racing a
+/// spill. It is counted because the spilled bytes become orphaned in their
+/// file, and a rate that tracks the eviction rate means the workload is
+/// re-touching keys as fast as they are being spilled — the signal that
+/// `maxmemory` is too small for the working set. Exposed as
+/// `spill_completion_superseded` in INFO.
+static SPILL_COMPLETION_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative superseded (unpublished) spill completions. For INFO / metrics.
+#[inline]
+pub fn spill_completion_superseded_total() -> u64 {
+    SPILL_COMPLETION_SUPERSEDED.load(Ordering::Relaxed)
+}
+
+/// Record one superseded spill completion.
+#[inline]
+pub fn record_spill_completion_superseded() {
+    SPILL_COMPLETION_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+}
+
 use bytes::Bytes;
 use tracing::warn;
 
@@ -130,6 +211,10 @@ use crate::storage::tiered::kv_spill::{
 ///
 /// Contains all data needed for pwrite -- no references to shard state.
 /// `Bytes` fields are reference-counted (cheap clone on event loop side).
+/// `Clone` exists so a FAILED write can carry the request back to the event
+/// loop for hot re-insert (deep-review F1) — cheap: both payload fields are
+/// refcounted `Bytes`.
+#[derive(Clone)]
 pub struct SpillRequest {
     pub key: Bytes,
     /// Logical database index the key was evicted from. Used by completion
@@ -168,6 +253,15 @@ pub struct SpillCompletionEntry {
     /// `ColdLocation::ttl_ms` (R1, H-2: proactive TTL-expiry sweep) without
     /// re-reading the just-written file.
     pub ttl_ms: Option<u64>,
+    /// Value type, likewise carried through from the `SpillRequest` so the
+    /// event loop can populate `ColdLocation::value_type` (#364: SCAN TYPE
+    /// filter over cold keys) without re-reading the just-written file.
+    pub value_type: ValueType,
+    /// The originating request's `file_id` (each request gets a unique
+    /// monotonic id even when batching flushes many requests into one
+    /// file). Lets the completion handler retire the per-key in-flight
+    /// spill record for exactly this request (stale-shadow guard).
+    pub req_file_id: u64,
 }
 
 /// Completion sent from background thread back to event loop.
@@ -181,10 +275,15 @@ pub struct SpillCompletion {
     pub entries: Vec<SpillCompletionEntry>,
     /// Whether the pwrite succeeded. If false, no entries should be indexed.
     pub success: bool,
+    /// On failure: the original request, so the event loop can re-insert the
+    /// already-evicted key into the hot table (deep-review F1 — without this
+    /// the key exists in neither plane and reads nil until restart).
+    /// Always `None` on success.
+    pub failed_request: Option<Box<SpillRequest>>,
 }
 
 /// Build a `FileEntry` skeleton for a spill file (fields not tracked by Moon are zero).
-fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
+fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64, db_index: usize) -> FileEntry {
     FileEntry {
         file_id,
         file_type: PageType::KvLeaf as u8,
@@ -194,7 +293,7 @@ fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
         page_count,
         byte_size,
         created_lsn: 0,
-        min_key_hash: 0,
+        db_index: db_index as u64,
         max_key_hash: 0,
         last_modified_lsn: 0,
     }
@@ -250,9 +349,16 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
     while start < buffer.len() {
         let mut end = start + 1;
         let mut chunk_bytes = buffer[start].value_bytes.len();
+        // Chunks additionally never cross a logical-DB boundary: the
+        // manifest attributes a whole file to ONE `db_index` (#139 — cold
+        // recovery re-attaches each file to the database its keys were
+        // evicted from), so a flush holding requests from several DBs
+        // produces one file per contiguous same-DB run. Interleaved
+        // multi-DB eviction costs extra files, never correctness.
+        let chunk_db = buffer[start].db_index;
         while end < buffer.len() {
             let next_len = buffer[end].value_bytes.len();
-            if chunk_bytes + next_len > BATCH_BYTES_CAP {
+            if chunk_bytes + next_len > BATCH_BYTES_CAP || buffer[end].db_index != chunk_db {
                 break;
             }
             chunk_bytes += next_len;
@@ -291,12 +397,15 @@ pub(crate) fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletio
                                 page_idx,
                                 slot_idx,
                                 ttl_ms: req.ttl_ms,
+                                value_type: req.value_type,
+                                req_file_id: req.file_id,
                             })
                             .collect();
                         completions.push(SpillCompletion {
-                            file_entry: make_file_entry(file_id, total_pages, byte_size),
+                            file_entry: make_file_entry(file_id, total_pages, byte_size, chunk_db),
                             entries,
                             success: true,
+                            failed_request: None,
                         });
                     }
                     Err(e) => {
@@ -352,15 +461,18 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
     ) {
         Ok(pages) => match write_kv_spill_pages(&req.shard_dir, file_id, &pages) {
             Ok(byte_size) => SpillCompletion {
-                file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
+                file_entry: make_file_entry(file_id, pages.total_pages, byte_size, req.db_index),
                 entries: vec![SpillCompletionEntry {
                     key: req.key.clone(),
                     db_index: req.db_index,
                     page_idx: 0,
                     slot_idx: 0,
                     ttl_ms: req.ttl_ms,
+                    value_type: req.value_type,
+                    req_file_id: req.file_id,
                 }],
                 success: true,
+                failed_request: None,
             },
             Err(e) => {
                 warn!(
@@ -370,9 +482,10 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                     "spill_thread: single-file write failed"
                 );
                 SpillCompletion {
-                    file_entry: make_file_entry(file_id, 0, 0),
+                    file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                     entries: Vec::new(),
                     success: false,
+                    failed_request: Some(Box::new(req.clone())),
                 }
             }
         },
@@ -384,9 +497,10 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
                 "spill_thread: single-file build failed (key too large)"
             );
             SpillCompletion {
-                file_entry: make_file_entry(file_id, 0, 0),
+                file_entry: make_file_entry(file_id, 0, 0, req.db_index),
                 entries: Vec::new(),
                 success: false,
+                failed_request: Some(Box::new(req.clone())),
             }
         }
     }
@@ -417,7 +531,7 @@ impl SpillThread {
     /// rebuilds `cold_index` from the manifest, so dropping is safe (though
     /// we count it for observability).
     pub fn new(shard_id: usize) -> Self {
-        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
+        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(REQUEST_QUEUE_CAP);
         let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
@@ -427,6 +541,11 @@ impl SpillThread {
         let join_handle = std::thread::Builder::new()
             .name(format!("spill-{shard_id}"))
             .spawn(move || {
+                // O5: this thread is spawned from the shard's own (pinned)
+                // event-loop thread and would otherwise inherit its exact
+                // single-core mask — re-pin to the non-shard core set as the
+                // first act, before anything else runs.
+                crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
                 Self::run(request_rx, completion_tx, stop_flag_bg);
             })
             .expect("failed to spawn spill thread");
@@ -451,6 +570,19 @@ impl SpillThread {
         stop_flag: Arc<AtomicBool>,
     ) {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
+
+        // Task #59 lever 2: after a durable batch flush, briefly yield the
+        // device to any waiting cold reader. Never paces at shutdown or when
+        // the request backlog is deep (see `spill_pace_after_flush`).
+        let pace = |request_rx: &flume::Receiver<SpillRequest>| {
+            let pause = spill_pace_after_flush(
+                super::cold_read_pool::COLD_READS_INFLIGHT.load(Ordering::Relaxed),
+                request_rx.len(),
+            );
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+        };
 
         loop {
             // Liveness heartbeat (R5): stamped every loop tick so INFO can
@@ -481,6 +613,7 @@ impl SpillThread {
                             flush_buffer(&mut buffer),
                             &stop_flag,
                         );
+                        pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Timeout) => {
@@ -491,6 +624,7 @@ impl SpillThread {
                             flush_buffer(&mut buffer),
                             &stop_flag,
                         );
+                        pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
@@ -639,6 +773,90 @@ mod tests {
         completions
     }
 
+    /// F1 (deep review): a failed spill write must carry the original request
+    /// back so the event loop can re-insert the already-evicted key.
+    #[test]
+    fn failed_spill_write_carries_request_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Make shard_dir an existing FILE so the spill write cannot succeed.
+        let bogus_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&bogus_dir, b"occupied").unwrap();
+
+        let req = SpillRequest {
+            key: Bytes::from_static(b"lost-key"),
+            db_index: 3,
+            value_bytes: Bytes::from_static(b"payload"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: Some(12345),
+            file_id: 42,
+            shard_dir: bogus_dir,
+        };
+        let completion = spill_single_entry(&req, req.file_id);
+        assert!(!completion.success);
+        let carried = completion
+            .failed_request
+            .expect("failure completion must carry the request payload back");
+        assert_eq!(carried.key, req.key);
+        assert_eq!(carried.db_index, 3);
+        assert_eq!(carried.value_bytes, req.value_bytes);
+        assert_eq!(carried.ttl_ms, Some(12345));
+    }
+
+    #[test]
+    fn pace_is_zero_when_no_readers_waiting() {
+        assert_eq!(
+            spill_pace_after_flush(0, 0),
+            std::time::Duration::ZERO,
+            "pacing must cost nothing when nobody is reading"
+        );
+        assert_eq!(
+            spill_pace_after_flush(0, REQUEST_QUEUE_CAP),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pace_is_zero_under_deep_backlog_even_with_readers() {
+        // A paced spill thread must never push eviction into try_send
+        // failure (-OOM to write clients): deep backlog always wins.
+        assert_eq!(
+            spill_pace_after_flush(3, REQUEST_QUEUE_CAP / 2),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            spill_pace_after_flush(100, REQUEST_QUEUE_CAP),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pace_yields_a_quantum_when_reader_waits_and_backlog_shallow() {
+        let d = spill_pace_after_flush(1, 0);
+        assert!(d > std::time::Duration::ZERO);
+        assert!(
+            d <= std::time::Duration::from_millis(10),
+            "quantum must stay small — this is a yield, not a stall ({d:?})"
+        );
+        assert_eq!(d, spill_pace_after_flush(64, REQUEST_QUEUE_CAP / 2 - 1));
+    }
+
+    #[test]
+    fn reader_inflight_guard_counts_and_releases() {
+        use super::super::cold_read_pool::ColdReadInflightGuard;
+        // Own counter, NOT the global COLD_READS_INFLIGHT: sibling tests in
+        // this binary exercise the cold-read path concurrently, so exact
+        // assertions on the shared global are racy. The RAII mechanics are
+        // identical either way.
+        static LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let _g1 = ColdReadInflightGuard::on(&LOCAL);
+            let _g2 = ColdReadInflightGuard::on(&LOCAL);
+            assert_eq!(LOCAL.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(LOCAL.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn test_spill_thread_new_returns_valid_handles() {
         let st = SpillThread::new(0);
@@ -738,6 +956,7 @@ mod tests {
             page_idx: entry.page_idx,
             slot_idx: entry.slot_idx,
             ttl_ms: entry.ttl_ms,
+            value_type: ValueType::String,
         };
         let result = read_cold_entry_at(tmp.path(), loc, 0);
         assert!(result.is_some(), "should read entry back");
@@ -761,9 +980,10 @@ mod tests {
         let (tx, rx) = flume::bounded::<SpillCompletion>(1);
         let stop = Arc::new(AtomicBool::new(false));
         let dummy = || SpillCompletion {
-            file_entry: make_file_entry(7, 1, PAGE_4K as u64),
+            file_entry: make_file_entry(7, 1, PAGE_4K as u64, 0),
             entries: Vec::new(),
             success: true,
+            failed_request: None,
         };
 
         // Saturate the single slot so the next send must wait for a free slot.
@@ -829,6 +1049,50 @@ mod tests {
             total, 1,
             "shutdown must return the unapplied completion, not drop it"
         );
+    }
+
+    /// Flush chunks must never cross a logical-DB boundary (#139): each
+    /// spill file is attributed wholesale to ONE `FileEntry::db_index`, so
+    /// a buffer interleaving dbs must produce one file per contiguous
+    /// same-db run, each completion carrying its db and only its keys.
+    #[test]
+    fn flush_buffer_cuts_chunks_at_db_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |key: &str, db: usize, file_id: u64| SpillRequest {
+            key: Bytes::from(key.to_owned()),
+            db_index: db,
+            value_bytes: Bytes::from_static(b"v"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id,
+            shard_dir: tmp.path().to_path_buf(),
+        };
+        let mut buffer = vec![
+            mk("a0", 0, 1),
+            mk("a1", 0, 2),
+            mk("b0", 1, 3),
+            mk("c0", 0, 4),
+        ];
+        let completions = flush_buffer(&mut buffer);
+        assert!(completions.iter().all(|c| c.success));
+        let summary: Vec<(u64, usize)> = completions
+            .iter()
+            .map(|c| (c.file_entry.db_index, c.entries.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(0, 2), (1, 1), (0, 1)],
+            "expected one file per contiguous same-db run: {summary:?}"
+        );
+        for c in &completions {
+            for e in &c.entries {
+                assert_eq!(
+                    e.db_index as u64, c.file_entry.db_index,
+                    "entry db must match its file's manifest attribution"
+                );
+            }
+        }
     }
 
     /// An entry that passes the `INLINE_MAX_VALUE_BYTES` pre-screen but does not
@@ -953,6 +1217,7 @@ mod tests {
                     page_idx: entry.page_idx,
                     slot_idx: entry.slot_idx,
                     ttl_ms: entry.ttl_ms,
+                    value_type: ValueType::String,
                 };
                 let outcome = crate::storage::tiered::cold_read::read_cold_entry_at(
                     tmp.path(),
@@ -1058,6 +1323,7 @@ mod tests {
                     page_idx: entry.page_idx,
                     slot_idx: entry.slot_idx,
                     ttl_ms: entry.ttl_ms,
+                    value_type: ValueType::String,
                 };
                 let result =
                     crate::storage::tiered::cold_read::read_cold_entry_at(tmp.path(), loc, 0);

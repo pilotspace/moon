@@ -1,0 +1,8 @@
+/Volumes/Games/tindang-repo/moon/target-stats/release-fast/deps/synstructure-949df511520b37bb.d: /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/lib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/macros.rs
+
+/Volumes/Games/tindang-repo/moon/target-stats/release-fast/deps/libsynstructure-949df511520b37bb.rlib: /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/lib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/macros.rs
+
+/Volumes/Games/tindang-repo/moon/target-stats/release-fast/deps/libsynstructure-949df511520b37bb.rmeta: /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/lib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/macros.rs
+
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/lib.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/synstructure-0.13.2/src/macros.rs:
