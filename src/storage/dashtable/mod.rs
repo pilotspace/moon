@@ -276,6 +276,17 @@ impl<V> DashTable<CompactKey, V> {
         self.split_count
     }
 
+    /// Global directory depth (log2 of directory size).
+    ///
+    /// SCAN's 48-bit cursor mapping (`Database::scan_hot_page`) relies on
+    /// `depth <= 48` so that equal-top-48-bit hashes always route to the
+    /// same segment; a depth beyond 48 would need a 2^48-entry directory,
+    /// unreachable on real hardware.
+    #[inline]
+    pub fn directory_depth(&self) -> u32 {
+        self.depth
+    }
+
     /// Resident bytes used by the DashTable structural overhead (segments +
     /// directory + index map). Does NOT include per-entry key/value data --
     /// that is tracked separately by `Database::used_memory`.
@@ -429,38 +440,50 @@ impl<V> DashTable<CompactKey, V> {
                 InsertOrUpdate::Updated(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
             }
             SegmentInsertOrUpdate::NeedsSplit { update, make } => {
-                // Split the segment, then retry via the normal insert path.
-                // The closures were not consumed by the segment helper.
-                self.split_segment(dir_idx);
+                // Split and retry until the key's target segment has room,
+                // mirroring `insert`'s recursive retry. A single split does
+                // NOT guarantee room: when the overflowing segment's keys are
+                // skewed on the next directory bit they can all land in the
+                // same child, which is then still over LOAD_THRESHOLD.
+                // Each split raises the target's local depth, so the loop
+                // terminates once the colliding keys separate.
+                let mut update = update;
+                let mut make = make;
+                let mut split_dir_idx = dir_idx;
+                let (final_seg_idx, slot, inserted) = loop {
+                    self.split_segment(split_dir_idx);
 
-                // After split, the directory may have doubled and the key now
-                // routes to a different segment. Recompute.
-                let new_dir_idx = segment_index(hash, self.depth);
-                let new_seg_idx = self.directory[new_dir_idx];
-                let new_segment = self.segments.get_mut(new_seg_idx);
+                    // After split, the directory may have doubled and the key
+                    // now routes to a different segment. Recompute.
+                    split_dir_idx = segment_index(hash, self.depth);
+                    let new_seg_idx = self.directory[split_dir_idx];
+                    let new_segment = self.segments.get_mut(new_seg_idx);
 
-                let retry =
-                    new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make);
-
-                match retry {
-                    SegmentInsertOrUpdate::Inserted { slot } => {
-                        self.len += 1;
-                        // SAFETY: just-inserted (mirrors find at segment.rs:277).
-                        InsertOrUpdate::Inserted(unsafe {
-                            self.segments.get_mut(new_seg_idx).value_mut(slot)
-                        })
+                    match new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make)
+                    {
+                        SegmentInsertOrUpdate::Inserted { slot } => {
+                            break (new_seg_idx, slot, true);
+                        }
+                        SegmentInsertOrUpdate::Updated { slot } => {
+                            break (new_seg_idx, slot, false);
+                        }
+                        SegmentInsertOrUpdate::NeedsSplit { update: u, make: m } => {
+                            update = u;
+                            make = m;
+                        }
                     }
-                    SegmentInsertOrUpdate::Updated { slot } => {
-                        // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
-                        InsertOrUpdate::Updated(unsafe {
-                            self.segments.get_mut(new_seg_idx).value_mut(slot)
-                        })
-                    }
-                    SegmentInsertOrUpdate::NeedsSplit { .. } => {
-                        // A single split guarantees room (LOAD_THRESHOLD < TOTAL_SLOTS
-                        // and split halves the load). This path should be unreachable.
-                        unreachable!("double NeedsSplit after split_segment")
-                    }
+                };
+                if inserted {
+                    self.len += 1;
+                    // SAFETY: just-inserted (mirrors find at segment.rs:277).
+                    InsertOrUpdate::Inserted(unsafe {
+                        self.segments.get_mut(final_seg_idx).value_mut(slot)
+                    })
+                } else {
+                    // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
+                    InsertOrUpdate::Updated(unsafe {
+                        self.segments.get_mut(final_seg_idx).value_mut(slot)
+                    })
                 }
             }
         }
@@ -514,6 +537,68 @@ impl<V> DashTable<CompactKey, V> {
     /// Return an iterator over `(&Bytes, &V)` pairs.
     pub fn iter(&self) -> Iter<'_, CompactKey, V> {
         Iter::new(self.segments.collect_refs(), self.len)
+    }
+
+    /// Hash-ordered page collection for SCAN (#368 O(COUNT) walk).
+    ///
+    /// Because the extendible-hashing directory is indexed by the hash's
+    /// TOP `global_depth` bits (`segment_index`), ascending directory order
+    /// is ascending hash order, and directory entry `d` covers exactly the
+    /// hash range `[d << (64-D), (d+1) << (64-D))`. Segments are therefore
+    /// range-partitioned: every entry of the segment at a lower directory
+    /// index hashes below every entry at a higher one. This walk starts at
+    /// the segment covering `from_hash` and visits segments in ascending
+    /// range order, stopping as soon as `want` qualifying entries are
+    /// collected — later segments can only contain larger hashes, so the
+    /// result is complete without touching the rest of the table.
+    ///
+    /// A segment with `local_depth < global_depth` occupies a CONTIGUOUS
+    /// run of directory slots, so alias-dedup is a consecutive store-index
+    /// comparison.
+    ///
+    /// Returns entries with `hash_key(key) >= from_hash` passing `alive`,
+    /// sorted ascending by `(hash, key)`, plus `true` if the walk stopped
+    /// with unvisited segments remaining (i.e. more entries may exist).
+    ///
+    /// Split/merge/directory-doubling between calls is safe by
+    /// construction: the caller's cursor is a position in hash space, and
+    /// structural churn only changes WHICH segment covers that position,
+    /// never the set of keys at or above it.
+    pub fn hash_page<F: Fn(&CompactKey, &V) -> bool>(
+        &self,
+        from_hash: u64,
+        want: usize,
+        alive: F,
+    ) -> (Vec<(u64, CompactKey)>, bool) {
+        let mut out: Vec<(u64, CompactKey)> = Vec::with_capacity(want.min(1024));
+        let start = segment_index(from_hash, self.depth);
+        let mut last_store_idx = usize::MAX;
+        let mut dir_idx = start;
+        while dir_idx < self.directory.len() {
+            let store_idx = self.directory[dir_idx];
+            if store_idx != last_store_idx {
+                last_store_idx = store_idx;
+                if out.len() >= want {
+                    // Enough collected and at least one unvisited segment
+                    // remains; everything in it hashes above what we have.
+                    return (Self::finish_page(out), true);
+                }
+                let seg = self.segments.get(store_idx);
+                for (k, v) in seg.iter_occupied() {
+                    let h = hash_key(k.as_ref());
+                    if h >= from_hash && alive(k, v) {
+                        out.push((h, k.clone()));
+                    }
+                }
+            }
+            dir_idx += 1;
+        }
+        (Self::finish_page(out), false)
+    }
+
+    fn finish_page(mut out: Vec<(u64, CompactKey)>) -> Vec<(u64, CompactKey)> {
+        out.sort_unstable_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        out
     }
 
     /// Return a mutable iterator over `(&Bytes, &mut V)` pairs.
@@ -592,11 +677,152 @@ impl<'a, V> IntoIterator for &'a DashTable<CompactKey, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::segment::TOTAL_SLOTS;
+    use super::segment::{LOAD_THRESHOLD, TOTAL_SLOTS};
     use super::*;
 
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
+    }
+
+    #[test]
+    fn test_insert_or_update_survives_skewed_double_split() {
+        // Keys sharing the top 12 hash bits route to the same segment for
+        // every split up to depth 12, so one split cannot separate them.
+        // Filling a segment past LOAD_THRESHOLD with such keys makes the
+        // post-split retry inside insert_or_update hit NeedsSplit again —
+        // the old code declared that unreachable and panicked (reproduced
+        // live replaying a 219k-key WAL checkpoint on recovery).
+        const SKEW_BITS: u32 = 12;
+        let want = LOAD_THRESHOLD + 2;
+        let target = hash_key(b"skew_0") >> (64 - SKEW_BITS);
+        let mut keys = Vec::with_capacity(want);
+        let mut i = 0u64;
+        while keys.len() < want {
+            let k = format!("skew_{i}");
+            if hash_key(k.as_bytes()) >> (64 - SKEW_BITS) == target {
+                keys.push(k);
+            }
+            i += 1;
+        }
+
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for (n, k) in keys.iter().enumerate() {
+            let mut updated = false;
+            table.insert_or_update(
+                CompactKey::from(k.clone()),
+                |_| updated = true,
+                || format!("v{n}"),
+            );
+            assert!(!updated, "unexpected in-place update for fresh key {k}");
+        }
+
+        assert_eq!(table.len(), want);
+        for (n, k) in keys.iter().enumerate() {
+            assert_eq!(
+                table.get(k.as_bytes()),
+                Some(&format!("v{n}")),
+                "missing {k} after skewed splits"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_page_empty_table_is_terminal() {
+        let table: DashTable<CompactKey, String> = DashTable::new();
+        let (page, more) = table.hash_page(0, 16, |_, _| true);
+        assert!(page.is_empty());
+        assert!(!more);
+    }
+
+    #[test]
+    fn hash_page_alive_filter_and_more_flag() {
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for i in 0..2000u32 {
+            table.insert(CompactKey::from(format!("af_{i}")), test_value(i));
+        }
+        // Filter out every odd value: only evens may appear.
+        let (page, _) = table.hash_page(0, 200, |_, v| {
+            let n: u32 = v.trim_start_matches("value_").parse().unwrap();
+            n % 2 == 0
+        });
+        assert!(!page.is_empty());
+        for (_, k) in &page {
+            let n: u32 = std::str::from_utf8(k.as_ref())
+                .unwrap()
+                .trim_start_matches("af_")
+                .parse()
+                .unwrap();
+            assert_eq!(n % 2, 0, "alive filter leaked odd key {n}");
+        }
+        // A want larger than the table drains everything in one page.
+        let (all, more) = table.hash_page(0, usize::MAX, |_, _| true);
+        assert_eq!(all.len(), 2000);
+        assert!(!more, "full drain must report no further segments");
+    }
+
+    #[test]
+    fn hash_page_drains_in_hash_order_under_split_churn() {
+        // 4000 keys force many segment splits + directory doublings; paging
+        // with concurrent inserts between pages exercises the split-safety
+        // claim (cursor is a hash-space position, not a structure position).
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        let mut original: Vec<String> = Vec::with_capacity(4000);
+        for i in 0..4000u32 {
+            let k = format!("hp_{i}");
+            table.insert(CompactKey::from(k.clone()), test_value(i));
+            original.push(k);
+        }
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut churn = 0u32;
+        loop {
+            let (page, more) = table.hash_page(cursor, 64, |_, _| true);
+            let mut prev: Option<(u64, &[u8])> = None;
+            for (h, k) in &page {
+                assert!(*h >= cursor, "entry below cursor");
+                assert_eq!(*h, hash_key(k.as_ref()), "stale hash in page");
+                if let Some((ph, pk)) = prev {
+                    assert!(
+                        (ph, pk) < (*h, k.as_ref()),
+                        "page not ascending by (hash, key)"
+                    );
+                }
+                prev = Some((*h, k.as_ref()));
+            }
+            if page.is_empty() {
+                assert!(!more, "empty page must be terminal");
+                break;
+            }
+            for (_, k) in &page {
+                assert!(
+                    seen.insert(k.as_ref().to_vec()),
+                    "duplicate key across pages: {:?}",
+                    String::from_utf8_lossy(k.as_ref())
+                );
+            }
+            #[allow(clippy::unwrap_used)] // page verified non-empty above
+            let last = page.last().unwrap().0;
+            cursor = last + 1;
+            if !more {
+                break;
+            }
+            // Structural churn between pages: force splits mid-walk.
+            for _ in 0..50 {
+                table.insert(
+                    CompactKey::from(format!("churn_{churn}")),
+                    test_value(churn),
+                );
+                churn += 1;
+            }
+        }
+
+        for k in &original {
+            assert!(
+                seen.contains(k.as_bytes()),
+                "stable key {k} lost during split churn"
+            );
+        }
     }
 
     #[test]

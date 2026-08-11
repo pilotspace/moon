@@ -43,7 +43,12 @@ impl Drop for Moon {
 }
 
 fn bin_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    // MOON_BIN -> CARGO_BIN_EXE_moon (cargo guarantees this exists for any
+    // test binary that references it) -> target/{release,debug} — see
+    // `common::find_moon_binary`. The bare `target/release/moon` guess this
+    // used to return unconditionally could silently pick a stale binary of
+    // unknown provenance on a shared checkout.
+    common::find_moon_binary()
 }
 
 /// GET `url` with the given headers, returning the raw response even for

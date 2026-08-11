@@ -79,6 +79,7 @@ fn base_config(port: u16) -> ServerConfig {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        memory_thp: false,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,

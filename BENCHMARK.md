@@ -326,6 +326,47 @@ Multi-client (pinned-core VM probe): busy-poll also wins c=8 (+6.5%) and c=64 (+
 owner-task participation — DEFER_TASKRUN, TWA_SIGNAL, and SQPOLL variants all measured worse;
 experiment ledger in `tmp/KV-FULLPROOF.md` Round 2).
 
+### 2.11 2026-08-10 RESP3 type-fidelity regression check (branch `fix/resp3-type-fidelity`, `eff5a1e9`, PR #463)
+
+**Not a performance claim — a no-regression gate.** PR #463 adds a shape classification on the
+command path (`Resp3Shape`, computed at enqueue for cross-shard commands) and a conversion at the
+reply exit. Both are gated on `proto >= 3`; `redis-benchmark` speaks RESP2, so this measures the
+cost of the *gate*, which is the thing that could regress every existing workload.
+
+**Method — and why the first attempt was discarded.** A single full `bench-compare.sh` matrix
+(200k requests, both arches, main vs branch) produced apparent Moon regressions of −16.3% (HSET),
+−15.5% (LRANGE 100) and −11.4% (GET) on x86. Those were **noise, not signal**: Redis — unchanged
+code, benchmarked in both legs — drifted by up to **−27.0%** on x86 and **+11.3%** on ARM between
+the same two legs. When the control moves further than the subject, no per-row number is
+interpretable (cf. §2.5).
+
+The single pass was therefore replaced by an **interleaved A/B**: 5 repetitions alternating
+main → branch → main → branch, so thermal and neighbour drift hit both legs equally, 100k requests
+per point, Redis re-measured every repetition as an ongoing control. "Noise floor" below is the
+worst within-leg coefficient of variation across the four series for that row (Moon-main,
+Moon-branch, Redis-main, Redis-branch).
+
+| arch | median Moon Δ (branch vs main) | median noise floor | rows outside noise |
+|------|:---:|:---:|:---:|
+| **x86 c3-standard-8** | **+0.00%** | 5.99% | **0 / 18** |
+| **ARM t2a-standard-8** | **+0.72%** | 3.63% | 1 / 18 |
+
+Grid: {SET, GET, INCR, LPUSH, SPOP, HSET} × p={1, 8, 64}, 50 clients, shards=1, `--appendonly no
+--disk-offload disable`, Redis 7.0.15 with `--save "" --appendonly no`.
+
+The one ARM row outside its floor is GET p=1 at **+7.41%** against a 5.33% floor — a *gain*, and
+not a claimable one: Redis on the same row moved +2.45% in the same direction, leaving ~5% residual
+against a 5.33% floor. Recorded rather than claimed.
+
+**Conclusion: no regression is detectable at this resolution on either architecture.** The stronger
+statement — "there is no regression" — is not supported and is not made; what is supported is that
+any effect is smaller than a noise floor of 3.6% (ARM) / 6.0% (x86).
+
+**Caveats:** (1) shared-tenant GCE instances, not pinned/dedicated — see §2.5 and the §2.10 pinning
+caveat; (2) RESP2 path only, since `redis-benchmark` cannot negotiate RESP3 — the converted RESP3
+path is covered for *correctness* by `tests/resp3_type_fidelity.rs` and the client-compat harness,
+not for throughput; (3) shards=1, loopback.
+
 ---
 
 ## 3. Memory Efficiency

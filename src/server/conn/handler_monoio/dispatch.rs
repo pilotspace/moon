@@ -8,7 +8,6 @@
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
 use bytes::Bytes;
-use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,8 +19,6 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::extract_bytes;
-use crate::shard::dispatch::ShardMessage;
-use crate::shard::mesh::ChannelMesh;
 use crate::tracking::TrackingState;
 use crate::workspace::strip_workspace_prefix_from_response;
 
@@ -58,8 +55,7 @@ pub(super) fn check_auth_gate(
             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
             if let Some(uname) = opt_user {
                 conn.authenticated = true;
-                conn.current_user = uname;
-                conn.refresh_acl_cache(&ctx.acl_table);
+                conn.adopt_user(uname, &ctx.acl_table);
                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                     crate::auth_ratelimit::record_success(addr.ip());
                 }
@@ -99,8 +95,7 @@ pub(super) fn check_auth_gate(
                 conn.client_name = Some(name);
             }
             if let Some(ref uname) = opt_user {
-                conn.current_user = uname.clone();
-                conn.refresh_acl_cache(&ctx.acl_table);
+                conn.adopt_user(uname.clone(), &ctx.acl_table);
             }
             // HELLO AUTH rate limiting
             if matches!(&response, Frame::Error(_)) {
@@ -220,12 +215,14 @@ pub(super) fn try_handle_eval(
 
 /// Handle SCRIPT subcommands (LOAD, EXISTS, FLUSH). Returns `true` if consumed.
 ///
-/// `#[inline]`: see `try_handle_cluster` rationale.
-#[inline]
-pub(super) fn try_handle_script(
+/// Async since E3: the SCRIPT LOAD fan-out retries a full ring with bounded
+/// backpressure instead of silently dropping the load (divergent per-shard
+/// script caches). Cold path — SCRIPT is never hot.
+pub(super) async fn try_handle_script(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
@@ -234,21 +231,8 @@ pub(super) fn try_handle_script(
     let (response, fanout) =
         crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
     if let Some((sha1, script_bytes)) = fanout {
-        let mut producers = ctx.dispatch_tx.borrow_mut();
-        for target in 0..ctx.num_shards {
-            if target == ctx.shard_id {
-                continue;
-            }
-            let idx = ChannelMesh::target_index(ctx.shard_id, target);
-            let msg = ShardMessage::ScriptLoad {
-                sha1: sha1.clone(),
-                script: script_bytes.clone(),
-            };
-            if producers[idx].try_push(msg).is_ok() {
-                ctx.spsc_notifiers[target].notify_one();
-            }
-        }
-        drop(producers);
+        crate::server::conn::shared::script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes)
+            .await;
     }
     responses.push(response);
     true
@@ -276,9 +260,7 @@ pub(super) fn try_handle_cluster_routing(
     let maybe_key = super::extract_primary_key(cmd, cmd_args);
     if let Some(key) = maybe_key {
         let slot = crate::cluster::slots::slot_for_key(key);
-        #[allow(clippy::unwrap_used)]
-        // std RwLock: poison = prior panic = unrecoverable
-        let route = cs.read().unwrap().route_slot(slot, was_asking);
+        let route = cs.read().route_slot(slot, was_asking);
         match route {
             crate::cluster::SlotRoute::Local => {} // proceed
             other => {
@@ -337,8 +319,7 @@ pub(super) fn try_handle_auth(
     }
     let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
     if let Some(uname) = opt_user {
-        conn.current_user = uname;
-        conn.refresh_acl_cache(&ctx.acl_table);
+        conn.adopt_user(uname, &ctx.acl_table);
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             crate::auth_ratelimit::record_success(addr.ip());
         }
@@ -382,8 +363,7 @@ pub(super) fn try_handle_hello(
         conn.client_name = Some(name);
     }
     if let Some(ref uname) = opt_user {
-        conn.current_user = uname.clone();
-        conn.refresh_acl_cache(&ctx.acl_table);
+        conn.adopt_user(uname.clone(), &ctx.acl_table);
     }
     if matches!(&response, Frame::Error(_)) {
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
@@ -418,6 +398,7 @@ pub(super) fn try_handle_acl(
         &conn.current_user,
         peer_addr,
         &ctx.runtime_config,
+        conn.client_id,
     );
     responses.push(response);
     true
@@ -429,12 +410,20 @@ pub(super) fn try_handle_config(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    proto: u8,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CONFIG") {
         return false;
     }
-    responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
+    // This intercept short-circuits the generic dispatch exit, so it must
+    // apply the RESP3 conversion itself — otherwise `CONFIG GET` reaches the
+    // wire as a flat Array where Redis sends a Map. That omission is exactly
+    // why CONFIG was the one command the old converter could never fix.
+    let reply = handle_config(cmd_args, &ctx.runtime_config, &ctx.config);
+    responses.push(crate::server::conn::util::apply_resp3_conversion(
+        cmd, cmd_args, reply, proto,
+    ));
     true
 }
 
@@ -814,7 +803,12 @@ pub(super) fn try_enforce_readonly(
 #[inline]
 pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
     if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
-        let msg: &'static [u8] = if crate::shard::disk_monitor::is_write_paused() {
+        // dir-lost first: it also sets `is_write_paused`, and "diskfull"
+        // would send the operator hunting free space instead of the missing
+        // data directory (#366).
+        let msg: &'static [u8] = if crate::shard::disk_monitor::is_dir_lost() {
+            b"MOONERR dirmissing: data directory was removed; writes refused until it is restored"
+        } else if crate::shard::disk_monitor::is_write_paused() {
             b"MOONERR diskfull: writes paused until free space recovers"
         } else if crate::shard::mem_monitor::is_write_paused() {
             b"MOONERR memfull: writes paused until memory pressure recovers"
@@ -982,7 +976,9 @@ pub(super) fn try_handle_client_admin(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -1000,13 +996,21 @@ pub(super) fn try_handle_client_admin(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
-                responses.push(Frame::BulkString(Bytes::from(info)));
+                // RESP3 sends CLIENT INFO as a Verbatim string. This intercept
+                // never reaches the generic dispatch exit, so it converts here.
+                responses.push(crate::protocol::resp3::apply_shape(
+                    crate::protocol::resp3::Resp3Shape::Verbatim,
+                    Frame::BulkString(Bytes::from(info)),
+                    conn.protocol_version,
+                ));
                 return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"KILL") {
@@ -1301,6 +1305,8 @@ pub(super) async fn try_handle_swapdb(
         &ctx.shard_databases,
         &ctx.dispatch_tx,
         &ctx.spsc_notifiers,
+        ctx.aof_pool.as_ref(),
+        &ctx.repl_state,
     )
     .await;
     responses.push(response);
@@ -1582,10 +1588,20 @@ pub(super) enum BlockingResult {
     Handled,
     /// Write error during flush. Caller should return Done.
     WriteError,
+    /// c10k A1: the client vanished while blocked. Its registrations are gone;
+    /// the caller must close the connection WITHOUT writing a reply.
+    PeerGone,
 }
 
 /// Handle blocking commands (BLPOP, BRPOP, BLMOVE, etc.).
-pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
+///
+/// c10k A1: `read_buf` is the handler's own accumulation buffer, passed in so
+/// the peer watch can carry any bytes the client pipelines behind its blocking
+/// command straight back into the parse stream. It holds only the unparsed
+/// tail of the current batch here, so appending preserves wire order.
+pub(super) async fn try_handle_blocking<
+    S: monoio::io::AsyncWriteRent + super::idle_park::IdleParkRead,
+>(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -1594,18 +1610,12 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
     local_leg_write_idxs: &mut Vec<usize>,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
+    read_buf: &mut bytes::BytesMut,
     stream: &mut S,
     shutdown: &CancellationToken,
+    client_live: &std::sync::Arc<crate::client_registry::ClientLiveState>,
 ) -> BlockingResult {
-    if !cmd.eq_ignore_ascii_case(b"BLPOP")
-        && !cmd.eq_ignore_ascii_case(b"BRPOP")
-        && !cmd.eq_ignore_ascii_case(b"BLMOVE")
-        && !cmd.eq_ignore_ascii_case(b"BZPOPMIN")
-        && !cmd.eq_ignore_ascii_case(b"BZPOPMAX")
-        && !cmd.eq_ignore_ascii_case(b"BLMPOP")
-        && !cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
-        && !cmd.eq_ignore_ascii_case(b"BZMPOP")
-    {
+    if !crate::server::conn::blocking::is_blocking_command(cmd) {
         return BlockingResult::NotBlocking;
     }
 
@@ -1641,7 +1651,14 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
         }
     }
 
-    let blocking_response = handle_blocking_command_monoio(
+    // D1: mark the connection blocked for the duration of the wait. The
+    // idle-timeout sweep (`client_registry::kill_idle_clients`) exempts
+    // blocked clients, matching Redis — without this a client parked in
+    // `BLPOP key 0` looks idle and gets closed at `timeout`.
+    // RAII, not a set/clear pair: a leaked `blocked` bit exempts the client
+    // from `timeout` permanently.
+    let blocked_guard = client_live.blocked_guard();
+    let outcome = handle_blocking_command_monoio(
         cmd,
         cmd_args,
         conn.selected_db,
@@ -1652,8 +1669,19 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
         &ctx.dispatch_tx,
         shutdown,
         &ctx.spsc_notifiers,
+        stream,
+        read_buf,
     )
     .await;
+    drop(blocked_guard);
+
+    let blocking_response = match outcome {
+        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+        crate::server::conn::blocking::BlockingOutcome::PeerGone => {
+            responses.clear();
+            return BlockingResult::PeerGone;
+        }
+    };
 
     // Encode blocking response directly
     codec.encode_frame(&blocking_response, write_buf);

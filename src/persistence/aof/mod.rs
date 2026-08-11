@@ -92,6 +92,76 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Total everysec deadline-fsync failures across all AOF writers (both
+/// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
+pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-writer "most recent everysec deadline fsync FAILED" bits (bit =
+/// `min(writer_idx, 63)`; TopLevel layout uses writer 0, PerShard uses the
+/// shard index). Surfaced as `aof_last_fsync_status:ok|err` in INFO
+/// (Redis's `aof_last_write_status` analogue): the status reads "err" while
+/// ANY writer's latest fsync failed. Per-writer bits — not one global bool —
+/// because with N per-shard writers a healthy shard's success within ~1s
+/// would otherwise mask a failing shard's hole (deep-review P2). Kernel
+/// semantics make a *retry* of a failed fsync succeed trivially while the
+/// failed window's pages are already gone (fsyncgate), so each writer's bit
+/// clears only when a fsync that follows a successful write batch completes
+/// on THAT writer — operators must treat any "err" observation as "an AOF
+/// has a hole".
+pub static AOF_FSYNC_ERR_WRITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// True while every AOF writer's most recent everysec deadline fsync
+/// succeeded (the INFO `aof_last_fsync_status` predicate).
+pub fn aof_last_fsync_ok() -> bool {
+    AOF_FSYNC_ERR_WRITERS.load(std::sync::atomic::Ordering::Relaxed) == 0
+}
+
+/// Record the outcome of an everysec deadline fsync attempt on `writer_idx`
+/// (0 for the TopLevel writer, shard index for PerShard writers). Failure
+/// bumps [`AOF_FSYNC_FAILURES`] and sets the writer's bit in
+/// [`AOF_FSYNC_ERR_WRITERS`]; success clears only that writer's bit (the
+/// counter keeps the history).
+pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
+    use std::sync::atomic::Ordering;
+    let bit = 1u64 << writer_idx.min(63);
+    if ok {
+        AOF_FSYNC_ERR_WRITERS.fetch_and(!bit, Ordering::Relaxed);
+    } else {
+        AOF_FSYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
+        AOF_FSYNC_ERR_WRITERS.fetch_or(bit, Ordering::Relaxed);
+    }
+}
+
+/// Degraded-state latch (#452.4): `false` once ANY acked append has been
+/// dropped at the writer channel since boot. Unlike the rolling counter
+/// above, this is a sticky health bit — operators (and test harnesses) can
+/// alert on `aof_last_append_status:err` in `INFO persistence` without
+/// diffing counters. It never resets: after a drop the AOF is missing an
+/// acked record for the lifetime of this generation, so "everything is fine
+/// again" would be a lie until a successful rewrite folds live state into a
+/// fresh base. (`BGREWRITEAOF` is the operator remediation; wiring the latch
+/// reset into rewrite completion is deliberate follow-up work tracked in
+/// #452 — reset must only happen if NO drop occurred during the fold.)
+pub static AOF_LAST_APPEND_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Reason-DELs (eviction/expiry) dropped at the writer channel (#452.4).
+/// Strictly worse than a dropped client write: replay RESURRECTS a key the
+/// server told clients was gone. Kept as a dedicated counter so a non-zero
+/// value can be alerted on independently of generic backpressure drops.
+pub static AOF_REASON_DEL_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record `n` dropped acked appends: bumps [`AOF_BACKPRESSURE_DROPPED`] and
+/// latches [`AOF_LAST_APPEND_OK`] to `err`. Every drop site MUST go through
+/// this helper so the degraded-state latch can never miss a loss.
+#[inline]
+pub fn record_append_dropped(n: u64) {
+    AOF_BACKPRESSURE_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    AOF_LAST_APPEND_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bound for the SPSC-drain path's blocking AOF backpressure
 /// ([`AofWriterPool::send_append_bounded_blocking`]). Sized to cover the
 /// writer draining one group-commit batch (≤1024 msgs / 8 MiB buffered
@@ -99,6 +169,17 @@ pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
 /// while keeping the worst-case shard event-loop stall small. Reached only
 /// when the writer channel (10k slots) is completely full.
 pub const AOF_SPSC_BACKPRESSURE_BOUND: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Backpressure bound for reason-DELs (eviction/expiry — #452.4). 100× the
+/// generic SPSC bound: a dropped reason-DEL makes restart replay resurrect
+/// data clients were told is gone, so we trade a longer worst-case shard
+/// stall (only reachable when the writer is >10k appends behind) for a much
+/// smaller loss window. NOT unbounded: a dead writer must not hang the
+/// shard, and a deferred-retry queue would reorder DEL-after-SET on replay —
+/// beyond this bound the drop is counted in [`AOF_REASON_DEL_DROPPED`] and
+/// latches [`AOF_LAST_APPEND_OK`], never silent.
+pub const AOF_REASON_DEL_BACKPRESSURE_BOUND: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// Result of awaiting an `AppendSync` ack under a bounded timeout (F2).
 ///
@@ -194,9 +275,16 @@ pub enum AofMessage {
         ack: crate::runtime::channel::OneshotSender<AofAck>,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
-    Rewrite(SharedDatabases),
+    /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
+    /// buffer (issue #452.1): armed by the writer around the fold, fed by the
+    /// pool's producers when the append channel saturates mid-fold.
+    Rewrite(SharedDatabases, Arc<rewrite::RewriteOverflow>),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
-    RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
+    /// Overflow semantics identical to [`AofMessage::Rewrite`].
+    RewriteSharded(
+        Arc<crate::shard::shared_databases::ShardDatabases>,
+        Arc<rewrite::RewriteOverflow>,
+    ),
     /// [F6] Trigger a per-shard AOF rewrite (compaction) in the PerShard
     /// layout. Sent to EVERY per-shard writer at once. Each writer folds its
     /// own shard (drain → AofFold SPSC → snapshot → write new base+incr at
@@ -218,6 +306,11 @@ pub enum AofMessage {
             Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         /// Notifier that wakes the shard event loop after an SPSC push.
         fold_notifier: Arc<crate::runtime::channel::Notify>,
+        /// Rewrite-window spill buffer for THIS shard (issue #452.1) — armed
+        /// by the writer around the fold, fed by the pool's producers when
+        /// the append channel saturates mid-fold, drained by the writer into
+        /// the committed incr immediately after the fold.
+        overflow: Arc<rewrite::RewriteOverflow>,
     },
     /// Shut down the AOF writer task gracefully.
     Shutdown,
@@ -391,13 +484,57 @@ impl PerShardRewriteCoord {
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
-            for sid in 0..self.n_shards {
-                m.prune_shard_files(sid as u16, self.old_seq);
+            // Deep-review D1/D4: prune the old generation ONLY once (a) every
+            // manifest-sync agent's pending deferred ShardManifest commit is
+            // durable — the old incr is the AOF-replay backstop for exactly
+            // those spill placements — and (b) the manifest flip's dirent is
+            // durable (a crash booting the OLD manifest against pruned files
+            // replays as a silent fresh init and orphan-sweeps the NEW
+            // generation). On either failure keep both generations: costs
+            // disk, never data.
+            let safe_to_prune = match crate::persistence::manifest_sync::flush_all_agents() {
+                Ok(()) => {
+                    let dirent_durable = m
+                        .manifest_path()
+                        .parent()
+                        .map(crate::persistence::fsync::fsync_directory)
+                        .transpose();
+                    match dirent_durable {
+                        Ok(_) => true,
+                        Err(e) => {
+                            error!(
+                                "F6 rewrite: manifest dirent not durable ({}); keeping old \
+                                 generation seq {} on disk",
+                                e, self.old_seq
+                            );
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "F6 rewrite: manifest-sync barrier failed ({}); keeping old \
+                         generation seq {} on disk as the durability backstop",
+                        e, self.old_seq
+                    );
+                    false
+                }
+            };
+            if safe_to_prune {
+                for sid in 0..self.n_shards {
+                    m.prune_shard_files(sid as u16, self.old_seq);
+                }
             }
             drop(m);
             info!(
-                "F6 per-shard rewrite complete: committed seq {} across {} shards, pruned seq {}",
-                self.new_seq, self.n_shards, self.old_seq
+                "F6 per-shard rewrite complete: committed seq {} across {} shards{}",
+                self.new_seq,
+                self.n_shards,
+                if safe_to_prune {
+                    format!(", pruned seq {}", self.old_seq)
+                } else {
+                    format!(" (old seq {} retained)", self.old_seq)
+                }
             );
             // Success: new_seq is committed. Folded writers already reopened onto
             // new_seq in phase 6, so the barrier is a no-op for them — but it must
@@ -487,12 +624,16 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 // ── Submodule decomposition (refactor: aof.rs 4379 lines -> directory module) ──
 // Codec (serialize_command/replay_aof) stays in this parent so children reach it
 // via `use super::*`. AofWriterPool, writer tasks, and rewrite paths move out.
+/// #433 — automatic AOF rewrite monitor (Redis `auto-aof-rewrite-*` parity)
+/// plus the INFO-persistence size/enabled statics (#432).
+pub mod auto_rewrite;
 /// Group-commit batching seam (coalesce concurrent pending writes into one
 /// fsync under `appendfsync=always`). `pub` so the §4 red suite can pin the pure
 /// seam (collect/commit) against the public API.
 pub mod group_commit;
 mod pool;
-mod rewrite;
+pub mod rewrite;
+pub mod rewrite_overflow;
 mod writer_task;
 
 pub use pool::AofWriterPool;
@@ -985,7 +1126,7 @@ mod tests {
         let base_ts = dbs[0].base_timestamp();
         let entry = dbs[0].get(b"mykey").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
         assert!(remaining_secs >= 50); // Allow some tolerance
     }
 
@@ -1125,7 +1266,7 @@ mod tests {
         let base_ts = loaded_dbs[0].base_timestamp();
         let entry = loaded_dbs[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
         assert!(remaining_secs > 3500);
     }
 
@@ -1134,24 +1275,20 @@ mod tests {
     /// tests exercise the exact same production path.
     fn db_slice_to_snapshot(
         dbs: &[Database],
-    ) -> Vec<(
+    ) -> Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> {
+    > {
         let now_ms = crate::storage::entry::current_time_ms();
         dbs.iter()
             .map(|db| {
-                let base_ts = db.base_timestamp();
-                let entries: Vec<_> = db
-                    .data()
+                db.data()
                     .iter()
-                    .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+                    .filter(|(_, e)| !e.is_expired_at(now_ms))
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                (entries, base_ts)
+                    .collect()
             })
             .collect()
     }
@@ -1315,5 +1452,31 @@ mod tests {
             "AOF_FSYNC_ERR must start with 'ERR ' (got {:?})",
             std::str::from_utf8(AOF_FSYNC_ERR).unwrap_or("<non-utf8>")
         );
+    }
+
+    /// F2/F3 (deep review): everysec fsync failures must latch an "err"
+    /// status and count — the old tokio paths dropped the error and recorded
+    /// success, so an operator had no way to learn the AOF has a hole.
+    /// Per-writer bits (deep-review P2 follow-up): a healthy writer's
+    /// success must NOT clear a failing sibling writer's "err" status.
+    #[test]
+    fn everysec_fsync_failure_latches_err_status() {
+        use std::sync::atomic::Ordering;
+        // Use writer indexes far above any concurrently-running writer-loop
+        // test so parallel tests can't flip these bits.
+        let before = AOF_FSYNC_FAILURES.load(Ordering::Relaxed);
+        record_everysec_fsync_result(61, false);
+        assert!(!aof_last_fsync_ok());
+        assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
+        // A DIFFERENT writer's success must not mask writer 61's hole.
+        record_everysec_fsync_result(62, true);
+        assert!(
+            !aof_last_fsync_ok(),
+            "a healthy writer's fsync success must not clear a failing sibling's err status"
+        );
+        // Success on the failing writer restores the status but never the counter.
+        record_everysec_fsync_result(61, true);
+        assert!(aof_last_fsync_ok());
+        assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
     }
 }

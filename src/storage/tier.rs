@@ -24,6 +24,14 @@
 
 /// A segment/entry's residency state along the shared tier ladder.
 ///
+/// Not to be confused with `persistence::manifest::StorageTier` (W6 note):
+/// that enum is an ON-DISK field of the page manifest's `FileEntry`
+/// describing where a *file's payload* lives, with its own persisted byte
+/// values; this enum is the IN-MEMORY residency vocabulary a plane's
+/// live segments report themselves in. They intersect in concept but not
+/// in role — do not merge them (a persisted format tag must never gain
+/// variants because a runtime ladder grew one).
+///
 /// `Hot` -> `WarmReloadable` -> `ColdStub`, in decreasing RAM cost and
 /// increasing reload latency to serve a request. Not every plane
 /// implements every tier:

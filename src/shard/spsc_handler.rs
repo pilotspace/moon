@@ -23,9 +23,7 @@ use crate::replication::backlog::ReplicationBacklog;
 use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::{
-    try_evict_if_needed_async_spill_budget_reporting, try_evict_if_needed_budget_reporting,
-};
+use crate::storage::eviction::{EvictionRun, evict_to_budget};
 use crate::storage::tiered::spill_thread::SpillRequest;
 
 use crate::command::vector_search;
@@ -78,20 +76,21 @@ pub(super) fn spsc_eviction_gate(
         // non-reporting wrapper (hardcoded no-op sink), silently dropping
         // `on_plain_drop` on the floor for this branch even though the
         // caller already threads a real one for the sibling branch below.
-        let res = try_evict_if_needed_async_spill_budget_reporting(
+        let res = evict_to_budget(
             db,
             &rt,
-            sender,
-            dir,
-            &mut fid,
-            db_idx,
-            budget,
-            on_plain_drop,
+            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, None)
+                .budget(budget)
+                .report(on_plain_drop),
         );
         spill_file_id.set(fid);
         res
     } else {
-        try_evict_if_needed_budget_reporting(db, &rt, budget, on_plain_drop)
+        evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::plain().budget(budget).report(on_plain_drop),
+        )
     };
     global_result?;
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
@@ -132,7 +131,7 @@ pub(crate) fn drain_spsc_shared(
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
     pending_migrations: &mut Vec<(
-        crate::shard::dispatch::RawSocketFd,
+        crate::shard::dispatch::MigrateFd,
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
     pending_cdc_subscribes: &mut Vec<crate::shard::dispatch::CdcSubscribePayload>,
@@ -222,8 +221,27 @@ pub(crate) fn drain_spsc_shared(
         other_messages.push(msg);
     }
 
+    // c10k W7: rotate the consumer start index per drain call. The loop used
+    // to start at consumers[0] every cycle, so whenever the 256-message
+    // budget ran out before the tail was reached, a hot low-index peer shard
+    // starved high-index peers indefinitely (tmp/C10K-REVIEW.md defect #4).
+    thread_local! {
+        static DRAIN_START: Cell<usize> = const { Cell::new(0) };
+    }
+    let n = consumers.len();
+    let start = if n > 0 {
+        DRAIN_START.with(|c| {
+            let s = c.get() % n;
+            c.set(s + 1);
+            s
+        })
+    } else {
+        0
+    };
+
     let mut snapshot_seen = false;
-    for consumer in consumers.iter_mut() {
+    for idx in rotated_indices(start, n) {
+        let consumer = &mut consumers[idx];
         if snapshot_seen {
             break;
         }
@@ -273,6 +291,7 @@ pub(crate) fn drain_spsc_shared(
                             execute_batch.push(msg);
                         }
                         ShardMessage::MigrateConnection(payload) => {
+                            let payload = *payload;
                             pending_migrations.push((payload.fd, payload.state));
                         }
                         ShardMessage::CdcSubscribe(payload) => {
@@ -685,6 +704,10 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write {
                         crate::shard::slice::with_shard_db(db_idx, |db| {
                             if evict_active {
+                                // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                                // (per-key minting could stall the shard bound x victim-count).
+                                let mut reason_del_budget =
+                                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                 if let Err(oom) = spsc_eviction_gate(
                                     db,
                                     db_idx,
@@ -706,6 +729,7 @@ pub(crate) fn handle_shard_message_shared(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     },
                                 ) {
@@ -932,6 +956,10 @@ pub(crate) fn handle_shard_message_shared(
                         // M2 fix: same gate as the Execute arm, applied per
                         // command in this batch's shared `guard` borrow.
                         if evict_active {
+                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                            // (per-key minting could stall the shard bound x victim-count).
+                            let mut reason_del_budget =
+                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
                                 guard,
                                 db_idx,
@@ -953,6 +981,7 @@ pub(crate) fn handle_shard_message_shared(
                                         shard_id,
                                         aof_pool,
                                         wal_kv_log,
+                                        &mut reason_del_budget,
                                     );
                                 },
                             ) {
@@ -1131,6 +1160,10 @@ pub(crate) fn handle_shard_message_shared(
                         // M2 fix: same gate as the Execute arm, applied per
                         // command in this batch's shared `guard` borrow.
                         if evict_active {
+                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                            // (per-key minting could stall the shard bound x victim-count).
+                            let mut reason_del_budget =
+                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
                                 guard,
                                 db_idx,
@@ -1152,6 +1185,7 @@ pub(crate) fn handle_shard_message_shared(
                                         shard_id,
                                         aof_pool,
                                         wal_kv_log,
+                                        &mut reason_del_budget,
                                     );
                                 },
                             ) {
@@ -1373,6 +1407,10 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write {
                         crate::shard::slice::with_shard_db(db_idx, |db| {
                             if evict_active {
+                                // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                                // (per-key minting could stall the shard bound x victim-count).
+                                let mut reason_del_budget =
+                                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                 if let Err(oom) = spsc_eviction_gate(
                                     db,
                                     db_idx,
@@ -1394,6 +1432,7 @@ pub(crate) fn handle_shard_message_shared(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
                                     },
                                 ) {
@@ -1578,6 +1617,10 @@ pub(crate) fn handle_shard_message_shared(
                         // M2 fix: same gate as the Execute arm, applied per
                         // command in this batch's shared `guard` borrow.
                         if evict_active {
+                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                            // (per-key minting could stall the shard bound x victim-count).
+                            let mut reason_del_budget =
+                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
                                 guard,
                                 db_idx,
@@ -1599,6 +1642,7 @@ pub(crate) fn handle_shard_message_shared(
                                         shard_id,
                                         aof_pool,
                                         wal_kv_log,
+                                        &mut reason_del_budget,
                                     );
                                 },
                             ) {
@@ -1778,6 +1822,10 @@ pub(crate) fn handle_shard_message_shared(
                         // M2 fix: same gate as the Execute arm, applied per
                         // command in this batch's shared `guard` borrow.
                         if evict_active {
+                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                            // (per-key minting could stall the shard bound x victim-count).
+                            let mut reason_del_budget =
+                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
                                 guard,
                                 db_idx,
@@ -1799,6 +1847,7 @@ pub(crate) fn handle_shard_message_shared(
                                         shard_id,
                                         aof_pool,
                                         wal_kv_log,
+                                        &mut reason_del_budget,
                                     );
                                 },
                             ) {
@@ -2025,12 +2074,14 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(keys);
         }
         ShardMessage::KeyspaceStats { reply_tx } => {
-            // Per-db (keys, expires) for INFO # Keyspace. O(#dbs) counter
-            // reads — no key iteration.
+            // Per-db (keys, expires) for INFO # Keyspace. `logical_len`
+            // counts hot + cold keys (overlap once) so the section agrees
+            // with DBSIZE under disk-offload (issue #355); costs an O(cold)
+            // probe pass, same order as the `expires_count` scan beside it.
             let stats: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
                 s.databases
                     .iter()
-                    .map(|db| (db.len() as u64, db.expires_count() as u64))
+                    .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
                     .collect()
             });
             let _ = reply_tx.send(stats);
@@ -2429,7 +2480,7 @@ pub(crate) fn handle_shard_message_shared(
             // WAL-before-swap: emit the SWAPDB record so that crash-recovery
             // replay can re-apply the swap in the correct order.  The record
             // is written even when wal_writer/wal_writer are None (the
-            // fast-path in wal_append_and_fanout will skip it cheaply).
+            // fast-path skips it cheaply).
             //
             // Serialise "SWAPDB <a> <b>" without heap allocation on the number
             // formatting (itoa writes into a stack buffer).
@@ -2443,25 +2494,40 @@ pub(crate) fn handle_shard_message_shared(
                 crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(b_str.as_bytes())),
             ]);
             let serialized = aof::serialize_command(&wal_frame);
+            // #386 exactly-once wire contract: remote legs write ONLY the
+            // durability planes (WAL v3 + this shard's AOF — per-shard
+            // recovery replays each shard's own record). The REPLICATION
+            // plane record is emitted exactly once, by the coordinator's
+            // local leg (`coordinate_swapdb`), because today's replica
+            // applies the merged wire as one stream: per-remote-leg emission
+            // made the replica swap N-1 times (net no-op at odd shard
+            // counts). When #406 lands per-shard demuxed replicas this must
+            // flip back to per-shard emission.
+            //
             // No per-client response frame exists here (coordinator broadcast,
             // reply is `()`): an AOF-append loss is already counted +
             // error!-logged inside the pool, so the result is discarded.
-            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-            let _ = wal_append_and_fanout(
-                &serialized,
+            if wal_kv_log {
+                if let Some(w) = wal_writer {
+                    w.append(
+                        crate::persistence::wal_v3::record::WalRecordType::Command,
+                        &serialized,
+                    );
+                }
+            }
+            if let Some(pool) = aof_pool {
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 // task #35: SWAPDB affects both `a` and `b` — no single db
                 // context applies; pass 0 (writer may emit a harmless
                 // redundant SELECT 0 if last_db was already non-zero).
-                0,
-                wal_writer,
-                repl_backlog,
-                replica_txs,
-                repl_state,
-                shard_id,
-                aof_pool, // FIX-W1-2
-                wal_kv_log,
-                &mut aof_budget,
-            );
+                let _ = pool.send_append_bounded_blocking(
+                    shard_id,
+                    0,
+                    0,
+                    bytes::Bytes::copy_from_slice(&serialized),
+                    &mut aof_budget,
+                );
+            }
 
             // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
             crate::shard::slice::with_shard(|s| {
@@ -2666,18 +2732,27 @@ pub(crate) fn handle_shard_message_shared(
             // count as the phase-3 mid-drain bound, preventing an infinite drain
             // loop under sustained high write load where the channel never empties.
             let pending_aof_count = aof_pool.map(|p| p.sender(shard_id).len()).unwrap_or(0);
+            // #452.1 snapshot cut (P0 fix): entries spilled into the rewrite
+            // overflow BEFORE this instant have their effects captured by the
+            // snapshot below (the shard mutates before enqueuing/spilling) —
+            // the post-fold overflow drain must NOT write them into the NEW
+            // incr (base already contains them → double-apply of
+            // non-idempotent commands on replay). Record the buffer-side cut
+            // at the same atomic instant as the channel-side count above.
+            if let Some(p) = aof_pool {
+                p.overflow_for(shard_id).mark_cut();
+            }
             let now_ms = crate::storage::entry::current_time_ms();
             let snapshot = crate::shard::slice::with_shard(|s| {
                 let mut dbs = Vec::with_capacity(s.databases.len());
                 for db in s.databases.iter() {
-                    let base_ts = db.base_timestamp();
                     let mut entries = Vec::new();
                     for (key, entry) in db.data().iter() {
-                        if !entry.is_expired_at(base_ts, now_ms) {
+                        if !entry.is_expired_at(now_ms) {
                             entries.push((key.clone(), entry.clone()));
                         }
                     }
-                    dbs.push((entries, base_ts));
+                    dbs.push(entries);
                 }
                 crate::shard::dispatch::AofFoldSnapshot {
                     dbs,
@@ -2701,16 +2776,24 @@ pub(crate) fn handle_shard_message_shared(
                 db_index,
                 commands,
                 reply_tx,
+                proto,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
+            // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
+            // slice. Collect them and hand them back to the originator, which
+            // broadcasts to the other shards (see `TxnExecReply::exec_flushes`
+            // for why the fan-out cannot happen here).
+            let mut exec_flushes: Vec<(usize, crate::protocol::Frame, usize)> = Vec::new();
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
                     shard_id,
                     &commands,
                     db_index,
+                    proto,
                     cached_clock,
                     &mut exec_publishes,
+                    &mut exec_flushes,
                 );
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
@@ -2764,6 +2847,7 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(crate::shard::dispatch::TxnExecReply {
                 result,
                 exec_publishes,
+                exec_flushes,
                 wrote,
                 append_lost,
             });
@@ -4177,8 +4261,8 @@ mod wal_append_tests {
                 );
             }
             AofMessage::AppendSync { .. } => panic!("expected Append, got AppendSync"),
-            AofMessage::Rewrite(_) => panic!("expected Append, got Rewrite"),
-            AofMessage::RewriteSharded(_) => panic!("expected Append, got RewriteSharded"),
+            AofMessage::Rewrite(..) => panic!("expected Append, got Rewrite"),
+            AofMessage::RewriteSharded(..) => panic!("expected Append, got RewriteSharded"),
             AofMessage::RewritePerShard { .. } => panic!("expected Append, got RewritePerShard"),
             AofMessage::Shutdown => panic!("expected Append, got Shutdown"),
         }
@@ -4454,5 +4538,43 @@ mod drain_cap_tests {
         );
         use ringbuf::traits::Observer;
         assert!(consumers[0].is_empty(), "all 300 messages must be consumed");
+    }
+}
+
+/// c10k W7: visit order for the SPSC consumer drain — a rotation of
+/// `0..n` beginning at `start`. Extracted so the fairness property is unit
+/// -testable without standing up the full drain call.
+#[inline]
+pub(crate) fn rotated_indices(start: usize, n: usize) -> impl Iterator<Item = usize> {
+    (0..n).map(move |off| (start + off) % n)
+}
+
+#[cfg(test)]
+mod drain_rotation_tests {
+    use super::rotated_indices;
+
+    #[test]
+    fn every_cycle_covers_all_consumers_exactly_once() {
+        for start in 0..5 {
+            let mut seen: Vec<usize> = rotated_indices(start, 5).collect();
+            assert_eq!(seen.len(), 5);
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn successive_starts_change_the_first_visited_consumer() {
+        // The budget cut-off truncates the TAIL of the visit order; rotating
+        // the head is what guarantees no consumer is permanently tail-most.
+        let firsts: Vec<usize> = (0..4)
+            .map(|s| rotated_indices(s, 4).next().unwrap())
+            .collect();
+        assert_eq!(firsts, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn zero_consumers_is_empty_not_panic() {
+        assert_eq!(rotated_indices(0, 0).count(), 0);
     }
 }

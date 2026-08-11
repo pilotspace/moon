@@ -31,9 +31,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Workflow-level env merges into EVERY job and a job cannot unset an inherited
+# key (an empty value is still a set variable). MOON_NO_URING therefore lives
+# per-job, never here — see `check-monoio`, which exists to run io_uring and was
+# silently running the timer fallback for as long as this was a global.
 env:
   CARGO_TERM_COLOR: always
-  MOON_NO_URING: "1"
   # 2026-07-13 CI optimization: no debuginfo in CI builds/tests — halves
   # artifact size (faster rust-cache save/restore) and speeds linking.
   # Backtraces in CI keep function names via symbol table; local builds
@@ -95,6 +98,9 @@ jobs:
     runs-on: [self-hosted, moon-dev]
     env:
       CARGO_TARGET_DIR: /home/tindang/ci-target/check
+      # tokio's io_uring bridge is off in CI (it floods errors under load).
+      # Per-job, never workflow-level: `check-monoio` must not inherit it.
+      MOON_NO_URING: "1"
       # Spawned test servers must not trip the diskfull write-pause on the
       # VM's shared-volume mounts.
       MOON_DISK_FREE_MIN_PCT: "0"
@@ -135,6 +141,55 @@ jobs:
       - name: Test (graph)
         run: "cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc,graph --lib -E 'test(graph::)'"
         timeout-minutes: 5
+
+  # ── monoio — the runtime Moon actually SHIPS ────────────────────────
+  # Until this job existed, every CI job that EXECUTED tests did so under
+  # `--no-default-features --features runtime-tokio`. Moon's default feature
+  # set is runtime-monoio, and that is what ships on Linux — so 26 monoio
+  # integration test files and 30 monoio-gated src/ files were unreachable by
+  # CI. That is how the v0.8.6 inline-GET ACL bypass (#457) shipped green: it
+  # was wrong only on the monoio dispatch path, which no CI job could see.
+  #
+  # Self-hosted is not a preference: it is the only Linux runner, and therefore
+  # the only place monoio's io_uring driver executes at all. MOON_NO_URING must
+  # reach this job from NOWHERE — the point is io_uring. Its first cut left the
+  # job block clean but inherited `MOON_NO_URING: "1"` from workflow-level env,
+  # which a job cannot unset; every cooperative_yield() fell back to the
+  # sleep(ZERO) timer park and `monoio_yield_overhead_is_microscopic` failed at
+  # 1.45ms/yield. That var is now per-job and `ci_covers_monoio.rs` asserts both
+  # scopes.
+  #
+  # Measured before landing (moon-dev, kernel 6.17, 2026-08-10):
+  #   cargo nextest run --profile ci  ->  5145 passed, 1 flaky, 244 skipped,
+  #   exit 0, 80.3s of test time. The `ci` profile's retries=2 absorbs the
+  #   known load-sensitive flake class (#459) while still reporting it FLAKY,
+  #   so the job is green from day one without hiding the signal.
+  #
+  # Guarded by tests/ci_covers_monoio.rs — weakening this job (wrong features,
+  # continue-on-error, bare `cargo test`, shared target dir) fails that suite.
+  check-monoio:
+    name: Check (monoio — the shipped runtime)
+    runs-on: [self-hosted, moon-dev]
+    env:
+      # MUST differ from `check`'s dir: the two jobs build incompatible feature
+      # sets from one checkout and can run concurrently on this runner.
+      CARGO_TARGET_DIR: /home/tindang/ci-target/check-monoio
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@nextest
+
+      # Default features == runtime-monoio. Never --no-default-features here.
+      # `--profile ci` is load-bearing: a bare `cargo test` has no retries, and
+      # an intermittently-red required job gets disabled — which is worse than
+      # no job, because it still looks like coverage.
+      - name: Test (default features — monoio + io_uring)
+        run: cargo nextest run --profile ci
+        # 30m mirrors `check`: the budget is dominated by compiling test
+        # binaries on a cold CARGO_TARGET_DIR, not by the 80s of test time.
+        timeout-minutes: 30
 
   # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
   # Main-push only (2026-07-13 queue-killer round): macOS runners are the
@@ -285,6 +340,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      # Spawns a real (tokio-built) moon on a GitHub-hosted runner, where
+      # io_uring may be unavailable or restricted by seccomp.
+      MOON_NO_URING: "1"
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     steps:
@@ -306,3 +364,57 @@ jobs:
         with:
           name: memory-steady-state-report
           path: /tmp/moon-*.txt
+
+  # ── Client compatibility — raw-RESP diff against a real redis-server ─
+  # Runs on the self-hosted moon-dev VM because it already carries
+  # redis-server, and because this job MUST have an oracle: the harness exits 2
+  # with ERR_NO_ORACLE rather than skipping when redis-server is absent. A
+  # differential harness with nothing to differ against would report a green
+  # that means nothing — the exact failure class this milestone exists to close.
+  #
+  # The manifest ships with a recorded BASELINE of waived, reasoned divergences,
+  # so this job is a ratchet: a NEW divergence fails it, and `--strict` fails
+  # the moment a waived one is fixed and its waiver goes stale.
+  client-compat:
+    name: Client compat (RESP2/RESP3 diff vs Redis)
+    runs-on: [self-hosted, moon-dev]
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/client-compat
+      # Kept from when this was a workflow-level global, so this job's recorded
+      # waiver baseline stays comparable: the differ probes RESP wire shapes,
+      # which the I/O driver does not change. Drop it if the driver ever
+      # becomes part of what this job is meant to prove.
+      MOON_NO_URING: "1"
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Build moon (default runtime — monoio, the one clients hit)
+        run: cargo build --release
+        timeout-minutes: 30
+      - name: Differ unit tests
+        run: python3 -m unittest discover -s scripts/client-compat -p 'test_differ.py' -v
+      - name: Differ end-to-end tests (real Moon + real redis-server)
+        run: python3 -m unittest discover -s scripts/client-compat -p 'test_e2e.py' -v
+        env:
+          MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
+        timeout-minutes: 15
+      - name: Compatibility diff (strict — stale waivers fail)
+        run: ./scripts/test-client-compat.sh --strict --record tmp/client-compat-record.json
+        env:
+          MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
+        timeout-minutes: 15
+      - name: INFO field coverage
+        run: ./scripts/test-client-compat.sh --filter __none__ --info-manifest --record tmp/client-compat-info.json
+        env:
+          MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
+        # Reports the missing-field set; not yet a gate — info-observability
+        # owns closing it, and this flips to a hard gate when that task lands.
+        continue-on-error: true
+      - name: Upload record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-compat-record
+          path: tmp/client-compat-*.json

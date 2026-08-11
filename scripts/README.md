@@ -87,6 +87,7 @@ across Moon + Redis 8.x + Qdrant and emits `BENCHMARK-REPORT.md`.
 |---|---|
 | `test-commands.sh` | Command-coverage smoke test |
 | `test-consistency.sh` | Redis-vs-Moon consistency suite (ground truth) |
+| `test-client-compat.sh` | Raw-RESP diff vs a real redis-server (RESP2+RESP3, type/shape/value) |
 
 ## Git / workflow helpers
 

@@ -1,6 +1,6 @@
 [package]
 name = "moon"
-version = "0.7.1"
+version = "0.8.5"
 edition = "2024"
 rust-version = "1.94"
 description = "A high-performance Redis-compatible server written in Rust"
@@ -23,7 +23,11 @@ flume = "0.12"
 atomic-waker = "1"
 # Base features (rt, net) are always available for the admin HTTP server.
 # runtime-tokio adds the full feature set (multi-thread, io-util, signal, etc.).
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+# Base features include "time" + "io-util" for the cluster control plane
+# (bus + gossip + election), which is tokio-native on BOTH runtimes — under
+# monoio it runs on a dedicated std thread with a current-thread runtime
+# (v0.9 C-1, #405).
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -69,6 +73,10 @@ http-body-util = "0.1"
 
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
+# Direct dep for the raw `mallctl` symbol: `arena.<i>.decay` is a
+# NEITHER_READ_NOR_WRITE ctl (every pointer NULL, newlen 0), which the
+# safe tikv-jemalloc-ctl wrappers cannot express. See src/memory_decay.rs.
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
 slotmap = "1"
@@ -99,6 +107,14 @@ levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc", "graph", "text-index"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Compile jemalloc with --enable-stats and expose its counters through
+# `INFO memory` (Redis-compatible `allocator_*` field names). OFF by default:
+# jemalloc's stats add bookkeeping to every allocation, which this project
+# will not pay on the hot path unconditionally. Build with it when you need
+# to answer "why is RSS N times used_memory" — see src/memory_ctl.rs.
+# Only `jemalloc-stats` needs the -sys crate: no Rust code calls it directly,
+# it is here solely to turn on jemalloc's `stats` build option.
+jemalloc-stats = ["jemalloc", "dep:tikv-jemalloc-sys", "tikv-jemalloc-ctl/stats", "tikv-jemalloc-sys/stats"]
 # Opt-in alternate allocator. Mutually exclusive with `jemalloc`.
 # Usage:
 #   cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index
@@ -135,6 +151,8 @@ text-index = [
 # when the MOON_* spin knobs are unset.
 [patch.crates-io]
 monoio = { path = "vendor/monoio" }
+monoio-rustls = { path = "vendor/monoio-rustls" }
+monoio-io-wrapper = { path = "vendor/monoio-io-wrapper" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -143,10 +161,12 @@ io-uring = "0.7"
 # tuned setup flags (COOP_TASKRUN / SINGLE_ISSUER / DEFER_TASKRUN) to the
 # monoio runtime; must track monoio's own io-uring version.
 io-uring-06 = { package = "io-uring", version = "0.6" }
-nix = { version = "0.31", features = ["net", "socket"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# `net`/`socket` are used by Linux-only code (connection migration); `fs`
+# powers the cross-Unix data-dir instance lock (persistence::dir_lock).
+nix = { version = "0.31", features = ["net", "socket", "fs"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -210,6 +230,10 @@ harness = false
 
 [[bench]]
 name = "get_hotpath"
+harness = false
+
+[[bench]]
+name = "dashtable_probe"
 harness = false
 
 [[bench]]

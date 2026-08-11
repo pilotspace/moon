@@ -88,6 +88,10 @@ pub struct Conn {
     s: TcpStream,
     buf: Vec<u8>,
     pos: usize,
+    /// Last command (or pipeline summary) sent on this connection — panic
+    /// context for the rare mid-scenario ConnectionReset (#365): knowing
+    /// WHICH phase reset is diagnostic step 2 in that issue.
+    last_cmd: String,
 }
 
 impl Conn {
@@ -96,7 +100,23 @@ impl Conn {
             s,
             buf: Vec::with_capacity(16 * 1024),
             pos: 0,
+            last_cmd: String::new(),
         }
+    }
+
+    /// Record a compact description of an outgoing command for panic context.
+    fn note_cmd(&mut self, parts: &[&[u8]]) {
+        let mut desc = String::with_capacity(48);
+        for p in parts.iter().take(2) {
+            if !desc.is_empty() {
+                desc.push(' ');
+            }
+            desc.push_str(&String::from_utf8_lossy(&p[..p.len().min(32)]));
+        }
+        if parts.len() > 2 {
+            desc.push_str(" …");
+        }
+        self.last_cmd = desc;
     }
 
     pub fn open(port: u16) -> Self {
@@ -104,6 +124,7 @@ impl Conn {
     }
 
     pub fn cmd(&mut self, parts: &[&[u8]]) -> Resp {
+        self.note_cmd(parts);
         let mut req = Vec::with_capacity(128);
         req.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
         for p in parts {
@@ -111,7 +132,9 @@ impl Conn {
             req.extend_from_slice(p);
             req.extend_from_slice(b"\r\n");
         }
-        self.s.write_all(&req).expect("write cmd");
+        if let Err(e) = self.s.write_all(&req) {
+            panic!("write cmd [{}]: {e:?}", self.last_cmd);
+        }
         self.frame()
     }
 
@@ -137,14 +160,36 @@ impl Conn {
             }
             buf.extend_from_slice(&req);
         }
-        self.s.write_all(&buf).expect("write pipeline");
+        self.last_cmd = format!(
+            "pipeline[{}]: {} .. {}",
+            cmds.len(),
+            cmds.first().map(|c| c.join(" ")).unwrap_or_default(),
+            cmds.last().map(|c| c.join(" ")).unwrap_or_default()
+        );
+        if let Err(e) = self.s.write_all(&buf) {
+            panic!("write pipeline [{}]: {e:?}", self.last_cmd);
+        }
         cmds.iter().map(|_| self.frame()).collect()
     }
 
     fn fill(&mut self) {
         let mut chunk = [0u8; 16 * 1024];
-        let n = self.s.read(&mut chunk).expect("read from server");
-        assert!(n > 0, "connection closed mid-frame");
+        let n = match self.s.read(&mut chunk) {
+            Ok(n) => n,
+            // #365 diagnostic: the rare mid-scenario ConnectionReset lands
+            // here — the last command sent tells us WHICH phase reset.
+            Err(e) => panic!(
+                "read from server after [{}] (peer {:?}): {e:?}",
+                self.last_cmd,
+                self.s.peer_addr()
+            ),
+        };
+        assert!(
+            n > 0,
+            "connection closed mid-frame after [{}] (peer {:?})",
+            self.last_cmd,
+            self.s.peer_addr()
+        );
         self.buf.extend_from_slice(&chunk[..n]);
     }
 

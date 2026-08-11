@@ -65,6 +65,21 @@ impl ValueType {
             _ => None,
         }
     }
+
+    /// Redis TYPE-command name for this value type. Must stay in sync with
+    /// `RedisValue::type_name` — SCAN's TYPE filter compares the two
+    /// case-insensitively when judging cold (spilled) keys (#364).
+    #[inline]
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::ZSet => "zset",
+            Self::Stream => "stream",
+        }
+    }
 }
 
 // ── Entry flags (bitfield) ──────────────────────────────

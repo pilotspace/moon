@@ -1,12 +1,28 @@
 //! In-memory cold index tracking KV entries spilled to disk DataFiles.
 //!
-//! Maps key bytes to (file_id, slot_idx) for O(1) cold lookup.
+//! Maps key bytes to (file_id, slot_idx) for cold lookup.
 //! Populated at spill time, rebuilt from heap DataFiles during recovery.
+//!
+//! Since #368 the index is ordered by `(scan_hash48(key), key)` — the same
+//! stable 48-bit hash order the hot plane's SCAN page walk uses — so SCAN's
+//! cold side can range-resume from a cursor in O(log n + COUNT) instead of
+//! filtering the whole index on every page. Lookup pays O(log n) instead of
+//! O(1); cold lookups sit on disk-read-through and sweep paths where a
+//! ~100ns tree descent is noise next to the I/O they front.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use bytes::Bytes;
+
+/// The SCAN cursor hash: the hot table's fixed-seed xxh64 truncated to its
+/// top 48 bits. MUST stay identical to the hot plane's cursor mapping
+/// (`Database::scan_hot_page` maps `hash_key(key) >> 16`) — both planes
+/// feed one merged hash-ordered page walk.
+#[inline]
+fn scan_h48(key: &[u8]) -> u64 {
+    crate::storage::dashtable::hash_key(key) >> 16
+}
 
 /// Maximum TTL-expired cold entries reclaimed per [`ColdIndex::sweep_expired`]
 /// call. Bounds one sweep tick's work so a large cold index under an expiry
@@ -59,6 +75,19 @@ pub struct ColdLocation {
     /// index format to version and no old-format file that could ever fail to
     /// load because of it.
     pub ttl_ms: Option<u64>,
+    /// Redis value type of the on-disk entry, mirroring the on-disk
+    /// `KvEntry::value_type` this location points at.
+    ///
+    /// Same cached-copy contract as `ttl_ms` (#364): populated at insert
+    /// time (spill / recovery rebuild) purely so SCAN's TYPE filter can
+    /// judge a cold-only key from the in-RAM index alone — WITHOUT a pread
+    /// of the cold file and WITHOUT promoting the entry into hot RAM. The
+    /// on-disk `KvLeafPage` entry stays authoritative and
+    /// [`ColdIndex::rebuild_from_manifest`] re-derives this field from it
+    /// after a restart; no on-disk format changes. Fits the struct's
+    /// existing padding (after `slot_idx`), so the in-RAM index does not
+    /// grow.
+    pub value_type: crate::persistence::kv_page::ValueType,
 }
 
 /// In-memory index from key to cold disk location.
@@ -67,7 +96,11 @@ pub struct ColdLocation {
 /// and disk-offload is enabled.
 #[derive(Debug)]
 pub struct ColdIndex {
-    map: HashMap<Bytes, ColdLocation>,
+    /// Primary index, ordered by `(scan_hash48(key), key)` so SCAN's cold
+    /// plane can range-resume from a hash-space cursor (#368). The u64 is
+    /// always `scan_h48` of the Bytes it is paired with — every mutation
+    /// site derives it from the key, never stores it independently.
+    map: BTreeMap<(u64, Bytes), ColdLocation>,
     /// Reverse liveness: `file_id` -> count of live `map` entries pointing at it.
     ///
     /// A batched spill file (`heap-NNNNNN.mpf`) holds up to `FLUSH_ENTRY_CAP`
@@ -98,10 +131,11 @@ pub struct ColdIndex {
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
-/// `ColdLocation` value plus a `HashMap` bucket's control-byte/pointer
-/// overhead. Not exact -- `hashbrown`'s SwissTable layout is an
-/// implementation detail -- but monotonic, matching the approximation style
-/// already used by `Database::entry_overhead` (WS6) and
+/// `ColdLocation` value plus the ordered map's per-entry share of node
+/// overhead (hash48 tuple field + B-tree node slack). Not exact --
+/// `BTreeMap`'s node layout is an implementation detail -- but monotonic,
+/// matching the approximation style already used by
+/// `Database::entry_overhead` (WS6) and
 /// `text::term_dict::TermDictionary::resident_bytes`.
 const COLD_ENTRY_OVERHEAD: usize = std::mem::size_of::<ColdLocation>() + 48;
 
@@ -113,7 +147,7 @@ fn cold_entry_cost(key_len: usize) -> usize {
 impl ColdIndex {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
             file_refs: HashMap::new(),
             pending_unlink: Vec::new(),
             resident_bytes: 0,
@@ -159,7 +193,8 @@ impl ColdIndex {
     pub fn insert(&mut self, key: Bytes, location: ColdLocation) {
         let new_file = location.file_id;
         let key_len = key.len();
-        if let Some(old) = self.map.insert(key, location) {
+        let h = scan_h48(&key);
+        if let Some(old) = self.map.insert((h, key), location) {
             if old.file_id != new_file {
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
@@ -167,7 +202,7 @@ impl ColdIndex {
                 self.ref_inc(new_file);
             }
             // Same file_id (different slot/page): live-ref count is
-            // unchanged. `HashMap::insert` keeps the pre-existing key on an
+            // unchanged. `BTreeMap::insert` keeps the pre-existing key on an
             // overwrite (the new key argument, byte-equal, is dropped), so
             // `resident_bytes` is unchanged too -- no delta to apply.
         } else {
@@ -176,13 +211,29 @@ impl ColdIndex {
         }
     }
 
+    /// Remove the entry for `key` from the ordered map, returning its
+    /// location. Finds the owned map key via an equal-hash range probe
+    /// (the `Bytes` clone is a refcount bump, not a data copy) — `BTreeMap`
+    /// cannot borrow-match a `(u64, &[u8])` probe against a
+    /// `(u64, Bytes)` key.
+    fn remove_raw(&mut self, key: &[u8]) -> Option<ColdLocation> {
+        let h = scan_h48(key);
+        let owned = self
+            .map
+            .range((h, Bytes::new())..)
+            .take_while(|(k, _)| k.0 == h)
+            .find(|(k, _)| k.1.as_ref() == key)
+            .map(|(k, _)| k.clone())?;
+        self.map.remove(&owned)
+    }
+
     /// Remove a key from the cold index (promotion back to RAM, DEL/UNLINK,
     /// expired-on-read reclaim). Returns `true` when the key was present.
     ///
     /// Decrements the backing file's live-ref count; if this removes the file's
     /// last referrer, the `file_id` is queued for unlink by the next sweep.
     pub fn remove(&mut self, key: &[u8]) -> bool {
-        if let Some(old) = self.map.remove(key) {
+        if let Some(old) = self.remove_raw(key) {
             if self.ref_dec(old.file_id) {
                 self.pending_unlink.push(old.file_id);
             }
@@ -208,9 +259,15 @@ impl ColdIndex {
         self.file_refs.clear();
     }
 
-    /// Look up a key's cold location.
+    /// Look up a key's cold location (equal-hash range probe; the group is
+    /// almost always a single entry at 48 bits).
     pub fn lookup(&self, key: &[u8]) -> Option<ColdLocation> {
-        self.map.get(key).copied()
+        let h = scan_h48(key);
+        self.map
+            .range((h, Bytes::new())..)
+            .take_while(|(k, _)| k.0 == h)
+            .find(|(k, _)| k.1.as_ref() == key)
+            .map(|(_, loc)| *loc)
     }
 
     /// Merge another ColdIndex into this one (used during recovery).
@@ -219,7 +276,7 @@ impl ColdIndex {
     /// liveness index is rebuilt for the merged entries (a raw `map.extend`
     /// would leave the ref counts inconsistent and break safe reclamation).
     pub fn merge(&mut self, other: ColdIndex) {
-        for (key, location) in other.map {
+        for ((_h, key), location) in other.map {
             self.insert(key, location);
         }
     }
@@ -243,7 +300,18 @@ impl ColdIndex {
     ///
     /// Used by the orphan sweeper to walk all entries without taking ownership.
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &ColdLocation)> {
-        self.map.iter()
+        self.map.iter().map(|(k, loc)| (&k.1, loc))
+    }
+
+    /// Hash-ordered iteration starting at `from_h48` in the SCAN cursor's
+    /// 48-bit hash space (#368 cold-plane range resume). Yields
+    /// `(hash48, key, location)` ascending by `(hash48, key)`; the caller
+    /// applies liveness/shadow filters and stops after COUNT candidates —
+    /// O(log n) to seek plus O(items yielded).
+    pub fn range_from(&self, from_h48: u64) -> impl Iterator<Item = (u64, &Bytes, &ColdLocation)> {
+        self.map
+            .range((from_h48, Bytes::new())..)
+            .map(|(k, loc)| (k.0, &k.1, loc))
     }
 
     /// Sweep cold entries that are shadowed by a live hot key.
@@ -319,6 +387,7 @@ impl ColdIndex {
         let orphan_keys: Vec<Bytes> = self
             .map
             .keys()
+            .map(|k| &k.1)
             .filter(|key| db.is_hot(key))
             .cloned()
             .collect();
@@ -362,7 +431,7 @@ impl ColdIndex {
         // removed — NEVER on a single orphan key while co-located keys in the
         // same batched `.mpf` still reference it (the data-loss bug this fixes).
         for key in &orphan_keys {
-            if let Some(old) = self.map.remove(key.as_ref()) {
+            if let Some(old) = self.remove_raw(key.as_ref()) {
                 stats.entries_reclaimed += 1;
                 self.resident_bytes = self
                     .resident_bytes
@@ -442,19 +511,20 @@ impl ColdIndex {
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         max_batch: usize,
     ) -> std::io::Result<SweepStats> {
-        // Phase 1: identify expired keys, bounded to `max_batch`. HashMap
-        // iteration order is unspecified and may differ call-to-call; that is
-        // fine here — an entry left behind by the cap is simply picked up by
-        // a later sweep, it is never permanently skipped.
+        // Phase 1: identify expired keys, bounded to `max_batch`. Iteration
+        // is in (hash48, key) order and restarts from the front each call;
+        // an entry left behind by the cap is picked up by a later sweep once
+        // earlier expired entries are reclaimed — it is never permanently
+        // skipped (reclaimed entries stop occupying batch slots).
         let mut expired_keys: Vec<Bytes> = Vec::new();
         let mut more_remain = false;
-        for (key, loc) in self.map.iter() {
+        for (k, loc) in self.map.iter() {
             if loc.ttl_ms.is_some_and(|t| now_ms > t) {
                 if expired_keys.len() >= max_batch {
                     more_remain = true;
                     break;
                 }
-                expired_keys.push(key.clone());
+                expired_keys.push(k.1.clone());
             }
         }
 
@@ -474,7 +544,7 @@ impl ColdIndex {
         // shape as `sweep_known_orphans`).
         let mut stats = SweepStats::default();
         for key in &expired_keys {
-            if let Some(old) = self.map.remove(key.as_ref()) {
+            if let Some(old) = self.remove_raw(key.as_ref()) {
                 stats.entries_reclaimed += 1;
                 self.resident_bytes = self
                     .resident_bytes
@@ -590,14 +660,42 @@ impl ColdIndex {
         shard_dir: &Path,
         manifest: &crate::persistence::manifest::ShardManifest,
     ) -> Self {
+        let mut merged = Self::new();
+        for (_db, index) in Self::rebuild_from_manifest_per_db(shard_dir, manifest) {
+            merged.merge(index);
+        }
+        merged
+    }
+
+    /// Rebuild one cold index PER LOGICAL DATABASE from the manifest's
+    /// KvLeaf files (#139). Each spill file is attributed wholesale via
+    /// `FileEntry::db_index` — the spill path guarantees single-db files
+    /// (flush chunks cut at db boundaries), and manifests from before the
+    /// field existed read as db 0, matching their actual (db-blind,
+    /// attach-to-db0) provenance. Returns `(db_index, index)` pairs for
+    /// every db that has at least one recovered entry.
+    pub fn rebuild_from_manifest_per_db(
+        shard_dir: &Path,
+        manifest: &crate::persistence::manifest::ShardManifest,
+    ) -> Vec<(usize, Self)> {
         use crate::persistence::manifest::FileStatus;
         use crate::persistence::page::{PAGE_4K, PageType};
 
-        let mut index = Self::new();
+        let mut per_db: Vec<(usize, Self)> = Vec::new();
         let data_dir = shard_dir.join("data");
 
         for entry in manifest.files() {
             if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
+                let db = entry.db_index as usize;
+                let index = match per_db.iter_mut().find(|(d, _)| *d == db) {
+                    Some((_, idx)) => idx,
+                    None => {
+                        per_db.push((db, Self::new()));
+                        #[allow(clippy::unwrap_used)] // pushed on the previous line
+                        let last = per_db.last_mut().unwrap();
+                        &mut last.1
+                    }
+                };
                 let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
                 // Read raw bytes and iterate by absolute chunk index.
                 // `read_datafile` skips overflow pages (returns only KvLeaf pages),
@@ -620,6 +718,7 @@ impl ColdIndex {
                                         page_idx: page_idx as u32,
                                         slot_idx,
                                         ttl_ms: kv.ttl_ms,
+                                        value_type: kv.value_type,
                                     },
                                 );
                             }
@@ -628,7 +727,7 @@ impl ColdIndex {
                 }
             }
         }
-        index
+        per_db
     }
 }
 
@@ -644,6 +743,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         assert_eq!(idx.len(), 1);
@@ -653,6 +753,74 @@ mod tests {
         assert_eq!(found.slot_idx, 0);
         idx.remove(b"key1");
         assert!(idx.lookup(b"key1").is_none());
+    }
+
+    #[test]
+    fn range_from_is_hash_ordered_and_resumable() {
+        // 200 entries paged via range_from must drain every key exactly
+        // once in ascending (hash48, key) order — the #368 cold-plane
+        // contract SCAN's merged page walk depends on.
+        let mut idx = ColdIndex::new();
+        let loc = ColdLocation {
+            file_id: 1,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
+        };
+        for i in 0..200 {
+            idx.insert(Bytes::from(format!("rk:{i}")), loc);
+        }
+        let mut seen: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        loop {
+            let page: Vec<(u64, Bytes)> = idx
+                .range_from(cursor)
+                .take(16)
+                .map(|(h, k, _)| (h, k.clone()))
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            let mut prev: Option<(u64, &Bytes)> = None;
+            for (h, k) in &page {
+                assert_eq!(*h, scan_h48(k.as_ref()), "stored hash must match key");
+                assert!(*h >= cursor, "entry below resume point");
+                if let Some((ph, pk)) = prev {
+                    assert!((ph, pk) < (*h, k), "not ascending by (hash, key)");
+                }
+                prev = Some((*h, k));
+                assert!(seen.insert(k.clone()), "duplicate across pages");
+            }
+            #[allow(clippy::unwrap_used)] // page verified non-empty above
+            let last = page.last().unwrap().0;
+            cursor = last + 1;
+        }
+        assert_eq!(seen.len(), 200, "every entry exactly once");
+    }
+
+    #[test]
+    fn lookup_and_remove_survive_equal_hash_range_probe() {
+        // lookup/remove go through an equal-hash range probe now; two keys
+        // in the index must stay independently addressable, and removing
+        // one must not disturb the other.
+        let mut idx = ColdIndex::new();
+        let mk = |fid| ColdLocation {
+            file_id: fid,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
+        };
+        idx.insert(Bytes::from_static(b"alpha"), mk(1));
+        idx.insert(Bytes::from_static(b"beta"), mk(2));
+        assert_eq!(idx.lookup(b"alpha").map(|l| l.file_id), Some(1));
+        assert_eq!(idx.lookup(b"beta").map(|l| l.file_id), Some(2));
+        assert!(!idx.remove(b"missing"));
+        assert!(idx.remove(b"alpha"));
+        assert!(idx.lookup(b"alpha").is_none());
+        assert_eq!(idx.lookup(b"beta").map(|l| l.file_id), Some(2));
+        assert_eq!(idx.len(), 1);
     }
 
     // ── K4 accounting spine: resident_bytes O(1) accumulator ─────────────
@@ -670,6 +838,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"a_reasonably_long_key"), loc);
         let after_one = idx.resident_bytes();
@@ -693,12 +862,14 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         let loc_b = ColdLocation {
             file_id: 2,
             page_idx: 0,
             slot_idx: 1,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc_a);
         let after_first = idx.resident_bytes();
@@ -717,6 +888,7 @@ mod tests {
             page_idx: 0,
             slot_idx: 0,
             ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         idx.insert(Bytes::from_static(b"key2"), loc);
@@ -763,6 +935,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -772,6 +945,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -816,6 +990,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -825,6 +1000,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -862,6 +1038,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         // Key re-spilled to a NEW file (re-eviction) -> file 10 orphaned.
@@ -872,6 +1049,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -910,6 +1088,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: Some(1_000), // expires at t=1000ms
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -960,6 +1139,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -969,6 +1149,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: Some(5_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -1002,6 +1183,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: Some(1_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
         ci.insert(
@@ -1011,6 +1193,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 1,
                 ttl_ms: Some(9_999_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 
@@ -1059,6 +1242,7 @@ mod tests {
                     page_idx: 0,
                     slot_idx: i,
                     ttl_ms: Some(1_000),
+                    value_type: crate::persistence::kv_page::ValueType::String,
                 },
             );
         }
@@ -1106,6 +1290,7 @@ mod tests {
                 page_idx: 0,
                 slot_idx: 0,
                 ttl_ms: None,
+                value_type: crate::persistence::kv_page::ValueType::String,
             },
         );
 

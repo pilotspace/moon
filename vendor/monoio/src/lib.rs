@@ -58,6 +58,17 @@ pub fn set_legacy_spin_budget_us(us: u64) {
     driver::set_legacy_spin_budget_us(us)
 }
 
+/// moon patch (O3): flip the CALLING thread's spin contention gate. While
+/// `true`, this thread's legacy-driver parks skip the readiness spin (as if
+/// the budget were 0) and fall back to plain blocking polls; the budget and
+/// idle-disengage state are untouched, so retracting the gate restores
+/// spinning immediately. Set by the host's per-shard governor when the
+/// thread's involuntary-preemption rate says the core is shared.
+#[cfg(feature = "legacy")]
+pub fn set_legacy_spin_contended(contended: bool) {
+    driver::set_legacy_spin_contended(contended)
+}
+
 /// moon patch: register per-thread spin-park hooks for the legacy driver's
 /// poll-mode park (skip-notify handshake). `advertise(spinning)` is invoked
 /// at spin entry/exit; `probe()` each spin iteration plus once after the

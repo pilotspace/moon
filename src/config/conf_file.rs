@@ -104,6 +104,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     "experimental-per-shard-rewrite",
     "cluster-enabled",
     "vector-exact-beam",
+    "memory-thp",
 ];
 
 /// Parse a conf file and return a list of synthesised argv tokens.
@@ -471,6 +472,22 @@ mod tests {
 ",
         )
         .unwrap();
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn memory_thp_is_a_bool_flag() {
+        // PR #387 review regression: `memory-thp` missing from BOOL_FLAGS made
+        // ANY moon.conf value for it (even the default `no`) synthesise
+        // `["--memory-thp", "yes"]`, which clap's SetTrue flag rejects with
+        // `unexpected argument` — a hard startup failure. As a registered bool
+        // flag it must emit the bare flag for truthy and nothing for falsy.
+        // (The flag is still allocator-CLI-only: jemalloc can't see conf-file
+        // values, and main.rs warns loudly about that — but the conf file
+        // must PARSE, not refuse to start the server.)
+        let tokens = parse_conf_contents("memory-thp yes\n").unwrap();
+        assert_eq!(tokens, vec!["--memory-thp"]);
+        let tokens = parse_conf_contents("memory-thp no\n").unwrap();
         assert!(tokens.is_empty());
     }
 

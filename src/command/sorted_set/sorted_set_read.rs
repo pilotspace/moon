@@ -1396,7 +1396,7 @@ fn collect_source_sets(
     Ok(source_data)
 }
 
-/// Read-only twin: collect source sets using `get_sorted_set_if_alive`.
+/// Read-only twin: collect source sets using `get_sorted_set_ref_if_alive`.
 ///
 /// Compact (listpack) encodings return an empty map — callers see an absent
 /// set, which is correct because compact sets are upgraded to BPTree on first

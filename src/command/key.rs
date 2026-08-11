@@ -184,7 +184,6 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -192,7 +191,7 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now_ms >= exp_ms {
                     // Edge case: expired between get and now
                     Frame::Integer(-2)
@@ -215,7 +214,6 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -223,7 +221,7 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now_ms >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -362,14 +360,13 @@ pub fn expiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+                Frame::Integer((entry.expires_at_ms() / 1000) as i64)
             }
         }
     }
@@ -386,14 +383,13 @@ pub fn pexpiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+                Frame::Integer(entry.expires_at_ms() as i64)
             }
         }
     }
@@ -534,8 +530,9 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
         match db.get(key) {
             Some(entry) => {
                 let last = entry.last_access();
-                // Wraparound-safe delta in seconds (16-bit)
-                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                // Full u32 epoch-seconds delta; saturate rather than wrap if
+                // the cached clock lags a concurrent touch.
+                let idle = now.saturating_sub(last);
                 Frame::Integer(idle as i64)
             }
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
@@ -603,8 +600,9 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         match db.get_if_alive(key, now_ms) {
             Some(entry) => {
                 let last = entry.last_access();
-                // Wraparound-safe delta in seconds (16-bit)
-                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                // Full u32 epoch-seconds delta; saturate rather than wrap if
+                // the cached clock lags a concurrent touch.
+                let idle = now.saturating_sub(last);
                 Frame::Integer(idle as i64)
             }
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
@@ -755,9 +753,11 @@ fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
 
 /// DBSIZE
 ///
-/// Returns the number of keys in the currently selected database.
+/// Returns the number of LOGICAL keys in the currently selected database —
+/// hot entries plus disk-offloaded (cold) keys, overlap counted once
+/// (issue #355; Redis parity: a spilled-but-readable key is still a key).
 pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
-    Frame::Integer(db.len() as i64)
+    Frame::Integer(db.logical_len() as i64)
 }
 
 /// DBSIZE — read-only variant for `dispatch_read()`.
@@ -767,7 +767,7 @@ pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
 /// immutable `&Database` and returns the current key count, matching the
 /// mutable `dbsize` semantics exactly (neither variant lazily expires).
 pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
-    Frame::Integer(db.len() as i64)
+    Frame::Integer(db.logical_len() as i64)
 }
 
 /// KEYS pattern
@@ -785,12 +785,22 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Collect all keys first (need to release immutable borrow before calling db.get)
     let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
+    let now_ms = db.now_ms();
 
     let mut result = Vec::new();
     for key in all_keys {
-        // Trigger lazy expiry by calling exists
-        if db.exists(key.as_bytes()) && glob_match(pattern, key.as_bytes()) {
+        // Trigger lazy expiry by calling exists; membership below is strict
+        // hot-aliveness so cold-only keys enter exactly once, via the cold
+        // loop (#364 plane partition — see Database::cold_only_keys).
+        let _ = db.exists(key.as_bytes());
+        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        {
             result.push(Frame::BulkString(key.to_bytes()));
+        }
+    }
+    for key in db.cold_only_keys(now_ms) {
+        if glob_match(pattern, key.as_ref()) {
+            result.push(Frame::BulkString(key.clone()));
         }
     }
 
@@ -925,6 +935,19 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(count)
 }
 
+/// SCAN's TYPE-filter judgment for a cold-only (spilled) key.
+///
+/// Judged from the in-RAM `ColdLocation::value_type` cache — must never
+/// read the cold value from disk or promote it into RAM, or SCAN over a
+/// large offloaded keyspace turns into a disk crawl / memory-pressure
+/// storm on the shard thread (#364).
+fn cold_type_matches(db: &Database, key: &[u8], type_filter: &[u8]) -> bool {
+    db.cold_index
+        .as_ref()
+        .and_then(|ci| ci.lookup(key))
+        .is_some_and(|loc| type_filter.eq_ignore_ascii_case(loc.value_type.type_name().as_bytes()))
+}
+
 /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
 ///
 /// Incrementally iterates the key space. Returns a cursor and a batch of keys.
@@ -933,18 +956,24 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SCAN");
     }
 
-    // Parse cursor
+    // Parse cursor (a position in 48-bit hash space — see `scan_core`)
     let cursor_str = match extract_key(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("SCAN"),
     };
-    let cursor: usize = match std::str::from_utf8(cursor_str)
+    let cursor: u64 = match std::str::from_utf8(cursor_str)
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
+    // Clamp to the 48-bit hash space. Legitimate resumed cursors always
+    // fit (multi-shard composites are unpacked by `coordinate_scan` before
+    // reaching here); an out-of-range client cursor would otherwise filter
+    // out every key (h48 < 2^48) and falsely report "scan complete" on a
+    // non-empty keyspace.
+    let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
     // Parse optional arguments
     let mut match_pattern: Option<&[u8]> = None;
@@ -983,57 +1012,170 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration
-    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
-    let mut sorted_keys: Vec<CompactKey> = Vec::new();
-    for key in all_keys {
-        if db.exists(key.as_bytes()) {
-            sorted_keys.push(key);
+    let now_ms = db.now_ms();
+    scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
+}
+
+// The SCAN cursor is a POSITION IN 48-BIT HASH SPACE: the hot table's own
+// fixed-seed key hash truncated to its TOP 48 bits
+// (`storage::dashtable::hash_key(key) >> 16`). Neither plane computes it
+// here anymore — `Database::scan_hot_page` walks only the DashTable
+// segments covering `[cursor << 16, ..)` and the ordered cold index
+// (`Database::cold_only_keys_from`) range-resumes from the cursor — but
+// both derive the SAME value internally, keeping the two planes in one
+// merged hash order. 48 bits because the multi-shard composite cursor
+// reserves the upper 16 bits for the shard index (`coordinate_scan`).
+
+/// Shared SCAN page walk (#368): hash-ordered iteration with a real
+/// stable-key guarantee, replacing the old positional-index-over-a-
+/// per-call-re-sort design.
+///
+/// Keys are visited in `(hash48(key), key)` order; the cursor is the next
+/// unvisited hash. A key's hash never changes, so inserts/deletes/spills/
+/// promotions between pages cannot displace another key's position —
+/// Redis's contract ("a key present for the entire scan is returned at
+/// least once"; here exactly once) holds under churn. Per page the hot
+/// plane is a true O(COUNT) segment-range walk (`Database::scan_hot_page`
+/// visits only DashTable segments covering hashes ≥ cursor, #368); the
+/// cold plane is still a filtered in-RAM index walk. Both feed one bounded
+/// `count`-min selection heap — no full-keyspace sort and no second
+/// lookup pass (the old design paid `collect + sort + exists() +
+/// get_if_alive()` over every key on every page).
+///
+/// Page-boundary rule: a full page never advances the cursor past a hash
+/// value whose key group might be only partially selected, so hash
+/// collisions (rare at 48 bits) can never skip a key. Trailing entries
+/// sharing the last hash are deferred to the next page; if an entire page
+/// shares one hash (pathological), the whole equal-hash group is emitted
+/// and the cursor steps past it.
+fn scan_core(
+    db: &Database,
+    cursor: u64,
+    count: usize,
+    match_pattern: Option<&[u8]>,
+    type_filter: Option<&[u8]>,
+    now_ms: u64,
+) -> Frame {
+    use std::collections::BinaryHeap;
+
+    // Hot plane: O(COUNT) hash-range page — only the DashTable segments
+    // covering hashes ≥ cursor are visited; entries arrive live-filtered
+    // with their hash48 precomputed. When `more`, the page holds ≥ count
+    // entries, all below anything in unvisited segments, so it always
+    // contains the count smallest hot candidates.
+    let (hot_page, _hot_more) = db.scan_hot_page(cursor, count, now_ms);
+
+    // Bounded max-heap selection: the `count` smallest (hash, key) pairs
+    // at or after the cursor, across both planes.
+    let mut heap: BinaryHeap<(u64, CompactKey, bool)> = BinaryHeap::with_capacity(count + 1);
+    {
+        let mut consider = |h: u64, key_bytes: &[u8], is_cold: bool| {
+            if h < cursor {
+                return;
+            }
+            if heap.len() < count {
+                heap.push((h, CompactKey::from(key_bytes), is_cold));
+            } else if let Some(top) = heap.peek() {
+                if h < top.0 || (h == top.0 && key_bytes < top.1.as_bytes()) {
+                    heap.pop();
+                    heap.push((h, CompactKey::from(key_bytes), is_cold));
+                }
+            }
+        };
+        for (h, key) in &hot_page {
+            consider(*h, key.as_bytes(), false);
+        }
+        // Cold plane: spilled keys with no live hot shadow (pure in-RAM
+        // index probe — no disk I/O). Partitioned from the hot walk, so no
+        // dedup pass (#364). Hash-ordered range resume: the first `count`
+        // live candidates at or after the cursor are exactly the smallest
+        // cold candidates — no full cold-index filter per page.
+        for (h, key) in db.cold_only_keys_from(cursor, now_ms).take(count) {
+            consider(h, key.as_ref(), true);
         }
     }
-    sorted_keys.sort();
 
-    let total = sorted_keys.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-
-    // Iterate from cursor position, collect up to `count` matching keys
-    let mut checked = 0;
-    while pos < total && checked < count {
-        let key = &sorted_keys[pos];
-        pos += 1;
-        checked += 1;
-
-        // TYPE filter
-        if let Some(tf) = type_filter {
-            if let Some(entry) = db.get(key.as_bytes()) {
-                let tn = entry.value.type_name().as_bytes();
-                if !tf.eq_ignore_ascii_case(tn) {
-                    continue;
+    let full_page = heap.len() == count;
+    let mut selected = heap.into_sorted_vec();
+    let mut next_cursor: u64 = 0;
+    if full_page {
+        #[allow(clippy::unwrap_used)] // full_page ⇒ count ≥ 1 entries
+        let h_last = selected.last().unwrap().0;
+        let h_first = selected.first().map(|e| e.0).unwrap_or(h_last);
+        if h_first == h_last {
+            // Whole page one hash value: emit the ENTIRE equal-hash group
+            // (unreachable in practice at 48 bits) so the cursor may step
+            // past it. Hot members all live in the already-fetched page:
+            // equal h48 ⇒ same DashTable segment, and pages are
+            // whole-segment granular.
+            let mut extra: Vec<(u64, CompactKey, bool)> = Vec::new();
+            for (h, key) in &hot_page {
+                if *h == h_last && !selected.iter().any(|(_, k, _)| k == key) {
+                    extra.push((h_last, key.clone(), false));
                 }
+            }
+            for (h, key) in db.cold_only_keys_from(h_last, now_ms) {
+                if h > h_last {
+                    break;
+                }
+                if !selected
+                    .iter()
+                    .any(|(_, k, _)| k.as_bytes() == key.as_ref())
+                {
+                    extra.push((h_last, CompactKey::from(key.as_ref()), true));
+                }
+            }
+            selected.extend(extra);
+            // If the group sits at the very top of the 48-bit hash space,
+            // the scan is complete — nothing can hash above it, and
+            // `h_last + 1` (2^48) would be masked back to 0 by the cursor
+            // clamp on the next call, restarting the scan forever. Not
+            // practically constructible (needs a full page of keys at the
+            // exact max hash), hence no test — this is belt-and-braces
+            // against an infinite scan loop.
+            next_cursor = if h_last == 0x0000_FFFF_FFFF_FFFF {
+                0
             } else {
+                h_last + 1
+            };
+        } else {
+            // Defer the (possibly incomplete) trailing hash group to the
+            // next page; resume exactly at its hash.
+            selected.retain(|(h, _, _)| *h < h_last);
+            next_cursor = h_last;
+        }
+    }
+
+    let mut results = Vec::new();
+    for (_, key, is_cold) in &selected {
+        // TYPE filter (`is_cold` avoids a promoting/disk-reading lookup)
+        if let Some(tf) = type_filter {
+            let matches = if *is_cold {
+                cold_type_matches(db, key.as_bytes(), tf)
+            } else {
+                db.get_if_alive(key.as_bytes(), now_ms)
+                    .is_some_and(|e| tf.eq_ignore_ascii_case(e.value.type_name().as_bytes()))
+            };
+            if !matches {
                 continue;
             }
         }
-
-        // MATCH filter
         if let Some(pattern) = match_pattern {
             if !glob_match(pattern, key.as_bytes()) {
                 continue;
             }
         }
-
         results.push(Frame::BulkString(key.to_bytes()));
     }
 
-    let next_cursor = if pos >= total {
+    let next_cursor_bytes = if next_cursor == 0 {
         Bytes::from_static(b"0")
     } else {
-        Bytes::from(pos.to_string())
+        Bytes::from(next_cursor.to_string())
     };
 
     Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
+        Frame::BulkString(next_cursor_bytes),
         Frame::Array(results.into()),
     ])
 }
@@ -1067,7 +1209,6 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -1075,7 +1216,7 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -1095,7 +1236,6 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -1103,7 +1243,7 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                let exp_ms = entry.expires_at_ms(base_ts);
+                let exp_ms = entry.expires_at_ms();
                 if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
@@ -1144,8 +1284,16 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
     let mut result = Vec::new();
     for key in db.keys() {
-        if db.exists_if_alive(key.as_bytes(), now_ms) && glob_match(pattern, key.as_bytes()) {
+        // Strict hot-aliveness: cold-visible keys enter exactly once, via
+        // the cold loop below (#364 plane partition).
+        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        {
             result.push(Frame::BulkString(key.to_bytes()));
+        }
+    }
+    for key in db.cold_only_keys(now_ms) {
+        if glob_match(pattern, key.as_ref()) {
+            result.push(Frame::BulkString(key.clone()));
         }
     }
     Frame::Array(result.into())
@@ -1161,13 +1309,19 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SCAN"),
     };
-    let cursor: usize = match std::str::from_utf8(cursor_str)
+    let cursor: u64 = match std::str::from_utf8(cursor_str)
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
+    // Clamp to the 48-bit hash space. Legitimate resumed cursors always
+    // fit (multi-shard composites are unpacked by `coordinate_scan` before
+    // reaching here); an out-of-range client cursor would otherwise filter
+    // out every key (h48 < 2^48) and falsely report "scan complete" on a
+    // non-empty keyspace.
+    let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
     let mut match_pattern: Option<&[u8]> = None;
     let mut count: usize = 10;
@@ -1205,56 +1359,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         i += 1;
     }
 
-    // Collect all non-expired keys sorted for deterministic iteration
-    let mut sorted_keys: Vec<CompactKey> = db
-        .keys()
-        .filter(|k| db.exists_if_alive(k.as_bytes(), now_ms))
-        .cloned()
-        .collect();
-    sorted_keys.sort();
-
-    let total = sorted_keys.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-    let mut checked = 0;
-
-    while pos < total && checked < count {
-        let key = &sorted_keys[pos];
-        pos += 1;
-        checked += 1;
-
-        // TYPE filter
-        if let Some(tf) = type_filter {
-            if let Some(entry) = db.get_if_alive(key.as_bytes(), now_ms) {
-                let tn = entry.value.type_name().as_bytes();
-                if !tf.eq_ignore_ascii_case(tn) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-
-        // MATCH filter
-        if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, key.as_bytes()) {
-                continue;
-            }
-        }
-
-        results.push(Frame::BulkString(key.to_bytes()));
-    }
-
-    let next_cursor = if pos >= total {
-        Bytes::from_static(b"0")
-    } else {
-        Bytes::from(pos.to_string())
-    };
-
-    Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
-        Frame::Array(results.into()),
-    ])
+    scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,14 +1377,13 @@ pub fn expiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+                Frame::Integer((entry.expires_at_ms() / 1000) as i64)
             }
         }
     }
@@ -1296,14 +1400,13 @@ pub fn pexpiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
                 Frame::Integer(-1)
             } else {
-                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+                Frame::Integer(entry.expires_at_ms() as i64)
             }
         }
     }
@@ -1360,12 +1463,268 @@ mod tests {
 
     fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::copy_from_slice(key),
-            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
         );
         db
+    }
+
+    // --- SCAN cursor tests (issue #368: hash-ordered stable-key cursor) ---
+
+    fn scan_page(db: &mut Database, cursor: u64, count: usize) -> (u64, Vec<Bytes>) {
+        let reply = scan(
+            db,
+            &[
+                bs(cursor.to_string().as_bytes()),
+                bs(b"COUNT"),
+                bs(count.to_string().as_bytes()),
+            ],
+        );
+        let Frame::Array(parts) = reply else {
+            panic!("SCAN must return an array");
+        };
+        let next: u64 = match &parts[0] {
+            Frame::BulkString(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+            other => panic!("cursor frame: {other:?}"),
+        };
+        let keys = match &parts[1] {
+            Frame::Array(items) => items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.clone(),
+                    other => panic!("key frame: {other:?}"),
+                })
+                .collect(),
+            other => panic!("keys frame: {other:?}"),
+        };
+        (next, keys)
+    }
+
+    /// Issue #368 red/green: the old positional cursor skipped stable keys
+    /// when deletions shifted positions between pages. The hash-ordered
+    /// cursor must return every key that exists for the entire scan.
+    #[test]
+    fn scan_returns_all_stable_keys_under_delete_and_insert_churn() {
+        let mut db = Database::new();
+        for i in 0..100 {
+            db.set(
+                Bytes::from(format!("stable:{i:03}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+
+        let mut returned: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut churn = 0;
+        loop {
+            let (next, keys) = scan_page(&mut db, cursor, 10);
+            for k in keys {
+                returned.insert(k.clone());
+                // Churn: delete a key we already got, insert a brand-new one.
+                if churn < 40 {
+                    db.remove(k.as_ref());
+                    db.set(
+                        Bytes::from(format!("churn:{churn:03}")),
+                        Entry::new_string(Bytes::from_static(b"v")),
+                    );
+                    churn += 1;
+                }
+            }
+            if next == 0 {
+                break;
+            }
+            assert!(next < 1 << 48, "cursor must fit the 48-bit composite slot");
+            cursor = next;
+        }
+
+        for i in 0..100 {
+            let key = format!("stable:{i:03}");
+            assert!(
+                returned.contains(key.as_bytes()),
+                "stable key {key} was skipped under churn — the SCAN \
+                 stable-key guarantee is broken"
+            );
+        }
+    }
+
+    /// Full no-churn drain: exact key-set equality and no duplicates.
+    #[test]
+    fn scan_full_drain_is_exact_and_duplicate_free() {
+        let mut db = Database::new();
+        for i in 0..57 {
+            db.set(
+                Bytes::from(format!("k:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        let mut seen: Vec<Bytes> = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next, keys) = scan_page(&mut db, cursor, 7);
+            seen.extend(keys);
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        let unique: std::collections::HashSet<&Bytes> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "no key may be returned twice");
+        assert_eq!(seen.len(), 57, "every live key exactly once");
+    }
+
+    /// An out-of-range client cursor (bits above the 48-bit hash space,
+    /// e.g. a composite cursor replayed against a single-shard server)
+    /// must be clamped, not silently filter out every key and report a
+    /// false "scan complete" on a non-empty keyspace.
+    #[test]
+    fn scan_out_of_range_cursor_clamps_to_hash_space() {
+        let mut db = Database::new();
+        for i in 0..20 {
+            db.set(
+                Bytes::from(format!("k:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        // 2^63: garbage in the shard-index bits, zero in the low 48.
+        let (_, keys) = scan_page(&mut db, 1u64 << 63, 50);
+        assert_eq!(keys.len(), 20, "clamped cursor must scan from position 0");
+    }
+
+    /// MATCH + COUNT paging still terminates and honors the filter.
+    #[test]
+    fn scan_match_filter_pages_terminate() {
+        let mut db = Database::new();
+        for i in 0..30 {
+            db.set(
+                Bytes::from(format!("user:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+            db.set(
+                Bytes::from(format!("other:{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        let mut matched = 0usize;
+        let mut cursor = 0u64;
+        let mut pages = 0;
+        loop {
+            let reply = scan(
+                &mut db,
+                &[
+                    bs(cursor.to_string().as_bytes()),
+                    bs(b"MATCH"),
+                    bs(b"user:*"),
+                    bs(b"COUNT"),
+                    bs(b"5"),
+                ],
+            );
+            let Frame::Array(parts) = reply else {
+                panic!("array")
+            };
+            let next: u64 = match &parts[0] {
+                Frame::BulkString(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+                _ => panic!("cursor"),
+            };
+            if let Frame::Array(items) = &parts[1] {
+                for f in items.iter() {
+                    if let Frame::BulkString(b) = f {
+                        assert!(b.starts_with(b"user:"), "MATCH must filter");
+                        matched += 1;
+                    }
+                }
+            }
+            pages += 1;
+            assert!(pages < 1000, "must terminate");
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(matched, 30, "every user:* key exactly once");
+    }
+
+    // --- DBSIZE tests (issue #355: logical count under disk-offload) ---
+
+    fn cold_loc(file_id: u64) -> crate::storage::tiered::cold_index::ColdLocation {
+        crate::storage::tiered::cold_index::ColdLocation {
+            file_id,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
+        }
+    }
+
+    /// Issue #355 red/green: a spilled-but-readable key is still a key.
+    /// DBSIZE must count hot + cold, not the resident set only (observed
+    /// 24K reported vs ~164K logical in the 2026-07-16 G2 re-run).
+    #[test]
+    fn test_dbsize_counts_cold_entries() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut db = setup_db_with_key(b"hot1", b"v");
+        db.set(
+            Bytes::from_static(b"hot2"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"cold1"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"cold2"), cold_loc(2));
+        ci.insert(Bytes::from_static(b"cold3"), cold_loc(3));
+        db.cold_index = Some(ci);
+
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(5));
+        assert_eq!(dbsize_readonly(&db, &[]), Frame::Integer(5));
+    }
+
+    /// Issue #355: a key that is BOTH hot and cold-shadowed (fresh SET over a
+    /// cold-only key lands on the `Inserted` arm, which must leave the shadow
+    /// for the AOF-replay ambiguity proof — see `Database::set`) counts ONCE.
+    #[test]
+    fn test_dbsize_does_not_double_count_cold_shadowed_hot_key() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut ci = ColdIndex::new();
+        // Cold entries exist FIRST (rebuilt from manifest / spilled earlier)…
+        ci.insert(Bytes::from_static(b"shadowed"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"cold_only"), cold_loc(2));
+        let mut db = Database::new();
+        db.cold_index = Some(ci);
+        // …then a fresh SET over the cold-only key: `Inserted` arm, shadow
+        // intentionally survives.
+        db.set(
+            Bytes::from_static(b"shadowed"),
+            Entry::new_string(Bytes::from_static(b"new")),
+        );
+        assert!(db.is_hot(b"shadowed"));
+        assert!(
+            db.cold_index
+                .as_ref()
+                .unwrap()
+                .lookup(b"shadowed")
+                .is_some(),
+            "precondition: the cold shadow must still exist for this test to bite"
+        );
+
+        // shadowed (1) + cold_only (1) = 2 logical keys, never 3.
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(2));
+        assert_eq!(dbsize_readonly(&db, &[]), Frame::Integer(2));
+    }
+
+    /// Control: without a cold index (disk-offload disabled) DBSIZE is the
+    /// plain hot count, and `clear()` zeroes both planes.
+    #[test]
+    fn test_dbsize_no_cold_index_and_clear() {
+        use crate::storage::tiered::cold_index::ColdIndex;
+        let mut db = setup_db_with_key(b"k", b"v");
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(1));
+
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"cold"), cold_loc(1));
+        db.cold_index = Some(ci);
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(2));
+
+        db.clear();
+        assert_eq!(dbsize(&mut db, &[]), Frame::Integer(0));
     }
 
     // --- DEL tests ---
@@ -1779,10 +2138,9 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"1")),
         );
         let past_ms = current_time_ms() - 1000;
-        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
         );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {
@@ -2006,7 +2364,16 @@ mod tests {
                     _ => panic!("Expected cursor"),
                 }
                 match &arr[1] {
-                    Frame::Array(keys) => assert_eq!(keys.len(), 5),
+                    // COUNT is a hint (Redis parity): the hash-ordered
+                    // cursor (#368) may defer the trailing hash group to
+                    // the next page, so a full page returns 1..=COUNT keys.
+                    Frame::Array(keys) => {
+                        assert!(
+                            !keys.is_empty() && keys.len() <= 5,
+                            "full page must return 1..=COUNT keys, got {}",
+                            keys.len()
+                        );
+                    }
                     _ => panic!("Expected keys array"),
                 }
             }
@@ -2217,5 +2584,368 @@ mod tests {
         let mut db = Database::new();
         let result = object(&mut db, &[bs(b"BOGUS")]);
         assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- Cold-plane enumeration tests (issue #364) ---
+    //
+    // Under disk-offload, keys spilled by eviction live ONLY in
+    // `Database::cold_index` (no in-RAM Entry). SCAN/KEYS/RANDOMKEY must
+    // enumerate them from the in-RAM index alone — no disk I/O.
+
+    mod cold_enumeration {
+        use super::*;
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        /// Db with `hot` resident string keys and `cold` cold-only keys.
+        fn db_with_planes(hot: &[&[u8]], cold: &[(&[u8], Option<u64>)]) -> Database {
+            let mut db = Database::new();
+            for k in hot {
+                db.set(
+                    Bytes::copy_from_slice(k),
+                    Entry::new_string(Bytes::from_static(b"v")),
+                );
+            }
+            let mut ci = ColdIndex::new();
+            for (i, (k, ttl_ms)) in cold.iter().enumerate() {
+                ci.insert(
+                    Bytes::copy_from_slice(k),
+                    ColdLocation {
+                        file_id: 1,
+                        page_idx: 0,
+                        slot_idx: i as u16,
+                        ttl_ms: *ttl_ms,
+                        value_type: crate::persistence::kv_page::ValueType::String,
+                    },
+                );
+            }
+            db.cold_index = Some(ci);
+            db
+        }
+
+        /// Drive SCAN (mutable track) to completion, collecting every key.
+        fn full_scan(db: &mut Database, extra: &[&[u8]]) -> Vec<Bytes> {
+            let mut cursor = Bytes::from_static(b"0");
+            let mut keys = Vec::new();
+            loop {
+                let mut args = vec![Frame::BulkString(cursor.clone())];
+                for e in extra {
+                    args.push(bs(e));
+                }
+                let Frame::Array(parts) = scan(db, &args) else {
+                    panic!("SCAN did not return an array");
+                };
+                let Frame::BulkString(next) = &parts[0] else {
+                    panic!("SCAN cursor not a bulk string");
+                };
+                let Frame::Array(batch) = &parts[1] else {
+                    panic!("SCAN batch not an array");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        keys.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    return keys;
+                }
+                cursor = next.clone();
+            }
+        }
+
+        fn full_scan_readonly(db: &Database, now_ms: u64, extra: &[&[u8]]) -> Vec<Bytes> {
+            let mut cursor = Bytes::from_static(b"0");
+            let mut keys = Vec::new();
+            loop {
+                let mut args = vec![Frame::BulkString(cursor.clone())];
+                for e in extra {
+                    args.push(bs(e));
+                }
+                let Frame::Array(parts) = scan_readonly(db, &args, now_ms) else {
+                    panic!("SCAN did not return an array");
+                };
+                let Frame::BulkString(next) = &parts[0] else {
+                    panic!("SCAN cursor not a bulk string");
+                };
+                let Frame::Array(batch) = &parts[1] else {
+                    panic!("SCAN batch not an array");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        keys.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    return keys;
+                }
+                cursor = next.clone();
+            }
+        }
+
+        #[test]
+        fn scan_paged_drain_across_planes_exact_once() {
+            // 40 hot + 40 cold-only + 10 both-planes keys drained at
+            // COUNT 7: the ranged cold walk (#368 cold-plane resume) must
+            // merge with the hot page walk so every LOGICAL key appears
+            // exactly once across pages.
+            let hot_names: Vec<Vec<u8>> = (0..50).map(|i| format!("h:{i}").into_bytes()).collect();
+            let cold_names: Vec<Vec<u8>> = (0..40).map(|i| format!("c:{i}").into_bytes()).collect();
+            let hot_refs: Vec<&[u8]> = hot_names.iter().map(|v| v.as_slice()).collect();
+            let mut cold_refs: Vec<(&[u8], Option<u64>)> =
+                cold_names.iter().map(|v| (v.as_slice(), None)).collect();
+            // 10 both-planes keys: hot shadow over a stale cold entry.
+            for v in hot_names.iter().take(10) {
+                cold_refs.push((v.as_slice(), None));
+            }
+            let mut db = db_with_planes(&hot_refs, &cold_refs);
+            let keys = full_scan(&mut db, &[b"COUNT", b"7"]);
+            let unique: std::collections::HashSet<&Bytes> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "no key may be returned twice");
+            assert_eq!(keys.len(), 90, "every logical key exactly once");
+        }
+
+        #[test]
+        fn scan_cold_churn_between_pages_keeps_stable_keys() {
+            // New spills landing mid-scan must not displace pre-existing
+            // cold keys (hash-space cursor: churn can't shift positions).
+            let cold_names: Vec<Vec<u8>> =
+                (0..30).map(|i| format!("st:{i}").into_bytes()).collect();
+            let cold_refs: Vec<(&[u8], Option<u64>)> =
+                cold_names.iter().map(|v| (v.as_slice(), None)).collect();
+            let mut db = db_with_planes(&[], &cold_refs);
+            let mut cursor = Bytes::from_static(b"0");
+            let mut seen: Vec<Bytes> = Vec::new();
+            let mut churn = 0u32;
+            loop {
+                let args = [Frame::BulkString(cursor.clone()), bs(b"COUNT"), bs(b"5")];
+                let Frame::Array(parts) = scan(&mut db, &args) else {
+                    panic!("SCAN did not return an array");
+                };
+                let (Frame::BulkString(next), Frame::Array(batch)) = (&parts[0], &parts[1]) else {
+                    panic!("malformed SCAN reply");
+                };
+                for f in batch.iter() {
+                    if let Frame::BulkString(k) = f {
+                        seen.push(k.clone());
+                    }
+                }
+                if next.as_ref() == b"0" {
+                    break;
+                }
+                cursor = next.clone();
+                // Churn: spill 5 NEW cold keys between every page.
+                #[allow(clippy::unwrap_used)] // test-only: planes fabricated above
+                let ci = db.cold_index.as_mut().unwrap();
+                for _ in 0..5 {
+                    ci.insert(
+                        Bytes::from(format!("churn:{churn}")),
+                        ColdLocation {
+                            file_id: 2,
+                            page_idx: 0,
+                            slot_idx: 0,
+                            ttl_ms: None,
+                            value_type: crate::persistence::kv_page::ValueType::String,
+                        },
+                    );
+                    churn += 1;
+                }
+            }
+            for name in &cold_names {
+                assert!(
+                    seen.iter().any(|k| k.as_ref() == name.as_slice()),
+                    "stable cold key {} lost under mid-scan spill churn",
+                    String::from_utf8_lossy(name)
+                );
+            }
+            let unique: std::collections::HashSet<&Bytes> = seen.iter().collect();
+            assert_eq!(unique.len(), seen.len(), "no key may be returned twice");
+        }
+
+        #[test]
+        fn scan_includes_cold_only_keys() {
+            let mut db = db_with_planes(&[b"hot1", b"hot2"], &[(b"cold1", None), (b"cold2", None)]);
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["cold1", "cold2", "hot1", "hot2"]);
+        }
+
+        #[test]
+        fn scan_readonly_includes_cold_only_keys() {
+            let db = db_with_planes(&[b"hot1"], &[(b"cold1", None)]);
+            let now_ms = current_time_ms();
+            let mut keys = full_scan_readonly(&db, now_ms, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["cold1", "hot1"]);
+        }
+
+        #[test]
+        fn scan_returns_both_planes_key_exactly_once() {
+            // A key present in BOTH planes (hot shadow over a stale cold
+            // entry, e.g. after AOF-replay) must be returned exactly once.
+            let mut db = db_with_planes(&[b"both"], &[(b"both", None), (b"coldonly", None)]);
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["both", "coldonly"]);
+        }
+
+        #[test]
+        fn scan_skips_ttl_expired_cold_keys() {
+            let now_ms = current_time_ms();
+            let mut db = db_with_planes(
+                &[],
+                &[
+                    (b"alive", Some(now_ms + 60_000)),
+                    (b"dead", Some(now_ms - 60_000)),
+                ],
+            );
+            let keys = full_scan(&mut db, &[b"COUNT", b"100"]);
+            assert_eq!(keys, vec!["alive"]);
+        }
+
+        #[test]
+        fn scan_match_filter_applies_to_cold_keys() {
+            let mut db = db_with_planes(&[b"user:1"], &[(b"user:2", None), (b"other", None)]);
+            let mut keys = full_scan(&mut db, &[b"MATCH", b"user:*", b"COUNT", b"100"]);
+            keys.sort();
+            assert_eq!(keys, vec!["user:1", "user:2"]);
+        }
+
+        #[test]
+        fn scan_small_count_pages_through_cold_keys() {
+            let mut db = db_with_planes(
+                &[b"h1", b"h2", b"h3"],
+                &[(b"c1", None), (b"c2", None), (b"c3", None)],
+            );
+            // COUNT 1 forces one key per page — exercises cursor continuity
+            // across the hot/cold boundary.
+            let mut keys = full_scan(&mut db, &[b"COUNT", b"1"]);
+            keys.sort();
+            assert_eq!(keys, vec!["c1", "c2", "c3", "h1", "h2", "h3"]);
+        }
+
+        #[test]
+        fn keys_includes_cold_only_keys() {
+            let mut db = db_with_planes(&[b"hot1"], &[(b"cold1", None), (b"both", None)]);
+            db.set(
+                Bytes::from_static(b"both"),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+            let Frame::Array(arr) = keys(&mut db, &[bs(b"*")]) else {
+                panic!("KEYS did not return an array");
+            };
+            let mut got: Vec<Bytes> = arr
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::BulkString(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, vec!["both", "cold1", "hot1"]);
+        }
+
+        #[test]
+        fn keys_readonly_includes_cold_only_keys() {
+            let db = db_with_planes(&[b"hot1"], &[(b"cold1", None)]);
+            let now_ms = current_time_ms();
+            let Frame::Array(arr) = keys_readonly(&db, &[bs(b"*")], now_ms) else {
+                panic!("KEYS did not return an array");
+            };
+            let mut got: Vec<Bytes> = arr
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::BulkString(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, vec!["cold1", "hot1"]);
+        }
+
+        #[test]
+        fn scan_type_filter_judges_cold_keys_from_index() {
+            use crate::persistence::kv_page::ValueType;
+            // One cold hash + one cold string + one hot string. TYPE hash
+            // must surface ONLY the cold hash — judged from the in-RAM
+            // ColdLocation::value_type cache, no disk read available here
+            // (no spill file exists behind these locations).
+            let mut db = db_with_planes(&[b"hotstr"], &[]);
+            let mut ci = ColdIndex::new();
+            ci.insert(
+                Bytes::from_static(b"coldhash"),
+                ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: 0,
+                    ttl_ms: None,
+                    value_type: ValueType::Hash,
+                },
+            );
+            ci.insert(
+                Bytes::from_static(b"coldstr"),
+                ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: 1,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                },
+            );
+            db.cold_index = Some(ci);
+
+            let hashes = full_scan(&mut db, &[b"TYPE", b"hash", b"COUNT", b"100"]);
+            assert_eq!(hashes, vec!["coldhash"]);
+
+            let mut strings = full_scan(&mut db, &[b"TYPE", b"string", b"COUNT", b"100"]);
+            strings.sort();
+            assert_eq!(strings, vec!["coldstr", "hotstr"]);
+
+            // Read-only twin must agree.
+            let now_ms = current_time_ms();
+            let ro_hashes = full_scan_readonly(&db, now_ms, &[b"TYPE", b"hash", b"COUNT", b"100"]);
+            assert_eq!(ro_hashes, vec!["coldhash"]);
+        }
+
+        #[test]
+        fn randomkey_sees_all_cold_database() {
+            // Every key spilled: RANDOMKEY must not report an empty db.
+            let mut db = db_with_planes(&[], &[(b"cold1", None), (b"cold2", None)]);
+            match randomkey(&mut db, &[]) {
+                Frame::BulkString(k) => {
+                    assert!(k.as_ref() == b"cold1" || k.as_ref() == b"cold2");
+                }
+                other => panic!("expected a key, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn randomkey_readonly_sees_all_cold_database() {
+            let db = db_with_planes(&[], &[(b"cold1", None)]);
+            match randomkey_readonly(&db, &[], current_time_ms()) {
+                Frame::BulkString(k) => assert_eq!(k.as_ref(), b"cold1"),
+                other => panic!("expected a key, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn del_of_ttl_expired_cold_key_answers_zero_but_reclaims() {
+            // Redis parity: DEL of a logically-expired key deletes nothing
+            // (returns 0) — but the stale cold-index entry must still be
+            // reclaimed as a side effect, not left behind.
+            let now_ms = current_time_ms();
+            let mut db = db_with_planes(&[], &[(b"dead", Some(now_ms - 60_000))]);
+            assert_eq!(del(&mut db, &[bs(b"dead")]), Frame::Integer(0));
+            assert!(
+                db.cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.lookup(b"dead").is_none()),
+                "stale cold entry must be reclaimed by the DEL attempt"
+            );
+        }
+
+        #[test]
+        fn unlink_of_alive_cold_key_still_counts() {
+            let mut db = db_with_planes(&[], &[(b"alive", None)]);
+            assert_eq!(unlink(&mut db, &[bs(b"alive")]), Frame::Integer(1));
+        }
     }
 }

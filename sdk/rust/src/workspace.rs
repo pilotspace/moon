@@ -11,7 +11,7 @@ use std::collections::HashMap;
 ///
 /// Obtain via [`MoonClient::workspace`](crate::MoonClient::workspace).
 pub struct WorkspaceClient {
-    pub(crate) conn: redis::aio::MultiplexedConnection,
+    pub(crate) conn: redis::aio::ConnectionManager,
 }
 
 impl WorkspaceClient {
