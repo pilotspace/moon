@@ -1,0 +1,2 @@
+target: aarch64, ext: false
+cargo:rustc-check-cfg=cfg(nightly)

@@ -1029,17 +1029,57 @@ impl AofManifest {
                 source: e,
             })?;
 
-        // 4. Delete old files (best-effort)
+        // 4. Delete old files — ONLY once it is safe (deep-review D1/D4).
+        //
+        // D4: the manifest rename above fsyncs its parent dir best-effort. If
+        // that dirent is NOT durable and we prune anyway, a crash can boot
+        // with the OLD manifest resolving to already-deleted files — the
+        // replay path then treats it as a fresh init and cleanup_orphans
+        // deletes the new generation too: total dataset loss instead of a
+        // fail-stop. Re-attempt the dir fsync here, propagating: on failure
+        // keep BOTH generations on disk so either manifest resolution finds
+        // complete files.
+        //
+        // D1: the old incr is also the durability backstop for cold-plane
+        // spill placements whose ShardManifest commit is still sitting in a
+        // manifest-sync agent's deferred slot ("AOF replay + orphan sweep
+        // reconstruct anything a lost manifest commit would have recorded").
+        // Barrier those commits durable before deleting the records that
+        // back-stop them; on barrier failure, skip the prune.
+        if let Err(e) = crate::persistence::manifest_sync::flush_all_agents() {
+            warn!(
+                "AOF advance: manifest-sync barrier failed ({}); keeping old \
+                 generation seq {} on disk as the durability backstop",
+                e, old_seq
+            );
+            return Ok(new_incr);
+        }
+        if let Some(parent) = self.manifest_path().parent() {
+            if let Err(e) = fsync_directory(parent) {
+                warn!(
+                    "AOF advance: manifest dirent not durable ({}); keeping old \
+                     generation seq {} on disk (both generations present is \
+                     crash-safe; a pruned old generation with a non-durable \
+                     manifest flip is not)",
+                    e, old_seq
+                );
+                return Ok(new_incr);
+            }
+        }
         let old_base = self.base_path_seq(old_seq);
-        let old_incr = self.incr_path_seq(old_seq);
+        let old_incr_path = self.incr_path_seq(old_seq);
         if old_base.exists() {
             if let Err(e) = std::fs::remove_file(&old_base) {
                 warn!("Failed to delete old base {}: {}", old_base.display(), e);
             }
         }
-        if old_incr.exists() {
-            if let Err(e) = std::fs::remove_file(&old_incr) {
-                warn!("Failed to delete old incr {}: {}", old_incr.display(), e);
+        if old_incr_path.exists() {
+            if let Err(e) = std::fs::remove_file(&old_incr_path) {
+                warn!(
+                    "Failed to delete old incr {}: {}",
+                    old_incr_path.display(),
+                    e
+                );
             }
         }
 

@@ -45,6 +45,9 @@ pub(crate) fn run_active_expiry(
 ) {
     if !is_replica {
         let db_count = shard_databases.db_count();
+        // #454 P2.8: ONE shared backpressure bound for this entire sweep
+        // (per-key minting could stall the shard bound x victim-count).
+        let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 crate::server::expiration::expire_cycle_direct(db, &mut |key| {
@@ -58,6 +61,7 @@ pub(crate) fn run_active_expiry(
                         shard_id,
                         aof_pool,
                         wal_kv_log,
+                        &mut reason_del_budget,
                     );
                 });
             });
@@ -156,6 +160,9 @@ pub(crate) fn run_eviction(
         // actually freed; once it drops to the budget, remaining dbs see an
         // under-budget total and return immediately (no eviction).
         let mut remaining = kv_total.saturating_add(vector_bytes);
+        // #454 P2.8: ONE shared backpressure bound for this entire sweep
+        // (per-key minting could stall the shard bound x victim-count).
+        let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 let before = db.estimated_memory();
@@ -182,6 +189,7 @@ pub(crate) fn run_eviction(
                                 shard_id,
                                 aof_pool,
                                 wal_kv_log,
+                                &mut reason_del_budget,
                             );
                         }),
                 );
@@ -209,9 +217,14 @@ pub(crate) fn run_eviction(
 }
 
 /// Expire timed-out blocked clients.
+///
+/// Heap-driven since c10k W6: cost is O(due + stale-heap-entries), not
+/// O(all blocked waiters), so the 100 Hz cadence is safe at 10k+ blocked
+/// clients. The visit count is intentionally dropped here — it exists for
+/// tests/observability at the registry layer.
 pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>) {
     let now = std::time::Instant::now();
-    blocking_rc.borrow_mut().expire_timed_out(now);
+    let _ = blocking_rc.borrow_mut().expire_timed_out(now);
 }
 
 /// Checkpoint tick interval in milliseconds.

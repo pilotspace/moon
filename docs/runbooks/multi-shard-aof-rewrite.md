@@ -52,15 +52,25 @@ linearly with shard count.
 
 ### BGREWRITEAOF in per-shard mode
 
-`BGREWRITEAOF` is **not yet supported** for PerShard layouts. Issuing it on a
-PerShard instance returns the following error immediately:
+`BGREWRITEAOF` is **fully supported** on PerShard layouts (#433, un-gated
+2026-08): the per-shard fan-out folds every shard cooperatively (C4 snapshot
+via the shard event loop), advances each shard's manifest entry, and the last
+writer performs a single synchronized seq commit + old-generation prune.
+Exactness (no dropped, no double-applied writes across a rewrite that
+straddles a live write stream + SIGKILL) is pinned by
+`tests/crash_matrix_per_shard_bgrewriteaof.rs`.
+`--experimental-per-shard-rewrite`, the old opt-in, is deprecated and a
+no-op.
 
-```
-ERR BGREWRITEAOF is not yet supported under per-shard AOF layout; per-shard rewrite ships in step 6 of the per-shard AOF migration
-```
+### Automatic rewrite (#433)
 
-Per-shard BGREWRITEAOF (each shard compacts its own log independently, with
-all N acks awaited before returning confirmation) is tracked for v0.2.
+The AOF compacts itself, Redis-style: when its on-disk size exceeds
+`auto-aof-rewrite-min-size` (default `64mb`) AND has grown
+`auto-aof-rewrite-percentage`% (default `100`) over its size after the last
+rewrite, a background rewrite is dispatched automatically. Set the
+percentage to `0` to disable automatic rewrites (manual `BGREWRITEAOF`
+always works). Watch `INFO persistence` → `aof_base_size` /
+`aof_current_size` to see the trigger's inputs.
 
 ---
 

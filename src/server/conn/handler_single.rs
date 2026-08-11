@@ -9,6 +9,41 @@ use crate::runtime::channel;
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
+
+/// c10k C1 — bound a reply send so a peer that stops reading cannot park the
+/// handler forever.
+///
+/// `Framed::send` is feed + flush; the flush blocks once the socket's receive
+/// window closes and never returns. The handler then holds its `maxclients`
+/// slot, and its share of the batch's serialized replies, for as long as the
+/// client cares to wait. N such clients is an OOM that costs the attacker
+/// nothing but an unread socket.
+///
+/// Cancelling the flush may leave a partial frame on the wire; that is
+/// correct here, because the only thing we do afterwards is close the
+/// connection. Evaluates to `true` when the send completed, `false` when it
+/// failed or stalled. `$wt` is an `Option<Duration>`; `None` keeps the pre-C1
+/// wait-forever behaviour.
+macro_rules! send_bounded {
+    ($framed:expr, $frame:expr, $wt:expr, $client_id:expr) => {{
+        match $wt {
+            None => $framed.send($frame).await.is_ok(),
+            Some(dur) => match tokio::time::timeout(dur, $framed.send($frame)).await {
+                Ok(r) => r.is_ok(),
+                Err(_) => {
+                    tracing::warn!(
+                        "Connection {} reply write made no progress for {}ms — \
+                         closing (client is not reading)",
+                        $client_id,
+                        dur.as_millis(),
+                    );
+                    false
+                }
+            },
+        }
+    }};
+}
+
 use futures::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -171,12 +206,44 @@ pub async fn handle_connection(
     );
     conn.refresh_acl_cache(&acl_table);
 
+    // c10k C2: arm the query-buffer ceiling. This handler reads through
+    // `Framed`, which loops read -> decode -> read internally and does not
+    // yield while a frame is incomplete — so the ceiling lives in the codec
+    // (see `RespCodec::max_query_buf`) rather than in this loop. A connection
+    // that starts out already authenticated (no requirepass) gets the full
+    // limit immediately; the rest are raised by `arm_query_buf_limit` on
+    // their first successful AUTH/HELLO.
+    let (qbuf_limit, qbuf_preauth, write_timeout_ms) = {
+        let rt = runtime_config.read();
+        (
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
+            rt.client_write_timeout_ms,
+        )
+    };
+    // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
+    let write_timeout = match write_timeout_ms {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    };
+
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
     // Phase 9+ will leverage this for per-request temporaries.
     let mut arena = Bump::with_capacity(4096); // 4KB initial capacity
 
     loop {
+        // c10k C2: re-arm the ceiling every pass rather than at each of the
+        // five AUTH/HELLO success sites — two local loads and a field store,
+        // and it cannot be forgotten when a sixth site appears. It must run
+        // before `framed.next()`, which is exactly here.
+        framed
+            .codec_mut()
+            .set_max_query_buf(super::util::query_buf_limit(
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            ));
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -330,8 +397,7 @@ pub async fn handle_connection(
                                             conn.client_name = Some(name);
                                         }
                                         if let Some(uname) = opt_user {
-                                            conn.current_user = uname;
-                                            conn.refresh_acl_cache(&acl_table);
+                                            conn.adopt_user(uname, &acl_table);
                                         }
                                         let _ = framed.send(response).await;
                                     }
@@ -385,7 +451,7 @@ pub async fn handle_connection(
                                 }
                                 agg.freeze()
                             };
-                            if framed.send(Frame::PreSerialized(payload)).await.is_err() {
+                            if !send_bounded!(framed, Frame::PreSerialized(payload), write_timeout, client_id) {
                                 break;
                             }
                         }
@@ -450,8 +516,7 @@ pub async fn handle_connection(
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&acl_table);
+                                    conn.adopt_user(uname, &acl_table);
                                 } else {
                                     // Log failed auth attempt
                                     conn.acl_log.push(crate::acl::AclLogEntry {
@@ -485,8 +550,7 @@ pub async fn handle_connection(
                                     conn.client_name = Some(name);
                                 }
                                 if let Some(uname) = opt_user {
-                                    conn.current_user = uname;
-                                    conn.refresh_acl_cache(&acl_table);
+                                    conn.adopt_user(uname, &acl_table);
                                 }
                                 responses.push(response);
                                 continue;
@@ -511,8 +575,7 @@ pub async fn handle_connection(
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                             if let Some(uname) = opt_user {
-                                conn.current_user = uname;
-                                conn.refresh_acl_cache(&acl_table);
+                                conn.adopt_user(uname, &acl_table);
                             }
                             responses.push(response);
                             continue;
@@ -534,8 +597,7 @@ pub async fn handle_connection(
                                 conn.client_name = Some(name);
                             }
                             if let Some(uname) = opt_user {
-                                conn.current_user = uname;
-                                conn.refresh_acl_cache(&acl_table);
+                                conn.adopt_user(uname, &acl_table);
                             }
                             responses.push(response);
                             continue;
@@ -549,6 +611,7 @@ pub async fn handle_connection(
                                 &conn.current_user,
                                 &peer_addr,
                                 &runtime_config,
+                                client_id,
                             );
                             responses.push(response);
                             continue;
@@ -802,29 +865,27 @@ pub async fn handle_connection(
                                         //   - appendfsync=everysec/no → fire-and-forget (fast)
                                         // On any Err the caller aborts and leaves both DBs
                                         // untouched, preserving atomicity from the WAL's perspective.
+                                        let mut a_buf = itoa::Buffer::new();
+                                        let mut b_buf = itoa::Buffer::new();
+                                        let wal_frame = Frame::Array(crate::framevec![
+                                            Frame::BulkString(Bytes::from_static(b"SWAPDB")),
+                                            Frame::BulkString(Bytes::copy_from_slice(
+                                                a_buf.format(a).as_bytes()
+                                            )),
+                                            Frame::BulkString(Bytes::copy_from_slice(
+                                                b_buf.format(b).as_bytes()
+                                            )),
+                                        ]);
+                                        let serialized =
+                                            crate::persistence::aof::serialize_command(&wal_frame);
                                         let wal_ok = if let Some(ref pool) = aof_pool {
-                                            let mut a_buf = itoa::Buffer::new();
-                                            let mut b_buf = itoa::Buffer::new();
-                                            let wal_frame = Frame::Array(crate::framevec![
-                                                Frame::BulkString(Bytes::from_static(b"SWAPDB")),
-                                                Frame::BulkString(Bytes::copy_from_slice(
-                                                    a_buf.format(a).as_bytes()
-                                                )),
-                                                Frame::BulkString(Bytes::copy_from_slice(
-                                                    b_buf.format(b).as_bytes()
-                                                )),
-                                            ]);
-                                            let serialized =
-                                                crate::persistence::aof::serialize_command(
-                                                    &wal_frame,
-                                                );
                                             // Single-shard mode — shard_id = 0.
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
                                             // task #35: SWAPDB affects both `a` and
                                             // `b` — no single db context applies;
                                             // pass 0 (writer may emit a harmless
                                             // redundant SELECT 0).
-                                            pool.try_send_append_durable(0, lsn, 0, serialized)
+                                            pool.try_send_append_durable(0, lsn, 0, serialized.clone())
                                                 .await
                                                 .is_ok()
                                         } else {
@@ -841,6 +902,14 @@ pub async fn handle_connection(
                                             let mut guard_lo = db[lo].write();
                                             let mut guard_hi = db[hi].write();
                                             std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                            drop(guard_hi);
+                                            drop(guard_lo);
+                                            // #386 — replication plane, exactly once per
+                                            // client SWAPDB, AFTER the durability gate and
+                                            // the swap itself (mirrors the coordinator leg).
+                                            crate::replication::state::record_local_write_global(
+                                                0, serialized,
+                                            );
                                             Frame::SimpleString(Bytes::from_static(b"OK"))
                                         }
                                     }
@@ -1074,7 +1143,12 @@ pub async fn handle_connection(
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
-                                    let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
+                                    let response = apply_resp3_conversion(
+                                    d_cmd,
+                                    d_args,
+                                    response,
+                                    framed.codec().protocol_version(),
+                                );
                                     responses[resp_idx] = response;
                                     if quit {
                                         should_quit = true;
@@ -1145,7 +1219,7 @@ pub async fn handle_connection(
                             // Flush accumulated +OK responses now that AOF durability
                             // has been confirmed (or is fire-and-forget).
                             for resp in responses.drain(..) {
-                                if framed.send(resp).await.is_err() {
+                                if !send_bounded!(framed, resp, write_timeout, client_id) {
                                     break_outer = true;
                                     break;
                                 }
@@ -1212,7 +1286,7 @@ pub async fn handle_connection(
                                         } else {
                                             pubsub::subscribe_response(&channel_or_pattern, conn.subscription_count)
                                         };
-                                        if framed.send(response).await.is_err() {
+                                        if !send_bounded!(framed, response, write_timeout, client_id) {
                                             break_outer = true;
                                             break;
                                         }
@@ -2216,7 +2290,7 @@ pub async fn handle_connection(
                                     );
                                 }
                                 // Apply RESP3 response conversion if needed
-                                let response = apply_resp3_conversion(d_cmd, response, proto);
+                                let response = apply_resp3_conversion(d_cmd, d_args, response, proto);
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;
@@ -2670,7 +2744,12 @@ pub async fn handle_connection(
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed
-                                let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
+                                let response = apply_resp3_conversion(
+                                    d_cmd,
+                                    d_args,
+                                    response,
+                                    framed.codec().protocol_version(),
+                                );
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;
@@ -2715,7 +2794,7 @@ pub async fn handle_connection(
                     // EverySec / No policy: flush responses first (zero added latency),
                     // then fire-and-forget AOF enqueue.
                     for response in responses {
-                        if framed.send(response).await.is_err() {
+                        if !send_bounded!(framed, response, write_timeout, client_id) {
                             break_outer = true;
                             break;
                         }
@@ -2746,7 +2825,7 @@ pub async fn handle_connection(
                 }
             } => {
                 if let Some(push_frame) = msg {
-                    if framed.send(push_frame).await.is_err() {
+                    if !send_bounded!(framed, push_frame, write_timeout, client_id) {
                         break;
                     }
                 }

@@ -68,8 +68,20 @@ impl ClusterNode {
         // Redis convention: bus_port = port + 10000. Guard overflow for test
         // servers on ephemeral ports (49152-65535) where port + 10000 > u16::MAX.
         let bus_port = addr.port().checked_add(10000).unwrap_or_else(|| {
-            // Wrap into valid range for test compatibility
-            ((addr.port() as u32 + 10000) % 65536) as u16
+            // Wrap into valid range for test compatibility (ephemeral-port
+            // test clusters). Our OWN port is refused at startup when
+            // port+10000 > 65535 (main.rs), so a wrap here means a PEER
+            // announced such a port — its bus is almost certainly not
+            // reachable at the wrapped value (deep-review A5): say so.
+            let wrapped = ((addr.port() as u32 + 10000) % 65536) as u16;
+            tracing::warn!(
+                "cluster node {} announces client port {} whose bus port wraps to {} — \
+                 gossip to this peer will likely fail (peer ports must be <= 55535)",
+                node_id,
+                addr.port(),
+                wrapped
+            );
+            wrapped
         });
         ClusterNode {
             node_id,

@@ -12,7 +12,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::lfu_decay;
+use crate::storage::entry::{RedisValue, lfu_decay};
 use crate::storage::tiered::kv_serde;
 use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
@@ -182,18 +182,18 @@ fn sample_random_keys(
     out
 }
 
-/// Compare two LRU timestamps with u16 wraparound handling.
-/// Uses signed-distance comparison: treats the 16-bit clock as circular.
+/// Compare two LRU timestamps with u32 wraparound handling.
+/// Uses signed-distance comparison: treats the 32-bit epoch-seconds clock as
+/// circular, so verdicts are correct for access-time gaps up to ±68 years —
+/// including across the year-2106 clock wrap. (The old 16-bit variant
+/// inverted verdicts once two keys' access times differed by more than
+/// ~9.1h, making LRU evict hot keys under diurnal workloads.)
 /// Returns true if `a` is considered older (less recent) than `b`.
 #[inline]
 pub fn lru_is_older(a: u32, b: u32) -> bool {
-    let a16 = a as i16;
-    let b16 = b as i16;
     // Signed difference handles wraparound: if a was accessed before b,
-    // (a16 - b16) is negative (a < b in time), meaning a is older.
-    // Wraparound case: a=65400 (pre-wrap), b=100 (post-wrap):
-    //   a16=-136, b16=100, -136-100=-236 < 0 → correctly identifies a as older.
-    a16.wrapping_sub(b16) < 0
+    // the circular distance a-b is negative (a < b in time) → a is older.
+    (a.wrapping_sub(b) as i32) < 0
 }
 
 /// Sum used_memory across all databases for aggregate eviction decisions.
@@ -695,6 +695,37 @@ fn build_spill_payload(
     Some((value_type, value_bytes, flags, ttl_ms))
 }
 
+/// Inverse of [`build_spill_payload`]: rebuild a hot [`Entry`] from a spill
+/// payload that never reached disk (deep-review F1).
+///
+/// `evict_one_async_spill` removes the hot entry as soon as the request is
+/// queued, on the promise that the background thread's completion lands the
+/// key in the cold index. When the pwrite FAILS, that promise is broken: the
+/// key is in neither plane and every read returns nil until an AOF-replay
+/// restart. The completion handler re-inserts via this helper instead
+/// (fail-closed, mirroring the enqueue-failure path which retains the hot
+/// value).
+///
+/// Returns `None` only if the payload does not deserialize — impossible for
+/// bytes produced by `build_spill_payload` unless memory was corrupted in
+/// transit; the caller logs that loudly.
+pub(crate) fn rehydrate_spill_payload(
+    value_type: ValueType,
+    value_bytes: &Bytes,
+    ttl_ms: Option<u64>,
+) -> Option<crate::storage::Entry> {
+    let redis_value = match value_type {
+        ValueType::String => RedisValue::String(value_bytes.clone()),
+        _ => kv_serde::deserialize_collection(value_bytes, value_type)?,
+    };
+    let mut entry = crate::storage::Entry::new_string(Bytes::new());
+    entry.value = crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+    if let Some(ttl) = ttl_ms {
+        entry.set_expires_at_ms(ttl);
+    }
+    Some(entry)
+}
+
 /// Batch-durable synchronous spill (W2: the ONE sync spill implementation).
 ///
 /// Originally built for the no-AOF-backstop case (`--appendonly no`); since
@@ -876,6 +907,11 @@ fn evict_one_async_spill(
         let file_id = *next_file_id;
         *next_file_id += 1;
 
+        // Second handle on the SAME payload the request carries (refcount,
+        // not a copy) so the in-flight plane below can answer reads from RAM
+        // while the request is queued.
+        let pending_bytes = value_bytes.clone();
+
         let req = SpillRequest {
             key: Bytes::copy_from_slice(key.as_bytes()),
             db_index,
@@ -894,18 +930,33 @@ fn evict_one_async_spill(
         if sender.try_send(req).is_err() {
             return false;
         }
-
-        // Now safe to free RAM. The bg thread holds the SpillRequest and will
-        // produce a SpillCompletion that updates cold_index for this db_index.
+        // Free RAM, then hand the key to the in-flight plane. `db.remove`
+        // clears any in-flight record for the key (that is what makes DEL
+        // final), so the mark MUST follow it — marking first would erase
+        // itself. Both calls run synchronously on the shard thread with no
+        // `.await` between them, so no reader can catch the key between
+        // planes.
         db.remove(key.as_bytes());
 
-        // NOTE: we do NOT insert a tentative cold_index entry here.
+        // NOTE: we still do NOT insert a tentative cold_index entry here.
         // Under batching the (page_idx, slot_idx) are unknown at evict time;
-        // slot 0 would return a *different* key's value in the pre-flush window.
-        // Accept a brief read-miss until the completion applies — the key is
-        // safe: it is in the SpillRequest and will be registered once the bg
-        // thread writes and the event loop processes the SpillCompletion.
-        // AOF incr log is the durability backstop for the pre-flush window.
+        // slot 0 would return a *different* key's value in the pre-flush
+        // window. Instead the key stays readable from the in-flight plane
+        // itself, which holds the payload in RAM until the completion lands
+        // (#459). Before that fix this window was documented as "accept a
+        // brief read-miss" with the AOF as backstop — but the AOF backstops
+        // DURABILITY, not VISIBILITY: measured on 400 keys, GET and EXISTS
+        // denied live keys, DEL answered :0 and was then undone by the
+        // completion, and DBSIZE under-counted by 276.
+        db.spill_inflight_mark(
+            Bytes::copy_from_slice(key.as_bytes()),
+            crate::storage::db::PendingSpill {
+                req_id: file_id,
+                value_type,
+                value_bytes: pending_bytes,
+                ttl_ms,
+            },
+        );
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());
@@ -1102,6 +1153,53 @@ mod tests {
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
+    #[test]
+    fn spill_payload_round_trips_through_rehydrate() {
+        // F1 (deep review): a failed background spill must be able to
+        // resurrect the exact hot entry from its request payload.
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+        map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::entry::RedisValue::Hash(map.clone()),
+        );
+        entry.set_expires_at_ms(current_time_ms() + 60_000);
+
+        let (vt, bytes, _flags, ttl) = build_spill_payload(&entry).expect("serializable");
+        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        match restored.as_redis_value() {
+            RedisValueRef::Hash(h) => assert_eq!(*h, map),
+            _ => panic!("expected hash after rehydrate"),
+        }
+        assert_eq!(restored.expires_at_ms(), entry.expires_at_ms());
+
+        // String payloads round-trip too.
+        let s = Entry::new_string(Bytes::from_static(b"hello"));
+        let (vt, bytes, _f, ttl) = build_spill_payload(&s).expect("serializable");
+        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        match restored.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"hello"),
+            _ => panic!("expected string after rehydrate"),
+        }
+    }
+
+    #[test]
+    fn lru_is_older_valid_beyond_nine_hours() {
+        // Regression: the old i16 comparison window (±32768s ≈ ±9.1h)
+        // inverted verdicts for diurnal idle gaps — a key idle 10h compared
+        // as NEWER than one touched a minute ago, so LRU evicted the hot key.
+        let now: u32 = 1_754_000_000;
+        let idle_10h = now - 36_000;
+        let idle_1m = now - 60;
+        assert!(lru_is_older(idle_10h, idle_1m));
+        assert!(!lru_is_older(idle_1m, idle_10h));
+        // Still correct at multi-day idle.
+        let idle_3d = now - 259_200;
+        assert!(lru_is_older(idle_3d, idle_10h));
+    }
+
     // -----------------------------------------------------------------
     // compute_elastic_budget (GAP-1)
     // -----------------------------------------------------------------
@@ -1280,6 +1378,10 @@ mod tests {
             client_pause_write_only: false,
             lazyfree_threshold: 64,
             maxclients: 10000,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             timeout: 0,
             tcp_keepalive: 300,
             num_shards: 1,

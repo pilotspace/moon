@@ -1788,8 +1788,6 @@ dependencies = [
 [[package]]
 name = "monoio-io-wrapper"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bcfaa76e5daf87cc4d31b4d1b6bc93c12db59c19df50b9200afdbde42077655"
 dependencies = [
  "monoio",
 ]
@@ -1808,8 +1806,6 @@ dependencies = [
 [[package]]
 name = "monoio-rustls"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e31f422825bd7fb19957af6eaf89d7234ba143fcc0e515f5a2f526e332d1875"
 dependencies = [
  "bytes",
  "monoio",
@@ -1820,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "moon"
-version = "0.8.2"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1894,6 +1890,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",

@@ -1,0 +1,258 @@
+# Client-compat manifest — Moon vs a real redis-server.
+#
+# Breadth strategy (frozen at the contract): HARD CASES FIRST. The first block
+# targets the replies most likely to falsify the five-policy normalization model
+# — if the model is wrong, it must break here, before breadth is added on top of
+# it. The rest reproduces the defects the 2026-08 client/SDK deep review found,
+# so each wave-2 task has a wire-level reproduction to work against.
+#
+# policy: exact | sorted | type_only | numeric_tolerance | ignore_value
+#
+# expect_diff.reason is REQUIRED whenever expect_diff is present — an
+# unexplained waiver is exactly the silent pass this harness exists to prevent.
+# The waivers below are the BASELINE recorded on the harness's first full run
+# (2026-08-09, oracle redis 8.6.1, moon 0.8.5+): every one is a real, reproduced
+# divergence owned by a named wave-2 task. They make CI a ratchet — a NEW
+# divergence fails the job, and `--strict` fails the moment a waived one is
+# fixed, so a waiver cannot rot into a permanent blind spot.
+
+entries:
+
+  # ── Hard cases: legitimate non-determinism ────────────────────────────
+  # These exist to falsify the policy model. Where they carry a waiver it is
+  # for a REAL type divergence, never because normalization fell short.
+
+  - name: hard_ttl_drift
+    setup: ["SET k v", "EXPIRE k 100"]
+    command: "TTL k"
+    policy: numeric_tolerance
+    tolerance: 5
+
+  - name: hard_pttl_drift
+    setup: ["SET k v", "PEXPIRE k 100000"]
+    command: "PTTL k"
+    policy: numeric_tolerance
+    tolerance: 5000
+
+  - name: hard_scan_cursor
+    setup: ["MSET a 1 b 2 c 3"]
+    command: "SCAN 0"
+    policy: type_only
+
+  - name: hard_randomkey
+    setup: ["MSET a 1 b 2 c 3"]
+    command: "RANDOMKEY"
+    policy: type_only
+
+  - name: hard_srandmember
+    setup: ["DEL s", "SADD s a b c"]
+    command: "SRANDMEMBER s"
+    policy: type_only
+
+  - name: hard_unordered_smembers
+    setup: ["DEL s", "SADD s a b c"]
+    command: "SMEMBERS s"
+    policy: sorted
+
+  - name: hard_unordered_hgetall
+    setup: ["DEL h", "HSET h f1 v1 f2 v2"]
+    command: "HGETALL h"
+    policy: sorted
+
+  - name: hard_float_formatting
+    setup: ["SET f 10.5"]
+    command: "INCRBYFLOAT f 0.1"
+    policy: numeric_tolerance
+    tolerance: 0.0001
+
+  - name: hard_zscore_float
+    setup: ["DEL z", "ZADD z 1.5 a"]
+    command: "ZSCORE z a"
+    policy: numeric_tolerance
+    tolerance: 0.0001
+
+  # ── Transaction integrity ─────────────────────────────────────────────
+
+  # Found by this harness 2026-08-09 and FIXED in the same v0.8.6 hotfix
+  # (PR #457): GET inside MULTI was answered by the inline fast path instead of
+  # queued, so EXEC returned *0. The waiver that recorded it went stale the
+  # moment the fix landed and --strict said so by name — which is the whole
+  # point of the mechanism. Kept unwaived as the permanent regression guard.
+  - name: multi_get_must_queue
+    setup: ["SET k v"]
+    command: "GET k"
+    policy: exact
+
+  - name: multi_queues_config_get
+    command: "CONFIG GET maxmemory"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        FOUND BY THIS HARNESS, 2026-08-09. CONFIG GET inside MULTI is not
+        queued either — EXEC returns *0. A second command family bypassing
+        transaction queueing, distinct from the inline-GET path.
+        Owner: multi-exec-queue-semantics (re-owned 2026-08-10: a
+        transaction-QUEUEING defect, not a reply-type one).
+
+  - name: multi_aborts_on_unknown_command
+    command: "THISCOMMANDDOESNOTEXIST"
+    policy: exact
+    expect_diff:
+      reason: >-
+        Redis fails the queue-time error and then answers EXEC with
+        -EXECABORT "Transaction discarded because of previous errors."; Moon
+        queues the bad command and surfaces the -ERR from inside EXEC instead.
+        A client that relies on EXECABORT to detect a poisoned transaction sees
+        a partially-applied one. Owner: multi-exec-queue-semantics (re-owned
+        2026-08-10: a transaction-QUEUEING defect, not a reply-type one).
+
+  - name: multi_aborts_on_wrong_arity
+    command: "GET"
+    policy: exact
+    expect_diff:
+      reason: >-
+        Same EXECABORT gap as multi_aborts_on_unknown_command, reached through
+        an arity error rather than an unknown name.
+        Owner: multi-exec-queue-semantics.
+
+  # ── RESP3 reply-type fidelity (review findings, wire-confirmed) ───────
+
+  - name: type_sismember_is_integer
+    setup: ["DEL s", "SADD s a"]
+    command: "SISMEMBER s a"
+    policy: exact
+
+  - name: type_expire_is_integer
+    setup: ["SET k v"]
+    command: "EXPIRE k 100"
+    policy: exact
+
+  - name: type_incrbyfloat_is_bulk
+    setup: ["SET f 1"]
+    command: "INCRBYFLOAT f 1"
+    policy: type_only
+
+  - name: shape_hrandfield_withvalues_is_pair_array
+    setup: ["DEL h", "HSET h f1 v1"]
+    command: "HRANDFIELD h 1 WITHVALUES"
+    policy: sorted
+
+  - name: shape_zrandmember_withscores_is_pair_array
+    setup: ["DEL z", "ZADD z 1 a"]
+    command: "ZRANDMEMBER z 1 WITHSCORES"
+    policy: sorted
+
+  - name: shape_zrange_withscores
+    setup: ["DEL z", "ZADD z 1 a 2 b"]
+    command: "ZRANGE z 0 -1 WITHSCORES"
+    policy: exact
+
+  - name: shape_zpopmin
+    setup: ["DEL z", "ZADD z 1 a 2 b"]
+    command: "ZPOPMIN z"
+    policy: exact
+
+  - name: shape_spop_with_count_is_set
+    setup: ["DEL s", "SADD s a b c"]
+    command: "SPOP s 2"
+    policy: type_only
+
+  - name: shape_xinfo_stream
+    setup: ["DEL st", "XADD st '*' f v"]
+    command: "XINFO STREAM st"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        NARROWED 2026-08-10 by resp3-type-fidelity: the reply TYPE is now
+        correct — both servers answer a Map. What remains is a FIELD-SET gap,
+        not a reply-shape gap: Moon reports 7 fields, Redis 8.6.1 reports 16.
+        Each missing field (entries-added, max-deleted-entry-id,
+        recorded-first-entry-id, and the 8.x idempotency counters
+        idmp-*/pids-tracked/iids-*) needs real stream bookkeeping, and
+        inventing values would serve a client worse than their absence.
+        Owner: resp3-type-fidelity, carried forward as a SPEC delta —
+        stream-metadata completeness, NOT a RESP3 conversion defect.
+
+  - name: config_get_resp3_is_a_map
+    command: "CONFIG GET maxmemory"
+    policy: type_only
+    protocols: [resp3]
+    contexts: [standalone, pipeline]
+
+  # ── Miss path: emptiness must not change the reply TYPE ───────────────
+  # Every case above populates its key first, so the harness only ever diffed
+  # the hit path — which is how an empty HGETALL answering *0 instead of %0
+  # survived a 128-PASS run. The miss path is the one clients hit most and
+  # tested least; these cases keep it diffed against the live oracle.
+
+  - name: empty_hgetall_is_still_a_map
+    setup: ["DEL nosuchhash"]
+    command: "HGETALL nosuchhash"
+    policy: type_only
+
+  - name: empty_config_get_is_still_a_map
+    command: "CONFIG GET no-such-parameter-at-all"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
+  # Split from the entry above rather than folded into it: a waiver is
+  # per-entry, so waiving the whole case would blunt the two contexts that
+  # genuinely pass. This entry keeps the MULTI defect on the books.
+  - name: empty_config_get_in_multi
+    command: "CONFIG GET no-such-parameter-at-all"
+    policy: type_only
+    contexts: [multi]
+    expect_diff:
+      reason: >-
+        Redis answers *1[%0]; Moon answers a bare *0 — CONFIG GET is never
+        queued inside MULTI at all, so EXEC returns an empty array. The reply
+        TYPE is correct in every context where the command actually runs
+        (standalone and pipeline both answer %0); this is the transaction
+        QUEUEING gap, not a reply-shape one.
+        Owner: multi-exec-queue-semantics.
+
+  - name: empty_smembers_is_still_a_set
+    setup: ["DEL nosuchset"]
+    command: "SMEMBERS nosuchset"
+    policy: type_only
+
+  - name: empty_zrange_withscores_stays_an_array
+    setup: ["DEL nosuchzset"]
+    command: "ZRANGE nosuchzset 0 -1 WITHSCORES"
+    policy: type_only
+
+  - name: empty_hrandfield_withvalues_stays_an_array
+    setup: ["DEL nosuchhash2"]
+    command: "HRANDFIELD nosuchhash2 2 WITHVALUES"
+    policy: type_only
+
+  # ── Identity & introspection (review findings, wire-confirmed) ────────
+
+  - name: identity_command_count
+    command: "COMMAND COUNT"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        Redis answers Integer :274; Moon answers an empty Array *0 — it ignores
+        the COUNT subcommand and falls through to the bare COMMAND stub. A
+        client using COMMAND COUNT to size its command table reads zero.
+        Owner: client-identity-introspection.
+
+  - name: identity_role
+    command: "ROLE"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        Redis answers *3[master, offset, replicas]; Moon answers
+        -ERR unknown command 'ROLE'. Sentinel-aware and failover-aware clients
+        call ROLE during topology discovery.
+        Owner: client-identity-introspection.
+
+  # ── Error-code parity (compared on the code, never the message) ───────
+
+  # Waiver removed with the MULTI queueing fix: the MULTI legs used to diverge
+  # only because the inline GET ran instead of queueing, emptying EXEC.
+  - name: error_wrongtype
+    setup: ["DEL k", "LPUSH k v"]
+    command: "GET k"
+    policy: exact
