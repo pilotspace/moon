@@ -390,6 +390,68 @@ pub fn write_reclamation_section(buf: &mut String) {
 }
 
 // ---------------------------------------------------------------------------
+// P9: Cold-tier orphan reclamation counters
+// ---------------------------------------------------------------------------
+
+/// Total cold-tier orphan index entries reclaimed since server start.
+pub static RECL_COLD_ORPHANS_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total bytes reclaimed from cold-tier orphan files since server start.
+pub static RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Increment both orphan reclamation counters atomically.
+#[inline]
+pub fn record_cold_orphan_reclaim(bytes: u64) {
+    RECL_COLD_ORPHANS_RECLAIMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Read current totals for the VACUUM/INFO response shape.
+#[inline]
+pub fn snapshot_cold_orphan_totals() -> (u64, u64) {
+    (
+        RECL_COLD_ORPHANS_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// R1 / H-2: Cold-tier proactive TTL-expiry reclamation counters
+// ---------------------------------------------------------------------------
+//
+// Distinct from the orphan counters above: those count ANY zero-ref file
+// unlink (hot-shadow orphan, re-eviction overwrite, or TTL expiry all share
+// the same `drain_pending_unlink` file-reclaim machinery). These counters
+// isolate the TTL-expiry cause specifically — the R1 fix
+// (tmp/OFFLOAD-COMPRESSION-REVIEW.md) for cold entries that expired and were
+// NEVER re-read, which previously leaked forever because nothing else in the
+// system ever inspects a cold entry's TTL except a read that never comes.
+
+/// Total cold-tier index entries reclaimed by the proactive TTL-expiry sweep
+/// ([`crate::storage::tiered::cold_index::ColdIndex::sweep_expired`]) since
+/// server start.
+pub static RECL_COLD_EXPIRED_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total bytes reclaimed by the TTL-expiry sweep specifically.
+pub static RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record entries+bytes reclaimed by one TTL-expiry sweep call.
+#[inline]
+pub fn record_cold_expired_reclaim(entries: u64, bytes: u64) {
+    RECL_COLD_EXPIRED_RECLAIMED_TOTAL.fetch_add(entries, Ordering::Relaxed);
+    RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Read current TTL-expiry reclamation totals.
+#[inline]
+pub fn snapshot_cold_expired_totals() -> (u64, u64) {
+    (
+        RECL_COLD_EXPIRED_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -616,66 +678,4 @@ mod tests {
             "cold_expired_bytes_reclaimed_total must reflect record_cold_expired_reclaim's bytes delta"
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// P9: Cold-tier orphan reclamation counters
-// ---------------------------------------------------------------------------
-
-/// Total cold-tier orphan index entries reclaimed since server start.
-pub static RECL_COLD_ORPHANS_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Total bytes reclaimed from cold-tier orphan files since server start.
-pub static RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Increment both orphan reclamation counters atomically.
-#[inline]
-pub fn record_cold_orphan_reclaim(bytes: u64) {
-    RECL_COLD_ORPHANS_RECLAIMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
-}
-
-/// Read current totals for the VACUUM/INFO response shape.
-#[inline]
-pub fn snapshot_cold_orphan_totals() -> (u64, u64) {
-    (
-        RECL_COLD_ORPHANS_RECLAIMED_TOTAL.load(Ordering::Relaxed),
-        RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// R1 / H-2: Cold-tier proactive TTL-expiry reclamation counters
-// ---------------------------------------------------------------------------
-//
-// Distinct from the orphan counters above: those count ANY zero-ref file
-// unlink (hot-shadow orphan, re-eviction overwrite, or TTL expiry all share
-// the same `drain_pending_unlink` file-reclaim machinery). These counters
-// isolate the TTL-expiry cause specifically — the R1 fix
-// (tmp/OFFLOAD-COMPRESSION-REVIEW.md) for cold entries that expired and were
-// NEVER re-read, which previously leaked forever because nothing else in the
-// system ever inspects a cold entry's TTL except a read that never comes.
-
-/// Total cold-tier index entries reclaimed by the proactive TTL-expiry sweep
-/// ([`crate::storage::tiered::cold_index::ColdIndex::sweep_expired`]) since
-/// server start.
-pub static RECL_COLD_EXPIRED_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Total bytes reclaimed by the TTL-expiry sweep specifically.
-pub static RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Record entries+bytes reclaimed by one TTL-expiry sweep call.
-#[inline]
-pub fn record_cold_expired_reclaim(entries: u64, bytes: u64) {
-    RECL_COLD_EXPIRED_RECLAIMED_TOTAL.fetch_add(entries, Ordering::Relaxed);
-    RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
-}
-
-/// Read current TTL-expiry reclamation totals.
-#[inline]
-pub fn snapshot_cold_expired_totals() -> (u64, u64) {
-    (
-        RECL_COLD_EXPIRED_RECLAIMED_TOTAL.load(Ordering::Relaxed),
-        RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
-    )
 }

@@ -22,6 +22,8 @@
 //! Requires the release binary at ./target/release/moon.
 //! The MOON_TEST_AOF_FSYNC_FAIL=1 env var is passed to the child process.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -46,7 +48,7 @@ fn spawn_moon_with_fsync_fail(port: u16, shards: u16) -> (Child, PathBuf) {
     let stderr_log = dir.join("moon.stderr.log");
     let stdout_log = dir.join("moon.stdout.log");
 
-    let child = Command::new("./target/release/moon")
+    let child = Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),

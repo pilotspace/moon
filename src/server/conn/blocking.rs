@@ -4,7 +4,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(feature = "runtime-monoio")]
 use bytes::BytesMut;
 use futures::StreamExt;
 use ringbuf::HeapProd;
@@ -21,12 +20,295 @@ use crate::storage::Database;
 
 use super::util::extract_bytes;
 
+/// Returned to the client when a blocking command cannot be registered on the
+/// shard that owns its key. Fails the command instead of the two silent
+/// alternatives the old code had: replying nil at t=0 (protocol violation) or
+/// blocking forever on a key nobody is watching.
+const BLOCK_REGISTER_FAILED: &[u8] =
+    b"MOONERR blocking registration failed: owning shard not draining";
+
+/// What a blocking command produced.
+///
+/// c10k hardening A1: the wait used to have only two exits — a reply or a
+/// timeout — so a client that vanished mid-`BLPOP key 0` was unreachable
+/// forever. [`PeerGone`](BlockingOutcome::PeerGone) is the third, and it is
+/// deliberately NOT a `Frame`: there is nobody left to send one to, and the
+/// caller must close the connection rather than write into a dead socket.
+pub(crate) enum BlockingOutcome {
+    /// Normal completion: wake-up value, timeout nil, or an error frame.
+    Reply(Frame),
+    /// The peer went away while blocked (EOF, RST, or a `CLIENT KILL`
+    /// `shutdown(2)`). Every registration this waiter held has already been
+    /// torn down; the caller must close the connection without replying.
+    PeerGone,
+}
+
+/// Scratch size for one drain of a blocked client's socket. Only ever used by
+/// a client that pipelines behind a blocking command, which is legal but rare
+/// — the buffer is allocated once per such connection and reused across the
+/// wait loop, never on any dispatch path.
+#[cfg(feature = "runtime-monoio")]
+const PEER_DRAIN_BUF: usize = 512;
+
+/// Ceiling on bytes a blocked client may pipeline behind its blocking command
+/// before the connection is dropped.
+///
+/// The carry buffer is the one place A1 accumulates client input outside the
+/// handler's own read loop, so it gets its own bound rather than inheriting
+/// the read loop's (which has none — that is finding C2, a separate fix). The
+/// value is far above any legitimate pipeline and far below a memory problem
+/// at c10k.
+const PEER_CARRY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// c10k A1 (tokio): classify one peer read taken while a client is blocked.
+///
+/// `true` means the wait is over because the peer is gone: EOF, a socket
+/// error, or a client that pipelined past [`PEER_CARRY_LIMIT`]. `false` means
+/// the bytes were carried and the client stays blocked.
+#[cfg(feature = "runtime-tokio")]
+fn peer_wake_ends_wait(read: std::io::Result<usize>, carry: &BytesMut) -> bool {
+    match read {
+        Ok(0) => true,
+        Ok(_) => carry.len() > PEER_CARRY_LIMIT,
+        // `Interrupted` is a retry signal, not a dead peer (tokio never
+        // surfaces `WouldBlock` here — it returns `Pending` instead).
+        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => false,
+        Err(_) => true,
+    }
+}
+
+/// c10k A1: result of one peer-readiness wake while a client is blocked.
+#[cfg(feature = "runtime-monoio")]
+enum PeerWake {
+    /// Bytes arrived and were carried forward; the client is alive and stays
+    /// blocked (Redis executes pipelined commands only after the block ends).
+    Alive,
+    /// EOF or a fatal socket error — the connection is finished.
+    Gone,
+}
+
+/// c10k A1 (monoio): consume one readiness worth of bytes from a blocked
+/// client's socket into `carry`.
+///
+/// MUST be called only after [`IdleParkRead::peer_readable`] has fired, and
+/// MUST NOT be called from inside a `select!`. Both rules exist for the same
+/// reason: level-triggered readiness guarantees this read completes at once
+/// (data, EOF, or error), so it can never be cancelled mid-flight and lose
+/// client bytes — the failure mode that rules out a naive read arm.
+///
+/// Racing the reply is harmless: `reply_tx` is a `flume` bounded(1), so a
+/// wake-up delivered while this read is in flight simply sits in the channel
+/// and the next loop turn picks it up.
+#[cfg(feature = "runtime-monoio")]
+async fn drain_peer_bytes<S: monoio::io::AsyncReadRent>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    carry: &mut BytesMut,
+) -> PeerWake {
+    if scratch.len() != PEER_DRAIN_BUF {
+        scratch.resize(PEER_DRAIN_BUF, 0);
+    }
+    let buf = std::mem::take(scratch);
+    let (res, buf) = stream.read(buf).await;
+    let wake = match res {
+        Ok(0) => PeerWake::Gone,
+        Ok(n) => {
+            carry.extend_from_slice(&buf[..n]);
+            PeerWake::Alive
+        }
+        // NOT death. `readable(false)` does a real `poll(2)`, but the legacy
+        // (epoll/kqueue) driver can still hand back a readiness that yields
+        // nothing, and a cancel is a control signal, not a peer event.
+        // Misreading either as EOF would drop a perfectly healthy blocked
+        // client — the exact inverse of the bug being fixed. Re-arming is
+        // safe: the next poll only resolves on a real event.
+        Err(ref e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) || super::handler_monoio::idle_park::is_sweep_cancel(e) =>
+        {
+            PeerWake::Alive
+        }
+        Err(_) => PeerWake::Gone,
+    };
+    *scratch = buf;
+    wake
+}
+
+/// c10k A1 (monoio): handle one resolved peer-readiness poll.
+///
+/// `true` means the wait is over because the peer is gone. A readiness error
+/// counts as gone; readiness success means bytes or EOF are waiting, so the
+/// (uncancellable, immediately-completing) drain decides which.
+#[cfg(feature = "runtime-monoio")]
+async fn peer_wake_ends_wait_monoio<S: monoio::io::AsyncReadRent>(
+    ready: std::io::Result<()>,
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    carry: &mut BytesMut,
+) -> bool {
+    if let Err(e) = ready {
+        // Same rule as the drain below: only a real error is death.
+        return !(matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) || super::handler_monoio::idle_park::is_sweep_cancel(&e));
+    }
+    match drain_peer_bytes(stream, scratch, carry).await {
+        PeerWake::Gone => true,
+        PeerWake::Alive => carry.len() > PEER_CARRY_LIMIT,
+    }
+}
+
+/// Push a blocking-registry control message (`BlockRegister` / `BlockCancel`)
+/// to the shard that owns the key.
+///
+/// c10k hardening A4/A5/A6. Every call site was previously either a bare
+/// `try_push` — silently dropping the message when the ring was full — or an
+/// unbounded `loop { try_push; sleep(10µs) }` with no shutdown arm. Each
+/// failure mode is a real defect:
+///   * a dropped `BlockRegister` drops `reply_tx` with it, so the waiter's
+///     receiver disconnects and `BLPOP key 0` returns nil immediately;
+///   * a dropped `BlockCancel` leaks the owner-side `WaitEntry` permanently
+///     (remote entries carry `deadline: None`, so the W6 sweep never reaps
+///     them) — the leak that then feeds the A2 data-loss path;
+///   * the unbounded retry turned a saturated owner into a zombie connection
+///     that also prevented graceful shutdown from completing.
+///
+/// Uses the same budget as every other cross-shard push
+/// ([`CROSS_SHARD_PUSH_MAX_RETRIES`] × [`CROSS_SHARD_PUSH_BACKOFF`] ≈ 0.5 s):
+/// wedged-shard detection scale, generous enough not to false-reject a merely
+/// saturated shard. Deliberately NOT a tighter blocking-specific budget — a
+/// registration that gives up early is a client-visible error, and the old
+/// monoio path retried forever, so the only safe direction to move is toward
+/// the plane-wide bound.
+///
+/// Returns `false` if the message could not be delivered.
+async fn push_block_msg(
+    shutdown: &CancellationToken,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    my_shard: usize,
+    target_shard: usize,
+    msg: ShardMessage,
+    notify: Option<&channel::Notify>,
+) -> bool {
+    debug_assert_ne!(
+        my_shard, target_shard,
+        "blocking control message must target a remote shard"
+    );
+    let target_idx = ChannelMesh::target_index(my_shard, target_shard);
+    let mut slot = Some(msg);
+    let outcome = crate::shard::dispatch::push_with_backpressure(
+        shutdown,
+        crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+        crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+        || {
+            let Some(m) = slot.take() else { return true };
+            // Borrow is scoped to this closure body, never held across the
+            // caller's `.await` between retries.
+            let mut producers = dispatch_tx.borrow_mut();
+            match producers[target_idx].try_push(m) {
+                Ok(()) => true,
+                Err(back) => {
+                    slot = Some(back);
+                    false
+                }
+            }
+        },
+    )
+    .await;
+    if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+        return false;
+    }
+    // A5: the owner's event loop may be parked; without this kick the
+    // registration sits in the ring until the next periodic tick.
+    //
+    // `notify` is `Some` only on the monoio runtime, whose shard loops park in
+    // the driver and need the explicit eventfd kick. The tokio shard loop has
+    // no equivalent task-local `Notify` receive path — it discovers ring items
+    // through its own periodic drain — so tokio call sites pass `None` and
+    // accept up to one tick of latency rather than a lost registration. Wiring
+    // a `Notify` into the tokio loop is a separate change; this comment states
+    // what the code actually does today.
+    if let Some(n) = notify {
+        n.notify_one();
+    }
+    true
+}
+
+/// Tear down every registration a multi-key waiter holds: the local ones
+/// directly, the remote ones with a `BlockCancel` per owning shard.
+///
+/// A6: the cancels were bare `try_push`es, so a full ring leaked the owner's
+/// `WaitEntry` — which is exactly the ghost waiter the A2 wake path then had
+/// to defend against. `notifiers` is `Some` only on the monoio runtime, whose
+/// shard loops park and need an explicit kick.
+async fn cancel_multikey_registrations(
+    shutdown: &CancellationToken,
+    blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    shard_id: usize,
+    wait_id: u64,
+    registered_remote_shards: &[usize],
+    notifiers: Option<&[std::sync::Arc<channel::Notify>]>,
+) {
+    blocking_registry.borrow_mut().remove_wait(wait_id);
+    for &remote_shard in registered_remote_shards {
+        let delivered = push_block_msg(
+            shutdown,
+            dispatch_tx,
+            shard_id,
+            remote_shard,
+            ShardMessage::BlockCancel { wait_id },
+            notifiers.map(|n| &*n[remote_shard]),
+        )
+        .await;
+        if !delivered {
+            // The push budget is bounded by design (A4 — the old unbounded
+            // retry was itself the bug), so a shard wedged for the whole
+            // ~0.5 s budget, or a shutdown mid-cancel, can still drop this.
+            // The owner then keeps a `WaitEntry` that its deadline sweep will
+            // not reap (remote entries carry `deadline: None`).
+            //
+            // This is a memory leak, NOT data loss: since A2 every wake path
+            // checks `is_disconnected()` before touching the datastore and
+            // restores anything it popped, so a stale entry is skipped and
+            // pruned rather than swallowing an element. Log it so the leak is
+            // observable instead of silent — a shard wedged this long is
+            // already an incident.
+            tracing::warn!(
+                wait_id,
+                from_shard = shard_id,
+                owner_shard = remote_shard,
+                "BlockCancel undelivered: owner shard not draining; its waiter \
+                 entry leaks until a later push prunes it"
+            );
+        }
+    }
+}
+
 /// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
 /// BLPOP key [key ...] timeout -> LPOP key [key ...]
 /// BRPOP key [key ...] timeout -> RPOP key [key ...]
 /// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout -> LMOVE src dst LEFT|RIGHT LEFT|RIGHT
 /// BZPOPMIN key [key ...] timeout -> ZPOPMIN key [key ...]
 /// BZPOPMAX key [key ...] timeout -> ZPOPMAX key [key ...]
+/// The full set of client-blocking commands (the ones whose handler may
+/// early-flush accumulated responses and await outside the batch loop).
+/// Keep in sync with the dispatch guards in `try_handle_blocking`
+/// (handler_monoio) and the sharded handler's blocking arm.
+pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"BLPOP")
+        || cmd.eq_ignore_ascii_case(b"BRPOP")
+        || cmd.eq_ignore_ascii_case(b"BLMOVE")
+        || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
+        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+        || cmd.eq_ignore_ascii_case(b"BLMPOP")
+        || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
+        || cmd.eq_ignore_ascii_case(b"BZMPOP")
+}
+
 pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
     let mut new_args = Vec::new();
     if cmd.eq_ignore_ascii_case(b"BLPOP") {
@@ -92,8 +374,13 @@ pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Fra
 ///    first-wakeup-wins, BlockCancel cleanup on completion/timeout/shutdown.
 ///
 /// CRITICAL: RefCell borrows MUST be dropped before any .await point.
+///
+/// c10k A1: `stream` is watched for EOF throughout the wait. `tokio`'s
+/// `AsyncReadExt::read_buf` is documented cancel-safe (a losing `select!`
+/// branch reads nothing), so here the watch is a plain read arm and any bytes
+/// it does pick up are carried into `carry` for the handler's read loop.
 #[cfg(feature = "runtime-tokio")]
-pub(crate) async fn handle_blocking_command(
+pub(crate) async fn handle_blocking_command<S>(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
@@ -103,19 +390,25 @@ pub(crate) async fn handle_blocking_command(
     num_shards: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     shutdown: &CancellationToken,
-) -> Frame {
+    stream: &mut S,
+    carry: &mut BytesMut,
+) -> BlockingOutcome
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     use futures::stream::FuturesUnordered;
+    use tokio::io::AsyncReadExt;
 
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
         Ok(t) => t,
-        Err(e) => return e,
+        Err(e) => return BlockingOutcome::Reply(e),
     };
 
     // Parse keys and command-specific args
     let (keys, blocked_cmd_factory) = match parse_blocking_args(cmd, args) {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => return BlockingOutcome::Reply(e),
     };
 
     // --- Non-blocking fast path: try to get data immediately ---
@@ -131,7 +424,7 @@ pub(crate) async fn handle_blocking_command(
             None
         });
         if let Some(frame) = maybe_frame {
-            return frame;
+            return BlockingOutcome::Reply(frame);
         }
         // Borrow released at with_shard_db boundary — safe before await.
     }
@@ -145,76 +438,130 @@ pub(crate) async fn handle_blocking_command(
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
-        let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
-        let wait_id = {
-            let mut reg = blocking_registry.borrow_mut();
-            let wait_id = reg.next_wait_id();
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
+        let is_remote = target != shard_id;
+        let (reply_tx, mut reply_rx) = channel::oneshot::<Option<Frame>>();
+        let wait_id = blocking_registry.borrow_mut().next_wait_id();
+        if is_remote {
+            // Remote registration via SPSC — bounded and shutdown-aware
+            // (A4/A5). The borrow above is released before this await.
+            let msg = ShardMessage::BlockRegister(Box::new(
+                crate::shard::dispatch::BlockRegisterPayload {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    deadline,
-                };
-                reg.register(selected_db, keys[0].clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let mut producers = dispatch_tx.borrow_mut();
-                let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: keys[0].clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx,
-                    },
-                ));
-                let _ = producers[target_idx].try_push(msg);
+                },
+            ));
+            if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
+                return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(
+                    BLOCK_REGISTER_FAILED,
+                )));
             }
-            wait_id
-        }; // reg borrow dropped
+        } else {
+            // Local registration
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            blocking_registry
+                .borrow_mut()
+                .register(selected_db, keys[0].clone(), entry);
+        }
 
-        let is_remote = target != shard_id;
+        // A1: every arm below is a `loop` because the peer-watch arm can fire
+        // repeatedly without ending the wait — a client is allowed to pipeline
+        // behind a blocking command, and Redis runs those commands only after
+        // the block resolves. `&mut reply_rx` is re-selected across turns
+        // safely: `OneshotReceiver` caches its inner `flume` future, so the
+        // waker registration survives and no wake-up is lost.
         let result = if let Some(dl) = deadline {
-            tokio::select! {
-                res = reply_rx => {
-                    match res {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) | Err(_) => Frame::Null,
+            let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    res = &mut reply_rx => {
+                        break match res {
+                            Ok(Some(frame)) => Some(frame),
+                            Ok(None) | Err(_) => Some(Frame::Null),
+                        };
                     }
-                }
-                _ = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())) => {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Null
-                }
-                _ = shutdown.cancelled() => {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                    _ = &mut sleep => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Null);
+                    }
+                    _ = shutdown.cancelled() => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
+                    }
+                    read = stream.read_buf(carry) => {
+                        if peer_wake_ends_wait(read, carry) {
+                            blocking_registry.borrow_mut().remove_wait(wait_id);
+                            break None;
+                        }
+                    }
                 }
             }
         } else {
-            tokio::select! {
-                res = reply_rx => {
-                    match res {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) | Err(_) => Frame::Null,
+            loop {
+                tokio::select! {
+                    res = &mut reply_rx => {
+                        break match res {
+                            Ok(Some(frame)) => Some(frame),
+                            Ok(None) | Err(_) => Some(Frame::Null),
+                        };
                     }
-                }
-                _ = shutdown.cancelled() => {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                    _ = shutdown.cancelled() => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
+                    }
+                    read = stream.read_buf(carry) => {
+                        if peer_wake_ends_wait(read, carry) {
+                            blocking_registry.borrow_mut().remove_wait(wait_id);
+                            break None;
+                        }
+                    }
                 }
             }
         };
-        // Cleanup remote registration on timeout/shutdown
-        if is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_)) {
-            let mut producers = dispatch_tx.borrow_mut();
-            let target_idx = ChannelMesh::target_index(shard_id, target);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        // Cleanup remote registration on timeout/shutdown.
+        //
+        // A3: this used to read
+        //   `is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_))`
+        // which Rust parses as `(is_remote && !Null) || Error`. Two bugs fell
+        // out of that precedence:
+        //   * on TIMEOUT (`result == Frame::Null`) the cancel was never sent,
+        //     so the owner shard kept a `WaitEntry` that nothing can ever
+        //     reap (remote entries carry `deadline: None`, so the W6 deadline
+        //     sweep skips them) — a permanent leak that also hands the next
+        //     pusher a ghost waiter;
+        //   * on a LOCAL wait ending in shutdown (`Frame::Error`) it took the
+        //     remote branch anyway and computed `target_index(shard, shard)`,
+        //     which underflows to a panic on shard 0 and misroutes the cancel
+        //     to an unrelated shard otherwise.
+        // The correct condition is simply "did we register remotely" — the
+        // monoio twin below always had it right. A cancel that races a
+        // successful wake is a harmless no-op (`remove_wait` on an unknown id).
+        if is_remote {
+            let _ = push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                ShardMessage::BlockCancel { wait_id },
+                None,
+            )
+            .await;
         }
-        return result;
+        // A1: the cancel above runs for a vanished peer too — that is the
+        // whole point. Leaving the owner-side `WaitEntry` behind is what made
+        // a disconnected `BLPOP key 0` unreapable.
+        return match result {
+            Some(frame) => BlockingOutcome::Reply(frame),
+            None => BlockingOutcome::PeerGone,
+        };
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
@@ -224,9 +571,13 @@ pub(crate) async fn handle_blocking_command(
         FuturesUnordered::new();
     let mut registered_remote_shards: Vec<usize> = Vec::new();
 
+    // A4/A5: build every registration under one borrow, but STAGE the remote
+    // ones and push them only after the borrow is released — the old code
+    // pushed while holding both borrows, which forced the bare `try_push`
+    // (no await possible, so no backpressure retry and no shutdown arm).
+    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
     {
         let mut reg = blocking_registry.borrow_mut();
-        let mut producers = dispatch_tx.borrow_mut();
         wait_id = reg.next_wait_id();
 
         for key in &keys {
@@ -245,7 +596,6 @@ pub(crate) async fn handle_blocking_command(
                 reg.register(selected_db, key.clone(), entry);
             } else {
                 // Remote registration via SPSC
-                let target_idx = ChannelMesh::target_index(shard_id, target);
                 let msg = ShardMessage::BlockRegister(Box::new(
                     crate::shard::dispatch::BlockRegisterPayload {
                         db_index: selected_db,
@@ -255,7 +605,7 @@ pub(crate) async fn handle_blocking_command(
                         reply_tx: tx,
                     },
                 ));
-                let _ = producers[target_idx].try_push(msg);
+                pending_remote.push((target, msg));
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
                 }
@@ -263,9 +613,39 @@ pub(crate) async fn handle_blocking_command(
         }
     } // borrows dropped -- CRITICAL before await
 
+    // A5: a silently dropped registration leaves this waiter blocked on a key
+    // nobody is watching — it would sleep through data that IS available.
+    // Fail the whole command instead, after unwinding what did register.
+    let mut registration_failed = false;
+    for (target, msg) in pending_remote {
+        if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
+            registration_failed = true;
+            break;
+        }
+    }
+    if registration_failed {
+        cancel_multikey_registrations(
+            shutdown,
+            blocking_registry,
+            dispatch_tx,
+            shard_id,
+            wait_id,
+            &registered_remote_shards,
+            None,
+        )
+        .await;
+        drop(receivers);
+        return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED)));
+    }
+
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
+    //
+    // A1: `peer_gone` breaks the same loop as every other terminal condition,
+    // so the shared cleanup below runs identically — a vanished multi-key
+    // waiter unwinds ALL of its registrations, local and remote.
+    let mut peer_gone = false;
     let frame = if let Some(dl) = deadline {
         let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
         tokio::pin!(sleep);
@@ -284,6 +664,9 @@ pub(crate) async fn handle_blocking_command(
                     result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
                     break;
                 }
+                read = stream.read_buf(carry) => {
+                    if peer_wake_ends_wait(read, carry) { peer_gone = true; break; }
+                }
             }
         }
         result_frame
@@ -302,24 +685,33 @@ pub(crate) async fn handle_blocking_command(
                     result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
                     break;
                 }
+                read = stream.read_buf(carry) => {
+                    if peer_wake_ends_wait(read, carry) { peer_gone = true; break; }
+                }
             }
         }
         result_frame
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
-    blocking_registry.borrow_mut().remove_wait(wait_id);
-    if !registered_remote_shards.is_empty() {
-        let mut producers = dispatch_tx.borrow_mut();
-        for &remote_shard in &registered_remote_shards {
-            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
-        }
-    }
+    cancel_multikey_registrations(
+        shutdown,
+        blocking_registry,
+        dispatch_tx,
+        shard_id,
+        wait_id,
+        &registered_remote_shards,
+        None,
+    )
+    .await;
     // Drop remaining receivers; remote senders get Err on send -- harmless
     drop(receivers);
 
-    frame
+    if peer_gone {
+        BlockingOutcome::PeerGone
+    } else {
+        BlockingOutcome::Reply(frame)
+    }
 }
 
 /// Monoio version of handle_blocking_command.
@@ -331,9 +723,20 @@ pub(crate) async fn handle_blocking_command(
 /// - `monoio::time::sleep(Duration::from_micros(10))` for SPSC backpressure
 ///
 /// CRITICAL: RefCell borrows MUST be dropped before any .await point.
+///
+/// c10k A1: `stream` is watched for EOF throughout the wait, but unlike the
+/// tokio twin the watch is a two-step — [`IdleParkRead::peer_readable`] inside
+/// the `select!`, [`drain_peer_bytes`] outside it. A monoio read owns its
+/// buffer, so a read arm losing the race could take client bytes down with the
+/// cancelled op; a readiness poll owns nothing and is safe to drop.
+///
+/// Streams whose `peer_readable` is the never-resolving default (TLS — see the
+/// trait docs) keep the pre-A1 behaviour: their blocked clients are still not
+/// reapable by disconnect. TLS at least requires a completed handshake, so it
+/// is not the unauthenticated one-command DoS this fixes.
 #[cfg(feature = "runtime-monoio")]
 #[allow(clippy::await_holding_refcell_ref)]
-pub(crate) async fn handle_blocking_command_monoio(
+pub(crate) async fn handle_blocking_command_monoio<S>(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
@@ -344,20 +747,29 @@ pub(crate) async fn handle_blocking_command_monoio(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     shutdown: &CancellationToken,
     spsc_notifiers: &[Arc<channel::Notify>],
-) -> Frame {
+    stream: &mut S,
+    carry: &mut BytesMut,
+) -> BlockingOutcome
+where
+    S: super::handler_monoio::idle_park::IdleParkRead,
+{
     use futures::stream::FuturesUnordered;
 
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
         Ok(t) => t,
-        Err(e) => return e,
+        Err(e) => return BlockingOutcome::Reply(e),
     };
 
     // Parse keys and command-specific args
     let (keys, blocked_cmd_factory) = match parse_blocking_args(cmd, args) {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => return BlockingOutcome::Reply(e),
     };
+
+    // Reused across every drain in this wait — one allocation for a client
+    // that actually pipelines, none for the overwhelming majority that do not.
+    let mut peer_scratch: Vec<u8> = Vec::new();
 
     // --- Non-blocking fast path: try to get data immediately ---
     // Use with_shard_db (thread-local ShardSlice) — no RwLock guard needed.
@@ -371,7 +783,7 @@ pub(crate) async fn handle_blocking_command_monoio(
             None
         });
         if let Some(frame) = immediate_result {
-            return frame;
+            return BlockingOutcome::Reply(frame);
         }
     }
 
@@ -384,88 +796,116 @@ pub(crate) async fn handle_blocking_command_monoio(
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
-        let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
-        let wait_id = {
-            let mut reg = blocking_registry.borrow_mut();
-            let wait_id = reg.next_wait_id();
-            if target == shard_id {
-                let entry = crate::blocking::WaitEntry {
+        let is_remote = target != shard_id;
+        let (reply_tx, mut reply_rx) = channel::oneshot::<Option<Frame>>();
+        let wait_id = blocking_registry.borrow_mut().next_wait_id();
+        if is_remote {
+            // A4: the old `loop { try_push; sleep(10µs) }` had no retry cap
+            // and no shutdown arm — a saturated owner turned this into a
+            // zombie connection that also blocked graceful shutdown.
+            let msg = ShardMessage::BlockRegister(Box::new(
+                crate::shard::dispatch::BlockRegisterPayload {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    deadline,
-                };
-                reg.register(selected_db, keys[0].clone(), entry);
-            } else {
-                drop(reg);
-                let mut producers = dispatch_tx.borrow_mut();
-                let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: keys[0].clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx,
-                    },
-                ));
-                let mut msg_pending = msg;
-                loop {
-                    match producers[target_idx].try_push(msg_pending) {
-                        Ok(()) => {
-                            spsc_notifiers[target].notify_one();
-                            break;
-                        }
-                        Err(val) => {
-                            msg_pending = val;
-                            drop(producers);
-                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
-                            producers = dispatch_tx.borrow_mut();
-                        }
-                    }
-                }
+                },
+            ));
+            if !push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                msg,
+                Some(&spsc_notifiers[target]),
+            )
+            .await
+            {
+                return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(
+                    BLOCK_REGISTER_FAILED,
+                )));
             }
-            wait_id
-        }; // reg borrow dropped
+        } else {
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            blocking_registry
+                .borrow_mut()
+                .register(selected_db, keys[0].clone(), entry);
+        }
 
-        let is_remote = target != shard_id;
+        // A1: see the tokio twin for why these are loops. The peer arm only
+        // awaits READINESS; the read that follows happens after the select!
+        // has already resolved, where no cancellation can reach it.
         let result = if let Some(dl) = deadline {
-            monoio::select! {
-                res = reply_rx => {
-                    match res {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) | Err(_) => Frame::Null,
+            let mut sleep = std::pin::pin!(monoio::time::sleep(
+                dl.saturating_duration_since(std::time::Instant::now())
+            ));
+            loop {
+                let ready = monoio::select! {
+                    res = &mut reply_rx => {
+                        break match res {
+                            Ok(Some(frame)) => Some(frame),
+                            Ok(None) | Err(_) => Some(Frame::Null),
+                        };
                     }
-                }
-                _ = monoio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())) => {
+                    _ = &mut sleep => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Null);
+                    }
+                    _ = shutdown.cancelled() => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
+                    }
+                    r = stream.peer_readable() => r,
+                };
+                if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
                     blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Null
-                }
-                _ = shutdown.cancelled() => {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                    break None;
                 }
             }
         } else {
-            monoio::select! {
-                res = reply_rx => {
-                    match res {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) | Err(_) => Frame::Null,
+            loop {
+                let ready = monoio::select! {
+                    res = &mut reply_rx => {
+                        break match res {
+                            Ok(Some(frame)) => Some(frame),
+                            Ok(None) | Err(_) => Some(Frame::Null),
+                        };
                     }
-                }
-                _ = shutdown.cancelled() => {
+                    _ = shutdown.cancelled() => {
+                        blocking_registry.borrow_mut().remove_wait(wait_id);
+                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
+                    }
+                    r = stream.peer_readable() => r,
+                };
+                if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
                     blocking_registry.borrow_mut().remove_wait(wait_id);
-                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                    break None;
                 }
             }
         };
         if is_remote {
-            let mut producers = dispatch_tx.borrow_mut();
-            let target_idx = ChannelMesh::target_index(shard_id, target);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+            // A6: bounded push + notify instead of a bare `try_push` that
+            // leaked the owner's WaitEntry whenever the ring was full.
+            let _ = push_block_msg(
+                shutdown,
+                dispatch_tx,
+                shard_id,
+                target,
+                ShardMessage::BlockCancel { wait_id },
+                Some(&spsc_notifiers[target]),
+            )
+            .await;
         }
-        return result;
+        return match result {
+            Some(frame) => BlockingOutcome::Reply(frame),
+            None => BlockingOutcome::PeerGone,
+        };
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
@@ -475,9 +915,11 @@ pub(crate) async fn handle_blocking_command_monoio(
         FuturesUnordered::new();
     let mut registered_remote_shards: Vec<usize> = Vec::new();
 
+    // A4/A5: stage remote registrations, push them after the borrow is
+    // released. See the tokio twin for the full rationale.
+    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
     {
         let mut reg = blocking_registry.borrow_mut();
-        let mut producers = dispatch_tx.borrow_mut();
         wait_id = reg.next_wait_id();
 
         for key in &keys {
@@ -496,7 +938,6 @@ pub(crate) async fn handle_blocking_command_monoio(
                 reg.register(selected_db, key.clone(), entry);
             } else {
                 // Remote registration via SPSC
-                let target_idx = ChannelMesh::target_index(shard_id, target);
                 let msg = ShardMessage::BlockRegister(Box::new(
                     crate::shard::dispatch::BlockRegisterPayload {
                         db_index: selected_db,
@@ -506,25 +947,7 @@ pub(crate) async fn handle_blocking_command_monoio(
                         reply_tx: tx,
                     },
                 ));
-                // SPSC push with backpressure retry (monoio pattern)
-                let mut msg_pending = msg;
-                loop {
-                    match producers[target_idx].try_push(msg_pending) {
-                        Ok(()) => {
-                            spsc_notifiers[target].notify_one();
-                            break;
-                        }
-                        Err(val) => {
-                            msg_pending = val;
-                            // Drop borrows before await
-                            drop(producers);
-                            drop(reg);
-                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
-                            reg = blocking_registry.borrow_mut();
-                            producers = dispatch_tx.borrow_mut();
-                        }
-                    }
-                }
+                pending_remote.push((target, msg));
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
                 }
@@ -532,16 +955,48 @@ pub(crate) async fn handle_blocking_command_monoio(
         }
     } // borrows dropped -- CRITICAL before await
 
+    let mut registration_failed = false;
+    for (target, msg) in pending_remote {
+        if !push_block_msg(
+            shutdown,
+            dispatch_tx,
+            shard_id,
+            target,
+            msg,
+            Some(&spsc_notifiers[target]),
+        )
+        .await
+        {
+            registration_failed = true;
+            break;
+        }
+    }
+    if registration_failed {
+        cancel_multikey_registrations(
+            shutdown,
+            blocking_registry,
+            dispatch_tx,
+            shard_id,
+            wait_id,
+            &registered_remote_shards,
+            Some(spsc_notifiers),
+        )
+        .await;
+        drop(receivers);
+        return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED)));
+    }
+
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
+    let mut peer_gone = false;
     let frame = if let Some(dl) = deadline {
         let mut sleep = std::pin::pin!(monoio::time::sleep(
             dl.saturating_duration_since(std::time::Instant::now())
         ));
         let mut result_frame = Frame::Null;
         loop {
-            monoio::select! {
+            let ready = monoio::select! {
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
@@ -554,13 +1009,18 @@ pub(crate) async fn handle_blocking_command_monoio(
                     result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
                     break;
                 }
+                r = stream.peer_readable() => r,
+            };
+            if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
+                peer_gone = true;
+                break;
             }
         }
         result_frame
     } else {
         let mut result_frame = Frame::Null;
         loop {
-            monoio::select! {
+            let ready = monoio::select! {
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
@@ -572,25 +1032,35 @@ pub(crate) async fn handle_blocking_command_monoio(
                     result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
                     break;
                 }
+                r = stream.peer_readable() => r,
+            };
+            if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
+                peer_gone = true;
+                break;
             }
         }
         result_frame
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
-    blocking_registry.borrow_mut().remove_wait(wait_id);
-    if !registered_remote_shards.is_empty() {
-        let mut producers = dispatch_tx.borrow_mut();
-        for &remote_shard in &registered_remote_shards {
-            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
-            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
-            spsc_notifiers[remote_shard].notify_one();
-        }
-    }
+    cancel_multikey_registrations(
+        shutdown,
+        blocking_registry,
+        dispatch_tx,
+        shard_id,
+        wait_id,
+        &registered_remote_shards,
+        Some(spsc_notifiers),
+    )
+    .await;
     // Drop remaining receivers; remote senders get Err on send -- harmless
     drop(receivers);
 
-    frame
+    if peer_gone {
+        BlockingOutcome::PeerGone
+    } else {
+        BlockingOutcome::Reply(frame)
+    }
 }
 
 /// Parse timeout from a blocking command.
@@ -1122,7 +1592,7 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 ///
 /// **SET:** plain `SET key value` only (exactly `*3` args, no NX/XX/EX/PX options).
 ///   Side-effects handled by this path:
-///   - maxmemory eviction (`try_evict_if_needed`)
+///   - maxmemory eviction (`evict_to_budget`)
 ///   - AOF append (raw RESP bytes, zero re-serialization)
 ///
 ///   Side-effects intentionally skipped (caller gates via `can_inline_writes`):
@@ -1151,6 +1621,7 @@ pub(crate) fn try_inline_dispatch(
     >,
     now_ms: u64,
     num_shards: usize,
+    can_inline_reads: bool,
     can_inline_writes: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
@@ -1181,7 +1652,15 @@ pub(crate) fn try_inline_dispatch(
     if buf[2] != b'\r' || buf[3] != b'\n' {
         return 0;
     }
-    let is_get = argc == b'2';
+    // `can_inline_reads` is NOT optional bookkeeping: this path answers GET
+    // without entering generic dispatch, so it runs neither the ACL
+    // command/key check nor `tracking::invalidation::track_read_keys`.
+    // Ungated it was (a) an ACL bypass — a `-@all` user read any key by name
+    // — and (b) a silent client-side-caching failure: a tracking client's own
+    // GETs were never registered, so nothing ever invalidated them.
+    // See `tests/acl_inline_read_enforcement.rs` and the inline-GET cases in
+    // `tests/client_tracking_invalidation.rs`.
+    let is_get = argc == b'2' && can_inline_reads;
     let is_set = argc == b'3' && can_inline_writes;
     if !is_get && !is_set {
         return 0;
@@ -1276,6 +1755,13 @@ pub(crate) fn try_inline_dispatch(
             if db.hot_keys().tick() {
                 db.hot_keys().observe(key_bytes);
             }
+            // #459: a key mid-spill is in neither hot nor cold, so the miss
+            // arm below would frame `$-1` inline for a key that exists and
+            // that EXISTS reports as present. Pull it back first — RAM only,
+            // no disk read — so the hot lookup answers it. Costs one
+            // `is_empty()` load per inline GET on a server that is not
+            // spilling, which is every server without --disk-offload.
+            db.promote_inflight_if_present(key_bytes, now_ms);
             match db.get_if_alive(key_bytes, now_ms) {
                 Some(entry) => match entry.value.as_bytes() {
                     Some(val) => {
@@ -1398,30 +1884,33 @@ pub(crate) fn try_inline_dispatch(
         if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
             let rt = runtime_config.read();
             let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
-                crate::storage::eviction::try_evict_if_needed_budget_reporting(
+                crate::storage::eviction::evict_to_budget(
                     db,
                     &rt,
-                    budget,
-                    // task #34 (Wave A): the inline SET fast path is the
-                    // ONLY write-eviction gate that can plain-drop a key
-                    // with zero AOF/replication visibility today — the
-                    // key vanishes from RAM but the client's `+OK` and any
-                    // attached replica/AOF replay never learn it happened.
-                    // `can_inline_writes` (this path's caller) already
-                    // forces the generic dispatch path once a replica has
-                    // ever attached (`fanout_hint_active`), so this sink's
-                    // replication leg is a cheap no-op in that case; the
-                    // AOF leg still fires unconditionally.
-                    &mut |key| {
-                        crate::replication::reason_del::record_reason_del_conn(
-                            repl_state,
-                            shard_id,
-                            num_shards,
-                            aof_pool.as_ref(),
-                            selected_db,
-                            key,
-                        );
-                    },
+                    crate::storage::eviction::EvictionRun::plain()
+                        .budget(budget)
+                        .report(
+                            // task #34 (Wave A): the inline SET fast path is the
+                            // ONLY write-eviction gate that can plain-drop a key
+                            // with zero AOF/replication visibility today — the
+                            // key vanishes from RAM but the client's `+OK` and any
+                            // attached replica/AOF replay never learn it happened.
+                            // `can_inline_writes` (this path's caller) already
+                            // forces the generic dispatch path once a replica has
+                            // ever attached (`fanout_hint_active`), so this sink's
+                            // replication leg is a cheap no-op in that case; the
+                            // AOF leg still fires unconditionally.
+                            &mut |key| {
+                                crate::replication::reason_del::record_reason_del_conn(
+                                    repl_state,
+                                    shard_id,
+                                    num_shards,
+                                    aof_pool.as_ref(),
+                                    selected_db,
+                                    key,
+                                );
+                            },
+                        ),
                 )
                 .is_err()
             });
@@ -1503,7 +1992,15 @@ pub(crate) fn try_inline_dispatch(
 
 /// Loop wrapper: call try_inline_dispatch repeatedly until it returns 0.
 /// Returns total number of commands inlined.
+///
+/// `cluster_enabled` must carry `crate::cluster::cluster_enabled()` (a param
+/// for unit-testability): in cluster mode NOTHING may inline — reads and
+/// writes alike must reach the generic dispatch loop's
+/// `try_handle_cluster_routing` so mis-routed keys get MOVED/ASK instead of
+/// being silently served/misplaced against the local DashTable (deep-review
+/// R6 — the classic "three dispatch paths" gap).
 #[cfg(feature = "runtime-monoio")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_inline_dispatch_loop(
     read_buf: &mut BytesMut,
     write_buf: &mut BytesMut,
@@ -1516,9 +2013,14 @@ pub(crate) fn try_inline_dispatch_loop(
     >,
     now_ms: u64,
     num_shards: usize,
+    can_inline_reads: bool,
     can_inline_writes: bool,
+    cluster_enabled: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
+    if cluster_enabled {
+        return 0;
+    }
     let mut total = 0;
     loop {
         let n = try_inline_dispatch(
@@ -1531,6 +2033,7 @@ pub(crate) fn try_inline_dispatch_loop(
             repl_state,
             now_ms,
             num_shards,
+            can_inline_reads,
             can_inline_writes,
             runtime_config,
         );

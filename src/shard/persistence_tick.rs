@@ -70,14 +70,11 @@ pub(crate) fn handle_pending_snapshot(
             } else {
                 snap_dir.join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
-                let mut seg_counts = Vec::with_capacity(s.databases.len());
-                let mut base_ts = Vec::with_capacity(s.databases.len());
-                for db in s.databases.iter() {
-                    seg_counts.push(db.data().segment_count());
-                    base_ts.push(db.base_timestamp());
-                }
-                (seg_counts, base_ts)
+            let segment_counts = crate::shard::slice::with_shard(|s| {
+                s.databases
+                    .iter()
+                    .map(|db| db.data().segment_count())
+                    .collect::<Vec<_>>()
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -85,7 +82,6 @@ pub(crate) fn handle_pending_snapshot(
                 epoch,
                 db_count,
                 segment_counts,
-                base_timestamps,
                 snap_path,
             );
             // P3c — stamp the WAL LSN so PITR can pick this snapshot as a
@@ -116,6 +112,17 @@ pub(crate) fn check_auto_save_trigger(
     let new_epoch = snapshot_trigger_rx.borrow();
     if new_epoch > *last_snapshot_epoch && snapshot_state.is_none() {
         *last_snapshot_epoch = new_epoch;
+        // #366: consume the epoch but skip the save while the data directory
+        // is missing — the snapshot temp file can't be created, and retrying
+        // per save-point trigger just spams one doomed attempt per epoch.
+        if crate::shard::disk_monitor::is_dir_lost() {
+            tracing::warn!(
+                "Shard {}: auto-save epoch {} skipped — data directory missing",
+                shard_id,
+                new_epoch
+            );
+            return;
+        }
         if let Some(dir) = persistence_dir {
             // When disk-offload is enabled, write snapshot to the offload shard directory
             // so v3 recovery can find it alongside WAL v3 segments and manifest.
@@ -126,14 +133,11 @@ pub(crate) fn check_auto_save_trigger(
             } else {
                 std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
-                let mut seg_counts = Vec::with_capacity(s.databases.len());
-                let mut base_ts = Vec::with_capacity(s.databases.len());
-                for db in s.databases.iter() {
-                    seg_counts.push(db.data().segment_count());
-                    base_ts.push(db.base_timestamp());
-                }
-                (seg_counts, base_ts)
+            let segment_counts = crate::shard::slice::with_shard(|s| {
+                s.databases
+                    .iter()
+                    .map(|db| db.data().segment_count())
+                    .collect::<Vec<_>>()
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -141,7 +145,6 @@ pub(crate) fn check_auto_save_trigger(
                 new_epoch,
                 db_count,
                 segment_counts,
-                base_timestamps,
                 snap_path,
             );
             // P3c — stamp the WAL LSN before the header is written.
@@ -220,9 +223,25 @@ pub(crate) fn finalize_snapshot_error(
 pub(crate) fn flush_wal_v3_if_needed(
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
 ) {
+    // #366: while the data directory is missing, every flush that needs a
+    // path operation (segment rotation) fails — at the 1ms tick cadence that
+    // is a hot syscall+log error loop. The dir-lost latch already logged
+    // loudly and refused new writes; skip until the directory heals.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return;
+    }
     if let Some(wal) = wal_v3 {
+        // Belt-and-suspenders for failure classes the latch can't see
+        // (EACCES, a shallow heal missing nested dirs, …): a failed flush
+        // arms a 1s backoff so no flush error can ever loop at tick cadence.
+        if wal.flush_backing_off() {
+            return;
+        }
         if let Err(e) = wal.flush_if_needed() {
-            tracing::error!("WAL v3 flush failed: {}", e);
+            wal.note_flush_failure();
+            tracing::error!("WAL v3 flush failed (retrying in 1s): {}", e);
+        } else {
+            wal.clear_flush_backoff();
         }
     }
 }
@@ -250,6 +269,11 @@ pub(crate) fn check_warm_transitions(
     shard_id: usize,
     wal: &mut Option<WalWriterV3>,
 ) {
+    // #366: warm-tier transitions write segment files under the offload dir
+    // — doomed while the data directory is missing; skip until it heals.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return;
+    }
     let count = vector_store.try_warm_transitions_all_idle(
         shard_dir,
         manifest,
@@ -325,6 +349,13 @@ pub(crate) fn run_eviction_tick(
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
+    // task/issue #45: `<offload>/shard-{id}`, precomputed ONCE at shard init
+    // (event_loop's `disk_offload_dir`) instead of a per-tick
+    // `format!` + `join` allocation pair on this 100ms path. `None` iff
+    // disk-offload is disabled — the same gate that nulls `spill_thread`
+    // and `shard_manifest`, so every consumer below is already
+    // Some-guarded.
+    offload_shard_dir: Option<&std::path::Path>,
     // task #34 (Wave A): `record_reason_del` handles for plain-dropped
     // eviction victims — threaded straight through to `timers::run_eviction`
     // and `handle_memory_pressure`'s sync-spill-fallback branch.
@@ -412,7 +443,7 @@ pub(crate) fn run_eviction_tick(
         // change this tick's cost -- and it is intentionally NOT folded into
         // Database::estimated_memory()/resident_bytes() themselves, which
         // stay untouched O(1) hot-path reads for the per-write eviction
-        // pre-gate (inline_write_can_skip_eviction / try_evict_if_needed).
+        // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
         let used = crate::shard::slice::with_shard(|s| {
             s.databases
                 .iter()
@@ -482,11 +513,11 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             runtime_config,
-            server_config,
             shard_manifest,
             next_file_id,
             wal_v3_writer,
             spill_thread,
+            offload_shard_dir,
             repl_backlog,
             replica_txs,
             repl_state,
@@ -505,17 +536,17 @@ pub(crate) fn run_eviction_tick(
         // its pre-existing fail-close plain-drop (policy-aware: `noeviction`
         // still OOMs, an evicting policy still frees RAM, just with no cold
         // copy -- matches PR #273's fail-close discipline).
-        let eviction_shard_dir = server_config
-            .effective_disk_offload_dir()
-            .join(format!("shard-{}", shard_id));
         let mut spill_ctx: Option<crate::storage::eviction::SpillContext<'_>> = None;
         if server_config.disk_offload_enabled()
+            && let Some(shard_dir) = offload_shard_dir
             && let Some(ref mut manifest) = *shard_manifest
         {
             spill_ctx = Some(crate::storage::eviction::SpillContext {
-                shard_dir: &eviction_shard_dir,
+                shard_dir,
                 manifest,
                 next_file_id,
+                // Placeholder — `run_eviction` restamps per database (#139).
+                db_index: 0,
             });
         }
         super::timers::run_eviction(
@@ -587,27 +618,93 @@ fn apply_completion_vec(
         return;
     }
 
+    // Task #59: this runs on the shard event-loop thread, so it must not pay
+    // for manifest fsyncs — one DEFERRED commit for the whole batch (below),
+    // shipped to the manifest-sync thread. Correct because this path only
+    // runs under `--appendonly yes` (evict_one_async_spill bails otherwise):
+    // AOF replay + the orphan sweep reconstruct anything a lost manifest
+    // commit would have recorded. Previously: one durable commit (up to 2
+    // fsyncs) per flushed file, measured blocking the loop 1.0-2.1s per 8s
+    // window under spill flood, single calls up to 1.0s.
+    let mut manifest_dirty = false;
     for c in completions {
         if !c.success {
-            tracing::warn!(
-                file_id = c.file_entry.file_id,
-                "Spill pwrite failed on background thread"
-            );
+            // Deep-review F1: the hot entry was removed at evict time on the
+            // promise this completion would land the key in the cold index.
+            // A failed pwrite breaks that promise — without re-insert the key
+            // exists in NEITHER plane and reads nil until an AOF-replay
+            // restart (and permanently under --appendonly no sync paths).
+            // Fail-closed: put the value back in RAM, mirroring the
+            // enqueue-failure path which retains the hot value. Under a
+            // persistently failing disk this re-arms eviction for the same
+            // key — bounded per tick and loudly counted, which beats silent
+            // wrong answers.
+            if let Some(req) = c.failed_request {
+                crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    // Deep-review P2 stale-shadow guard: if the key was
+                    // re-created and re-evicted while this pwrite was in
+                    // flight, a NEWER spill request supersedes this one —
+                    // re-inserting this older payload would shadow the newer
+                    // cold value in the hot plane (and the next eviction
+                    // would spill the stale copy as authoritative).
+                    let newest = db.spill_inflight_is_newest(&req.key, req.file_id);
+                    db.spill_inflight_clear(&req.key, req.file_id);
+                    if !newest {
+                        tracing::warn!(
+                            file_id = c.file_entry.file_id,
+                            key_len = req.key.len(),
+                            "Spill pwrite failed for a request that no longer owns this \
+                             key; skipping re-insert (a newer spill is in flight or \
+                             landed, or the key was deleted / overwritten / read-promoted \
+                             while this write was in flight — #459)"
+                        );
+                        return;
+                    }
+                    if db.get_version(&req.key) != 0 {
+                        // A newer write recreated the key while the spill was
+                        // in flight; the failed payload is stale — drop it.
+                        return;
+                    }
+                    match crate::storage::eviction::rehydrate_spill_payload(
+                        req.value_type,
+                        &req.value_bytes,
+                        req.ttl_ms,
+                    ) {
+                        Some(entry) => {
+                            db.set(req.key.clone(), entry);
+                            crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed; evicted key re-inserted into hot table \
+                                 (spill volume is failing writes)"
+                            );
+                        }
+                        None => {
+                            tracing::error!(
+                                file_id = c.file_entry.file_id,
+                                key_len = req.key.len(),
+                                "Spill pwrite failed AND payload does not rehydrate — key lost \
+                                 until AOF-replay restart"
+                            );
+                        }
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    file_id = c.file_entry.file_id,
+                    "Spill pwrite failed on background thread (no payload carried back)"
+                );
+            }
             continue;
         }
 
         let file_id = c.file_entry.file_id;
 
-        // ONE manifest add_file + commit per flushed file.
+        // RAM-only manifest update; durability handled once per batch below.
         if let Some(ref mut manifest) = *shard_manifest {
             manifest.add_file(c.file_entry);
-            if let Err(e) = manifest.commit() {
-                tracing::warn!(
-                    file_id,
-                    error = %e,
-                    "Manifest commit failed for spill completion"
-                );
-            }
+            manifest_dirty = true;
         }
 
         // Insert one ColdIndex entry per KV within this file. `ttl_ms` rides
@@ -619,13 +716,42 @@ fn apply_completion_vec(
                 page_idx: entry.page_idx,
                 slot_idx: entry.slot_idx,
                 ttl_ms: entry.ttl_ms,
+                value_type: entry.value_type,
             };
 
             crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                // The in-flight record is this completion's AUTHORIZATION to
+                // publish, not just a stale-shadow guard (#459). It is gone
+                // when the key was deleted, overwritten, or read-promoted
+                // while the spill was in flight; publishing anyway resurrects
+                // a deleted key — and because this insert reaches the
+                // manifest, the resurrection survives restart. Measured
+                // pre-fix: 277 of 400 DELs undone this way.
+                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+                    return;
+                }
                 if let Some(ref mut ci) = db.cold_index {
                     ci.insert(entry.key.clone(), location);
                 }
+                // Retire this request's record; a newer request's is left
+                // for its own completion.
+                db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
+        }
+    }
+
+    // ONE deferred commit for the whole drained batch (see the task #59 note
+    // at the top of this function). Non-blocking when the manifest-sync
+    // thread is attached; degrades to a synchronous persist otherwise.
+    if manifest_dirty {
+        if let Some(ref mut manifest) = *shard_manifest {
+            if let Err(e) = manifest.commit_deferred() {
+                tracing::warn!(
+                    error = %e,
+                    "Deferred manifest commit failed for spill completion batch"
+                );
+            }
         }
     }
 }
@@ -698,11 +824,12 @@ pub(crate) fn handle_memory_pressure(
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
-    server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     spill_thread: Option<&crate::storage::tiered::spill_thread::SpillThread>,
+    // task/issue #45: see `run_eviction_tick`.
+    offload_shard_dir: Option<&std::path::Path>,
     // task #34 (Wave A): see `run_eviction_tick`.
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
@@ -734,13 +861,12 @@ pub(crate) fn handle_memory_pressure(
     // stub), which actually returns RAM — and stays reloadable-on-touch. We
     // pass `warm_after = u64::MAX` so the age-based HOT->WARM path stays
     // disabled here; only the idle->COLD path fires.
-    if let Some(ref mut manifest) = *shard_manifest {
-        let shard_dir = server_config
-            .effective_disk_offload_dir()
-            .join(format!("shard-{}", shard_id));
+    if let Some(ref mut manifest) = *shard_manifest
+        && let Some(shard_dir) = offload_shard_dir
+    {
         let count = crate::shard::slice::with_shard(|s| {
             s.vector_store.try_warm_transitions_all_idle(
-                &shard_dir,
+                shard_dir,
                 manifest,
                 u64::MAX,
                 PRESSURE_OFFLOAD_IDLE_SECS,
@@ -791,11 +917,16 @@ pub(crate) fn handle_memory_pressure(
             };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();
-                let shard_dir = server_config
-                    .effective_disk_offload_dir()
-                    .join(format!("shard-{}", shard_id));
+                // #454 P2.8: ONE shared backpressure bound for this entire sweep
+                // (per-key minting could stall the shard bound x victim-count).
+                let mut reason_del_budget =
+                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+                // task/issue #45: `offload_shard_dir` is precomputed at shard
+                // init. `spill_thread` and `shard_manifest` share its
+                // disk-offload gate, so both branches below pair their
+                // existing Some-guard with the dir's.
 
-                if let Some(spill_t) = spill_thread {
+                if let (Some(spill_t), Some(shard_dir)) = (spill_thread, offload_shard_dir) {
                     // Async spill path: background thread does pwrite under
                     // `--appendonly yes` (AOF-backstopped fast path). Under
                     // `--appendonly no` there is no AOF backstop, so
@@ -809,35 +940,40 @@ pub(crate) fn handle_memory_pressure(
                     let sender = spill_t.sender();
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
-                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget_reporting(
+                            let _ = crate::storage::eviction::evict_to_budget(
                                 db,
                                 &rt,
-                                &sender,
-                                &shard_dir,
-                                next_file_id,
-                                total_mem,
-                                i,
-                                budget,
-                                shard_manifest.as_mut(),
-                                // task #34 (Wave A): only the no-manifest,
-                                // `--appendonly no` plain-drop fallback
-                                // inside this function ever calls this sink
-                                // (the async-spill and durable-batch
-                                // branches leave a cold/AOF-recoverable
-                                // copy and never invoke it).
-                                &mut |key| {
-                                    crate::replication::reason_del::record_reason_del(
-                                        key,
-                                        i,
-                                        wal_v3,
-                                        repl_backlog,
-                                        replica_txs,
-                                        repl_state,
-                                        shard_id,
-                                        aof_pool,
-                                        wal_kv_log,
-                                    );
-                                },
+                                crate::storage::eviction::EvictionRun::async_spill(
+                                    &sender,
+                                    shard_dir,
+                                    next_file_id,
+                                    i,
+                                    shard_manifest.as_mut(),
+                                )
+                                .total(total_mem)
+                                .budget(budget)
+                                .report(
+                                    // task #34 (Wave A): only the no-manifest,
+                                    // `--appendonly no` plain-drop fallback
+                                    // inside this function ever calls this sink
+                                    // (the async-spill and durable-batch
+                                    // branches leave a cold/AOF-recoverable
+                                    // copy and never invoke it).
+                                    &mut |key| {
+                                        crate::replication::reason_del::record_reason_del(
+                                            key,
+                                            i,
+                                            wal_v3,
+                                            repl_backlog,
+                                            replica_txs,
+                                            repl_state,
+                                            shard_id,
+                                            aof_pool,
+                                            wal_kv_log,
+                                            &mut reason_del_budget,
+                                        );
+                                    },
+                                ),
                             );
                         });
                     }
@@ -847,11 +983,16 @@ pub(crate) fn handle_memory_pressure(
                     // Sync spill fallback
                     for i in 0..db_count {
                         crate::shard::slice::with_shard_db(i, |db| {
-                            if let Some(ref mut manifest) = *shard_manifest {
+                            if let Some(ref mut manifest) = *shard_manifest
+                                && let Some(shard_dir) = offload_shard_dir
+                            {
                                 let mut ctx = crate::storage::eviction::SpillContext {
-                                    shard_dir: &shard_dir,
+                                    shard_dir,
                                     manifest,
                                     next_file_id,
+                                    // #139: this fallback runs inside the
+                                    // per-db loop — attribute to db `i`.
+                                    db_index: i,
                                 };
                                 // Durable spill (manifest reachable): a
                                 // STRING victim stays cold-readable, never a
@@ -864,13 +1005,15 @@ pub(crate) fn handle_memory_pressure(
                                 // reporting sink (previously a hardcoded
                                 // no-op here, which silently swallowed those
                                 // emissions).
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
+                                let _ = crate::storage::eviction::evict_to_budget(
                                     db,
                                     &rt,
-                                    Some(&mut ctx),
-                                    total_mem,
-                                    budget,
-                                    &mut |key| {
+                                    crate::storage::eviction::EvictionRun::sync_spill(Some(
+                                        &mut ctx,
+                                    ))
+                                    .total(total_mem)
+                                    .budget(budget)
+                                    .report(&mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
                                             i,
@@ -881,27 +1024,33 @@ pub(crate) fn handle_memory_pressure(
                                             shard_id,
                                             aof_pool,
                                             wal_kv_log,
+                                            &mut reason_del_budget,
                                         );
-                                    },
+                                    }),
                                 );
                             } else {
                                 // No manifest reachable: this IS the plain
                                 // -drop path (task #34, Wave A) — emit.
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget_reporting(
-                                    db, &rt, None, total_mem, budget,
-                                    &mut |key| {
-                                        crate::replication::reason_del::record_reason_del(
-                                            key,
-                                            i,
-                                            wal_v3,
-                                            repl_backlog,
-                                            replica_txs,
-                                            repl_state,
-                                            shard_id,
-                                            aof_pool,
-                                            wal_kv_log,
-                                        );
-                                    },
+                                let _ = crate::storage::eviction::evict_to_budget(
+                                    db,
+                                    &rt,
+                                    crate::storage::eviction::EvictionRun::plain()
+                                        .total(total_mem)
+                                        .budget(budget)
+                                        .report(&mut |key| {
+                                            crate::replication::reason_del::record_reason_del(
+                                                key,
+                                                i,
+                                                wal_v3,
+                                                repl_backlog,
+                                                replica_txs,
+                                                repl_state,
+                                                shard_id,
+                                                aof_pool,
+                                                wal_kv_log,
+                                                &mut reason_del_budget,
+                                            );
+                                        }),
                                 );
                             }
                         });
@@ -912,7 +1061,7 @@ pub(crate) fn handle_memory_pressure(
     }
 
     // Step 4: NoEviction policy check -- if we reached here with noeviction,
-    // log a warning. The actual OOM rejection is handled inside try_evict_if_needed.
+    // log a warning. The actual OOM rejection is handled inside evict_to_budget.
     {
         let rt = runtime_config.read();
         if rt.maxmemory_policy == "noeviction" {
@@ -1089,6 +1238,11 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     max_checkpoint_lag_ms: u64,
     graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
+    // #366: no overflow scan while the data directory is missing — the
+    // per-second directory read would warn-loop forever.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return false;
+    }
     // Condition 1: total on-disk WAL exceeds the configured ceiling.
     let total_wal = match wal.stats() {
         Ok(s) => {
@@ -1212,6 +1366,12 @@ pub(crate) fn handle_checkpoint_tick(
     tombstone_retain_secs: u64,
     graph_save: &mut dyn FnMut(u64) -> bool,
 ) -> bool {
+    // #366: checkpoints are pure file work (page pwrite, manifest rename,
+    // WAL recycle) — all doomed while the data directory is missing. Skip;
+    // the CheckpointManager simply resumes when the latch clears.
+    if crate::shard::disk_monitor::is_dir_lost() {
+        return false;
+    }
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
@@ -1790,9 +1950,11 @@ mod tests {
 
         // 1 shard, 1 MiB maxmemory => per-shard budget is the whole 1 MiB.
         // disk_offload_threshold defaults to 0.85 (see config.rs).
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024;
-        rt.num_shards = 1;
+        let rt = crate::config::RuntimeConfig {
+            maxmemory: 1024 * 1024,
+            num_shards: 1,
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
         let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
             [],
@@ -1818,9 +1980,11 @@ mod tests {
 
         // maxmemory == 0 (unset) must never trigger, regardless of usage.
         {
-            let mut rt2 = crate::config::RuntimeConfig::default();
-            rt2.maxmemory = 0;
-            rt2.num_shards = 1;
+            let rt2 = crate::config::RuntimeConfig {
+                maxmemory: 0,
+                num_shards: 1,
+                ..Default::default()
+            };
             let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
             shared.publish_memory(0, usize::MAX / 2);
             assert!(
@@ -1839,9 +2003,11 @@ mod tests {
         let dbs = vec![vec![Database::new()]];
         let (shared, _inits) = ShardDatabases::new(dbs);
 
-        let mut rt = crate::config::RuntimeConfig::default();
-        rt.maxmemory = 1024 * 1024; // 1 MiB per-shard budget (1 shard)
-        rt.num_shards = 1;
+        let rt = crate::config::RuntimeConfig {
+            maxmemory: 1024 * 1024, // 1 MiB per-shard budget (1 shard)
+            num_shards: 1,
+            ..Default::default()
+        };
         let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
         let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
             [],

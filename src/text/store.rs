@@ -1591,8 +1591,10 @@ impl TextIndex {
     /// `TermDictionary::resident_bytes_ground_truth`, and the TAG/NUMERIC/
     /// FST/bookkeeping formulas inlined below). Test-only: exists solely to
     /// assert the incremental accumulators never drift from a from-scratch
-    /// recount after a mixed mutation sequence.
-    #[cfg(test)]
+    /// recount after a mixed mutation sequence. Its only caller (`mod
+    /// tests` below) is itself gated on `feature = "text-index"`, so this
+    /// must match or it's dead code under a `text-index`-off test build.
+    #[cfg(all(test, feature = "text-index"))]
     pub(crate) fn resident_bytes_ground_truth(&self) -> usize {
         let postings: usize = self
             .field_postings

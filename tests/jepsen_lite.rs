@@ -31,10 +31,10 @@ const KEYS_PER_WRITER: u64 = 50;
 
 /// Find the Moon binary. Check `target/release/moon` first, then `target/debug/moon`.
 fn find_moon_binary() -> String {
-    if let Ok(bin) = std::env::var("MOON_BIN") {
-        if std::path::Path::new(&bin).exists() {
-            return bin;
-        }
+    if let Ok(bin) = std::env::var("MOON_BIN")
+        && std::path::Path::new(&bin).exists()
+    {
+        return bin;
     }
     // The binary cargo built for THIS test run: compile-time path with the
     // right profile, CARGO_TARGET_DIR, and .exe suffix on Windows (the old

@@ -1,0 +1,10 @@
+/Volumes/Games/tindang-repo/moon/target-stats/release-fast/deps/mlua_sys-d07466bb41726789.d: /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/mod.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lauxlib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lua.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lualib.rs
+
+/Volumes/Games/tindang-repo/moon/target-stats/release-fast/deps/libmlua_sys-d07466bb41726789.rmeta: /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/mod.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lauxlib.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lua.rs /Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lualib.rs
+
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/mod.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lauxlib.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lua.rs:
+/Users/tindang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua54/lualib.rs:

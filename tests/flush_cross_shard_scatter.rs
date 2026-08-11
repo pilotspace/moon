@@ -28,11 +28,7 @@ fn redis_cli_available() -> bool {
 }
 
 fn release_binary() -> std::path::PathBuf {
-    // MOON_BIN pin wins (VM-local target dirs); fall back to target/release.
-    if let Ok(p) = std::env::var("MOON_BIN") {
-        return std::path::PathBuf::from(p);
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/moon")
+    common::find_moon_binary()
 }
 
 struct Moon {

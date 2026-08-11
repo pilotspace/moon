@@ -55,9 +55,11 @@
 //!     probes were durably spilled to cold BEFORE the kill (ground truth,
 //!     read directly via `moon::persistence::{manifest,kv_page}`).
 //!   * POST-crash read-through must recover AT LEAST that many probes.
+//!
 //!   RED (pre-#22-fix binary): ground truth > 0, POST == ~0 (recovery skipped
 //!   entirely — the persistence_dir gate regressed).
 //!   GREEN (post-#22-fix): POST >= ground truth.
+//!
 //! Because there is NO AOF under `appendonly no`, a non-zero POST count can ONLY
 //! come from the cold-manifest recovery path the #22 fix enables.
 //!
@@ -80,6 +82,8 @@
 //! Requires: built release binary, `redis-cli` on PATH.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+
+mod common;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -132,7 +136,7 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 fn start_moon(port: u16, dir: &std::path::Path) -> Child {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),

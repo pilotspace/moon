@@ -132,6 +132,27 @@ fn bump_total_commands() {
     });
 }
 
+/// This thread's slot of the sharded total-commands counter. Used by the
+/// shard loop's adaptive idle park (#373) as its "commands dispatched on
+/// this shard since the last tick" signal — one relaxed load per tick.
+/// Slot collisions (>64 threads share slots round-robin) can only inflate
+/// the count, which keeps the loop in fast mode: the safe direction.
+#[inline]
+pub fn this_thread_commands() -> u64 {
+    COMMAND_COUNTER_SLOT.with(|&slot| COMMAND_COUNTERS[slot].0.load(Ordering::Relaxed))
+}
+
+/// Count a replica-applied command in this thread's total-commands slot.
+/// Redis parity: replicas include applied master-stream commands in
+/// `total_commands_processed`. Also the adaptive idle park's (#373)
+/// activity signal for the apply path, which bypasses the connection
+/// handlers and would otherwise be invisible to the idle gate — a busy
+/// replica must never be classified idle.
+#[inline]
+pub fn record_replica_apply() {
+    bump_total_commands();
+}
+
 /// Exact sum across all counter slots. O(64) loads — read paths only
 /// (INFO, the 1s server_stats tick), never the command hot path.
 fn total_commands_sum() -> u64 {
@@ -232,6 +253,17 @@ pub fn init_metrics(
             "Resident bytes per subsystem; sum approximates RSS"
         );
         prime_moon_memory_bytes();
+        // Task #56 (used_memory truthfulness): headline gauge matching
+        // INFO's `used_memory` field -- the logical ledger `--maxmemory`
+        // eviction gates on (KV + ColdIndex + vector/text/graph), NOT RSS.
+        // `moon_rss_bytes` (primed by the first `update_rss_bytes` call)
+        // remains the true OS-level footprint for comparison.
+        describe_gauge!(
+            "moon_used_memory_bytes",
+            Unit::Bytes,
+            "Logical used-memory ledger --maxmemory eviction gates on (KV+ColdIndex+vector+text+graph); compare against a configured maxmemory, NOT moon_rss_bytes"
+        );
+        gauge!("moon_used_memory_bytes").set(0.0);
 
         Some(ready)
     } else {
@@ -891,6 +923,31 @@ pub fn record_dispatch_cross_spsc() {
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
 }
 
+/// Cross-shard fan-out message dropped after bounded retry (c10k E1/E3):
+/// the target shard's SPSC ring stayed full through every backoff. `kind` is
+/// `"publish"` (that shard's subscribers miss the message; PUBLISH count
+/// under-reports) or `"script_load"` (that shard's script cache diverges —
+/// EVALSHA there answers NOSCRIPT until the next SCRIPT LOAD).
+#[inline]
+pub fn record_xshard_fanout_drop(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_fanout_drop_total", "kind" => kind).increment(1);
+}
+
+/// Cross-shard reply await expired (c10k E4): the owner shard did not fill
+/// the reply slot within `XSHARD_REPLY_TIMEOUT`. `kind` `"dispatch"` is
+/// fatal for the connection (the reusable slot may be filled late);
+/// `"publish"` degrades to an under-reported subscriber count.
+#[inline]
+pub fn record_xshard_reply_timeout(kind: &'static str) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_xshard_reply_timeout_total", "kind" => kind).increment(1);
+}
+
 /// Batched variant of `record_dispatch_cross_spsc`.
 #[inline]
 pub fn record_dispatch_cross_spsc_batch(count: u64) {
@@ -1311,6 +1368,69 @@ pub fn get_global_shard_databases()
     GLOBAL_SHARD_DBS.get().and_then(|w| w.upgrade())
 }
 
+/// The instance-wide logical memory ledger reported as `INFO`'s
+/// `used_memory` field and the `moon_used_memory_bytes` gauge.
+///
+/// Task #56 (used_memory truthfulness) + adversarial-review finding #3
+/// (parity delta): this is NOT process RSS -- RSS also contains the binary
+/// image, thread stacks, allocator arena fragmentation, and mmap'd
+/// page-cache frames for cold-tier reads, none of which real Redis counts
+/// in `used_memory` either. Reporting RSS as `used_memory` made every
+/// disk-offload deployment look permanently over-budget (RSS-vs-ledger gap
+/// of 150-500MB+ was misread as a leak in the G2 acceptance run) even when
+/// the eviction system was correctly holding the real, gated ledger under
+/// the cap. `used_memory_rss` / `used_memory_peak` still report the true
+/// OS-level footprint alongside this field -- see `allocator_overhead_bytes`
+/// and `pagecache_bytes` for the two largest components still legitimately
+/// excluded, and `MEMORY DOCTOR` for the full per-subsystem breakdown.
+///
+/// This figure is DELIBERATELY WIDER than
+/// `ShardDatabases::recompute_elastic_budget` (the formula `--maxmemory`
+/// eviction actually gates on: KV DashTable + its ColdIndex overhead, plus
+/// vector/text/graph resident bytes). It ALSO adds the Lua script cache and
+/// the replication backlog ring, matching real Redis's `used_memory`
+/// semantics: Redis's `used_memory` is "total allocator-attributed memory",
+/// not "memory eviction can reclaim" -- Lua scripts (`SCRIPT FLUSH` is the
+/// only reclaim path) and the replication backlog are real allocations
+/// Redis counts there too, even though neither is "evictable data" in the
+/// `--maxmemory` sense. Both terms are already tracked as O(1) accumulators
+/// for the `moon_memory_bytes{kind="lua_scripts"}` /
+/// `{kind="replication_backlog"}` gauges, so including them here is free --
+/// no new instrumentation, just reusing the existing published totals. The
+/// elastic budget / eviction gate is UNCHANGED by this: eviction still only
+/// ever acts on KV+vector+text+graph, so a large Lua cache or replication
+/// backlog can (correctly, matching Redis) push `used_memory` above what
+/// eviction is actively bounding, without eviction trying to reclaim either.
+///
+/// O(num_shards) Relaxed atomic loads -- no lock, no allocation. Every term
+/// is itself an O(1) accumulator maintained at its own mutation sites (the
+/// `#297` cached-total pattern): this function only sums already-published
+/// per-shard snapshots, exactly like `pagecache_bytes` already does at its
+/// INFO call site.
+#[must_use]
+pub fn logical_used_memory_bytes() -> usize {
+    let Some(shard_dbs) = get_global_shard_databases() else {
+        return 0;
+    };
+    let dashtable_and_cold_index = shard_dbs.read_memory_sum();
+    let store_total: usize = shard_dbs
+        .store_memory_per_shard
+        .iter()
+        .map(|mem| {
+            mem.vector.load(Ordering::Relaxed)
+                + mem.text.load(Ordering::Relaxed)
+                + mem.graph.load(Ordering::Relaxed)
+                + mem.lua.load(Ordering::Relaxed)
+        })
+        .sum();
+    let replication_backlog = get_global_repl_state_arc()
+        .map(|state| state.read().backlog_resident_bytes())
+        .unwrap_or(0);
+    dashtable_and_cold_index
+        .saturating_add(store_total)
+        .saturating_add(replication_backlog)
+}
+
 // ── Global SLOWLOG ─────────────────────────────────────────────────────
 
 /// Global slowlog instance accessible from any handler thread.
@@ -1476,6 +1596,17 @@ fn update_moon_memory_bytes() {
     gauge!("moon_memory_bytes", "kind" => "lua_scripts").set(lua as f64);
     gauge!("moon_memory_bytes", "kind" => "pagecache").set(pagecache as f64);
     gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
+
+    // Task #56 (used_memory truthfulness) + finding #3 (parity delta): the
+    // same logical ledger INFO's `used_memory` reports -- KV+ColdIndex +
+    // vector/text/graph, PLUS the Lua script cache and replication backlog
+    // (both already sampled above for their own `moon_memory_bytes{kind=...}`
+    // series) to match real Redis's `used_memory` semantics -- published as
+    // its own top-level gauge so `moon_used_memory_bytes / <maxmemory>` is a
+    // meaningful alert expression. Still narrower than `moon_rss_bytes`,
+    // which also carries allocator overhead and page cache (see
+    // `logical_used_memory_bytes`'s doc comment for the full breakdown).
+    gauge!("moon_used_memory_bytes").set((dashtable + hnsw + text + csr + lua + backlog) as f64);
 
     // Update the existing RSS gauge in the same snapshot so the integration
     // test can compare moon_memory_bytes sum against moon_rss_bytes from the

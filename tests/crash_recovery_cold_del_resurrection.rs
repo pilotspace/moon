@@ -37,6 +37,8 @@
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
+mod common;
+
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -83,7 +85,7 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 fn start_moon(port: u16, dir: &std::path::Path) -> Child {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
-    Command::new("./target/release/moon")
+    Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),
@@ -407,5 +409,5 @@ fn deleted_cold_keys_stay_deleted_after_crash() {
 #[test]
 #[ignore] // requires ./target/release/moon + redis-cli; run with -- --ignored
 fn flushed_cold_keys_stay_flushed_after_crash() {
-    run_scenario("flushall", |port| redis_flushall(port));
+    run_scenario("flushall", redis_flushall);
 }

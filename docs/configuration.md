@@ -127,12 +127,24 @@ promotion (`REPLICAOF NO ONE`), and the replica TTL caveat: see the
 | `--tcp-keepalive` | `300` | TCP keepalive interval in seconds (0 = disabled) |
 | `--slowlog-log-slower-than` | `10000` | Slowlog threshold in microseconds |
 | `--slowlog-max-len` | `128` | Maximum slowlog entries |
-| `--profile` | *(none)* | Apply a named tuning preset (currently `standalone`). Only fills flags left at their default — an explicit flag always wins. Logs exactly what it set. **`standalone` requires pinned/dedicated cores** (regresses on shared hosts). See the [tuning guide](guides/tuning.md#profiles) |
+| `--profile` | *(none)* | Apply a named tuning preset (currently `standalone`). Only fills flags left at their default — an explicit flag always wins. Logs exactly what it set. Safe on any host (busy-poll auto-gates on shared cores). See the [tuning guide](guides/tuning.md#profiles) |
 | `--io-driver` | `auto` | I/O driver: `auto` (io_uring on Linux, kqueue on macOS) or `epoll` |
-| `--io-busy-poll-us` | `0` (off) | Busy-poll the I/O driver for N µs before parking. Large single-op latency win on **dedicated, pinned cores**; a regression on shared/oversubscribed hosts. See the [tuning guide](guides/tuning.md) |
+| `--io-busy-poll-us` | `0` (off) | Busy-poll the I/O driver for N µs before parking. Large single-op latency win on dedicated cores; **auto-disables on shared/oversubscribed cores** via the per-shard contention governor, so it no longer regresses there. See the [tuning guide](guides/tuning.md#busy-polling-single-op-latency-on-dedicated-cores) |
 | `--initial-keyspace-hint` | `0` | Pre-size the keyspace (e.g. `1000000`) to avoid rehash pauses during bulk loads |
-| `--memory-arenas-cap` | `8` | Cap jemalloc arenas — lower (e.g. `2`) for small containers |
+| `--memory-arenas-cap` | `8` | Cap jemalloc arenas — lower (e.g. `2`) for a single-shard / small-container footprint. jemalloc builds only; **CLI-only** (read before the config file). `--profile standalone` sets `2` |
+| `--memory-thp` | *(off)* | Opt the jemalloc value heap into transparent huge pages (`thp:always`). Measured GET +12–24% on GCE, but **permanently opt-in**: idle khugepaged re-collapse drifts RSS ~+31% after mixed-size churn, so enable only on uniform-value-size fleets with RSS headroom. jemalloc + Linux only; **CLI-only** |
 | `--uring-sqpoll` | *(disabled)* | io_uring SQPOLL idle timeout in ms. Requires CAP_SYS_NICE. Linux only |
+
+### Environment tuning knobs (diagnostics)
+
+These are same-binary A/B / diagnostic overrides, not production tuning:
+
+| Env var | Effect |
+|---------|--------|
+| `MOON_SPIN_ADAPTIVE=0` | Disable the busy-poll contention governor — the shard spins unconditionally whenever `--io-busy-poll-us > 0` (pre-governor behaviour; dedicated cores only) |
+| `MOON_SPIN_MAX_PREEMPTS_PER_SEC` | Governor gate threshold in involuntary preemptions/sec (default `25`). One window above this disables the spin on that shard; five quiet windows re-enable it |
+| `MOON_NO_URING=1` | Force-disable io_uring everywhere (epoll/kqueue fallback); for CI/containers/WSL. CLI equivalent: `--io-driver epoll` |
+| `MOON_IDLE_PARK=0` | Disable the adaptive idle-park (pins the shard loop to its fixed 1 ms tick instead of stretching to 10 ms after proven quiet) |
 
 ## Disk offload (tiered storage)
 

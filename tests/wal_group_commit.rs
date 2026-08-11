@@ -9,6 +9,7 @@
 //!     `<W: Write>` + "flush()+sync_data()" — non-behavioral: the durability behavior is unchanged)
 //!   - `struct CommitOutcome { synced, write_failed, fsync_failed }`
 //!   - `fn commit_group_commit_batch(sink, batch, do_fsync) -> CommitOutcome`
+//!
 //! Before build the `use` below is UNRESOLVED → this crate fails to compile. That compile
 //! failure IS the red signal (the other test crates build independently).
 //!
@@ -19,6 +20,8 @@
 //! at build), NOT here — a unit mock cannot prove on-disk survival across a real kill.
 //!
 //! Running: cargo test --test wal_group_commit
+
+mod common;
 
 use bytes::Bytes;
 use moon::persistence::aof::group_commit::{
@@ -411,7 +414,7 @@ mod integration {
     }
 
     fn start_moon(port: u16, dir: &std::path::Path, shards: u16, fsync: &str) -> Child {
-        Command::new("./target/release/moon")
+        Command::new(super::common::find_moon_binary())
             .args([
                 "--port",
                 &port.to_string(),

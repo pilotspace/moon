@@ -62,6 +62,8 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             appendonly: appendonly.clone(),
             unsafe_multishard_aof: false,
             experimental_per_shard_rewrite: false,
+            auto_aof_rewrite_percentage: 100,
+            auto_aof_rewrite_min_size: "64mb".to_string(),
             appendfsync: "everysec".to_string(),
             aof_fsync_timeout_ms: 2000,
             save: None,
@@ -102,6 +104,8 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             uring_sqpoll_ms: None,
             io_driver: "auto".to_string(),
             io_busy_poll_us: 0,
+            uring_entries: None,
+            conn_park_secs: 0,
             ft_search_workers: None,
             admin_port: 0,
             slowlog_log_slower_than: 10000,
@@ -109,7 +113,12 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             check_config: false,
             initial_keyspace_hint: 0,
             memory_arenas_cap: 8,
+            memory_thp: false,
             maxclients: 10000,
+            client_query_buffer_limit: 1024 * 1024 * 1024,
+            client_query_buffer_limit_preauth: 64 * 1024,
+            client_write_timeout_ms: 60_000,
+            client_output_buffer_limit_normal: 256 * 1024 * 1024,
             timeout: 0,
             tcp_keepalive: 300,
             console_auth_required: false,
@@ -302,13 +311,12 @@ fn spawn_txn_server_thread(config: ServerConfig, num_shards: usize, cancel: Canc
 async fn await_server_ready(port: u16, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}")) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let pong: redis::RedisResult<String> =
-                    redis::cmd("PING").query_async(&mut conn).await;
-                if pong.is_ok() {
-                    return true;
-                }
+        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}"))
+            && let Ok(mut conn) = client.get_multiplexed_async_connection().await
+        {
+            let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            if pong.is_ok() {
+                return true;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

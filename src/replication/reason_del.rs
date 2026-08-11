@@ -57,7 +57,7 @@
 
 use bytes::Bytes;
 
-use crate::persistence::aof::{AOF_SPSC_BACKPRESSURE_BOUND, AofWriterPool, serialize_command};
+use crate::persistence::aof::{AofWriterPool, serialize_command};
 use crate::protocol::Frame;
 #[cfg(feature = "runtime-monoio")]
 use crate::replication::state::ReplicationState;
@@ -80,6 +80,16 @@ fn serialize_del(key: &[u8]) -> Bytes {
 /// `wal_append_and_fanout` so its SELECT-on-db-change bookkeeping (and the
 /// AOF writer's own db-scoped SELECT injection) stay correct for multi-db
 /// deployments, exactly as every ordinary write already relies on.
+/// `aof_budget` is the caller's SHARED backpressure budget for the whole
+/// sweep (#454 review P2.8): callers mint ONE
+/// [`crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND`] per
+/// expiry cycle / eviction run and thread it through every per-key
+/// emission, so a stalled AOF writer costs the shard event loop at most
+/// one bound per SWEEP — not one bound per KEY (a 1000-victim OOM sweep
+/// against a hung disk used to block the shard for 1000 × 500ms).
+/// `wal_append_and_fanout` decrements it by time actually spent blocking;
+/// once exhausted, remaining keys in the sweep fail fast into
+/// [`record_reason_del_dropped`] accounting.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_reason_del(
     key: &[u8],
@@ -91,6 +101,7 @@ pub(crate) fn record_reason_del(
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
 ) {
     // Task #34 review (defect 2): hoist the exact same no-work gate
     // `wal_append_and_fanout` checks internally to BEFORE `serialize_del`
@@ -110,12 +121,15 @@ pub(crate) fn record_reason_del(
         return;
     }
     let serialized = serialize_del(key);
-    // Fire-and-forget-on-loss like every other background-tick record (the
-    // client that originally SET the key is long gone; there is no response
-    // frame to fail loud through). A dropped AOF append here is already
-    // counted + `error!`-logged inside `send_append_bounded_blocking`.
-    let mut aof_budget = AOF_SPSC_BACKPRESSURE_BOUND;
-    let _ = crate::shard::spsc_handler::wal_append_and_fanout(
+    // #452.4: reason-DELs get the escalated backpressure bound — a dropped
+    // record here means restart replay RESURRECTS a key clients were told is
+    // gone (strictly worse than a lost client write, which at least matches
+    // what the client observed on a non-durable server). There is no
+    // response frame to fail loud through, so a drop past the bound is
+    // counted in [`crate::persistence::aof::AOF_REASON_DEL_DROPPED`] and
+    // latches `aof_last_append_status:err`. The bound itself is the
+    // caller's per-sweep `aof_budget` — see the doc comment above.
+    if !crate::shard::spsc_handler::wal_append_and_fanout(
         &serialized,
         db,
         wal_writer,
@@ -125,7 +139,22 @@ pub(crate) fn record_reason_del(
         shard_id,
         aof_pool,
         wal_kv_log,
-        &mut aof_budget,
+        aof_budget,
+    ) {
+        record_reason_del_dropped(key);
+    }
+}
+
+/// #452.4 fail-loud accounting for a reason-DEL that could not be enqueued
+/// for persistence within [`crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND`].
+fn record_reason_del_dropped(key: &[u8]) {
+    crate::persistence::aof::AOF_REASON_DEL_DROPPED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::persistence::aof::AOF_LAST_APPEND_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+    tracing::error!(
+        "reason-DEL LOST for key {:?}: AOF writer saturated past the escalated bound — \
+         restart replay will RESURRECT this key unless a rewrite completes first",
+        String::from_utf8_lossy(&key[..key.len().min(64)]),
     );
 }
 
@@ -233,8 +262,12 @@ fn record_bytes_conn(
         push_record_db(repl_state, shard_id, num_shards, db, bytes.clone());
     }
     if let Some(pool) = aof_pool {
-        let mut budget = AOF_SPSC_BACKPRESSURE_BOUND;
-        let _ = pool.send_append_bounded_blocking(shard_id, 0, db, bytes, &mut budget);
+        // #452.4: escalated bound + fail-loud accounting — see
+        // `record_reason_del`'s comment for the resurrection rationale.
+        let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+        if !pool.send_append_bounded_blocking(shard_id, 0, db, bytes.clone(), &mut budget) {
+            record_reason_del_dropped(&bytes);
+        }
     }
 }
 
@@ -323,6 +356,7 @@ mod tests {
         let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
         let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
 
+        let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         record_reason_del(
             b"gone",
             0,
@@ -333,6 +367,7 @@ mod tests {
             0,
             None,
             false,
+            &mut aof_budget,
         );
 
         assert!(
@@ -356,6 +391,7 @@ mod tests {
         let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
         let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
 
+        let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         record_reason_del(
             b"gone",
             0,
@@ -366,6 +402,7 @@ mod tests {
             0,
             Some(&pool),
             false,
+            &mut aof_budget,
         );
 
         match rx.try_recv() {
@@ -379,6 +416,109 @@ mod tests {
             Ok(_) => panic!("expected an AofMessage::Append record"),
             Err(e) => panic!("expected a queued AOF record, got recv error: {e:?}"),
         }
+    }
+
+    /// #452.4: a reason-DEL that cannot be enqueued within the escalated
+    /// bound must be counted in `AOF_REASON_DEL_DROPPED` and latch the
+    /// degraded status — never a silent `let _ =` loss (the pre-fix
+    /// behavior), because restart replay resurrects the key.
+    #[test]
+    fn record_reason_del_drop_is_counted_and_latches_degraded() {
+        // Capacity-1 channel, pre-filled and never drained: the send inside
+        // record_reason_del exhausts the escalated bound (the real 500ms —
+        // the bound is a const, deliberately not injectable) and reports
+        // the drop.
+        let (tx, rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(1);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+        assert!(pool.try_send_append(0, 0, 0, Bytes::from_static(b"fill")));
+
+        let repl_backlog: crate::replication::backlog::SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
+        let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
+
+        let before = crate::persistence::aof::AOF_REASON_DEL_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+        record_reason_del(
+            b"resurrect-me",
+            0,
+            &mut wal_writer,
+            &repl_backlog,
+            &mut replica_txs,
+            &None,
+            0,
+            Some(&pool),
+            false,
+            &mut aof_budget,
+        );
+        let after = crate::persistence::aof::AOF_REASON_DEL_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "dropped reason-DEL must increment AOF_REASON_DEL_DROPPED (before={before}, after={after})"
+        );
+        assert!(
+            !crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
+            "dropped reason-DEL must latch aof_last_append_status:err"
+        );
+        drop(rx);
+    }
+
+    /// #454 review P2.8: the backpressure budget is SHARED across a sweep —
+    /// once one blocked emission exhausts it, later per-key calls in the
+    /// same sweep must fail fast (drop-with-accounting) instead of each
+    /// minting a fresh bound and re-stalling the shard event loop.
+    #[test]
+    fn reason_del_budget_is_shared_across_a_sweep() {
+        let (tx, _rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(1);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+        assert!(pool.try_send_append(0, 0, 0, Bytes::from_static(b"fill")));
+
+        let repl_backlog: crate::replication::backlog::SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs: Vec<crate::shard::dispatch::ReplicaFanout> = Vec::new();
+        let mut wal_writer: Option<crate::persistence::wal_v3::segment::WalWriterV3> = None;
+
+        // Small sweep budget so the test doesn't sit through the real 500ms.
+        let mut sweep_budget = std::time::Duration::from_millis(20);
+        record_reason_del(
+            b"victim-1",
+            0,
+            &mut wal_writer,
+            &repl_backlog,
+            &mut replica_txs,
+            &None,
+            0,
+            Some(&pool),
+            false,
+            &mut sweep_budget,
+        );
+        assert_eq!(
+            sweep_budget,
+            std::time::Duration::ZERO,
+            "a fully-blocked emission must consume the whole shared budget"
+        );
+        let t0 = std::time::Instant::now();
+        record_reason_del(
+            b"victim-2",
+            0,
+            &mut wal_writer,
+            &repl_backlog,
+            &mut replica_txs,
+            &None,
+            0,
+            Some(&pool),
+            false,
+            &mut sweep_budget,
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(15),
+            "an exhausted sweep budget must fail fast, not re-block per key (took {:?})",
+            t0.elapsed()
+        );
     }
 
     /// `conn_has_work` (defect 2's connection-context gate): an AOF pool

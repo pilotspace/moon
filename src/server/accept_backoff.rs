@@ -158,7 +158,7 @@ mod tests {
         let aborted = std::io::Error::from_raw_os_error(10053); // WSAECONNABORTED
         assert!(!is_resource_exhaustion(&aborted));
         // A non-OS error (e.g. synthesized) is not classified as exhaustion.
-        let other = std::io::Error::new(std::io::ErrorKind::Other, "synthetic");
+        let other = std::io::Error::other("synthetic");
         assert!(!is_resource_exhaustion(&other));
     }
 }

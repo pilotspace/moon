@@ -110,7 +110,9 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
@@ -128,13 +130,21 @@ pub(super) fn try_handle_client_command(
                         crate::client_registry::ClientFlags {
                             subscriber: conn.subscription_count > 0,
                             in_multi: conn.in_multi,
+                            // Executing CLIENT LIST/INFO means not blocked.
                             blocked: false,
+                            replica: conn.saw_replconf,
                         },
                         crate::storage::entry::current_time_ms(),
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
-                responses.push(Frame::BulkString(Bytes::from(info)));
+                // RESP3 sends CLIENT INFO as a Verbatim string. This intercept
+                // never reaches the generic dispatch exit, so it converts here.
+                responses.push(crate::protocol::resp3::apply_shape(
+                    crate::protocol::resp3::Resp3Shape::Verbatim,
+                    Frame::BulkString(Bytes::from(info)),
+                    conn.protocol_version,
+                ));
                 return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"KILL") {
@@ -228,12 +238,20 @@ pub(super) fn try_handle_config(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    proto: u8,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CONFIG") {
         return false;
     }
-    responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
+    // This intercept short-circuits the generic dispatch exit, so it must
+    // apply the RESP3 conversion itself — otherwise `CONFIG GET` reaches the
+    // wire as a flat Array where Redis sends a Map. That omission is exactly
+    // why CONFIG was the one command the old converter could never fix.
+    let reply = handle_config(cmd_args, &ctx.runtime_config, &ctx.config);
+    responses.push(crate::server::conn::util::apply_resp3_conversion(
+        cmd, cmd_args, reply, proto,
+    ));
     true
 }
 
@@ -651,6 +669,8 @@ pub(super) async fn try_handle_swapdb(
         &ctx.shard_databases,
         &ctx.dispatch_tx,
         &ctx.spsc_notifiers,
+        ctx.aof_pool.as_ref(),
+        &ctx.repl_state,
     )
     .await;
     responses.push(response);
@@ -779,8 +799,12 @@ pub(super) fn try_enforce_readonly(
 #[inline]
 pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
     if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
-        // Distinguish the stall source for operator clarity.
-        let msg: &'static [u8] = if crate::shard::disk_monitor::is_write_paused() {
+        // Distinguish the stall source for operator clarity. dir-lost first:
+        // it also sets `is_write_paused`, and "diskfull" would send the
+        // operator hunting free space instead of the missing data dir (#366).
+        let msg: &'static [u8] = if crate::shard::disk_monitor::is_dir_lost() {
+            b"MOONERR dirmissing: data directory was removed; writes refused until it is restored"
+        } else if crate::shard::disk_monitor::is_write_paused() {
             b"MOONERR diskfull: writes paused until free space recovers"
         } else if crate::shard::mem_monitor::is_write_paused() {
             b"MOONERR memfull: writes paused until memory pressure recovers"

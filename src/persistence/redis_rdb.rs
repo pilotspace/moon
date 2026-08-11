@@ -275,10 +275,10 @@ fn write_rdb_footer(buf: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Write a single entry in Redis RDB format.
-fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
+fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
     // TTL (if present)
     if entry.has_expiry() {
-        let ms = entry.expires_at_ms(base_ts);
+        let ms = entry.expires_at_ms();
         buf.push(RDB_OPCODE_EXPIRETIME_MS);
         buf.extend_from_slice(&ms.to_le_bytes());
     }
@@ -549,13 +549,12 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
     let now_ms = current_time_ms();
 
     for (db_idx, db) in databases.iter().enumerate() {
-        let base_ts = db.base_timestamp();
         let data = db.data();
 
         // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
+            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
             .collect();
 
         if live.is_empty() {
@@ -575,7 +574,7 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
         write_length(buf, expires_count as u64);
 
         for (key, entry) in &live {
-            write_rdb_entry(buf, key.as_bytes(), entry, base_ts);
+            write_rdb_entry(buf, key.as_bytes(), entry);
         }
     }
 }
@@ -984,7 +983,7 @@ fn read_rdb_entry(
 
     // Apply expiry if present
     if let Some(ms) = expiry_ms {
-        entry.set_expires_at_ms(0, ms);
+        entry.set_expires_at_ms(ms);
     }
 
     Ok(entry)
@@ -1252,11 +1251,10 @@ mod tests {
     #[test]
     fn test_write_rdb_string_with_ttl() {
         let mut db = Database::new();
-        let base_ts = db.base_timestamp();
         let expire_ms = current_time_ms() + 60_000;
         db.set(
             Bytes::from_static(b"expkey"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), expire_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), expire_ms),
         );
         let databases = vec![db];
         let mut buf = Vec::new();
@@ -1361,11 +1359,10 @@ mod tests {
     #[test]
     fn test_roundtrip_string_with_ttl() {
         let mut db = Database::new();
-        let base_ts = db.base_timestamp();
         let expire_ms = current_time_ms() + 600_000; // 10 min in future
         db.set(
             Bytes::from_static(b"ek"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"ev"), expire_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"ev"), expire_ms),
         );
         let databases = vec![db];
         let mut buf = Vec::new();
@@ -1379,7 +1376,7 @@ mod tests {
         let entry = data.get(b"ek".as_ref()).expect("key ek not found");
         assert!(entry.has_expiry());
         // TTL should be approximately the same (within 1 second tolerance)
-        let loaded_ms = entry.expires_at_ms(0);
+        let loaded_ms = entry.expires_at_ms();
         let diff = (loaded_ms as i64 - expire_ms as i64).unsigned_abs();
         assert!(
             diff < 1000,
@@ -1519,7 +1516,6 @@ mod tests {
     #[test]
     fn test_roundtrip_all_types() {
         let mut db = Database::new();
-        let base_ts = db.base_timestamp();
 
         // String
         db.set(
@@ -1531,7 +1527,7 @@ mod tests {
         let expire_ms = current_time_ms() + 300_000;
         db.set(
             Bytes::from_static(b"str_ttl"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"world"), expire_ms, base_ts),
+            Entry::new_string_with_expiry(Bytes::from_static(b"world"), expire_ms),
         );
 
         // Hash
@@ -1711,7 +1707,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        write_rdb_entry(&mut buf, b"mystream", &entry, 0);
+        write_rdb_entry(&mut buf, b"mystream", &entry);
         assert_eq!(
             buf[0], RDB_TYPE_STREAM_MOON,
             "no TTL set, first byte is the type tag"
@@ -1771,7 +1767,7 @@ mod tests {
             *rv = RedisValue::Stream(Box::new(stream));
         }
         let mut full = Vec::new();
-        write_rdb_entry(&mut full, b"k", &entry, 0);
+        write_rdb_entry(&mut full, b"k", &entry);
 
         for cut in 1..full.len() {
             let mut cursor = Cursor::new(&full[1..cut.max(1)]);

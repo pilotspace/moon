@@ -76,24 +76,20 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
     }
 
     // Clone snapshot: lock each db individually with read lock
-    // Include base_timestamp for TTL delta resolution during serialization
-    let snapshot: Vec<(
+    let snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> = db
+    > = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            let base_ts = guard.base_timestamp();
-            let entries = guard
+            guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            (entries, base_ts)
+                .collect()
         })
         .collect();
 
@@ -260,7 +256,7 @@ pub fn bgrewriteaof_start(pool: &AofWriterPool, db: SharedDatabases) -> Frame {
             b"ERR Background AOF rewrite already in progress",
         ));
     }
-    match pool.try_send_rewrite(AofMessage::Rewrite(db)) {
+    match pool.try_send_rewrite(AofMessage::Rewrite(db, pool.overflow_for(0).clone())) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),
@@ -328,7 +324,10 @@ pub fn bgrewriteaof_start_sharded(
         }
     }
 
-    match pool.try_send_rewrite(AofMessage::RewriteSharded(shard_databases)) {
+    match pool.try_send_rewrite(AofMessage::RewriteSharded(
+        shard_databases,
+        pool.overflow_for(0).clone(),
+    )) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),
@@ -353,23 +352,20 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
     }
 
     // Clone snapshot: lock each db individually with read lock (same pattern as bgsave_start)
-    let snapshot: Vec<(
+    let snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
-        u32,
-    )> = db
+    > = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            let base_ts = guard.base_timestamp();
-            let entries = guard
+            guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            (entries, base_ts)
+                .collect()
         })
         .collect();
 

@@ -475,6 +475,14 @@ pub fn mq_isolated(cfg: &Config) {
     let marker = "XPLANE-MQ-MARKER".to_string();
     mq_push(&mut c, ordersq, "final", &marker);
     harness::wait_for_wal_v3_bytes_any_shard(&dir, cfg.shards, marker.as_bytes());
+    // The marker proves ORDERSQ's shard flushed its WAL stream — it says
+    // nothing about the shard that owns the DLQ queue: per-shard WAL streams
+    // flush independently on each shard's own 1ms tick, and under CPU
+    // starvation (full-suite parallelism) that tick can slip past this kill.
+    // Sync on the DLQ queue's own bytes before crashing, or this cell
+    // measures cross-shard flush-timing luck instead of DLQ durability
+    // (observed: dlqtestq absent from EVERY WAL at kill time, 2/12 runs).
+    harness::wait_for_wal_v3_bytes_any_shard(&dir, cfg.shards, dlqtestq.as_bytes());
     harness::crash(guard, port);
 
     let (guard2, port2) = harness::spawn_moon_on(&dir, cfg, &[]);

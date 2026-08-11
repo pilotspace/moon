@@ -99,6 +99,20 @@ pub fn parse_tracking_args(args: &[Frame]) -> Result<TrackingConfig, Frame> {
         )));
     }
 
+    // `BCAST` with no `PREFIX` means "invalidate me for EVERY key" in Redis.
+    // The handlers register broadcast interest with
+    // `TrackingTable::register_prefix` inside `for prefix in &prefixes`, so a
+    // prefix-less BCAST client used to register nothing and then never
+    // received an invalidation — at any shard count, and regardless of what it
+    // read (BCAST does not depend on reads at all). `TrackingTable` matches
+    // with `key.starts_with(prefix)`, for which the empty prefix is exactly
+    // "all keys". Normalising here fixes all three handlers at once
+    // (monoio/dispatch.rs, handler_single.rs, handler_sharded/dispatch.rs)
+    // and keeps the semantics in one place.
+    if bcast && prefixes.is_empty() {
+        prefixes.push(Bytes::new());
+    }
+
     Ok(TrackingConfig {
         enable,
         bcast,

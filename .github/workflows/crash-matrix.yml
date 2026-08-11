@@ -1,0 +1,189 @@
+name: Crash Matrix (Cross-Plane)
+
+# Nightly kill-9 durability tripwire for tests/crash_matrix_cross_plane.rs
+# (kernel M3/G1: KV/graph/vector/WS/MQ/cross-store-TXN durability across
+# appendonly x disk-offload x shards -- 46 test fns covering the brief's
+# curated 42-cell matrix plus a few follow-on regression cells). Every
+# server-spawning cell needs a release binary and real wall-clock time
+# (spawn -> write -> sync -> SIGKILL -> restart -> verify), so this does
+# NOT run per-PR -- the self-hosted `moon-dev` runner is a single machine
+# and PR-time is already tight (see the `check` job in ci.yml). Nightly
+# gives same-day regression signal without contending with the PR gate.
+#
+# As of 2026-07-16 (main @ ec084556) all 46 cells are GREEN by default --
+# `harness::red_guard` (the suite's RED-cell gate) has no remaining call
+# sites; the former RED cells (legacy-mode graph WAL replay, task #60 /
+# PR #322; MQ generic-DEL resurrection, task #46 / PR #301) were both
+# root-caused and un-gated. If a future change reintroduces a gated RED
+# cell, add `MOON_CRASH_MATRIX_RED: "1"` to the relevant job's `env` so
+# this workflow still exercises it (the default `--ignored` run is
+# green-only, per the suite's own module doc).
+#
+# Two schedules:
+#   - nightly (03:17 UTC): the full matrix, MOON_CRASH_MATRIX_ITERS=1 (the
+#     default single-iteration pass -- ~80s of test time on the moon-dev
+#     VM, 2026-07-16 measurement).
+#   - weekly soak (Saturday 04:41 UTC): MOON_CRASH_MATRIX_ITERS=20 on just
+#     the probabilistic-kill-point cells (`mid_checkpoint`,
+#     `graph_drop_survives`, `txn_isolated_*` -- the ones kernel M3 stage 2
+#     (task #53) proved need repeated sampling to catch a timing-window
+#     bug: the pre-fix baseline only failed at iteration 7-11 of 20). A
+#     single-iteration nightly run is NOT proof any specific timing window
+#     was hit -- see the suite's own "Honesty note on kill_mid_checkpoint".
+#
+# workflow_dispatch lets either mode run on demand (e.g. to re-verify a
+# fix before the next scheduled window).
+on:
+  schedule:
+    - cron: '17 3 * * *'   # nightly: full matrix
+    - cron: '41 4 * * 6'   # weekly soak (Saturday), offset off the hour
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which job to run on manual dispatch'
+        required: false
+        default: 'nightly'
+        type: choice
+        options:
+          - nightly
+          - soak
+      soak_iters:
+        description: 'MOON_CRASH_MATRIX_ITERS for a manual soak run (soak mode only)'
+        required: false
+        default: '20'
+
+concurrency:
+  group: crash-matrix-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a mid-flight kill-9 cycle
+
+env:
+  CARGO_TERM_COLOR: always
+  MOON_NO_URING: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  nightly:
+    name: Crash Matrix (nightly, full matrix)
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/crash-matrix
+      # Spawned test servers must not trip the diskfull write-pause guard
+      # on the VM's shared-volume mounts (same rationale as the `check` job).
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Build release binary + test binary
+        run: cargo build --release --test crash_matrix_cross_plane
+      - name: Run full crash matrix (green-only default, --test-threads=1)
+        # --test-threads=1: every scenario spawns a real server process;
+        # concurrent scenarios multiply port/tmpdir/VM-resource pressure
+        # for no benefit (I/O- and wall-clock-bound, not CPU-bound).
+        run: |
+          cargo test --release --test crash_matrix_cross_plane -- --ignored --test-threads=1 \
+            2>&1 | tee crash-matrix-nightly.log
+      - name: Collect spawned-server logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/crash-matrix-artifacts
+          cp crash-matrix-nightly.log /tmp/crash-matrix-artifacts/ || true
+          find /tmp -maxdepth 1 -name 'moon-xplane-*' -newer crash-matrix-nightly.log \
+            -exec cp -r {} /tmp/crash-matrix-artifacts/ \; 2>/dev/null || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-matrix-nightly-failure-${{ github.run_id }}
+          path: /tmp/crash-matrix-artifacts
+          retention-days: 14
+
+  # ── Recall canaries (nightly) ────────────────────────────────────────
+  # The heavy vector recall-quality benchmarks (`test(/recall/)` across
+  # src/vector/hnsw/{search_sq,parallel_build}.rs unit tests and
+  # tests/vector_recall_benchmark.rs) are #[ignore]d in the per-PR gate:
+  # at the unoptimized test profile they run 1.5-8 MINUTES each (2026-07-16
+  # measurement: the recall family was ~half the whole suite's CPU, and the
+  # two biggest cases were the only tests that flaked when the runner VM
+  # shared a loaded host). They are statistical quality canaries, not
+  # correctness gates — a fast smoke variant (1k/128d) still runs per-PR.
+  # This job runs the FULL family nightly, release-profile (realistic
+  # kernels, ~10x faster than the debug test profile), sharing the nightly
+  # cron with the crash matrix. Runs after it thanks to the shared
+  # single-machine runner queue; order does not matter.
+  recall-canaries:
+    name: Recall canaries (nightly)
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/crash-matrix
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@nextest
+      - name: Run all recall benchmarks (ignored + not) at release profile
+        # --run-ignored all: the per-PR smoke variants AND the #[ignore]d
+        # heavy ones — one nightly answer for the whole recall surface.
+        # Release profile: recall math at realistic speed; the assertions
+        # are profile-independent.
+        # --lib + --test vector_recall_benchmark: the recall family lives in
+        # exactly these two binaries — don't build the other ~40 integration
+        # test binaries at release profile for nothing.
+        run: |
+          cargo nextest run --cargo-profile release --profile ci \
+            --lib --test vector_recall_benchmark \
+            --run-ignored all -E 'test(/recall/)' \
+            2>&1 | tee recall-canaries.log
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-canaries-failure-${{ github.run_id }}
+          path: recall-canaries.log
+          retention-days: 14
+
+  soak:
+    name: Crash Matrix (weekly soak, probabilistic cells)
+    if: github.event.schedule == '41 4 * * 6' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'soak')
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/crash-matrix
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+      MOON_CRASH_MATRIX_ITERS: ${{ github.event_name == 'workflow_dispatch' && inputs.soak_iters || '20' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Build release binary + test binary
+        run: cargo build --release --test crash_matrix_cross_plane
+      - name: Soak the probabilistic-kill-point cells
+        # Filter args are OR'd substrings (libtest): mid_checkpoint (2
+        # cells) + graph_drop_survives (2 cells) + txn (6 cells,
+        # isolated_committed/isolated_atomicity x {prod_s1,prod_s4,legacy_yes_s1})
+        # = 10 cells, each repeated MOON_CRASH_MATRIX_ITERS times.
+        run: |
+          cargo test --release --test crash_matrix_cross_plane -- --ignored --test-threads=1 \
+            mid_checkpoint graph_drop_survives txn \
+            2>&1 | tee crash-matrix-soak.log
+      - name: Collect spawned-server logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/crash-matrix-artifacts
+          cp crash-matrix-soak.log /tmp/crash-matrix-artifacts/ || true
+          find /tmp -maxdepth 1 -name 'moon-xplane-*' -newer crash-matrix-soak.log \
+            -exec cp -r {} /tmp/crash-matrix-artifacts/ \; 2>/dev/null || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-matrix-soak-failure-${{ github.run_id }}
+          path: /tmp/crash-matrix-artifacts
+          retention-days: 14

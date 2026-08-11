@@ -102,10 +102,10 @@ fn wait_for_ready(child: &mut std::process::Child, port: u16, deadline: Duration
             s.set_write_timeout(Some(Duration::from_millis(500))).ok();
             if s.write_all(b"PING\r\n").is_ok() {
                 let mut buf = [0u8; 16];
-                if let Ok(n) = s.read(&mut buf) {
-                    if buf[..n].windows(4).any(|w| w == b"PONG") {
-                        return Readiness::Ready;
-                    }
+                if let Ok(n) = s.read(&mut buf)
+                    && buf[..n].windows(4).any(|w| w == b"PONG")
+                {
+                    return Readiness::Ready;
                 }
             }
         }

@@ -149,10 +149,10 @@ fn wait_ready(port: u16) {
             stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
             let mut c = Conn { s: stream };
-            if let Ok(reply) = c.cmd(&["PING"]) {
-                if reply.contains("PONG") {
-                    return;
-                }
+            if let Ok(reply) = c.cmd(&["PING"])
+                && reply.contains("PONG")
+            {
+                return;
             }
         }
         assert!(

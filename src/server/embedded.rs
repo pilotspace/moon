@@ -134,6 +134,13 @@ pub async fn run_embedded(
         num_shards, config.bind, config.port
     );
 
+    // O5: record the non-shard core set for this process before any
+    // auxiliary thread spawns below (AOF writer, and — indirectly — the
+    // manifest-sync/spill/wal-sync threads each shard spawns internally).
+    // Unlike main.rs, the CALLING thread here belongs to the embedding
+    // application, not to us — it is deliberately left untouched.
+    crate::shard::numa::init_aux_pinning(num_shards);
+
     // One-time global init that the production binary normally performs.
     crate::admin::metrics_setup::init_global_slowlog(
         config.slowlog_max_len,
@@ -165,6 +172,9 @@ pub async fn run_embedded(
         let handle = std::thread::Builder::new()
             .name("embedded-moon-aof".to_string())
             .spawn(move || {
+                // O5: escape the shard-core mask this thread would otherwise
+                // inherit from its spawning thread.
+                crate::shard::numa::pin_current_aux_thread("embedded-moon-aof");
                 RuntimeFactoryImpl::block_on_local(
                     "embedded-moon-aof".to_string(),
                     aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None),
