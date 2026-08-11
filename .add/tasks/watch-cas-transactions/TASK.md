@@ -229,7 +229,7 @@ EXEC  (with watches held)        -> Null                    # any watched versio
 Internal shape (the anchor that must change):
   execute_transaction_sharded(shard_databases, shard_id, command_queue, selected_db,
                               proto, cached_clock, exec_publishes, exec_flushes,
-+                             watched_keys: &HashMap<Bytes, u32>)
++                             watched_keys: &HashMap<Bytes, WatchToken>)   # v2, was u32
       -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>)
   Returns (Frame::Null, vec![], vec![]) when any watched version differs — checked BEFORE the
   first body command runs, under the same shard slice lock the body commits under.
@@ -238,7 +238,45 @@ Schema: no storage change. Reads Database::get_version(key) per watched key; ver
 maintained by Database::set(). Watched-key state stays on ConnectionState.watched_keys.
 ```
 
-Status: FROZEN @ v1 — approved by Tin Dang, 2026-08-11.
+Status: FROZEN @ v2 — approved by Tin Dang, 2026-08-11.
+
+### Amendments v1 -> v2 (raised by the build tripwire, not by the author)
+
+`add.py check` flagged `build_tampered` after the build: §3 as frozen at v1 and the shipped code had
+diverged in two places. Recorded here rather than reconciled silently — a frozen contract edited to
+match a build is the one move this method forbids, so both are stated with what actually shipped.
+
+1. **ABA mechanism: per-database DELETE counter -> per-database CREATION ticket.**
+   v1's freeze resolution said "the cheap fix is a per-database monotonic delete counter consulted
+   alongside the entry version". That design is unsound for this codebase and was rejected during
+   build: **expiry is a delete**, so any keyspace with TTLs would bump the epoch continuously and
+   abort essentially every WATCH transaction — a correctness fix that makes CAS unusable on exactly
+   the session/cache workloads that need it. Shipped instead: `Database::birth_counter`, a
+   per-database creation ticket stamped into the entry's existing version field, so a recreated key
+   is observably a different incarnation. Same guarantee, no TTL interaction, no new storage.
+   The residual (24-bit wrap, ~1 in 16.7M vs the pre-fix certainty of 1.0) is measured in §7. The
+   numbers were put in front of the human mid-build, before the mechanism was written.
+
+2. **Token type: `&HashMap<Bytes, u32>` -> `&HashMap<Bytes, WatchToken>`.**
+   A newtype over the same `u32`. The wire contract above is byte-for-byte unaffected. It exists so
+   the residual wrap in (1) has one obvious place to be retired later — a real incarnation field —
+   without churning every call site that threads the map through the owner hop.
+
+Unchanged and fully honored: every wire line in the fenced block above, the CROSSSLOT rule, and the
+"watched_keys is empty on EVERY outcome" post-condition.
+
+Least-sure flag surfaced at freeze: [contract/spec] the v2 ABA mechanism leaves a MEASURED residue
+rather than eliminating one. The creation ticket shares the entry's 24-bit version field, so it
+wraps every 16,777,216 creations — ~18.3s of saturated single-database insert at the measured
+914,634 SET/s. A miss needs that wrap to land inside one client's open WATCH..EXEC window AND hit
+the one watched key: ~1 in 16.7M, against v1's pre-fix certainty of 1.0. This is the least certain
+part of the contract because it is the one place the guarantee is probabilistic instead of total,
+and because only a wider `Entry` (an incarnation field) retires it — a change the codebase's
+CompactKey/CompactValue size discipline argues against for a 6e-8 residual. If this is judged
+unacceptable later it is a change request back to SPECIFY, not a patch: it changes `Entry`'s size.
+Second, smaller: [contract] cross-shard watches answer CROSSSLOT, which a client cannot predict
+because Moon's shard map is invisible to it — consistent with the MULTI body rule already shipped,
+unaffected at `--shards 1`, and mitigated by hash tags, but it must be documented, not discovered.
 
 Changing anything above this line from here on is a change request back to SPECIFY, not an edit.
 The frozen shape neighbours depend on: `execute_transaction_sharded` gains `watched_keys` and
@@ -359,19 +397,44 @@ non-transaction hot path (the watch check must be skipped entirely when `watched
 - [ ] a person reviewed and approved the change
 
 ### Build expectations — what "correct" looks like
-- [ ] The §0 two-connection probe, replayed against the built binary, reports `EXEC -> Null` and
-      `GET k -> from-B` — the exact inverse of the measured pre-fix result — confirmed by rerunning
-      `tmp/probe_watch.py`.
-- [ ] `WATCH`/`UNWATCH` reply `+OK` on RESP shards=1, RESP shards=4, and the inline path —
-      confirmed by `tmp/probe_watch2.py`, all four rows.
-- [ ] `ACL CAT transaction` still lists watch/unwatch, and both are now dispatchable — confirmed by
-      `tmp/probe_watch3.py`.
-- [ ] Non-transaction throughput unchanged — confirmed by the empty-`watched_keys` early-out being
-      the first statement of the check, plus an interleaved A/B if any bench cell moves.
+- [x] The §0 two-connection probe, replayed against the built binary, reports `EXEC -> Null` and
+      `GET k -> from-B` — the exact inverse of the measured pre-fix result. `tmp/probe_watch.py`
+      @151a1857: `A EXEC -> $-1`, `final GET k -> from-B`. VERDICT: CAS honored.
+- [x] `WATCH`/`UNWATCH` reply `+OK` on RESP shards=1, RESP shards=4, and the inline path —
+      `tmp/probe_watch2.py` @shards=4: `WATCH k`, `UNWATCH`, `WATCH a b`, `inline WATCH k` all `+OK`.
+- [x] `ACL CAT transaction` still lists watch/unwatch, and both are now dispatchable —
+      `tmp/probe_watch3.py`: 7 entries incl. `watch`, `unwatch`. (`COMMAND INFO/COUNT` still reply
+      `*0` — the §0 out-of-scope defect, unchanged, owned by `info-observability`.)
+- [x] Non-transaction throughput unchanged — interleaved A/B on moon-dev (aarch64 Linux), fat-LTO
+      release both legs, 6 alternating rounds, 1M req `-c 50 -P 16` after a 200k warm:
+
+      | leg | before (median) | after (median) | delta |
+      |---|---|---|---|
+      | SET (under test) | 1,648,994/s | 1,626,743/s | -1.35% |
+      | GET (control, untouched by the change) | 3,311,404/s | 3,273,401/s | -1.15% |
+
+      Worst within-leg CV 7.7%; best 3.1%. The untouched control moved essentially as much as the
+      leg under test (0.2pp apart), so both deltas are drift, not signal. A first pass at `-P 1`
+      was DISCARDED as uninformative: 13.9% noise floor with the control moving MORE (-3.9%) than
+      SET (-0.8%) — recorded because "we benched it" is worthless without the noise floor beside it.
 - [ ] The full matrix is green via `gh workflow run CI --ref <branch>` BEFORE merge, per the
       standing merge bar — Windows/macOS/console are skipped on PRs.
 
----
+### Durability (kill-9) leg
+Run against the fat-LTO `target/release/moon`: **22 passed, 1 failed**. The failure,
+`durability::backup_restore::tests::backup_restore_parity`, is PRE-EXISTING ROT, not a regression —
+three independent proofs: (a) BGSAVE reports `rdb_last_bgsave_status:ok` and writes
+`shard-0/shard-0.rrdshard`; (b) `dump.rdb`, the path the test asserts, is never written by the
+snapshot writer — it survives only as the `--dbfilename` default and a data-dir marker string;
+(c) this commit touches no persistence/rdb/snapshot file at all. The test last changed in
+`24ee60eb` (v0.1.3, #65), predating the per-shard snapshot layout.
+
+Two defects found in that suite, both OUT OF SCOPE here, both filed rather than fixed inline:
+1. `tests/durability/*` hardcode `Command::new("./target/release/moon")`, ignoring `MOON_BIN` — the
+   suite silently tests whatever binary is lying at that path (the local one was 3 days stale, which
+   produced 7 bogus "connection refused" failures before the binary was rebuilt).
+2. `backup_restore_parity` asserts a filename the server no longer produces. Both are `#[ignore]`d,
+   so CI never runs them — which is exactly how a durability gate rots into proving nothing.
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 

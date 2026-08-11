@@ -282,26 +282,20 @@
         "client-compat-harness"
       ],
       "created": "2026-08-09T16:42:29+00:00",
-      "updated": "2026-08-11T06:00:56+00:00",
+      "updated": "2026-08-11T12:31:35+00:00",
       "tripwire": {
-        "contract_md5": "bfaa3121f30e4d1ba469666929a4242a",
+        "contract_md5": "6f2cd3da5562c2cc4bd2fcf12c373405",
         "tests": {}
       },
       "scope": {
         "declared": [
           "src/server/conn/shared.rs",
-          "src/server/conn/handler_monoio/",
-          "src/server/conn/handler_sharded/",
-          "src/shard/spsc_handler.rs",
-          "src/storage/db/kv_ops.rs",
-          "src/command/metadata.rs",
-          "tests/watch_cas_transactions.rs",
-          "scripts/test-consistency.sh",
-          "scripts/test-commands.sh",
-          "scripts/CHANGELOG.md"
+          "src/server/conn/watch.rs",
+          "src/server/conn/core.rs"
         ],
-        "snapshot_md5": "9a4aa716ec248c9c79a260c126dee978"
-      }
+        "snapshot_md5": "fe6a109ebabb70ce61c2310ddd28f5e2"
+      },
+      "flag_verified": true
     },
     "protocol-error-lifetime": {
       "title": "Protocol errors reply and close cleanly, never stall or eat the valid prefix",
@@ -429,7 +423,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-11T06:00:56+00:00",
+  "updated": "2026-08-11T12:31:35+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
