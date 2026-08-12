@@ -380,9 +380,13 @@ mod tests {
     #[test]
     fn test_parse_error_invalid_display() {
         let err = ParseError::Invalid {
+            kind: ProtoFault::BulkLen,
             message: "bad".into(),
             offset: 5,
         };
+        // Display still renders the DETAILED internal message, not the wire
+        // text — the two are deliberately different, and this assertion is
+        // what pins that. `kind` travels alongside for the client's benefit.
         assert_eq!(format!("{}", err), "invalid frame at byte 5: bad");
     }
 

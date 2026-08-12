@@ -33,14 +33,20 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
     let mut pos = 0;
     match validate_frame(&buf[..], &mut pos, config, 0) {
         Ok(()) => {
-            // A top-level null multibulk (`*-1`, `*-9`, any negative count) is
+            // A top-level multibulk with a count BELOW -1 (`*-9`) is
             // well-formed but carries no command. Redis consumes it and says
             // nothing at all. Consume the bytes — so the caller does not spin
             // on them forever — and report "no frame here", which is exactly
             // what `Ok(None)` means to the read loops.
+            //
+            // `*-1` is EXCLUDED: it is the canonical null array and must keep
+            // yielding `Frame::Null`, because `parse()` also parses replies
+            // (replication), not just requests. Folding it in here broke
+            // `test_parse_null_array`.
             let is_null_multibulk = buf[0] == b'*'
-                && buf.len() > 1
+                && buf.len() > 3
                 && buf[1] == b'-'
+                && !(buf[2] == b'1' && buf[3] == b'\r')
                 && matches!(find_crlf(&buf[..], 1), Some(c) if c == pos - 2);
             if is_null_multibulk {
                 buf.advance(pos);
@@ -463,14 +469,27 @@ fn validate_frame(
         b'*' | b'~' | b'>' => {
             // Array, Set, Push: count + elements
             let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
-            // ANY negative count is a null array, not just -1. Measured
-            // against redis-server 8.6.1: `*-9\r\n` is consumed silently and
-            // the connection keeps serving. Moon used to reject everything
-            // below -1, which turned a harmless (if odd) frame into a
-            // connection kill — the single most surprising divergence in the
-            // whole protocol ground sweep.
-            if count < 0 {
+            if count == -1 {
                 return Ok(());
+            } // Null array
+            if count < 0 {
+                // Below -1 is lenient for `*` ONLY. Measured against
+                // redis-server 8.6.1: `*-9\r\n` is consumed silently and the
+                // connection keeps serving, where Moon used to kill it.
+                //
+                // Scoped to `*` deliberately: RESP3 Set (`~`) and Push (`>`)
+                // have no such Redis behaviour to match, and blanket leniency
+                // silently stopped rejecting `~-2` — caught by
+                // `test_resp3_negative_set_count`, which is why that test
+                // exists.
+                if type_byte == b'*' {
+                    return Ok(());
+                }
+                return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
+                    message: format!("invalid array/set/push length: {}", count),
+                    offset: *pos,
+                });
             }
             let count = count as usize;
             if count > config.max_array_length {

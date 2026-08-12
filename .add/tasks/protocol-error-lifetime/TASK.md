@@ -229,6 +229,15 @@ reached only when the connection is already terminating.
 ```
 
 Status: FROZEN @ v1 — approved by Tin Dang (2026-08-12)
+
+Least-sure flag surfaced at freeze:
+- [contract] The `@bogus` stall's CAUSE was unknown at freeze — the contract prescribes "must not
+  stall" without naming the mechanism. Why it might be wrong: a stall whose cause is a shared
+  buffer-state bug would not be fixed by the read-loop change alone. Cost if wrong: pe6 stays red
+  and the fix needs a second, unscoped change.
+  OUTCOME: the read-loop change fixed it; pe6 green on both runtimes.
+- [spec] Answering the valid prefix BEFORE closing acknowledges writes into a socket nobody may
+  read. Redis has the same property, so parity was the tie-breaker.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract

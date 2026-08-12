@@ -246,6 +246,19 @@ Null-type fix: the zero-timeout path of the blocking family returns `Frame::Arra
 ```
 
 Status: FROZEN @ v1 — approved by Tin Dang (2026-08-12)
+
+Least-sure flag surfaced at freeze:
+- [contract] That every command Moon dispatches is present in COMMAND_META with a correct arity.
+  Why it might be wrong: Moon has THREE dispatch paths, and a command reachable through one but
+  absent from the table would be REJECTED inside MULTI while still working outside it — a
+  regression strictly worse than the bug. Cost if wrong: a working command becomes unusable in
+  transactions.
+  OUTCOME: **this flag was correct.** COMMAND_META (263 entries) omits TS.*, JSON.*, TXN, FT and
+  bare GRAPH. Nothing broke only because TXN is intercepted above the queue gate, FT.* is rejected
+  above it, and TS./JSON. do not exist — four accidents, not a safety argument. Resolved with a
+  dotted-name carve-out in `queue_time_rejection`, pinned by me10b.
+- [scenario] me7 (BLPOP null TYPE) turned out to be unfixable in scope: `Frame` has no null-array
+  variant, so RESP2 `*-1` is inexpressible anywhere in Moon. Filed; test #[ignore]d with its reason.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
