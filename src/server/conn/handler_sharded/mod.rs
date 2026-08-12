@@ -390,6 +390,7 @@ pub(crate) async fn handle_connection_sharded_inner<
     let client_live = crate::client_registry::register(
         client_id,
         peer_addr.clone(),
+        ctx.local_addr_string(),
         conn.current_user.clone(),
         ctx.shard_id,
         kill_fd,
@@ -616,6 +617,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     client_id,
                                     &ctx.acl_table,
                                     &mut conn.authenticated,
+                                    crate::command::identity::hello_role_and_mode(
+                                        ctx.repl_state.as_ref(),
+                                        ctx.cluster_state.is_some(),
+                                    ),
                                 );
                                 if !matches!(&response, Frame::Error(_)) {
                                     conn.protocol_version = new_proto;
@@ -722,6 +727,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if cmd.eq_ignore_ascii_case(b"HELLO") {
                         let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                             cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
+                            crate::command::identity::hello_role_and_mode(
+                                ctx.repl_state.as_ref(),
+                                ctx.cluster_state.is_some(),
+                            ),
                         );
                         if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
                         if let Some(name) = new_name { conn.client_name = Some(name); }
@@ -738,6 +747,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                         responses.push(response);
+                        continue;
+                    }
+
+                    // --- RESET ---
+                    // Above the ACL gate for the same reason HELLO is: the
+                    // registry marks RESET NO_AUTH|LOADING|STALE, and returning
+                    // to default (unauthenticated) state must not itself
+                    // require authentication. Also above the MULTI queueing
+                    // step — measured on redis-server 8.6.1, RESET inside MULTI
+                    // executes immediately and discards the transaction.
+                    //
+                    // Shared with handler_monoio: a per-handler copy of this is
+                    // how RESET came to exist ONLY inside this handler's
+                    // subscribe-mode loop and nowhere else.
+                    if crate::server::conn::shared::try_handle_reset(
+                        cmd,
+                        cmd_args,
+                        client_id,
+                        &mut conn,
+                        &ctx.requirepass,
+                        &ctx.tracking_table,
+                        &*ctx.pubsub_registry,
+                        &mut responses,
+                        None,
+                    ) {
                         continue;
                     }
 

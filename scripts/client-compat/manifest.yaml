@@ -228,25 +228,45 @@ entries:
 
   # ── Identity & introspection (review findings, wire-confirmed) ────────
 
+  # Waivers removed with client-identity-introspection: COMMAND COUNT answered
+  # an empty Array *0 (ignoring the subcommand and falling through to the bare
+  # COMMAND stub) and ROLE was -ERR unknown command. Both are live comparisons
+  # now. `type_only` is the right policy for the pair: the COUNT values are
+  # SUPPOSED to differ (Moon implements a different number of commands than
+  # Redis), and ROLE's offset moves — what must match is the reply TYPE, which
+  # is what clients dispatch on.
   - name: identity_command_count
     command: "COMMAND COUNT"
     policy: type_only
-    expect_diff:
-      reason: >-
-        Redis answers Integer :274; Moon answers an empty Array *0 — it ignores
-        the COUNT subcommand and falls through to the bare COMMAND stub. A
-        client using COMMAND COUNT to size its command table reads zero.
-        Owner: client-identity-introspection.
 
   - name: identity_role
     command: "ROLE"
     policy: type_only
+
+  - name: identity_command_info_known_and_unknown
+    command: "COMMAND INFO GET nosuchcmd"
+    policy: type_only
     expect_diff:
       reason: >-
-        Redis answers *3[master, offset, replicas]; Moon answers
-        -ERR unknown command 'ROLE'. Sentinel-aware and failover-aware clients
-        call ROLE during topology discovery.
-        Owner: client-identity-introspection.
+        The 10-field spec SHAPE now matches (that was the fix), and the unknown
+        name correctly yields a Null element. Three inner divergences remain,
+        all pre-existing data/typing gaps rather than introspection bugs:
+        (1) acl_categories is thin — Redis reports @read @string @fast for GET,
+        Moon's registry carries only @string;
+        (2) key_specs is empty — Redis emits one spec for GET, Moon emits *0;
+        (3) under RESP3 Redis types flags and acl_categories as Sets (~) and
+        key_specs entries as Maps (%), while Moon emits Arrays (*).
+        A client dispatching on the reply shape is served; one reading
+        acl_categories to build a permission model is not.
+        Owner: (1)+(2) sdk-wire-form-fixes, (3) resp3-type-fidelity.
+
+  - name: identity_command_getkeys
+    command: "COMMAND GETKEYS MSET k1 v1 k2 v2"
+    policy: exact
+
+  - name: identity_reset
+    command: "RESET"
+    policy: exact
 
   # ── Error-code parity (compared on the code, never the message) ───────
 

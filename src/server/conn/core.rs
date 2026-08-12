@@ -301,6 +301,26 @@ pub(crate) struct ConnectionState {
     pub cached_metrics: crate::admin::metrics_setup::CachedMetricsHandles,
 }
 
+impl ConnectionContext {
+    /// The server-side address clients on this listener connected to, for
+    /// `CLIENT INFO`/`CLIENT LIST`'s `laddr` field.
+    ///
+    /// Derived from the configured bind + port rather than the socket's real
+    /// `local_addr()`: the monoio handler's stream is a generic `S` with no
+    /// such method, and reporting a DIFFERENT laddr per runtime would recreate
+    /// the per-path divergence this task exists to remove. A wildcard bind is
+    /// rendered as loopback, matching the existing convention at
+    /// `handler_monoio/dispatch.rs`. Known limit: a TLS connection is reported
+    /// against the plain port.
+    pub fn local_addr_string(&self) -> String {
+        let host = match self.config.bind.as_str() {
+            "0.0.0.0" | "::" | "*" | "" => "127.0.0.1",
+            other => other,
+        };
+        format!("{host}:{}", self.config_port)
+    }
+}
+
 impl ConnectionState {
     /// Create fresh connection state for a new client.
     pub fn new(

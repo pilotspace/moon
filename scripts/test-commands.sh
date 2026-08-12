@@ -675,6 +675,19 @@ if should_run "connection"; then
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "COMMAND"           COMMAND
     assert_moon_ok "COMMAND COUNT"     COMMAND COUNT
+    # `assert_moon_ok` passed on the old stub too — it replied `*0`, which is a
+    # perfectly well-formed reply of the WRONG TYPE. These assert content, so a
+    # regression to a stub cannot slip past as "ok".
+    assert_moon_contains "COMMAND INFO GET names the command" "get" COMMAND INFO GET
+    assert_moon_contains "COMMAND LIST includes reset" "reset" COMMAND LIST
+    assert_moon_contains "COMMAND GETKEYS extracts the key" "k1" COMMAND GETKEYS MSET k1 v1 k2 v2
+    assert_moon_contains "COMMAND GETKEYS rejects keyless" "no key arguments" COMMAND GETKEYS PING
+    assert_moon_contains "COMMAND COUNT arity" "wrong number of arguments" COMMAND COUNT extra
+    assert_match "ROLE"                ROLE
+    assert_moon_contains "ROLE reports master" "master" ROLE
+    assert_match "RESET"               RESET
+    assert_moon_contains "RESET arity" "wrong number of arguments" RESET now
+    assert_moon_contains "CLIENT INFO laddr is not port 0" "laddr=127.0.0.1:$PORT_RUST" CLIENT INFO
     assert_moon_contains "MEMORY DOCTOR" "Per-subsystem (resident):" MEMORY DOCTOR
 fi
 

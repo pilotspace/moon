@@ -661,6 +661,70 @@ assert_both "WATCH arity" WATCH
 assert_both "UNWATCH outside MULTI" UNWATCH
 
 # ===========================================================================
+# Identity / introspection (COMMAND, ROLE, RESET)
+# ===========================================================================
+log "=== IDENTITY/INTROSPECTION ==="
+
+# These compare REPLY SHAPE against Redis, not reply content: Moon registers a
+# different command set than Redis, so `COMMAND COUNT` legitimately differs in
+# value while its TYPE must not. The old bug was a type inversion — bare
+# COMMAND replied an Integer and COMMAND COUNT replied an Array, each the
+# other's type — which `redis-cli` renders identically as "0". Comparing
+# rendered text here would have shown a false match, so shape is derived from
+# the reply itself.
+
+# Integer-typed and positive on both servers.
+count_is_positive_int() {
+    local port="$1" v
+    v="$(redis-cli -p "$port" COMMAND COUNT 2>&1)"
+    [[ "$v" =~ ^[0-9]+$ ]] && [[ "$v" -gt 0 ]] && echo "int>0" || echo "NOT-AN-INT:$v"
+}
+assert_eq "COMMAND COUNT is a positive integer" \
+    "$(count_is_positive_int "$PORT_REDIS")" "$(count_is_positive_int "$PORT_RUST")"
+
+# The bare COMMAND array must hold exactly COMMAND COUNT entries on each server.
+count_matches_specs() {
+    local port="$1" n specs
+    n="$(redis-cli -p "$port" COMMAND COUNT 2>&1)"
+    # One line per top-level spec: count the lines that open a spec's name.
+    specs="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c .)"
+    [[ "$n" == "$specs" ]] && echo "match" || echo "mismatch($n vs $specs)"
+}
+assert_eq "COMMAND COUNT equals COMMAND LIST length" \
+    "$(count_matches_specs "$PORT_REDIS")" "$(count_matches_specs "$PORT_RUST")"
+
+assert_both "COMMAND GETKEYS extracts keys" COMMAND GETKEYS MSET ik1 v1 ik2 v2
+assert_both "COMMAND GETKEYS rejects a keyless command" COMMAND GETKEYS PING
+assert_both "COMMAND COUNT arity" COMMAND COUNT extra
+assert_both "COMMAND INFO unknown name" COMMAND INFO definitely-not-a-command
+
+# ROLE on a standalone master is byte-identical between the two.
+assert_both "ROLE on a master" ROLE
+assert_both "RESET replies +RESET" RESET
+assert_both "RESET arity" RESET now
+
+# RESET must return the connection to default state, and it must do so INSIDE
+# MULTI (measured on redis 8.6.1: executed immediately, transaction discarded)
+# rather than being queued. Needs one held-open connection, same /dev/tcp
+# technique as the WATCH tests above.
+reset_state_outcome() {
+    local port="$1" line="" out=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
+    printf 'SELECT 5\r\nCLIENT SETNAME probe\r\nMULTI\r\nRESET\r\n' >&3
+    # EXEC after RESET must fail: the transaction is gone.
+    printf 'EXEC\r\nCLIENT GETNAME\r\nECHO reset-done\r\n' >&3
+    while IFS= read -r -t 5 line <&3; do
+        line="${line%$'\r'}"
+        [[ "$line" == *"without MULTI"* ]] && out="${out}exec-refused;"
+        [[ "$line" == "reset-done" ]] && break
+    done
+    exec 3>&-
+    echo "${out:-no-refusal}"
+}
+assert_eq "RESET inside MULTI discards the transaction" \
+    "$(reset_state_outcome "$PORT_REDIS")" "$(reset_state_outcome "$PORT_RUST")"
+
+# ===========================================================================
 # SWAPDB consistency
 # ===========================================================================
 log "=== SWAPDB ==="

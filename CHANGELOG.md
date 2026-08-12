@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`ROLE`, `RESET`, and a real `COMMAND` introspection surface.** `COMMAND` and `COMMAND COUNT`
+  each returned the OTHER'S RESP TYPE — bare `COMMAND` replied `:0` (an Integer where an Array
+  belongs) and `COMMAND COUNT` replied `*0` (an Array where an Integer belongs); `COMMAND
+  INFO`/`DOCS`/`LIST`/`GETKEYS` all replied an empty array. A driver that builds its command map at
+  connect time does not read that as "unsupported", it reads it as a protocol violation, and
+  `redis-cli` renders `:0` and `*0` identically as "0" so it never showed up by eye. All six now
+  derive from `COMMAND_META`, so registering a command is what makes it introspectable and there is
+  no second table to drift. `ROLE` and `RESET` were unknown commands: `RESET` was registered in the
+  metadata table with full flags while dispatch rejected it (the same advertise-then-reject class as
+  WATCH/UNWATCH before v0.8.6), and a partial `RESET` existed only inside `handler_sharded`'s
+  subscribe-mode loop, so it worked if you happened to be subscribed on one runtime and nowhere
+  else. `RESET` is wired on every production path and on `handler_single` (the in-process
+  single-shard handler that only tests reach) so the third copy of this surface cannot drift
+  unnoticed the way it just did. `ROLE` is answered from the shared dispatch table instead,
+  reading the process-global replication handle that `INFO` already uses — which is what lets a
+  QUEUED `ROLE` work: `EXEC` replays the queue through `dispatch()`, so a connection-layer
+  intercept would have executed `ROLE` at queue time and dropped it from the `EXEC` array,
+  shifting every later result index for the client. Caught by the client-compat harness.
+
+### Fixed
+- **`HELLO` no longer contradicts `INFO replication` about what the server is.** `hello_acl` built
+  its reply with `mode` and `standalone` and `role` and `master` as compile-time literals, so a
+  replica told `HELLO` it was a master while telling `INFO` it was a slave — on the same connection.
+  Both fields now read `ReplicationState`/`ClusterState`, the same source `INFO` uses. Note that
+  Redis deliberately uses three vocabularies for this one fact (`HELLO` -> `replica`, `INFO` ->
+  `slave`, `ROLE` -> `slave`), verified against a live replica pair on redis-server 8.6.1, and Moon
+  now matches each.
+- **The client-compat harness no longer needs a live Moon defect to test itself.** Its
+  divergence-classification test borrowed a real bug as its fixture, so it FAILED whenever
+  someone fixed that bug — three fixtures were burned this way (GET-inside-MULTI #457,
+  SISMEMBER RESP3 #463, and `COMMAND COUNT` here). It now fabricates the divergence through a
+  test-only `inject_moon_reply` hook, with a guard test asserting the shipped manifest never
+  uses it. The `identity_command_count` and `identity_role` waivers were retired as fixed.
+- **`CLIENT INFO` / `CLIENT LIST` report the real `laddr`.** The field was the literal
+  `laddr=127.0.0.1:0` inside the format string, so every client on every listener reported port 0 —
+  a monitoring agent using `laddr` to tell listeners apart saw nothing.
 - **CI now tests the runtime Moon actually ships (`check-monoio`).** Every CI job that *executed*
   tests did so under `--no-default-features --features runtime-tokio,…`, while Moon's default
   feature set — and what ships on Linux — is `runtime-monoio`. 26 monoio integration test files and

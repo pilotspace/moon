@@ -290,3 +290,18 @@ entries:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInjectionIsTestOnly(unittest.TestCase):
+    def test_shipped_manifest_injects_nothing(self):
+        """The shipped manifest must never fabricate a Moon reply.
+
+        `inject_moon_reply` exists so the harness's OWN tests can build a
+        divergence without depending on a live Moon defect. An injected reply
+        in the shipped manifest would be a comparison against a fixture rather
+        than against Moon — a green that proves nothing.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        entries = load_manifest(os.path.join(here, "manifest.yaml"))
+        offenders = [e.name for e in entries if e.inject_moon_reply is not None]
+        self.assertEqual(offenders, [], f"shipped manifest fabricates replies: {offenders}")

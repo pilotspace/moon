@@ -225,6 +225,10 @@ impl Drop for BlockedGuard {
 pub struct ClientEntry {
     pub id: u64,
     pub addr: String,
+    /// Local (server-side) address this client connected to. Was hardcoded
+    /// `127.0.0.1:0` in the CLIENT LIST format string; a monitoring agent
+    /// reading `laddr` to tell listeners apart saw port 0 for every client.
+    pub laddr: String,
     pub name: Option<String>,
     pub user: String,
     pub shard: usize,
@@ -289,6 +293,7 @@ impl ClientFlags {
 pub fn register(
     id: u64,
     addr: String,
+    laddr: String,
     user: String,
     shard: usize,
     kill_fd: i32,
@@ -307,6 +312,7 @@ pub fn register(
     let entry = ClientEntry {
         id,
         addr,
+        laddr,
         name: None,
         user,
         shard,
@@ -678,7 +684,7 @@ pub fn parse_kill_args(args: &[&[u8]]) -> Option<KillFilter> {
 /// Field set matches real Redis (`clientCommand`/`catClientInfoString`) so
 /// tooling that parses CLIENT LIST by key (redis-cli, client libraries,
 /// `redis_exporter`) doesn't choke on missing keys. Fields Moon doesn't
-/// track yet (`laddr`, `rbs`/`rbp`/`obl`/`oll`/`omem`, `tot-net-in/out`,
+/// track yet (`rbs`/`rbp`/`obl`/`oll`/`omem`, `tot-net-in/out`,
 /// `cmd`, `events`) are emitted with honest placeholder values (0 / "NULL" /
 /// unknown) rather than omitted — see docs/redis-compat.md for the list of
 /// fields that are structurally present but not yet semantically populated.
@@ -706,11 +712,23 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
     let tot_net_out = live.tot_net_out.load(Ordering::Relaxed);
     let _ = writeln!(
         buf,
-        "id={} addr={} laddr=127.0.0.1:0 fd=0 name={} age={} idle={} flags={} db={} \
+        "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} \
          sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
          tot-net-in=0 tot-net-out={} rbs=1024 rbp=0 obl={} oll=0 omem={} tot-mem={} events=r \
          cmd=NULL user={} redir=-1 resp=2 lib-name= lib-ver=",
-        entry.id, entry.addr, name, age, idle, flags, db, tot_net_out, omem, omem, omem, entry.user,
+        entry.id,
+        entry.addr,
+        entry.laddr,
+        name,
+        age,
+        idle,
+        flags,
+        db,
+        tot_net_out,
+        omem,
+        omem,
+        omem,
+        entry.user,
     );
 }
 
@@ -721,7 +739,14 @@ mod tests {
     #[test]
     fn test_register_and_list() {
         let id = 999_000;
-        register(id, "127.0.0.1:12345".into(), "default".into(), 0, -1);
+        register(
+            id,
+            "127.0.0.1:12345".into(),
+            "127.0.0.1:6379".into(),
+            "default".into(),
+            0,
+            -1,
+        );
         let list = client_list();
         assert!(list.contains("id=999000"));
         assert!(list.contains("addr=127.0.0.1:12345"));
@@ -734,7 +759,14 @@ mod tests {
     #[test]
     fn test_client_info() {
         let id = 999_001;
-        register(id, "10.0.0.1:5000".into(), "alice".into(), 1, -1);
+        register(
+            id,
+            "10.0.0.1:5000".into(),
+            "127.0.0.1:6379".into(),
+            "alice".into(),
+            1,
+            -1,
+        );
         let info = client_info(id);
         assert!(info.is_some());
         assert!(info.as_ref().is_some_and(|s| s.contains("user=alice")));
@@ -748,7 +780,14 @@ mod tests {
     #[test]
     fn test_client_info_field_set_matches_redis() {
         let id = 999_030;
-        register(id, "10.0.0.3:7000".into(), "carol".into(), 0, -1);
+        register(
+            id,
+            "10.0.0.3:7000".into(),
+            "127.0.0.1:6379".into(),
+            "carol".into(),
+            0,
+            -1,
+        );
         let info = client_info(id).expect("registered client has info");
         for field in [
             "id=",
@@ -796,7 +835,14 @@ mod tests {
     #[test]
     fn test_kill_by_id() {
         let id = 999_002;
-        let live = register(id, "10.0.0.2:6000".into(), "bob".into(), 0, -1);
+        let live = register(
+            id,
+            "10.0.0.2:6000".into(),
+            "127.0.0.1:6379".into(),
+            "bob".into(),
+            0,
+            -1,
+        );
         assert!(!is_killed(id));
         assert!(!live.is_killed());
         let count = kill_clients(&KillFilter::Id(id), None);
@@ -822,6 +868,7 @@ mod tests {
         let live = register(
             id,
             "unix:socketpair".into(),
+            "127.0.0.1:6379".into(),
             "default".into(),
             0,
             killed_end.as_raw_fd(),
@@ -855,6 +902,7 @@ mod tests {
         let live = register(
             id,
             "unix:socketpair-self".into(),
+            "127.0.0.1:6379".into(),
             "default".into(),
             0,
             self_end.as_raw_fd(),
@@ -882,8 +930,22 @@ mod tests {
     fn test_kill_by_user() {
         let id1 = 999_010;
         let id2 = 999_011;
-        register(id1, "10.0.0.3:7000".into(), "eve".into(), 0, -1);
-        register(id2, "10.0.0.4:7001".into(), "eve".into(), 1, -1);
+        register(
+            id1,
+            "10.0.0.3:7000".into(),
+            "127.0.0.1:6379".into(),
+            "eve".into(),
+            0,
+            -1,
+        );
+        register(
+            id2,
+            "10.0.0.4:7001".into(),
+            "127.0.0.1:6379".into(),
+            "eve".into(),
+            1,
+            -1,
+        );
         let count = kill_clients(&KillFilter::User("eve".into()), None);
         assert_eq!(count, 2);
         assert!(is_killed(id1));
@@ -895,7 +957,14 @@ mod tests {
     #[test]
     fn test_update_and_touch() {
         let id = 999_003;
-        let live = register(id, "10.0.0.5:8000".into(), "default".into(), 0, -1);
+        let live = register(
+            id,
+            "10.0.0.5:8000".into(),
+            "127.0.0.1:6379".into(),
+            "default".into(),
+            0,
+            -1,
+        );
         update(id, |e| {
             e.name = Some("myconn".into());
         });
@@ -909,7 +978,14 @@ mod tests {
     #[test]
     fn test_touch_uses_caller_clock_not_instant_now() {
         let id = 999_004;
-        let live = register(id, "10.0.0.6:9000".into(), "default".into(), 0, -1);
+        let live = register(
+            id,
+            "10.0.0.6:9000".into(),
+            "127.0.0.1:6379".into(),
+            "default".into(),
+            0,
+            -1,
+        );
         // touch takes the caller's (shard-cached) epoch clock — no per-op
         // Instant::now(). last_cmd_ms stays "ms since connect".
         live.touch(2, ClientFlags::default(), live.connected_at_epoch_ms + 5000);
@@ -960,7 +1036,14 @@ mod striping_tests {
         (0..n)
             .map(|i| {
                 let id = BASE + i;
-                let _ = register(id, format!("10.0.0.{i}:1234"), user.to_string(), 0, -1);
+                let _ = register(
+                    id,
+                    format!("10.0.0.{i}:1234"),
+                    "127.0.0.1:6379".into(),
+                    user.to_string(),
+                    0,
+                    -1,
+                );
                 id
             })
             .collect()
@@ -1050,7 +1133,14 @@ mod idle_timeout_tests {
     /// (`SHARD_CONNS` is unset in unit tests, so the per-shard counters are
     /// inert for these ids.)
     fn client(id: u64, shard: usize) -> Arc<ClientLiveState> {
-        register(id, format!("127.0.0.1:{id}"), "default".into(), shard, -1)
+        register(
+            id,
+            format!("127.0.0.1:{id}"),
+            "127.0.0.1:6379".into(),
+            "default".into(),
+            shard,
+            -1,
+        )
     }
 
     /// `kill_fd` is -1 here, so `force_close_fd` is a no-op and the observable
@@ -1319,9 +1409,23 @@ mod idle_timeout_tests {
         let mut clean_attempt_seen = false;
         for attempt in 0..5u64 {
             let id = 9_060 + attempt;
-            let _a = register(id, "t:1".into(), "default".into(), 908, -1);
+            let _a = register(
+                id,
+                "t:1".into(),
+                "127.0.0.1:6379".into(),
+                "default".into(),
+                908,
+                -1,
+            );
             let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
-            let _b = register(id, "t:1".into(), "default".into(), 909, -1);
+            let _b = register(
+                id,
+                "t:1".into(),
+                "127.0.0.1:6379".into(),
+                "default".into(),
+                909,
+                -1,
+            );
             let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
             deregister(id);
             assert!(live_handle(id).is_none(), "single deregister must clear");

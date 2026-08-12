@@ -10,7 +10,9 @@ pub mod graph;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
+pub mod identity;
 pub mod info_reclamation;
+pub mod introspect;
 pub mod key;
 pub mod key_extra;
 pub mod keyspace;
@@ -240,6 +242,25 @@ fn dispatch_inner(
             // RPOP
             if cmd.eq_ignore_ascii_case(b"RPOP") {
                 return resp(list::rpop(db, args));
+            }
+            // ROLE — answered HERE rather than at the connection layer so a
+            // queued ROLE inside MULTI works: EXEC replays the queue through
+            // dispatch(), and a connection-layer intercept would have executed
+            // ROLE immediately at queue time, dropping it from the EXEC array
+            // and shifting every later result index for the client.
+            //
+            // The replication state comes from the process-global handle every
+            // entry point registers (main.rs, listener.rs, embedded.rs), which
+            // is the same source INFO reads. Unset (before replication init)
+            // yields the master form, matching a `None` ReplicationState.
+            if cmd.eq_ignore_ascii_case(b"ROLE") {
+                return resp(if args.is_empty() {
+                    identity::role(crate::admin::metrics_setup::get_global_repl_state_arc())
+                } else {
+                    Frame::Error(Bytes::from_static(
+                        b"ERR wrong number of arguments for 'role' command",
+                    ))
+                });
             }
         }
         (4, b's') => {
@@ -638,7 +659,7 @@ fn dispatch_inner(
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
-                return resp(connection::command(args));
+                return resp(introspect::command(args));
             }
         }
         (7, b'f') => {
@@ -1367,7 +1388,28 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
-                return resp(connection::command(args));
+                return resp(introspect::command(args));
+            }
+        }
+        (4, b'r') => {
+            // ROLE — answered HERE rather than at the connection layer so a
+            // queued ROLE inside MULTI works: EXEC replays the queue through
+            // dispatch(), and a connection-layer intercept would have executed
+            // ROLE immediately at queue time, dropping it from the EXEC array
+            // and shifting every later result index for the client.
+            //
+            // The replication state comes from the process-global handle every
+            // entry point registers (main.rs, listener.rs, embedded.rs), which
+            // is the same source INFO reads. Unset (before replication init)
+            // yields the master form, matching a `None` ReplicationState.
+            if cmd.eq_ignore_ascii_case(b"ROLE") {
+                return resp(if args.is_empty() {
+                    identity::role(crate::admin::metrics_setup::get_global_repl_state_arc())
+                } else {
+                    Frame::Error(Bytes::from_static(
+                        b"ERR wrong number of arguments for 'role' command",
+                    ))
+                });
             }
         }
         (7, b'h') => {

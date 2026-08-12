@@ -84,6 +84,10 @@ pub(super) fn check_auth_gate(
                 client_id,
                 &ctx.acl_table,
                 &mut conn.authenticated,
+                crate::command::identity::hello_role_and_mode(
+                    ctx.repl_state.as_ref(),
+                    ctx.cluster_state.is_some(),
+                ),
             );
             if !matches!(&response, Frame::Error(_)) {
                 conn.protocol_version = new_proto;
@@ -352,6 +356,10 @@ pub(super) fn try_handle_hello(
         client_id,
         &ctx.acl_table,
         &mut conn.authenticated,
+        crate::command::identity::hello_role_and_mode(
+            ctx.repl_state.as_ref(),
+            ctx.cluster_state.is_some(),
+        ),
     );
     if !matches!(&response, Frame::Error(_)) {
         conn.protocol_version = new_proto;

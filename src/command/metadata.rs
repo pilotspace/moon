@@ -352,6 +352,10 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HELLO" => CommandMeta { name: "HELLO", arity: -1, flags: CommandFlags(CommandFlags::FAST.0 | CommandFlags::NO_AUTH.0), first_key: 0, last_key: 0, step: 0, acl_categories: CON },
     "RESET" => CommandMeta { name: "RESET", arity: 1, flags: CommandFlags(CommandFlags::FAST.0 | CommandFlags::NO_AUTH.0 | CommandFlags::LOADING.0 | CommandFlags::STALE.0), first_key: 0, last_key: 0, step: 0, acl_categories: CON },
     "CLIENT" => CommandMeta { name: "CLIENT", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: CON },
+    // ROLE is LOADING|STALE like Redis: a client asking "what are you" must get
+    // an answer while the server is loading or link-down, precisely when the
+    // answer matters most for failover decisions.
+    "ROLE" => CommandMeta { name: "ROLE", arity: 1, flags: CommandFlags(CommandFlags::FAST.0 | CommandFlags::LOADING.0 | CommandFlags::STALE.0), first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
     "WAIT" => CommandMeta { name: "WAIT", arity: 3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
 
     // ---- Server / admin commands ----
