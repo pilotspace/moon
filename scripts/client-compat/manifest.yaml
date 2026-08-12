@@ -93,27 +93,23 @@ entries:
         transaction queueing, distinct from the inline-GET path.
         Owner: multi-exec-queue-semantics (re-owned 2026-08-10: a
         transaction-QUEUEING defect, not a reply-type one).
+        STILL REPRODUCES 2026-08-12 after the MULTI queue gate landed, which
+        DID fix the same class for INFO and SUBSCRIBE. CONFIG sits below the
+        gate in every handler, so the reason is not intercept order and is not
+        yet understood — deliberately not guessed at here.
 
+  # FIXED 2026-08-12 by multi-exec-queue-semantics. The waivers are retired
+  # rather than deleted: these two are now live parity assertions, so the
+  # EXECABORT behaviour cannot silently regress. Moon used to queue the bad
+  # command and surface its -ERR from inside EXEC, leaving the transaction
+  # PARTIALLY APPLIED — `MULTI / NOSUCHCMD / SET k v / EXEC` left k set.
   - name: multi_aborts_on_unknown_command
     command: "THISCOMMANDDOESNOTEXIST"
     policy: exact
-    expect_diff:
-      reason: >-
-        Redis fails the queue-time error and then answers EXEC with
-        -EXECABORT "Transaction discarded because of previous errors."; Moon
-        queues the bad command and surfaces the -ERR from inside EXEC instead.
-        A client that relies on EXECABORT to detect a poisoned transaction sees
-        a partially-applied one. Owner: multi-exec-queue-semantics (re-owned
-        2026-08-10: a transaction-QUEUEING defect, not a reply-type one).
 
   - name: multi_aborts_on_wrong_arity
     command: "GET"
     policy: exact
-    expect_diff:
-      reason: >-
-        Same EXECABORT gap as multi_aborts_on_unknown_command, reached through
-        an arity error rather than an unknown name.
-        Owner: multi-exec-queue-semantics.
 
   # ── RESP3 reply-type fidelity (review findings, wire-confirmed) ───────
 
@@ -209,6 +205,8 @@ entries:
         TYPE is correct in every context where the command actually runs
         (standalone and pipeline both answer %0); this is the transaction
         QUEUEING gap, not a reply-shape one.
+        STILL REPRODUCES 2026-08-12 after the MULTI queue gate landed — see
+        multi_queues_config_get for the same unexplained residual.
         Owner: multi-exec-queue-semantics.
 
   - name: empty_smembers_is_still_a_set
