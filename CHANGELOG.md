@@ -18,9 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata table with full flags while dispatch rejected it (the same advertise-then-reject class as
   WATCH/UNWATCH before v0.8.6), and a partial `RESET` existed only inside `handler_sharded`'s
   subscribe-mode loop, so it worked if you happened to be subscribed on one runtime and nowhere
-  else. Both are now wired on every production path, and on `handler_single` (the in-process
+  else. `RESET` is wired on every production path and on `handler_single` (the in-process
   single-shard handler that only tests reach) so the third copy of this surface cannot drift
-  unnoticed the way it just did.
+  unnoticed the way it just did. `ROLE` is answered from the shared dispatch table instead,
+  reading the process-global replication handle that `INFO` already uses — which is what lets a
+  QUEUED `ROLE` work: `EXEC` replays the queue through `dispatch()`, so a connection-layer
+  intercept would have executed `ROLE` at queue time and dropped it from the `EXEC` array,
+  shifting every later result index for the client. Caught by the client-compat harness.
 
 ### Fixed
 - **`HELLO` no longer contradicts `INFO replication` about what the server is.** `hello_acl` built
@@ -30,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Redis deliberately uses three vocabularies for this one fact (`HELLO` -> `replica`, `INFO` ->
   `slave`, `ROLE` -> `slave`), verified against a live replica pair on redis-server 8.6.1, and Moon
   now matches each.
+- **The client-compat harness no longer needs a live Moon defect to test itself.** Its
+  divergence-classification test borrowed a real bug as its fixture, so it FAILED whenever
+  someone fixed that bug — three fixtures were burned this way (GET-inside-MULTI #457,
+  SISMEMBER RESP3 #463, and `COMMAND COUNT` here). It now fabricates the divergence through a
+  test-only `inject_moon_reply` hook, with a guard test asserting the shipped manifest never
+  uses it. The `identity_command_count` and `identity_role` waivers were retired as fixed.
 - **`CLIENT INFO` / `CLIENT LIST` report the real `laddr`.** The field was the literal
   `laddr=127.0.0.1:0` inside the format string, so every client on every listener reported port 0 —
   a monitoring agent using `laddr` to tell listeners apart saw nothing.

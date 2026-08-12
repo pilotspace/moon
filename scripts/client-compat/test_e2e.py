@@ -125,44 +125,38 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(report.tally()["fail"], 0)
 
     def test_a_diverging_entry_exits_one_and_names_the_divergence(self):
-        # COMMAND COUNT: Redis answers Integer :274, Moon answers an empty
-        # Array *0 (it ignores the COUNT subcommand). The harness must surface
-        # this as a failure naming TYPE, not swallow it.
-        #
-        # THIRD fixture for this test. The rotation is the point, so read it
-        # before picking a fourth:
+        # The divergence is FABRICATED via inject_moon_reply, not borrowed from
+        # a live Moon defect. Three real fixtures were burned before this hook
+        # existed, each retired by someone FIXING the bug it depended on:
         #   1. GET-inside-MULTI  — fixed by the v0.8.6 inline-GET hotfix (#457)
-        #   2. SISMEMBER RESP3   — fixed by resp3-type-fidelity (#463); Moon no
-        #      longer over-converts Integer to Boolean, so this test began
-        #      failing with `0 != 1` the moment that landed
-        #   3. COMMAND COUNT     — open, owned by `client-identity-introspection`
+        #   2. SISMEMBER RESP3   — fixed by resp3-type-fidelity (#463)
+        #   3. COMMAND COUNT     — fixed by client-identity-introspection, which
+        #      is what forced this rewrite: Moon now answers `:263` where it
+        #      answered `*0`, so the divergence became `value` instead of `type`
+        #      and this test failed as a REWARD for the fix.
         #
-        # A test that needs a live defect to pass fails as a REWARD for fixing
-        # something, which is exactly backwards. #3 is chosen because it is
-        # owned by a different task than the reply-type work, so that line of
-        # work cannot silently retire it again — but that is damage control,
-        # not a fix.
-        #
-        # No permanent-by-construction TYPE divergence exists today: Moon's
-        # proprietary commands (TXN.ABORT, MQ PUSH) return an Error on BOTH
-        # servers, so they diverge in text but not in type; and redis 8.6.1
-        # turns out to implement `hotkeys` too. The durable fix is a test-only
-        # injection hook that fabricates a divergence rather than borrowing a
-        # real one — tracked in #461 alongside the harness's other
-        # self-honesty gaps.
+        # PING is chosen as the carrier precisely because it is the least likely
+        # command in Redis to ever change: the entry asserts nothing about PING,
+        # it only needs a reply to overwrite. Redis answers `+PONG` (SimpleString)
+        # and the injected reply is an Integer, so the classifier must say TYPE.
         report = Runner(cfg(manifest_path=manifest("""
 entries:
-  - name: command_count_type
-    command: "COMMAND COUNT"
+  - name: fabricated_type_divergence
+    command: "PING"
     policy: exact
     protocols: [resp3]
     contexts: [standalone]
+    inject_moon_reply: ":1\\r\\n"
 """))).run()
         self.assertEqual(report.exit_code(), 1)
         diffs = [r for r in report.results if r.verdict == "diff"]
         self.assertTrue(diffs)
         for r in diffs:
             self.assertEqual(r.divergence, "type")
+            # The fabricated reply must be what was compared and recorded —
+            # otherwise the hook is a no-op and this test proves nothing.
+            self.assertEqual(r.moon_raw, b":1\r\n")
+            self.assertEqual(r.redis_raw, b"+PONG\r\n")
 
     def test_info_manifest_reports_missing_fields_by_name(self):
         # run_id is emitted by real Redis and not by Moon, so it is a genuine

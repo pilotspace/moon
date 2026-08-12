@@ -1048,19 +1048,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- REPLICAOF / SLAVEOF ---
-                    // ROLE — connection-layer, because the answer lives on
-                    // ConnectionContext.repl_state rather than in the keyspace.
-                    // Post-ACL, beside the other replication intercepts.
-                    if cmd.eq_ignore_ascii_case(b"ROLE") {
-                        responses.push(if cmd_args.is_empty() {
-                            crate::command::identity::role(ctx.repl_state.as_ref())
-                        } else {
-                            Frame::Error(Bytes::from_static(
-                                b"ERR wrong number of arguments for 'role' command",
-                            ))
-                        });
-                        continue;
-                    }
                     if dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses) {
                         continue;
                     }

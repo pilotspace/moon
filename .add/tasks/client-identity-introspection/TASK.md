@@ -592,6 +592,22 @@ What did this loop teach the foundation? One line each, tagged by competency
   task `batch-protocol-version-fidelity` with the full measurement table. Pre-existing — the
   `HELLO`+`HELLO` reproducer touches none of this task's code — but RESET, which reverts the
   protocol by contract, adds a second trigger, which is how it surfaced here.
+- [TDD · open] The client-compat harness caught a regression that FOURTEEN raw-RESP tests and
+  two full suites missed: `ROLE` intercepted at the connection layer ran ahead of the MULTI
+  queueing step, so `MULTI; ROLE; EXEC` executed ROLE at queue time and returned `*0` — the
+  command vanished from the EXEC array and shifted every later result index. Nothing in this
+  task's own suite exercised a connection-layer command INSIDE a transaction. Lesson: a new
+  intercept must be tested in MULTI as well as standalone, because the intercept's POSITION
+  relative to queueing is the thing that can be wrong. Fixed by moving ROLE into the shared
+  dispatch table (answered from the process-global replication handle `INFO` already uses),
+  which also deleted all three handler intercepts.
+- [ADD · open] A harness test that borrows a live defect as its fixture punishes the fix. This
+  task retired the third such fixture (`COMMAND COUNT`); the durable hook was already designed
+  and filed as #461, so it was implemented here rather than rotating to a fourth defect.
+- [SPEC · open] `COMMAND INFO`'s 10-field SHAPE now matches Redis, but three inner divergences
+  remain and are now WAIVED with owners rather than unmeasured: acl_categories is thin
+  (`@string` where Redis says `@read @string @fast`), key_specs is empty, and under RESP3 Redis
+  types flags/acl_categories as Sets and key_specs entries as Maps where Moon emits Arrays.
 - [SPEC · open] `handler_single` is dead weight in the shipped binary (no non-test caller) yet
   carries a full command loop that must be kept in parity with two live handlers. Either wire it
   to something real or delete it; a third copy nobody executes is where drift hides. This task

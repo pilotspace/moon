@@ -1656,19 +1656,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
                 continue;
             }
-            // ROLE — connection-layer because the answer lives on
-            // ConnectionContext.repl_state, not in the keyspace. Post-ACL like
-            // the other server-introspection intercepts around it.
-            if cmd_len == 4 && cmd.eq_ignore_ascii_case(b"ROLE") {
-                responses.push(if cmd_args.is_empty() {
-                    crate::command::identity::role(ctx.repl_state.as_ref())
-                } else {
-                    Frame::Error(Bytes::from_static(
-                        b"ERR wrong number of arguments for 'role' command",
-                    ))
-                });
-                continue;
-            }
             // CLIENT TRACKING mutates server-side invalidation state — post-ACL
             // (H-3), matching handler_sharded's placement of all CLIENT subcmds.
             if cmd_len == 6

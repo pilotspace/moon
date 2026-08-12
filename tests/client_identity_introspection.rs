@@ -885,3 +885,53 @@ async fn ci14_handler_single_identity_surface() {
 
     token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// ci15 — ROLE must QUEUE inside MULTI, not execute at queue time.
+//
+// Caught by the client-compat harness, not by this suite, and it was a
+// regression introduced by the first cut of this task: ROLE was intercepted at
+// the connection layer, ahead of the MULTI queueing step, so `MULTI; ROLE;
+// EXEC` replied the role array immediately and then EXEC returned `*0`. The
+// damage is worse than a wrong reply — the command silently vanishes from the
+// EXEC array, so every LATER result shifts down one index and a client reads
+// another command's answer as this one's.
+//
+// The fix moved ROLE into the shared dispatch table (answered from the
+// process-global replication handle), which is also the only way a queued ROLE
+// can work: EXEC replays the queue through dispatch().
+#[test]
+fn ci15_role_queues_inside_multi_and_keeps_result_alignment() {
+    let srv = server(1);
+    let mut c = connect_ready(srv.port);
+
+    assert_eq!(&cmd(&mut c, &["MULTI"])[..], b"+OK\r\n");
+    let queued = cmd(&mut c, &["ROLE"]);
+    assert_eq!(
+        &queued[..],
+        b"+QUEUED\r\n",
+        "ROLE must be QUEUED inside MULTI, not executed at queue time; got {:?}",
+        String::from_utf8_lossy(&queued)
+    );
+
+    // A second command AFTER ROLE is the alignment probe: if ROLE were dropped
+    // the array would be *1 and PING's reply would land at index 0.
+    assert_eq!(&cmd(&mut c, &["PING"])[..], b"+QUEUED\r\n");
+
+    let exec = cmd(&mut c, &["EXEC"]);
+    assert!(
+        exec.starts_with(b"*2\r\n"),
+        "EXEC must return one result per queued command (2); got {:?}",
+        String::from_utf8_lossy(&exec)
+    );
+    assert!(
+        exec.windows(6).any(|w| w == b"master"),
+        "the queued ROLE must have produced the role array inside EXEC; got {:?}",
+        String::from_utf8_lossy(&exec)
+    );
+    assert!(
+        exec.ends_with(b"+PONG\r\n"),
+        "PING must remain the LAST result — if it moved, alignment broke; got {:?}",
+        String::from_utf8_lossy(&exec)
+    );
+}

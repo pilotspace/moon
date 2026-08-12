@@ -256,6 +256,17 @@ class Entry:
     contexts: tuple[str, ...] = CONTEXTS
     protocols: tuple[str, ...] = PROTOCOLS
     expect_diff: Optional[str] = None
+    # TEST-ONLY. Replaces Moon's reply with these literal wire bytes before the
+    # comparison, so the harness's own tests can fabricate a divergence instead
+    # of borrowing a live Moon defect.
+    #
+    # Three fixtures were burned this way before the hook existed — GET-inside-
+    # MULTI (#457), SISMEMBER RESP3 (#463), COMMAND COUNT (this task) — each
+    # retired the moment someone FIXED the bug it depended on, so the suite
+    # punished the fix. Fabricating the divergence removes that incentive
+    # permanently. Never set this in the shipped manifest: an injected reply is
+    # not evidence about Moon.
+    inject_moon_reply: Optional[bytes] = None
 
 
 def load_manifest(path: str) -> list[Entry]:
@@ -314,6 +325,14 @@ def load_manifest(path: str) -> list[Entry]:
                                    f"entry {item['name']}: expect_diff needs a reason")
             waiver = reason
 
+        inject = item.get("inject_moon_reply")
+        if inject is not None:
+            if not isinstance(inject, str):
+                raise HarnessError("ERR_BAD_MANIFEST",
+                                   f"entry {item['name']}: inject_moon_reply must be a string")
+            # Written with escapes in YAML (\r\n); decode to real wire bytes.
+            inject = inject.encode("latin1").decode("unicode_escape").encode("latin1")
+
         entries.append(Entry(
             name=item["name"],
             command=item["command"],
@@ -323,6 +342,7 @@ def load_manifest(path: str) -> list[Entry]:
             contexts=contexts,
             protocols=protocols,
             expect_diff=waiver,
+            inject_moon_reply=inject,
         ))
     return entries
 
@@ -567,6 +587,17 @@ class Runner:
             mc.close()
 
         assert r_sent == m_sent, "byte-identical send is a contract invariant"
+
+        if entry.inject_moon_reply is not None:
+            # Substitution happens AFTER the real exchange on purpose: the
+            # servers still run, the bytes are still sent identically, and only
+            # the reply under comparison is fabricated. A hook that skipped the
+            # exchange would also stop testing the exchange.
+            m_raw = entry.inject_moon_reply
+            try:
+                m_node = parse_resp(m_raw)
+            except Exception:
+                m_node = None
 
         if r_node is None or m_node is None:
             return Result(entry.name, protocol, context, r_sent, r_raw, m_raw,

@@ -1669,22 +1669,6 @@ pub async fn handle_connection(
                             }
                         }
 
-                        // === ROLE ===
-                        // Connection-layer, like the monoio/sharded handlers:
-                        // the answer lives on the replication state, not in the
-                        // keyspace, so `dispatch()` (which only receives a
-                        // Database) cannot produce it.
-                        if cmd.eq_ignore_ascii_case(b"ROLE") {
-                            responses.push(if cmd_args.is_empty() {
-                                crate::command::identity::role(repl_state.as_ref())
-                            } else {
-                                Frame::Error(Bytes::from_static(
-                                    b"ERR wrong number of arguments for 'role' command",
-                                ))
-                            });
-                            continue;
-                        }
-
                         // === RESET ===
                         // Shares `try_handle_reset` with the other two handlers
                         // rather than re-deriving "default state" here, so the
