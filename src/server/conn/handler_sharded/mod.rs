@@ -871,7 +871,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // The replication handshake verbs are exempt. A replica
                     // never opens a transaction, so queueing them could only
                     // ever break a handshake — and no test covers that.
-                    if conn.in_multi && !is_transaction_control(cmd) {
+                    if conn.in_multi
+                        && !is_transaction_control(cmd)
+                        && !crate::server::conn::shared::is_intercept_only(cmd)
+                    {
                         // FT.* vector commands aren't wired through the txn
                         // execution path; reject them explicitly inside MULTI
                         // (matches handler_single) rather than failing later.

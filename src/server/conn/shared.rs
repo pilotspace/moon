@@ -1019,6 +1019,46 @@ pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
     CONTROL.iter().any(|c| cmd.eq_ignore_ascii_case(c))
 }
 
+/// Commands the transaction executor CANNOT run, so queueing them would turn a
+/// working command into a guaranteed error inside `EXEC`.
+///
+/// `execute_transaction` replays the queue through `dispatch()`. These commands
+/// are connection-level *intercepts* — they never reach `dispatch()` at all, so
+/// a queued one comes back as `-ERR unknown command`. Measured 2026-08-12 by
+/// queueing each inside a MULTI and reading the EXEC array:
+///
+/// ```text
+/// CONFIG · CLIENT · ACL · CLUSTER · SCRIPT · WAIT          -> unknown command
+/// INFO · SLOWLOG · PUBLISH · MEMORY · DEBUG · COMMAND · OBJECT -> execute fine
+/// ```
+///
+/// Redis queues all of them and runs them properly. Moon cannot yet, so these
+/// keep EXECUTING immediately — the pre-existing divergence, which the
+/// client-compat manifest already waives — rather than queueing into a hard
+/// error. That is strictly better than the alternative: before the queue gate a
+/// client got its data with the wrong reply shape; queueing it unconditionally
+/// gave them an error instead, which is a regression, not a narrowing.
+///
+/// `LATENCY` looked like a member and is NOT: it errors outside a transaction
+/// too, because Moon does not implement it at all. Exempting it would have
+/// papered over nothing and hidden a genuine unimplemented command.
+///
+/// `PUBSUB` is absent from `COMMAND_META`, so `queue_time_rejection` would call
+/// it an unknown command and poison the transaction — it has no dot, so the
+/// dotted carve-out misses it. That is exactly the regression class the §1 ⚠
+/// assumption named. It is handled by `queue_time_rejection` consulting this
+/// list, not by exempting it from queueing.
+///
+/// Removing an entry from this list requires teaching `execute_transaction` to
+/// run it. The test `me10` asserts every queued command's EXEC result is not an
+/// error, so a premature removal fails loudly.
+pub(crate) fn is_intercept_only(cmd: &[u8]) -> bool {
+    const INTERCEPT_ONLY: [&[u8]; 7] = [
+        b"CONFIG", b"CLIENT", b"ACL", b"CLUSTER", b"SCRIPT", b"WAIT", b"PUBSUB",
+    ];
+    INTERCEPT_ONLY.iter().any(|c| cmd.eq_ignore_ascii_case(c))
+}
+
 /// Validate a command at QUEUE time, the way Redis does before storing it.
 ///
 /// Returns `Some(error)` when the command must not be queued. The caller

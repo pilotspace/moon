@@ -439,6 +439,21 @@ fn me10_every_dispatchable_command_is_queueable() {
             !exec.contains("EXECABORT"),
             "{cmd:?} queued but the transaction was poisoned anyway: {exec:?}"
         );
+        // The assertion this test was MISSING. `+QUEUED` plus "no EXECABORT"
+        // says the transaction was not poisoned — it says nothing about
+        // whether the command actually RAN. It did not: `execute_transaction`
+        // replays the queue through `dispatch()`, and a connection-level
+        // intercept never reaches dispatch, so it came back as
+        // `-ERR unknown command` INSIDE the EXEC array while both assertions
+        // above stayed happy. That is how a regression shipped past a green
+        // test — the check verified the signal expected, not the behaviour
+        // claimed.
+        assert!(
+            !exec.contains("unknown command"),
+            "{cmd:?} queued but could not be EXECUTED — a queued command that \
+             cannot run is worse than one that never queued, because the client \
+             gets an error where it used to get data. got {exec:?}"
+        );
     }
 }
 
@@ -479,6 +494,54 @@ fn me10b_unregistered_dotted_commands_still_queue() {
         c2.send(&["NOSUCHCMD"]).contains("unknown command"),
         "the dotted carve-out must not weaken the plain unknown-command check"
     );
+}
+
+// ---------------------------------------------------------------------------
+// me10c — intercept-only commands must not be queued into a guaranteed error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn me10c_intercept_only_commands_are_not_queued_into_an_error() {
+    // LATENCY is deliberately NOT in this list: it errors outside a
+    // transaction too (Moon does not implement it), so including it would have
+    // hidden an unimplemented command behind a transaction exemption.
+    //
+    // These reach a connection-level intercept and never `dispatch()`, so the
+    // transaction executor cannot replay them. Redis queues and runs them all;
+    // Moon cannot yet, so it keeps executing them immediately — the
+    // pre-existing divergence the compat manifest waives.
+    //
+    // What must NEVER happen is the middle state: queueing them into an
+    // `-ERR unknown command` inside EXEC. That turns data into an error, which
+    // is strictly worse than the divergence it replaced.
+    let m = spawn_moon("1");
+    for cmd in [
+        &["CONFIG", "GET", "maxmemory"][..],
+        &["CLIENT", "GETNAME"][..],
+        &["ACL", "WHOAMI"][..],
+        &["CLUSTER", "INFO"][..],
+        &["SCRIPT", "EXISTS", "deadbeef"][..],
+        &["WAIT", "0", "0"][..],
+        // PUBSUB is the one that matters most here: it works outside MULTI
+        // (`*0`) but is ABSENT from COMMAND_META, so queue-time validation
+        // would call it unknown and poison the transaction. It has no dot,
+        // so the dotted carve-out does not cover it.
+        &["PUBSUB", "CHANNELS"][..],
+    ] {
+        let mut c = Conn::open(m.port);
+        c.send(&["MULTI"]);
+        let queued = c.send(cmd);
+        assert!(
+            !queued.contains("unknown command"),
+            "{cmd:?} works outside MULTI, so it must not be rejected as unknown \
+             inside one. got {queued:?}"
+        );
+        let exec = c.send(&["EXEC"]);
+        assert!(
+            !exec.contains("unknown command") && !exec.contains("EXECABORT"),
+            "{cmd:?} must not end up as an error inside EXEC. got {exec:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1487,7 +1487,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // This handler is the DEFAULT runtime (`runtime-monoio`). The
             // sharded/tokio handlers carry the identical gate — a fix in only
             // one of them is invisible to whichever job builds the other.
-            if conn.in_multi && !is_transaction_control(cmd) {
+            if conn.in_multi
+                && !is_transaction_control(cmd)
+                && !crate::server::conn::shared::is_intercept_only(cmd)
+            {
                 // FT.* isn't wired through the txn execution path; reject it
                 // explicitly rather than failing incidentally later.
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
