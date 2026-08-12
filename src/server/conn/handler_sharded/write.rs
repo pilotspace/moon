@@ -567,6 +567,15 @@ pub(super) async fn try_handle_multi_exec(
             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
         } else {
             conn.in_multi = false;
+            // A transaction poisoned at queue time executes NOTHING. Redis's
+            // CLIENT_DIRTY_EXEC: the client was already told which command was
+            // bad; EXEC's job is to make sure none of the others ran.
+            if std::mem::take(&mut conn.multi_dirty) {
+                conn.command_queue.clear();
+                conn.watched_keys.clear();
+                responses.push(crate::server::conn::shared::execabort_frame());
+                return true;
+            }
             // Taken, not borrowed: EXEC must clear its watches on BOTH the
             // committed and the aborted outcome, and a stale watch surviving
             // an abort is how a CAS retry loop livelocks.
@@ -799,6 +808,9 @@ pub(super) async fn try_handle_multi_exec(
         } else {
             conn.in_multi = false;
             conn.command_queue.clear();
+            // DISCARD must clear the poison too, or the NEXT transaction on
+            // this connection aborts for a fault that was never its own.
+            conn.multi_dirty = false;
             conn.watched_keys.clear();
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }

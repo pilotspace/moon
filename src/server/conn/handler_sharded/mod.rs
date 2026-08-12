@@ -72,6 +72,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::persistence::aof;
 use crate::protocol::Frame;
+use crate::server::conn::shared::is_transaction_control;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{EvictionRun, evict_to_budget};
@@ -442,6 +443,10 @@ pub(crate) async fn handle_connection_sharded_inner<
     };
 
     let mut break_outer = false;
+    // Set when the parser rejects a frame. The connection still dies, but not
+    // silently and not before the valid frames that preceded the fault in the
+    // same read have been executed and answered — see the parse loop below.
+    let mut proto_fault: Option<crate::protocol::ProtoFault> = None;
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
         if client_live.is_killed() {
@@ -539,11 +544,34 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                         Ok(None) => break,
                         Err(crate::protocol::ParseError::Incomplete) => break,
-                        Err(_) => { break_outer = true; break; }
+                        // A protocol fault is fatal to the connection, but it
+                        // is not a licence to drop what the client already
+                        // sent. `batch` holds every VALID frame parsed from
+                        // this same read; the old `Err(_) => break` discarded
+                        // it along with the reason, so `PING\r\n<bad frame>`
+                        // in one write answered nothing at all and closed mute.
+                        // Record the fault, stop parsing, and let the normal
+                        // batch machinery below execute and flush the prefix.
+                        // The error frame and the close happen after that.
+                        Err(crate::protocol::ParseError::Invalid { kind, .. }) => {
+                            proto_fault = Some(kind);
+                            break;
+                        }
+                        // The socket is already gone; there is nobody to tell.
+                        Err(crate::protocol::ParseError::Io(_)) => { break_outer = true; break; }
                     }
                 }
                 if break_outer { break; }
-                if batch.is_empty() { continue; }
+                if batch.is_empty() {
+                    // Nothing valid preceded the fault — report it directly.
+                    if let Some(kind) = proto_fault.take() {
+                        let _ = stream
+                            .write_all(super::util::proto_error_frame(kind).as_bytes())
+                            .await;
+                        break;
+                    }
+                    continue;
+                }
 
                 // CLIENT PAUSE: delay processing if server is paused
                 // Check with is_write=true (conservative — pauses all batches in ALL mode)
@@ -820,6 +848,59 @@ pub(crate) async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
+                    }
+
+                    // === MULTI QUEUE GATE — every non-transactional intercept
+                    // MUST sit below this ===
+                    //
+                    // Redis executes exactly six commands while a transaction
+                    // is open (MULTI, EXEC, DISCARD, WATCH, RESET, QUIT);
+                    // EVERYTHING else queues. Moon decided this ~500 lines
+                    // further down, below the INFO / CLIENT / WS / MQ /
+                    // PUBLISH / SUBSCRIBE intercepts, so each of those ran for
+                    // real inside a transaction. Measured against
+                    // redis-server 8.6.1: `SUBSCRIBE ch` put the connection
+                    // into subscriber mode mid-MULTI, and `INFO server`
+                    // returned a 3 KB dump where Redis returns `+QUEUED`.
+                    //
+                    // Deliberately BELOW the ACL gate: Redis refuses a
+                    // forbidden command at queue time, and this repo has
+                    // already shipped one ACL bypass that came from an
+                    // intercept sitting above its permission check.
+                    //
+                    // The replication handshake verbs are exempt. A replica
+                    // never opens a transaction, so queueing them could only
+                    // ever break a handshake — and no test covers that.
+                    if conn.in_multi && !is_transaction_control(cmd) {
+                        // FT.* vector commands aren't wired through the txn
+                        // execution path; reject them explicitly inside MULTI
+                        // (matches handler_single) rather than failing later.
+                        if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR FT.* commands are not supported inside MULTI/EXEC",
+                            )));
+                            continue;
+                        }
+                        // Queue-time validation (Redis CLIENT_DIRTY_EXEC): a
+                        // command that could never run poisons the whole
+                        // transaction HERE, so EXEC refuses everything rather
+                        // than applying the half that happened to be valid.
+                        if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args) {
+                            conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // Blocking commands queue as their non-blocking twin:
+                        // a raw BLPOP reaching EXEC would BLOCK inside the
+                        // transaction — a hang, not a divergence.
+                        if crate::server::conn::blocking::is_blocking_command(cmd) {
+                            conn.command_queue
+                                .push(convert_blocking_to_nonblocking(cmd, cmd_args));
+                        } else {
+                            conn.command_queue.push(frame);
+                        }
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                        continue;
                     }
 
                     // --- CLUSTER subcommands ---
@@ -1176,12 +1257,6 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- BLOCKING COMMANDS ---
                     if crate::server::conn::blocking::is_blocking_command(cmd) {
-                        if conn.in_multi {
-                            let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
-                            conn.command_queue.push(nb_frame);
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
-                            continue;
-                        }
                         // Earlier frames in this batch may hold barrier-pending
                         // local-leg writes — confirm (or fail-loud) them before
                         // this early flush; the replacement of `responses` below
@@ -1287,22 +1362,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
-                    // --- MULTI queue mode ---
-                    if conn.in_multi {
-                        // FT.* vector commands aren't wired through the txn
-                        // execution path; reject them explicitly inside MULTI
-                        // (matches handler_single) instead of an incidental
-                        // later error.
-                        if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                            responses.push(Frame::Error(Bytes::from_static(
-                                b"ERR FT.* commands are not supported inside MULTI/EXEC",
-                            )));
-                            continue;
-                        }
-                        conn.command_queue.push(frame);
-                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
-                        continue;
-                    }
 
                     // --- BGSAVE / SAVE / LASTSAVE / BGREWRITEAOF ---
                     if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
@@ -2571,6 +2630,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 if should_quit { break; }
+
+                // The valid prefix has now been executed and flushed. Name the
+                // fault, then close — in that order, so the client can tell a
+                // bad encoder from a dropped network.
+                if let Some(kind) = proto_fault.take() {
+                    let _ = stream
+                        .write_all(super::util::proto_error_frame(kind).as_bytes())
+                        .await;
+                    break;
+                }
             }
             // CLIENT TRACKING: deliver invalidation Push frames while the
             // connection is idle in read(). Pending-branch when tracking is

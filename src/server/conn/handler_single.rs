@@ -495,16 +495,33 @@ pub async fn handle_connection(
             first_result = framed.next() => {
                 let first_frame = match first_result {
                     Some(Ok(frame)) => frame,
-                    Some(Err(_)) => break,
+                    Some(Err(_)) => {
+                        // Name the fault before closing. Nothing valid
+                        // preceded it — this IS the first frame of the read.
+                        if let Some(kind) = framed.codec_mut().take_last_fault() {
+                            use tokio::io::AsyncWriteExt;
+                            let msg = crate::server::conn::util::proto_error_frame(kind);
+                            let _ = framed.get_mut().write_all(msg.as_bytes()).await;
+                        }
+                        break;
+                    }
                     None => break,
                 };
 
                 // Collect batch: first frame + all immediately available frames
                 let mut batch = vec![first_frame];
                 const MAX_BATCH: usize = 1024;
+                // Set when a later frame in this same read is malformed: the
+                // batch collected so far still runs and is answered, and the
+                // fault is reported after it — never instead of it.
+                let mut proto_fault: Option<crate::protocol::ProtoFault> = None;
                 while batch.len() < MAX_BATCH {
                     match framed.next().now_or_never() {
                         Some(Some(Ok(frame))) => batch.push(frame),
+                        Some(Some(Err(_))) => {
+                            proto_fault = framed.codec_mut().take_last_fault();
+                            break;
+                        }
                         _ => break,
                     }
                 }
@@ -1411,6 +1428,16 @@ pub async fn handle_connection(
                                 ));
                             } else {
                                 conn.in_multi = false;
+                                // A transaction poisoned at queue time
+                                // executes NOTHING (Redis CLIENT_DIRTY_EXEC).
+                                if std::mem::take(&mut conn.multi_dirty) {
+                                    conn.command_queue.clear();
+                                    conn.watched_keys.clear();
+                                    responses.push(
+                                        crate::server::conn::shared::execabort_frame(),
+                                    );
+                                    continue;
+                                }
                                 let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
                                 // PR #282 review: `execute_transaction` holds
                                 // ONE guard on the db selected at EXEC time —
@@ -1580,6 +1607,9 @@ pub async fn handle_connection(
                             } else {
                                 conn.in_multi = false;
                                 conn.command_queue.clear();
+                                // DISCARD clears the poison too, or the NEXT
+                                // transaction aborts for a fault not its own.
+                                conn.multi_dirty = false;
                                 conn.watched_keys.clear();
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
@@ -1732,6 +1762,18 @@ pub async fn handle_connection(
                                 )));
                                 continue;
                             }
+                        }
+                        // Queue-time validation (Redis CLIENT_DIRTY_EXEC): a
+                        // command that could never run poisons the whole
+                        // transaction HERE, so EXEC refuses everything rather
+                        // than applying the half that happened to be valid.
+                        if let Some((cmd, cmd_args)) = extract_command(&frame)
+                            && let Some(err) =
+                                crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
+                        {
+                            conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
                         }
                         conn.command_queue.push(frame);
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
@@ -2867,6 +2909,15 @@ pub async fn handle_connection(
                 arena.reset(); // O(1) bulk deallocation of batch temporaries
 
                 if break_outer || should_quit {
+                    break;
+                }
+
+                // The valid prefix has been executed and flushed. Name the
+                // fault, then close — in that order.
+                if let Some(kind) = proto_fault.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let msg = crate::server::conn::util::proto_error_frame(kind);
+                    let _ = framed.get_mut().write_all(msg.as_bytes()).await;
                     break;
                 }
             }

@@ -2,7 +2,7 @@ use memchr::{memchr, memchr2};
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::frame::{Frame, FrameVec, ParseError};
+use super::frame::{Frame, FrameVec, ParseError, ProtoFault};
 
 /// Parse an inline command from the buffer.
 ///
@@ -32,6 +32,7 @@ pub fn parse_inline(
             // forever. Redis caps this at PROTO_INLINE_MAX_SIZE.
             if buf.len() > max_inline_size {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::InlineTooBig,
                     message: "Protocol error: too big inline request".into(),
                     offset: 0,
                 });
@@ -44,6 +45,7 @@ pub fn parse_inline(
     // any inline request past the cap regardless of termination).
     if crlf_pos > max_inline_size {
         return Err(ParseError::Invalid {
+            kind: ProtoFault::InlineTooBig,
             message: "Protocol error: too big inline request".into(),
             offset: 0,
         });
@@ -51,6 +53,24 @@ pub fn parse_inline(
 
     // Extract line content before CRLF
     let line = &buf[..crlf_pos];
+
+    // Quoted inline arguments take the careful path. Redis parses inline
+    // commands with `sdssplitargs`, which understands quoting and escapes;
+    // Moon used to split on whitespace unconditionally, so `SET k "a b"`
+    // became three arguments with literal quote bytes in them, and an
+    // unterminated quote was silently accepted as part of a key.
+    //
+    // memchr2 over the line is one SIMD pass and is only paid once per inline
+    // command — the unquoted case (every benchmark, every redis-cli one-liner
+    // without spaces in values) keeps the original loop untouched below.
+    if memchr2(b'"', b'\'', line).is_some() {
+        let args = split_args_quoted(line)?;
+        buf.advance(crlf_pos + 2);
+        if args.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(Frame::Array(args)));
+    }
 
     // Split by whitespace (spaces and tabs) using SIMD, filtering empty slices
     let mut args = FrameVec::new();
@@ -87,6 +107,145 @@ pub fn parse_inline(
     }
 
     Ok(Some(Frame::Array(args)))
+}
+
+/// Split an inline command line that contains at least one quote character.
+///
+/// A port of Redis's `sdssplitargs` (`sds.c`), which is what defines inline
+/// argument syntax for every client that speaks it — telnet users, `redis-cli`
+/// pasting a quoted value, and the health-check scripts that send `PING\r\n`
+/// down a bare socket.
+///
+/// Rules, all of them Redis's:
+///   * double quotes honour `\xHH` hex and the `\n \r \t \b \a` escapes;
+///     any other `\<c>` is that literal character.
+///   * single quotes honour only `\'`; everything else is literal.
+///   * a closing quote must be followed by whitespace or end-of-line —
+///     `"foo"bar` is an error, not two tokens.
+///   * an unterminated quote is an error for the whole request.
+///
+/// Returns `ParseError::Invalid` with [`ProtoFault::UnbalancedQuotes`] on any
+/// of the error cases, which the caller turns into Redis's
+/// `-ERR Protocol error: unbalanced quotes in request` and then closes.
+fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
+    #[inline]
+    fn hex_val(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let unbalanced = || ParseError::Invalid {
+        kind: ProtoFault::UnbalancedQuotes,
+        message: "Protocol error: unbalanced quotes in request".into(),
+        offset: 0,
+    };
+
+    let mut args = FrameVec::new();
+    let mut i = 0;
+    loop {
+        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+            i += 1;
+        }
+        if i >= line.len() {
+            return Ok(args);
+        }
+
+        // One token. `current` is only allocated for tokens that actually
+        // need unescaping; a plain token is copied once, same as the fast path.
+        let mut current: Vec<u8> = Vec::new();
+        let quote = match line[i] {
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                Some(q)
+            }
+            _ => None,
+        };
+
+        match quote {
+            Some(b'"') => loop {
+                if i >= line.len() {
+                    return Err(unbalanced());
+                }
+                match line[i] {
+                    b'\\' if i + 3 < line.len() && line[i + 1] == b'x' => {
+                        match (hex_val(line[i + 2]), hex_val(line[i + 3])) {
+                            (Some(hi), Some(lo)) => {
+                                current.push(hi * 16 + lo);
+                                i += 4;
+                            }
+                            // Not a valid hex escape: `\x` is literal, exactly
+                            // as Redis falls through here.
+                            _ => {
+                                current.push(b'x');
+                                i += 2;
+                            }
+                        }
+                    }
+                    b'\\' if i + 1 < line.len() => {
+                        current.push(match line[i + 1] {
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'b' => 0x08,
+                            b'a' => 0x07,
+                            other => other,
+                        });
+                        i += 2;
+                    }
+                    b'"' => {
+                        // A closing quote must end the token.
+                        if i + 1 < line.len() && line[i + 1] != b' ' && line[i + 1] != b'\t' {
+                            return Err(unbalanced());
+                        }
+                        i += 1;
+                        break;
+                    }
+                    c => {
+                        current.push(c);
+                        i += 1;
+                    }
+                }
+            },
+            Some(_) => loop {
+                // Single quotes: only \' is an escape.
+                if i >= line.len() {
+                    return Err(unbalanced());
+                }
+                match line[i] {
+                    b'\\' if i + 1 < line.len() && line[i + 1] == b'\'' => {
+                        current.push(b'\'');
+                        i += 2;
+                    }
+                    b'\'' => {
+                        if i + 1 < line.len() && line[i + 1] != b' ' && line[i + 1] != b'\t' {
+                            return Err(unbalanced());
+                        }
+                        i += 1;
+                        break;
+                    }
+                    c => {
+                        current.push(c);
+                        i += 1;
+                    }
+                }
+            },
+            None => {
+                while i < line.len() {
+                    match line[i] {
+                        b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => break,
+                        c => {
+                            current.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        args.push(Frame::BulkString(Bytes::from(current)));
+    }
 }
 
 /// SIMD-accelerated CRLF position finder. Returns position of \r.

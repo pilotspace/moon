@@ -277,6 +277,19 @@ pub(crate) fn query_buf_exceeded(
 pub(crate) const QUERY_BUF_LIMIT_ERROR: &[u8] =
     b"-ERR Protocol error: query buffer limit reached\r\n";
 
+/// Render a parse fault as the RESP error line Redis would send, CRLF and all.
+///
+/// Every handler funnels through this so the three of them cannot drift: a
+/// protocol fault that reads one way on monoio and another on tokio is a
+/// compatibility bug that no single-runtime CI job would ever catch.
+///
+/// Allocates. That is deliberate and safe: this is reached once per doomed
+/// connection, never on a serving path, so it is not a hot-path allocation in
+/// the sense the coding rules police.
+pub(crate) fn proto_error_frame(kind: crate::protocol::ProtoFault) -> String {
+    format!("-ERR {}\r\n", kind.wire_text_owned())
+}
+
 #[cfg(test)]
 mod query_buf_limit_tests {
     use super::*;

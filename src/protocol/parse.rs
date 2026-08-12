@@ -4,7 +4,7 @@ use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::frame::{Frame, FrameVec, ParseConfig, ParseError};
+use super::frame::{Frame, FrameVec, ParseConfig, ParseError, ProtoFault};
 use super::inline;
 
 /// Attempt to parse one RESP2 frame from the buffer.
@@ -33,6 +33,19 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
     let mut pos = 0;
     match validate_frame(&buf[..], &mut pos, config, 0) {
         Ok(()) => {
+            // A top-level null multibulk (`*-1`, `*-9`, any negative count) is
+            // well-formed but carries no command. Redis consumes it and says
+            // nothing at all. Consume the bytes — so the caller does not spin
+            // on them forever — and report "no frame here", which is exactly
+            // what `Ok(None)` means to the read loops.
+            let is_null_multibulk = buf[0] == b'*'
+                && buf.len() > 1
+                && buf[1] == b'-'
+                && matches!(find_crlf(&buf[..], 1), Some(c) if c == pos - 2);
+            if is_null_multibulk {
+                buf.advance(pos);
+                return Ok(None);
+            }
             // Pass 2: Zero-copy extraction from frozen Bytes
             // split_to moves bytes out of buf; freeze() enables Arc-backed slicing
             let frozen = buf.split_to(pos).freeze();
@@ -265,11 +278,17 @@ fn strict_atoi(line: &[u8]) -> Option<i64> {
 
 /// Read a CRLF-terminated decimal integer from buf at position pos.
 /// Advances pos past the CRLF.
+///
+/// `kind` comes from the caller because this helper serves BOTH bulk headers
+/// (`$`, `=`) and collection counts (`*`/`%`/`~`/`>`), and Redis names those
+/// two faults differently. Hardcoding one here made `$abc` report
+/// "invalid multibulk length" — right machinery, wrong noun.
 #[inline]
-fn read_decimal(buf: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
+fn read_decimal(buf: &[u8], pos: &mut usize, kind: ProtoFault) -> Result<i64, ParseError> {
     let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
     let line = &buf[*pos..crlf];
     let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
+        kind,
         message: format!("invalid decimal: {:?}", String::from_utf8_lossy(line)),
         offset: *pos,
     })?;
@@ -288,6 +307,7 @@ fn validate_frame(
 ) -> Result<(), ParseError> {
     if depth > config.max_array_depth {
         return Err(ParseError::Invalid {
+            kind: ProtoFault::MultibulkLen,
             message: format!(
                 "array nesting depth {} exceeds maximum {}",
                 depth, config.max_array_depth
@@ -313,6 +333,7 @@ fn validate_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
             strict_atoi(line).ok_or_else(|| ParseError::Invalid {
+                kind: ProtoFault::ExpectedDollar(type_byte),
                 message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
                 offset: *pos,
             })?;
@@ -324,11 +345,13 @@ fn validate_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
             let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
+                kind: ProtoFault::ExpectedDollar(type_byte),
                 message: "invalid UTF-8 in double".into(),
                 offset: *pos,
             })?;
             if !matches!(s, "inf" | "-inf" | "nan") {
                 s.parse::<f64>().map_err(|_| ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!("invalid double: {:?}", s),
                     offset: *pos,
                 })?;
@@ -344,6 +367,7 @@ fn validate_frame(
                 b"t" | b"f" => {}
                 _ => {
                     return Err(ParseError::Invalid {
+                        kind: ProtoFault::ExpectedDollar(type_byte),
                         message: format!(
                             "invalid boolean value: {:?}",
                             String::from_utf8_lossy(line)
@@ -360,6 +384,7 @@ fn validate_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             if crlf != *pos {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!(
                         "RESP3 null has trailing data before CRLF at offset {}",
                         *pos
@@ -371,12 +396,13 @@ fn validate_frame(
             Ok(())
         }
         b'$' => {
-            let len = read_decimal(buf, pos)?;
+            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
             if len == -1 {
                 return Ok(());
             } // Null bulk string
             if len < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::BulkLen,
                     message: format!("invalid bulk string length: {}", len),
                     offset: *pos,
                 });
@@ -384,6 +410,7 @@ fn validate_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::BulkLen,
                     message: format!(
                         "bulk string size {} exceeds maximum {}",
                         len, config.max_bulk_string_size
@@ -400,9 +427,10 @@ fn validate_frame(
         }
         b'=' => {
             // VerbatimString: length-prefixed like bulk string
-            let len = read_decimal(buf, pos)?;
+            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
             if len < 4 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!("verbatim string length {} too short", len),
                     offset: *pos,
                 });
@@ -410,6 +438,7 @@ fn validate_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!(
                         "verbatim string size {} exceeds maximum {}",
                         len, config.max_bulk_string_size
@@ -423,6 +452,7 @@ fn validate_frame(
             }
             if buf[*pos + 3] != b':' {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: "verbatim string missing ':' after 3-byte encoding".into(),
                     offset: *pos + 3,
                 });
@@ -432,19 +462,20 @@ fn validate_frame(
         }
         b'*' | b'~' | b'>' => {
             // Array, Set, Push: count + elements
-            let count = read_decimal(buf, pos)?;
-            if count == -1 {
-                return Ok(());
-            } // Null array
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
+            // ANY negative count is a null array, not just -1. Measured
+            // against redis-server 8.6.1: `*-9\r\n` is consumed silently and
+            // the connection keeps serving. Moon used to reject everything
+            // below -1, which turned a harmless (if odd) frame into a
+            // connection kill — the single most surprising divergence in the
+            // whole protocol ground sweep.
             if count < 0 {
-                return Err(ParseError::Invalid {
-                    message: format!("invalid array/set/push length: {}", count),
-                    offset: *pos,
-                });
+                return Ok(());
             }
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -459,12 +490,13 @@ fn validate_frame(
         }
         b'%' => {
             // Map: count pairs
-            let count = read_decimal(buf, pos)?;
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
             if count == -1 {
                 return Ok(()); // Null map
             }
             if count < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!("invalid map length: {}", count),
                     offset: *pos,
                 });
@@ -472,6 +504,7 @@ fn validate_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "map length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -486,6 +519,7 @@ fn validate_frame(
             Ok(())
         }
         byte => Err(ParseError::Invalid {
+            kind: ProtoFault::UnknownType(byte),
             message: format!("unknown type byte: 0x{:02x}", byte),
             offset: *pos - 1,
         }),
@@ -504,6 +538,7 @@ fn parse_single_frame(
 ) -> Result<Frame, ParseError> {
     if depth > config.max_array_depth {
         return Err(ParseError::Invalid {
+            kind: ProtoFault::MultibulkLen,
             message: format!(
                 "array nesting depth {} exceeds maximum {}",
                 depth, config.max_array_depth
@@ -534,6 +569,7 @@ fn parse_single_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
             let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
+                kind: ProtoFault::ExpectedDollar(type_byte),
                 message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
                 offset: *pos,
             })?;
@@ -541,12 +577,13 @@ fn parse_single_frame(
             Ok(Frame::Integer(n))
         }
         b'$' => {
-            let len = read_decimal(buf, pos)?;
+            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
             if len == -1 {
                 return Ok(Frame::Null);
             }
             if len < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::BulkLen,
                     message: format!("invalid bulk string length: {}", len),
                     offset: *pos,
                 });
@@ -554,6 +591,7 @@ fn parse_single_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::BulkLen,
                     message: format!(
                         "bulk string size {} exceeds maximum {}",
                         len, config.max_bulk_string_size
@@ -573,12 +611,13 @@ fn parse_single_frame(
             Ok(frame)
         }
         b'*' => {
-            let count = read_decimal(buf, pos)?;
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
             if count == -1 {
                 return Ok(Frame::Null);
             }
             if count < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!("invalid array length: {}", count),
                     offset: *pos,
                 });
@@ -586,6 +625,7 @@ fn parse_single_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "array length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -605,6 +645,7 @@ fn parse_single_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             if crlf != *pos {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!(
                         "RESP3 null has trailing data before CRLF at offset {}",
                         *pos
@@ -624,6 +665,7 @@ fn parse_single_frame(
                 b"f" => false,
                 _ => {
                     return Err(ParseError::Invalid {
+                        kind: ProtoFault::ExpectedDollar(type_byte),
                         message: format!(
                             "invalid boolean value: {:?}",
                             String::from_utf8_lossy(line)
@@ -640,6 +682,7 @@ fn parse_single_frame(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
             let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
+                kind: ProtoFault::ExpectedDollar(type_byte),
                 message: "invalid UTF-8 in double".into(),
                 offset: *pos,
             })?;
@@ -651,6 +694,7 @@ fn parse_single_frame(
                 f64::NAN
             } else {
                 s.parse::<f64>().map_err(|_| ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!("invalid double: {:?}", s),
                     offset: *pos,
                 })?
@@ -667,9 +711,10 @@ fn parse_single_frame(
         }
         b'=' => {
             // RESP3 VerbatimString: `=<len>\r\n<enc>:<data>\r\n`
-            let len = read_decimal(buf, pos)?;
+            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
             if len < 4 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!(
                         "verbatim string length {} too short (minimum 4 for encoding + colon)",
                         len
@@ -680,6 +725,7 @@ fn parse_single_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: format!(
                         "verbatim string size {} exceeds maximum {}",
                         len, config.max_bulk_string_size
@@ -694,6 +740,7 @@ fn parse_single_frame(
             let payload = &buf[*pos..*pos + len];
             if payload[3] != b':' {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::ExpectedDollar(type_byte),
                     message: "verbatim string missing ':' after 3-byte encoding".into(),
                     offset: *pos + 3,
                 });
@@ -705,9 +752,10 @@ fn parse_single_frame(
         }
         b'%' => {
             // RESP3 Map: `%<count>\r\n<key><value>...`
-            let count = read_decimal(buf, pos)?;
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
             if count < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!("invalid map length: {}", count),
                     offset: *pos,
                 });
@@ -715,6 +763,7 @@ fn parse_single_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "map length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -732,9 +781,10 @@ fn parse_single_frame(
         }
         b'~' => {
             // RESP3 Set: `~<count>\r\n<elements...>`
-            let count = read_decimal(buf, pos)?;
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
             if count < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!("invalid set length: {}", count),
                     offset: *pos,
                 });
@@ -742,6 +792,7 @@ fn parse_single_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "set length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -757,9 +808,10 @@ fn parse_single_frame(
         }
         b'>' => {
             // RESP3 Push: `><count>\r\n<elements...>`
-            let count = read_decimal(buf, pos)?;
+            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
             if count < 0 {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!("invalid push length: {}", count),
                     offset: *pos,
                 });
@@ -767,6 +819,7 @@ fn parse_single_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
+                    kind: ProtoFault::MultibulkLen,
                     message: format!(
                         "push length {} exceeds maximum {}",
                         count, config.max_array_length
@@ -781,6 +834,7 @@ fn parse_single_frame(
             Ok(Frame::Push(items))
         }
         byte => Err(ParseError::Invalid {
+            kind: ProtoFault::UnknownType(byte),
             message: format!("unknown type byte: 0x{:02x}", byte),
             offset: *pos - 1,
         }),
