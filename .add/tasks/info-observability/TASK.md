@@ -152,9 +152,15 @@ Assumptions — lowest-confidence first:
     If wrong: the hook has to be threaded through every write command's
     signature — a much larger, more invasive diff than this contract assumes,
     and the §5 scope would need to grow to `src/command/**`.
-  - [ ] Cross-shard notification fan-out can reuse PUBLISH's existing
+  - [x] Cross-shard notification fan-out can reuse PUBLISH's existing
     `all_pubsub_registries` path rather than needing a new SPSC message class.
-    Confirm by reading how PUBLISH fans out before writing the hook.
+    **CONFIRMED** (`handler_monoio/pubsub.rs:60`): PUBLISH resolves targets via
+    `ctx.remote_subscriber_map.read().target_shards(&ch)` and dispatches in
+    per-shard batches. The outbox drain reuses exactly this — no new message
+    class. Filed #474 along the way: the MQ-trigger path
+    (`shard/timers.rs:249`) does the LOCAL publish only and so never reaches a
+    subscriber on another shard; the same mistake is the one `kn9` guards
+    against here.
   - [ ] `instantaneous_ops_per_sec` can be derived from an existing counter
     sampled on the 1s chore, with no new per-command atomic on the hot path.
     Confirm against the existing Stats counters; if it needs a new atomic,
