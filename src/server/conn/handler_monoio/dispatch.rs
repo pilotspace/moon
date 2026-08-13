@@ -664,22 +664,18 @@ pub(super) async fn try_handle_info(
         &ctx.spsc_notifiers,
     )
     .await;
-    let response_text = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-        let resp_frame = conn_cmd::info_with_keyspace(db, cmd_args, &keyspace);
-        match resp_frame {
-            Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-            _ => String::new(),
-        }
+    // The real replication section is PASSED IN, not appended: `info()` writes
+    // a stub `# Replication`, so appending produced the section twice and left
+    // section filtering unable to see the final set.
+    let real_repl = ctx
+        .repl_state
+        .as_ref()
+        .and_then(|rs| rs.try_read())
+        .map(|rs_guard| crate::replication::handshake::build_info_replication(&rs_guard));
+    let resp_frame = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+        conn_cmd::info_with_keyspace_and_replication(db, cmd_args, &keyspace, real_repl.as_deref())
     });
-    let mut response_text = response_text;
-    if let Some(ref rs) = ctx.repl_state {
-        if let Some(rs_guard) = rs.try_read() {
-            response_text.push_str(&crate::replication::handshake::build_info_replication(
-                &rs_guard,
-            ));
-        }
-    }
-    responses.push(Frame::BulkString(Bytes::from(response_text)));
+    responses.push(resp_frame);
     true
 }
 

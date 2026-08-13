@@ -165,9 +165,18 @@ Assumptions — lowest-confidence first:
     sampled on the 1s chore, with no new per-command atomic on the hot path.
     Confirm against the existing Stats counters; if it needs a new atomic,
     drop the field rather than pay hot-path cost (Must says omit, never lie).
-  - [ ] Moon's `# Reclamation` and duplicate `# Replication` come from a path
+  - [x] Moon's `# Reclamation` and duplicate `# Replication` come from a path
     outside `connection.rs:info`; the section filter must cover that path too
-    or filtering will silently leak sections. Confirm by locating the injector.
+    or filtering will silently leak sections. **CONFIRMED, and located.**
+    `connection.rs:426` writes a STUB `# Replication`, then all three handlers
+    append the REAL one from `replication::handshake::build_info_replication`
+    (`handler_monoio/dispatch.rs:677`, `handler_sharded/dispatch.rs:369`,
+    `handler_single.rs:1078`). That is the duplicate. `# Reclamation` is
+    written from inside `info()` (`connection.rs:391`) and is fine.
+    Consequence: INFO has THREE assembly points, so a filter applied only in
+    `connection.rs` would leak the replication section on every request. The
+    fix is to give `info()` the real section and delete the append — which
+    requires touching the handlers, hence the §3 scope amendment below.
 </assumptions>
 
 ---
@@ -367,6 +376,14 @@ pub fn info_sections(db: &Database, sections: &[&str], keyspace: &[(u64,u64)]) -
   - `src/command/introspect.rs` (CONFIG GET/SET wiring)
   - `tests/info_observability.rs` (new) · `tests/keyspace_notifications.rs` (new)
   - `scripts/client-compat/manifest.yaml` · `CHANGELOG.md`
+  - `src/server/conn/handler_monoio/dispatch.rs` · `handler_sharded/dispatch.rs` ·
+    `handler_single.rs` — **added by amendment (contract still DRAFT)**. INFO
+    has three assembly points, not one: each handler appends the real
+    `# Replication` section after `info()` has already written a stub. A filter
+    applied only in `connection.rs` would leak that section on every request,
+    and the duplicate-header Must (`io6`) cannot be satisfied without deleting
+    the append. Scope is limited to passing the real section into `info()` and
+    removing the append — no other handler behaviour changes.
   - **Out of scope:** `src/command/**` other than `connection.rs`/`introspect.rs`.
     If the outbox turns out to need per-command call sites, that is a contract
     change, not a build decision.

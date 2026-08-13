@@ -1065,20 +1065,20 @@ pub async fn handle_connection(
                                         (g.logical_len() as u64, g.expires_count() as u64)
                                     })
                                     .collect();
+                                // Passed in rather than appended — appending
+                                // emitted `# Replication` twice.
+                                let real_repl = rs.try_read().map(|rs_guard| {
+                                    crate::replication::handshake::build_info_replication(&rs_guard)
+                                });
                                 let guard = db[conn.selected_db].read();
-                                let resp_frame =
-                                    conn_cmd::info_with_keyspace(&guard, cmd_args, &keyspace);
+                                let resp_frame = conn_cmd::info_with_keyspace_and_replication(
+                                    &guard,
+                                    cmd_args,
+                                    &keyspace,
+                                    real_repl.as_deref(),
+                                );
                                 drop(guard);
-                                let mut response_text = match resp_frame {
-                                    Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-                                    _ => String::new(),
-                                };
-                                if let Some(rs_guard) = rs.try_read() {
-                                    response_text.push_str(
-                                        &crate::replication::handshake::build_info_replication(&rs_guard),
-                                    );
-                                }
-                                responses.push(Frame::BulkString(Bytes::from(response_text)));
+                                responses.push(resp_frame);
                                 continue;
                             }
                             // Fall through to normal dispatch if no repl_state

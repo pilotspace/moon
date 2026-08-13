@@ -12,6 +12,7 @@ pub mod helpers;
 pub mod hll;
 pub mod identity;
 pub mod info_reclamation;
+pub mod info_sections;
 pub mod introspect;
 pub mod key;
 pub mod key_extra;
