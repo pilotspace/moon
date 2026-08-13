@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`maxmemory` now bounds what the process actually costs, not what the allocator says is live.**
+  A live instance ran for an hour with `used_memory:4.21G` against a **10 GB** real footprint —
+  a 2.3x gap — so a 19.2 GB cap never engaged, eviction never fired (`spill_batches_flushed:0`),
+  and the OS reclaimed by swapping 9.9 GB instead: 76M page faults and 53 GB read back off disk.
+  Activity Monitor showing "Real Memory 66 MB" was the *symptom*, not the reassurance it looks
+  like — that is the residue left after everything else was paged out. The eviction budget is now
+  scaled by how far real footprint exceeds accounted memory, so the cap holds against the number
+  the machine is charged for. Two things this fix needed to get right, both caught before merge:
+  the macOS reader was pulling `resident_size` (offset 16 of `task_vm_info_data_t`) rather than
+  `phys_footprint` (offset 144), which on a swapped-out process reports 91 MB for a 10 GB
+  instance and would have made the whole correction inert; and the ratio must ignore fixed
+  process overhead — binary, thread stacks, arena metadata cost tens of MB before a single key
+  exists — so it prices only the marginal cost of the data over a startup baseline and stays
+  inert below 64 MiB of accounted memory. `INFO memory` gained `mem_fragmentation_ratio` and
+  `maxmemory`, and `used_memory_rss` now reports footprint rather than a resident figure that
+  understates the truth by two orders of magnitude under swap.
 - **A malformed frame no longer closes the connection silently, and no longer eats the valid
   commands that arrived with it.** `Err(_) => break` in the read loops discarded two things: the
   parse error's reason, so a client got a bare FIN and could not tell a bad encoder from a dropped
