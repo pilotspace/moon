@@ -53,6 +53,15 @@ pub fn publish_maxmemory(bytes: u64) {
     MAXMEMORY_GLOBAL.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The configured `maxmemory` in bytes, 0 when unlimited.
+///
+/// Reads the same published atomic the eviction gate uses, so INFO cannot
+/// disagree with the value actually being enforced.
+#[inline]
+pub fn maxmemory_bytes() -> u64 {
+    MAXMEMORY_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `true` iff `maxmemory` is currently nonzero (i.e. a limit is configured).
 /// Lock-free: a single Relaxed atomic load, safe to call on every SPSC drain
 /// cycle or Lua `redis.call`/`redis.pcall` invocation.
@@ -458,7 +467,14 @@ pub fn evict_to_budget(
     // once accounted memory passes ~8.3 GB, holding REAL footprint near the
     // configured limit — which is what the operator asked for.
     let budget = {
-        let ratio = crate::admin::metrics_setup::footprint_ratio(db.estimated_memory() as u64);
+        // Denominator must be the WHOLE instance's accounted memory, not this
+        // shard's slice. `process_footprint_bytes()` covers the entire
+        // process, so dividing it by one shard's `estimated_memory()` inflates
+        // the ratio by roughly the shard count and would evict N times too
+        // aggressively at `--shards N`. Caught by the eviction budget tests.
+        let ratio = crate::admin::metrics_setup::footprint_ratio(
+            crate::admin::metrics_setup::logical_used_memory_bytes() as u64,
+        );
         if ratio > 1.0 {
             ((budget as f64) / ratio) as usize
         } else {

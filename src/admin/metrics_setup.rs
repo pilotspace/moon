@@ -1898,6 +1898,21 @@ mod footprint_tests {
     }
 
     #[test]
+    fn ratio_denominator_must_be_instance_wide_not_per_shard() {
+        // Regression: the first version of the eviction budget scaling divided
+        // the WHOLE-PROCESS footprint by ONE SHARD's estimated_memory. At
+        // `--shards N` that inflates the ratio by ~N and evicts N times too
+        // aggressively. This asserts the shape of the mistake: a small
+        // denominator against a process-sized numerator saturates the clamp.
+        let per_shard_sized = 1024u64; // what one shard might report
+        let instance_sized = process_footprint_bytes().max(1);
+        assert!(
+            footprint_ratio(per_shard_sized) >= footprint_ratio(instance_sized),
+            "a per-shard denominator yields a LARGER ratio than an              instance-wide one — that is the bug, and the caller must pass              logical_used_memory_bytes(), not db.estimated_memory()"
+        );
+    }
+
+    #[test]
     fn footprint_is_measurable_on_this_platform() {
         // Guards the offset/flavor constants: a wrong TASK_VM_INFO layout
         // reads as 0 and silently disables the whole mechanism.

@@ -249,7 +249,8 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          used_memory_peak:{rss}\r\n\
          allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
          pagecache_bytes:{pagecache_bytes}\r\n\
-         mem_fragmentation_ratio:{frag:.2}\r\n",
+         mem_fragmentation_ratio:{frag:.2}\r\n\
+         maxmemory:{maxmemory}\r\n",
         used_memory = used_memory,
         human = format_memory_human(used_memory),
         rss = rss,
@@ -258,6 +259,9 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         // The gap operators currently cannot see. Redis's field name, so
         // existing dashboards pick it up without translation.
         frag = crate::admin::metrics_setup::footprint_ratio(used_memory),
+        // Read from the same atomic the eviction gate enforces, so INFO can
+        // never report a cap different from the one actually applied.
+        maxmemory = crate::storage::eviction::maxmemory_bytes(),
     );
 
     // Allocator counters, Redis's `allocator_*` field names so existing
