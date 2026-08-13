@@ -29,6 +29,12 @@ pub fn config_get(
         (b"maxmemory" as &[u8], runtime_config.maxmemory.to_string()),
         (b"maxmemory-policy", runtime_config.maxmemory_policy.clone()),
         (
+            // Canonical form, not the caller's spelling: `CONFIG SET KEA`
+            // reads back `AKE`, and clients compare the readback.
+            b"notify-keyspace-events",
+            crate::notify::flags_to_string(crate::notify::published_flags()),
+        ),
+        (
             b"maxmemory-samples",
             runtime_config.maxmemory_samples.to_string(),
         ),
@@ -164,6 +170,18 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     )));
                 }
             }
+            "notify-keyspace-events" => match crate::notify::parse_flags(&value_str) {
+                Ok(flags) => crate::notify::publish_flags(flags),
+                Err(reason) => {
+                    // Redis wraps the class-set message in its generic CONFIG
+                    // SET failure envelope; config-management tooling matches
+                    // on the tail, so both halves are reproduced verbatim.
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         'notify-keyspace-events') - {reason}"
+                    )));
+                }
+            },
             "maxmemory-samples" => match value_str.parse::<usize>() {
                 Ok(v) if v > 0 => runtime_config.maxmemory_samples = v,
                 _ => {
