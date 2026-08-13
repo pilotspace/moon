@@ -51,6 +51,16 @@ pub(crate) fn run_active_expiry(
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 crate::server::expiration::expire_cycle_direct(db, &mut |key| {
+                    // Cache-invalidation consumers subscribe to this to drop
+                    // their copy. Queued here and delivered by the shard
+                    // loop's own drain — there is no connection to attribute
+                    // an expiry to.
+                    crate::notify::notify_keyspace_event(
+                        crate::notify::NotifyFlags::EXPIRED,
+                        "expired",
+                        key,
+                        i,
+                    );
                     crate::replication::reason_del::record_reason_del(
                         key,
                         i,

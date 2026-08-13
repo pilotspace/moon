@@ -129,11 +129,16 @@ impl Shard {
         };
         let databases: Vec<Database> = (0..num_databases)
             .map(|i| {
-                if i == 0 {
+                let mut db = if i == 0 {
                     Database::with_capacity(per_shard_hint)
                 } else {
                     Database::new()
-                }
+                };
+                // Keyspace notifications name the db in their channel
+                // (`__keyspace@<db>__:<key>`), and command code only ever sees
+                // a `&Database` — this is where that identity is stamped.
+                db.db_index = i;
+                db
             })
             .collect();
         Shard {

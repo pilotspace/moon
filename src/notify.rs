@@ -169,6 +169,111 @@ pub fn notifications_enabled() -> bool {
     published_flags().is_enabled()
 }
 
+/// One event waiting to be published, produced by command code and consumed
+/// by whichever layer owns this shard's cross-shard mesh.
+#[derive(Debug, Clone)]
+pub struct PendingNotification {
+    /// Logical db the key lives in — part of both channel names.
+    pub db: usize,
+    /// Event name, e.g. `set`, `incrby`, `rename_from`. Always a literal:
+    /// event names are a closed set, so this costs no allocation.
+    pub event: &'static str,
+    /// The key the event is about.
+    pub key: bytes::Bytes,
+}
+
+thread_local! {
+    /// Per-shard-thread outbox.
+    ///
+    /// Command code cannot publish directly: it has no access to the pub/sub
+    /// registries, and — the real constraint — a subscriber's task lives on
+    /// another shard thread, where a `Waker` from this thread does not reach
+    /// it (see the monoio note in CLAUDE.md). So events are queued here and
+    /// drained by a layer that holds the SPSC mesh, which is the only
+    /// cross-thread wake that works.
+    ///
+    /// Thread-local rather than a field on the shard: expiry and eviction
+    /// notify from the shard timer, command dispatch notifies from three
+    /// different handlers, and threading a handle through all of them would
+    /// touch every signature on the write path.
+    static OUTBOX: std::cell::RefCell<Vec<PendingNotification>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Queue one keyspace event, if its class is enabled.
+///
+/// The disabled path is a Relaxed load and two masks — no allocation, no
+/// lock, no thread-local access — which is what lets this sit on the write
+/// path of every mutating command.
+#[inline]
+pub fn notify_keyspace_event(class: NotifyFlags, event: &'static str, key: &[u8], db: usize) {
+    let flags = published_flags();
+    if !flags.is_enabled() || !flags.intersects(class) {
+        return;
+    }
+    let pending = PendingNotification {
+        db,
+        event,
+        key: bytes::Bytes::copy_from_slice(key),
+    };
+    OUTBOX.with(|o| o.borrow_mut().push(pending));
+}
+
+/// Take everything queued on this thread, leaving the outbox empty.
+///
+/// Returns `None` when there is nothing pending, so the overwhelmingly common
+/// case allocates nothing and the caller can skip its fan-out entirely.
+#[inline]
+pub fn take_outbox() -> Option<Vec<PendingNotification>> {
+    OUTBOX.with(|o| {
+        let mut b = o.borrow_mut();
+        if b.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *b))
+        }
+    })
+}
+
+/// `true` when this thread has queued events. A borrow-and-check, cheaper
+/// than [`take_outbox`] for a caller that only wants to know.
+#[inline]
+pub fn outbox_is_empty() -> bool {
+    OUTBOX.with(|o| o.borrow().is_empty())
+}
+
+/// Render the `(channel, payload)` pairs one event publishes.
+///
+/// The two channels are INVERTED with respect to each other, which is the
+/// detail consumers get wrong: `__keyspace@<db>__:<key>` carries the EVENT,
+/// while `__keyevent@<db>__:<event>` carries the KEY.
+pub fn channels_for(
+    n: &PendingNotification,
+    flags: NotifyFlags,
+) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+    let mut out = Vec::with_capacity(2);
+    if flags.contains(NotifyFlags::KEYSPACE) {
+        let mut ch = Vec::with_capacity(16 + n.key.len());
+        ch.extend_from_slice(b"__keyspace@");
+        ch.extend_from_slice(itoa::Buffer::new().format(n.db).as_bytes());
+        ch.extend_from_slice(b"__:");
+        ch.extend_from_slice(&n.key);
+        out.push((
+            bytes::Bytes::from(ch),
+            bytes::Bytes::from_static(n.event.as_bytes()),
+        ));
+    }
+    if flags.contains(NotifyFlags::KEYEVENT) {
+        let mut ch = Vec::with_capacity(16 + n.event.len());
+        ch.extend_from_slice(b"__keyevent@");
+        ch.extend_from_slice(itoa::Buffer::new().format(n.db).as_bytes());
+        ch.extend_from_slice(b"__:");
+        ch.extend_from_slice(n.event.as_bytes());
+        out.push((bytes::Bytes::from(ch), n.key.clone()));
+    }
+    out
+}
+
 /// The valid characters, in the order Redis names them in its error message.
 pub const VALID_FLAG_CHARS: &str = "Ag$lshzxeKEtmdn";
 

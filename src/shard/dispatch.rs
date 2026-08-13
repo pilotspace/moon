@@ -834,6 +834,15 @@ pub enum ShardMessage {
         pairs: Vec<(Bytes, Bytes)>,
         slot: std::sync::Arc<PubSubResponseSlot>,
     },
+    /// Keyspace-notification fan-out: publish these `(channel, payload)` pairs
+    /// into the target shard's registry.
+    ///
+    /// Deliberately has NO response slot, unlike `PubSubPublish`: a
+    /// notification has no return value, so the producer never waits and the
+    /// drain can stay synchronous. That is what lets it be called from the
+    /// shard timer (expiry, eviction) as well as from the connection layer.
+    /// Boxed to keep the enum small — this variant is off the hot path.
+    NotifyPublish(Box<Vec<(Bytes, Bytes)>>),
     /// Swap two databases within this shard (SWAPDB implementation).
     ///
     /// The SPSC handler emits a per-shard WAL record before performing the swap,

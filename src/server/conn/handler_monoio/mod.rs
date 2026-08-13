@@ -3294,6 +3294,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // parks holding the 1024-frame high-water (~74 KB each — the E5
         // permanent-ratchet finding). Sustained >256-frame pipelines pay one
         // shrink+regrow per batch (~sub-µs vs a 1024-command batch).
+        // Deliver anything the batch's commands queued. Here rather than
+        // per-command: a pipeline of 1000 SETs then costs one fan-out per
+        // target shard instead of 1000, and the connection is about to park in
+        // read() anyway. With notifications off this is one thread-local
+        // borrow of an empty Vec.
+        crate::notify_fanout::flush_from_connection(ctx);
+
         responses.clear();
         super::util::shrink_batch_vec(&mut responses);
         frames.clear();

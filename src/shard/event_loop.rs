@@ -1472,6 +1472,20 @@ impl super::Shard {
                         spsc_notify_local.notify_one();
                         crate::admin::metrics_setup::bump_spsc_drain_renotify();
                     }
+                    // Deliver keyspace events produced ON THIS SHARD THREAD:
+                    // a write routed here from another shard's connection
+                    // executes here, and TTL expiry / eviction have no
+                    // connection at all. The connection-side drain sees
+                    // neither. Mirrored in the monoio arm below — this block
+                    // is `#[cfg(runtime-tokio)]`, and putting it in only one
+                    // of the two arms is invisible to the other runtime's CI.
+                    crate::notify_fanout::flush_from_shard(
+                        shard_id,
+                        &pubsub_arc,
+                        &remote_sub_map_arc,
+                        &dispatch_tx,
+                        &all_notifiers,
+                    );
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
                     if autovacuum_daemon.maintenance_schedule.is_dirty() {
                         if let Some(ref dir) = persistence_dir {
@@ -1577,6 +1591,20 @@ impl super::Shard {
                         spsc_notify_local.notify_one();
                         crate::admin::metrics_setup::bump_spsc_drain_renotify();
                     }
+                    // Deliver keyspace events produced ON THIS SHARD THREAD:
+                    // a write routed here from another shard's connection
+                    // executes here, and TTL expiry / eviction have no
+                    // connection at all. The connection-side drain sees
+                    // neither. Mirrored in the monoio arm below — this block
+                    // is `#[cfg(runtime-tokio)]`, and putting it in only one
+                    // of the two arms is invisible to the other runtime's CI.
+                    crate::notify_fanout::flush_from_shard(
+                        shard_id,
+                        &pubsub_arc,
+                        &remote_sub_map_arc,
+                        &dispatch_tx,
+                        &all_notifiers,
+                    );
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
                     if autovacuum_daemon.maintenance_schedule.is_dirty() {
                         if let Some(ref dir) = persistence_dir {
@@ -2308,6 +2336,17 @@ impl super::Shard {
                     let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                     cdc_registry.register_pending(pending_cdc_subscribes.drain(..), wal_dir);
                 }
+                // Deliver keyspace events produced ON THIS SHARD THREAD: a
+                // write routed here from another shard's connection executes
+                // here, and TTL expiry / eviction have no connection at all.
+                // The connection-side drain cannot see either.
+                crate::notify_fanout::flush_from_shard(
+                    shard_id,
+                    &pubsub_arc,
+                    &remote_sub_map_arc,
+                    &dispatch_tx,
+                    &all_notifiers,
+                );
                 persistence_tick::handle_pending_snapshot(
                     pending_snapshot,
                     &mut snapshot_state,

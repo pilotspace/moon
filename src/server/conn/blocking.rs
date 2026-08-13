@@ -1771,6 +1771,13 @@ pub(crate) fn try_inline_dispatch(
                         write_buf.extend_from_slice(b"\r\n");
                         write_buf.extend_from_slice(val);
                         write_buf.extend_from_slice(b"\r\n");
+                        // This is the route a plain `GET key` actually takes
+                        // under monoio — it frames the reply here and returns,
+                        // reaching NEITHER `get` nor `get_readonly`. Without
+                        // this call `keyspace_hits` stayed at zero on the
+                        // shipped runtime while reading correct under tokio,
+                        // which is why it survived CI (#477).
+                        crate::admin::metrics_setup::record_keyspace_hit();
                         (GetOutcome::Handled, None)
                     }
                     None => {
@@ -1822,6 +1829,16 @@ pub(crate) fn try_inline_dispatch(
                     Some(_) => return 0,
                     None => {
                         write_buf.extend_from_slice(b"$-1\r\n");
+                        crate::admin::metrics_setup::record_keyspace_miss();
+                        // Queued, delivered by this shard's own drain. 'm' is
+                        // not in the 'A' class, so this is inert unless an
+                        // operator asked for keymiss explicitly.
+                        crate::notify::notify_keyspace_event(
+                            crate::notify::NotifyFlags::KEY_MISS,
+                            "keymiss",
+                            key_bytes,
+                            selected_db,
+                        );
                     }
                 }
             }
@@ -1952,6 +1969,16 @@ pub(crate) fn try_inline_dispatch(
             let mut entry = crate::storage::entry::Entry::new_string(value);
             entry.set_last_access(db.now());
             entry.set_access_counter(5);
+            // Same reason as the inline GET above: a plain `SET k v` is served
+            // HERE and never reaches `string::set`, so the notification has to
+            // be queued on this path too or it exists only for SETs complex
+            // enough to fall out of the fast path.
+            crate::notify::notify_keyspace_event(
+                crate::notify::NotifyFlags::STRING,
+                "set",
+                &key,
+                selected_db,
+            );
             db.set(key, entry);
         });
     }

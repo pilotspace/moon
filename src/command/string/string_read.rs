@@ -28,6 +28,15 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
         }
         None => {
             crate::admin::metrics_setup::record_keyspace_miss();
+            // 'm' is NOT in the 'A' class, so this is silent unless an
+            // operator asked for it explicitly — publishing on every miss
+            // would put a pub/sub fan-out on the read path.
+            crate::notify::notify_keyspace_event(
+                crate::notify::NotifyFlags::KEY_MISS,
+                "keymiss",
+                key,
+                db.db_index,
+            );
             Frame::Null
         }
     }
@@ -361,6 +370,12 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 }
             } else {
                 crate::admin::metrics_setup::record_keyspace_miss();
+                crate::notify::notify_keyspace_event(
+                    crate::notify::NotifyFlags::KEY_MISS,
+                    "keymiss",
+                    key,
+                    db.db_index,
+                );
                 Frame::Null
             }
         }

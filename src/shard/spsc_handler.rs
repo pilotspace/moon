@@ -1999,6 +1999,14 @@ pub(crate) fn handle_shard_message_shared(
                 crate::pubsub::publish_shared(pubsub_registry, &payload.channel, &payload.message);
             payload.slot.add(count);
         }
+        ShardMessage::NotifyPublish(pairs) => {
+            for (channel, message) in pairs.iter() {
+                // Return value discarded on purpose: a keyspace notification
+                // has no subscriber count to report back, and a channel with
+                // no subscriber on this shard is the normal case.
+                crate::pubsub::publish_shared(pubsub_registry, channel, message);
+            }
+        }
         ShardMessage::PubSubPublishBatch { pairs, slot } => {
             let mut batch_total: i64 = 0;
             for (i, (channel, message)) in pairs.iter().enumerate() {
