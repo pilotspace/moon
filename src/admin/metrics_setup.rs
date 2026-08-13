@@ -3,7 +3,7 @@
 //! Uses the `metrics` facade crate so metric recording is a single atomic
 //! operation on the hot path (counter increment or histogram observation).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use metrics::{Unit, counter, describe_gauge, gauge, histogram};
 
@@ -62,6 +62,13 @@ static NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// the delta since the previous sample, NOT a per-command computation.
 static OPS_LAST_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static OPS_PER_SEC: AtomicU64 = AtomicU64::new(0);
+/// Clients currently parked in a blocking command. A GAUGE, not a counter:
+/// the per-shard `BlockingRegistry` that owns the truth is an `Rc<RefCell<_>>`
+/// pinned to its shard thread, so INFO — which runs on whichever thread the
+/// asking connection landed on — cannot read it directly. Maintained instead
+/// at the registry's two `wait_keys` transitions, which are the exact points a
+/// client becomes and stops being blocked.
+static BLOCKED_CLIENTS: AtomicI64 = AtomicI64::new(0);
 
 /// Count one cooperative yield taken by the FT.SEARCH local slice (per chunk).
 #[inline]
@@ -1677,6 +1684,27 @@ pub fn total_net_input_bytes() -> u64 {
 /// Bytes written to clients since start.
 pub fn total_net_output_bytes() -> u64 {
     NET_OUTPUT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Clients currently parked in a blocking command (BLPOP, BRPOP, XREAD …).
+///
+/// Never negative: a decrement that would go below zero means a
+/// block/unblock pair was mismatched, and reporting a negative gauge would
+/// turn a bookkeeping bug into a nonsense dashboard.
+pub fn blocked_clients() -> u64 {
+    BLOCKED_CLIENTS.load(Ordering::Relaxed).max(0) as u64
+}
+
+/// A client entered a blocking wait.
+#[inline]
+pub fn record_client_blocked() {
+    BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A client left a blocking wait — served, timed out, or cancelled.
+#[inline]
+pub fn record_client_unblocked() {
+    BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Commands per second over the last sampling window.

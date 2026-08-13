@@ -1132,6 +1132,9 @@ fn main() -> anyhow::Result<()> {
     // any server launched with --maxmemory (until the first CONFIG SET).
     moon::storage::eviction::publish_maxmemory(runtime_config_shared.read().maxmemory as u64);
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    moon::storage::eviction::publish_maxmemory_policy(
+        &runtime_config_shared.read().maxmemory_policy,
+    );
     // Record what the process costs the OS with no dataset in it. The eviction
     // budget is scaled by how far real footprint exceeds accounted memory, and
     // that comparison is only meaningful on the MARGINAL cost of the data —

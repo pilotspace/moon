@@ -192,6 +192,14 @@ pub struct Database {
     /// self-reset gate in `expire_cycle`). The scan-based reset costs O(N)
     /// but happens at most once per "expiring key drained" transition.
     maybe_has_expiring_keys: bool,
+    /// Logical db this instance holds (0..databases).
+    ///
+    /// Needed because a keyspace notification's channel names embed it
+    /// (`__keyspace@<db>__:<key>`), and command code is handed a `&Database`
+    /// with no other way to know which one it has. Set once by the shard when
+    /// it builds its database array; `Database::new()` defaults it to 0, which
+    /// is correct for the single-db paths (tests, embedded) that use it.
+    pub db_index: usize,
     /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
     /// Shard directory for cold reads (None when disk-offload disabled).
@@ -288,6 +296,7 @@ impl Database {
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
             maybe_has_expiring_keys: false,
+            db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
@@ -314,6 +323,7 @@ impl Database {
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
             maybe_has_expiring_keys: false,
+            db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),

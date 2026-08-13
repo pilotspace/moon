@@ -54,6 +54,8 @@ pub mod graph;
 pub mod io;
 pub mod memory_ctl;
 pub mod mq;
+pub mod notify;
+pub mod notify_fanout;
 pub mod persistence;
 pub mod protocol;
 pub mod pubsub;

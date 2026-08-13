@@ -2570,6 +2570,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     return (HandlerResult::Done, None);
                 }
 
+                // Deliver anything this batch's commands queued. Once per
+                // batch, not per command: a 1000-command pipeline then costs
+                // one fan-out per target shard. With notifications off it is a
+                // thread-local borrow of an empty Vec.
+                crate::notify_fanout::flush_from_connection(ctx);
+
                 // E4: a timed-out cross-shard reply slot must never be reused
                 // — the error replies are flushed above, now close.
                 if xshard_reply_fatal {

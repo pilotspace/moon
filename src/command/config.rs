@@ -29,6 +29,12 @@ pub fn config_get(
         (b"maxmemory" as &[u8], runtime_config.maxmemory.to_string()),
         (b"maxmemory-policy", runtime_config.maxmemory_policy.clone()),
         (
+            // Canonical form, not the caller's spelling: `CONFIG SET KEA`
+            // reads back `AKE`, and clients compare the readback.
+            b"notify-keyspace-events",
+            crate::notify::flags_to_string(crate::notify::published_flags()),
+        ),
+        (
             b"maxmemory-samples",
             runtime_config.maxmemory_samples.to_string(),
         ),
@@ -153,6 +159,9 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 ];
                 let lower = value_str.to_ascii_lowercase();
                 if valid.contains(&lower.as_str()) {
+                    // Same publish contract as `maxmemory` above: INFO and the
+                    // eviction gate must never name different policies.
+                    crate::storage::eviction::publish_maxmemory_policy(&lower);
                     runtime_config.maxmemory_policy = lower;
                 } else {
                     return Frame::Error(Bytes::from(format!(
@@ -161,6 +170,18 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     )));
                 }
             }
+            "notify-keyspace-events" => match crate::notify::parse_flags(&value_str) {
+                Ok(flags) => crate::notify::publish_flags(flags),
+                Err(reason) => {
+                    // Redis wraps the class-set message in its generic CONFIG
+                    // SET failure envelope; config-management tooling matches
+                    // on the tail, so both halves are reproduced verbatim.
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         'notify-keyspace-events') - {reason}"
+                    )));
+                }
+            },
             "maxmemory-samples" => match value_str.parse::<usize>() {
                 Ok(v) if v > 0 => runtime_config.maxmemory_samples = v,
                 _ => {

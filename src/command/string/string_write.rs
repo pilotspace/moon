@@ -26,6 +26,15 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         let mut entry = Entry::new_string(value);
         entry.set_last_access(db.now());
         entry.set_access_counter(5);
+        // Queued, not published: publishing here would need the pub/sub mesh,
+        // which command code has no access to. When notifications are off this
+        // is one Relaxed load — see `crate::notify`.
+        crate::notify::notify_keyspace_event(
+            crate::notify::NotifyFlags::STRING,
+            "set",
+            &key,
+            db.db_index,
+        );
         db.set(key, entry);
         return ok();
     }
@@ -399,6 +408,14 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
+    // "incrby", not "incr": Redis names the internal operation, not the
+    // command the client typed, so INCR/DECR/INCRBY/DECRBY all report this.
+    crate::notify::notify_keyspace_event(
+        crate::notify::NotifyFlags::STRING,
+        "incrby",
+        key,
+        db.db_index,
+    );
     db.set(key.clone(), entry);
 
     Frame::Integer(new_val)

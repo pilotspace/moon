@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`keyspace_hits` and `keyspace_misses` had been reporting zero for plain `GET`s on the shipped
+  runtime.** `try_inline_dispatch` — the route a plain `GET key` actually takes under monoio —
+  frames its reply straight into the write buffer and returns, reaching neither `string::get` nor
+  `string::get_readonly` where the recorders live. Every hit-rate dashboard built on those two
+  fields has been dividing by zero-over-zero. The reason it survived CI is worth stating: the
+  counters read CORRECTLY under `runtime-tokio`, which is what the test matrix ran, so a test that
+  proved the fix under tokio passed while the shipped runtime stayed broken. The inline path now
+  records hit, miss, and the `keymiss` notification. (#477)
 - **`maxmemory` now bounds what the process actually costs, not what the allocator says is live.**
   A live instance ran for an hour with `used_memory:4.21G` against a **10 GB** real footprint —
   a 2.3x gap — so a 19.2 GB cap never engaged, eviction never fired (`spill_batches_flushed:0`),
@@ -47,6 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly below each handler's ACL gate, which fixes the whole class at once.
 
 ### Added
+- **Keyspace notifications (`notify-keyspace-events`).** Moon had none: cache-invalidation
+  frameworks and change-data-capture consumers subscribe to `__keyspace@<db>__:<key>` and
+  `__keyevent@<db>__:<event>` and got silence. Both channel families are now published, gated by
+  the full Redis flag model — including the parts that are not what the letters suggest, all
+  measured against redis-server 8.6.1 rather than recalled: `CONFIG SET KEA` reads back as `AKE`,
+  `mn` as `nm`, `Km` as `Km`, and `A` deliberately excludes `m` (keymiss) and `n` (newkey) so it
+  stays safe to enable in production. Events wired: `set`, `incrby` (INCR publishes `incrby`, not
+  `incr`), `rename_from`/`rename_to` (RENAME emits BOTH halves, carrying different keys),
+  `expired`, `keymiss`. Off by default and genuinely zero-cost when off — one relaxed atomic load.
+  Delivery reaches subscribers on **every** shard, not just the one that owns the mutated key: a
+  local-only publish would pass at `--shards 1` and silently drop roughly (N-1)/N of events at
+  `--shards N`.
 - **`ROLE`, `RESET`, and a real `COMMAND` introspection surface.** `COMMAND` and `COMMAND COUNT`
   each returned the OTHER'S RESP TYPE — bare `COMMAND` replied `:0` (an Integer where an Array
   belongs) and `COMMAND COUNT` replied `*0` (an Array where an Integer belongs); `COMMAND

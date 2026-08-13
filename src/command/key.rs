@@ -840,6 +840,22 @@ pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
     let entry = db.remove(src).unwrap();
     db.set(Bytes::copy_from_slice(dst), entry);
 
+    // TWO events, not one: a consumer tracking key lifetimes needs to see the
+    // source disappear and the destination appear, and the halves carry
+    // different keys.
+    crate::notify::notify_keyspace_event(
+        crate::notify::NotifyFlags::GENERIC,
+        "rename_from",
+        src,
+        db.db_index,
+    );
+    crate::notify::notify_keyspace_event(
+        crate::notify::NotifyFlags::GENERIC,
+        "rename_to",
+        dst,
+        db.db_index,
+    );
+
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 

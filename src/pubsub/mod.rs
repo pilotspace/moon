@@ -270,6 +270,17 @@ impl PubSubRegistry {
             .collect()
     }
 
+    /// The DISTINCT patterns this registry holds, for INFO's
+    /// `pubsub_patterns`.
+    ///
+    /// Deliberately not [`Self::numpat`], which sums subscribers per pattern:
+    /// INFO reports how many patterns exist, so two clients on one pattern is
+    /// one, and the caller unions these across shards to avoid counting a
+    /// pattern twice when its subscribers landed on different shard threads.
+    pub fn pattern_names(&self) -> Vec<Bytes> {
+        self.patterns.iter().map(|(p, _)| p.clone()).collect()
+    }
+
     /// Return total number of pattern subscriptions across all patterns.
     pub fn numpat(&self) -> usize {
         self.patterns.iter().map(|(_, subs)| subs.len()).sum()
@@ -526,6 +537,26 @@ fn pmessage_frame_push(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Fra
         Frame::BulkString(channel.clone()),
         Frame::BulkString(payload.clone()),
     ])
+}
+
+/// Instance-wide `(pubsub_channels, pubsub_patterns)` for INFO.
+///
+/// Unions across every shard's registry rather than summing: a channel with
+/// subscribers on two shard threads exists in two registries, and reporting it
+/// twice would make a healthy fan-out look like a leak. Mirrors exactly what
+/// `PUBSUB CHANNELS` / `PUBSUB NUMPAT` scatter-gather, so the two surfaces
+/// cannot disagree.
+pub fn instance_pubsub_counts(
+    registries: &[std::sync::Arc<parking_lot::RwLock<PubSubRegistry>>],
+) -> (usize, usize) {
+    let mut channels: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+    let mut patterns: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+    for reg in registries {
+        let guard = reg.read();
+        channels.extend(guard.active_channels(None));
+        patterns.extend(guard.pattern_names());
+    }
+    (channels.len(), patterns.len())
 }
 
 #[cfg(all(test, feature = "runtime-tokio"))]

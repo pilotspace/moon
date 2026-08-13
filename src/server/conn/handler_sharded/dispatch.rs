@@ -357,21 +357,26 @@ pub(super) async fn try_handle_info(
     )
     .await;
     // ShardSlice path: access the local shard's database via thread-local.
-    let mut response_text = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-        let resp_frame = conn_cmd::info_with_keyspace(db, cmd_args, &keyspace);
-        match resp_frame {
-            Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-            _ => String::new(),
-        }
+    // Passed in rather than appended — see the monoio handler for why the
+    // append produced a duplicate `# Replication`.
+    let real_repl = ctx
+        .repl_state
+        .as_ref()
+        .and_then(|rs| rs.try_read())
+        .map(|rs_guard| crate::replication::handshake::build_info_replication(&rs_guard));
+    // Instance-wide pub/sub counts, unioned across every shard's registry —
+    // the same gather `PUBSUB CHANNELS`/`NUMPAT` do, so INFO cannot disagree
+    // with them.
+    let (pubsub_channels, pubsub_patterns) =
+        crate::pubsub::instance_pubsub_counts(&ctx.all_pubsub_registries);
+    let pubsub_facts = conn_cmd::InstanceFacts {
+        pubsub_channels,
+        pubsub_patterns,
+    };
+    let resp_frame = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+        conn_cmd::info_with_facts(db, cmd_args, &keyspace, real_repl.as_deref(), &pubsub_facts)
     });
-    if let Some(ref rs) = ctx.repl_state {
-        if let Some(rs_guard) = rs.try_read() {
-            response_text.push_str(&crate::replication::handshake::build_info_replication(
-                &rs_guard,
-            ));
-        }
-    }
-    responses.push(Frame::BulkString(Bytes::from(response_text)));
+    responses.push(resp_frame);
     true
 }
 
