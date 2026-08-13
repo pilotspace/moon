@@ -332,15 +332,27 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get_if_alive(key, now_ms) {
-        Some(entry) => match entry.value.as_bytes_owned() {
-            Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
-        },
+        Some(entry) => {
+            // This is the path GET actually takes. `dispatch_read` is the hot
+            // read path and calls THIS function, not `get()` — which is where
+            // the recorders previously lived, so `keyspace_hits` and
+            // `keyspace_misses` never moved for a plain GET at all. Both
+            // fields have been reporting zero on every deployment.
+            crate::admin::metrics_setup::record_keyspace_hit();
+            match entry.value.as_bytes_owned() {
+                Some(v) => Frame::BulkString(v),
+                None => Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
+            }
+        }
         None => {
-            // Cold storage fallback: key may have been evicted to NVMe
+            // Cold storage fallback: key may have been evicted to NVMe.
+            // A key found on the cold tier is still a HIT — it existed. Only
+            // the fully-absent case is a miss, or hit-rate dashboards would
+            // read a disk-offload deployment as permanently missing.
             if let Some(value) = db.get_cold_value(key, now_ms) {
+                crate::admin::metrics_setup::record_keyspace_hit();
                 match value {
                     crate::storage::entry::RedisValue::String(v) => Frame::BulkString(v),
                     _ => Frame::Error(Bytes::from_static(
@@ -348,6 +360,7 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                     )),
                 }
             } else {
+                crate::admin::metrics_setup::record_keyspace_miss();
                 Frame::Null
             }
         }
