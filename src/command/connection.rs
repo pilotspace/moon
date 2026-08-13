@@ -197,7 +197,22 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# Memory\r\n");
-    let rss = crate::admin::metrics_setup::get_rss_bytes();
+    // `phys_footprint`, not `resident_size`. On macOS the latter counts only
+    // pages currently in RAM, so a process whose heap has been swapped out
+    // reports a SMALL rss precisely when it is costing the most. Measured on
+    // the live :6381 instance: resident 439 MB against a 10.1 GB footprint,
+    // 9.9 GB of it swapped — INFO read `used_memory:4.21G` and
+    // `used_memory_rss:0.4G`, which looks like excellent efficiency and is in
+    // fact a machine about to thrash. Falls back to the old reading when the
+    // platform cannot answer.
+    let rss = {
+        let fp = crate::admin::metrics_setup::process_footprint_bytes();
+        if fp > 0 {
+            fp
+        } else {
+            crate::admin::metrics_setup::get_rss_bytes()
+        }
+    };
     // Task #56 (used_memory truthfulness): `used_memory` reports the same
     // logical ledger `--maxmemory` eviction actually gates on (KV + its
     // ColdIndex overhead + vector/text/graph resident bytes) -- NOT raw
@@ -233,12 +248,16 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          used_memory_rss:{rss}\r\n\
          used_memory_peak:{rss}\r\n\
          allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
-         pagecache_bytes:{pagecache_bytes}\r\n",
+         pagecache_bytes:{pagecache_bytes}\r\n\
+         mem_fragmentation_ratio:{frag:.2}\r\n",
         used_memory = used_memory,
         human = format_memory_human(used_memory),
         rss = rss,
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
+        // The gap operators currently cannot see. Redis's field name, so
+        // existing dashboards pick it up without translation.
+        frag = crate::admin::metrics_setup::footprint_ratio(used_memory),
     );
 
     // Allocator counters, Redis's `allocator_*` field names so existing
