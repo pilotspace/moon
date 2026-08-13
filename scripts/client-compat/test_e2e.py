@@ -159,14 +159,21 @@ entries:
             self.assertEqual(r.redis_raw, b"+PONG\r\n")
 
     def test_info_manifest_reports_missing_fields_by_name(self):
-        # run_id is emitted by real Redis and not by Moon, so it is a genuine
-        # finding; redis_version is emitted by both.
+        # atomicvar_api is emitted unconditionally by real Redis (it names the
+        # atomics implementation it was built against) and is meaningless for a
+        # Rust server, so Moon will never emit it — which is what makes it a
+        # stable fixture. redis_version is emitted by both.
+        #
+        # This assertion previously pinned run_id, and went stale the moment
+        # Moon implemented it: the fixture failed because the gap it was proving
+        # had been CLOSED. Pick a field Moon cannot plausibly grow, or this test
+        # becomes a tax on every INFO improvement.
         fields = manifest("")  # reuse tempfile helper for a plain list file
         with open(fields, "w") as f:
-            f.write("redis_version\nrun_id\n")
+            f.write("redis_version\natomicvar_api\n")
         report = Runner(cfg(info_manifest=fields)).run()
         missing = [r.name for r in report.results if r.verdict == "diff"]
-        self.assertIn("info:run_id", missing)
+        self.assertIn("info:atomicvar_api", missing)
         self.assertNotIn("info:redis_version", missing)
 
     def test_info_manifest_blames_the_pin_not_moon_when_redis_lacks_it_too(self):
