@@ -44,6 +44,25 @@ static SPSC_NOTIFY_SKIPPED: AtomicU64 = AtomicU64::new(0);
 // of monopolizing the loop. Coarse (≪ per-command rate) ⇒ plain atomic is fine.
 static FT_SEARCH_COOPERATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 
+// ── INFO-readable counters ──────────────────────────────────────────────
+//
+// The `counter!()` macros below feed Prometheus and are gated behind
+// METRICS_INITIALIZED, which is only true when the admin port is up. INFO
+// must report these whether or not anyone scraped Prometheus, so each has an
+// ungated atomic alongside it. Relaxed ordering: these are monotonic
+// observability counters, never used to synchronise anything.
+static KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
+static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
+static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
+static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sampled once per second by the chore tick; `instantaneous_ops_per_sec` is
+/// the delta since the previous sample, NOT a per-command computation.
+static OPS_LAST_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static OPS_PER_SEC: AtomicU64 = AtomicU64::new(0);
+
 /// Count one cooperative yield taken by the FT.SEARCH local slice (per chunk).
 #[inline]
 pub fn bump_ft_search_cooperative_yield() {
@@ -789,6 +808,7 @@ pub fn try_accept_connection(maxclients: usize) -> bool {
 /// Record keyspace hit/miss.
 #[inline]
 pub fn record_keyspace_hit() {
+    KEYSPACE_HITS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -797,6 +817,7 @@ pub fn record_keyspace_hit() {
 
 #[inline]
 pub fn record_keyspace_miss() {
+    KEYSPACE_MISSES.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -808,6 +829,7 @@ pub fn record_keyspace_miss() {
 /// Record an eviction event.
 #[inline]
 pub fn record_eviction() {
+    EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
