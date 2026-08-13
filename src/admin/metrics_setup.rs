@@ -44,6 +44,25 @@ static SPSC_NOTIFY_SKIPPED: AtomicU64 = AtomicU64::new(0);
 // of monopolizing the loop. Coarse (≪ per-command rate) ⇒ plain atomic is fine.
 static FT_SEARCH_COOPERATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 
+// ── INFO-readable counters ──────────────────────────────────────────────
+//
+// The `counter!()` macros below feed Prometheus and are gated behind
+// METRICS_INITIALIZED, which is only true when the admin port is up. INFO
+// must report these whether or not anyone scraped Prometheus, so each has an
+// ungated atomic alongside it. Relaxed ordering: these are monotonic
+// observability counters, never used to synchronise anything.
+static KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
+static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
+static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
+static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sampled once per second by the chore tick; `instantaneous_ops_per_sec` is
+/// the delta since the previous sample, NOT a per-command computation.
+static OPS_LAST_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static OPS_PER_SEC: AtomicU64 = AtomicU64::new(0);
+
 /// Count one cooperative yield taken by the FT.SEARCH local slice (per chunk).
 #[inline]
 pub fn bump_ft_search_cooperative_yield() {
@@ -789,6 +808,7 @@ pub fn try_accept_connection(maxclients: usize) -> bool {
 /// Record keyspace hit/miss.
 #[inline]
 pub fn record_keyspace_hit() {
+    KEYSPACE_HITS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -797,6 +817,7 @@ pub fn record_keyspace_hit() {
 
 #[inline]
 pub fn record_keyspace_miss() {
+    KEYSPACE_MISSES.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -808,6 +829,7 @@ pub fn record_keyspace_miss() {
 /// Record an eviction event.
 #[inline]
 pub fn record_eviction() {
+    EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -1242,6 +1264,12 @@ pub fn get_rss_bytes() -> u64 {
     0
 }
 
+/// Real-footprint measurement lives in its own module; re-exported here
+/// so `metrics_setup::footprint_ratio` and friends keep resolving.
+pub use crate::admin::footprint::{
+    capture_footprint_baseline, footprint_baseline_bytes, footprint_ratio, process_footprint_bytes,
+};
+
 // ── INFO helpers ────────────────────────────────────────────────────────
 
 /// Total commands processed since server start (for INFO Stats).
@@ -1612,6 +1640,82 @@ fn update_moon_memory_bytes() {
     // test can compare moon_memory_bytes sum against moon_rss_bytes from the
     // same scrape (no drift between separate reads).
     update_rss_bytes(rss as u64);
+}
+
+// ── INFO-readable counter accessors ─────────────────────────────────────
+
+/// Number of successful key lookups since start.
+pub fn keyspace_hits() -> u64 {
+    KEYSPACE_HITS.load(Ordering::Relaxed)
+}
+
+/// Number of lookups that found no key since start.
+pub fn keyspace_misses() -> u64 {
+    KEYSPACE_MISSES.load(Ordering::Relaxed)
+}
+
+/// Keys removed because their TTL elapsed.
+pub fn expired_keys() -> u64 {
+    EXPIRED_KEYS.load(Ordering::Relaxed)
+}
+
+/// Keys removed by the maxmemory eviction policy.
+pub fn evicted_keys() -> u64 {
+    EVICTED_KEYS.load(Ordering::Relaxed)
+}
+
+/// Connections refused (limit reached, or rejected before handshake).
+pub fn rejected_connections() -> u64 {
+    REJECTED_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// Bytes read from clients since start.
+pub fn total_net_input_bytes() -> u64 {
+    NET_INPUT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes written to clients since start.
+pub fn total_net_output_bytes() -> u64 {
+    NET_OUTPUT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Commands per second over the last sampling window.
+pub fn instantaneous_ops_per_sec() -> u64 {
+    OPS_PER_SEC.load(Ordering::Relaxed)
+}
+
+/// Record an expired key.
+#[inline]
+pub fn record_expired_key() {
+    EXPIRED_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a refused connection.
+#[inline]
+pub fn record_rejected_connection() {
+    REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record bytes read from / written to clients.
+#[inline]
+pub fn record_net_bytes(input: u64, output: u64) {
+    if input > 0 {
+        NET_INPUT_BYTES.fetch_add(input, Ordering::Relaxed);
+    }
+    if output > 0 {
+        NET_OUTPUT_BYTES.fetch_add(output, Ordering::Relaxed);
+    }
+}
+
+/// Sample the ops-per-second rate. Call once per second from a chore tick.
+///
+/// Deliberately a sampled delta rather than a per-command rate computation:
+/// the alternative would put a timestamp read on the dispatch path for a
+/// field nobody reads more than once a second.
+pub fn sample_ops_per_sec() {
+    let total = total_commands_processed();
+    let prev = OPS_LAST_SAMPLE.swap(total, Ordering::Relaxed);
+    OPS_PER_SEC.store(total.saturating_sub(prev), Ordering::Relaxed);
 }
 
 #[cfg(test)]

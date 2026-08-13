@@ -53,6 +53,15 @@ pub fn publish_maxmemory(bytes: u64) {
     MAXMEMORY_GLOBAL.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The configured `maxmemory` in bytes, 0 when unlimited.
+///
+/// Reads the same published atomic the eviction gate uses, so INFO cannot
+/// disagree with the value actually being enforced.
+#[inline]
+pub fn maxmemory_bytes() -> u64 {
+    MAXMEMORY_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `true` iff `maxmemory` is currently nonzero (i.e. a limit is configured).
 /// Lock-free: a single Relaxed atomic load, safe to call on every SPSC drain
 /// cycle or Lua `redis.call`/`redis.pcall` invocation.
@@ -440,6 +449,37 @@ pub fn evict_to_budget(
         run.budget_override.min(config.maxmemory)
     } else {
         config.maxmemory_per_shard()
+    };
+
+    // Scale the budget down by how far the OS-charged footprint exceeds what
+    // the allocator says is live.
+    //
+    // Without this, `maxmemory` bounds `used_memory` — an accounting figure —
+    // while the process actually costs the OS substantially more. Measured on
+    // a live instance: used_memory 4.21 GB against a 9.7 GB phys_footprint, a
+    // 2.3x gap, of which 9.6 GB had been pushed to swap. maxmemory was set to
+    // 19.2 GB (75% of RAM), so eviction never fired and the OS reclaimed by
+    // swapping instead — the worst outcome for a key-value store. A restart
+    // did NOT help: a fresh heap returned to the same ratio within 30 minutes,
+    // so this is steady-state overhead, not drift that can be reset.
+    //
+    // Dividing by the ratio means a 19.2 GB maxmemory at 2.3x starts evicting
+    // once accounted memory passes ~8.3 GB, holding REAL footprint near the
+    // configured limit — which is what the operator asked for.
+    let budget = {
+        // Denominator must be the WHOLE instance's accounted memory, not this
+        // shard's slice. `process_footprint_bytes()` covers the entire
+        // process, so dividing it by one shard's `estimated_memory()` inflates
+        // the ratio by roughly the shard count and would evict N times too
+        // aggressively at `--shards N`. Caught by the eviction budget tests.
+        let ratio = crate::admin::metrics_setup::footprint_ratio(
+            crate::admin::metrics_setup::logical_used_memory_bytes() as u64,
+        );
+        if ratio > 1.0 {
+            ((budget as f64) / ratio) as usize
+        } else {
+            budget
+        }
     };
 
     let mut sink = run.sink;

@@ -1132,6 +1132,13 @@ fn main() -> anyhow::Result<()> {
     // any server launched with --maxmemory (until the first CONFIG SET).
     moon::storage::eviction::publish_maxmemory(runtime_config_shared.read().maxmemory as u64);
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
+    // Record what the process costs the OS with no dataset in it. The eviction
+    // budget is scaled by how far real footprint exceeds accounted memory, and
+    // that comparison is only meaningful on the MARGINAL cost of the data —
+    // charging the dataset for the binary and thread stacks would shrink the
+    // budget on a nearly-empty instance. Must run before the persistence
+    // recovery below (~L1290) puts keys in the heap.
+    moon::admin::metrics_setup::capture_footprint_baseline();
     // Publish the per-db quota "any set?" atomic (WS5b). Same fail-open
     // rationale as the maxmemory publishes above: a missed publish at
     // startup silently bypasses the inline write path's db-quota pre-gate
