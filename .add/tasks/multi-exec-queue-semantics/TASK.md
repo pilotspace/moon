@@ -2,7 +2,7 @@
 
 slug: multi-exec-queue-semantics · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: ground   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower the
      autonomy level to `manual` or `conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -345,18 +345,64 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 > Pre-declare the OBSERVABLE outcomes a correct build must produce — derived from §2 SCENARIOS
 > + §3 CONTRACT — so this gate checks the build is RIGHT, not merely that tests are green. Each
 > row is evidence you can SEE, not a restatement of a test name.
-- [ ] <observable outcome a correct build must produce> — confirmed by <how / where>
-- [ ] <another observable outcome> — confirmed by <evidence seen>
+- [x] The data-loss case is gone: `MULTI / NOSUCHCMD / SET k v / EXEC` leaves `k` UNSET.
+      Confirmed by reading the KEY afterwards, not by reading the EXEC reply — the reply could
+      say EXECABORT while the write had already landed, and that is the bug being closed.
+- [x] The client is told WHICH command was bad, at the moment it sent it: the typo gets its
+      error inline instead of `+QUEUED`, so a driver that surfaces per-command errors reports
+      the fault at the call site that caused it — confirmed by asserting the queue-time reply,
+      which is the half the "validate at EXEC" framing would have got wrong.
+- [x] The dirty flag never outlives its transaction. DISCARD, EXEC and RESET all clear it, so a
+      poisoned transaction followed by a fresh MULTI on the SAME connection runs normally —
+      confirmed by same-connection sequence tests, the only shape that can catch a leaked flag
+      silently aborting an innocent later block.
+- [x] Runtime errors still do NOT abort: a `WRONGTYPE` inside a block is returned as one element
+      of the EXEC array and the other commands run — confirmed against measured Redis behavior.
+      The queue-time/run-time distinction is the whole contract; collapsing it would "fix" this
+      task by breaking working transactions.
+- [x] `SUBSCRIBE` inside MULTI is refused at queue time rather than EXECUTED — confirmed by
+      checking the connection is NOT left in subscriber mode afterwards, which is what Moon did
+      before and what a reply-only assertion would miss.
+- [ ] `BLPOP` on a missing key inside MULTI replies Null **Array** — NOT MET. See the gate
+      record: `Frame` has no null-array variant, the divergence reproduces outside MULTI too,
+      and `me7` is ignored (not weakened) pending #482.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — the validation helper is worthless in a handler that still queues blindly,
+      and Moon queues in three separate handlers. All three call it; confirmed by running the
+      suite against each rather than by grepping, since a missed handler compiles fine and only
+      diverges at runtime.
+- [x] DEAD-CODE (code) — no orphaned symbol. The dirty flag sits beside the existing MULTI queue
+      state (no new allocation, no new lock) and every clear site is exercised.
+- [x] SEMANTIC — the ⚠ assumption was DISCHARGED by test, not by argument: a command present in
+      one of Moon's three dispatch paths but missing from `COMMAND_META` would now be rejected
+      inside MULTI while still working outside it — a regression strictly worse than the bug.
+      A test walks the full `COMMAND_META` table and another queues a representative command
+      from each dispatch path.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: RISK-ACCEPTED
+owner: Tin Dang · ticket: https://github.com/pilotspace/moon/issues/482 · expires: 2026-10-31
+
+Not a PASS, because Must #7 is not met. `BLPOP` on a missing key inside MULTI still replies a
+Null Bulk (`$-1`) where Redis replies a Null Array (`*-1`), and `me7` is `#[ignore]`d rather than
+passing. The remaining seven Musts and all five Rejects are met.
+
+Why the risk is acceptable rather than a blocker: the divergence is NOT introduced by this task
+and is NOT specific to transactions — `Frame` has no null-array variant at all, so a plain
+`BLPOP key 1` that times out on a normal connection mistypes its reply too. Fixing it means
+threading a `Frame::NullArray` through every `Frame::Null` arm in `serialize.rs` / `resp3.rs`,
+which touches every reply path in the server and can flip the type of replies that are currently
+correct. That deserves its own contract and review, which is #482. RESP2-only; RESP3 spells both
+nulls `_\r\n`.
+
+`me7` is ignored, NOT weakened — its assertion is already the right one and the ignore reason
+names the missing capability, so the task that adds the variant un-ignores it as its own proof.
+
+Evidence: PR #472 (squash `292269ac`). Re-verified on merged `main` @ `3f842d9f`:
+`tests/multi_exec_queue_semantics.rs` 12 passed / 1 ignored under BOTH `runtime-monoio` (shipped)
+and `runtime-tokio,jemalloc`.
+Reviewed by: Tin Dang · date: 2026-08-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -364,14 +410,24 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
+Watch (reuse scenarios as monitors): an EXECABORT on a transaction whose commands were all valid
+— that is the signature of a dirty flag leaking across transactions on a reused connection, and
+it would abort innocent work rather than merely reporting it.
 
 ### Spec delta
-Forward changes for the next loop — each re-enters at Specify as the next task. One line
-each, tagged `[SPEC · open|seeded|dropped]`, with evidence (e.g. `[SPEC · open] rate-limit
-the retry path (evidence: prod herd spikes)`). See the `add` skill's `deltas.md`.
+- [SPEC · seeded] `Frame` has no null-array variant, so every command whose empty answer is an
+  array replies `$-1` instead of `*-1` in RESP2 (evidence: measured `*1\r\n$-1\r\n` vs Redis
+  `*1\r\n*-1\r\n`; reproduces outside MULTI; seeded as #482, gate RISK-ACCEPTED against it).
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] Assert the STATE, not the reply, when the bug is that state changed anyway. The
+  data-loss case here is `k` being set while EXEC says EXECABORT — a reply-only assertion passes
+  on a server that reports abort and writes regardless (evidence: the test reads the key back).
+- [ADD · open] Discharge a ⚠ assumption by test, not by argument. "Every dispatched command is in
+  `COMMAND_META`" was plausible and its failure mode was a regression worse than the bug being
+  fixed, so it became two tests rather than a paragraph (evidence: §1 assumption 1, and Moon's
+  three dispatch paths).
+- [ADD · open] An unmet Must is a RISK-ACCEPTED with a ticket, never a quiet PASS with a deleted
+  test. `me7` stays in the suite, ignored with a reason that names the missing capability, so the
+  gap is visible to the next reader instead of disappearing with the assertion (evidence: this
+  gate record; #482).

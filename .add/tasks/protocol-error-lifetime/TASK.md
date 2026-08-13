@@ -2,7 +2,7 @@
 
 slug: protocol-error-lifetime · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: tests   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower the
      autonomy level to `manual` or `conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -322,18 +322,42 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 > Pre-declare the OBSERVABLE outcomes a correct build must produce — derived from §2 SCENARIOS
 > + §3 CONTRACT — so this gate checks the build is RIGHT, not merely that tests are green. Each
 > row is evidence you can SEE, not a restatement of a test name.
-- [ ] <observable outcome a correct build must produce> — confirmed by <how / where>
-- [ ] <another observable outcome> — confirmed by <evidence seen>
+- [x] A protocol fault arrives as BYTES, not as a bare FIN. Every Reject row is readable on the
+      wire before the close — confirmed by reading the raw socket in `tests/protocol_error_lifetime.rs`
+      rather than through a client library, because a library that reconnects would hide exactly
+      the failure this task exists to remove.
+- [x] The valid prefix is answered first: `PING\r\n*-9\r\n` in ONE write returns `+PONG` and the
+      connection survives — confirmed by the single-write test, which is the only shape that can
+      catch a handler that drops the whole read buffer on a late fault.
+- [x] `GET "unclosed` no longer succeeds. It was ACCEPTED before, with the quote taken as key
+      bytes and `$-1` returned — a wrong answer, not a missing one — confirmed by the
+      unbalanced-quote test asserting the error AND that no lookup happened.
+- [x] The parser's internal diagnostics survive the mapping: the wire says "invalid bulk length"
+      while `ParseError` still carries "invalid bulk string length: -5" with its offset —
+      confirmed by the fuzz targets still localising faults, which was the whole reason the
+      rewrite-every-message framing was rejected.
+- [x] No parse path gained an unwrap, expect, or panic — the invariant that outranks parity here.
+      Confirmed by `scripts/audit-unwrap.sh` (the CI ratchet) staying green over the diff.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — `ProtoFault` + `wire_text()` are useless unless EVERY handler consults
+      them, and Moon has four places that read frames (monoio, sharded, single, and the inline
+      fast path). All four carry the execute-prefix / reply / close sequence; confirmed by
+      running the suite against each rather than by grepping for the call, since a handler that
+      still does `Err(_) => break` compiles perfectly.
+- [x] DEAD-CODE (code) — no orphaned symbol: every `ProtoFault` variant is reachable from a
+      `ParseError::Invalid` construction site and is asserted by a Reject-row test.
+- [x] SEMANTIC — the five wire strings were MEASURED against redis-server 8.6.1, not copied
+      from documentation, including the inline cap boundary (identical to Moon up to 65 530 B;
+      they diverge only at 70 000 B, where Redis still serves). Getting a byte wrong here is
+      invisible to a human reader and fatal to a driver that string-matches.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS
+Evidence: PR #472 (squash `292269ac`). Re-verified on merged `main` @ `3f842d9f`, not on the
+PR branch: `tests/protocol_error_lifetime.rs` 8/8 under BOTH `runtime-monoio` (the shipped
+runtime) and `runtime-tokio,jemalloc`.
+Reviewed by: Tin Dang · date: 2026-08-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -341,14 +365,26 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
+Watch (reuse scenarios as monitors): connections closed with NO error frame written first — the
+regression this task removes is silent by nature, so the monitor is the absence of bytes, not an
+error rate. Also the inline-cap boundary: Moon closes at 70 000 B where Redis still serves, so a
+client sending large inline requests sees a divergence this task did not close.
 
 ### Spec delta
-Forward changes for the next loop — each re-enters at Specify as the next task. One line
-each, tagged `[SPEC · open|seeded|dropped]`, with evidence (e.g. `[SPEC · open] rate-limit
-the retry path (evidence: prod herd spikes)`). See the `add` skill's `deltas.md`.
+- [SPEC · open] Moon's inline cap diverges from Redis above 65 530 B — Moon closes at 70 000 B
+  where Redis still serves (evidence: §1 assumption 3, measured; both RST at 200 000 B, so only
+  the middle band differs).
+- [SPEC · open] The valid prefix is answered before the close even when it contains a WRITE, so a
+  client that never reads the reply cannot tell whether the write landed (evidence: §1 ⚠
+  assumption — accepted on parity grounds, Redis has the same property, but it is a real
+  ambiguity and not merely a compatibility detail).
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] Test the wire, not the client. Every assertion here reads raw socket bytes,
+  because a client library that reconnects or normalises errors would have hidden the exact
+  failure mode — a connection closed with nothing written (evidence: the pre-fix behavior was
+  invisible through redis-rs and obvious over a raw socket).
+- [ADD · open] "Already builds the right string" is not the same as "the client receives it".
+  Moon constructed `too big inline request` verbatim in `src/protocol/inline.rs` and never sent
+  it — the value existed and the wiring did not (evidence: §0, confirmed by measurement before
+  any code was written).

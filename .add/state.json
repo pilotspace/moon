@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "info-observability",
+  "active_task": "multi-exec-queue-semantics",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -344,25 +344,59 @@
     },
     "protocol-error-lifetime": {
       "title": "Protocol errors reply and close cleanly, never stall or eat the valid prefix",
-      "phase": "tests",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T16:42:35+00:00",
-      "updated": "2026-08-12T04:55:05+00:00"
+      "updated": "2026-08-13T17:54:49+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "aa64e31cd61efa314a4a6620480040d0",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/protocol/",
+          "src/server/conn/",
+          "tests/protocol_error_lifetime.rs",
+          "scripts/client-compat/manifest.yaml"
+        ],
+        "snapshot_md5": "1b35284675ead72a3f5e5c9d41c6f372"
+      }
     },
     "multi-exec-queue-semantics": {
       "title": "MULTI queues every command, and EXEC answers correctly on every shard count",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "RISK-ACCEPTED",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T16:46:23+00:00",
-      "updated": "2026-08-09T16:46:23+00:00"
+      "updated": "2026-08-13T17:55:11+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "a31ef31cfcdae118ee1ffea35b9e6554",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/server/conn/",
+          "src/command/mod.rs",
+          "src/command/list/",
+          "tests/multi_exec_queue_semantics.rs",
+          "scripts/client-compat/manifest.yaml"
+        ],
+        "snapshot_md5": "1b35284675ead72a3f5e5c9d41c6f372"
+      },
+      "waiver": {
+        "owner": "Tin Dang",
+        "ticket": "https://github.com/pilotspace/moon/issues/482",
+        "expires": "2026-10-31"
+      }
     },
     "monitor-command-feed": {
       "title": "MONITOR command feed \u2014 stream executed commands, redacted, zero-cost when unattached",
@@ -488,7 +522,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-13T17:49:45+00:00",
+  "updated": "2026-08-13T17:55:11+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
