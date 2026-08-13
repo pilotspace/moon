@@ -126,6 +126,18 @@ impl Conn {
         self.read_reply()
     }
 
+    /// Write a command without waiting for its reply — for commands that are
+    /// SUPPOSED not to answer yet (a parked `BLPOP`, a `SUBSCRIBE` whose push
+    /// stream we do not consume). Reading here would block the test, not the
+    /// server.
+    fn write_only(&mut self, parts: &[&str]) {
+        let mut out = format!("*{}\r\n", parts.len());
+        for p in parts {
+            out.push_str(&format!("${}\r\n{p}\r\n", p.len()));
+        }
+        self.0.write_all(out.as_bytes()).expect("write");
+    }
+
     fn read_reply(&mut self) -> String {
         let mut buf = [0u8; 16384];
         let mut acc = Vec::new();
@@ -378,5 +390,115 @@ fn io10_keyspace_hit_miss_counters() {
         m1 - m0,
         1,
         "one missing-key GET must move keyspace_misses by exactly 1"
+    );
+}
+
+#[test]
+fn io11_maxmemory_policy_reflects_config() {
+    // A dashboard reads `maxmemory_policy` to decide whether an OOM is an
+    // operator choice (`noeviction`) or a bug. Reporting a constant would be
+    // worse than omitting the field, so it must track CONFIG SET.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    // Against CONFIG GET, not a hardcoded name: Moon's memory guardrail
+    // auto-caps maxmemory and switches the policy when the operator sets
+    // neither, so the startup default is a runtime decision. What must hold is
+    // that the two surfaces agree.
+    let configured = c.send(&["CONFIG", "GET", "maxmemory-policy"]);
+    let configured = configured
+        .lines()
+        .last()
+        .map(|l| l.trim().to_string())
+        .expect("CONFIG GET reply");
+    assert_eq!(
+        field(&c.send(&["INFO", "memory"]), "maxmemory_policy").as_deref(),
+        Some(configured.as_str()),
+        "INFO and CONFIG GET must name the same policy at startup"
+    );
+
+    let flipped = if configured == "noeviction" {
+        "allkeys-lru"
+    } else {
+        "noeviction"
+    };
+    c.send(&["CONFIG", "SET", "maxmemory-policy", flipped]);
+    assert_eq!(
+        field(&c.send(&["INFO", "memory"]), "maxmemory_policy").as_deref(),
+        Some(flipped),
+        "INFO must follow CONFIG SET — a stale policy tells an operator the \
+         instance will OOM when it will in fact evict, or vice versa"
+    );
+}
+
+#[test]
+fn io12_blocked_clients_tracks_a_real_block() {
+    // `blocked_clients` is how an operator distinguishes "the server is idle"
+    // from "every worker is parked on an empty queue". A hardcoded 0 reads as
+    // the former while the latter is happening.
+    let m = spawn_moon("1");
+    let mut observer = Conn::open(m.port);
+    assert_eq!(
+        field(&observer.send(&["INFO", "clients"]), "blocked_clients").as_deref(),
+        Some("0"),
+        "no client is blocked yet"
+    );
+
+    let mut blocker = Conn::open(m.port);
+    blocker.write_only(&["BLPOP", "io12queue", "0"]);
+    // The block registers on the shard thread; give it a moment to land.
+    let mut seen = None;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        seen = field(&observer.send(&["INFO", "clients"]), "blocked_clients");
+        if seen.as_deref() == Some("1") {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some("1"),
+        "a client parked in BLPOP must be counted"
+    );
+
+    observer.send(&["LPUSH", "io12queue", "v"]);
+    let mut after = None;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        after = field(&observer.send(&["INFO", "clients"]), "blocked_clients");
+        if after.as_deref() == Some("0") {
+            break;
+        }
+    }
+    assert_eq!(
+        after.as_deref(),
+        Some("0"),
+        "serving the blocked client must decrement the gauge — a counter that \
+         only goes up is worse than no counter"
+    );
+}
+
+#[test]
+fn io13_pubsub_counts_are_instance_wide() {
+    // Both fields must agree with the PUBSUB command, which scatter-gathers
+    // across every shard's registry. A local-only answer under-reports by
+    // roughly 1/N and makes a fan-out look broken.
+    let m = spawn_moon("4");
+    let mut sub = Conn::open(m.port);
+    sub.write_only(&["SUBSCRIBE", "io13a", "io13b"]);
+    let mut psub = Conn::open(m.port);
+    psub.write_only(&["PSUBSCRIBE", "io13.*"]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut c = Conn::open(m.port);
+    let stats = c.send(&["INFO", "stats"]);
+    assert_eq!(
+        field(&stats, "pubsub_channels").as_deref(),
+        Some("2"),
+        "two subscribed channels must be visible instance-wide"
+    );
+    assert_eq!(
+        field(&stats, "pubsub_patterns").as_deref(),
+        Some("1"),
+        "one subscribed pattern must be visible instance-wide"
     );
 }

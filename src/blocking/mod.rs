@@ -122,10 +122,16 @@ impl BlockingRegistry {
             .or_insert_with(VecDeque::new)
             .push_back(entry);
 
-        self.wait_keys
-            .entry(wait_id)
-            .or_insert_with(Vec::new)
-            .push(queue_key);
+        // A wait_id appears in `wait_keys` exactly while its client is
+        // blocked, and a multi-key BLPOP registers the same id once per key —
+        // so the gauge moves on the FIRST registration only.
+        match self.wait_keys.entry(wait_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(queue_key),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(vec![queue_key]);
+                crate::admin::metrics_setup::record_client_blocked();
+            }
+        }
     }
 
     /// Pop the first waiter from the FIFO queue for (db_index, key).
@@ -148,6 +154,7 @@ impl BlockingRegistry {
     /// Used after a waiter is woken or times out to clean up cross-key registrations.
     pub fn remove_wait(&mut self, wait_id: u64) {
         if let Some(keys) = self.wait_keys.remove(&wait_id) {
+            crate::admin::metrics_setup::record_client_unblocked();
             for queue_key in keys {
                 if let Some(queue) = self.waiters.get_mut(&queue_key) {
                     queue.retain(|e| e.wait_id != wait_id);
@@ -220,7 +227,9 @@ impl BlockingRegistry {
         timed_out_ids.sort_unstable();
         timed_out_ids.dedup();
         for id in timed_out_ids {
-            self.wait_keys.remove(&id);
+            if self.wait_keys.remove(&id).is_some() {
+                crate::admin::metrics_setup::record_client_unblocked();
+            }
         }
         visited
     }

@@ -170,7 +170,7 @@ fn format_memory_human(bytes: u64) -> String {
 /// dispatch). The connection handlers pass cross-shard, all-db stats through
 /// [`info_with_keyspace`] instead.
 pub fn info(db: &Database, args: &[Frame]) -> Frame {
-    let raw = info_raw(db);
+    let raw = info_raw(db, &InstanceFacts::default());
     crate::command::info_sections::finalize(&raw, None, args)
 }
 
@@ -212,7 +212,7 @@ fn run_id() -> &'static str {
 /// section here is a STUB that the connection handlers replace with the real
 /// one, so a filter applied during assembly would either emit the stub or drop
 /// the real section depending on where it ran.
-fn info_raw(db: &Database) -> String {
+fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     use std::fmt::Write as _;
     let mut sections = String::with_capacity(2048);
 
@@ -248,6 +248,13 @@ fn info_raw(db: &Database) -> String {
         sections,
         "parked_clients:{}\r\n",
         crate::client_registry::parked_clients(),
+    );
+    // A gauge, not a counter: an operator reads it to tell an idle server
+    // apart from one whose every worker is parked on an empty queue.
+    let _ = write!(
+        sections,
+        "blocked_clients:{}\r\n",
+        crate::admin::metrics_setup::blocked_clients(),
     );
     sections.push_str("\r\n");
 
@@ -305,7 +312,8 @@ fn info_raw(db: &Database) -> String {
          allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
          pagecache_bytes:{pagecache_bytes}\r\n\
          mem_fragmentation_ratio:{frag:.2}\r\n\
-         maxmemory:{maxmemory}\r\n",
+         maxmemory:{maxmemory}\r\n\
+         maxmemory_policy:{maxmemory_policy}\r\n",
         used_memory = used_memory,
         human = format_memory_human(used_memory),
         rss = rss,
@@ -326,6 +334,9 @@ fn info_raw(db: &Database) -> String {
         // Read from the same atomic the eviction gate enforces, so INFO can
         // never report a cap different from the one actually applied.
         maxmemory = crate::storage::eviction::maxmemory_bytes(),
+        // Named from the same published atomic the gate reads, so INFO cannot
+        // claim `noeviction` while the instance is in fact evicting.
+        maxmemory_policy = crate::storage::eviction::maxmemory_policy_name(),
     );
 
     // Allocator counters, Redis's `allocator_*` field names so existing
@@ -509,7 +520,9 @@ fn info_raw(db: &Database) -> String {
          rejected_connections:{}\r\n\
          total_net_input_bytes:{}\r\n\
          total_net_output_bytes:{}\r\n\
-         instantaneous_ops_per_sec:{}\r\n",
+         instantaneous_ops_per_sec:{}\r\n\
+         pubsub_channels:{}\r\n\
+         pubsub_patterns:{}\r\n",
         crate::admin::metrics_setup::keyspace_hits(),
         crate::admin::metrics_setup::keyspace_misses(),
         crate::admin::metrics_setup::expired_keys(),
@@ -518,6 +531,8 @@ fn info_raw(db: &Database) -> String {
         crate::admin::metrics_setup::total_net_input_bytes(),
         crate::admin::metrics_setup::total_net_output_bytes(),
         crate::admin::metrics_setup::instantaneous_ops_per_sec(),
+        facts.pubsub_channels,
+        facts.pubsub_patterns,
     );
     sections.push_str("\r\n");
 
@@ -601,8 +616,46 @@ pub fn info_with_keyspace_and_replication(
     keyspace: &[(u64, u64)],
     real_replication: Option<&str>,
 ) -> Frame {
+    info_with_facts(
+        db,
+        args,
+        keyspace,
+        real_replication,
+        &InstanceFacts::default(),
+    )
+}
+
+/// Instance-wide facts INFO must report that a single shard's [`Database`]
+/// cannot answer.
+///
+/// Pub/sub counts are the motivating case: a channel with subscribers on two
+/// shard threads exists in two per-shard registries, so summing per-registry
+/// counters would report it twice. The connection handlers already hold
+/// `all_pubsub_registries` and already de-duplicate for `PUBSUB CHANNELS`, so
+/// they compute the same way and pass the answer in — the alternative, a
+/// process-global counter maintained at subscribe time, cannot dedupe.
+///
+/// Defaults to zeroes so a caller without handler context (Lua's `redis.call`,
+/// unit tests) still gets a well-formed INFO rather than a missing field.
+#[derive(Default, Clone, Copy)]
+pub struct InstanceFacts {
+    /// Distinct channels with at least one subscriber, across all shards.
+    pub pubsub_channels: usize,
+    /// Distinct subscribed patterns, across all shards.
+    pub pubsub_patterns: usize,
+}
+
+/// As [`info_with_keyspace_and_replication`], plus the instance-wide facts
+/// only a connection handler can gather.
+pub fn info_with_facts(
+    db: &Database,
+    args: &[Frame],
+    keyspace: &[(u64, u64)],
+    real_replication: Option<&str>,
+    facts: &InstanceFacts,
+) -> Frame {
     use std::fmt::Write as _;
-    let text = info_raw(db);
+    let text = info_raw(db, facts);
     // Rebuild everything up to the fallback "# Keyspace" section, then emit
     // the accurate per-db lines. Filtering runs afterwards, so a request for a
     // single section still gets the ACCURATE keyspace numbers.

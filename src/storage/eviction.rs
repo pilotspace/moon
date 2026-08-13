@@ -53,6 +53,33 @@ pub fn publish_maxmemory(bytes: u64) {
     MAXMEMORY_GLOBAL.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-global eviction policy, as an [`EvictionPolicy`] discriminant.
+///
+/// Published alongside [`MAXMEMORY_GLOBAL`] so INFO can name the policy
+/// without taking the runtime-config lock, and — more to the point — so it
+/// names the policy the gate will actually apply rather than a second copy
+/// that can drift from it.
+static MAXMEMORY_POLICY_GLOBAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Publish the current `maxmemory-policy`. Same contract as
+/// [`publish_maxmemory`]: every production write site of
+/// `RuntimeConfig.maxmemory_policy` must call it — startup and
+/// `CONFIG SET maxmemory-policy`.
+#[inline]
+pub fn publish_maxmemory_policy(name: &str) {
+    MAXMEMORY_POLICY_GLOBAL.store(
+        EvictionPolicy::from_str(name).as_u8(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Canonical name of the published eviction policy, for INFO.
+#[inline]
+pub fn maxmemory_policy_name() -> &'static str {
+    EvictionPolicy::from_u8(MAXMEMORY_POLICY_GLOBAL.load(std::sync::atomic::Ordering::Relaxed))
+        .as_str()
+}
+
 /// The configured `maxmemory` in bytes, 0 when unlimited.
 ///
 /// Reads the same published atomic the eviction gate uses, so INFO cannot
@@ -258,6 +285,38 @@ impl EvictionPolicy {
             EvictionPolicy::VolatileLfu => "volatile-lfu",
             EvictionPolicy::VolatileRandom => "volatile-random",
             EvictionPolicy::VolatileTtl => "volatile-ttl",
+        }
+    }
+
+    /// Discriminant for the process-global publish. Written out rather than
+    /// derived via `as` so that reordering the enum cannot silently change
+    /// what a running process's published value means.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            EvictionPolicy::NoEviction => 0,
+            EvictionPolicy::AllKeysLru => 1,
+            EvictionPolicy::AllKeysLfu => 2,
+            EvictionPolicy::AllKeysRandom => 3,
+            EvictionPolicy::VolatileLru => 4,
+            EvictionPolicy::VolatileLfu => 5,
+            EvictionPolicy::VolatileRandom => 6,
+            EvictionPolicy::VolatileTtl => 7,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`]. An unknown byte means the publish and the
+    /// read disagree about the encoding, which can only happen through a bug —
+    /// report the safe policy rather than guess.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => EvictionPolicy::AllKeysLru,
+            2 => EvictionPolicy::AllKeysLfu,
+            3 => EvictionPolicy::AllKeysRandom,
+            4 => EvictionPolicy::VolatileLru,
+            5 => EvictionPolicy::VolatileLfu,
+            6 => EvictionPolicy::VolatileRandom,
+            7 => EvictionPolicy::VolatileTtl,
+            _ => EvictionPolicy::NoEviction,
         }
     }
 }

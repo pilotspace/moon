@@ -153,6 +153,9 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 ];
                 let lower = value_str.to_ascii_lowercase();
                 if valid.contains(&lower.as_str()) {
+                    // Same publish contract as `maxmemory` above: INFO and the
+                    // eviction gate must never name different policies.
+                    crate::storage::eviction::publish_maxmemory_policy(&lower);
                     runtime_config.maxmemory_policy = lower;
                 } else {
                     return Frame::Error(Bytes::from(format!(

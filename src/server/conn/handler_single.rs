@@ -1070,12 +1070,23 @@ pub async fn handle_connection(
                                 let real_repl = rs.try_read().map(|rs_guard| {
                                     crate::replication::handshake::build_info_replication(&rs_guard)
                                 });
+                                // One registry on this handler (embedded /
+                                // non-sharded), so the union the sharded
+                                // handlers perform collapses to a direct read.
+                                let pubsub_facts = {
+                                    let reg = pubsub_registry.lock();
+                                    conn_cmd::InstanceFacts {
+                                        pubsub_channels: reg.active_channels(None).len(),
+                                        pubsub_patterns: reg.pattern_names().len(),
+                                    }
+                                };
                                 let guard = db[conn.selected_db].read();
-                                let resp_frame = conn_cmd::info_with_keyspace_and_replication(
+                                let resp_frame = conn_cmd::info_with_facts(
                                     &guard,
                                     cmd_args,
                                     &keyspace,
                                     real_repl.as_deref(),
+                                    &pubsub_facts,
                                 );
                                 drop(guard);
                                 responses.push(resp_frame);

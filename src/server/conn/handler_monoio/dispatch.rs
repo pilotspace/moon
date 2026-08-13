@@ -672,8 +672,17 @@ pub(super) async fn try_handle_info(
         .as_ref()
         .and_then(|rs| rs.try_read())
         .map(|rs_guard| crate::replication::handshake::build_info_replication(&rs_guard));
+    // Instance-wide pub/sub counts, unioned across every shard's registry —
+    // the same gather `PUBSUB CHANNELS`/`NUMPAT` do, so INFO cannot disagree
+    // with them.
+    let (pubsub_channels, pubsub_patterns) =
+        crate::pubsub::instance_pubsub_counts(&ctx.all_pubsub_registries);
+    let pubsub_facts = conn_cmd::InstanceFacts {
+        pubsub_channels,
+        pubsub_patterns,
+    };
     let resp_frame = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-        conn_cmd::info_with_keyspace_and_replication(db, cmd_args, &keyspace, real_repl.as_deref())
+        conn_cmd::info_with_facts(db, cmd_args, &keyspace, real_repl.as_deref(), &pubsub_facts)
     });
     responses.push(resp_frame);
     true
