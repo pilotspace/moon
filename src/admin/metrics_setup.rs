@@ -1259,81 +1259,16 @@ pub fn macos_task_memory_info() -> (u64, u64) {
     (0, 0)
 }
 
-/// Bytes the OS charges this process, INCLUDING pages pushed to swap.
-///
-/// This is deliberately not `get_rss_bytes()`. On macOS that returns
-/// `resident_size`, which counts only what is currently in RAM — so a process
-/// whose heap has been swapped out reports a SMALL number precisely when it is
-/// consuming the most memory. Measured on the live :6381 instance: 439 MB
-/// resident vs 10.1 GB `phys_footprint`, 9.9 GB of it swapped. Anything that
-/// makes a capacity decision must use this, not RSS.
-///
-/// Returns 0 when the platform cannot answer, which callers must treat as
-/// "unknown" and fall back to allocator accounting — never as "zero bytes".
-#[cfg(target_os = "macos")]
-pub fn process_footprint_bytes() -> u64 {
-    // SAFETY: identical contract to `macos_task_memory_info` above — stable
-    // Mach ABI, and `vm_info` is 272 bytes = TASK_VM_INFO_COUNT x 4. Queried
-    // directly rather than via that function because it tries
-    // MACH_TASK_BASIC_INFO first, which succeeds and therefore never reaches
-    // the TASK_VM_INFO path where `phys_footprint` lives.
-    unsafe extern "C" {
-        fn mach_task_self() -> u32;
-        fn task_info(target: u32, flavor: u32, info: *mut u8, count: *mut u32) -> i32;
-    }
-    const TASK_VM_INFO: u32 = 22;
-    const TASK_VM_INFO_COUNT: u32 = 68;
-    let mut vm_info = [0u8; 272];
-    let mut vm_count = TASK_VM_INFO_COUNT;
-    // SAFETY: see above.
-    let kr = unsafe {
-        task_info(
-            mach_task_self(),
-            TASK_VM_INFO,
-            vm_info.as_mut_ptr(),
-            &mut vm_count,
-        )
-    };
-    if kr == 0 {
-        // phys_footprint is at offset 16 in task_vm_info_data_t.
-        return u64::from_ne_bytes(vm_info[16..24].try_into().unwrap_or([0; 8]));
-    }
-    0
-}
-
-/// Bytes the OS charges this process. On Linux RSS is the right measure —
-/// swapped pages are not charged the same way, and `VmRSS` is what the OOM
-/// killer and cgroup limits act on.
-#[cfg(target_os = "linux")]
-pub fn process_footprint_bytes() -> u64 {
-    get_rss_bytes()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn process_footprint_bytes() -> u64 {
-    0
-}
-
-/// How far real footprint exceeds what the allocator says is live.
-///
-/// Returns 1.0 when the platform cannot measure footprint, when nothing is
-/// allocated yet, or when footprint is below accounted memory — the value is
-/// only ever used to make a budget SMALLER, so an unknown must not shrink it.
-pub fn footprint_ratio(used_memory: u64) -> f64 {
-    let fp = process_footprint_bytes();
-    if fp == 0 || used_memory == 0 {
-        return 1.0;
-    }
-    let r = fp as f64 / used_memory as f64;
-    // Clamp: below 1.0 is meaningless here, and an absurd ratio (a bad read,
-    // or a huge transient) must not collapse the budget to nothing.
-    r.clamp(1.0, 8.0)
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn get_rss_bytes() -> u64 {
     0
 }
+
+/// Real-footprint measurement lives in its own module; re-exported here
+/// so `metrics_setup::footprint_ratio` and friends keep resolving.
+pub use crate::admin::footprint::{
+    capture_footprint_baseline, footprint_baseline_bytes, footprint_ratio, process_footprint_bytes,
+};
 
 // ── INFO helpers ────────────────────────────────────────────────────────
 
@@ -1707,6 +1642,82 @@ fn update_moon_memory_bytes() {
     update_rss_bytes(rss as u64);
 }
 
+// ── INFO-readable counter accessors ─────────────────────────────────────
+
+/// Number of successful key lookups since start.
+pub fn keyspace_hits() -> u64 {
+    KEYSPACE_HITS.load(Ordering::Relaxed)
+}
+
+/// Number of lookups that found no key since start.
+pub fn keyspace_misses() -> u64 {
+    KEYSPACE_MISSES.load(Ordering::Relaxed)
+}
+
+/// Keys removed because their TTL elapsed.
+pub fn expired_keys() -> u64 {
+    EXPIRED_KEYS.load(Ordering::Relaxed)
+}
+
+/// Keys removed by the maxmemory eviction policy.
+pub fn evicted_keys() -> u64 {
+    EVICTED_KEYS.load(Ordering::Relaxed)
+}
+
+/// Connections refused (limit reached, or rejected before handshake).
+pub fn rejected_connections() -> u64 {
+    REJECTED_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// Bytes read from clients since start.
+pub fn total_net_input_bytes() -> u64 {
+    NET_INPUT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes written to clients since start.
+pub fn total_net_output_bytes() -> u64 {
+    NET_OUTPUT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Commands per second over the last sampling window.
+pub fn instantaneous_ops_per_sec() -> u64 {
+    OPS_PER_SEC.load(Ordering::Relaxed)
+}
+
+/// Record an expired key.
+#[inline]
+pub fn record_expired_key() {
+    EXPIRED_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a refused connection.
+#[inline]
+pub fn record_rejected_connection() {
+    REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record bytes read from / written to clients.
+#[inline]
+pub fn record_net_bytes(input: u64, output: u64) {
+    if input > 0 {
+        NET_INPUT_BYTES.fetch_add(input, Ordering::Relaxed);
+    }
+    if output > 0 {
+        NET_OUTPUT_BYTES.fetch_add(output, Ordering::Relaxed);
+    }
+}
+
+/// Sample the ops-per-second rate. Call once per second from a chore tick.
+///
+/// Deliberately a sampled delta rather than a per-command rate computation:
+/// the alternative would put a timestamp read on the dispatch path for a
+/// field nobody reads more than once a second.
+pub fn sample_ops_per_sec() {
+    let total = total_commands_processed();
+    let prev = OPS_LAST_SAMPLE.swap(total, Ordering::Relaxed);
+    OPS_PER_SEC.store(total.saturating_sub(prev), Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,144 +1816,6 @@ mod tests {
         assert!(
             after >= before,
             "counter must be monotone; before={before} after={after}"
-        );
-    }
-}
-
-// ── INFO-readable counter accessors ─────────────────────────────────────
-
-/// Number of successful key lookups since start.
-pub fn keyspace_hits() -> u64 {
-    KEYSPACE_HITS.load(Ordering::Relaxed)
-}
-
-/// Number of lookups that found no key since start.
-pub fn keyspace_misses() -> u64 {
-    KEYSPACE_MISSES.load(Ordering::Relaxed)
-}
-
-/// Keys removed because their TTL elapsed.
-pub fn expired_keys() -> u64 {
-    EXPIRED_KEYS.load(Ordering::Relaxed)
-}
-
-/// Keys removed by the maxmemory eviction policy.
-pub fn evicted_keys() -> u64 {
-    EVICTED_KEYS.load(Ordering::Relaxed)
-}
-
-/// Connections refused (limit reached, or rejected before handshake).
-pub fn rejected_connections() -> u64 {
-    REJECTED_CONNECTIONS.load(Ordering::Relaxed)
-}
-
-/// Bytes read from clients since start.
-pub fn total_net_input_bytes() -> u64 {
-    NET_INPUT_BYTES.load(Ordering::Relaxed)
-}
-
-/// Bytes written to clients since start.
-pub fn total_net_output_bytes() -> u64 {
-    NET_OUTPUT_BYTES.load(Ordering::Relaxed)
-}
-
-/// Commands per second over the last sampling window.
-pub fn instantaneous_ops_per_sec() -> u64 {
-    OPS_PER_SEC.load(Ordering::Relaxed)
-}
-
-/// Record an expired key.
-#[inline]
-pub fn record_expired_key() {
-    EXPIRED_KEYS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Record a refused connection.
-#[inline]
-pub fn record_rejected_connection() {
-    REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Record bytes read from / written to clients.
-#[inline]
-pub fn record_net_bytes(input: u64, output: u64) {
-    if input > 0 {
-        NET_INPUT_BYTES.fetch_add(input, Ordering::Relaxed);
-    }
-    if output > 0 {
-        NET_OUTPUT_BYTES.fetch_add(output, Ordering::Relaxed);
-    }
-}
-
-/// Sample the ops-per-second rate. Call once per second from a chore tick.
-///
-/// Deliberately a sampled delta rather than a per-command rate computation:
-/// the alternative would put a timestamp read on the dispatch path for a
-/// field nobody reads more than once a second.
-pub fn sample_ops_per_sec() {
-    let total = total_commands_processed();
-    let prev = OPS_LAST_SAMPLE.swap(total, Ordering::Relaxed);
-    OPS_PER_SEC.store(total.saturating_sub(prev), Ordering::Relaxed);
-}
-
-#[cfg(test)]
-mod footprint_tests {
-    use super::*;
-
-    #[test]
-    fn ratio_is_one_when_nothing_allocated() {
-        // Divide-by-zero guard. The ratio only ever SHRINKS a budget, so an
-        // unmeasurable state must return the neutral value, never 0 or inf.
-        assert_eq!(footprint_ratio(0), 1.0);
-    }
-
-    #[test]
-    fn ratio_never_below_one() {
-        // Footprint below accounted memory is meaningless for our purposes
-        // (and happens transiently right after a large free). Shrinking the
-        // budget on that basis would evict for no reason.
-        let huge = u64::MAX / 2;
-        assert!(
-            footprint_ratio(huge) >= 1.0,
-            "a below-1 ratio would INFLATE the eviction budget"
-        );
-    }
-
-    #[test]
-    fn ratio_is_clamped_against_absurd_readings() {
-        // A bad task_info read or a huge transient must not collapse the
-        // budget to near zero and evict the entire keyspace.
-        assert!(
-            footprint_ratio(1) <= 8.0,
-            "an unclamped ratio on a 1-byte denominator would drive the \
-             budget to ~0 and evict everything"
-        );
-    }
-
-    #[test]
-    fn ratio_denominator_must_be_instance_wide_not_per_shard() {
-        // Regression: the first version of the eviction budget scaling divided
-        // the WHOLE-PROCESS footprint by ONE SHARD's estimated_memory. At
-        // `--shards N` that inflates the ratio by ~N and evicts N times too
-        // aggressively. This asserts the shape of the mistake: a small
-        // denominator against a process-sized numerator saturates the clamp.
-        let per_shard_sized = 1024u64; // what one shard might report
-        let instance_sized = process_footprint_bytes().max(1);
-        assert!(
-            footprint_ratio(per_shard_sized) >= footprint_ratio(instance_sized),
-            "a per-shard denominator yields a LARGER ratio than an              instance-wide one — that is the bug, and the caller must pass              logical_used_memory_bytes(), not db.estimated_memory()"
-        );
-    }
-
-    #[test]
-    fn footprint_is_measurable_on_this_platform() {
-        // Guards the offset/flavor constants: a wrong TASK_VM_INFO layout
-        // reads as 0 and silently disables the whole mechanism.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(
-            process_footprint_bytes() > 0,
-            "footprint must be readable, or maxmemory silently falls back to \
-             accounting-only and the swap-death bug returns"
         );
     }
 }

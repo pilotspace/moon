@@ -256,9 +256,18 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         rss = rss,
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
-        // The gap operators currently cannot see. Redis's field name, so
-        // existing dashboards pick it up without translation.
-        frag = crate::admin::metrics_setup::footprint_ratio(used_memory),
+        // The gap operators currently cannot see, under Redis's field name so
+        // existing dashboards pick it up without translation. Deliberately the
+        // raw quotient of the two fields printed just above, NOT
+        // `footprint_ratio` — that one is floored, baseline-subtracted and
+        // clamped for use as an eviction divisor, and publishing a doctored
+        // number under a standard field name would make INFO disagree with
+        // itself.
+        frag = if used_memory > 0 {
+            rss as f64 / used_memory as f64
+        } else {
+            0.0
+        },
         // Read from the same atomic the eviction gate enforces, so INFO can
         // never report a cap different from the one actually applied.
         maxmemory = crate::storage::eviction::maxmemory_bytes(),
