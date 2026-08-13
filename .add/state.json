@@ -276,14 +276,26 @@
     },
     "info-observability": {
       "title": "INFO sections/fields, keyspace notifications, protocol-error replies",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-09T07:32:04+00:00"
+      "updated": "2026-08-13T17:49:45+00:00",
+      "tripwire": {
+        "contract_md5": "8445c7f1e28c33e033f007a34f4f8aa5",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/",
+          "tests/",
+          "scripts/client-compat/"
+        ],
+        "snapshot_md5": "b349e5883578956af78539a0977d9ca4"
+      }
     },
     "sdk-wire-form-fixes": {
       "title": "First-party Rust/Python SDK wire forms + MQ/WS registry entries",
@@ -476,7 +488,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-13T02:05:58+00:00",
+  "updated": "2026-08-13T17:49:45+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

@@ -2,7 +2,7 @@
 
 slug: info-observability · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: ground   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower the
      autonomy level to `manual` or `conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -441,9 +441,18 @@ to the shipped runtime.
 
 ## 5 · BUILD — AI writes code ▸ docs/07-step-5-build.md
 
-Scope (may touch): `./src/`   <fill before the §3 freeze — every file the build may write>
-Strategy (ordered batches): <1. … 2. … — the planned build order; guidance, not enforced>
-Safety rule (feature-specific): <e.g. debit+credit in one atomic transaction>
+Scope (may touch): `src/` `tests/` `scripts/client-compat/`
+Strategy (ordered batches): 1. INFO section selection + dedup (`src/command/connection.rs`)
+  2. the real values the new fields need, published where a connection can read them
+  (`src/storage/eviction.rs` policy, `src/blocking/` waiter gauge, pub/sub counts)
+  3. the notify flag model + parser as pure logic (`src/notify.rs`)
+  4. emission call sites in command code
+  5. delivery — the two drains (`src/notify_fanout.rs`, `src/shard/`, `src/server/conn/`)
+Safety rule (feature-specific): a notification must never block or fail a write. Delivery is
+  fire-and-forget end to end — a full SPSC ring DROPS the batch rather than back-pressuring
+  the command path, which is the trade Redis makes for a slow subscriber. Correspondingly,
+  no INFO field may be invented: a value Moon cannot answer truthfully is omitted, never
+  filled with a plausible-looking placeholder that a client would act on.
 Code lives in: `./src/`
 Constraints: do NOT change any test or the contract; allow-list packages only; ask if unclear.
 
@@ -472,18 +481,50 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 > Pre-declare the OBSERVABLE outcomes a correct build must produce — derived from §2 SCENARIOS
 > + §3 CONTRACT — so this gate checks the build is RIGHT, not merely that tests are green. Each
 > row is evidence you can SEE, not a restatement of a test name.
-- [ ] <observable outcome a correct build must produce> — confirmed by <how / where>
-- [ ] <another observable outcome> — confirmed by <evidence seen>
+- [x] A client that asks for one section gets ONE section — no second `# Replication`
+      header, no `# Commandstats` unless asked — confirmed by io1/io5/io6/io7, and against
+      a live redis-server by the compat harness's INFO manifest.
+- [x] Every field the new INFO answers carries a value that MOVES when the thing it names
+      moves — `maxmemory_policy` follows a `CONFIG SET`, `blocked_clients` rises while a
+      BLPOP waits and falls on timeout, `pubsub_channels` tracks SUBSCRIBE/UNSUBSCRIBE,
+      `keyspace_hits/misses` step by exactly 1 per GET — confirmed by io8/io10/io11.
+      A field Moon cannot answer truthfully is ABSENT, not zero: the harness proves the
+      absence is visible (`info:atomicvar_api` reported missing by name).
+- [x] A subscriber on ANY connection sees events for keys owned by ANY shard — confirmed
+      by kn9 at `--shards 4`, which is the test that caught the single-drain build seeing
+      1 of 8 events.
+- [x] Default config is silent — no channel traffic at all until the operator opts in,
+      and `m`/`n` are NOT swept in by `A` — confirmed by kn10 and kn7.
+- [x] The canonical flag string Moon echoes back matches what a live redis-server 8.6.1
+      echoes for the same input — confirmed by 29 measured pairs pinned in
+      `canonical_form_matches_measured_redis` (measured, not recalled from docs).
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — this task's central risk, and it bit twice. `notify_keyspace_event`
+      is called from the command paths; `flush_from_connection` from the sharded/monoio
+      handlers; `flush_from_shard` from THREE event-loop sites (two `runtime-tokio`, one
+      `runtime-monoio`). Confirmed by running kn1–kn10 and io1–io13 under BOTH runtimes,
+      not by reading the call graph: the first build wired the shard drain into the
+      monoio arm only and kn6/kn9 stayed red under tokio.
+- [x] DEAD-CODE (code) — `NotifyFlags::NEW_KEY` is parsed and canonicalized but emits
+      nothing, because no `n` event is produced yet. Deliberate and NOT orphaned: the
+      flag is part of the wire contract (a client may set it and read it back), and
+      accepting-then-silently-dropping is what Redis does for a class with no emitters.
+      Recorded in §7 rather than hidden.
+- [x] SEMANTIC — the `notify-keyspace-events` canonicalization rule was MEASURED against
+      a running redis-server 8.6.1 (15 pairs, then 6 more to settle `n`/`m`), because the
+      documented "one ordered list" model is wrong: `n` sorts with the classes, `m` trails
+      `K`/`E`, and `A` suppresses `n` but not `m`. All 21 measurements are pinned as test
+      data, so a future reading of the docs cannot quietly "correct" the code back.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS
+Evidence: PR #481 (squash `73c6597d`). 10/10 `keyspace_notifications`, 13/13
+`info_observability`, run under BOTH `runtime-monoio` (shipped) and `runtime-tokio,jemalloc`;
+lib suites 4605 and 3768 green. Full CI matrix dispatched on the branch —
+run `31725319305`, 9/9 including the three jobs PR path-filters skip (Windows, macOS,
+console) and `Check (monoio — the shipped runtime)`.
+Reviewed by: Tin Dang · date: 2026-08-13
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -491,14 +532,34 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
+Watch (reuse scenarios as monitors): dropped notification batches (a full SPSC ring is
+silent by design — if it is ever non-rare, the fire-and-forget trade needs revisiting);
+`blocked_clients` failing to return to 0 after a blocking command drains (a leaked gauge
+increment reads as a hung client that isn't there).
 
 ### Spec delta
-Forward changes for the next loop — each re-enters at Specify as the next task. One line
-each, tagged `[SPEC · open|seeded|dropped]`, with evidence (e.g. `[SPEC · open] rate-limit
-the retry path (evidence: prod herd spikes)`). See the `add` skill's `deltas.md`.
+- [SPEC · open] The `n` (new-key) class is accepted and canonicalized but emits nothing —
+  no call site produces a `new` event yet (evidence: `NotifyFlags::NEW_KEY` has no emitter;
+  §6 DEAD-CODE).
+- [SPEC · open] Only `set`, `incrby`, `rename_from`/`rename_to`, `expired` and `keymiss`
+  are emitted. The list, hash, set, zset and stream classes parse and gate correctly but
+  have no call sites (evidence: §4 covers the classes' plumbing, not their events).
+- [SPEC · open] `PUBSUB NUMPAT` counts subscribers, not unique patterns (evidence: #480,
+  found while wiring `pubsub_patterns` into INFO).
+- [SPEC · open] `metrics_setup.rs` is 1822 lines against the repo's 1500 ceiling even after
+  `src/admin/footprint.rs` was split out (evidence: #479).
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] A test suite that runs under only ONE runtime is CI-blind to the shipped one.
+  `keyspace_hits`/`keyspace_misses` had been reporting zero for plain GETs under monoio the
+  whole time and PR CI never saw it, because tokio reads correctly (evidence: io10 passed
+  under tokio, failed under monoio; #477 closed as a consequence).
+- [TDD · open] A fixture that pins a CAPABILITY GAP fails as a reward for closing the gap.
+  The compat harness's `run_id`-missing fixture broke the moment INFO grew `run_id` — the
+  fourth such retirement in that file. Pin gaps on things the subject cannot plausibly grow
+  (evidence: repinned on `atomicvar_api`, a field meaningless for a Rust server).
+- [ADD · open] Verify a platform claim by MEASUREMENT before building on it. The macOS
+  footprint read used `task_vm_info` offset 16 (`resident_size`) where it needed 144
+  (`phys_footprint`) — a header-shaped assumption that would have made the whole fix inert
+  on the live instance (evidence: discriminated with a clean file-backed mmap, which moves
+  one field and not the other).
