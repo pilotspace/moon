@@ -263,6 +263,18 @@ pub(crate) struct ConnectionState {
     /// Set by WS.AUTH, cleared on connection drop.
     pub workspace_id: Option<WorkspaceId>,
     pub command_queue: Vec<Frame>,
+    /// The open transaction hit a QUEUE-TIME fault (unknown command, wrong
+    /// arity, an unqueueable verb) and must be refused wholesale at EXEC.
+    ///
+    /// Redis's `CLIENT_DIRTY_EXEC`. Without it Moon ran the half of a
+    /// transaction that happened to parse: `MULTI / NOSUCHCMD / SET k v /
+    /// EXEC` left `k` set, where Redis discards everything.
+    ///
+    /// Connection-local by construction, so shard count cannot affect it.
+    /// MUST be cleared on every exit from MULTI state — EXEC, DISCARD, RESET.
+    /// A leaked flag silently aborts an innocent later transaction, which is
+    /// a worse bug than the one it fixes.
+    pub multi_dirty: bool,
 
     /// c1M P1: this connection has issued REPLCONF — it is (almost
     /// certainly) a replica mid-handshake that will send PSYNC next, and
@@ -354,6 +366,7 @@ impl ConnectionState {
             active_cross_txn: None,
             workspace_id: migrated.and_then(|s| s.workspace_id),
             command_queue: Vec::new(),
+            multi_dirty: false,
             // Not carried through MigratedConnectionState: a conn that sent
             // REPLCONF never parks (so never rehydrates through this path),
             // and migration of a mid-handshake replica is not a supported

@@ -98,6 +98,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::persistence::aof;
 use crate::protocol::Frame;
+use crate::server::conn::shared::is_transaction_control;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{EvictionRun, evict_to_budget};
@@ -508,6 +509,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
     // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
+    // Set when the parser rejects a frame. The connection still dies, but not
+    // silently and not before the valid frames that preceded the fault in the
+    // same read have been executed and answered.
+    let mut proto_fault: Option<crate::protocol::ProtoFault> = None;
 
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
@@ -1222,11 +1227,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                 }
                 Ok(None) => break,
-                Err(_) => return (MonoioHandlerResult::Done, None), // parse error, close connection
+                Err(_) => {
+                    // A protocol fault kills the connection, but not before
+                    // the frames already parsed from this same read are run
+                    // and answered, and not before the client is told WHY.
+                    // The old `return Done` here dropped both — so
+                    // `PING\r\n<bad frame>` in one write answered nothing.
+                    proto_fault = codec.take_last_fault();
+                    break;
+                }
             }
         }
 
         if frames.is_empty() {
+            // Nothing valid preceded the fault: report it and close.
+            if let Some(kind) = proto_fault.take() {
+                let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
+                let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) =
+                    stream.write_all(data).await;
+                return (MonoioHandlerResult::Done, None);
+            }
             continue;
         }
 
@@ -1445,6 +1465,59 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // If you add a privileged intercept, add it BELOW this line.
             if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
             {
+                continue;
+            }
+
+            // === MULTI QUEUE GATE — every non-transactional intercept MUST
+            // sit below this ===
+            //
+            // Redis executes exactly six commands while a transaction is open
+            // (MULTI, EXEC, DISCARD, WATCH, RESET, QUIT); EVERYTHING else
+            // queues. Moon decided this hundreds of lines further down, below
+            // the INFO / CLIENT / WS / MQ / PUBLISH / SUBSCRIBE intercepts, so
+            // each of those executed for real inside a transaction. Measured
+            // against redis-server 8.6.1: `SUBSCRIBE ch` put the connection
+            // into subscriber mode mid-MULTI, and `INFO server` returned a
+            // 3 KB dump where Redis returns `+QUEUED`.
+            //
+            // Deliberately BELOW the ACL gate: Redis refuses a forbidden
+            // command at queue time, and this repo has already shipped one ACL
+            // bypass that came from an intercept sitting above its check.
+            //
+            // This handler is the DEFAULT runtime (`runtime-monoio`). The
+            // sharded/tokio handlers carry the identical gate — a fix in only
+            // one of them is invisible to whichever job builds the other.
+            if conn.in_multi
+                && !is_transaction_control(cmd)
+                && !crate::server::conn::shared::is_intercept_only(cmd)
+            {
+                // FT.* isn't wired through the txn execution path; reject it
+                // explicitly rather than failing incidentally later.
+                if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR FT.* commands are not supported inside MULTI/EXEC",
+                    )));
+                    continue;
+                }
+                // Queue-time validation (Redis CLIENT_DIRTY_EXEC): a command
+                // that could never run poisons the whole transaction HERE, so
+                // EXEC refuses everything rather than applying the valid half.
+                if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
+                {
+                    conn.multi_dirty = true;
+                    responses.push(err);
+                    continue;
+                }
+                // Blocking commands queue as their non-blocking twin: a raw
+                // BLPOP reaching EXEC would BLOCK inside the transaction — a
+                // hang, not a divergence.
+                if crate::server::conn::blocking::is_blocking_command(cmd) {
+                    conn.command_queue
+                        .push(convert_blocking_to_nonblocking(cmd, cmd_args));
+                } else {
+                    conn.command_queue.push(frame);
+                }
+                responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                 continue;
             }
 
@@ -3183,6 +3256,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         if should_quit {
             break;
+        }
+
+        // The valid prefix has been executed and flushed. Name the fault,
+        // then close — in that order.
+        if let Some(kind) = proto_fault.take() {
+            let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
+            let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+            return (MonoioHandlerResult::Done, None);
         }
 
         // Check shutdown (polled after each batch -- acceptable for MVP)

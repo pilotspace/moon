@@ -991,6 +991,181 @@ impl PubSubTeardown for parking_lot::Mutex<crate::pubsub::PubSubRegistry> {
     }
 }
 
+/// Commands that EXECUTE while a transaction is open instead of queueing.
+///
+/// Redis's list is exactly six: MULTI, EXEC, DISCARD, WATCH, RESET, QUIT.
+/// (WATCH executes only to be refused — `queue_time_rejection` returns its
+/// error — but it must reach that intercept rather than land in the queue.)
+///
+/// The replication handshake verbs are added on top, and only those. A replica
+/// never opens a transaction, so queueing REPLCONF or PSYNC could not fix any
+/// real client and could break a handshake no test covers — the asymmetry is
+/// the whole argument for the exemption.
+pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
+    const CONTROL: [&[u8]; 12] = [
+        b"MULTI",
+        b"EXEC",
+        b"DISCARD",
+        b"WATCH",
+        b"UNWATCH",
+        b"RESET",
+        b"QUIT",
+        b"REPLCONF",
+        b"PSYNC",
+        b"SYNC",
+        b"REPLICAOF",
+        b"SLAVEOF",
+    ];
+    CONTROL.iter().any(|c| cmd.eq_ignore_ascii_case(c))
+}
+
+/// Commands the transaction executor CANNOT run, so queueing them would turn a
+/// working command into a guaranteed error inside `EXEC`.
+///
+/// `execute_transaction` replays the queue through `dispatch()`. These commands
+/// are connection-level *intercepts* — they never reach `dispatch()` at all, so
+/// a queued one comes back as `-ERR unknown command`. Measured 2026-08-12 by
+/// queueing each inside a MULTI and reading the EXEC array:
+///
+/// ```text
+/// CONFIG · CLIENT · ACL · CLUSTER · SCRIPT · WAIT          -> unknown command
+/// INFO · SLOWLOG · PUBLISH · MEMORY · DEBUG · COMMAND · OBJECT -> execute fine
+/// ```
+///
+/// Redis queues all of them and runs them properly. Moon cannot yet, so these
+/// keep EXECUTING immediately — the pre-existing divergence, which the
+/// client-compat manifest already waives — rather than queueing into a hard
+/// error. That is strictly better than the alternative: before the queue gate a
+/// client got its data with the wrong reply shape; queueing it unconditionally
+/// gave them an error instead, which is a regression, not a narrowing.
+///
+/// `LATENCY` looked like a member and is NOT: it errors outside a transaction
+/// too, because Moon does not implement it at all. Exempting it would have
+/// papered over nothing and hidden a genuine unimplemented command.
+///
+/// `PUBSUB` is absent from `COMMAND_META`, so `queue_time_rejection` would call
+/// it an unknown command and poison the transaction — it has no dot, so the
+/// dotted carve-out misses it. That is exactly the regression class the §1 ⚠
+/// assumption named. It is handled by `queue_time_rejection` consulting this
+/// list, not by exempting it from queueing.
+///
+/// Removing an entry from this list requires teaching `execute_transaction` to
+/// run it. The test `me10` asserts every queued command's EXEC result is not an
+/// error, so a premature removal fails loudly.
+pub(crate) fn is_intercept_only(cmd: &[u8]) -> bool {
+    const INTERCEPT_ONLY: [&[u8]; 7] = [
+        b"CONFIG", b"CLIENT", b"ACL", b"CLUSTER", b"SCRIPT", b"WAIT", b"PUBSUB",
+    ];
+    INTERCEPT_ONLY.iter().any(|c| cmd.eq_ignore_ascii_case(c))
+}
+
+/// Validate a command at QUEUE time, the way Redis does before storing it.
+///
+/// Returns `Some(error)` when the command must not be queued. The caller
+/// replies that error INSTEAD of `+QUEUED`, does not push the command, and
+/// sets `conn.multi_dirty` so `EXEC` refuses the whole block.
+///
+/// This is the difference between a transaction that is atomic with respect to
+/// typos and one that is not. Measured against redis-server 8.6.1:
+///
+/// ```text
+/// MULTI / NOSUCHCMD / SET k v / EXEC
+///   redis -> k UNSET   (EXECABORT, nothing ran)
+///   moon  -> k SET     (the valid half ran)
+/// ```
+///
+/// Shared by all THREE handlers, for the same reason `RESET` and `WATCH` are:
+/// a queue-time check that lands on one runtime and not the others is not a
+/// fix, and no single-runtime CI job would notice.
+///
+/// The arity/existence check reads `COMMAND_META` — the SAME table dispatch
+/// consults — so a command cannot become queueable-but-undispatchable, or the
+/// reverse. That symmetry is the whole safety argument for this function:
+/// rejecting a command that DOES dispatch would be a regression strictly worse
+/// than the bug being fixed.
+pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> {
+    // Verbs that are refused rather than queued. Redis rejects these because
+    // they change the connection's mode, which a queued command cannot
+    // meaningfully do. Moon used to EXECUTE `SUBSCRIBE` immediately, putting
+    // the connection into subscriber mode in the middle of a transaction.
+    const UNQUEUEABLE: [&[u8]; 4] = [b"SUBSCRIBE", b"UNSUBSCRIBE", b"PSUBSCRIBE", b"PUNSUBSCRIBE"];
+    for verb in UNQUEUEABLE {
+        if cmd.eq_ignore_ascii_case(verb) {
+            let name = String::from_utf8_lossy(verb).to_uppercase();
+            return Some(Frame::Error(Bytes::from(format!(
+                "ERR {name} is not allowed in transactions"
+            ))));
+        }
+    }
+    if cmd.eq_ignore_ascii_case(b"WATCH") {
+        return Some(Frame::Error(Bytes::from_static(
+            b"ERR WATCH inside MULTI is not allowed",
+        )));
+    }
+
+    let Some(meta) = crate::command::metadata::lookup(cmd) else {
+        // Only a NON-namespaced name can confidently be called unknown.
+        //
+        // `COMMAND_META` (263 entries) covers Redis's surface plus the Moon
+        // extensions that were registered — `GRAPH.QUERY` is in it — but NOT
+        // every dotted family the handlers intercept ahead of dispatch.
+        // Rejecting an unregistered dotted name here would break a command
+        // that works fine OUTSIDE a transaction: a regression strictly worse
+        // than the bug this function exists to fix.
+        //
+        // Audited 2026-08-12: of the dotted families absent from the table,
+        // `TXN` is intercepted before the queue block, `FT.*` is rejected
+        // above it, and `TS.*` / `JSON.*` do not exist in Moon at all. So
+        // nothing is broken today — but that is four separate accidents, not
+        // a safety argument, and the next dotted family added without a table
+        // entry would silently become unusable inside MULTI.
+        //
+        // The carve-out costs only the ability to catch a typo'd dotted name.
+        // Dotted names that ARE registered still get their arity checked.
+        if cmd.contains(&b'.') {
+            return None;
+        }
+        // Redis's format: the name quoted, then the args it did get. A driver
+        // author reading this sees their typo; a generic "unknown command"
+        // sends them looking at Moon.
+        let mut detail = String::new();
+        for a in args.iter().take(20) {
+            if let Frame::BulkString(b) | Frame::SimpleString(b) = a {
+                detail.push('\'');
+                detail.push_str(&String::from_utf8_lossy(b));
+                detail.push_str("', ");
+            }
+        }
+        return Some(Frame::Error(Bytes::from(format!(
+            "ERR unknown command '{}', with args beginning with: {detail}",
+            String::from_utf8_lossy(cmd)
+        ))));
+    };
+
+    // `arity` counts the command name itself, so compare against args + 1.
+    // Positive = exact; negative = minimum (variadic).
+    let given = args.len() as i16 + 1;
+    let bad_arity = if meta.arity >= 0 {
+        given != meta.arity
+    } else {
+        given < -meta.arity
+    };
+    if bad_arity {
+        return Some(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            meta.name.to_lowercase()
+        ))));
+    }
+    None
+}
+
+/// The reply `EXEC` owes a transaction poisoned at queue time.
+pub(crate) fn execabort_frame() -> Frame {
+    Frame::Error(Bytes::from_static(
+        b"EXECABORT Transaction discarded because of previous errors.",
+    ))
+}
+
 /// Handle `RESET`, returning `true` when the command was consumed.
 ///
 /// MUST be called BEFORE the MULTI queueing step. Measured against
@@ -1038,6 +1213,9 @@ pub(crate) fn try_handle_reset(
     // Transaction
     conn.in_multi = false;
     conn.command_queue.clear();
+    // The dirty flag must not survive the transaction it belongs to; a leak
+    // would abort the NEXT, innocent one.
+    conn.multi_dirty = false;
     conn.watched_keys.clear();
 
     // Client-side caching

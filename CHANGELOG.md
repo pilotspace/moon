@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A malformed frame no longer closes the connection silently, and no longer eats the valid
+  commands that arrived with it.** `Err(_) => break` in the read loops discarded two things: the
+  parse error's reason, so a client got a bare FIN and could not tell a bad encoder from a dropped
+  network, and the already-parsed batch — so `PING\r\n*-9\r\n` in a single write answered
+  *nothing at all*. All three handlers now execute and flush the valid prefix, then send
+  `-ERR Protocol error: <reason>` using redis-server 8.6.1's verbatim wording, then close. Also
+  measured and fixed alongside it: `*-9` (any negative multibulk count) killed the connection where
+  Redis ignores it; an oversized inline request closed mute even though Moon already *built* the
+  correct "too big inline request" message; and inline quoting did not exist at all, so
+  `SET k "a b"` became three arguments containing literal quote bytes and `GET "unclosed` was
+  silently accepted as a key — the inline parser is now a port of Redis's `sdssplitargs`.
+- **`MULTI` is atomic with respect to queue-time faults.** Moon had no queue-time validation, so
+  `EXEC` ran whichever half of a transaction happened to parse: `MULTI / NOSUCHCMD / SET k v / EXEC`
+  left `k` **set** where Redis discards everything — data corruption, not a compatibility nit. A
+  command that could never run (unknown name, impossible arity, `SUBSCRIBE`, `WATCH`) is now refused
+  as it is queued and poisons the transaction, and `EXEC` answers
+  `-EXECABORT Transaction discarded because of previous errors.` Fixing this exposed a wider defect:
+  Moon decided "am I in a transaction?" hundreds of lines *below* the `INFO` / `CLIENT` / `WS` /
+  `MQ` / `PUBLISH` / `SUBSCRIBE` intercepts, so every one of those executed for real inside a
+  transaction — `SUBSCRIBE ch` put the connection into subscriber mode mid-`MULTI`, and
+  `INFO server` returned a 3 KB dump where Redis returns `+QUEUED`. The queue decision now sits
+  directly below each handler's ACL gate, which fixes the whole class at once.
+
 ### Added
 - **`ROLE`, `RESET`, and a real `COMMAND` introspection surface.** `COMMAND` and `COMMAND COUNT`
   each returned the OTHER'S RESP TYPE — bare `COMMAND` replied `:0` (an Integer where an Array

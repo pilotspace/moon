@@ -217,6 +217,77 @@ impl PartialEq for Frame {
     }
 }
 
+/// Which protocol fault occurred, in the vocabulary Redis puts on the wire.
+///
+/// `ParseError::Invalid` already carries a detailed `message` — it is what a
+/// fuzz triage or a log reader wants ("invalid bulk string length: -5"
+/// localises a bug; "invalid bulk length" does not). But that detail is
+/// Moon's own wording, and a driver author reading it cannot match it against
+/// the Redis error they wrote their reconnect logic around.
+///
+/// So the fault carries BOTH: this enum for the wire, the message for us.
+/// Redis's set is small and fixed (`networking.c`), which is why this is a
+/// closed enum of `&'static str` rather than a formatted string — nothing
+/// here allocates, and it is only ever reached on a connection that is
+/// already terminating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoFault {
+    /// A bulk header's length was absent, non-numeric, negative (other than
+    /// the `-1` null), or past the configured maximum.
+    BulkLen,
+    /// An array/set/map/push header's element count was malformed or too deep.
+    MultibulkLen,
+    /// An array element did not begin with `$`. Carries the offending byte.
+    ExpectedDollar(u8),
+    /// An inline request exceeded the inline cap.
+    InlineTooBig,
+    /// An inline request ended with a quote still open.
+    UnbalancedQuotes,
+    /// The multibulk count string itself was implausibly long.
+    MbulkCountTooBig,
+    /// A type byte Moon parses but a Redis client should never send inbound.
+    /// Redis conflates this with `ExpectedDollar`, and so do we.
+    UnknownType(u8),
+}
+
+impl ProtoFault {
+    /// The reason text, verbatim from redis-server 8.6.1. The caller prefixes
+    /// `-ERR `. Returns `None` for the two byte-carrying variants, whose text
+    /// must be formatted — see [`ProtoFault::wire_text_owned`].
+    pub fn wire_text(&self) -> &'static str {
+        match self {
+            ProtoFault::BulkLen => "Protocol error: invalid bulk length",
+            ProtoFault::MultibulkLen => "Protocol error: invalid multibulk length",
+            ProtoFault::InlineTooBig => "Protocol error: too big inline request",
+            ProtoFault::UnbalancedQuotes => "Protocol error: unbalanced quotes in request",
+            ProtoFault::MbulkCountTooBig => "Protocol error: too big mbulk count string",
+            // Both byte-carrying variants render through `wire_text_owned`;
+            // this arm exists so a caller that only wants a static string
+            // still gets the right *shape* rather than a panic.
+            ProtoFault::ExpectedDollar(_) | ProtoFault::UnknownType(_) => {
+                "Protocol error: expected '$', got '?'"
+            }
+        }
+    }
+
+    /// The reason text with any offending byte substituted in.
+    ///
+    /// Allocates, deliberately: this runs once per doomed connection, never on
+    /// a serving path, and the alternative (a stack buffer threaded through
+    /// three handlers) buys nothing measurable.
+    pub fn wire_text_owned(&self) -> String {
+        match self {
+            ProtoFault::ExpectedDollar(b) | ProtoFault::UnknownType(b) => {
+                // Redis prints the raw byte. A non-printable one renders as
+                // whatever the terminal makes of it, which is Redis's
+                // behavior too — matching it matters more than prettiness.
+                format!("Protocol error: expected '$', got '{}'", *b as char)
+            }
+            other => other.wire_text().to_string(),
+        }
+    }
+}
+
 /// Errors that can occur when parsing RESP2 frames.
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -226,8 +297,15 @@ pub enum ParseError {
     Incomplete,
 
     /// The data violates the RESP2 protocol specification.
+    ///
+    /// `kind` is what goes on the wire; `message` is the detailed internal
+    /// reason kept for logs and fuzz triage. They are deliberately different.
     #[error("invalid frame at byte {offset}: {message}")]
-    Invalid { message: String, offset: usize },
+    Invalid {
+        kind: ProtoFault,
+        message: String,
+        offset: usize,
+    },
 
     /// An I/O error occurred while reading from the buffer.
     #[error("io error: {0}")]
@@ -302,9 +380,13 @@ mod tests {
     #[test]
     fn test_parse_error_invalid_display() {
         let err = ParseError::Invalid {
+            kind: ProtoFault::BulkLen,
             message: "bad".into(),
             offset: 5,
         };
+        // Display still renders the DETAILED internal message, not the wire
+        // text — the two are deliberately different, and this assertion is
+        // what pins that. `kind` travels alongside for the client's benefit.
         assert_eq!(format!("{}", err), "invalid frame at byte 5: bad");
     }
 

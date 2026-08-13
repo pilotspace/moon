@@ -29,6 +29,10 @@ pub struct RespCodec {
     /// run during the growth that matters. `decode` is the one place that
     /// sees the buffer on every pass.
     max_query_buf: usize,
+    /// Fault from the last failed decode — see `take_last_fault`. The
+    /// `Decoder` trait's `io::Error` cannot carry it, and a bare close leaves
+    /// the client unable to tell a bad encoder from a dropped network.
+    last_fault: Option<crate::protocol::ProtoFault>,
 }
 
 impl RespCodec {
@@ -37,6 +41,7 @@ impl RespCodec {
             config,
             protocol_version: 2,
             max_query_buf: 0,
+            last_fault: None,
         }
     }
 
@@ -68,8 +73,27 @@ impl RespCodec {
         match protocol::parse(src, &self.config) {
             Ok(frame) => Ok(frame),
             Err(ParseError::Incomplete) => Ok(None),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) => {
+                // `Decoder` pins the error type to `io::Error`, which cannot
+                // carry the fault kind — and the kind is exactly what the
+                // client needs to be told. Park it here for the handler to
+                // pick up; it is read immediately after this returns Err, so
+                // there is no window in which it can go stale.
+                if let ParseError::Invalid { kind, .. } = &e {
+                    self.last_fault = Some(*kind);
+                }
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }
         }
+    }
+
+    /// The fault from the most recent failed [`Self::decode_frame`], taken.
+    ///
+    /// `None` means the read failed for a non-protocol reason (a dead socket,
+    /// the query-buffer ceiling) — in which case there is nothing useful to
+    /// tell the client and the connection just closes.
+    pub fn take_last_fault(&mut self) -> Option<crate::protocol::ProtoFault> {
+        self.last_fault.take()
     }
 
     /// Encode a frame into the buffer (runtime-agnostic).
