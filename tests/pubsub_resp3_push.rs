@@ -199,7 +199,10 @@ fn frame_end(buf: &[u8], i: usize) -> Option<usize> {
     match tag {
         b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => Some(line_end),
         b'$' | b'=' => {
-            let n: i64 = std::str::from_utf8(&buf[i + 1..line_end - 2]).ok()?.parse().ok()?;
+            let n: i64 = std::str::from_utf8(&buf[i + 1..line_end - 2])
+                .ok()?
+                .parse()
+                .ok()?;
             if n < 0 {
                 return Some(line_end);
             }
@@ -207,11 +210,18 @@ fn frame_end(buf: &[u8], i: usize) -> Option<usize> {
             if end > buf.len() { None } else { Some(end) }
         }
         b'*' | b'~' | b'>' | b'%' => {
-            let n: i64 = std::str::from_utf8(&buf[i + 1..line_end - 2]).ok()?.parse().ok()?;
+            let n: i64 = std::str::from_utf8(&buf[i + 1..line_end - 2])
+                .ok()?
+                .parse()
+                .ok()?;
             if n < 0 {
                 return Some(line_end);
             }
-            let count = if tag == b'%' { n as usize * 2 } else { n as usize };
+            let count = if tag == b'%' {
+                n as usize * 2
+            } else {
+                n as usize
+            };
             let mut j = line_end;
             for _ in 0..count {
                 j = frame_end(buf, j)?;
@@ -239,8 +249,12 @@ fn s(b: &[u8]) -> String {
 
 /// Assert every frame in `buf` whose payload names `verb` leads with `lead`.
 fn assert_confirmation_lead(buf: &[u8], verb: &str, lead: u8, ctx: &str) {
-    let frames = split_frames(buf)
-        .unwrap_or_else(|| panic!("{ctx}: reply is not a sequence of whole frames: {:?}", s(buf)));
+    let frames = split_frames(buf).unwrap_or_else(|| {
+        panic!(
+            "{ctx}: reply is not a sequence of whole frames: {:?}",
+            s(buf)
+        )
+    });
     let hit = frames
         .iter()
         .find(|f| f.windows(verb.len()).any(|w| w == verb.as_bytes()));
@@ -248,7 +262,8 @@ fn assert_confirmation_lead(buf: &[u8], verb: &str, lead: u8, ctx: &str) {
         panic!("{ctx}: no `{verb}` confirmation in {:?}", s(buf));
     });
     assert_eq!(
-        f[0] as char, lead as char,
+        f[0] as char,
+        lead as char,
         "{ctx}: `{verb}` confirmation must lead with `{}`; got {:?}. A RESP3 client tells an \
          out-of-band push from a command reply by this byte alone.",
         lead as char,
@@ -486,7 +501,11 @@ fn ps11_sharded_publish_delivers_smessage() {
 
     let mut pubc = Conn::open(m.port);
     let n = pubc.send(&["SPUBLISH", "sch", "hi"]);
-    assert_eq!(s(&n), ":1\r\n", "SPUBLISH reports the sharded receiver count");
+    assert_eq!(
+        s(&n),
+        ":1\r\n",
+        "SPUBLISH reports the sharded receiver count"
+    );
 
     let got = sub.drain();
     assert!(

@@ -702,6 +702,16 @@ if should_run "pubsub"; then
 
     # Publish to a channel (no subscribers = 0)
     assert_match "PUBLISH (no subs)"   PUBLISH chan:test "hello"
+
+    # Sharded pub/sub. Compared against Redis like everything else here, so a
+    # divergence in the sharded namespace shows up next to the plain one.
+    assert_match "SPUBLISH (no subs)"  SPUBLISH schan:test "hello"
+    assert_match "PUBSUB SHARDCHANNELS (empty)" PUBSUB SHARDCHANNELS
+    assert_match "PUBSUB SHARDNUMSUB (absent)"  PUBSUB SHARDNUMSUB schan:test
+    # Distinct patterns, not subscribers — with nobody subscribed both are 0,
+    # so this row guards the wiring; the two-live-subscriber case that actually
+    # exposes the counting bug is tests/pubsub_resp3_push.rs::ps14.
+    assert_match "PUBSUB NUMPAT (none)" PUBSUB NUMPAT
 fi
 
 # ===========================================================================

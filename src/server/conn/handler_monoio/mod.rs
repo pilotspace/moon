@@ -109,8 +109,8 @@ use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
     handle_config, is_multi_key_command, propagate_shard_subscription, propagate_subscription,
-    resp3_shape_for,
-    try_inline_dispatch_loop, unpropagate_shard_subscription, unpropagate_subscription,
+    resp3_shape_for, try_inline_dispatch_loop, unpropagate_shard_subscription,
+    unpropagate_subscription,
 };
 use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
@@ -1400,8 +1400,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         local_leg_write_idxs.clear();
         // The trailing bool marks a SHARDED publish. One batch map, split at flush:
         // the two namespaces share the fan-out plumbing but never the destination.
-        let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes, bool)>> =
-            std::collections::HashMap::new();
+        let mut publish_batches: std::collections::HashMap<
+            usize,
+            Vec<(usize, Bytes, Bytes, bool)>,
+        > = std::collections::HashMap::new();
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         crate::shard::slice::with_shard_db(conn.selected_db, |db| {
@@ -3029,8 +3031,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
                 );
                 let resp_indices: Vec<usize> = entries.iter().map(|(idx, ..)| *idx).collect();
-                let pairs: Vec<(Bytes, Bytes)> =
-                    entries.into_iter().map(|(_, ch, msg, _)| (ch, msg)).collect();
+                let pairs: Vec<(Bytes, Bytes)> = entries
+                    .into_iter()
+                    .map(|(_, ch, msg, _)| (ch, msg))
+                    .collect();
 
                 let idx = ChannelMesh::target_index(ctx.shard_id, target);
                 // E1: bounded backpressure retry instead of one bare try_push
