@@ -81,7 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative for its own bitmap; a strictly *lower* epoch is still ignored, preserving Redis's
   highest-epoch-wins tie-break), and the unclaimed-slot fallback is split: a lone node still serves
   locally so single-node bootstrap keeps working, while a formed cluster answers
-  `CLUSTERDOWN The cluster is down` rather than inventing an answer. Direct contact with a node also
+  `CLUSTERDOWN Hash slot not served` rather than inventing an answer. That is the per-slot message,
+  measured — Redis's other CLUSTERDOWN, `The cluster is down`, means `cluster_state` is fail, and
+  sending it for one unowned slot tells an operator the whole cluster is gone. Direct contact with a
+  node also
   now clears any suspicion about it — previously nothing ever reset health, so a node that recovered
   stayed suspected forever and its slots never counted as covered again.
 - **A node's role and its health were the same field, so learning one erased the other.**
