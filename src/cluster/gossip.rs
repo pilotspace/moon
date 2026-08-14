@@ -492,6 +492,11 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
             state.nodes.insert(target_node_id, node);
         }
     }
+
+    // Slot ownership and node health both just moved: re-derive the fail-closed
+    // cache now rather than waiting for the next 100ms tick, so a cluster that
+    // has just regained coverage starts serving immediately.
+    state.refresh_fail_closed();
 }
 
 /// Check for PFAIL -> FAIL transitions based on ping timeout.
@@ -546,6 +551,12 @@ pub async fn run_gossip_ticker(
                 let (target_addr, ping_msg) = {
                     let mut cs = cluster_state.write();
                     check_failure_states(&mut cs, node_timeout_ms);
+                    // Unconditional refresh of the fail-closed cache. This tick
+                    // is the backstop: every other refresh site is an
+                    // optimisation for latency, and a site someone forgets to
+                    // add self-heals here within 100ms rather than pinning a
+                    // stale answer forever.
+                    cs.refresh_fail_closed();
 
                     // Reset election_spawned when failover state returns to None
                     if election_spawned && cs.failover_state == FailoverState::None {

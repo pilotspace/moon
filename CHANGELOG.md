@@ -70,6 +70,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separators, and only a non-whitespace byte (`ECHO "hi"y`) is unbalanced. The check now reads the
   same `is_inline_space` set as the rest of the splitter — the narrow/wide disagreement here was the
   milder form of the bug that made the splitter unable to advance at all.
+- **`cluster_state` was a constant, so a cluster that had lost a master still reported itself
+  healthy.** The `status` field was assigned once in `ClusterState::new` and never written again;
+  `cluster_slots_pfail` and `cluster_slots_fail` were the literals `0`, and `cluster_slots_ok` was
+  reported as "however many slots are assigned". A client had no way to learn the cluster was
+  degraded. `cluster_state` is now derived on read from real coverage — `ok` only when every one of
+  the 16384 slots is claimed by a node that is not confirmed `FAIL` — and the three slot counters
+  are counted per slot through their owners' bitmaps rather than by summing per-node counts, so a
+  slot two nodes both claim cannot mask a real coverage hole.
+
+  Fixing the reporting exposed that the transition it reports could never happen either:
+  `try_mark_fail_with_consensus` counted only reports received FROM peers, but Redis's
+  `markNodeAsFailingIfNeeded` also counts the local node's own suspicion when it is a master
+  (`if (nodeIsMaster(myself)) failures++`). Without that vote a 3-master cluster is arithmetically
+  unable to promote PFAIL to FAIL — quorum is 2, and each survivor hears about the dead node from
+  exactly one other survivor, so the count tops out at 1 forever. A replica still casts no vote.
+- **A degraded cluster kept serving keys, handing clients a partial view they could not detect.**
+  While `cluster_state` is `fail`, every keyspace command now answers `CLUSTERDOWN The cluster is
+  down` — including keys in slots the receiving node owns and could serve. That over-refusal is
+  deliberate and measured: a partially-visible keyspace is worse than a refusal, because a client
+  cannot tell which half of the data it is seeing. Redis's two CLUSTERDOWN messages stay distinct
+  and the order between them is load-bearing — an unclaimed slot answers the per-slot `CLUSTERDOWN
+  Hash slot not served` even while the cluster is fail, matching a real server (a lone
+  `--cluster-enabled` node reports `cluster_state:fail` and yet answers `Hash slot not served`). A
+  single-node cluster never trips the gate, so bootstrap stays usable. The gate is one bool read on
+  state already under the caller's lock; the coverage scan behind it runs on topology change, never
+  per command.
+- **`CLUSTER INFO` reported `cluster_enabled`, which Redis reports only in `INFO`.** Removed from
+  `CLUSTER INFO`; measured against redis-server 8.6.1, which emits it in INFO's Cluster section and
+  never here.
 - **A multi-node cluster silently served keys it did not own (#485).** `CLUSTER ADDSLOTS` does not
   bump the config epoch, so a hand-built cluster sits at epoch 0 forever. The gossip merge accepted
   a peer's slot bitmap only at a *strictly higher* epoch — `0 > 0` is false — so peer ownership was

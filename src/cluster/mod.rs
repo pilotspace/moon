@@ -45,10 +45,28 @@ pub enum NodeHealth {
 
 // --- Cluster-level status --------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClusterStatus {
     Ok,
     Fail,
+}
+
+/// Cluster-wide slot health, counted per slot rather than per node.
+///
+/// Every field answers a question `CLUSTER INFO` asks, and each was a constant
+/// before: `ok` was reported as "however many slots are assigned" and `pfail` /
+/// `fail` were the literals `0`, so a cluster that had lost a master still
+/// reported every slot healthy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlotCoverage {
+    /// Slots claimed by some node, whatever its health.
+    pub assigned: usize,
+    /// Slots whose owner is `Online`.
+    pub ok: usize,
+    /// Slots whose owner is suspected down (`Pfail`) but not yet confirmed.
+    pub pfail: usize,
+    /// Slots whose owner is confirmed `Fail`.
+    pub fail: usize,
 }
 
 // --- ClusterNode -----------------------------------------------------------------
@@ -190,6 +208,13 @@ pub enum SlotRoute {
     /// CLUSTERDOWN messages and this is the per-slot one. See
     /// `into_error_frame`.
     SlotNotServed,
+    /// `cluster_state` is `fail`, so this node refuses ALL keyspace traffic —
+    /// including keys in slots it owns and could serve.
+    ///
+    /// That looks like over-refusal and is deliberate, measured against Redis:
+    /// a partially-visible keyspace is worse than a refusal, because a client
+    /// cannot tell which half of the data it is seeing.
+    ClusterDown,
 }
 
 impl SlotRoute {
@@ -219,6 +244,12 @@ impl SlotRoute {
             // why this must be the ex-owner's own reply and not a redirect.
             SlotRoute::SlotNotServed => {
                 Frame::Error(Bytes::from_static(b"CLUSTERDOWN Hash slot not served"))
+            }
+            // The CLUSTER-WIDE message, the counterpart to the per-slot one
+            // above. Sent when cluster_state is fail even for a slot this node
+            // owns; a client distinguishes the two texts.
+            SlotRoute::ClusterDown => {
+                Frame::Error(Bytes::from_static(b"CLUSTERDOWN The cluster is down"))
             }
             SlotRoute::Local => unreachable!("Local routes do not produce error frames"),
         }
@@ -254,8 +285,23 @@ pub struct ClusterState {
     pub node_id: String,
     /// Config epoch -- increments on failover or topology change. Persisted to nodes.conf.
     pub epoch: u64,
-    /// Overall cluster status.
-    pub status: ClusterStatus,
+    // NOTE: there is deliberately no `status` field. It existed, was assigned
+    // exactly once in `new()`, and was never written again — so `cluster_state`
+    // reported the constant `ok` even after a master died. `cluster_state` is
+    // now derived on read by `cluster_status()`, which cannot go stale.
+    /// Hot-path mirror of "is `cluster_status()` currently `Fail`?".
+    ///
+    /// `cluster_status()` remains the authority and every client-visible answer
+    /// is computed from it. This exists only because the fail-closed gate sits
+    /// on the keyspace path, where recomputing coverage would mean ORing every
+    /// node's 2048-byte bitmap on every single command.
+    ///
+    /// It is a cache, not the second source of truth the old `status` field
+    /// was: that field had no refresh path at all, while this one is refreshed
+    /// unconditionally by the 100ms gossip tick as well as at each mutation
+    /// site, so a refresh site someone forgets to add self-heals within a tick
+    /// instead of pinning a wrong answer forever.
+    fail_closed: bool,
     /// All known nodes keyed by node_id (includes self).
     pub nodes: HashMap<String, ClusterNode>,
     /// Slots currently being IMPORTED on this node (slot -> source node_id).
@@ -278,7 +324,7 @@ impl ClusterState {
         let mut state = ClusterState {
             node_id: node_id.clone(),
             epoch: 0,
-            status: ClusterStatus::Ok,
+            fail_closed: false,
             nodes: HashMap::new(),
             importing: HashMap::new(),
             migrating: HashMap::new(),
@@ -320,6 +366,39 @@ impl ClusterState {
             return SlotRoute::Local;
         }
 
+        // Nobody claims this slot.
+        //
+        // Checked FIRST, before the fail-closed gate, because the two
+        // CLUSTERDOWN messages are not interchangeable and Redis picks the
+        // per-slot one here. Measured: a lone `--cluster-enabled` node with no
+        // slots reports `cluster_state:fail` AND answers a key command with
+        // `CLUSTERDOWN Hash slot not served` — the unbound-slot answer wins
+        // over the cluster-down answer.
+        //
+        // For a LONE node this is instead the bootstrap case: a single server
+        // with cluster mode on and no slots assigned must still serve, or it is
+        // useless until someone runs ADDSLOTS. That is a deliberate divergence
+        // from Redis (M3), which refuses. For a FORMED cluster it is a coverage
+        // hole, and serving locally is what produced #485 — a write accepted by
+        // a node that does not own the slot, invisible to the node that does,
+        // with no error to tell the client.
+        if self.slot_owner(slot).is_none() {
+            return if self.nodes.len() <= 1 {
+                SlotRoute::Local
+            } else {
+                SlotRoute::SlotNotServed
+            };
+        }
+
+        // The slot HAS an owner, but the cluster as a whole has lost coverage
+        // somewhere else: refuse everything, including keys this node owns and
+        // could serve. A single relaxed atomic load — the coverage scan behind
+        // it runs on topology change, never per command (see
+        // `refresh_fail_closed`).
+        if self.fail_closed {
+            return SlotRoute::ClusterDown;
+        }
+
         let my_node = self.my_node();
 
         if my_node.owns_slot(slot) {
@@ -343,24 +422,96 @@ impl ClusterState {
             };
         }
 
-        // Nobody claims this slot.
-        //
-        // For a LONE node this is the bootstrap case: a single server with
-        // cluster mode on and no slots assigned must still serve, or it is
-        // useless until someone runs ADDSLOTS. For a FORMED cluster it is a
-        // coverage hole, and serving locally is what produced #485 — a write
-        // accepted by a node that does not own the slot, invisible to the node
-        // that does, with no error to tell the client.
-        if self.nodes.len() <= 1 {
-            SlotRoute::Local
-        } else {
-            SlotRoute::SlotNotServed
-        }
+        // Unreachable in practice: the no-owner case is handled at the top of
+        // this function, so reaching here means some node owns the slot but
+        // neither the MOVED nor the Local branch claimed it. Route locally
+        // rather than inventing an error.
+        SlotRoute::Local
     }
 
     /// How many slots total are assigned to any node in this cluster.
     pub fn assigned_slot_count(&self) -> usize {
         self.nodes.values().map(|n| n.slot_count()).sum()
+    }
+
+    /// Classify all 16384 slots by the health of the node that owns them.
+    ///
+    /// Counted through the owners' bitmaps in one pass rather than by summing
+    /// per-node slot counts: summing would double-count a slot two nodes both
+    /// claim, and could then report `assigned == 16384` for a cluster with an
+    /// actual coverage hole. First claimant wins, matching `slot_owner`.
+    pub fn slot_coverage(&self) -> SlotCoverage {
+        let mut claimed = [0u8; 2048];
+        let mut ok = [0u8; 2048];
+        let mut pfail = [0u8; 2048];
+        let mut fail = [0u8; 2048];
+
+        for node in self.nodes.values() {
+            let bucket = match node.health {
+                NodeHealth::Online => &mut ok,
+                NodeHealth::Pfail => &mut pfail,
+                NodeHealth::Fail => &mut fail,
+            };
+            for i in 0..2048 {
+                // Only slots nobody has claimed yet fall to this node.
+                bucket[i] |= node.slots[i] & !claimed[i];
+            }
+            for i in 0..2048 {
+                claimed[i] |= node.slots[i];
+            }
+        }
+
+        let popcount = |b: &[u8; 2048]| b.iter().map(|x| x.count_ones() as usize).sum();
+        SlotCoverage {
+            assigned: popcount(&claimed),
+            ok: popcount(&ok),
+            pfail: popcount(&pfail),
+            fail: popcount(&fail),
+        }
+    }
+
+    /// Recompute the hot-path fail-closed cache from real coverage.
+    ///
+    /// A lone node never trips the gate: a single server with cluster mode on
+    /// and no slots assigned is the bootstrap case and must stay usable (M3).
+    /// Redis refuses there; this is Moon's contracted divergence.
+    pub fn refresh_fail_closed(&mut self) {
+        self.fail_closed = self.nodes.len() > 1 && self.cluster_status() == ClusterStatus::Fail;
+    }
+
+    /// Is the fail-closed gate currently engaged? Test/introspection accessor;
+    /// the hot path reads the field directly.
+    #[inline]
+    pub fn is_fail_closed(&self) -> bool {
+        self.fail_closed
+    }
+
+    /// The cluster's real state, derived rather than stored.
+    ///
+    /// Derived deliberately: the old `status` field was assigned once in the
+    /// initialiser and never again, so `cluster_state` was the constant `ok` —
+    /// a cluster that had lost a master still told every client it was healthy.
+    /// A value computed at read time cannot go stale.
+    ///
+    /// `Ok` iff every one of the 16384 slots is claimed by a node that is not
+    /// confirmed `Fail`. `Pfail` is a local suspicion, not consensus, and does
+    /// NOT by itself bring the cluster down — matching Redis, which fails the
+    /// cluster on an uncovered slot or a FAIL owner.
+    pub fn cluster_status(&self) -> ClusterStatus {
+        let mut served = [0u8; 2048];
+        for node in self.nodes.values() {
+            if node.is_failed() {
+                continue;
+            }
+            for i in 0..2048 {
+                served[i] |= node.slots[i];
+            }
+        }
+        if served.iter().all(|b| *b == 0xff) {
+            ClusterStatus::Ok
+        } else {
+            ClusterStatus::Fail
+        }
     }
 
     /// Quorum: strict majority of masters required for consensus decisions.
@@ -453,6 +604,73 @@ mod tests {
             }
             other => panic!("expected Moved, got {:?}", other),
         }
+    }
+
+    /// The fail-closed gate refuses a key this node OWNS.
+    ///
+    /// Freeze flag 2, and the surprising half on purpose: measured against
+    /// redis-server, a degraded cluster refuses even a slot the receiving node
+    /// could serve. A partially-visible keyspace is worse than a refusal.
+    #[test]
+    fn test_fail_closed_gate_refuses_a_locally_owned_slot() {
+        let mut state = make_state_with_two_nodes();
+        // Full coverage, everyone healthy -> gate open.
+        state.refresh_fail_closed();
+        assert!(!state.is_fail_closed());
+        assert_eq!(state.route_slot(0, false), SlotRoute::Local);
+
+        // The peer dies. Its half of the keyspace has no live owner.
+        let peer_id = "b".repeat(40);
+        state.nodes.get_mut(&peer_id).unwrap().health = NodeHealth::Fail;
+        state.refresh_fail_closed();
+        assert!(state.is_fail_closed());
+
+        // Slot 0 is OURS and we are healthy — and it is still refused.
+        assert_eq!(state.route_slot(0, false), SlotRoute::ClusterDown);
+    }
+
+    /// An unowned slot answers the PER-SLOT message even while the cluster is
+    /// fail — the two CLUSTERDOWN texts are not interchangeable.
+    ///
+    /// Measured: a lone `--cluster-enabled` node reports `cluster_state:fail`
+    /// and yet answers `CLUSTERDOWN Hash slot not served`, so the unbound-slot
+    /// check must be ordered BEFORE the fail-closed check.
+    #[test]
+    fn test_unowned_slot_beats_the_fail_closed_message() {
+        let mut state = make_state_with_two_nodes();
+        // Drop slot 9000 from the peer: now nobody owns it AND the cluster is
+        // no longer fully covered, so both conditions are live at once.
+        let peer_id = "b".repeat(40);
+        state.nodes.get_mut(&peer_id).unwrap().clear_slot(9000);
+        state.refresh_fail_closed();
+        assert!(state.is_fail_closed(), "coverage hole must trip the gate");
+
+        let route = state.route_slot(9000, false);
+        assert_eq!(route, SlotRoute::SlotNotServed);
+        match route.into_error_frame(9000) {
+            Frame::Error(msg) => assert_eq!(
+                std::str::from_utf8(&msg).unwrap(),
+                "CLUSTERDOWN Hash slot not served"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A lone node never trips the gate, however uncovered it is.
+    ///
+    /// Moon's contracted divergence from Redis (M3): a single server with
+    /// cluster mode on and no slots must stay usable, or it is useless until
+    /// someone runs ADDSLOTS.
+    #[test]
+    fn test_lone_node_never_trips_the_fail_closed_gate() {
+        let mut state = ClusterState::new("a".repeat(40), test_addr(6379));
+        assert_eq!(state.cluster_status(), ClusterStatus::Fail, "no coverage");
+        state.refresh_fail_closed();
+        assert!(
+            !state.is_fail_closed(),
+            "the bootstrap case must stay serveable"
+        );
+        assert_eq!(state.route_slot(1234, false), SlotRoute::Local);
     }
 
     /// CLUSTER-04: MOVED error format.

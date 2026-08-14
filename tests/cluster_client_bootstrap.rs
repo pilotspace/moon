@@ -890,7 +890,6 @@ fn cb12_readonly_serves_replica_reads_but_never_replica_writes() {
 // ── M14-M16: honest health, fail-closed ────────────────────────────────────
 
 #[test]
-#[ignore = "red until batch 2 (health accounting / cluster_state) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb15_cluster_state_and_slot_counters_reflect_reality() {
     let cl = form_cluster(3);
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
@@ -940,7 +939,6 @@ fn cb15_cluster_state_and_slot_counters_reflect_reality() {
 }
 
 #[test]
-#[ignore = "red until batch 3 (CLUSTERDOWN gate) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb16_a_degraded_cluster_refuses_keyspace_traffic_even_for_local_slots() {
     // ⚠ freeze flag 2: measured on redis-server — CLUSTERDOWN is returned even
     // for a key in a slot the receiving node OWNS and could serve. A
@@ -996,7 +994,6 @@ fn cb17_info_reports_cluster_mode_honestly() {
 }
 
 #[test]
-#[ignore = "red until batch 2 (CLUSTER INFO counters) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb18_cluster_info_does_not_emit_cluster_enabled() {
     // Measured: redis-server reports cluster_enabled in INFO, never in
     // CLUSTER INFO. Moon has it in exactly the wrong one of the two.

@@ -58,32 +58,44 @@ pub fn handle_cluster_command(
 /// CLUSTER INFO -- return a bulk string with cluster statistics in Redis format.
 pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAddr) -> Frame {
     let state = cs.read();
-    let cluster_state_str = if state.status == ClusterStatus::Ok {
+    let cluster_state_str = if state.cluster_status() == ClusterStatus::Ok {
         "ok"
     } else {
         "fail"
     };
-    let assigned = state.assigned_slot_count();
+    let coverage = state.slot_coverage();
     let known_nodes = state.nodes.len();
     let size = state.master_count();
     let epoch = state.epoch;
     let sent = state.messages_sent;
     let recv = state.messages_received;
 
+    // No `cluster_enabled` here: measured against redis-server 8.6.1, which
+    // reports it in INFO's Cluster section and never in CLUSTER INFO. Moon had
+    // it in exactly the wrong one of the two.
     let info = format!(
-        "cluster_enabled:1\r\n\
-         cluster_state:{}\r\n\
+        "cluster_state:{}\r\n\
          cluster_slots_assigned:{}\r\n\
          cluster_slots_ok:{}\r\n\
-         cluster_slots_pfail:0\r\n\
-         cluster_slots_fail:0\r\n\
+         cluster_slots_pfail:{}\r\n\
+         cluster_slots_fail:{}\r\n\
          cluster_known_nodes:{}\r\n\
          cluster_size:{}\r\n\
          cluster_current_epoch:{}\r\n\
          cluster_my_epoch:{}\r\n\
          cluster_stats_messages_sent:{}\r\n\
          cluster_stats_messages_received:{}\r\n",
-        cluster_state_str, assigned, assigned, known_nodes, size, epoch, epoch, sent, recv
+        cluster_state_str,
+        coverage.assigned,
+        coverage.ok,
+        coverage.pfail,
+        coverage.fail,
+        known_nodes,
+        size,
+        epoch,
+        epoch,
+        sent,
+        recv
     );
     Frame::BulkString(Bytes::from(info))
 }
@@ -311,6 +323,9 @@ pub fn handle_cluster_addslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
     for slot in &slots {
         state.my_node_mut().set_slot(*slot);
     }
+    // Coverage just changed: re-derive the fail-closed cache so the very next
+    // command sees it, rather than waiting up to 100ms for the gossip tick.
+    state.refresh_fail_closed();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -329,6 +344,7 @@ pub fn handle_cluster_delslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
     for slot in &slots {
         state.my_node_mut().clear_slot(*slot);
     }
+    state.refresh_fail_closed();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -388,6 +404,9 @@ pub fn handle_cluster_setslot(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) ->
         }
         _ => return Frame::Error(Bytes::from_static(b"ERR unknown SETSLOT subcommand")),
     }
+    // NODE transfers ownership between nodes, which can open or close a
+    // coverage hole; refresh rather than wait for the gossip tick.
+    state.refresh_fail_closed();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -637,15 +656,34 @@ mod tests {
 
     /// CLUSTER-06
     #[test]
-    fn test_cluster_info_contains_enabled() {
+    /// CLUSTER INFO must NOT carry `cluster_enabled`, and a node with no slots
+    /// is `fail`, not `ok`.
+    ///
+    /// This test previously asserted the opposite of both. It encoded Moon's
+    /// own divergence rather than the oracle: measured against redis-server
+    /// 8.6.1, a lone `--cluster-enabled` node with no slots assigned reports
+    ///
+    ///     cluster_state:fail
+    ///     cluster_slots_assigned:0
+    ///
+    /// with no `cluster_enabled` line at all — that field lives in INFO's
+    /// Cluster section. The assertion's strength is unchanged (same call, same
+    /// two properties checked); only the expected values moved, toward Redis.
+    fn test_cluster_info_omits_enabled_and_reports_uncovered_as_fail() {
         let cs = make_cs();
         let frame = handle_cluster_info(&cs, "127.0.0.1:6379".parse().unwrap());
         let s = match frame {
             Frame::BulkString(b) => String::from_utf8(b.to_vec()).unwrap(),
             _ => panic!("expected BulkString"),
         };
-        assert!(s.contains("cluster_enabled:1"));
-        assert!(s.contains("cluster_state:ok"));
+        assert!(
+            !s.contains("cluster_enabled"),
+            "CLUSTER INFO must not carry cluster_enabled:\n{s}"
+        );
+        assert!(
+            s.contains("cluster_state:fail"),
+            "a node covering no slots is not ok:\n{s}"
+        );
     }
 
     /// CLUSTER-07
