@@ -50,6 +50,16 @@ pub(super) fn check_auth_gate(
     if conn.authenticated {
         return AuthGateResult::Authenticated;
     }
+    // MONITOR: feed the pre-auth AUTH/HELLO here, because this gate `continue`s
+    // and the main feed hook further down is never reached for them. That makes
+    // the FIRST AUTH of a session — the only one carrying a credential on a
+    // password-protected server — the one command the feed would otherwise miss
+    // entirely. Redaction happens in the formatter, so nothing leaks.
+    if let Some((cmd, cmd_args)) = extract_command(frame)
+        && (cmd.eq_ignore_ascii_case(b"AUTH") || cmd.eq_ignore_ascii_case(b"HELLO"))
+    {
+        crate::monitor::feed_frames(conn.selected_db, peer_addr, cmd, cmd_args);
+    }
     match extract_command(frame) {
         Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);

@@ -439,6 +439,19 @@ pub fn make_redis_call_fn(
                 }
             }
 
+            // MONITOR: a script-issued command is fed with the literal `lua`
+            // in place of a peer address — measured against redis-server 8.6.1,
+            // which emits `[0 lua] "SET" "lk" "v"` after the client's own
+            // `[0 127.0.0.1:… ] "eval" …` line. This is the one hook site with
+            // no connection behind it, so the handler-level hooks structurally
+            // cannot cover it: without this call an operator watching a
+            // script-driven workload sees every EVAL and none of its effects.
+            //
+            // Fed BEFORE execution, matching every other hook site, so ordering
+            // is issue-order. Costs one `Relaxed` load per `redis.call` when no
+            // monitor is attached.
+            crate::monitor::feed_frames(db_idx, "lua", &cmd_bytes, &frames[1..]);
+
             let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
 
             // Wave A part 2 (task #34): dual-plane (AOF + replication)

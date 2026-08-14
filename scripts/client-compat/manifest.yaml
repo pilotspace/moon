@@ -317,3 +317,30 @@ entries:
     command: "SPUBLISH compat_sch hello"
     policy: exact
     contexts: [standalone]
+
+  # MONITOR: the attach reply and the registry entry. The FEED itself is a
+  # stream, not a reply, so it cannot be diffed by a request/response harness —
+  # tests/monitor_command_feed.rs owns the line-format parity, byte for byte.
+  - name: monitor_command_is_registered
+    command: "COMMAND INFO monitor"
+    policy: exact
+    contexts: [standalone]
+    expect_diff:
+      reason: >-
+        The 10-field spec shape, arity 1 and the four flags (admin, noscript,
+        loading, stale) all match. One inner divergence remains: Redis reports
+        acl_categories @admin @slow @dangerous, Moon reports @dangerous @slow —
+        Moon's registry has no @admin CATEGORY at all (its AclCategories table
+        renders SERVER as @server and has no admin bit), so the name cannot be
+        emitted without adding a category to the registry-wide table. This is the
+        same acl_categories thinness already waived for
+        identity_command_info_known_and_unknown, not a MONITOR-specific gap, and
+        it is not a permission hole: `+@all -@admin` DOES refuse MONITOR, because
+        Moon resolves @admin from a command-name list in src/acl/rules.rs rather
+        than from the category bitmask (pinned by mon14_non_admin_cannot_attach).
+        Owner: sdk-wire-form-fixes, which owns acl_categories completeness.
+
+  - name: monitor_rejects_arguments
+    command: "MONITOR extra"
+    policy: exact
+    contexts: [standalone]

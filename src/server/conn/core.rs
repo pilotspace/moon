@@ -251,6 +251,12 @@ pub(crate) struct ConnectionState {
     pub pubsub_tx: Option<channel::MpscSender<bytes::Bytes>>,
     pub pubsub_rx: Option<channel::MpscReceiver<bytes::Bytes>>,
 
+    // MONITOR. Separate from the pub/sub channel because a connection can be a
+    // monitor without being a subscriber, and Redis's rules for the two modes
+    // differ (a monitor may not touch the keyspace; a subscriber may).
+    pub monitor_attached: bool,
+    pub monitor_rx: Option<channel::MpscReceiver<bytes::Bytes>>,
+
     // Transaction (MULTI/EXEC)
     pub in_multi: bool,
     /// Active cross-store transaction (None if not in transaction).
@@ -362,6 +368,8 @@ impl ConnectionState {
             subscriber_id: 0,
             pubsub_tx: None,
             pubsub_rx: None,
+            monitor_attached: false,
+            monitor_rx: None,
             in_multi: false,
             active_cross_txn: None,
             workspace_id: migrated.and_then(|s| s.workspace_id),
@@ -497,6 +505,15 @@ impl ConnectionState {
             && self.subscription_count == 0
             && !self.tracking_state.enabled
             && !self.saw_replconf
+            // A monitor's registration is process-global and keyed by client
+            // id. Migration returns from the handler through its OWN path,
+            // before the disconnect detach block runs, so a migrated monitor
+            // would leave a dead sink registered forever — which also pins
+            // `any_attached()` true and holds the inline fast path down for the
+            // life of the process. Excluding monitors keeps every teardown on
+            // the paths that actually detach; a monitor connection is a
+            // diagnostic session, not something worth migrating.
+            && !self.monitor_attached
     }
 
     /// Get the active transaction's ID, if any.

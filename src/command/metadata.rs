@@ -366,6 +366,9 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "CONFIG" => CommandMeta { name: "CONFIG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "ACL" => CommandMeta { name: "ACL", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "SLOWLOG" => CommandMeta { name: "SLOWLOG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    // MONITOR streams every other client's traffic, so it is admin-gated: without
+    // the category any user could read every other user's arguments.
+    "MONITOR" => CommandMeta { name: "MONITOR", arity: 1, flags: CommandFlags(CommandFlags::ADMIN.0 | CommandFlags::NOSCRIPT.0 | CommandFlags::LOADING.0 | CommandFlags::STALE.0), first_key: 0, last_key: 0, step: 0, acl_categories: AclCategories(AclCategories::DANGEROUS.0 | AclCategories::SLOW.0) },
     // Moon extension: HOTKEYS [COUNT n] — top sampled keys from the per-shard sketch.
     "HOTKEYS" => CommandMeta { name: "HOTKEYS", arity: -1, flags: RA, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "DEBUG" => CommandMeta { name: "DEBUG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },

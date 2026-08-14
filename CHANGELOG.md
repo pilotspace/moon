@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`MONITOR` — the command feed.** `redis-cli monitor` now works against Moon, in Redis's exact
+  line format: `+<unix>.<micros> [<db> <addr>] "CMD" "arg" …`, arguments quoted and escaped per
+  byte (`sdscatrepr` semantics — `"` `\`, `\n` `\r` `\t`, `\a` `\b`, and `\xHH` for everything
+  outside printable ASCII, so UTF-8 escapes per byte rather than per character). The line is a
+  SimpleString under **both** RESP2 and RESP3 — measured; Redis does not use a Push frame here,
+  and the reflex to make it one after the RESP3 pub/sub work would have been a new divergence.
+  `AUTH`'s arguments and the credentials in `HELLO … AUTH` render as `(redacted)`, decided before
+  any argument is written rather than filtered afterwards.
+
+  Two behaviours are worth knowing because they are not the obvious implementation. First,
+  administrative commands are hidden at **subcommand** granularity: `CONFIG *`, `SLOWLOG *`,
+  `LATENCY *`, `ACL LIST/SETUSER` and `CLIENT LIST` never reach a monitor, while `INFO`, `DBSIZE`,
+  `LASTSAVE`, `CLIENT GETNAME/ID`, `ACL WHOAMI/CAT` and `CLUSTER INFO/MYID` do. Moon's own
+  `CommandFlags::ADMIN` is container-granular and could not express that split — using it would
+  have hidden six commands Redis shows — and Redis feeds the entire `EVAL` family despite flagging
+  it `skip_monitor`, so neither flag is consulted; the rule is stated explicitly and pinned
+  row-by-row against the measured oracle. `MONITOR` is absent from its own feed as a consequence of
+  that general rule rather than a self-suppression special case. Second, a monitor that stops
+  reading has its **connection dropped**: silently skipping lines would leave an operator unable to
+  tell a quiet server from a lossy feed, and blocking would let one slow TCP reader stall every
+  shard.
+
+  A monitor connection may not touch the keyspace, matching Redis
+  (`-ERR Replica can't interact with the keyspace`). The refusal set is measured, not derived from
+  a flag: `DBSIZE`, `KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL`,
+  `PUBLISH` and `MEMORY USAGE` name no key yet are all refused, while `PING`, `INFO`, `TIME`,
+  `ECHO`, `COMMAND`, `LASTSAVE`, `WAIT`, `SELECT`, `CLIENT`, `ACL`, `SUBSCRIBE` and `RESET` are
+  served. Neither `first_key` nor Moon's `WRITE`/`READONLY` flags reproduce that split — Moon
+  flags `PING` and `INFO` readonly and Redis does not — so the rule is stated explicitly and
+  pinned row by row against the oracle.
+
+  Commands issued by a Lua script are fed too, carrying the literal `lua` in place of a peer
+  address and appearing in execution order after the `EVAL` line — matching Redis. A script command
+  never passes a connection handler, so it needs its own hook; without it an operator watching a
+  script-driven workload would see every `EVAL` and none of its effects.
+
+  `MONITOR` requires the `admin` ACL category, and costs one relaxed atomic load per command when
+  nobody is attached — every other step lives behind that load. While a monitor IS attached the
+  inline fast path stands down, because it answers straight from the read buffer and never sees a
+  peer address; the feed is therefore correct by construction on that path rather than by a hook
+  that must be kept in sync. Fast-path retention when unattached is confirmed by
+  `moon_dispatch_path_total{path="local_inline"}`, not inferred from latency.
 - **Sharded pub/sub: `SSUBSCRIBE`, `SUNSUBSCRIBE`, `SPUBLISH`, and `PUBSUB SHARDCHANNELS` /
   `SHARDNUMSUB`.** Deliveries carry the `smessage` event name. The sharded namespace is a
   genuinely separate map from the plain one in both the per-shard registry and the
