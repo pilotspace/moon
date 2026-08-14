@@ -50,6 +50,16 @@ pub(super) fn check_auth_gate(
     if conn.authenticated {
         return AuthGateResult::Authenticated;
     }
+    // MONITOR: feed the pre-auth AUTH/HELLO here, because this gate `continue`s
+    // and the main feed hook further down is never reached for them. That makes
+    // the FIRST AUTH of a session — the only one carrying a credential on a
+    // password-protected server — the one command the feed would otherwise miss
+    // entirely. Redaction happens in the formatter, so nothing leaks.
+    if let Some((cmd, cmd_args)) = extract_command(frame)
+        && (cmd.eq_ignore_ascii_case(b"AUTH") || cmd.eq_ignore_ascii_case(b"HELLO"))
+    {
+        crate::monitor::feed_frames(conn.selected_db, peer_addr, cmd, cmd_args);
+    }
     match extract_command(frame) {
         Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
@@ -1700,45 +1710,4 @@ pub(super) async fn try_handle_blocking<
     codec.encode_frame(&blocking_response, write_buf);
     responses.clear();
     BlockingResult::Handled
-}
-
-/// `MONITOR` — attach this connection to the command feed.
-///
-/// Returns the reply to send, or `None` when the connection is ALREADY
-/// attached: Redis answers a second `MONITOR` with nothing at all. Measured,
-/// not inferred — it is silence, not an error.
-///
-/// The ACL check is not repeated here: this is reached only below
-/// `try_enforce_acl`, and `MONITOR` carries the admin category in
-/// `COMMAND_META`, so a non-admin user is refused by the general gate with the
-/// same `NOPERM` text every other command uses.
-pub(super) fn handle_monitor(
-    cmd_args: &[Frame],
-    conn: &mut ConnectionState,
-    _ctx: &ConnectionContext,
-    _peer_addr: &str,
-) -> Option<Frame> {
-    if !cmd_args.is_empty() {
-        return Some(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'monitor' command",
-        )));
-    }
-    if conn.monitor_attached {
-        return None;
-    }
-    // Bounded, and deliberately not large. A monitor that cannot keep up has
-    // this channel fill; the feed then drops the SINK, which closes the
-    // channel and ends the connection. Contracted at freeze: silently skipping
-    // lines would leave an operator unable to tell a quiet server from a lossy
-    // feed, and blocking would let one slow reader stall every shard.
-    let (tx, rx) = channel::mpsc_bounded::<Bytes>(4096);
-    if !crate::monitor::attach(conn.client_id, tx) {
-        // Registry already knows this connection — treat as already attached
-        // rather than double-registering, which would duplicate every line.
-        conn.monitor_attached = true;
-        return None;
-    }
-    conn.monitor_attached = true;
-    conn.monitor_rx = Some(rx);
-    Some(Frame::SimpleString(Bytes::from_static(b"OK")))
 }

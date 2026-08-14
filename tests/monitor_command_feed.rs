@@ -42,6 +42,10 @@ impl Drop for Moon {
 }
 
 fn spawn_moon(shards: &str) -> Moon {
+    spawn_moon_opts(shards, &[])
+}
+
+fn spawn_moon_opts(shards: &str, extra: &[&str]) -> Moon {
     // CARGO_BIN_EXE_moon is the binary cargo built for THIS invocation — fresh
     // and feature-matched. Never probe target/release directly: that path's
     // provenance is unknown and has produced false PASSes before.
@@ -50,6 +54,7 @@ fn spawn_moon(shards: &str) -> Moon {
         let tmp_dir = std::env::temp_dir().join(format!("moon-monitor-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
         Command::new(&bin)
+            .args(extra)
             .args([
                 "--port",
                 &port.to_string(),
@@ -87,7 +92,10 @@ fn spawn_moon(shards: &str) -> Moon {
                 let mut buf = [0u8; 64];
                 if let Ok(n) = c.read(&mut buf)
                     && n > 0
-                    && buf.starts_with(b"+PONG")
+                    // `-NOAUTH` is a READY server that wants a password: the
+                    // probe must not treat a password-protected instance as
+                    // one that never came up.
+                    && (buf.starts_with(b"+PONG") || buf.starts_with(b"-NOAUTH"))
                 {
                     return moon;
                 }
@@ -776,11 +784,21 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
     );
 
     // The monitor connection itself was closed rather than left half-alive.
+    // Assert on END OF STREAM, not on an empty drain: `after.is_empty()` is
+    // true whenever no line happened to be buffered, so an earlier version of
+    // this assertion was satisfied by a STARVED BUT OPEN connection — exactly
+    // the failure mode the policy exists to rule out. A closed socket answers
+    // Ok(0) (or errors); a starved-but-open one blocks until the timeout.
     let mut mon = mon;
-    let after = mon.drain();
-    let closed = after.is_empty() || mon.send(&["PING"]).is_empty();
+    let _ = mon.drain();
+    mon.0
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let _ = mon.0.write_all(b"*1\r\n$4\r\nPING\r\n");
+    let mut probe_buf = [0u8; 64];
+    let eof = matches!(mon.0.read(&mut probe_buf), Ok(0) | Err(_));
     assert!(
-        closed,
+        eof,
         "the slow monitor's connection must be CLOSED, not silently starved \
          of lines — a lossy feed an operator cannot detect is the failure mode \
          this policy exists to avoid"
@@ -849,5 +867,210 @@ fn mon22_script_issued_commands_are_fed_with_the_lua_address() {
         ls[get_at].contains("[0 lua] "),
         "reads issued by a script are fed the same way: {:?}",
         ls[get_at]
+    );
+}
+
+// ── the refusal rule: write|readonly, NOT `first_key != 0` ──────────────────
+
+#[test]
+fn mon23_refusal_rule_is_write_or_readonly_not_first_key() {
+    // Re-measured against redis-server 8.6.1 (2026-08-14, one fresh connection
+    // per probe — a shared socket desynchronises against the interleaved feed
+    // and produced two wrong readings on the first pass).
+    //
+    // The §3 contract said "keyspace command", and the first implementation
+    // read that as `first_key != 0`. That is measurably wrong in BOTH
+    // directions' worth of rows: `DBSIZE`, `KEYS`, `SCAN`, `RANDOMKEY`,
+    // `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL` and `PUBLISH` all carry
+    // `first_key == 0` and are all REFUSED by Redis. The rule that actually
+    // reproduces every measured row is the WRITE-or-READONLY flag pair, plus
+    // the script/publish family, which Redis refuses without either flag.
+    let m = spawn_moon("1");
+
+    for probe in [
+        &["DBSIZE"][..],
+        &["KEYS", "*"],
+        &["SCAN", "0"],
+        &["RANDOMKEY"],
+        &["FLUSHALL"],
+        &["FLUSHDB"],
+        &["SWAPDB", "0", "1"],
+        &["EVAL", "return 1", "0"],
+        &["PUBLISH", "c", "m"],
+        &["TYPE", "k"],
+        &["EXISTS", "k"],
+        &["TTL", "k"],
+        &["MEMORY", "USAGE", "k"],
+        &["GET", "k"],
+        &["SET", "k", "v"],
+        &["EXPIRE", "k", "1"],
+    ] {
+        let mut mon = attach(m.port);
+        let r = mon.send(probe);
+        assert_eq!(
+            s(&r),
+            "-ERR Replica can't interact with the keyspace\r\n",
+            "{:?} is refused on a monitor connection (measured)",
+            probe
+        );
+    }
+
+    for probe in [
+        &["PING"][..],
+        &["INFO", "server"],
+        &["CLIENT", "ID"],
+        &["ACL", "WHOAMI"],
+        &["COMMAND", "COUNT"],
+        &["LASTSAVE"],
+        &["TIME"],
+        &["ECHO", "x"],
+        &["SELECT", "1"],
+        &["WAIT", "0", "0"],
+        &["SCRIPT", "LOAD", "return 1"],
+        &["MEMORY", "DOCTOR"],
+        &["BGSAVE"],
+    ] {
+        let mut mon = attach(m.port);
+        let r = mon.send(probe);
+        assert!(
+            !s(&r).starts_with("-ERR Replica can't interact"),
+            "{:?} is SERVED on a monitor connection (measured); got {:?}",
+            probe,
+            s(&r)
+        );
+    }
+}
+
+// ── the first AUTH of a session — the one that carries the password ─────────
+
+#[test]
+fn mon24_first_auth_of_a_session_is_fed_and_redacted() {
+    // Both handlers gate on `!conn.authenticated` ABOVE the ACL-exempt AUTH /
+    // HELLO intercepts, and `continue` out of it. The feed hook sits below that
+    // gate, so on a password-protected server the FIRST AUTH — the only one
+    // that actually carries a credential — never reached the feed at all.
+    //
+    // `mon8` and `mon9` did not catch this because they run against a server
+    // with no password: `conn.authenticated` is already true there, so their
+    // AUTH falls through to the intercept the hook does cover. A redaction test
+    // that never exercises an authenticating connection tests the wrong path.
+    let m = spawn_moon_opts("1", &["--requirepass", "s3kr1t"]);
+
+    let mut mon = Conn::open(m.port);
+    assert_eq!(s(&mon.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
+    assert_eq!(
+        s(&mon.send(&["MONITOR"])),
+        "+OK\r\n",
+        "the default user must be able to attach after AUTH"
+    );
+
+    // A fresh connection performing its own first AUTH.
+    let mut c = Conn::open(m.port);
+    assert_eq!(s(&c.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
+
+    let feed = mon.feed();
+    let text = s(&feed);
+    assert!(
+        names(&feed, "AUTH"),
+        "the first AUTH of a session must be fed — it is the one command that \
+         carries a credential, so its absence is the least acceptable gap in \
+         the feed. Got {text:?}"
+    );
+    assert!(
+        !text.contains("s3kr1t"),
+        "and it must be redacted: the password appears in the feed. Got {text:?}"
+    );
+    assert!(text.contains("\"AUTH\" \"(redacted)\""), "got {text:?}");
+}
+
+#[test]
+fn mon25_first_hello_auth_of_a_session_is_fed_and_redacted() {
+    // The HELLO half of the same gate.
+    let m = spawn_moon_opts("1", &["--requirepass", "s3kr1t"]);
+
+    let mut mon = Conn::open(m.port);
+    assert_eq!(s(&mon.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
+    assert_eq!(s(&mon.send(&["MONITOR"])), "+OK\r\n");
+
+    let mut c = Conn::open(m.port);
+    let r = c.send(&["HELLO", "3", "AUTH", "default", "s3kr1t"]);
+    assert!(!r.is_empty() && r[0] != b'-', "HELLO AUTH must succeed");
+
+    let feed = mon.feed();
+    let text = s(&feed);
+    assert!(names(&feed, "HELLO"), "got {text:?}");
+    assert!(
+        !text.contains("s3kr1t"),
+        "the password must not survive: {text:?}"
+    );
+    assert!(
+        text.contains("\"HELLO\" \"3\" \"AUTH\" \"(redacted)\" \"(redacted)\""),
+        "the version survives; only the credentials go. Got {text:?}"
+    );
+}
+
+// ── ACL: +@all must grant MONITOR ───────────────────────────────────────────
+
+#[test]
+fn mon26_plus_at_all_grants_monitor() {
+    // `mon14` proves `-@admin` REFUSES MONITOR, which passes just as well when
+    // no grant reaches MONITOR at all. Without this positive case, a MONITOR
+    // that is ungrantable by any category looks correct.
+    let m = spawn_moon("1");
+    let mut admin = Conn::open(m.port);
+    assert_eq!(
+        s(&admin.send(&["ACL", "SETUSER", "opsy", "on", ">pw", "~*", "+@all"])),
+        "+OK\r\n",
+        "test fixture: create a +@all user"
+    );
+
+    let mut ops = Conn::open(m.port);
+    assert_eq!(s(&ops.send(&["AUTH", "opsy", "pw"])), "+OK\r\n");
+    assert_eq!(
+        s(&ops.send(&["MONITOR"])),
+        "+OK\r\n",
+        "+@all must grant MONITOR — a category expansion that omits it makes \
+         the command unreachable by any grant"
+    );
+
+    let mut c = Conn::open(m.port);
+    c.send(&["SET", "k", "v"]);
+    assert!(
+        names(&ops.feed(), "SET"),
+        "and the attach is real, not just an accepted reply"
+    );
+}
+
+// ── teardown: a monitor must never be silently carried across migration ─────
+
+#[test]
+fn mon27_monitor_connection_is_not_migration_eligible() {
+    // Connection migration returns from the handler through its own path,
+    // BEFORE the disconnect detach block runs. A monitor carried through it
+    // would leave its sink registered under the same client_id while the new
+    // handler starts unattached and never detaches — the registry then holds a
+    // dead sink forever, which also pins `any_attached()` true and holds the
+    // inline fast path down for the life of the process.
+    //
+    // Asserted from the outside, through the only observable the contract
+    // gives: RESET detaches, and after RESET a new MONITOR must be answered
+    // with `+OK` rather than the silence that means "already attached".
+    let m = spawn_moon("4");
+    let mut mon = attach(m.port);
+    assert_eq!(s(&mon.send(&["RESET"])), "+RESET\r\n");
+    assert_eq!(
+        s(&mon.send(&["MONITOR"])),
+        "+OK\r\n",
+        "after RESET the registry must no longer know this connection; \
+         silence here means a stale registration survived"
+    );
+
+    // And a stale registration under a reused id must never silently swallow
+    // the attach: the connection is either attached with a live sink or told so.
+    let mut c = Conn::open(m.port);
+    c.send(&["SET", "k", "v"]);
+    assert!(
+        names(&mon.feed(), "SET"),
+        "the re-attached monitor receives a live feed, not a dead sink"
     );
 }

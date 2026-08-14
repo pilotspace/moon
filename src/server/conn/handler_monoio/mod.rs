@@ -1784,16 +1784,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // commands are fed at EXEC, not at queue time) falls out for free
             // rather than needing its own special case.
             if cmd.eq_ignore_ascii_case(b"MONITOR") {
-                match dispatch::handle_monitor(cmd_args, &mut conn, ctx, &peer_addr) {
-                    Some(reply) => responses.push(reply),
-                    // Already attached: Redis answers NOTHING here. Measured —
-                    // it is not an error, it is silence.
-                    None => {}
+                // Already attached -> None: Redis answers NOTHING. Measured —
+                // it is not an error, it is silence.
+                if let Some(reply) = crate::server::conn::monitor_mode::handle_monitor(
+                    cmd_args.len(),
+                    client_id,
+                    &mut conn.monitor_attached,
+                    &mut conn.monitor_rx,
+                ) {
+                    responses.push(reply);
                 }
                 continue;
             }
             if conn.monitor_attached
-                && let Some(refusal) = crate::server::conn::monitor_mode::refuse_if_keyspace(cmd)
+                && let Some(refusal) = crate::server::conn::monitor_mode::refuse_if_keyspace(
+                    cmd,
+                    cmd_args
+                        .first()
+                        .and_then(crate::command::helpers::extract_bytes)
+                        .map(|b| b.as_ref()),
+                )
             {
                 responses.push(refusal);
                 continue;

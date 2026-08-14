@@ -35,10 +35,12 @@
 //! filter is one refactor away from leaking, and the thing it would leak is a
 //! password.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 
 use crate::runtime::channel;
 
@@ -46,9 +48,22 @@ use crate::runtime::channel;
 /// monitor exists.
 static MONITOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-static MONITORS: RwLock<Vec<MonitorSink>> = RwLock::new(Vec::new());
+/// The published sink list. Read on the command path via an `ArcSwap` load,
+/// which takes NO lock — the coding rule is "per-shard locks only, no global
+/// lock on the write path", and a global `RwLock` read on every fed command
+/// would have shared one cacheline across every shard for the whole time a
+/// monitor is attached. Writers are attach/detach only, serialised by
+/// [`REGISTRY_WRITE`] and published copy-on-write.
+static MONITORS: std::sync::LazyLock<ArcSwap<Vec<MonitorSink>>> =
+    std::sync::LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-/// One attached MONITOR connection.
+/// Serialises the read-modify-publish of [`MONITORS`]. Never taken on the
+/// command path — only by attach and detach, which happen once per monitor.
+static REGISTRY_WRITE: Mutex<()> = Mutex::new(());
+
+/// One attached MONITOR connection. `Clone` so the registry can publish a new
+/// snapshot copy-on-write without taking a lock on the read side.
+#[derive(Clone)]
 struct MonitorSink {
     /// The owning connection's id, so detach is exact.
     id: u64,
@@ -232,23 +247,28 @@ pub fn format_line(now_micros: u128, db: usize, addr: &str, cmd: &[u8], args: &[
 /// an already-attached connection must not double-register, or every line
 /// would be delivered twice.
 pub fn attach(id: u64, tx: channel::MpscSender<Bytes>) -> bool {
-    let mut guard = MONITORS.write();
-    if guard.iter().any(|m| m.id == id) {
+    let _w = REGISTRY_WRITE.lock();
+    let cur = MONITORS.load();
+    if cur.iter().any(|m| m.id == id) {
         return false;
     }
-    guard.push(MonitorSink { id, tx });
-    MONITOR_COUNT.store(guard.len(), Ordering::Relaxed);
+    let mut next: Vec<MonitorSink> = cur.iter().cloned().collect();
+    next.push(MonitorSink { id, tx });
+    MONITOR_COUNT.store(next.len(), Ordering::Relaxed);
+    MONITORS.store(Arc::new(next));
     true
 }
 
 /// Detach a connection (RESET, disconnect, or shed for being slow).
 pub fn detach(id: u64) {
-    let mut guard = MONITORS.write();
-    let before = guard.len();
-    guard.retain(|m| m.id != id);
-    if guard.len() != before {
-        MONITOR_COUNT.store(guard.len(), Ordering::Relaxed);
+    let _w = REGISTRY_WRITE.lock();
+    let cur = MONITORS.load();
+    if !cur.iter().any(|m| m.id == id) {
+        return;
     }
+    let next: Vec<MonitorSink> = cur.iter().filter(|m| m.id != id).cloned().collect();
+    MONITOR_COUNT.store(next.len(), Ordering::Relaxed);
+    MONITORS.store(Arc::new(next));
 }
 
 /// Is any monitor attached at all? One `Relaxed` load.
@@ -265,7 +285,7 @@ pub fn is_attached(id: u64) -> bool {
     if MONITOR_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    MONITORS.read().iter().any(|m| m.id == id)
+    MONITORS.load().iter().any(|m| m.id == id)
 }
 
 /// Emit one command to every attached monitor.
@@ -341,15 +361,13 @@ fn feed_cold(db: usize, addr: &str, cmd: &[u8], args: &[Bytes]) {
         .map_or(0, |d| d.as_micros());
     let line = format_line(now_micros, db, addr, cmd, args);
 
-    // Serialize once, fan out under the read lock; collect the slow ones and
-    // drop them in a second pass so the read lock is never upgraded in place.
+    // Serialise once, fan out over a lock-free snapshot. Collect the slow ones
+    // and detach them afterwards, so the publish path is never entered while
+    // iterating the list being replaced.
     let mut slow: Vec<u64> = Vec::new();
-    {
-        let guard = MONITORS.read();
-        for m in guard.iter() {
-            if m.tx.try_send(line.clone()).is_err() {
-                slow.push(m.id);
-            }
+    for m in MONITORS.load().iter() {
+        if m.tx.try_send(line.clone()).is_err() {
+            slow.push(m.id);
         }
     }
     for id in slow {

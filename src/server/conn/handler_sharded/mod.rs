@@ -619,6 +619,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                     frame_idx += 1;
                     // --- AUTH gate ---
                     if !conn.authenticated {
+                        // MONITOR: feed the pre-auth AUTH/HELLO here — this gate
+                        // `continue`s, so the main hook below never sees them,
+                        // and the FIRST AUTH of a session is the only command
+                        // carrying a credential on a password-protected server.
+                        // Redaction happens in the formatter; nothing leaks.
+                        if let Some((cmd, cmd_args)) = extract_command(&frame)
+                            && (cmd.eq_ignore_ascii_case(b"AUTH")
+                                || cmd.eq_ignore_ascii_case(b"HELLO"))
+                        {
+                            crate::monitor::feed_frames(
+                                conn.selected_db,
+                                &peer_addr,
+                                cmd,
+                                cmd_args,
+                            );
+                        }
                         match extract_command(&frame) {
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
@@ -933,26 +949,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // commands are fed at EXEC, not at queue time" falls out
                     // without a special case).
                     if cmd.eq_ignore_ascii_case(b"MONITOR") {
-                        if !cmd_args.is_empty() {
-                            responses.push(Frame::Error(Bytes::from_static(
-                                b"ERR wrong number of arguments for 'monitor' command",
-                            )));
-                        } else if !conn.monitor_attached {
-                            let (tx, rx) = crate::runtime::channel::mpsc_bounded::<Bytes>(4096);
-                            if crate::monitor::attach(conn.client_id, tx) {
-                                conn.monitor_rx = Some(rx);
-                                responses
-                                    .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            }
-                            conn.monitor_attached = true;
+                        // The attach rule lives in `monitor_mode`, once. This
+                        // block used to be a hand-written second copy of the
+                        // monoio one and had already drifted in structure.
+                        // Already attached -> None: Redis answers NOTHING.
+                        if let Some(reply) =
+                            crate::server::conn::monitor_mode::handle_monitor(
+                                cmd_args.len(),
+                                conn.client_id,
+                                &mut conn.monitor_attached,
+                                &mut conn.monitor_rx,
+                            )
+                        {
+                            responses.push(reply);
                         }
-                        // Already attached: Redis answers NOTHING. Measured —
-                        // silence, not an error.
                         continue;
                     }
                     if conn.monitor_attached
                         && let Some(refusal) =
-                            crate::server::conn::monitor_mode::refuse_if_keyspace(cmd)
+                            crate::server::conn::monitor_mode::refuse_if_keyspace(
+                    cmd,
+                    cmd_args.first().and_then(crate::command::helpers::extract_bytes).map(|b| b.as_ref()),
+                )
                     {
                         responses.push(refusal);
                         continue;

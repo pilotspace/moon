@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tell a quiet server from a lossy feed, and blocking would let one slow TCP reader stall every
   shard.
 
+  A monitor connection may not touch the keyspace, matching Redis
+  (`-ERR Replica can't interact with the keyspace`). The refusal set is measured, not derived from
+  a flag: `DBSIZE`, `KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL`,
+  `PUBLISH` and `MEMORY USAGE` name no key yet are all refused, while `PING`, `INFO`, `TIME`,
+  `ECHO`, `COMMAND`, `LASTSAVE`, `WAIT`, `SELECT`, `CLIENT`, `ACL`, `SUBSCRIBE` and `RESET` are
+  served. Neither `first_key` nor Moon's `WRITE`/`READONLY` flags reproduce that split — Moon
+  flags `PING` and `INFO` readonly and Redis does not — so the rule is stated explicitly and
+  pinned row by row against the oracle.
+
   Commands issued by a Lua script are fed too, carrying the literal `lua` in place of a peer
   address and appearing in execution order after the `EVAL` line — matching Redis. A script command
   never passes a connection handler, so it needs its own hook; without it an operator watching a

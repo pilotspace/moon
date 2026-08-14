@@ -627,12 +627,12 @@ than left for a reader to discover by diffing:
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [x] all tests pass — `tests/monitor_command_feed.rs` 22/22 under BOTH runtimes (monoio, the
-      shipped default, and tokio). lib 4619 monoio / 3785 tokio. Regressions green: `pubsub_resp3_push`
+- [x] all tests pass — `tests/monitor_command_feed.rs` 27/27 under BOTH runtimes (monoio, the
+      shipped default, and tokio). lib 4620 monoio / 3786 tokio. Regressions green: `pubsub_resp3_push`
       21, `multi_exec_queue_semantics` 12, `watch_cas_transactions` 10, `protocol_error_lifetime` 8,
       `info_observability` 13. The bridge edit's two closest suites are `#[ignore]`d by default and
       were run explicitly with `-- --ignored`: `functions_fcall` 9/9, `replication_readonly_eval` 1/1.
-- [x] coverage did not decrease — 23 tests added (22 integration + 6 unit), none removed.
+- [x] coverage did not decrease — 33 tests added (27 integration + 6 unit), none removed.
 - [x] no test or contract was altered during build — the one mechanism divergence is recorded in §5
       under "Contract deviations" rather than by editing the frozen §3.
 - [x] the green was EARNED — the two tests most able to lie were built to refuse to: `mon8`/`mon9`
@@ -703,6 +703,64 @@ Outcome: PASS
 Reviewed by: Tin Dang · date: 2026-08-14
 Target hit: yes — all 14 Musts and all 4 Rejects have a passing test, under both runtimes.
 
+### Review round 2 — what external review found that my own §6 did not
+
+Nine comments; five were real defects, one was a false positive I only knew was
+false because I tested it, three were correctness/clarity fixes. Recorded in full
+because the pattern matters more than the individual fixes.
+
+1. **The keyspace-refusal rule was wrong.** §3 said "keyspace command" and I
+   implemented `first_key != 0`. Re-measured: `DBSIZE`, `KEYS`, `SCAN`,
+   `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL`, `EVALSHA`, `PUBLISH`,
+   `SPUBLISH` and `MEMORY USAGE` all carry `first_key == 0` and are all REFUSED
+   by redis-server. So a monitor connection could run `FLUSHALL` and `KEYS *`.
+   Worse: my own unit test asserted `DBSIZE` was *served*, with a comment
+   claiming it was measured — it never had been. A wrong belief encoded as a
+   test is what let the wrong rule ship green.
+   The obvious repair — Redis's own `WRITE | READONLY` pair — is ALSO wrong,
+   because Moon flags `PING`, `ECHO`, `TIME`, `INFO`, `COMMAND`, `LASTSAVE` and
+   `WAIT` as `READONLY` and Redis flags none of them so. **That is the same trap
+   as `CommandFlags::ADMIN` in the hidden-set, hit a second time in the same
+   task.** Final rule is explicit and measured, matching `is_hidden`'s shape, and
+   pinned by `mon23`.
+2. **The first AUTH of a session was never fed** — on BOTH runtimes. Both
+   handlers gate on `!conn.authenticated` above the ACL-exempt intercepts and
+   `continue`, so the feed hook below never saw it. `mon8`/`mon9` passed because
+   they run against a server with NO PASSWORD, where that gate is already
+   satisfied — a redaction test that never exercises an authenticating
+   connection tests the wrong path. Fixed in the gate itself; `mon24`/`mon25`
+   run against `--requirepass`.
+3. **Connection migration bypassed every detach path** — `migration_eligible()`
+   excluded MULTI, cross-txn, subscribers, tracking and replconf, but not
+   monitors. A migrated monitor leaves a dead sink registered forever, which
+   also pins `any_attached()` and holds the inline fast path down for the life
+   of the process. Guarded.
+4. **A rejected attach left the connection half-attached** — marked attached,
+   receiver dropped: keyspace commands refused, no reply, no feed, no way to
+   notice. Now evicts the stale registration and re-attaches, or fails loudly.
+5. **`mon21`'s closed-connection assertion was vacuous** — `after.is_empty() || …`
+   is satisfied by an empty drain, i.e. by exactly the starved-but-open
+   connection the policy exists to prevent. Now asserts end-of-stream.
+6. **The sharded MONITOR block was a second copy of the attach rule** and had
+   already drifted — the failure mode `monitor_mode`'s own doc comment warns
+   about. Both handlers now call one helper.
+7. **A global `RwLock` read on every fed command** violated "per-shard locks
+   only, no global lock on the write path". The read path is now an `ArcSwap`
+   load (no lock); attach/detach publish copy-on-write under a `Mutex` never
+   touched by the command path.
+8. False positive: `+@all` DOES grant MONITOR — Moon's `@all` is a wildcard, not
+   the category name list. I only knew because `mon26` was written to check it,
+   and it passed on the first run. **`mon14` alone could not have told me**: a
+   `-@admin` refusal test passes just as well when no grant reaches MONITOR at
+   all, which would have made the command ungrantable by anyone.
+
+What this says about my §6: the WIRING check I had *just* widened to cover
+teardown found nothing here, and every one of these lived somewhere else — in a
+rule I derived instead of measured (1), in a gate ABOVE the code I was reading
+(2, 3), in an error branch I wrote and never exercised (4), and in an assertion I
+had described as strong (5). Checking that each new symbol is referenced does not
+test whether the rule it implements is the right rule.
+
 Residue carried forward (none blocking, each logged in §7):
 - `COMMAND INFO monitor` reports `@admin`-equivalent membership via the ACL name list, but Moon's
   registry has no `@admin` category BIT, so the `acl_categories` field of the `COMMAND INFO` reply
@@ -761,6 +819,27 @@ What did this loop teach the foundation? One line each, tagged by competency
   teardown (RESET, disconnect). Applying the corrected version here found the RESET and disconnect
   detach requirements before review rather than after. Evidence: the §6 WIRING entry above and the
   three `pubsub-resp3-push` CodeRabbit findings that motivated it.
+- [SDD · open] Deriving a rule from a flag Moon already has, instead of measuring
+  it, produced the SAME defect twice in one task: once for the MONITOR hidden-set
+  (`CommandFlags::ADMIN`, caught before freeze by the in-scope audit) and once for
+  the keyspace-refusal rule (`first_key`, then `WRITE|READONLY` — caught only by
+  external review). Moon's flags are named after Redis's and do not mean the same
+  thing. Evidence: `PING`/`ECHO`/`TIME`/`INFO` are `READONLY` in Moon and are not
+  in Redis; `DBSIZE`/`KEYS`/`FLUSHALL` have `first_key == 0` and are refused.
+  The rule: when a behaviour must match Redis, the predicate is measured and
+  table-pinned, never derived from a same-named local flag.
+- [TDD · open] A test written against a fixture that does not reach the code path
+  it names is worse than no test, because it reports the path as covered.
+  `mon8`/`mon9` claimed to cover AUTH redaction and ran against a server with no
+  password, so they never touched the pre-auth gate where the only
+  credential-bearing AUTH actually goes. Evidence: `mon24` fails on the same
+  binary those two pass on. Ask what fixture makes the path REACHABLE, not just
+  what call makes the assertion true.
+- [TDD · open] A negative-permission test needs its positive twin. `mon14`
+  (`-@admin` refuses MONITOR) passes identically whether the grant works or
+  MONITOR is ungrantable by anyone; only `mon26` (`+@all` grants it) tells the
+  two apart. Evidence: external review flagged the `@all` expansion as a defect,
+  and `mon26` is what proved it was not one.
 - [ADD · open] A frozen contract clause naming an IMPLEMENTATION SHAPE (three hook sites) rather
   than an observable can be satisfied better by a different mechanism. The right move was to build
   the better mechanism and record the deviation in §5, not to edit §3 and not to build the

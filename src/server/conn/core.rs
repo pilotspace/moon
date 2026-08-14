@@ -505,6 +505,15 @@ impl ConnectionState {
             && self.subscription_count == 0
             && !self.tracking_state.enabled
             && !self.saw_replconf
+            // A monitor's registration is process-global and keyed by client
+            // id. Migration returns from the handler through its OWN path,
+            // before the disconnect detach block runs, so a migrated monitor
+            // would leave a dead sink registered forever — which also pins
+            // `any_attached()` true and holds the inline fast path down for the
+            // life of the process. Excluding monitors keeps every teardown on
+            // the paths that actually detach; a monitor connection is a
+            // diagnostic session, not something worth migrating.
+            && !self.monitor_attached
     }
 
     /// Get the active transaction's ID, if any.
