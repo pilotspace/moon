@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **An inline closing quote followed by `\r`, vertical tab or form feed was rejected as unbalanced.**
+  Redis's `sdssplitargs` tests `isspace(p[1])` after a closing quote; Moon tested only `' '` and
+  `'\t'`, so `ECHO "hi"\rx` answered `-ERR Protocol error: unbalanced quotes in request` where Redis
+  splits the line into three arguments. Measured over a raw socket against redis-server 8.6.1, both
+  quote types, one fresh connection per probe: space, TAB, `\r`, `\x0b` and `\x0c` are all accepted as
+  separators, and only a non-whitespace byte (`ECHO "hi"y`) is unbalanced. The check now reads the
+  same `is_inline_space` set as the rest of the splitter — the narrow/wide disagreement here was the
+  milder form of the bug that made the splitter unable to advance at all.
 - **RESP3 pub/sub confirmations arrived as Arrays where Redis sends Push frames.** Moon's
   *deliveries* were already correct — `message` and `pmessage` lead with `>` — but `subscribe`,
   `unsubscribe`, `psubscribe` and `punsubscribe` were built by four functions that hardcoded

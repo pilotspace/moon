@@ -220,8 +220,15 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
                         i += 2;
                     }
                     b'"' => {
-                        // A closing quote must end the token.
-                        if i + 1 < line.len() && line[i + 1] != b' ' && line[i + 1] != b'\t' {
+                        // A closing quote must end the token — it may be
+                        // followed by ANY inline whitespace, or nothing.
+                        // Reading the narrow ` `/`\t` pair here while the skip
+                        // loop reads the wide set is the same disagreement that
+                        // caused #487, in its milder form: `"a"\rb` was
+                        // rejected as unbalanced where Redis splits it into two
+                        // arguments (measured — `sdssplitargs` tests
+                        // `isspace(p[1])`).
+                        if i + 1 < line.len() && !is_inline_space(line[i + 1]) {
                             return Err(unbalanced());
                         }
                         i += 1;
@@ -244,7 +251,9 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
                         i += 2;
                     }
                     b'\'' => {
-                        if i + 1 < line.len() && line[i + 1] != b' ' && line[i + 1] != b'\t' {
+                        // Same rule as the double-quote branch above; measured
+                        // identical on redis-server for both quote types.
+                        if i + 1 < line.len() && !is_inline_space(line[i + 1]) {
                             return Err(unbalanced());
                         }
                         i += 1;
@@ -523,6 +532,67 @@ mod tests {
                     "byte {b:#04x} produced {} args",
                     args.len()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_closing_quote_may_be_followed_by_any_inline_space() {
+        // Measured against redis-server 8.6.1 over a raw socket, one fresh
+        // connection per probe:
+        //   ECHO "hi"\rx    -> -ERR wrong number of arguments for 'echo'
+        //   ECHO 'hi'\rx    -> -ERR wrong number of arguments for 'echo'
+        //   ECHO "hi"\x0bx  -> -ERR wrong number of arguments for 'echo'
+        //   ECHO "hi"\x0cx  -> -ERR wrong number of arguments for 'echo'
+        //   ECHO "hi"\tx    -> -ERR wrong number of arguments for 'echo'
+        //   ECHO "hi"y      -> -ERR Protocol error: unbalanced quotes in request
+        // i.e. the arg-count error proves Redis SPLIT the line into three
+        // arguments; only a non-whitespace byte is unbalanced. That is
+        // `isspace(p[1])` in `sdssplitargs`, so the check must read the same
+        // set the rest of the splitter uses.
+        for q in [b'"', b'\''] {
+            for ws in [b' ', b'\t', b'\r', 0x0b, 0x0c] {
+                let mut line = vec![q, b'a', q];
+                line.push(ws);
+                line.extend_from_slice(b"b\r\n");
+                let mut buf = BytesMut::from(&line[..]);
+                let frame = parse_inline(&mut buf, TEST_MAX_INLINE)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "quote {:?} + ws {ws:#04x} must not be unbalanced: {e:?}",
+                            q as char
+                        )
+                    })
+                    .expect("a frame");
+                let Frame::Array(args) = frame else {
+                    panic!("expected array")
+                };
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "quote {:?} + ws {ws:#04x} should split into 2 args, got {args:?}",
+                    q as char
+                );
+                assert_eq!(args[0], Frame::BulkString(Bytes::from_static(b"a")));
+                assert_eq!(args[1], Frame::BulkString(Bytes::from_static(b"b")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_closing_quote_followed_by_non_space_is_still_unbalanced() {
+        // The other half of the measured oracle — widening the accepted set
+        // must not turn `"foo"bar` into two tokens.
+        for q in [b'"', b'\''] {
+            let line = [q, b'a', q, b'b', b'\r', b'\n'];
+            let mut buf = BytesMut::from(&line[..]);
+            let err = parse_inline(&mut buf, TEST_MAX_INLINE)
+                .expect_err("a closing quote glued to a token is an error");
+            match err {
+                ParseError::Invalid { kind, .. } => {
+                    assert_eq!(kind, ProtoFault::UnbalancedQuotes)
+                }
+                other => panic!("unexpected error: {other:?}"),
             }
         }
     }
