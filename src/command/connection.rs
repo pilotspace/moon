@@ -221,10 +221,22 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     let _ = write!(sections, "moon_version:{MOON_VERSION}\r\n");
     sections.push_str("moon:true\r\n");
     let _ = write!(sections, "run_id:{}\r\n", run_id());
-    // Cluster mode is reported by the cluster subsystem; standalone until it
-    // says otherwise. Clients branch on these two before anything else.
-    sections.push_str("redis_mode:standalone\r\n");
-    sections.push_str("cluster_enabled:0\r\n");
+    // Read from the real cluster gate, not a literal. These two were hardcoded
+    // `standalone` / `0`, and the comment above them promised the cluster
+    // subsystem would say otherwise — nothing ever did. An SDK branches on
+    // `redis_mode` BEFORE it ever calls CLUSTER SHARDS, so a server that
+    // answers SHARDS correctly while reporting `standalone` is still
+    // undiscoverable as a cluster.
+    //
+    // `cluster_enabled` belongs HERE and not in CLUSTER INFO — measured
+    // against redis-server 8.6.1, which emits it in INFO and never there.
+    if crate::cluster::cluster_enabled() {
+        sections.push_str("redis_mode:cluster\r\n");
+        sections.push_str("cluster_enabled:1\r\n");
+    } else {
+        sections.push_str("redis_mode:standalone\r\n");
+        sections.push_str("cluster_enabled:0\r\n");
+    }
     let _ = write!(sections, "process_id:{}\r\n", std::process::id());
     let _ = write!(sections, "os:{}\r\n", std::env::consts::OS);
     let _ = write!(

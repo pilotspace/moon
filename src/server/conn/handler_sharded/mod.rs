@@ -734,6 +734,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- READONLY / READWRITE ---
+                    //
+                    // Both are cluster-only: a standalone instance answers the
+                    // measured refusal rather than a misleading +OK, because a
+                    // client that gets +OK believes replica reads are enabled.
+                    if cmd.eq_ignore_ascii_case(b"READONLY") || cmd.eq_ignore_ascii_case(b"READWRITE") {
+                        if let Some(err) = crate::cluster::readonly_verb_reply(cmd, cmd_args) {
+                            responses.push(err);
+                            continue;
+                        }
+                        conn.readonly = cmd.eq_ignore_ascii_case(b"READONLY");
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        continue;
+                    }
+
                     // #438 batch-tail crash class: an early-flush command
                     // (blocking / SUBSCRIBE / PSUBSCRIBE) while remote-slotted
                     // commands are pending would flush their Frame::Null
@@ -1008,6 +1023,38 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let resp = crate::cluster::command::handle_cluster_command(
                                 cmd_args, cs, self_addr,
                             );
+                            // CLUSTER REPLICATE must actually replicate rather
+                            // than only relabel the node — see the monoio path.
+                            if matches!(resp, Frame::SimpleString(ref ok) if ok.as_ref() == b"OK")
+                                && let Some((host, port)) =
+                                    crate::cluster::command::cluster_replicate_target(cmd_args, cs)
+                                && let Some(ref rs) = ctx.repl_state
+                            {
+                                rs.write().set_role(
+                                    crate::replication::state::ReplicationRole::Replica {
+                                        host: host.clone(),
+                                        port,
+                                        state:
+                                            crate::replication::handshake::ReplicaHandshakeState::PingPending,
+                                    },
+                                );
+                                let epoch =
+                                    crate::replication::replica::bump_replica_task_epoch();
+                                let cfg = crate::replication::replica::ReplicaTaskConfig {
+                                    master_host: host,
+                                    master_port: port,
+                                    repl_state: std::sync::Arc::clone(rs),
+                                    num_shards: ctx.num_shards,
+                                    persistence_dir: None,
+                                    listening_port: 0,
+                                    epoch,
+                                    stream_db: std::sync::atomic::AtomicUsize::new(0),
+                                    shard_databases: ctx.shard_databases.clone(),
+                                };
+                                tokio::task::spawn_local(
+                                    crate::replication::replica::run_replica_task(cfg),
+                                );
+                            }
                             responses.push(resp);
                         } else {
                             responses.push(Frame::Error(Bytes::from_static(
@@ -1061,7 +1108,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let maybe_key = extract_primary_key(cmd, cmd_args);
                             if let Some(key) = maybe_key {
                                 let slot = crate::cluster::slots::slot_for_key(key);
-                                let route = cs.read().route_slot(slot, was_asking);
+                                let route = cs.read().route_slot_for(
+                                    slot,
+                                    was_asking,
+                                    conn.readonly,
+                                    crate::command::metadata::is_write(cmd),
+                                );
                                 match route {
                                     crate::cluster::SlotRoute::Local => {}
                                     other => {

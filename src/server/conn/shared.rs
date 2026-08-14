@@ -823,8 +823,10 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
         (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
         (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
-        (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF"),
-        (9, b'r') => cmd.eq_ignore_ascii_case(b"REPLICAOF"),
+        (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF") || cmd.eq_ignore_ascii_case(b"READONLY"),
+        (9, b'r') => {
+            cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"READWRITE")
+        }
         (9, b's') => cmd.eq_ignore_ascii_case(b"SUBSCRIBE"),
         (10, b'p') => cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"),
         (11, b'u') => cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE"),

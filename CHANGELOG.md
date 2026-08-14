@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`CLUSTER SHARDS`, `CLUSTER MYSHARDID`, `READONLY` and `READWRITE`** — the four verbs a
+  cluster-aware client needs to bootstrap. `CLUSTER SHARDS` reports every shard cluster-wide, one
+  entry per master with its replicas, master first; a shard that has lost every live node reports an
+  empty `slots` array while still listing the dead node as `role: master, health: fail`. The top
+  level is an Array under both protocols and only the shard and node entries change shape — a Map
+  under RESP3, a flat array under RESP2 — which falls out of building them as `Frame::Map` and
+  letting each serializer render it, the same approach the RESP3 pub/sub work used. A node entry
+  carries exactly `id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`, in that
+  order, because under RESP2 a client may read it positionally. `READONLY` lets a replica serve
+  reads for slots its own master owns; a WRITE still answers `MOVED`, the asymmetry a
+  "just return +OK" implementation gets wrong.
+- **`INFO` reports cluster identity honestly.** `redis_mode` and `cluster_enabled` were the hardcoded
+  literals `standalone` and `0`, under a comment promising the cluster subsystem would say otherwise
+  — nothing ever did. An SDK branches on `redis_mode` before it ever calls `CLUSTER SHARDS`, so a
+  server answering SHARDS correctly while reporting `standalone` stayed undiscoverable as a cluster.
 - **`MONITOR` — the command feed.** `redis-cli monitor` now works against Moon, in Redis's exact
   line format: `+<unix>.<micros> [<db> <addr>] "CMD" "arg" …`, arguments quoted and escaped per
   byte (`sdscatrepr` semantics — `"` `\`, `\n` `\r` `\t`, `\a` `\b`, and `\xHH` for everything
@@ -62,6 +77,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **`CLUSTER INFO` no longer claims `cluster_enabled`, and a slotless node no longer claims health.**
+  Two integration assertions encoded the pre-fix behaviour and contradicted the measured oracle:
+  redis-server 8.6.1 reports `cluster_enabled` in `INFO` only — `CLUSTER INFO` never carries it —
+  and a node with zero slots assigned answers `cluster_state:fail`, because state is derived from
+  slot coverage rather than from the `--cluster-enabled` flag.
+- **Replica routing tests no longer race gossip.** A freshly-`MEET`-ed node holds an incomplete slot
+  map until gossip hands it the rest, and an incomplete map answers `CLUSTERDOWN The cluster is down`
+  in front of any redirect — matching Redis, where the down-state check precedes `MOVED` once the
+  slot resolves. The replica tests now wait for the joining node's OWN view to reach
+  `cluster_state:ok` before asserting on redirects.
+- **Gossip never said WHICH master a replica follows, so replicas were reported as their own
+  shards.** The flags word carried a role bit but no master id, and a sender's own role was not
+  propagated at all — a replica was known as one only on the node its `CLUSTER REPLICATE` ran
+  against, and every other node saw a slotless master. The sender's `master_id` now rides in the
+  gossip header (wire v3). The header LAYOUT, not just the flags encoding, now depends on the
+  version, so a v1/v2 peer's sections begin 40 bytes earlier and are still parsed.
+- **`CLUSTER REPLICATE` neither validated its argument nor replicated anything.** It answered `+OK`
+  for a node id it had never heard of, and `NodeRole::Replica` was read nowhere outside
+  `src/cluster/` — so a cluster "replica" held no data and could serve no read. It now rejects with
+  the measured `ERR Unknown node <id>` / `ERR Can't replicate myself`, and starts the same
+  replication the `REPLICAOF` path starts. The validation is not cosmetic: a caller retrying until
+  `OK` — the only way to wait out gossip convergence — succeeded instantly against an empty node
+  table, leaving the node relabelled but permanently empty.
 - **An inline closing quote followed by `\r`, vertical tab or form feed was rejected as unbalanced.**
   Redis's `sdssplitargs` tests `isspace(p[1])` after a closing quote; Moon tested only `' '` and
   `'\t'`, so `ECHO "hi"\rx` answered `-ERR Protocol error: unbalanced quotes in request` where Redis
@@ -70,6 +108,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separators, and only a non-whitespace byte (`ECHO "hi"y`) is unbalanced. The check now reads the
   same `is_inline_space` set as the rest of the splitter — the narrow/wide disagreement here was the
   milder form of the bug that made the splitter unable to advance at all.
+- **`cluster_state` was a constant, so a cluster that had lost a master still reported itself
+  healthy.** The `status` field was assigned once in `ClusterState::new` and never written again;
+  `cluster_slots_pfail` and `cluster_slots_fail` were the literals `0`, and `cluster_slots_ok` was
+  reported as "however many slots are assigned". A client had no way to learn the cluster was
+  degraded. `cluster_state` is now derived on read from real coverage — `ok` only when every one of
+  the 16384 slots is claimed by a node that is not confirmed `FAIL` — and the three slot counters
+  are counted per slot through their owners' bitmaps rather than by summing per-node counts, so a
+  slot two nodes both claim cannot mask a real coverage hole.
+
+  Fixing the reporting exposed that the transition it reports could never happen either:
+  `try_mark_fail_with_consensus` counted only reports received FROM peers, but Redis's
+  `markNodeAsFailingIfNeeded` also counts the local node's own suspicion when it is a master
+  (`if (nodeIsMaster(myself)) failures++`). Without that vote a 3-master cluster is arithmetically
+  unable to promote PFAIL to FAIL — quorum is 2, and each survivor hears about the dead node from
+  exactly one other survivor, so the count tops out at 1 forever. A replica still casts no vote.
+- **A degraded cluster kept serving keys, handing clients a partial view they could not detect.**
+  While `cluster_state` is `fail`, every keyspace command now answers `CLUSTERDOWN The cluster is
+  down` — including keys in slots the receiving node owns and could serve. That over-refusal is
+  deliberate and measured: a partially-visible keyspace is worse than a refusal, because a client
+  cannot tell which half of the data it is seeing. Redis's two CLUSTERDOWN messages stay distinct
+  and the order between them is load-bearing — an unclaimed slot answers the per-slot `CLUSTERDOWN
+  Hash slot not served` even while the cluster is fail, matching a real server (a lone
+  `--cluster-enabled` node reports `cluster_state:fail` and yet answers `Hash slot not served`). A
+  single-node cluster never trips the gate, so bootstrap stays usable. The gate is one bool read on
+  state already under the caller's lock; the coverage scan behind it runs on topology change, never
+  per command.
+- **`CLUSTER INFO` reported `cluster_enabled`, which Redis reports only in `INFO`.** Removed from
+  `CLUSTER INFO`; measured against redis-server 8.6.1, which emits it in INFO's Cluster section and
+  never here.
 - **A multi-node cluster silently served keys it did not own (#485).** `CLUSTER ADDSLOTS` does not
   bump the config epoch, so a hand-built cluster sits at epoch 0 forever. The gossip merge accepted
   a peer's slot bitmap only at a *strictly higher* epoch — `0 > 0` is false — so peer ownership was

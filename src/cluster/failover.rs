@@ -155,13 +155,25 @@ pub fn try_mark_fail_with_consensus(state: &mut ClusterState, node_id: &str) -> 
     let stale_cutoff = now.saturating_sub(2 * DEFAULT_NODE_TIMEOUT_MS);
     let quorum = state.quorum();
 
+    // Does THIS node count toward the quorum? Redis's
+    // `markNodeAsFailingIfNeeded` does `if (nodeIsMaster(myself)) failures++`
+    // before comparing against the quorum: a master's own PFAIL suspicion is a
+    // vote, it is simply never written into its own failure-report map.
+    //
+    // Without this a 3-master cluster can never promote PFAIL to FAIL. Quorum
+    // is 2, `pfail_reports` only ever holds reports received FROM peers, and
+    // each survivor hears about the dead node from exactly one other survivor —
+    // so the count tops out at 1 and `cluster_state` could never become `fail`
+    // no matter how it was computed.
+    let self_votes = u32::from(state.my_node().is_master());
+
     // Clean stale reports and check count
     let (is_pfail, report_count) = {
         if let Some(node) = state.nodes.get_mut(node_id) {
             // Remove stale reports
             node.pfail_reports.retain(|_, ts| *ts > stale_cutoff);
             let is_pfail = matches!(node.health, NodeHealth::Pfail);
-            let count = node.pfail_reports.len() as u32;
+            let count = node.pfail_reports.len() as u32 + self_votes;
             (is_pfail, count)
         } else {
             return false;
@@ -549,7 +561,19 @@ mod tests {
             state.nodes.insert(nid, node);
         }
 
-        // 1 report: not enough
+        // This node is itself a master that sees the target as PFAIL, so it
+        // casts a vote of its own — Redis's `markNodeAsFailingIfNeeded` does
+        // `if (nodeIsMaster(myself)) failures++`. A master's own suspicion is a
+        // vote; it is simply never written into the target's report map, which
+        // only ever holds reports received FROM peers. Quorum is therefore
+        // reached one peer-report earlier than the map length suggests.
+        //
+        // This test previously expected the map length alone to decide. That
+        // arithmetic is what made a 3-master cluster unable to ever promote
+        // PFAIL to FAIL: quorum 2, but each survivor hears about the dead node
+        // from exactly one peer, so the count topped out at 1 forever.
+
+        // 1 peer report + 1 self vote = 2: not enough (quorum=3)
         state
             .nodes
             .get_mut(&target_id)
@@ -558,16 +582,74 @@ mod tests {
             .insert("c".repeat(40), now_ms());
         assert!(!try_mark_fail_with_consensus(&mut state, &target_id));
 
-        // 2 reports: still not enough (quorum=3)
+        // 2 peer reports + 1 self vote = 3: reaches quorum -> FAIL
         state
             .nodes
             .get_mut(&target_id)
             .unwrap()
             .pfail_reports
             .insert("d".repeat(40), now_ms());
-        assert!(!try_mark_fail_with_consensus(&mut state, &target_id));
+        assert!(try_mark_fail_with_consensus(&mut state, &target_id));
+        assert!(matches!(
+            state.nodes.get(&target_id).unwrap().health,
+            NodeHealth::Fail
+        ));
+    }
 
-        // 3 reports: reaches quorum -> FAIL
+    #[test]
+    /// A REPLICA does not vote in the failure quorum.
+    ///
+    /// The counterpart to the self-vote above: Redis gates it on
+    /// `nodeIsMaster(myself)`. Without this test the self-vote could be widened
+    /// to every node without anything failing, which would let a shard's
+    /// replicas outvote its masters.
+    fn test_replica_self_does_not_vote_in_failure_quorum() {
+        let my_id = "a".repeat(40);
+        let target_id = "b".repeat(40);
+        let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
+
+        // Make THIS node a replica; everything else matches the majority test.
+        let master_id = "c".repeat(40);
+        state.my_node_mut().role = NodeRole::Replica {
+            master_id: master_id.clone(),
+        };
+
+        let mut target = crate::cluster::ClusterNode::new(
+            target_id.clone(),
+            test_addr(6380),
+            NodeRole::Master,
+            0,
+        );
+        target.health = crate::cluster::NodeHealth::Pfail;
+        state.nodes.insert(target_id.clone(), target);
+
+        for ch in ['c', 'd', 'e'] {
+            let nid = format!("{}", ch).repeat(40);
+            let node = crate::cluster::ClusterNode::new(
+                nid.clone(),
+                test_addr(6381 + ch as u16),
+                NodeRole::Master,
+                0,
+            );
+            state.nodes.insert(nid, node);
+        }
+
+        // 4 masters (b, c, d, e) -> quorum = 3. Two peer reports and NO self
+        // vote, because this node is a replica: must not promote.
+        for reporter in ['c', 'd'] {
+            state
+                .nodes
+                .get_mut(&target_id)
+                .unwrap()
+                .pfail_reports
+                .insert(format!("{reporter}").repeat(40), now_ms());
+        }
+        assert!(
+            !try_mark_fail_with_consensus(&mut state, &target_id),
+            "a replica must not cast a vote in the failure quorum"
+        );
+
+        // The third peer report reaches quorum without any self vote.
         state
             .nodes
             .get_mut(&target_id)
@@ -575,10 +657,6 @@ mod tests {
             .pfail_reports
             .insert("e".repeat(40), now_ms());
         assert!(try_mark_fail_with_consensus(&mut state, &target_id));
-        assert!(matches!(
-            state.nodes.get(&target_id).unwrap().health,
-            NodeHealth::Fail
-        ));
     }
 
     /// Replica rank 0 gets shorter delay than rank 1 (statistical).

@@ -35,8 +35,14 @@ pub const GOSSIP_MAGIC: u32 = 0x52656469; // "Redi"
 /// because no v1 population exists to protect — a multi-node cluster could not
 /// form at all before #450, so no released build ever exchanged these bytes in
 /// anger. A v1<->v2 mixed cluster is unsupported and says so in the log.
-pub const GOSSIP_VERSION: u16 = 2;
+pub const GOSSIP_VERSION: u16 = 3;
 const GOSSIP_VERSION_LEGACY_FLAGS: u16 = 1;
+/// v2 packed role+health into `flags` but still had no way to say WHICH master
+/// a replica follows, so a replica could never be grouped into its master's
+/// shard by a node that had not been told locally. v3 appends the sender's
+/// `master_id` to the header. A v2 header is still parsed — the field simply
+/// reads as absent, which is exactly the pre-v3 behaviour.
+const GOSSIP_VERSION_NO_MASTER_ID: u16 = 2;
 
 /// Translate a v1 `flags` discriminant into the v2 role+health packing.
 ///
@@ -185,11 +191,20 @@ pub struct GossipMessage {
     pub sender_ip: [u8; 16],
     pub sender_port: u16,
     pub sender_bus_port: u16,
+    /// The master this sender follows, or all-zero when it is a master itself.
+    ///
+    /// The sender is authoritative about its OWN role, which is why this rides
+    /// in the header rather than in a rumor section: a third party's hearsay
+    /// about who replicates whom is exactly the kind of thing that goes stale.
+    pub sender_master_id: [u8; 40],
     pub gossip_sections: Vec<GossipSection>,
 }
 
 /// Header size: magic(4) + total_len(4) + ver(2) + msg_type(2) + node_id(40) + slots(2048) + epoch(8) + ip(16) + port(2) + bus_port(2) + num_gossip(2) = 2130
-const HEADER_SIZE: usize = 4 + 4 + 2 + 2 + 40 + 2048 + 8 + 16 + 2 + 2 + 2;
+const HEADER_SIZE: usize = 4 + 4 + 2 + 2 + 40 + 2048 + 8 + 16 + 2 + 2 + 2 + 40;
+/// Header size before v3 appended `sender_master_id`; a v2 peer's sections
+/// start here instead.
+const HEADER_SIZE_V2: usize = HEADER_SIZE - 40;
 
 /// Serialize a GossipMessage to bytes for wire transmission.
 pub fn serialize_gossip(msg: &GossipMessage) -> Vec<u8> {
@@ -208,6 +223,7 @@ pub fn serialize_gossip(msg: &GossipMessage) -> Vec<u8> {
     buf.extend_from_slice(&msg.sender_port.to_be_bytes());
     buf.extend_from_slice(&msg.sender_bus_port.to_be_bytes());
     buf.extend_from_slice(&num_gossip.to_be_bytes());
+    buf.extend_from_slice(&msg.sender_master_id);
     for section in &msg.gossip_sections {
         section.serialize_into(&mut buf);
     }
@@ -217,8 +233,11 @@ pub fn serialize_gossip(msg: &GossipMessage) -> Vec<u8> {
 /// Deserialize a GossipMessage from bytes.
 /// Returns Err if magic mismatch, truncated, or unknown message type.
 pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
-    if data.len() < HEADER_SIZE {
-        return Err(format!("too short: {} < {}", data.len(), HEADER_SIZE));
+    // Guard against the SMALLER of the two header layouts: a v2 peer legitimately
+    // sends 40 fewer bytes, and rejecting it here would break the mixed-version
+    // parse the version check below exists to support.
+    if data.len() < HEADER_SIZE_V2 {
+        return Err(format!("too short: {} < {}", data.len(), HEADER_SIZE_V2));
     }
     let magic = u32::from_be_bytes(data[0..4].try_into().unwrap());
     if magic != GOSSIP_MAGIC {
@@ -249,8 +268,19 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
     let sender_bus_port = u16::from_be_bytes([data[2126], data[2127]]);
     let num_gossip = u16::from_be_bytes([data[2128], data[2129]]) as usize;
 
+    // v3 appended the sender's master id. A v2 (or v1) peer sent no such field
+    // and its sections start 40 bytes earlier — so the header layout, not just
+    // the flags encoding, depends on the version.
+    let mut sender_master_id = [0u8; 40];
+    let header_len = if version <= GOSSIP_VERSION_NO_MASTER_ID {
+        HEADER_SIZE_V2
+    } else {
+        sender_master_id.copy_from_slice(&data[HEADER_SIZE_V2..HEADER_SIZE]);
+        HEADER_SIZE
+    };
+
     let mut gossip_sections = Vec::with_capacity(num_gossip);
-    let mut offset = 2130;
+    let mut offset = header_len;
     for _ in 0..num_gossip {
         if offset + GossipSection::SIZE > data.len() {
             return Err("truncated gossip section".to_string());
@@ -282,6 +312,7 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
         sender_ip,
         sender_port,
         sender_bus_port,
+        sender_master_id,
         gossip_sections,
     })
 }
@@ -344,6 +375,15 @@ pub fn build_message(
         })
         .collect();
 
+    // Announce which master we follow. All-zero means "I am a master"; the
+    // receiver reads the sender as authoritative about its own role.
+    let mut sender_master_id = [0u8; 40];
+    if let Some(mid) = my_node.master_id() {
+        let mb = mid.as_bytes();
+        let n = mb.len().min(40);
+        sender_master_id[..n].copy_from_slice(&mb[..n]);
+    }
+
     GossipMessage {
         msg_type,
         sender_node_id,
@@ -352,6 +392,7 @@ pub fn build_message(
         sender_ip: encode_ip(&self_addr),
         sender_port: self_addr.port(),
         sender_bus_port: my_node.bus_port,
+        sender_master_id,
         gossip_sections,
     }
 }
@@ -394,6 +435,27 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
     // its slots never counted as covered again.
     entry.health = crate::cluster::NodeHealth::Online;
     entry.pfail_reports.clear();
+
+    // The sender is authoritative about its OWN role, so adopt it on direct
+    // contact. Without this a replica was only ever known as a replica on the
+    // node it ran CLUSTER REPLICATE against: every other node saw a slotless
+    // master and `CLUSTER SHARDS` reported it as a fourth shard of its own
+    // instead of grouping it under its master.
+    //
+    // A v2 peer sends no master id, which decodes as all-zero and is
+    // indistinguishable from "I am a master" — the pre-v3 behaviour, and the
+    // reason this rides a version bump.
+    let announced_master = std::str::from_utf8(&msg.sender_master_id)
+        .unwrap_or("")
+        .trim_end_matches('\0')
+        .to_string();
+    entry.role = if announced_master.is_empty() {
+        NodeRole::Master
+    } else {
+        NodeRole::Replica {
+            master_id: announced_master,
+        }
+    };
 
     // A node is AUTHORITATIVE for its own slot bitmap at EQUAL epoch, not only
     // at a strictly higher one.
@@ -492,6 +554,11 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
             state.nodes.insert(target_node_id, node);
         }
     }
+
+    // Slot ownership and node health both just moved: re-derive the fail-closed
+    // cache now rather than waiting for the next 100ms tick, so a cluster that
+    // has just regained coverage starts serving immediately.
+    state.refresh_fail_closed();
 }
 
 /// Check for PFAIL -> FAIL transitions based on ping timeout.
@@ -546,6 +613,12 @@ pub async fn run_gossip_ticker(
                 let (target_addr, ping_msg) = {
                     let mut cs = cluster_state.write();
                     check_failure_states(&mut cs, node_timeout_ms);
+                    // Unconditional refresh of the fail-closed cache. This tick
+                    // is the backstop: every other refresh site is an
+                    // optimisation for latency, and a site someone forgets to
+                    // add self-heals here within 100ms rather than pinning a
+                    // stale answer forever.
+                    cs.refresh_fail_closed();
 
                     // Reset election_spawned when failover state returns to None
                     if election_spawned && cs.failover_state == FailoverState::None {
@@ -672,6 +745,7 @@ mod tests {
             sender_ip,
             sender_port: port,
             sender_bus_port: port + 10000,
+            sender_master_id: [0u8; 40],
             gossip_sections: sections,
         }
     }
@@ -779,6 +853,7 @@ mod tests {
             sender_ip: [0u8; 16],
             sender_port: 6379,
             sender_bus_port: 16379,
+            sender_master_id: [0u8; 40],
             gossip_sections: vec![],
         };
         msg.sender_slots[0] = 0xFF; // slot 0-7 owned
@@ -816,6 +891,7 @@ mod tests {
             sender_ip: [0u8; 16],
             sender_port: 6379,
             sender_bus_port: 16379,
+            sender_master_id: [0u8; 40],
             gossip_sections: vec![section.clone()],
         };
         let bytes = serialize_gossip(&msg);
@@ -891,6 +967,70 @@ mod tests {
         );
     }
 
+    /// Rewrite a v3 wire message into the pre-v3 layout at `version`: drop the
+    /// 40-byte `sender_master_id` and fix up the length + version fields.
+    fn downgrade_header_to(v3: &[u8], version: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v3.len() - 40);
+        out.extend_from_slice(&v3[..HEADER_SIZE_V2]);
+        out.extend_from_slice(&v3[HEADER_SIZE..]);
+        out[8..10].copy_from_slice(&version.to_be_bytes());
+        let total = out.len() as u32;
+        out[4..8].copy_from_slice(&total.to_be_bytes());
+        out
+    }
+
+    /// A v2 peer sends no master id, and must still parse — sections included.
+    ///
+    /// The field decodes as absent, which is indistinguishable from "I am a
+    /// master". That is exactly the pre-v3 behaviour and the reason adding it
+    /// required a version bump rather than a silent field append.
+    #[test]
+    fn test_deserialize_accepts_v2_header_without_master_id() {
+        let section = GossipSection {
+            node_id: [b'd'; 40],
+            ip: [
+                b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0, 0, 0, 0, 0, 0, 0,
+            ],
+            port: 7000,
+            bus_port: 17000,
+            flags: gossip_flags(&NodeRole::Master, NodeHealth::Fail),
+            epoch: 7,
+            ping_sent_ms: 1,
+            pong_recv_ms: 2,
+        };
+        let msg = GossipMessage {
+            msg_type: GossipMsgType::Ping,
+            sender_node_id: [b'a'; 40],
+            sender_slots: Box::new([0u8; 2048]),
+            config_epoch: 1,
+            sender_ip: [
+                b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0, 0, 0, 0, 0, 0, 0,
+            ],
+            sender_port: 6379,
+            sender_bus_port: 16379,
+            sender_master_id: *b"cccccccccccccccccccccccccccccccccccccccc",
+            gossip_sections: vec![section.clone()],
+        };
+        let bytes = downgrade_header_to(&serialize_gossip(&msg), 2);
+        let decoded = deserialize_gossip(&bytes).expect("v2 message must still parse");
+
+        assert_eq!(
+            decoded.sender_master_id, [0u8; 40],
+            "a v2 peer announces no master, so the field must read as absent"
+        );
+        assert_eq!(
+            decoded.gossip_sections.len(),
+            1,
+            "the section must be found at the v2 offset, not 40 bytes late"
+        );
+        let (_, health) = parse_gossip_flags(decoded.gossip_sections[0].flags);
+        assert_eq!(
+            health,
+            NodeHealth::Fail,
+            "v2 already packed role+health, so its flags are read as-is"
+        );
+    }
+
     /// End-to-end: a v1 message on the wire is translated during deserialize,
     /// so nothing downstream ever sees a v1 discriminant.
     #[test]
@@ -917,11 +1057,15 @@ mod tests {
             ],
             sender_port: 6379,
             sender_bus_port: 16379,
+            sender_master_id: [0u8; 40],
             gossip_sections: vec![section],
         };
-        let mut bytes = serialize_gossip(&msg);
-        // Stamp the header back to v1, simulating an old peer.
-        bytes[8..10].copy_from_slice(&1u16.to_be_bytes());
+        // Simulate a real old peer: v1/v2 wrote a SHORTER header (no
+        // `sender_master_id`), so stamping the version alone is not enough —
+        // the 40 announced-master bytes must actually be absent, or the
+        // sections land at the wrong offset. Getting this wrong is how a
+        // version bump silently breaks mixed-version parsing.
+        let bytes = downgrade_header_to(&serialize_gossip(&msg), 1);
 
         let decoded = deserialize_gossip(&bytes).expect("v1 message must still parse");
         let (_, health) = parse_gossip_flags(decoded.gossip_sections[0].flags);
@@ -943,6 +1087,7 @@ mod tests {
             sender_ip: [0u8; 16],
             sender_port: 6379,
             sender_bus_port: 16379,
+            sender_master_id: [0u8; 40],
             gossip_sections: vec![],
         });
         // Corrupt magic

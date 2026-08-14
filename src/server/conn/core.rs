@@ -218,6 +218,13 @@ pub(crate) struct ConnectionState {
     pub current_user: String,
     pub client_name: Option<Bytes>,
     pub asking: bool,
+    /// Per-connection READONLY flag (`READONLY` sets, `READWRITE` clears).
+    ///
+    /// Lets a replica serve READS for slots its master owns instead of
+    /// redirecting. Writes are unaffected and still answer MOVED — the
+    /// asymmetry is the whole point of the verb, and a "just return +OK"
+    /// implementation is what gets it wrong.
+    pub readonly: bool,
     pub acl_log: AclLog,
 
     /// Cached per-connection: true when the current user has no ACL
@@ -363,6 +370,7 @@ impl ConnectionState {
             current_user,
             client_name,
             asking: false,
+            readonly: false,
             acl_log: AclLog::new(acl_max_len),
             subscription_count: 0,
             subscriber_id: 0,

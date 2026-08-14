@@ -1597,6 +1597,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 continue;
             }
+
+            // --- READONLY / READWRITE ---
+            //
+            // Both are cluster-only: a standalone instance answers the
+            // measured refusal rather than a misleading +OK, because a
+            // client that gets +OK believes replica reads are enabled.
+            if cmd.eq_ignore_ascii_case(b"READONLY") || cmd.eq_ignore_ascii_case(b"READWRITE") {
+                if let Some(err) = crate::cluster::readonly_verb_reply(cmd, cmd_args) {
+                    responses.push(err);
+                    continue;
+                }
+                conn.readonly = cmd.eq_ignore_ascii_case(b"READONLY");
+                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                continue;
+            }
             // #438 batch-tail crash class: an early-flush command (blocking /
             // SUBSCRIBE / PSUBSCRIBE / PSYNC) while remote-slotted commands
             // are pending would flush their Frame::Null placeholders to the

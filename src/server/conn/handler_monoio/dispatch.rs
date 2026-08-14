@@ -153,6 +153,37 @@ pub(super) fn try_handle_cluster(
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
         let resp = crate::cluster::command::handle_cluster_command(cmd_args, cs, self_addr);
+        // CLUSTER REPLICATE must actually replicate, not merely relabel the
+        // node: the role it sets is read nowhere outside `src/cluster/`, so a
+        // cluster replica held no data and could serve no read. Start the same
+        // replica task REPLICAOF starts.
+        if matches!(resp, Frame::SimpleString(ref ok) if ok.as_ref() == b"OK")
+            && let Some((host, port)) =
+                crate::cluster::command::cluster_replicate_target(cmd_args, cs)
+            && let Some(ref rs) = ctx.repl_state
+        {
+            rs.write()
+                .set_role(crate::replication::state::ReplicationRole::Replica {
+                    host: host.clone(),
+                    port,
+                    state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
+                });
+            // Bump the generation FIRST so any previously spawned replica task
+            // sees itself superseded and exits instead of double-applying.
+            let epoch = crate::replication::replica::bump_replica_task_epoch();
+            let cfg = crate::replication::replica::ReplicaTaskConfig {
+                master_host: host,
+                master_port: port,
+                repl_state: Arc::clone(rs),
+                num_shards: ctx.num_shards,
+                persistence_dir: None,
+                listening_port: 0,
+                epoch,
+                stream_db: std::sync::atomic::AtomicUsize::new(0),
+                shard_databases: ctx.shard_databases.clone(),
+            };
+            monoio::spawn(crate::replication::replica::run_replica_task(cfg));
+        }
         responses.push(resp);
     } else {
         responses.push(Frame::Error(Bytes::from_static(
@@ -274,7 +305,12 @@ pub(super) fn try_handle_cluster_routing(
     let maybe_key = super::extract_primary_key(cmd, cmd_args);
     if let Some(key) = maybe_key {
         let slot = crate::cluster::slots::slot_for_key(key);
-        let route = cs.read().route_slot(slot, was_asking);
+        let route = cs.read().route_slot_for(
+            slot,
+            was_asking,
+            conn.readonly,
+            crate::command::metadata::is_write(cmd),
+        );
         match route {
             crate::cluster::SlotRoute::Local => {} // proceed
             other => {

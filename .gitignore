@@ -107,6 +107,9 @@ tmp/
 /target-check-monoio/
 /target-check/
 target-fast/
+# CARGO_TARGET_DIR used for the local release-fast build+test loop
+/target-rf/
+/target-tokio/
 
 # replication test-run artifact (written to CWD by save_replication_state)
 replication.state
