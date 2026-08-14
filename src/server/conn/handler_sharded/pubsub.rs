@@ -237,7 +237,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                             } else {
                                 let cmd_str = String::from_utf8_lossy(cmd);
                                 let err = Frame::Error(Bytes::from(format!(
-                                    "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+                                    "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                                     cmd_str.to_lowercase()
                                 )));
                                 write_buf.clear();

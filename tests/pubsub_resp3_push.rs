@@ -613,6 +613,51 @@ fn ps16_sharded_verbs_check_arity() {
     );
 }
 
+#[test]
+fn ps18_sharded_delivery_crosses_shards() {
+    // The half a --shards 1 suite cannot see. Plain PUBLISH fans out to remote
+    // shards via `remote_subscriber_map` + an SPSC message; a sharded registry
+    // that only ever serves its OWN shard would pass every other sharded test
+    // here and silently drop (N-1)/N of deliveries in production.
+    //
+    // This is the same shape that bit keyspace notifications: a delivery path
+    // proven at one shard and broken at four.
+    let m = spawn_moon("4");
+
+    // Enough distinct channels that at least one subscriber must land on a
+    // shard other than the publisher's, whatever the hash does.
+    let channels = ["sc0", "sc1", "sc2", "sc3", "sc4", "sc5", "sc6", "sc7"];
+    let mut subs: Vec<Conn> = Vec::new();
+    for ch in channels {
+        let mut c = Conn::open(m.port);
+        c.send(&["SSUBSCRIBE", ch]);
+        subs.push(c);
+    }
+
+    let mut pubc = Conn::open(m.port);
+    for ch in channels {
+        let n = pubc.send(&["SPUBLISH", ch, "hi"]);
+        assert_eq!(
+            s(&n),
+            ":1\r\n",
+            "SPUBLISH must report the subscriber on whichever shard owns `{ch}`"
+        );
+    }
+
+    let mut delivered = 0usize;
+    for c in subs.iter_mut() {
+        if c.drain().windows(8).any(|w| w == b"smessage") {
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered,
+        channels.len(),
+        "every sharded subscriber must be reached at --shards 4, not only those \
+         that happened to hash to the publisher's own shard"
+    );
+}
+
 // ── Must 7 — every handler agrees ───────────────────────────────────────────
 
 #[test]

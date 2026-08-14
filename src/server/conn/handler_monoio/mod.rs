@@ -520,8 +520,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             break;
         }
 
-        // Subscriber mode: bidirectional select on client commands + published messages
-        if conn.subscription_count > 0 {
+        // Subscriber mode: bidirectional select on client commands + published messages.
+        //
+        // RESP2 ONLY. Under RESP3 a subscribed connection stays in the normal
+        // command loop and takes the delivery branch further down instead —
+        // that is what lets it keep issuing commands while subscribed, which
+        // is a reason RESP3 exists and which Redis allows. Entering this loop
+        // for a RESP3 connection is what put it in the RESP2 jail.
+        if conn.subscription_count > 0 && conn.protocol_version < 3 {
             #[allow(clippy::unwrap_used)]
             // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
@@ -779,12 +785,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     let _ = wr; // ignore write error on quit
                                                     return (MonoioHandlerResult::Done, None); // exit connection
                                                 }
+                                                _ if cmd.eq_ignore_ascii_case(b"RESET") => {
+                                                    // The sanctioned way out of subscriber mode.
+                                                    // Only the SHARDED handler used to accept it,
+                                                    // so which answer a client got depended on the
+                                                    // shard count.
+                                                    { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id); }
+                                                    { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id); }
+                                                    conn.subscription_count = 0;
+                                                    let resp = Frame::SimpleString(Bytes::from_static(b"RESET"));
+                                                    let mut resp_buf = BytesMut::new();
+                                                    codec.encode_frame(&resp, &mut resp_buf);
+                                                    let data = resp_buf.freeze();
+                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    break;
+                                                }
                                                 _ => {
-                                                    let cmd_str = String::from_utf8_lossy(cmd);
-                                                    let err = Frame::Error(Bytes::from(format!(
-                                                        "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
-                                                        cmd_str.to_lowercase()
-                                                    )));
+                                                    // One allow-list, one text — see
+                                                    // `server::conn::subscriber_mode`. This loop is
+                                                    // RESP2-only now, so the refusal always applies.
+                                                    let err = crate::server::conn::subscriber_mode::subscriber_mode_error(cmd);
                                                     let mut resp_buf = BytesMut::new();
                                                     codec.encode_frame(&err, &mut resp_buf);
                                                     let data = resp_buf.freeze();
@@ -863,6 +884,55 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // structurally unreachable whenever `timeout` was set.
         if std::mem::take(&mut carried_input) {
             // Nothing to read: `read_buf` already holds unparsed input.
+        } else if conn.protocol_version >= 3 && conn.subscription_count > 0 {
+            // RESP3 subscriber: deliver pub/sub messages while parked in
+            // read(), instead of diverting the connection into the RESP2
+            // subscriber loop. This is the whole mechanism behind "RESP3 lets
+            // one connection subscribe AND issue commands" — the connection
+            // never leaves this loop, so every command still dispatches
+            // normally and the deliveries arrive between replies.
+            //
+            // The channel carries ALREADY-SERIALIZED bytes, framed by
+            // `publish()` according to the subscriber's own protocol (Push for
+            // RESP3), so this arm writes them verbatim. That also means a
+            // delivery can never be spliced into a half-written reply: both
+            // are whole frames handed to `write_all` from the same task, and
+            // this loop only reaches here when no reply is mid-flight.
+            #[allow(clippy::unwrap_used)] // guarded by subscription_count > 0
+            let rx = conn.pubsub_rx.as_ref().unwrap();
+            let sub_buf = std::mem::take(&mut tmp_buf);
+            let mut delivery: Option<bytes::Bytes> = None;
+            monoio::select! {
+                _ = shutdown.cancelled() => { break; }
+                read_result = stream.read(sub_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                msg = rx.recv_async() => {
+                    // The read future loses its buffer here (io_uring cancel
+                    // semantics), exactly as the RESP2 subscriber select
+                    // above documents; the pre-park sizing re-arms it.
+                    delivery = msg.ok();
+                }
+            }
+            if let Some(data) = delivery {
+                if !write_all_bounded!(
+                    stream,
+                    data,
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                ) {
+                    break;
+                }
+                continue;
+            }
         } else if conn.tracking_rx.is_some() {
             // CLIENT TRACKING: deliver invalidation Push frames while parked
             // in read(). Only tracking connections take this select — the
@@ -1686,6 +1756,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 pubsub::SubscribeResult::NotSubscribe => {}
                 pubsub::SubscribeResult::ArgError => continue,
                 pubsub::SubscribeResult::Subscribed => {
+                    // RESP3 never diverts into subscriber mode, so there is
+                    // nothing to defer: the rest of the batch keeps running in
+                    // THIS loop, which is the point. Breaking here would jump
+                    // to a subscriber loop that the RESP3 gate above no longer
+                    // enters, stranding the connection.
+                    if conn.protocol_version >= 3 {
+                        continue;
+                    }
                     // #438: carry the parsed-but-unconsumed batch tail into
                     // the next iteration (subscriber mode) instead of
                     // dropping it — `[SUBSCRIBE ch, PING]` in one pipelined

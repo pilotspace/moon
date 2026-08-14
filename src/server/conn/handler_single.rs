@@ -434,7 +434,7 @@ pub async fn handle_connection(
                                     _ => {
                                         let cmd_str = String::from_utf8_lossy(cmd);
                                         let _ = framed.send(Frame::Error(Bytes::from(format!(
-                                            "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / HELLO are allowed in this context",
+                                            "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                                             cmd_str.to_lowercase()
                                         )))).await;
                                     }

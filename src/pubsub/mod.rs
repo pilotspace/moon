@@ -50,6 +50,9 @@ pub fn next_subscriber_id() -> u64 {
 pub struct PubSubRegistry {
     channels: HashMap<Bytes, Vec<Subscriber>>,
     patterns: Vec<(Bytes, Vec<Subscriber>)>,
+    /// Sharded (`SSUBSCRIBE`) channels — a separate namespace from `channels`,
+    /// so `SPUBLISH ch` structurally cannot reach a `SUBSCRIBE ch`.
+    shard_channels: HashMap<Bytes, Vec<Subscriber>>,
 }
 
 impl PubSubRegistry {
@@ -57,6 +60,7 @@ impl PubSubRegistry {
         Self {
             channels: HashMap::new(),
             patterns: Vec::new(),
+            shard_channels: HashMap::new(),
         }
     }
 
@@ -302,10 +306,153 @@ impl PubSubRegistry {
             .count()
     }
 
-    /// Total subscription count (channels + patterns) for a subscriber.
+    /// Total subscription count (channels + patterns + sharded) for a
+    /// subscriber.
     pub fn total_subscription_count(&self, sub_id: u64) -> usize {
-        self.channel_subscription_count(sub_id) + self.pattern_subscription_count(sub_id)
+        self.channel_subscription_count(sub_id)
+            + self.pattern_subscription_count(sub_id)
+            + self.shard_subscription_count(sub_id)
     }
+
+    // ── Sharded pub/sub ─────────────────────────────────────────────────
+    //
+    // A SEPARATE map, not a flag on the existing one. The namespaces must not
+    // leak in either direction — `SPUBLISH ch` never reaches a `SUBSCRIBE ch`
+    // and vice versa — and sharing one map keyed by name with a discriminator
+    // would make that a filtering rule every call site has to remember rather
+    // than a structural guarantee.
+    //
+    // Standalone semantics only: in a real cluster `SSUBSCRIBE` is served by
+    // the slot's owner, which is `cluster-client-bootstrap`'s territory. What
+    // is contracted here is what a standalone redis-server does.
+
+    /// Subscribe to a sharded channel.
+    pub fn ssubscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        self.shard_channels.entry(channel).or_default().push(sub);
+    }
+
+    /// Unsubscribe from a sharded channel by subscriber ID.
+    pub fn sunsubscribe(&mut self, channel: &[u8], sub_id: u64) {
+        if let Some(subs) = self.shard_channels.get_mut(channel) {
+            subs.retain(|s| s.id != sub_id);
+            if subs.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+    }
+
+    /// Remove a subscriber from every sharded channel. Returns those channels.
+    pub fn sunsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
+        let mut removed = Vec::new();
+        self.shard_channels.retain(|channel, subs| {
+            let before = subs.len();
+            subs.retain(|s| s.id != sub_id);
+            if subs.len() < before {
+                removed.push(channel.clone());
+            }
+            !subs.is_empty()
+        });
+        removed
+    }
+
+    /// Count sharded channels this subscriber is subscribed to.
+    pub fn shard_subscription_count(&self, sub_id: u64) -> usize {
+        self.shard_channels
+            .values()
+            .filter(|subs| subs.iter().any(|s| s.id == sub_id))
+            .count()
+    }
+
+    /// List active sharded channels, optionally filtered by glob pattern.
+    pub fn active_shard_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
+        self.shard_channels
+            .keys()
+            .filter(|ch| match pattern {
+                Some(pat) => crate::command::key::glob_match(pat, ch),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Subscriber counts for specific sharded channels.
+    pub fn shard_numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
+        channels
+            .iter()
+            .map(|ch| {
+                let count = self
+                    .shard_channels
+                    .get(ch)
+                    .map(|subs| subs.len() as i64)
+                    .unwrap_or(0);
+                (ch.clone(), count)
+            })
+            .collect()
+    }
+
+    /// Publish to a sharded channel. Returns how many subscribers received it.
+    ///
+    /// Deliberately has no pattern leg: `PSUBSCRIBE` does not match sharded
+    /// channels in Redis either.
+    pub fn spublish(&mut self, channel: &Bytes, message: &Bytes) -> i64 {
+        let mut count: i64 = 0;
+        let mut slow_drops: i64 = 0;
+        if let Some(subs) = self.shard_channels.get_mut(channel) {
+            let mut resp2_bytes: Option<Bytes> = None;
+            let mut resp3_bytes: Option<Bytes> = None;
+            let before = subs.len();
+            subs.retain(|sub| {
+                let data = if sub.is_resp3 {
+                    resp3_bytes
+                        .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
+                        .clone()
+                } else {
+                    resp2_bytes
+                        .get_or_insert_with(|| serialize_smessage_bytes(channel, message, false))
+                        .clone()
+                };
+                if sub.try_send(data) {
+                    count += 1;
+                    true
+                } else {
+                    false // slow subscriber, remove
+                }
+            });
+            slow_drops += (before - subs.len()) as i64;
+            if subs.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+        if count > 0 {
+            crate::admin::metrics_setup::record_pubsub_published();
+        }
+        for _ in 0..slow_drops {
+            crate::admin::metrics_setup::record_pubsub_slow_drop();
+        }
+        count
+    }
+}
+
+/// Pre-serialize an `smessage` delivery.
+///
+/// `smessage`, not `message`: the sharded delivery carries its own event name,
+/// so a client subscribed to both namespaces can tell them apart.
+#[inline]
+fn serialize_smessage_bytes(channel: &Bytes, payload: &Bytes, resp3: bool) -> Bytes {
+    let capacity = 32 + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    let frame = Frame::Push(framevec![
+        Frame::BulkString(Bytes::from_static(b"smessage")),
+        Frame::BulkString(channel.clone()),
+        Frame::BulkString(payload.clone()),
+    ]);
+    if resp3 {
+        crate::protocol::serialize_resp3(&frame, &mut buf);
+    } else {
+        // RESP2 downgrades Push to Array — the same rule the confirmations use.
+        crate::protocol::serialize(&frame, &mut buf);
+    }
+    buf.freeze()
 }
 
 /// Publish with the fan-out OUTSIDE the registry lock (P1, 2026-07 pub/sub
