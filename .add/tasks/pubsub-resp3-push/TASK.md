@@ -2,7 +2,7 @@
 
 slug: pubsub-resp3-push · created: 2026-08-09 · stage: production
 autonomy: auto   <!-- inherited from the project default (PROJECT.md); explicit level: manual < conservative < auto (visible · overridable) — lower below if a high-risk task needs it, or run `add.py autonomy set`. -->
-phase: ground   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- ground -> specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower the
      autonomy level to `manual` or `conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -350,7 +350,7 @@ turns out to risk torn frames the answer is to fix the write path properly (seri
 writers) rather than to ship the framing fix alone. Recorded here because it converts flag 1 from
 "we may fall back" into "there is no fallback" — the tear test is now a blocker, not a probe.
 
-Lowest-confidence flags, surfaced for the freeze:
+Least-sure flag surfaced at freeze:
 1. `[spec]` **Lifting the RESP2 jail under RESP3 is the risky half, not the Push framing.** A
    subscribed RESP3 connection can now have a command reply and a delivery in flight at once, and
    Moon's handlers were written assuming a subscribed connection only ever writes pushes. If those
@@ -433,9 +433,25 @@ Tests live in: `./tests/` · MUST run red (missing implementation) before Build.
 
 ## 5 · BUILD — AI writes code ▸ docs/07-step-5-build.md
 
-Scope (may touch): `./src/`   <fill before the §3 freeze — every file the build may write>
-Strategy (ordered batches): <1. … 2. … — the planned build order; guidance, not enforced>
-Safety rule (feature-specific): <e.g. debit+credit in one atomic transaction>
+Scope (may touch): `src/pubsub/` `src/server/conn/` `src/shard/` `src/command/metadata.rs` `tests/pubsub_resp3_push.rs` `scripts/client-compat/manifest.yaml` `scripts/test-commands.sh` `CHANGELOG.md`
+Strategy (ordered batches):
+1. Confirmation framing — the four `Frame::Array` confirmation builders in `src/pubsub/mod.rs`
+   become `Frame::Push`. Measured first that `serialize.rs:102` already downgrades Push→Array
+   for RESP2 exactly as it does for `Frame::Set`, so no `resp3: bool` needs threading through
+   the builders and RESP2 output stays byte-identical. This is batch 1 because it is the
+   headline defect and it touches one file.
+2. Subscriber-mode rule — extract the allow-list into `src/server/conn/subscriber_mode.rs`
+   stated once, with its own unit tests, then have all three handlers call it. Lift the jail
+   for RESP3 (`subscription_count > 0 && protocol_version < 3`) and add a delivery select-arm
+   to the normal loop in the monoio and sharded handlers.
+3. Sharded pub/sub — a `shard_channels` map beside `channels` in the registry, the SSUBSCRIBE /
+   SUNSUBSCRIBE / SPUBLISH / SHARDCHANNELS / SHARDNUMSUB verbs across all three handlers, and
+   the cross-shard leg (`remote_subscriber_map.shard_channels` + an `SPublishBatch` message).
+   Last because it is the largest and depends on batch 1's frame shape.
+Safety rule (feature-specific): the sharded and plain channel namespaces must be SEPARATE MAPS,
+never one map with a flag each call site remembers to check. `SPUBLISH ch` reaching a
+`SUBSCRIBE ch` (or the reverse) is a correctness break a client cannot defend against, and the
+structural separation is what makes it unrepresentable rather than merely untested.
 Code lives in: `./src/`
 Constraints: do NOT change any test or the contract; allow-list packages only; ask if unclear.
 
@@ -451,31 +467,84 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] the green was EARNED, not gamed — no overfit to fixtures, vacuous asserts, or stubbed-away logic (score with an adversarial refute-read — a subagent recommended under `autonomy: auto`; a confirmed cheat is HARD-STOP)
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — 18/18 `tests/pubsub_resp3_push.rs` under BOTH runtimes (monoio 4610 lib
+      tests, tokio+jemalloc 3773); regression suites `pubsub_kv_ordering` 2/2,
+      `multi_exec_queue_semantics` 12 + 1 known-ignored, `protocol_error_lifetime` 8/8,
+      `info_observability` 13/13, `keyspace_notifications` 10/10; `test-commands.sh --category
+      pubsub` 5/5; compat harness PASS=199 FAIL=0 WAIVED=15 against live redis-server 8.6.1.
+- [x] coverage did not decrease — 18 new integration tests + 5 unit tests in
+      `subscriber_mode.rs`; no test removed or weakened.
+- [x] no test or contract was altered during build — §3 stayed FROZEN @ v1. One contracted
+      detail proved unnecessary rather than wrong (see the §3 note on `resp3: bool`): the
+      OBSERVABLE contract is unchanged, the implementation is simpler than the sketch.
+- [x] the green was EARNED — the tokio leg was 12/18 RED when monoio was already 18/18, from
+      four independent gaps (unconditional RESP2 serialize, no jail lift, no delivery arm, no
+      sharded verbs). A suite that could not tell the two runtimes apart would have been the
+      cheat; this one did, on the exact axis the repo has been burned by before. `ps18` was
+      written BEFORE the cross-shard wiring specifically so a local-only registry would fail
+      loudly instead of passing every `--shards 1` test while dropping (N-1)/N in production.
+- [x] concurrency / timing of the risky operation is safe — the RESP3 jail lift puts a delivery
+      branch next to command handling in one `select!`. Reply and delivery cannot interleave
+      mid-frame: both are whole frames written by the same task, and the loop only parks when
+      no reply is in flight. Verified empirically, not by argument — `ps5` parses the buffer
+      frame-by-frame and requires every byte to belong to a whole frame. `spublish_shared`
+      snapshots under a read lock, serializes + fans out lock-free, and reconciles slow
+      subscribers under a write lock — no lock held across the fan-out.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — no new dependency,
+      no `unsafe`, no `unwrap`/`expect` outside tests. Channel names are opaque `Bytes` used as
+      map keys only. `SPUBLISH` carries ACL category PUB, matching PUBLISH.
+- [x] layering & dependencies follow CONVENTIONS.md — the rule lives in one module rather than
+      being restated per handler (that duplication WAS the bug: three texts, two behaviours);
+      registry logic stays in `src/pubsub/`, wire concerns in `src/server/conn/`.
+- [ ] a person reviewed and approved the change — pending PR review.
 
 ### Build expectations — what "correct" looks like (fill BEFORE build; confirm each at the gate)
 > Pre-declare the OBSERVABLE outcomes a correct build must produce — derived from §2 SCENARIOS
 > + §3 CONTRACT — so this gate checks the build is RIGHT, not merely that tests are green. Each
 > row is evidence you can SEE, not a restatement of a test name.
-- [ ] <observable outcome a correct build must produce> — confirmed by <how / where>
-- [ ] <another observable outcome> — confirmed by <evidence seen>
+- [x] A RESP3 client can subscribe and then issue an ordinary command on the same connection,
+      and its frame-type dispatch stays in sync — every confirmation leads with `>`, every
+      command reply leads with its own type byte, forever. — confirmed by ps1–ps5 asserting the
+      LEADING BYTE (not the payload) of each confirmation, and ps5 additionally requiring the
+      whole buffer to split cleanly into frames so no reply/delivery tear is possible.
+- [x] A RESP2 client sees byte-for-byte what it saw before the change. — confirmed by ps6/ps7
+      pinning the `*3`-Array form, and by the compat harness diffing Moon's raw bytes against
+      redis-server 8.6.1 for both protocols (PASS=199 FAIL=0).
+- [x] `SPUBLISH ch` never reaches a `SUBSCRIBE ch` subscriber and vice versa, even though the
+      channel NAME is identical. — confirmed by ps12/ps13, which subscribe both ways to the same
+      name and assert each publish counts exactly 1 receiver and delivers to exactly one side.
+- [x] Sharded delivery works when the subscribers are spread across shard threads, not just at
+      `--shards 1`. — confirmed by ps18: `--shards 4`, 8 connections on sc0..sc7, every SPUBLISH
+      returns `:1` and all 8 `smessage` deliveries arrive.
+- [x] `PUBSUB NUMPAT` answers a count of DISTINCT PATTERNS, including when subscribers to one
+      pattern land on different shard threads. — confirmed by ps14 keeping both subscribers live
+      (the only shape that exposes it — after one leaves, buggy and correct both answer 1).
+- [x] `COMMAND` no longer advertises a verb Moon cannot run. — confirmed by SSUBSCRIBE /
+      SUNSUBSCRIBE / SPUBLISH all executing, where two were in `COMMAND_META` but answered
+      "unknown command" and one was absent from the table entirely. This also feeds #472, which
+      validates MULTI queue-time arity against that same table.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — this repo has THREE dispatch paths (monoio, sharded/tokio, single) plus an
+      inline fast path, and a rule added to one is CI-invisible in the others. Every new verb was
+      confirmed reachable in all of them: `handler_monoio/{mod,pubsub}.rs`,
+      `handler_sharded/{mod,pubsub}.rs`, `handler_single`, and `COMMAND_META`. The wiring check
+      is not ceremony here — the tokio leg was genuinely 12/18 red after the monoio leg was
+      green, and the 7th UNSUBSCRIBE call site was missed by a single-line regex sweep because
+      it was formatted across lines (ps15 caught it, still returning `$0`).
+- [x] DEAD-CODE (code) — clippy clean with `--all-targets` on default features AND
+      `--no-default-features --features runtime-tokio,jemalloc`; no `dead_code` allow added. The
+      `pending_wakers` relay was already deleted in an earlier wave and was not resurrected —
+      the cross-shard reply path awaits a `flume` oneshot directly.
+- [x] SEMANTIC (prose / non-code) — the §0 divergence table (18 rows) was re-read row by row
+      against the final build; each row now has a named test. CHANGELOG entries state the
+      divergence in terms of what a CLIENT observes rather than what the code did, since that
+      is the axis this milestone is measured on.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
+Outcome: PASS
 If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Reviewed by: Tin Dang · date: 2026-08-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -483,14 +552,43 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
+Watch (reuse scenarios as monitors): the compat harness is the standing monitor — the 7 new
+manifest entries diff Moon's raw bytes against a live redis-server on every run, so a regression
+in confirmation framing surfaces as a FAIL row rather than as a client bug report months later.
+Beyond that: `pubsub_patterns` in INFO must equal `PUBSUB NUMPAT` (they now share one gather, so
+a divergence means someone re-forked them), and `SPUBLISH` receiver counts at `--shards > 1`
+should track subscriber counts — a systematic (N-1)/N shortfall is the cross-shard leg breaking.
 
 ### Spec delta
-Forward changes for the next loop — each re-enters at Specify as the next task. One line
-each, tagged `[SPEC · open|seeded|dropped]`, with evidence (e.g. `[SPEC · open] rate-limit
-the retry path (evidence: prod herd spikes)`). See the `add` skill's `deltas.md`.
+- [SPEC · open] `HELLO` mid-subscription stays refused, matching measured Redis 8.6.1 behaviour.
+  If a future Redis permits the upgrade this becomes a divergence (evidence: ps16 pins the
+  refusal; the §0 table records it as measured-and-matched, not assumed).
+- [SPEC · open] Sharded pub/sub is standalone-only — it does not yet consult cluster slot
+  ownership, so in cluster mode `SPUBLISH` fans out within this node rather than to the slot's
+  shard. Belongs with `cluster-client-bootstrap` (evidence: §3 ⚠ assumption 2, recorded before
+  the freeze).
+- [SPEC · open] `UNSUBSCRIBE` with no arguments emits confirmations in a different ORDER than
+  Redis. Deliberately unpinned: Redis's order is dict-iteration order, so it is not contractual
+  and a test asserting it would encode an accident (evidence: measured during §0, left untested).
+- [SPEC · open] `Frame::NullArray` is still missing, so a Null Array and a Null Bulk cannot be
+  distinguished on the wire — the same root cause as the BLPOP-in-MULTI risk accepted in
+  `multi-exec-queue-semantics` (evidence: #482).
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] Write the multi-shard test BEFORE the multi-shard wiring, not after. `ps18` was
+  authored while the registry was still local-only precisely so it would fail loudly; had it
+  been written afterwards it would have been shaped to the code and a local-only registry would
+  have passed every `--shards 1` test while dropping (N-1)/N of deliveries in production.
+- [TDD · open] Assert the LEADING BYTE, not the decoded payload, for anything a client
+  frame-dispatches on. Every pre-existing pub/sub test decoded the payload and so passed
+  against Array confirmations — the bug was invisible to a suite that looked right (evidence:
+  the RESP3 divergence shipped undetected until §0's raw-socket table).
+- [ADD · open] "Runtime parity" is a distinct verification axis in this repo, not a formality.
+  Monoio 18/18 with tokio 12/18 is the recurring failure shape (four independent gaps this
+  time); every runtime-crossing task should run both legs before the gate, never just the
+  default one (evidence: this build, plus the prior monoio-intercept-order and
+  monoio-CI-coverage tasks).
+- [ADD · open] A rule restated in N places WILL drift to N behaviours. The subscriber-mode
+  allow-list existed three times with two texts and two behaviours, none matching Redis
+  (evidence: only the sharded handler accepted RESET; `handler_single` advertised HELLO as
+  allowed in its error text while refusing it).

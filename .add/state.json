@@ -254,14 +254,32 @@
     },
     "pubsub-resp3-push": {
       "title": "Pub/sub Push frames, subscriber-mode rules, and sharded pub/sub",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-09T07:32:04+00:00"
+      "updated": "2026-08-14T03:44:37+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "88473d57049216f96b018e73872204d5",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/pubsub/",
+          "src/server/conn/",
+          "src/shard/",
+          "src/command/metadata.rs",
+          "tests/pubsub_resp3_push.rs",
+          "scripts/client-compat/manifest.yaml",
+          "scripts/test-commands.sh",
+          "scripts/CHANGELOG.md"
+        ],
+        "snapshot_md5": "b2ffb350e747442adfd84718b8339e7d"
+      }
     },
     "cluster-client-bootstrap": {
       "title": "CLUSTER SHARDS, READONLY/READWRITE, and honest cluster_state",
@@ -522,7 +540,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-13T17:55:45+00:00",
+  "updated": "2026-08-14T03:44:37+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
