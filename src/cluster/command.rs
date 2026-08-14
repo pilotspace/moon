@@ -11,7 +11,7 @@ use bytes::Bytes;
 
 use crate::cluster::failover::DEFAULT_NODE_TIMEOUT_MS;
 use crate::cluster::slots::slot_for_key;
-use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
+use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeHealth, NodeRole};
 use crate::framevec;
 use crate::protocol::Frame;
 /// Entry point: dispatch CLUSTER <subcommand> [args...] to the correct handler.
@@ -107,29 +107,31 @@ fn format_node_line(node: &ClusterNode, self_node_id: &str) -> String {
     // appearing twice (once inside flags, once in the dedicated column),
     // which broke whitespace-tokenized parsers (e.g. redis-cli's own line
     // splitter). Reference: Redis CLUSTER NODES format spec.
-    let flags_str = if node.node_id == self_node_id {
-        match &node.flags {
-            NodeFlags::Master => "myself,master",
-            NodeFlags::Replica { .. } => "myself,slave",
-            NodeFlags::Pfail => "myself,pfail",
-            NodeFlags::Fail => "myself,fail",
-        }
-    } else {
-        match &node.flags {
-            NodeFlags::Master => "master",
-            NodeFlags::Replica { .. } => "slave",
-            NodeFlags::Pfail => "pfail",
-            NodeFlags::Fail => "fail",
-        }
-    };
+    // Redis's flags column is a COMMA-SEPARATED LIST combining identity, role
+    // and health — `master,fail` and `slave,fail?` are both normal. The old
+    // single `NodeFlags` enum could only ever emit one of them, so a failed
+    // master rendered as bare `fail` with its role erased. Now that role and
+    // health are separate axes, both are reported. `fail?` is Redis's spelling
+    // for PFAIL (suspected); `fail` is confirmed.
+    let mut flags_parts: Vec<&str> = Vec::with_capacity(3);
+    if node.node_id == self_node_id {
+        flags_parts.push("myself");
+    }
+    flags_parts.push(if node.is_master() { "master" } else { "slave" });
+    match node.health {
+        NodeHealth::Online => {}
+        NodeHealth::Pfail => flags_parts.push("fail?"),
+        NodeHealth::Fail => flags_parts.push("fail"),
+    }
+    let flags_str = flags_parts.join(",");
 
-    let master_id_field = match &node.flags {
-        NodeFlags::Replica { master_id } => master_id.clone(),
-        _ => "-".to_string(),
-    };
+    let master_id_field = node
+        .master_id()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     let slot_ranges = bitmap_to_ranges(&node.slots);
-    let link_state = if matches!(node.flags, NodeFlags::Fail) {
+    let link_state = if matches!(node.health, NodeHealth::Fail) {
         "disconnected"
     } else {
         "connected"
@@ -189,7 +191,7 @@ pub fn handle_cluster_replicas(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
     let lines: Vec<Frame> = state
         .nodes
         .values()
-        .filter(|n| matches!(&n.flags, NodeFlags::Replica { master_id } if master_id == &target_id))
+        .filter(|n| matches!(&n.role, NodeRole::Replica { master_id } if master_id == &target_id))
         .map(|n| Frame::BulkString(Bytes::from(format_node_line(n, &state.node_id))))
         .collect();
 
@@ -201,7 +203,7 @@ pub fn handle_cluster_slots(cs: &Arc<RwLock<ClusterState>>) -> Frame {
     let state = cs.read();
     let mut result = Vec::new();
     for node in state.nodes.values() {
-        if !matches!(node.flags, NodeFlags::Master) {
+        if !matches!(node.role, NodeRole::Master) {
             continue;
         }
         // Find contiguous ranges
@@ -283,7 +285,7 @@ pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
     // repeated MEETs for one address — or a MEET for a peer we already
     // know — must not stack a new placeholder per call.
     if !state.nodes.values().any(|n| n.addr == addr) {
-        let mut node = ClusterNode::new(peer_id.clone(), addr, NodeFlags::Master, 0);
+        let mut node = ClusterNode::new(peer_id.clone(), addr, NodeRole::Master, 0);
         // Freshness baseline: check_failure_states skips pong_recv_ms == 0
         // entries, so MEET-ing a dead address would otherwise leave an
         // entry that never goes PFAIL. The handshake replaces this
@@ -442,7 +444,7 @@ pub fn handle_cluster_replicate(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) 
     let mut state = cs.write();
     let my_id = state.node_id.clone();
     if let Some(my_node) = state.nodes.get_mut(&my_id) {
-        my_node.flags = NodeFlags::Replica { master_id };
+        my_node.role = NodeRole::Replica { master_id };
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
@@ -489,8 +491,8 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
     let mut state = cs.write();
 
     // Must be a replica to failover
-    let _master_id = match &state.my_node().flags {
-        NodeFlags::Replica { master_id } => master_id.clone(),
+    let _master_id = match &state.my_node().role {
+        NodeRole::Replica { master_id } => master_id.clone(),
         _ => {
             return Frame::Error(Bytes::from_static(
                 b"ERR CLUSTER FAILOVER can only be called on a replica node",
@@ -817,16 +819,19 @@ mod tests {
         {
             let mut state = cs.write();
             // Make self a replica
-            state.my_node_mut().flags = NodeFlags::Replica {
+            state.my_node_mut().role = NodeRole::Replica {
                 master_id: master_id.clone(),
             };
-            // Add master node as FAIL with some slots
+            // Add master node as FAIL with some slots. It stays a MASTER while
+            // failed — that pairing is the whole point of the role/health split
+            // and was inexpressible before it.
             let mut master = ClusterNode::new(
                 master_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
-                NodeFlags::Fail,
+                NodeRole::Master,
                 1,
             );
+            master.health = NodeHealth::Fail;
             for slot in 0u16..=100 {
                 master.set_slot(slot);
             }
@@ -862,7 +867,7 @@ mod tests {
         assert!(matches!(result, Frame::SimpleString(_)));
         let state = cs.read();
         assert!(
-            matches!(state.my_node().flags, NodeFlags::Master),
+            matches!(state.my_node().role, NodeRole::Master),
             "expected Master after FORCE failover"
         );
         // Should have inherited master's slots
@@ -879,7 +884,7 @@ mod tests {
         assert!(matches!(result, Frame::SimpleString(_)));
         let state = cs.read();
         assert!(
-            matches!(state.my_node().flags, NodeFlags::Master),
+            matches!(state.my_node().role, NodeRole::Master),
             "expected Master after TAKEOVER failover"
         );
         // Epoch should have been bumped (TAKEOVER +1, then check_and_initiate_failover +1)
@@ -949,7 +954,7 @@ mod tests {
             let r1 = ClusterNode::new(
                 replica1_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
-                NodeFlags::Replica {
+                NodeRole::Replica {
                     master_id: master_id.clone(),
                 },
                 0,
@@ -957,7 +962,7 @@ mod tests {
             let r2 = ClusterNode::new(
                 replica2_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6381),
-                NodeFlags::Replica {
+                NodeRole::Replica {
                     master_id: master_id.clone(),
                 },
                 0,
@@ -1145,14 +1150,14 @@ mod tests {
         {
             let mut state = cs.write();
             // Make self a replica of master_id
-            state.my_node_mut().flags = NodeFlags::Replica {
+            state.my_node_mut().role = NodeRole::Replica {
                 master_id: master_id.clone(),
             };
             // Add the master node
             let master = ClusterNode::new(
                 master_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
-                NodeFlags::Master,
+                NodeRole::Master,
                 1,
             );
             state.nodes.insert(master_id.clone(), master);

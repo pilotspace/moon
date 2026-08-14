@@ -70,6 +70,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separators, and only a non-whitespace byte (`ECHO "hi"y`) is unbalanced. The check now reads the
   same `is_inline_space` set as the rest of the splitter — the narrow/wide disagreement here was the
   milder form of the bug that made the splitter unable to advance at all.
+- **A multi-node cluster silently served keys it did not own (#485).** `CLUSTER ADDSLOTS` does not
+  bump the config epoch, so a hand-built cluster sits at epoch 0 forever. The gossip merge accepted
+  a peer's slot bitmap only at a *strictly higher* epoch — `0 > 0` is false — so peer ownership was
+  never merged and every node believed the only slots in existence were its own. `route_slot` then
+  found no owner for a peer's slot and fell through to a bootstrap fallback that serves everything
+  unclaimed locally. The result was the worst available failure mode: a write went to the wrong
+  node, returned `+OK`, and was invisible to the node that actually owned the slot — no `MOVED`, no
+  error, nothing a client could detect. The merge now accepts at equal epoch (a node is
+  authoritative for its own bitmap; a strictly *lower* epoch is still ignored, preserving Redis's
+  highest-epoch-wins tie-break), and the unclaimed-slot fallback is split: a lone node still serves
+  locally so single-node bootstrap keeps working, while a formed cluster answers
+  `CLUSTERDOWN The cluster is down` rather than inventing an answer. Direct contact with a node also
+  now clears any suspicion about it — previously nothing ever reset health, so a node that recovered
+  stayed suspected forever and its slots never counted as covered again.
+- **A node's role and its health were the same field, so learning one erased the other.**
+  `NodeFlags` had mutually exclusive `Master` / `Replica` / `Pfail` / `Fail` variants: marking a node
+  PFAIL destroyed the fact that it was a replica, and with it the `master_id` recording which shard
+  it belonged to. Redis treats these as orthogonal — a dead master is reported `role: master,
+  health: fail`, a shape the old type could not represent at all. Split into `NodeRole` + `NodeHealth`,
+  both carried together in the gossip flags word (bit 0 role, bits 1-2 health) so the wire header
+  keeps its fixed 2130-byte size; unknown health bits decode as online, so a forward-compatible peer
+  is never treated as failed by accident. `CLUSTER NODES` and `nodes.conf` now render both axes in
+  Redis's own spelling: a comma-separated list where PFAIL is **`fail?`** and confirmed FAIL is
+  `fail`, appended to the role (`master,fail?` → `master,fail`). Moon previously emitted `pfail`, a
+  token Redis never produces and no client parses.
 - **RESP3 pub/sub confirmations arrived as Arrays where Redis sends Push frames.** Moon's
   *deliveries* were already correct — `message` and `pmessage` lead with `>` — but `subscribe`,
   `unsubscribe`, `psubscribe` and `punsubscribe` were built by four functions that hardcoded

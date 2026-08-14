@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::cluster::bus::SharedVoteTx;
-use crate::cluster::{ClusterNode, ClusterState, FailoverState, NodeFlags};
+use crate::cluster::{ClusterNode, ClusterState, FailoverState, NodeHealth, NodeRole};
 
 pub const GOSSIP_MAGIC: u32 = 0x52656469; // "Redi"
 pub const GOSSIP_VERSION: u16 = 1;
@@ -41,6 +41,38 @@ impl GossipMsgType {
             _ => None,
         }
     }
+}
+
+/// Pack role + health into the gossip `flags` word.
+///
+/// bit 0   : 0 = master, 1 = replica
+/// bits 1-2: 0 = online, 1 = pfail, 2 = fail
+///
+/// Both axes travel together; the previous scheme could express only one, so a
+/// PFAIL rumor about a replica erased the fact that it was a replica.
+pub fn gossip_flags(role: &crate::cluster::NodeRole, health: crate::cluster::NodeHealth) -> u16 {
+    let role_bit = match role {
+        crate::cluster::NodeRole::Master => 0u16,
+        crate::cluster::NodeRole::Replica { .. } => 1,
+    };
+    let health_bits = match health {
+        crate::cluster::NodeHealth::Online => 0u16,
+        crate::cluster::NodeHealth::Pfail => 1,
+        crate::cluster::NodeHealth::Fail => 2,
+    };
+    role_bit | (health_bits << 1)
+}
+
+/// Unpack the gossip `flags` word. Unknown health bits read as Online — a
+/// forward-compatible peer must never be treated as failed by accident.
+pub fn parse_gossip_flags(flags: u16) -> (bool, crate::cluster::NodeHealth) {
+    let is_replica = flags & 1 != 0;
+    let health = match (flags >> 1) & 0b11 {
+        1 => crate::cluster::NodeHealth::Pfail,
+        2 => crate::cluster::NodeHealth::Fail,
+        _ => crate::cluster::NodeHealth::Online,
+    };
+    (is_replica, health)
 }
 
 /// Rumor section about a peer node included in a PING/PONG.
@@ -229,12 +261,12 @@ pub fn build_message(
             let mut node_id_bytes = [0u8; 40];
             let nb = n.node_id.as_bytes();
             node_id_bytes[..nb.len().min(40)].copy_from_slice(&nb[..nb.len().min(40)]);
-            let flags_val = match &n.flags {
-                NodeFlags::Master => 0u16,
-                NodeFlags::Replica { .. } => 1,
-                NodeFlags::Pfail => 2,
-                NodeFlags::Fail => 3,
-            };
+            // Two orthogonal axes packed into the existing u16, so the wire
+            // header keeps its fixed 2130-byte size: bit 0 is the role, bits
+            // 1-2 the health. The old encoding (0=master 1=replica 2=pfail
+            // 3=fail) could only carry ONE of them, so gossiping a failed
+            // master told the receiver nothing about its role.
+            let flags_val = gossip_flags(&n.role, n.health);
             GossipSection {
                 node_id: node_id_bytes,
                 ip: encode_ip(&n.addr),
@@ -286,12 +318,32 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
         ClusterNode::new(
             node_id_str.clone(),
             sender_addr,
-            NodeFlags::Master,
+            NodeRole::Master,
             msg.config_epoch,
         )
     });
     entry.pong_recv_ms = now_ms();
-    if msg.config_epoch > entry.epoch {
+
+    // We just heard from this node DIRECTLY, so any suspicion about it is
+    // stale. Nothing else clears health: `check_failure_states` only ever sets
+    // PFAIL, so without this a node that recovered stayed suspected forever and
+    // its slots never counted as covered again.
+    entry.health = crate::cluster::NodeHealth::Online;
+    entry.pfail_reports.clear();
+
+    // A node is AUTHORITATIVE for its own slot bitmap at EQUAL epoch, not only
+    // at a strictly higher one.
+    //
+    // The `>` here was the root cause of #485: `CLUSTER ADDSLOTS` never bumps
+    // the config epoch, so a hand-built cluster sits at epoch 0 forever,
+    // `0 > 0` is false, and peer ownership NEVER merged. Every node then
+    // believed it owned everything it had been given and nothing else existed,
+    // so `route_slot` found no owner for a peer's slot and served the key
+    // locally — a write accepted by the wrong node, invisible to the right one.
+    //
+    // A strictly LOWER epoch is still ignored, which preserves Redis's
+    // "highest epoch wins" tie-break for genuinely conflicting claims.
+    if msg.config_epoch >= entry.epoch {
         entry.epoch = msg.config_epoch;
         entry.slots = msg.sender_slots.clone();
     }
@@ -315,7 +367,7 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
     // learn about EACH OTHER and the mesh cannot complete.
     let my_addr = state.nodes.get(&self_id).map(|n| n.addr);
     for section in &msg.gossip_sections {
-        let section_flags = section.flags;
+        let (_rumor_is_replica, rumor_health) = parse_gossip_flags(section.flags);
         let target_node_id = std::str::from_utf8(&section.node_id)
             .unwrap_or("")
             .trim_end_matches('\0')
@@ -323,7 +375,11 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
         if target_node_id.is_empty() || target_node_id == state.node_id {
             continue;
         }
-        if section_flags == 2 || section_flags == 3 {
+        // Any non-Online rumor feeds the PFAIL consensus. Read through
+        // `parse_gossip_flags` rather than comparing the raw word: the flags
+        // now pack role AND health, so the old `== 2 || == 3` test would read a
+        // suspected REPLICA (0b011) as a confirmed failure.
+        if rumor_health != crate::cluster::NodeHealth::Online {
             let reporter_id = node_id_str.clone();
             let now = now_ms();
 
@@ -359,7 +415,7 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
             let mut node = ClusterNode::new(
                 target_node_id.clone(),
                 addr,
-                NodeFlags::Master,
+                NodeRole::Master,
                 section.epoch,
             );
             node.bus_port = section.bus_port;
@@ -387,13 +443,13 @@ pub fn check_failure_states(state: &mut ClusterState, node_timeout_ms: u64) {
         }
         if node.pong_recv_ms > 0
             && now.saturating_sub(node.pong_recv_ms) > node_timeout_ms
-            && !matches!(node.flags, NodeFlags::Fail | NodeFlags::Pfail)
+            && !matches!(node.health, NodeHealth::Fail | NodeHealth::Pfail)
         {
             warn!(
                 "Node {} not heard from in {}ms, marking PFAIL",
                 node.node_id, node_timeout_ms
             );
-            node.flags = NodeFlags::Pfail;
+            node.health = NodeHealth::Pfail;
         }
     }
 }
@@ -434,10 +490,10 @@ pub async fn run_gossip_ticker(
 
                     // Check if we should initiate failover (replica with FAIL master)
                     if !election_spawned {
-                        let my_flags = cs.my_node().flags.clone();
-                        if let NodeFlags::Replica { ref master_id } = my_flags {
+                        let my_flags = cs.my_node().role.clone();
+                        if let NodeRole::Replica { ref master_id } = my_flags {
                             let master_is_fail = cs.nodes.get(master_id)
-                                .map(|n| matches!(n.flags, NodeFlags::Fail))
+                                .map(|n| matches!(n.health, NodeHealth::Fail))
                                 .unwrap_or(false);
                             if master_is_fail && cs.failover_state == FailoverState::None {
                                 election_spawned = true;
@@ -583,7 +639,7 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
         state.nodes.insert(
             id40(b'p'),
-            ClusterNode::new(id40(b'p'), peer_addr, NodeFlags::Master, 0),
+            ClusterNode::new(id40(b'p'), peer_addr, NodeRole::Master, 0),
         );
         assert_eq!(state.nodes.len(), 2);
 

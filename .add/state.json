@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "monitor-command-feed",
+  "active_task": "cluster-client-bootstrap",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -283,14 +283,33 @@
     },
     "cluster-client-bootstrap": {
       "title": "CLUSTER SHARDS, READONLY/READWRITE, and honest cluster_state",
-      "phase": "ground",
+      "phase": "build",
       "gate": "none",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-09T07:32:04+00:00"
+      "updated": "2026-08-14T11:41:55+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "b1734c1bb104b9d9e339ff2b3b1e02d8",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/cluster/",
+          "src/command/connection.rs",
+          "src/command/metadata.rs",
+          "src/server/conn/",
+          "src/acl/rules.rs",
+          "tests/cluster_client_bootstrap.rs",
+          "scripts/client-compat/manifest.yaml",
+          "CHANGELOG.md",
+          "tmp/"
+        ],
+        "snapshot_md5": "095623ddf9de3aaf8bcf6959c4ccba38"
+      }
     },
     "info-observability": {
       "title": "INFO sections/fields, keyspace notifications, protocol-error replies",
@@ -575,7 +594,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-14T06:47:34+00:00",
+  "updated": "2026-08-14T11:41:55+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

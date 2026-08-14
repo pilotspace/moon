@@ -21,10 +21,24 @@ use slots::{ask_error_msg, moved_error_msg};
 
 // --- Node flags ------------------------------------------------------------------
 
+/// What a node IS. Independent of whether it is reachable.
 #[derive(Clone, Debug, PartialEq)]
-pub enum NodeFlags {
+pub enum NodeRole {
     Master,
     Replica { master_id: String },
+}
+
+/// How a node is DOING. Independent of what it is.
+///
+/// Split out of the old single `NodeFlags` enum, whose `Master` / `Replica` /
+/// `Pfail` / `Fail` variants were mutually exclusive: marking a node PFAIL
+/// destroyed its role, and for a replica destroyed the `master_id` saying which
+/// shard it belongs to. Redis treats these as orthogonal, which is why a dead
+/// master is reported as `role: master, health: fail` — a shape the old type
+/// could not express at all. Measured against redis-server 8.6.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeHealth {
+    Online,
     Pfail,
     Fail,
 }
@@ -48,7 +62,10 @@ pub struct ClusterNode {
     pub addr: SocketAddr,
     /// Cluster bus port = addr.port() + 10000.
     pub bus_port: u16,
-    pub flags: NodeFlags,
+    /// What this node is. Survives every health transition.
+    pub role: NodeRole,
+    /// How this node is doing. Survives every role transition.
+    pub health: NodeHealth,
     /// Config epoch for this node's slot assignment.
     pub epoch: u64,
     /// Unix millis when we last sent PING to this node.
@@ -64,7 +81,7 @@ pub struct ClusterNode {
 }
 
 impl ClusterNode {
-    pub fn new(node_id: String, addr: SocketAddr, flags: NodeFlags, epoch: u64) -> Self {
+    pub fn new(node_id: String, addr: SocketAddr, role: NodeRole, epoch: u64) -> Self {
         // Redis convention: bus_port = port + 10000. Guard overflow for test
         // servers on ephemeral ports (49152-65535) where port + 10000 > u16::MAX.
         let bus_port = addr.port().checked_add(10000).unwrap_or_else(|| {
@@ -87,13 +104,42 @@ impl ClusterNode {
             node_id,
             addr,
             bus_port,
-            flags,
+            role,
+            health: NodeHealth::Online,
             epoch,
             ping_sent_ms: 0,
             pong_recv_ms: 0,
             slots: Box::new([0u8; 2048]),
             pfail_reports: HashMap::new(),
         }
+    }
+
+    /// Is this node a master? Unaffected by health, unlike the old flags enum.
+    #[inline]
+    pub fn is_master(&self) -> bool {
+        matches!(self.role, NodeRole::Master)
+    }
+
+    /// The master this node follows, if it is a replica.
+    #[inline]
+    pub fn master_id(&self) -> Option<&str> {
+        match &self.role {
+            NodeRole::Replica { master_id } => Some(master_id.as_str()),
+            NodeRole::Master => None,
+        }
+    }
+
+    /// Confirmed failed. `Pfail` is a suspicion and deliberately does NOT
+    /// count here — only consensus promotes it.
+    #[inline]
+    pub fn is_failed(&self) -> bool {
+        self.health == NodeHealth::Fail
+    }
+
+    /// Suspected or confirmed down — i.e. not serving.
+    #[inline]
+    pub fn is_down(&self) -> bool {
+        matches!(self.health, NodeHealth::Pfail | NodeHealth::Fail)
     }
 
     #[inline]
@@ -136,6 +182,10 @@ pub enum SlotRoute {
     Ask { host: String, port: u16 },
     /// Multi-key command with keys spanning different slots.
     CrossSlot,
+    /// No node in a FORMED cluster claims this slot, so there is nobody to
+    /// redirect to and nobody who can answer. Serving it locally would hand the
+    /// client a partial view of the keyspace it cannot detect.
+    Down,
 }
 
 impl SlotRoute {
@@ -151,6 +201,7 @@ impl SlotRoute {
             SlotRoute::CrossSlot => Frame::Error(Bytes::from_static(
                 b"CROSSSLOT Keys in request don't hash to the same slot",
             )),
+            SlotRoute::Down => Frame::Error(Bytes::from_static(b"CLUSTERDOWN The cluster is down")),
             SlotRoute::Local => unreachable!("Local routes do not produce error frames"),
         }
     }
@@ -218,7 +269,7 @@ impl ClusterState {
             last_vote_epoch: 0,
             failover_state: FailoverState::None,
         };
-        let self_node = ClusterNode::new(node_id.clone(), self_addr, NodeFlags::Master, 0);
+        let self_node = ClusterNode::new(node_id.clone(), self_addr, NodeRole::Master, 0);
         state.nodes.insert(node_id, self_node);
         state
     }
@@ -274,8 +325,19 @@ impl ClusterState {
             };
         }
 
-        // Unconfigured slot -- treat as local (single-node setup / initial bootstrap).
-        SlotRoute::Local
+        // Nobody claims this slot.
+        //
+        // For a LONE node this is the bootstrap case: a single server with
+        // cluster mode on and no slots assigned must still serve, or it is
+        // useless until someone runs ADDSLOTS. For a FORMED cluster it is a
+        // coverage hole, and serving locally is what produced #485 — a write
+        // accepted by a node that does not own the slot, invisible to the node
+        // that does, with no error to tell the client.
+        if self.nodes.len() <= 1 {
+            SlotRoute::Local
+        } else {
+            SlotRoute::Down
+        }
     }
 
     /// How many slots total are assigned to any node in this cluster.
@@ -293,7 +355,7 @@ impl ClusterState {
     pub fn master_count(&self) -> usize {
         self.nodes
             .values()
-            .filter(|n| matches!(n.flags, NodeFlags::Master))
+            .filter(|n| matches!(n.role, NodeRole::Master))
             .count()
     }
 }
@@ -325,7 +387,7 @@ mod tests {
         let peer_id = "b".repeat(40);
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
 
-        let mut peer = ClusterNode::new(peer_id.clone(), test_addr(6380), NodeFlags::Master, 0);
+        let mut peer = ClusterNode::new(peer_id.clone(), test_addr(6380), NodeRole::Master, 0);
         // Peer owns slots 8193-16383
         for slot in 8193..=16383u16 {
             peer.set_slot(slot);
@@ -343,7 +405,7 @@ mod tests {
     #[test]
     fn test_owns_slot_bitmap() {
         let addr = test_addr(6379);
-        let mut node = ClusterNode::new("a".repeat(40), addr, NodeFlags::Master, 0);
+        let mut node = ClusterNode::new("a".repeat(40), addr, NodeRole::Master, 0);
         assert!(!node.owns_slot(0));
         node.set_slot(0);
         assert!(node.owns_slot(0));

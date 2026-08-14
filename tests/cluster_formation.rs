@@ -288,7 +288,7 @@ fn occupied_bus_port_aborts_startup() {
 }
 
 /// Failure detection through the control plane: killing one node of a formed
-/// 3-node cluster must get it flagged (pfail) by both survivors within the
+/// 3-node cluster must get it flagged (`fail?`/`fail`) by both survivors within the
 /// node timeout. Hard FAIL needs quorum ≥ 2 EXTERNAL reporters, which two
 /// survivors of three masters cannot reach — full FAIL/election e2e lands
 /// with C-3's replica legs.
@@ -306,8 +306,11 @@ fn killed_node_is_flagged_by_survivors() {
     common::sigkill(&mut fleet.0[2]);
 
     // node_timeout is 3s and gossip ticks every 100ms; poll each survivor's
-    // CLUSTER NODES for the victim's flags token to become pfail (or fail,
-    // should quorum semantics ever start counting the local observation).
+    // CLUSTER NODES for the victim's flags token to become `fail?` (PFAIL) or
+    // `fail` (FAIL, once quorum confirms). Those two spellings are Redis's own,
+    // measured against redis-server 3-node cluster + SHUTDOWN NOSAVE 2026-08:
+    // the victim's flags column went `master` -> `master,fail?` -> `master,fail`.
+    // Moon previously rendered PFAIL as `pfail`, which no real client parses.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     'outer: loop {
         let mut flagged = 0;
@@ -318,7 +321,7 @@ fn killed_node_is_flagged_by_survivors() {
                 .find(|l| l.starts_with(&victim_id))
                 .and_then(|l| l.split_whitespace().nth(2))
                 .unwrap_or("");
-            if flags.split(',').any(|f| f == "pfail" || f == "fail") {
+            if flags.split(',').any(|f| f == "fail?" || f == "fail") {
                 flagged += 1;
             }
         }
@@ -327,7 +330,7 @@ fn killed_node_is_flagged_by_survivors() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "survivors never flagged the killed node ({flagged}/2 saw pfail/fail)"
+            "survivors never flagged the killed node ({flagged}/2 saw fail?/fail)"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
