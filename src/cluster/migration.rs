@@ -300,6 +300,84 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from("nodes.conf")]);
     }
 
+    /// nodes.conf must round-trip BOTH axes for every combination, not just a
+    /// healthy master.
+    ///
+    /// The flags column is one comma-separated string parsed by substring, and
+    /// `"fail?"` CONTAINS `"fail"` — so testing them in the wrong order silently
+    /// reloads every PFAIL node as confirmed FAIL. The existing round-trip test
+    /// covers a healthy master only, which is exactly the shape that lets that
+    /// bug through: the ordering is correct today and nothing pinned it.
+    #[test]
+    fn test_nodes_conf_roundtrips_role_and_health_independently() {
+        let my_id = "a".repeat(40);
+        let master_id = "m".repeat(40);
+
+        // Every role x health pairing, including the ones the old single enum
+        // could not represent at all (a failed node that is still a master).
+        let cases: Vec<(&str, NodeRole, NodeHealth)> = vec![
+            ("master-online", NodeRole::Master, NodeHealth::Online),
+            ("master-pfail", NodeRole::Master, NodeHealth::Pfail),
+            ("master-fail", NodeRole::Master, NodeHealth::Fail),
+            (
+                "replica-online",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Online,
+            ),
+            (
+                "replica-pfail",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Pfail,
+            ),
+            (
+                "replica-fail",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Fail,
+            ),
+        ];
+
+        for (label, role, health) in cases {
+            let tmp = TempDir::new().unwrap();
+            let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
+            let peer_id = "p".repeat(40);
+            let mut peer =
+                crate::cluster::ClusterNode::new(peer_id.clone(), test_addr(6380), role.clone(), 3);
+            peer.health = health;
+            peer.set_slot(42);
+            state.nodes.insert(peer_id.clone(), peer);
+
+            save_nodes_conf(&state, tmp.path()).unwrap();
+
+            let mut fresh = ClusterState::new("z".repeat(40), test_addr(6381));
+            load_nodes_conf(&mut fresh, tmp.path()).unwrap();
+            let loaded = fresh
+                .nodes
+                .get(&peer_id)
+                .unwrap_or_else(|| panic!("{label}: peer not reloaded"));
+
+            assert_eq!(loaded.health, health, "{label}: health did not survive");
+            assert_eq!(
+                loaded.is_master(),
+                matches!(role, NodeRole::Master),
+                "{label}: role did not survive"
+            );
+            if let NodeRole::Replica { .. } = role {
+                assert_eq!(
+                    loaded.master_id(),
+                    Some(master_id.as_str()),
+                    "{label}: a replica that forgets its master cannot be grouped into a shard"
+                );
+            }
+            assert!(loaded.owns_slot(42), "{label}: slots did not survive");
+        }
+    }
+
     /// handle_get_keys_in_slot returns matching keys only.
     #[test]
     fn test_get_keys_in_slot_filters_correctly() {
