@@ -122,6 +122,48 @@ pub(crate) fn unpropagate_subscription(
     }
 }
 
+/// Propagate a SHARDED (`SSUBSCRIBE`) subscription to every remote shard's map.
+///
+/// Separate from [`propagate_subscription`] rather than a third bool on it: the
+/// sharded namespace is a different destination, and a bool that silently
+/// selects between three maps is the kind of parameter call sites get wrong.
+pub(crate) fn propagate_shard_subscription(
+    all_remote_sub_maps: &[std::sync::Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >],
+    channel: &Bytes,
+    shard_id: usize,
+    num_shards: usize,
+) {
+    for target in 0..num_shards {
+        if target == shard_id {
+            continue;
+        }
+        all_remote_sub_maps[target]
+            .write()
+            .add_shard_channel(channel.clone(), shard_id);
+    }
+}
+
+/// Remove a SHARDED subscription from every remote shard's map.
+pub(crate) fn unpropagate_shard_subscription(
+    all_remote_sub_maps: &[std::sync::Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >],
+    channel: &Bytes,
+    shard_id: usize,
+    num_shards: usize,
+) {
+    for target in 0..num_shards {
+        if target == shard_id {
+            continue;
+        }
+        all_remote_sub_maps[target]
+            .write()
+            .remove_shard_channel(channel, shard_id);
+    }
+}
+
 /// Post-batch capacity governor for the per-connection batch scratch vectors
 /// (c10k W1). `responses`/`frames` are cleared and reused across batches; one
 /// deep pipeline grows them to the 1024-frame batch cap (~74 KB each at

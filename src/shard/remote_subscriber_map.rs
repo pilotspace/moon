@@ -16,6 +16,10 @@ pub struct RemoteSubscriberMap {
     channels: HashMap<Bytes, HashSet<usize>>,
     /// pattern -> set of shard IDs that have at least one pattern subscriber
     patterns: HashMap<Bytes, HashSet<usize>>,
+    /// sharded channel -> set of shard IDs with at least one `SSUBSCRIBE`
+    /// subscriber. Separate from `channels`: the two namespaces may share a
+    /// channel NAME while being different destinations.
+    shard_channels: HashMap<Bytes, HashSet<usize>>,
 }
 
 impl RemoteSubscriberMap {
@@ -88,6 +92,42 @@ impl RemoteSubscriberMap {
             }
         }
         result.into_vec()
+    }
+
+    // ── Sharded pub/sub ─────────────────────────────────────────────────
+    //
+    // A third map, kept apart from `channels` for the same reason the
+    // registry keeps its sharded subscribers apart: a sharded channel and a
+    // plain channel may share a NAME while being different destinations. One
+    // map keyed by name would fan a plain PUBLISH out to shards that only hold
+    // sharded subscribers, and vice versa.
+
+    /// Record that `shard_id` has a SHARDED subscriber for `channel`.
+    pub fn add_shard_channel(&mut self, channel: Bytes, shard_id: usize) {
+        self.shard_channels
+            .entry(channel)
+            .or_default()
+            .insert(shard_id);
+    }
+
+    /// Remove `shard_id` from sharded subscribers for `channel`.
+    pub fn remove_shard_channel(&mut self, channel: &[u8], shard_id: usize) {
+        if let Some(shards) = self.shard_channels.get_mut(channel) {
+            shards.remove(&shard_id);
+            if shards.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+    }
+
+    /// Shard IDs that should receive an `SPUBLISH` for `channel`.
+    ///
+    /// No pattern leg: `PSUBSCRIBE` does not match sharded channels in Redis.
+    pub fn shard_target_shards(&self, channel: &[u8]) -> Vec<usize> {
+        self.shard_channels
+            .get(channel)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 

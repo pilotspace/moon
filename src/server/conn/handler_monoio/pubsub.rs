@@ -19,15 +19,20 @@ pub(super) fn try_handle_publish(
     conn: &ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
-    publish_batches: &mut std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>>,
+    publish_batches: &mut std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes, bool)>>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"PUBLISH") {
+    // SPUBLISH shares this handler: same arity, same ACL checks, same batched
+    // fan-out. Only the DESTINATION differs, and that is carried by `sharded`
+    // all the way to the target shard's registry.
+    let sharded = cmd.eq_ignore_ascii_case(b"SPUBLISH");
+    if !sharded && !cmd.eq_ignore_ascii_case(b"PUBLISH") {
         return false;
     }
     if cmd_args.len() != 2 {
-        responses.push(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'publish' command",
-        )));
+        responses.push(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            if sharded { "spublish" } else { "publish" }
+        ))));
         return true;
     }
     let channel = extract_bytes(&cmd_args[0]);
@@ -57,9 +62,19 @@ pub(super) fn try_handle_publish(
     }
     match (channel, message) {
         (Some(ch), Some(msg)) => {
-            let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, &ch, &msg);
-            // Targeted fanout: only send to shards that have subscribers
-            let targets = ctx.remote_subscriber_map.read().target_shards(&ch);
+            let local_count = if sharded {
+                crate::pubsub::spublish_shared(&ctx.pubsub_registry, &ch, &msg)
+            } else {
+                crate::pubsub::publish_shared(&ctx.pubsub_registry, &ch, &msg)
+            };
+            // Targeted fanout: only send to shards that have subscribers. The
+            // sharded lookup is a DIFFERENT map — a plain channel and a
+            // sharded one may share a name without sharing subscribers.
+            let targets = if sharded {
+                ctx.remote_subscriber_map.read().shard_target_shards(&ch)
+            } else {
+                ctx.remote_subscriber_map.read().target_shards(&ch)
+            };
             if targets.is_empty() {
                 // Fast path: no remote subscribers
                 responses.push(Frame::Integer(local_count));
@@ -77,6 +92,7 @@ pub(super) fn try_handle_publish(
                             resp_idx,
                             ch.clone(),
                             msg.clone(),
+                            sharded,
                         ));
                     }
                 }
@@ -137,12 +153,18 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     write_buf: &mut bytes::BytesMut,
     stream: &mut S,
 ) -> SubscribeResult {
-    if !cmd.eq_ignore_ascii_case(b"SUBSCRIBE") && !cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+    let is_sharded = cmd.eq_ignore_ascii_case(b"SSUBSCRIBE");
+    if !is_sharded
+        && !cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+        && !cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+    {
         return SubscribeResult::NotSubscribe;
     }
     let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
     if cmd_args.is_empty() {
-        let cmd_name = if is_pattern {
+        let cmd_name = if is_sharded {
+            "ssubscribe"
+        } else if is_pattern {
             "psubscribe"
         } else {
             "subscribe"
@@ -216,18 +238,28 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
                 conn.subscriber_id,
                 conn.protocol_version >= 3,
             );
-            if is_pattern {
-                ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
+            if is_sharded {
+                ctx.pubsub_registry.write().ssubscribe(ch.clone(), sub);
+                super::propagate_shard_subscription(
+                    &ctx.all_remote_sub_maps,
+                    &ch,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                );
             } else {
-                ctx.pubsub_registry.write().subscribe(ch.clone(), sub);
+                if is_pattern {
+                    ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
+                } else {
+                    ctx.pubsub_registry.write().subscribe(ch.clone(), sub);
+                }
+                super::propagate_subscription(
+                    &ctx.all_remote_sub_maps,
+                    &ch,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    is_pattern,
+                );
             }
-            super::propagate_subscription(
-                &ctx.all_remote_sub_maps,
-                &ch,
-                ctx.shard_id,
-                ctx.num_shards,
-                is_pattern,
-            );
             conn.subscription_count += 1;
             // Register pub/sub affinity for this client IP
             if conn.subscription_count == 1 {
@@ -237,7 +269,9 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
                         .register(addr.ip(), ctx.shard_id);
                 }
             }
-            let resp = if is_pattern {
+            let resp = if is_sharded {
+                crate::pubsub::ssubscribe_response(&ch, conn.subscription_count)
+            } else if is_pattern {
                 crate::pubsub::psubscribe_response(&ch, conn.subscription_count)
             } else {
                 crate::pubsub::subscribe_response(&ch, conn.subscription_count)
@@ -306,6 +340,41 @@ pub(super) fn try_handle_pubsub_introspection(
                 }
             }
             let mut arr = Vec::with_capacity(channels.len() * 2);
+            for ch in &channels {
+                arr.push(Frame::BulkString(ch.clone()));
+                arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));
+            }
+            responses.push(Frame::Array(arr.into()));
+        }
+        Some(ref sc) if sc.eq_ignore_ascii_case(b"SHARDCHANNELS") => {
+            // The SHARDED namespace only. `PUBSUB CHANNELS` must not list
+            // these and this must not list plain ones — they are separate
+            // maps, so the separation is structural rather than a filter.
+            let pattern = if cmd_args.len() > 1 {
+                extract_bytes(&cmd_args[1])
+            } else {
+                None
+            };
+            let mut all: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+            for reg in &ctx.all_pubsub_registries {
+                all.extend(reg.read().active_shard_channels(pattern.as_deref()));
+            }
+            let arr: Vec<Frame> = all.into_iter().map(Frame::BulkString).collect();
+            responses.push(Frame::Array(arr.into()));
+        }
+        Some(ref sc) if sc.eq_ignore_ascii_case(b"SHARDNUMSUB") => {
+            let channels: Vec<Bytes> = cmd_args[1..]
+                .iter()
+                .filter_map(|a| extract_bytes(a))
+                .collect();
+            let mut counts: std::collections::HashMap<Bytes, i64> =
+                std::collections::HashMap::new();
+            for reg in &ctx.all_pubsub_registries {
+                for (ch, n) in reg.read().shard_numsub(&channels) {
+                    *counts.entry(ch).or_insert(0) += n;
+                }
+            }
+            let mut arr: Vec<Frame> = Vec::with_capacity(channels.len() * 2);
             for ch in &channels {
                 arr.push(Frame::BulkString(ch.clone()));
                 arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));

@@ -10,8 +10,25 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::{
-    extract_bytes, extract_command, propagate_subscription, unpropagate_subscription,
+    extract_bytes, extract_command, propagate_shard_subscription, propagate_subscription,
+    unpropagate_shard_subscription, unpropagate_subscription,
 };
+
+/// Serialize with the CONNECTION's protocol, not RESP2 unconditionally.
+///
+/// This file wrote every pub/sub frame through `protocol::serialize`, which
+/// downgrades `Frame::Push` to an Array — so a RESP3 client got `*` where it
+/// expected `>` even after the confirmation builders were fixed. The codec
+/// makes this same choice for ordinary replies; the direct writes here have to
+/// make it too.
+#[inline]
+fn ser(conn: &ConnectionState, frame: &Frame, buf: &mut bytes::BytesMut) {
+    if conn.protocol_version >= 3 {
+        crate::protocol::serialize_resp3(frame, buf);
+    } else {
+        crate::protocol::serialize(frame, buf);
+    }
+}
 
 /// Signal from subscriber-mode or subscribe-entry helpers to the outer loop.
 pub(super) enum SubscriberAction {
@@ -79,7 +96,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 if cmd_args.is_empty() {
                                     let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
                                     write_buf.clear();
-                                    crate::protocol::serialize(&err, write_buf);
+                                    ser(conn, &err, write_buf);
                                     if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     continue;
                                 }
@@ -90,7 +107,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                         if let Some(reason) = acl_deny {
                                             let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                             write_buf.clear();
-                                            crate::protocol::serialize(&err, write_buf);
+                                            ser(conn, &err, write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                             continue;
                                         }
@@ -111,7 +128,64 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                         propagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
                                         write_buf.clear();
                                         let resp = pubsub::subscribe_response(&ch, conn.subscription_count);
-                                        crate::protocol::serialize(&resp, write_buf);
+                                        ser(conn, &resp, write_buf);
+                                        if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
+                                    }
+                                }
+                            } else if cmd.eq_ignore_ascii_case(b"SSUBSCRIBE") {
+                                // On Redis's subscriber-mode allow-list, so it
+                                // must be SERVED here, not refused.
+                                if cmd_args.is_empty() {
+                                    let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'ssubscribe' command"));
+                                    write_buf.clear();
+                                    ser(conn, &err, write_buf);
+                                    if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
+                                    continue;
+                                }
+                                for arg in cmd_args {
+                                    if let Some(ch) = extract_bytes(arg) {
+                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+                                        let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, ch.as_ref()) };
+                                        if let Some(reason) = acl_deny {
+                                            let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                            write_buf.clear();
+                                            ser(conn, &err, write_buf);
+                                            if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
+                                            continue;
+                                        }
+                                        #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                        let sub = Subscriber::with_protocol(
+                                            conn.pubsub_tx.clone().unwrap(),
+                                            conn.subscriber_id,
+                                            conn.protocol_version >= 3,
+                                        );
+                                        { ctx.pubsub_registry.write().ssubscribe(ch.clone(), sub); }
+                                        conn.subscription_count += 1;
+                                        propagate_shard_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards);
+                                        write_buf.clear();
+                                        let resp = pubsub::ssubscribe_response(&ch, conn.subscription_count);
+                                        ser(conn, &resp, write_buf);
+                                        if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
+                                    }
+                                }
+                            } else if cmd.eq_ignore_ascii_case(b"SUNSUBSCRIBE") {
+                                let targets: Vec<Bytes> = if cmd_args.is_empty() {
+                                    ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id)
+                                } else {
+                                    cmd_args.iter().filter_map(extract_bytes).collect()
+                                };
+                                if targets.is_empty() {
+                                    conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
+                                    write_buf.clear();
+                                    ser(conn, &pubsub::sunsubscribe_none_response(conn.subscription_count), write_buf);
+                                    if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
+                                } else {
+                                    for ch in &targets {
+                                        { ctx.pubsub_registry.write().sunsubscribe(ch.as_ref(), conn.subscriber_id); }
+                                        unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
+                                        conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                        write_buf.clear();
+                                        ser(conn, &pubsub::sunsubscribe_response(ch, conn.subscription_count), write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     }
                                 }
@@ -119,7 +193,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 if cmd_args.is_empty() {
                                     let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"));
                                     write_buf.clear();
-                                    crate::protocol::serialize(&err, write_buf);
+                                    ser(conn, &err, write_buf);
                                     if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     continue;
                                 }
@@ -130,7 +204,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                         if let Some(reason) = acl_deny {
                                             let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                             write_buf.clear();
-                                            crate::protocol::serialize(&err, write_buf);
+                                            ser(conn, &err, write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                             continue;
                                         }
@@ -151,7 +225,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                         propagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
                                         write_buf.clear();
                                         let resp = pubsub::psubscribe_response(&pat, conn.subscription_count);
-                                        crate::protocol::serialize(&resp, write_buf);
+                                        ser(conn, &resp, write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     }
                                 }
@@ -161,14 +235,14 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     if removed.is_empty() {
                                         conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                         write_buf.clear();
-                                        crate::protocol::serialize(&pubsub::unsubscribe_none_response(conn.subscription_count), write_buf);
+                                        ser(conn, &pubsub::unsubscribe_none_response(conn.subscription_count), write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     } else {
                                         for ch in &removed {
                                             conn.subscription_count = conn.subscription_count.saturating_sub(1);
                                             unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
                                             write_buf.clear();
-                                            crate::protocol::serialize(&pubsub::unsubscribe_response(ch, conn.subscription_count), write_buf);
+                                            ser(conn, &pubsub::unsubscribe_response(ch, conn.subscription_count), write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                         }
                                     }
@@ -179,7 +253,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                             conn.subscription_count = conn.subscription_count.saturating_sub(1);
                                             unpropagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
                                             write_buf.clear();
-                                            crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, conn.subscription_count), write_buf);
+                                            ser(conn, &pubsub::unsubscribe_response(&ch, conn.subscription_count), write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                         }
                                     }
@@ -190,14 +264,14 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     if removed.is_empty() {
                                         conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                         write_buf.clear();
-                                        crate::protocol::serialize(&pubsub::punsubscribe_none_response(conn.subscription_count), write_buf);
+                                        ser(conn, &pubsub::punsubscribe_none_response(conn.subscription_count), write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     } else {
                                         for pat in &removed {
                                             conn.subscription_count = conn.subscription_count.saturating_sub(1);
                                             unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
                                             write_buf.clear();
-                                            crate::protocol::serialize(&pubsub::punsubscribe_response(pat, conn.subscription_count), write_buf);
+                                            ser(conn, &pubsub::punsubscribe_response(pat, conn.subscription_count), write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                         }
                                     }
@@ -208,7 +282,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                             conn.subscription_count = conn.subscription_count.saturating_sub(1);
                                             unpropagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
                                             write_buf.clear();
-                                            crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, conn.subscription_count), write_buf);
+                                            ser(conn, &pubsub::punsubscribe_response(&pat, conn.subscription_count), write_buf);
                                             if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                         }
                                     }
@@ -219,11 +293,11 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     Frame::BulkString(Bytes::from_static(b"pong")),
                                     Frame::BulkString(Bytes::from_static(b"")),
                                 ]);
-                                crate::protocol::serialize(&resp, write_buf);
+                                ser(conn, &resp, write_buf);
                                 if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                             } else if cmd.eq_ignore_ascii_case(b"QUIT") {
                                 write_buf.clear();
-                                crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"OK")), write_buf);
+                                ser(conn, &Frame::SimpleString(Bytes::from_static(b"OK")), write_buf);
                                 let _ = stream.write_all(write_buf).await;
                                 sub_break = true;
                                 break;
@@ -232,7 +306,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id); }
                                 conn.subscription_count = 0;
                                 write_buf.clear();
-                                crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"RESET")), write_buf);
+                                ser(conn, &Frame::SimpleString(Bytes::from_static(b"RESET")), write_buf);
                                 if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                             } else {
                                 let cmd_str = String::from_utf8_lossy(cmd);
@@ -241,7 +315,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     cmd_str.to_lowercase()
                                 )));
                                 write_buf.clear();
-                                crate::protocol::serialize(&err, write_buf);
+                                ser(conn, &err, write_buf);
                                 if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                             }
                         }
@@ -281,7 +355,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
         }
         _ = shutdown.cancelled() => {
             write_buf.clear();
-            crate::protocol::serialize(&Frame::Error(Bytes::from_static(b"ERR server shutting down")), write_buf);
+            ser(conn, &Frame::Error(Bytes::from_static(b"ERR server shutting down")), write_buf);
             let _ = stream.write_all(write_buf).await;
             return SubscriberAction::BreakOuter;
         }
@@ -309,11 +383,17 @@ pub(super) async fn try_handle_subscribe<
 ) -> Option<SubscriberAction> {
     use tokio::io::AsyncWriteExt;
 
-    if !cmd.eq_ignore_ascii_case(b"SUBSCRIBE") && !cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+    let is_sharded = cmd.eq_ignore_ascii_case(b"SSUBSCRIBE");
+    if !is_sharded
+        && !cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+        && !cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+    {
         return None;
     }
     let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
-    let cmd_name = if is_pattern {
+    let cmd_name = if is_sharded {
+        "ssubscribe"
+    } else if is_pattern {
         "psubscribe"
     } else {
         "subscribe"
@@ -371,7 +451,7 @@ pub(super) async fn try_handle_subscribe<
             if let Some(reason) = acl_deny {
                 write_buf.clear();
                 let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
-                crate::protocol::serialize(&err, write_buf);
+                ser(conn, &err, write_buf);
                 if stream.write_all(write_buf).await.is_err() {
                     return Some(SubscriberAction::EarlyReturn);
                 }
@@ -384,7 +464,9 @@ pub(super) async fn try_handle_subscribe<
                 conn.subscriber_id,
                 conn.protocol_version >= 3,
             );
-            if is_pattern {
+            if is_sharded {
+                ctx.pubsub_registry.write().ssubscribe(ch.clone(), sub);
+            } else if is_pattern {
                 ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
             } else {
                 ctx.pubsub_registry.write().subscribe(ch.clone(), sub);
@@ -398,24 +480,41 @@ pub(super) async fn try_handle_subscribe<
                         .register(addr.ip(), ctx.shard_id);
                 }
             }
-            propagate_subscription(
-                &ctx.all_remote_sub_maps,
-                &ch,
-                ctx.shard_id,
-                ctx.num_shards,
-                is_pattern,
-            );
+            if is_sharded {
+                propagate_shard_subscription(
+                    &ctx.all_remote_sub_maps,
+                    &ch,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                );
+            } else {
+                propagate_subscription(
+                    &ctx.all_remote_sub_maps,
+                    &ch,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    is_pattern,
+                );
+            }
             write_buf.clear();
-            let resp = if is_pattern {
+            let resp = if is_sharded {
+                pubsub::ssubscribe_response(&ch, conn.subscription_count)
+            } else if is_pattern {
                 pubsub::psubscribe_response(&ch, conn.subscription_count)
             } else {
                 pubsub::subscribe_response(&ch, conn.subscription_count)
             };
-            crate::protocol::serialize(&resp, write_buf);
+            ser(conn, &resp, write_buf);
             if stream.write_all(write_buf).await.is_err() {
                 return Some(SubscriberAction::EarlyReturn);
             }
         }
+    }
+    // RESP3 never diverts into subscriber mode, so the rest of the batch keeps
+    // running in the normal loop — breaking here would jump to a loop the
+    // RESP3 gate no longer enters and strand the connection.
+    if conn.protocol_version >= 3 {
+        return Some(SubscriberAction::Continue);
     }
     // break out of frame batch loop to re-enter main loop in subscriber mode
     Some(SubscriberAction::BreakOuter)
@@ -424,14 +523,17 @@ pub(super) async fn try_handle_subscribe<
 /// Handle UNSUBSCRIBE / PUNSUBSCRIBE in normal (non-subscriber) mode.
 /// Returns `true` if the command was consumed (caller should `continue`).
 pub(super) fn try_handle_unsubscribe(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") && !cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-        return false;
-    }
-    let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
-    let resp = if is_pattern {
-        pubsub::punsubscribe_none_response(conn.subscription_count)
+    // Not in subscriber mode, so nothing is subscribed and the remaining count
+    // is 0 by construction — this path is reached only when the connection
+    // holds no subscriptions at all.
+    let resp = if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+        pubsub::punsubscribe_none_response(0)
+    } else if cmd.eq_ignore_ascii_case(b"SUNSUBSCRIBE") {
+        pubsub::sunsubscribe_none_response(0)
+    } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+        pubsub::unsubscribe_none_response(0)
     } else {
-        pubsub::unsubscribe_none_response(conn.subscription_count)
+        return false;
     };
     responses.push(resp);
     true
@@ -445,15 +547,19 @@ pub(super) fn try_handle_publish(
     conn: &ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
-    publish_batches: &mut HashMap<usize, Vec<(usize, Bytes, Bytes)>>,
+    publish_batches: &mut HashMap<usize, Vec<(usize, Bytes, Bytes, bool)>>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"PUBLISH") {
+    // SPUBLISH shares this handler; only the DESTINATION differs, and that is
+    // carried by `sharded` all the way to the target shard's registry.
+    let sharded = cmd.eq_ignore_ascii_case(b"SPUBLISH");
+    if !sharded && !cmd.eq_ignore_ascii_case(b"PUBLISH") {
         return false;
     }
     if cmd_args.len() != 2 {
-        responses.push(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'publish' command",
-        )));
+        responses.push(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            if sharded { "spublish" } else { "publish" }
+        ))));
     } else {
         let channel_arg = extract_bytes(&cmd_args[0]);
         let message_arg = extract_bytes(&cmd_args[1]);
@@ -471,9 +577,19 @@ pub(super) fn try_handle_publish(
         }
         match (channel_arg, message_arg) {
             (Some(ch), Some(msg)) => {
-                let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, &ch, &msg);
-                // Targeted fanout: only send to shards that have subscribers
-                let targets = ctx.remote_subscriber_map.read().target_shards(&ch);
+                let local_count = if sharded {
+                    crate::pubsub::spublish_shared(&ctx.pubsub_registry, &ch, &msg)
+                } else {
+                    crate::pubsub::publish_shared(&ctx.pubsub_registry, &ch, &msg)
+                };
+                // Targeted fanout: only send to shards that have subscribers.
+                // The sharded lookup is a DIFFERENT map — the two namespaces
+                // may share a channel name without sharing subscribers.
+                let targets = if sharded {
+                    ctx.remote_subscriber_map.read().shard_target_shards(&ch)
+                } else {
+                    ctx.remote_subscriber_map.read().target_shards(&ch)
+                };
                 if targets.is_empty() {
                     // Fast path: no remote subscribers, return local count immediately
                     responses.push(Frame::Integer(local_count));
@@ -492,6 +608,7 @@ pub(super) fn try_handle_publish(
                                 resp_idx,
                                 ch.clone(),
                                 msg.clone(),
+                                sharded,
                             ));
                         }
                     }
@@ -552,6 +669,41 @@ pub(super) fn try_handle_pubsub_introspection(
                 }
             }
             let mut arr = Vec::with_capacity(channels.len() * 2);
+            for ch in &channels {
+                arr.push(Frame::BulkString(ch.clone()));
+                arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));
+            }
+            responses.push(Frame::Array(arr.into()));
+        }
+        Some(ref sc) if sc.eq_ignore_ascii_case(b"SHARDCHANNELS") => {
+            // The SHARDED namespace only. `PUBSUB CHANNELS` must not list
+            // these and this must not list plain ones — they are separate
+            // maps, so the separation is structural rather than a filter.
+            let pattern = if cmd_args.len() > 1 {
+                extract_bytes(&cmd_args[1])
+            } else {
+                None
+            };
+            let mut all: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+            for reg in &ctx.all_pubsub_registries {
+                all.extend(reg.read().active_shard_channels(pattern.as_deref()));
+            }
+            let arr: Vec<Frame> = all.into_iter().map(Frame::BulkString).collect();
+            responses.push(Frame::Array(arr.into()));
+        }
+        Some(ref sc) if sc.eq_ignore_ascii_case(b"SHARDNUMSUB") => {
+            let channels: Vec<Bytes> = cmd_args[1..]
+                .iter()
+                .filter_map(|a| extract_bytes(a))
+                .collect();
+            let mut counts: std::collections::HashMap<Bytes, i64> =
+                std::collections::HashMap::new();
+            for reg in &ctx.all_pubsub_registries {
+                for (ch, n) in reg.read().shard_numsub(&channels) {
+                    *counts.entry(ch).or_insert(0) += n;
+                }
+            }
+            let mut arr: Vec<Frame> = Vec::with_capacity(channels.len() * 2);
             for ch in &channels {
                 arr.push(Frame::BulkString(ch.clone()));
                 arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));

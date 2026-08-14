@@ -1999,6 +1999,18 @@ pub(crate) fn handle_shard_message_shared(
                 crate::pubsub::publish_shared(pubsub_registry, &payload.channel, &payload.message);
             payload.slot.add(count);
         }
+        ShardMessage::SPublishBatch { pairs, slot } => {
+            // Mirrors PubSubPublishBatch, but lands in the SHARDED registry.
+            let mut batch_total: i64 = 0;
+            for (i, (channel, message)) in pairs.iter().enumerate() {
+                let count = crate::pubsub::spublish_shared(pubsub_registry, channel, message);
+                if i < slot.counts.len() {
+                    slot.counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+                batch_total += count;
+            }
+            slot.add(batch_total);
+        }
         ShardMessage::NotifyPublish(pairs) => {
             for (channel, message) in pairs.iter() {
                 // Return value discarded on purpose: a keyspace notification

@@ -433,6 +433,74 @@ impl PubSubRegistry {
     }
 }
 
+/// `SPUBLISH` with the fan-out OUTSIDE the registry lock.
+///
+/// Mirrors [`publish_shared`] and exists for the same reason: holding the
+/// per-shard registry lock across an O(N) subscriber loop stalls every other
+/// connection on that shard. Simpler than its plain counterpart because there
+/// is no pattern leg — `PSUBSCRIBE` does not match sharded channels.
+pub fn spublish_shared(
+    lock: &parking_lot::RwLock<PubSubRegistry>,
+    channel: &Bytes,
+    message: &Bytes,
+) -> i64 {
+    use smallvec::SmallVec;
+
+    // Phase 1: snapshot under the read lock.
+    let subs: SmallVec<[Subscriber; 8]> = {
+        let reg = lock.read();
+        reg.shard_channels
+            .get(channel)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    if subs.is_empty() {
+        return 0;
+    }
+
+    // Phase 2: serialize once per protocol variant, fan out lock-free.
+    let mut count: i64 = 0;
+    let mut slow: SmallVec<[u64; 4]> = SmallVec::new();
+    {
+        let mut resp2: Option<Bytes> = None;
+        let mut resp3: Option<Bytes> = None;
+        for sub in &subs {
+            let data = if sub.is_resp3 {
+                resp3
+                    .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
+                    .clone()
+            } else {
+                resp2
+                    .get_or_insert_with(|| serialize_smessage_bytes(channel, message, false))
+                    .clone()
+            };
+            if sub.try_send(data) {
+                count += 1;
+            } else {
+                slow.push(sub.id);
+            }
+        }
+    }
+
+    // Phase 3: reconcile slow subscribers under the write lock.
+    if !slow.is_empty() {
+        let mut reg = lock.write();
+        if let Some(entry) = reg.shard_channels.get_mut(channel) {
+            entry.retain(|s| !slow.contains(&s.id));
+            if entry.is_empty() {
+                reg.shard_channels.remove(channel);
+            }
+        }
+        for _ in 0..slow.len() {
+            crate::admin::metrics_setup::record_pubsub_slow_drop();
+        }
+    }
+    if count > 0 {
+        crate::admin::metrics_setup::record_pubsub_published();
+    }
+    count
+}
+
 /// Pre-serialize an `smessage` delivery.
 ///
 /// `smessage`, not `message`: the sharded delivery carries its own event name,

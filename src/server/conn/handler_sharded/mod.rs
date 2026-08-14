@@ -454,7 +454,12 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
 
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
-        if conn.subscription_count > 0 {
+        //
+        // RESP2 ONLY, matching the monoio handler. A subscribed RESP3
+        // connection stays in the normal command loop and takes the delivery
+        // branch below instead, so it can keep issuing commands while
+        // subscribed. Diverting it here is what put it in the RESP2 jail.
+        if conn.subscription_count > 0 && conn.protocol_version < 3 {
             // #438: a deferred batch tail from the subscribe break sits in
             // read_buf; run_subscriber_step parses it before awaiting the
             // socket, clearing the flag only when its read arm actually wins.
@@ -588,7 +593,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
-                let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
+                // Trailing bool marks a SHARDED publish. One batch map, split at flush:
+                // the namespaces share the fan-out plumbing but never the destination.
+                let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes, bool)>> = HashMap::new();
 
                 // Track if AUTH rate limiting delay is needed (applied after batch response)
                 let mut auth_delay_ms: u64 = 0;
@@ -2468,20 +2475,29 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Phase 3: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
                 if !publish_batches.is_empty() {
                     let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, Vec<usize>)> = Vec::new();
+                    let mut split: Vec<(usize, Vec<(usize, Bytes, Bytes, bool)>)> = Vec::new();
                     for (target, entries) in publish_batches.drain() {
+                        let (sharded, plain): (Vec<_>, Vec<_>) =
+                            entries.into_iter().partition(|(_, _, _, s)| *s);
+                        if !plain.is_empty() { split.push((target, plain)); }
+                        if !sharded.is_empty() { split.push((target, sharded)); }
+                    }
+                    for (target, entries) in split {
                         let n = entries.len();
+                        let is_sharded = entries[0].3;
                         let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
-                        let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                        let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+                        let resp_indices: Vec<usize> = entries.iter().map(|(idx, ..)| *idx).collect();
+                        let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg, _)| (ch, msg)).collect();
 
                         let idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // E1: bounded backpressure retry instead of one bare
                         // try_push — a transiently-full ring no longer loses
                         // the batch. Borrow taken+released per attempt, never
                         // held across the backoff await.
-                        let mut pending = Some(ShardMessage::PubSubPublishBatch {
-                            pairs,
-                            slot: slot.clone(),
+                        let mut pending = Some(if is_sharded {
+                            ShardMessage::SPublishBatch { pairs, slot: slot.clone() }
+                        } else {
+                            ShardMessage::PubSubPublishBatch { pairs, slot: slot.clone() }
                         });
                         let outcome = crate::shard::dispatch::push_with_backpressure(
                             &shutdown,
@@ -2648,6 +2664,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                         .write_all(super::util::proto_error_frame(kind).as_bytes())
                         .await;
                     break;
+                }
+            }
+            // RESP3 subscriber: deliver pub/sub messages while the connection
+            // is idle in read(), instead of diverting it into the RESP2
+            // subscriber loop. Pending-branch for everyone else, so
+            // non-subscribed connections pay nothing.
+            //
+            // The channel carries ALREADY-SERIALIZED bytes, framed by
+            // `publish()` per the subscriber's own protocol, so this arm writes
+            // them verbatim. A delivery cannot be spliced into a half-written
+            // reply: both are whole frames written by this same task, and this
+            // select is only reached when no reply is in flight.
+            delivery = async {
+                match conn.pubsub_rx {
+                    Some(ref rx) if conn.protocol_version >= 3 => rx.recv_async().await.ok(),
+                    _ => std::future::pending().await,
+                }
+            } => {
+                if let Some(data) = delivery {
+                    if !write_all_bounded!(stream, &data, write_timeout, out_cap_normal, client_live, client_id) {
+                        break;
+                    }
                 }
             }
             // CLIENT TRACKING: deliver invalidation Push frames while the
