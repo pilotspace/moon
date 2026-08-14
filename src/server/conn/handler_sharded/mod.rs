@@ -109,7 +109,8 @@ pub enum HandlerResult {
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, resp3_shape_for, unpropagate_subscription,
+    is_multi_key_command, resp3_shape_for, unpropagate_shard_subscription,
+    unpropagate_subscription,
 };
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -2751,6 +2752,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                 .write()
                 .punsubscribe_all(conn.subscriber_id)
         };
+        // See the monoio handler: the registry side partly self-heals, the
+        // remote maps do not.
+        let removed_shard = {
+            ctx.pubsub_registry
+                .write()
+                .sunsubscribe_all(conn.subscriber_id)
+        };
+        for ch in removed_shard {
+            unpropagate_shard_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
+            );
+        }
         for ch in removed_channels {
             unpropagate_subscription(
                 &ctx.all_remote_sub_maps,

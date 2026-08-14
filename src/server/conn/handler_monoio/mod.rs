@@ -637,6 +637,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     // Sharded subscribe from INSIDE RESP2
                                                     // subscriber mode. On Redis's allow-list, so
                                                     // it must be served here rather than refused.
+                                                    //
+                                                    // The arity guard is not decoration: without
+                                                    // it the loop below simply does not run and
+                                                    // the client is answered with NOTHING, which
+                                                    // it cannot tell from a slow server. The
+                                                    // sharded handler already guards here; this
+                                                    // arm did not.
+                                                    if cmd_args.is_empty() {
+                                                        let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'ssubscribe' command"));
+                                                        let mut resp_buf = BytesMut::new();
+                                                        codec.encode_frame(&err, &mut resp_buf);
+                                                        let data = resp_buf.freeze();
+                                                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        continue;
+                                                    }
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             let denied = {
@@ -857,8 +873,28 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     // Only the SHARDED handler used to accept it,
                                                     // so which answer a client got depended on the
                                                     // shard count.
-                                                    { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id); }
-                                                    { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id); }
+                                                    //
+                                                    // All THREE namespaces, and the remote maps
+                                                    // with them. Clearing only two leaves the
+                                                    // connection listed under `shard_channels`
+                                                    // while it believes it is back to issuing
+                                                    // ordinary commands — an unsolicited
+                                                    // `smessage` then lands in its reply stream
+                                                    // and desynchronises every reply after it,
+                                                    // which is the very defect this task exists
+                                                    // to fix.
+                                                    let gone_ch = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
+                                                    let gone_pat = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
+                                                    let gone_shard = { ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id) };
+                                                    for ch in &gone_ch {
+                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
+                                                    }
+                                                    for pat in &gone_pat {
+                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
+                                                    }
+                                                    for ch in &gone_shard {
+                                                        unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
+                                                    }
                                                     conn.subscription_count = 0;
                                                     let resp = Frame::SimpleString(Bytes::from_static(b"RESET"));
                                                     let mut resp_buf = BytesMut::new();
@@ -3516,6 +3552,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 .write()
                 .punsubscribe_all(conn.subscriber_id)
         };
+        // The sharded namespace partly self-heals — `spublish_shared` drops a
+        // subscriber whose channel is closed — but the REMOTE maps never do.
+        // Without this, every other shard keeps fanning SPUBLISH batches at a
+        // shard with no local receiver, for the life of the process, and the
+        // map grows one entry per disconnected sharded subscriber.
+        let removed_shard = {
+            ctx.pubsub_registry
+                .write()
+                .sunsubscribe_all(conn.subscriber_id)
+        };
         for ch in removed_channels {
             unpropagate_subscription(
                 &ctx.all_remote_sub_maps,
@@ -3523,6 +3569,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx.shard_id,
                 ctx.num_shards,
                 false,
+            );
+        }
+        for ch in removed_shard {
+            unpropagate_shard_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
             );
         }
         for pat in removed_patterns {

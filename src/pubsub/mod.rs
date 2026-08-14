@@ -1109,6 +1109,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sharded_namespace_is_isolated_from_plain() {
+        // The invariant the whole sharded design rests on. `SPUBLISH ch` and
+        // `SUBSCRIBE ch` name the SAME channel and must still be different
+        // destinations — which is why the registry keeps two maps rather than
+        // one map with a flag every call site has to remember to check.
+        let mut registry = PubSubRegistry::new();
+        let (tx_plain, rx_plain) = channel::mpsc_bounded::<Bytes>(16);
+        let (tx_shard, rx_shard) = channel::mpsc_bounded::<Bytes>(16);
+        let ch = Bytes::from_static(b"news");
+
+        registry.subscribe(ch.clone(), Subscriber::new(tx_plain, 1));
+        registry.ssubscribe(ch.clone(), Subscriber::new(tx_shard, 2));
+
+        // Each publish reaches exactly its own namespace — never both, never
+        // the other one.
+        assert_eq!(registry.spublish(&ch, &Bytes::from_static(b"s")), 1);
+        assert_eq!(registry.publish(&ch, &Bytes::from_static(b"p")), 1);
+
+        let got_shard = rx_shard.recv_async().await.unwrap();
+        assert_eq!(
+            parse_resp(&got_shard),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"smessage")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"s")),
+            ]),
+            "the sharded subscriber gets `smessage`, and gets it exactly once"
+        );
+        assert!(
+            rx_shard.try_recv().is_err(),
+            "the plain PUBLISH must not have leaked into the sharded namespace"
+        );
+
+        let got_plain = rx_plain.recv_async().await.unwrap();
+        assert_eq!(
+            parse_resp(&got_plain),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"p")),
+            ])
+        );
+        assert!(
+            rx_plain.try_recv().is_err(),
+            "the SPUBLISH must not have leaked into the plain namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spublish_shared_removes_slow_subscriber() {
+        // Parity with test_publish_shared_removes_slow_subscriber: the sharded
+        // fan-out reconciles a subscriber that cannot keep up, rather than
+        // blocking the publisher on it.
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
+        let ch = Bytes::from_static(b"news");
+        lock.write().ssubscribe(ch.clone(), Subscriber::new(tx, 1));
+
+        assert_eq!(spublish_shared(&lock, &ch, &Bytes::from_static(b"m1")), 1);
+        assert_eq!(spublish_shared(&lock, &ch, &Bytes::from_static(b"m2")), 0);
+        assert_eq!(lock.read().shard_subscription_count(1), 0);
+        assert!(
+            lock.read().active_shard_channels(None).is_empty(),
+            "reconciling the last subscriber must retire the channel, not leave it empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sunsubscribe_all_returns_channels_for_unpropagation() {
+        // Teardown depends on this return value: RESET and disconnect feed it
+        // to `unpropagate_shard_subscription`. A version that cleaned the
+        // registry but returned nothing would leave every other shard fanning
+        // SPUBLISH at a shard with no receiver, forever.
+        let mut registry = PubSubRegistry::new();
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        registry.ssubscribe(Bytes::from_static(b"a"), Subscriber::new(tx.clone(), 7));
+        registry.ssubscribe(Bytes::from_static(b"b"), Subscriber::new(tx, 7));
+
+        let mut gone = registry.sunsubscribe_all(7);
+        gone.sort();
+        assert_eq!(
+            gone,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            "every sharded channel the connection held must come back for unpropagation"
+        );
+        assert_eq!(registry.shard_subscription_count(7), 0);
+    }
+
+    #[tokio::test]
     async fn test_publish_shared_removes_slow_pattern_subscriber() {
         let lock = parking_lot::RwLock::new(PubSubRegistry::new());
         let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);

@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diverted every subscribed connection into a loop that answers only pub/sub verbs. RESP3
   connections now stay in the normal command loop and take a delivery branch alongside it. A
   reply and a delivery cannot tear: both are whole frames written by the same task. Two further
-  divergences closed themselves as a consequence — a subscribed RESP3 `PING` now answers `+PONG`
-  instead of the RESP2 `*2 pong ""` shape (the shape follows the protocol, not the mode).
+  divergences closed themselves as a consequence: a subscribed RESP3 `PING` now answers `+PONG`
+  instead of the RESP2 `*2 pong ""` shape (the shape follows the protocol, not the mode), and a
+  subscribed RESP3 connection can now run `GET`/`SET` at all, where Moon used to refuse both.
 - **The subscriber-mode allow-list was stated in three handlers with two different texts and two
   different behaviours.** Only the sharded handler accepted `RESET`; `handler_single` advertised
   `HELLO` as allowed in its error message while refusing it; and none matched Redis, which names

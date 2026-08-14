@@ -708,3 +708,105 @@ fn ps17_all_handlers_agree() {
         s(&lifted)
     );
 }
+
+#[test]
+fn ps19_ssubscribe_without_args_inside_subscriber_mode_answers() {
+    // ps16 exercises arity on a FRESH connection, which takes the normal
+    // dispatch path. A connection already in RESP2 subscriber mode is served by
+    // a separate arm in each handler, and that arm looped over an empty
+    // argument list and wrote nothing at all — the client got no reply and
+    // waited for its own timeout. Silence is the worst failure mode a protocol
+    // can have: the client cannot distinguish it from a slow server.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["SUBSCRIBE", "ch"]);
+
+    let r = c.send(&["SSUBSCRIBE"]);
+    assert_eq!(
+        s(&r),
+        "-ERR wrong number of arguments for 'ssubscribe' command\r\n",
+        "arity must be enforced from INSIDE subscriber mode too, not only on a fresh connection"
+    );
+    // And the connection is still serving — the arity error is not fatal here
+    // any more than it is on the normal path.
+    let after = c.send(&["PING"]);
+    assert!(
+        after.starts_with(b"*2\r\n$4\r\npong\r\n"),
+        "still in RESP2 subscriber mode after the arity error; got {:?}",
+        s(&after)
+    );
+}
+
+#[test]
+fn ps20_reset_clears_sharded_subscriptions_too() {
+    // RESET is contracted to return the connection to its normal state. It
+    // cleared plain and pattern subscriptions but not the sharded namespace, so
+    // the connection left subscriber mode while the registry still listed it
+    // under `shard_channels`. The result is the exact defect this whole task
+    // exists to fix, in a new place: an unsolicited `smessage` push injected
+    // into the reply stream of a connection that believes it is issuing
+    // ordinary commands, desynchronising every reply after it.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["SSUBSCRIBE", "sch"]);
+
+    let r = c.send(&["RESET"]);
+    assert_eq!(s(&r), "+RESET\r\n");
+
+    // The registry must no longer count this connection as a receiver.
+    let mut pubc = Conn::open(m.port);
+    let n = pubc.send(&["SPUBLISH", "sch", "after-reset"]);
+    assert_eq!(
+        s(&n),
+        ":0\r\n",
+        "after RESET the connection is not a sharded subscriber, so there is nobody to receive"
+    );
+
+    // And nothing may arrive on the reset connection: the next thing it reads
+    // must be its own reply, not a push.
+    let got = c.send(&["ECHO", "marker"]);
+    assert_eq!(
+        s(&got),
+        "$6\r\nmarker\r\n",
+        "the reply to ECHO must be the FIRST thing read back — a leaked smessage here \
+         would desynchronise every subsequent reply; got {:?}",
+        s(&got)
+    );
+}
+
+#[test]
+fn ps21_disconnect_clears_sharded_subscriptions() {
+    // Same leak on the other teardown path. A dropped connection left its entry
+    // in `shard_channels` and — the part that never self-heals — in every other
+    // shard's remote subscriber map, so remote shards keep fanning SPUBLISH
+    // batches at a shard with no local receiver for as long as the process
+    // lives.
+    let m = spawn_moon("4");
+    {
+        let mut c = Conn::open(m.port);
+        let r = c.send(&["SSUBSCRIBE", "sch"]);
+        assert!(
+            r.windows(9).any(|w| w == b"ssubscribe"[..9].as_ref()),
+            "subscribed before dropping; got {:?}",
+            s(&r)
+        );
+    } // dropped here
+
+    // Give the server a moment to run its disconnect cleanup.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let mut pubc = Conn::open(m.port);
+    let n = pubc.send(&["SPUBLISH", "sch", "orphan"]);
+    assert_eq!(
+        s(&n),
+        ":0\r\n",
+        "a disconnected subscriber must not still be counted as a sharded receiver"
+    );
+    let ch = pubc.send(&["PUBSUB", "SHARDCHANNELS"]);
+    assert_eq!(
+        s(&ch),
+        "*0\r\n",
+        "and the channel must not survive as a phantom; got {:?}",
+        s(&ch)
+    );
+}

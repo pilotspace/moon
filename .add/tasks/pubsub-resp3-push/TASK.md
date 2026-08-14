@@ -411,6 +411,19 @@ could see the difference — a library-based suite would pass against the bug it
     own command and the connection stays open. (Reject 3 · Reject 4)
   - ps17_all_handlers_agree — the confirmation-framing and jail rules re-run at `--shards 4`, so
     a fix landing in one handler and not the others fails here. (Must 7)
+  - ps18_sharded_delivery_crosses_shards — `--shards 4`, 8 subscribers on sc0..sc7. Written
+    BEFORE the cross-shard wiring so a local-only registry fails loudly instead of passing every
+    `--shards 1` test while dropping (N-1)/N of deliveries. (Must 9)
+  Added after review, from defects the suite above did not reach:
+  - ps19_ssubscribe_without_args_inside_subscriber_mode_answers — arity from INSIDE subscriber
+    mode. ps16 uses a fresh connection, which takes the normal dispatch path; the subscriber-loop
+    arm is separate code and answered NOTHING at all. (Reject 3, second path)
+  - ps20_reset_clears_sharded_subscriptions_too — RESET cleared plain and pattern but not
+    sharded, so the connection left subscriber mode still registered for `smessage`. (Must 8)
+  - ps21_disconnect_clears_sharded_subscriptions — the same teardown gap on disconnect. Note it
+    passed BEFORE the fix: `spublish_shared` reconciles a dead subscriber, so the count
+    self-heals and only the remote-map leak remains. Kept as an observable-contract guard, but
+    it is honestly not what proves that fix. (Must 8)
 </test_plan>
 
 Runtime note, learned the expensive way on `info-observability`: this suite MUST run under
@@ -433,7 +446,7 @@ Tests live in: `./tests/` · MUST run red (missing implementation) before Build.
 
 ## 5 · BUILD — AI writes code ▸ docs/07-step-5-build.md
 
-Scope (may touch): `src/pubsub/` `src/server/conn/` `src/shard/` `src/command/metadata.rs` `tests/pubsub_resp3_push.rs` `scripts/client-compat/manifest.yaml` `scripts/test-commands.sh` `CHANGELOG.md`
+Scope (may touch): `src/pubsub/` `src/server/conn/` `src/shard/` `src/command/metadata.rs` `tests/pubsub_resp3_push.rs` `scripts/client-compat/manifest.yaml` `scripts/test-commands.sh` `/CHANGELOG.md`
 Strategy (ordered batches):
 1. Confirmation framing — the four `Frame::Array` confirmation builders in `src/pubsub/mod.rs`
    become `Frame::Push`. Measured first that `serialize.rs:102` already downgrades Push→Array
@@ -496,7 +509,18 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 - [x] layering & dependencies follow CONVENTIONS.md — the rule lives in one module rather than
       being restated per handler (that duplication WAS the bug: three texts, two behaviours);
       registry logic stays in `src/pubsub/`, wire concerns in `src/server/conn/`.
-- [ ] a person reviewed and approved the change — pending PR review.
+- [x] a person reviewed and approved the change — PR #483. Review found THREE real defects the
+      §6 wiring check above had passed, all on TEARDOWN paths, all in code this task added:
+      (a) the monoio subscriber-loop `SSUBSCRIBE` arm had no arity guard, so `SSUBSCRIBE` with no
+      channel from inside RESP2 subscriber mode wrote NOTHING and the client waited for its own
+      timeout — silence being the one failure a client cannot distinguish from a slow server;
+      (b) `RESET` cleared the plain and pattern namespaces but not `shard_channels`, so the
+      connection left subscriber mode still registered for `smessage` — an unsolicited push
+      injected into the reply stream of a connection issuing ordinary commands, which is
+      precisely the desynchronisation defect this whole task exists to remove, reintroduced in a
+      new place; (c) no teardown path called `sunsubscribe_all` at all, so disconnect left every
+      other shard fanning SPUBLISH batches at a shard with no local receiver for the life of the
+      process. Fixed with ps19/ps20/ps21 + three registry unit tests, red-first.
 
 ### Build expectations — what "correct" looks like (fill BEFORE build; confirm each at the gate)
 > Pre-declare the OBSERVABLE outcomes a correct build must produce — derived from §2 SCENARIOS
@@ -525,7 +549,13 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
       validates MULTI queue-time arity against that same table.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [x] WIRING (code) — this repo has THREE dispatch paths (monoio, sharded/tokio, single) plus an
+- [x] WIRING (code) — INCOMPLETE AS FIRST RUN; corrected after review. The check below walked
+      every path a new verb is DISPATCHED on and found the tokio gaps, but it never walked the
+      paths a subscription is TORN DOWN on — and all three post-review defects lived there. The
+      lesson is recorded as a competency delta: a new piece of connection state needs its
+      teardown paths enumerated as deliberately as its dispatch paths, because `sunsubscribe_all`
+      existed, compiled, was called from exactly one place, and nothing flagged that RESET and
+      disconnect were not among them. This repo has THREE dispatch paths (monoio, sharded/tokio, single) plus an
       inline fast path, and a rule added to one is CI-invisible in the others. Every new verb was
       confirmed reachable in all of them: `handler_monoio/{mod,pubsub}.rs`,
       `handler_sharded/{mod,pubsub}.rs`, `handler_single`, and `COMMAND_META`. The wiring check
@@ -561,8 +591,8 @@ should track subscriber counts — a systematic (N-1)/N shortfall is the cross-s
 
 ### Spec delta
 - [SPEC · open] `HELLO` mid-subscription stays refused, matching measured Redis 8.6.1 behaviour.
-  If a future Redis permits the upgrade this becomes a divergence (evidence: ps16 pins the
-  refusal; the §0 table records it as measured-and-matched, not assumed).
+  If a future Redis permits the upgrade this becomes a divergence (evidence: ps10_hello_cannot_escape_the_jail
+  pins the refusal; the §0 table records it as measured-and-matched, not assumed).
 - [SPEC · open] Sharded pub/sub is standalone-only — it does not yet consult cluster slot
   ownership, so in cluster mode `SPUBLISH` fans out within this node rather than to the slot's
   shard. Belongs with `cluster-client-bootstrap` (evidence: §3 ⚠ assumption 2, recorded before
@@ -588,6 +618,19 @@ should track subscriber counts — a systematic (N-1)/N shortfall is the cross-s
   time); every runtime-crossing task should run both legs before the gate, never just the
   default one (evidence: this build, plus the prior monoio-intercept-order and
   monoio-CI-coverage tasks).
+- [ADD · open] Enumerate TEARDOWN paths as deliberately as dispatch paths. Adding a namespace
+  to the registry meant `ssubscribe` needed a matching call in RESET, in disconnect cleanup, and
+  in the no-args SUNSUBSCRIBE path — and only the last one got it. Nothing catches this: the
+  method exists, compiles, and is called from somewhere, so neither the compiler nor a
+  dead-code lint objects (evidence: PR #483 review, three defects, all teardown).
+- [TDD · open] An arity guard is protocol surface, not validation boilerplate. The subscriber-
+  mode arm answering NOTHING was worse than answering the wrong error, and no test covered it
+  because ps16 tested arity on a fresh connection — the same verb, a different code path
+  (evidence: ps19 got `left: ""`).
+- [ADD · open] A regression test that is green before the fix is not evidence for that fix.
+  ps21 passed pre-fix because `spublish_shared` reconciles dead subscribers, so the observable
+  count self-heals and only the remote-map leak survives. Kept as a contract guard, but the
+  §6 record says plainly that it does not prove the disconnect fix (evidence: red/green run).
 - [ADD · open] A rule restated in N places WILL drift to N behaviours. The subscriber-mode
   allow-list existed three times with two texts and two behaviours, none matching Redis
   (evidence: only the sharded handler accepted RESET; `handler_single` advertised HELLO as
