@@ -4143,7 +4143,16 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
     (port, token)
 }
 
-/// CLUSTER-06: CLUSTER INFO returns cluster_enabled:1 when started with --cluster-enabled.
+/// CLUSTER-06: `--cluster-enabled` is advertised in INFO, not CLUSTER INFO, and
+/// a node serving no slots reports `cluster_state:fail`.
+///
+/// Both assertions were inverted before `cluster-client-bootstrap`. Measured on
+/// redis-server 8.6.1: `cluster_enabled` appears ONLY in `INFO` (section
+/// `# Cluster`) — `CLUSTER INFO` never carries it — and a lone node with zero
+/// slots assigned answers `cluster_state:fail`, because state is derived from
+/// slot coverage rather than from the `--cluster-enabled` flag. Siblings:
+/// `cb18_cluster_info_does_not_emit_cluster_enabled` and
+/// `cb17_info_reports_cluster_mode_honestly`.
 #[tokio::test]
 async fn cluster_info() {
     let (port, shutdown) = start_cluster_server().await;
@@ -4155,14 +4164,21 @@ async fn cluster_info() {
         .await
         .unwrap();
     assert!(
-        info.contains("cluster_enabled:1"),
-        "expected cluster_enabled:1 in: {}",
+        !info.contains("cluster_enabled"),
+        "CLUSTER INFO must not carry cluster_enabled — Redis reports it in INFO only: {}",
         info
     );
     assert!(
-        info.contains("cluster_state:ok"),
-        "expected cluster_state:ok in: {}",
+        info.contains("cluster_state:fail"),
+        "a node with no slots assigned is not healthy: {}",
         info
+    );
+
+    let server_info: String = redis::cmd("INFO").query_async(&mut con).await.unwrap();
+    assert!(
+        server_info.contains("cluster_enabled:1"),
+        "expected cluster_enabled:1 in INFO: {}",
+        server_info
     );
 
     shutdown.cancel();

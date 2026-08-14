@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **`CLUSTER INFO` no longer claims `cluster_enabled`, and a slotless node no longer claims health.**
+  Two integration assertions encoded the pre-fix behaviour and contradicted the measured oracle:
+  redis-server 8.6.1 reports `cluster_enabled` in `INFO` only — `CLUSTER INFO` never carries it —
+  and a node with zero slots assigned answers `cluster_state:fail`, because state is derived from
+  slot coverage rather than from the `--cluster-enabled` flag.
+- **Replica routing tests no longer race gossip.** A freshly-`MEET`-ed node holds an incomplete slot
+  map until gossip hands it the rest, and an incomplete map answers `CLUSTERDOWN The cluster is down`
+  in front of any redirect — matching Redis, where the down-state check precedes `MOVED` once the
+  slot resolves. The replica tests now wait for the joining node's OWN view to reach
+  `cluster_state:ok` before asserting on redirects.
 - **Gossip never said WHICH master a replica follows, so replicas were reported as their own
   shards.** The flags word carried a role bit but no master id, and a sender's own role was not
   propagated at all — a replica was known as one only on the node its `CLUSTER REPLICATE` ran
