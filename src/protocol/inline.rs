@@ -109,6 +109,17 @@ pub fn parse_inline(
     Ok(Some(Frame::Array(args)))
 }
 
+/// The inline whitespace set, defined once so the argument splitter's skip loop
+/// and its token-terminator loop cannot disagree.
+///
+/// When they disagreed, a byte that terminated a token but was not skipped left
+/// the splitter unable to advance — see #487. These are exactly the bytes C's
+/// `isspace()` accepts, which is what Redis's `sdssplitargs` uses.
+#[inline]
+fn is_inline_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
 /// Split an inline command line that contains at least one quote character.
 ///
 /// A port of Redis's `sdssplitargs` (`sds.c`), which is what defines inline
@@ -146,7 +157,20 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
     let mut args = FrameVec::new();
     let mut i = 0;
     loop {
-        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+        // The skip set MUST match the token loop's terminator set below.
+        //
+        // It used to be ` ` and `\t` only, while the unquoted token loop broke
+        // — without advancing `i` — on ` \t \n \r \x0b \x0c`. A byte in the
+        // difference at a token boundary therefore made no progress at all:
+        // the token loop returned immediately, an empty arg was pushed, and the
+        // outer loop restarted at the same `i`. Forever, with `args` growing
+        // until the process died. Remotely reachable and pre-auth, since
+        // parsing happens before dispatch (#487).
+        //
+        // `is_inline_space` is now the single definition both loops read, so
+        // they cannot drift apart again. Matching Redis, whose `sdssplitargs`
+        // skips with `isspace()` — the same six bytes.
+        while i < line.len() && is_inline_space(line[i]) {
             i += 1;
         }
         if i >= line.len() {
@@ -234,13 +258,15 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
             },
             None => {
                 while i < line.len() {
-                    match line[i] {
-                        b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => break,
-                        c => {
-                            current.push(c);
-                            i += 1;
-                        }
+                    // Terminator set — read through the same helper the outer
+                    // skip loop uses. Breaking here does NOT advance `i`; the
+                    // outer loop is what must step past this byte, which is
+                    // only true while both sides agree on the set (#487).
+                    if is_inline_space(line[i]) {
+                        break;
                     }
+                    current.push(line[i]);
+                    i += 1;
                 }
             }
         }
@@ -439,5 +465,158 @@ mod tests {
             frame,
             Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
+    }
+
+    // === #487: whitespace-set mismatch in the quoted path ===
+    //
+    // `split_args_quoted`'s outer skip loop advanced past only ` ` and `\t`,
+    // while its unquoted-token loop BROKE (without advancing `i`) on the wider
+    // set ` \t \n \r \x0b \x0c`. Any byte in the difference — `\n`, `\r`, VT,
+    // FF — at a token boundary therefore made no progress: the token loop
+    // pushed an empty arg, the outer loop restarted at the same `i`, forever,
+    // growing `args` until the process died.
+    //
+    // Reachable remotely and pre-auth: parsing happens before dispatch, so a
+    // client that opens a socket and writes `"\r\r\n` pins a shard thread at
+    // 100% CPU and allocates until OOM. A lone `\r` survives into the line
+    // because `find_crlf_position` only terminates on the `\r\n` PAIR.
+    //
+    // The quoted path is entered by any line containing `"` or `'`.
+    //
+    // These tests hang rather than fail before the fix — an infinite loop has
+    // no assertion to trip — so a timeout IS the red signal.
+
+    #[test]
+    fn test_inline_quoted_line_with_bare_cr_terminates() {
+        // `\r"` then CRLF. The line is `\r"`, so:
+        //   * it contains a quote -> the quoted path handles it, and
+        //   * the FIRST token byte is `\r` -> the UNQUOTED branch handles that
+        //     token, and that is the branch which breaks without advancing.
+        // A leading quote instead would enter the quoted sub-loop, which does
+        // advance — that variant is not the bug and passes either way.
+        let mut buf = BytesMut::from(&b"\r\"\r\n"[..]);
+        let result = parse_inline(&mut buf, TEST_MAX_INLINE);
+        match result {
+            Ok(Some(Frame::Array(args))) => assert!(
+                args.len() < 16,
+                "bare CR produced {} args — the empty-arg loop is back",
+                args.len()
+            ),
+            Ok(None) | Err(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_inline_quoted_line_with_interior_whitespace_bytes_terminates() {
+        // Every byte the token loop treats as a terminator must also be
+        // skippable by the outer loop, or the two disagree and progress stops.
+        // `\n`, VT and FF are in the token loop's set but were absent from the
+        // skip loop's ` `/`\t` pair.
+        for b in [b'\n', b'\r', 0x0b, 0x0c] {
+            let line = [b, b'"', b'\r', b'\n'];
+            let mut buf = BytesMut::from(&line[..]);
+            let result = parse_inline(&mut buf, TEST_MAX_INLINE);
+            if let Ok(Some(Frame::Array(args))) = &result {
+                assert!(
+                    args.len() < 16,
+                    "byte {b:#04x} produced {} args",
+                    args.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_bare_cr_before_token_still_parses_the_token() {
+        // Progress must not come at the cost of eating the command: a stray
+        // CR ahead of a real token leaves the token intact.
+        let mut buf = BytesMut::from(&b"\"a\" \rPING\r\n"[..]);
+        let frame = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        let Frame::Array(args) = frame else {
+            panic!("expected array")
+        };
+        assert_eq!(args.len(), 2, "got {args:?}");
+        assert_eq!(args[0], Frame::BulkString(Bytes::from_static(b"a")));
+        assert_eq!(args[1], Frame::BulkString(Bytes::from_static(b"PING")));
+    }
+
+    /// The exact libFuzzer `oom-` artifact from the #487 run, through the same
+    /// pipelined loop the fuzz target uses.
+    #[test]
+    fn test_fuzz_artifact_487_terminates() {
+        use crate::protocol::{ParseConfig, parse};
+        let data: &[u8] = &[
+            32, 0, 1, 32, 13, 10, 13, 0, 34, 10, 13, 0, 10, 45, 48, 13, 10, 45, 56, 13, 10, 0, 124,
+            13,
+        ];
+        let config = ParseConfig {
+            max_bulk_string_size: 64 * 1024,
+            max_array_depth: 4,
+            max_array_length: 256,
+            max_inline_size: 64 * 1024,
+        };
+        let mut buf = BytesMut::from(data);
+        for _ in 0..16 {
+            if buf.is_empty() {
+                break;
+            }
+            match parse::parse(&mut buf, &config) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_termination {
+    use super::*;
+
+    /// Every short line built from the bytes that steer the splitter's control
+    /// flow must RETURN — 271k cases in ~0.03s.
+    ///
+    /// This is a structural guard, not four hand-picked inputs: #487 was found
+    /// by a fuzzer precisely because the hand-written tests all happened to
+    /// start their lines with a quote, which enters the quoted sub-loop and
+    /// advances. The bug needed a quote SOMEWHERE plus `\n`/`\r`/VT/FF at a
+    /// token start, a combination nobody thought to write down.
+    ///
+    /// Failure mode is not an assertion: without the fix this test allocates
+    /// until the OS kills the process (verified — SIGKILL, exit 101), which is
+    /// the same OOM libFuzzer reported. A test run that dies or hangs here IS
+    /// the signal.
+    #[test]
+    fn every_short_line_terminates() {
+        const ALPHA: &[u8] = &[
+            b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c, b'"', b'\'', b'\\', b'a', b'x', b'0',
+        ];
+        // The alphabet is every byte class the splitter branches on: each
+        // whitespace byte, both quote characters, the escape byte, a hex
+        // digit, an `x` (the \xHH lead-in) and an ordinary letter.
+        let mut checked: u64 = 0;
+        for len in 0..=5usize {
+            let total = ALPHA.len().pow(len as u32);
+            for n in 0..total {
+                let mut line = Vec::with_capacity(len + 2);
+                let mut m = n;
+                for _ in 0..len {
+                    line.push(ALPHA[m % ALPHA.len()]);
+                    m /= ALPHA.len();
+                }
+                line.extend_from_slice(b"\r\n");
+                let mut buf = BytesMut::from(&line[..]);
+                let r = parse_inline(&mut buf, 64 * 1024);
+                if let Ok(Some(Frame::Array(args))) = &r {
+                    assert!(
+                        args.len() <= len + 1,
+                        "line {line:?} produced {} args for {len} input bytes",
+                        args.len()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("exhaustively checked {checked} lines");
     }
 }

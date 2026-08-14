@@ -234,6 +234,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named missing `INFO` fields via `--info-manifest`.
 
 ### Security
+- **A remote client could hang a shard thread and exhaust memory with a 4-byte inline command
+  (#487).** `split_args_quoted` — the path any inline command containing a quote takes — skipped
+  only `' '` and `'\t'` between arguments, while its token loop *terminated* on the wider
+  `' ' \t \n \r \x0b \x0c`. A byte in the difference (`\n`, `\r`, vertical tab, form feed) sitting at a
+  token boundary therefore made no progress at all: the token loop returned without advancing, an
+  empty argument was appended, and the outer loop restarted at the same offset — forever, with the
+  argument vector growing until the process died. A lone `\r` reaches the line because the CRLF
+  scanner only terminates on the `\r\n` *pair*. Parsing happens before dispatch, so this was
+  reachable pre-authentication: `\r"` followed by CRLF was enough. Both loops now read one
+  `is_inline_space` definition, so they cannot drift apart again — the same six bytes C's
+  `isspace()` accepts, which is what Redis's own `sdssplitargs` skips with. Found by the
+  `resp_parse`, `resp_parse_differential` and `inline_parse` fuzz targets; guarded by an exhaustive
+  test over every short line built from the bytes the splitter branches on (271k cases, ~0.03s),
+  which without the fix allocates until the OS kills the process.
 - **ACL bypass on the inline GET fast path (monoio runtime).** An
   authenticated but restricted user could read any key with plain `GET`:
   `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
