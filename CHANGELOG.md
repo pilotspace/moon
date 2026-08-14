@@ -165,6 +165,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Redis's own spelling: a comma-separated list where PFAIL is **`fail?`** and confirmed FAIL is
   `fail`, appended to the role (`master,fail?` → `master,fail`). Moon previously emitted `pfail`, a
   token Redis never produces and no client parses.
+- **The nightly fuzz job never reported, and threw away its corpus every night.** The nightly
+  budget was `-max_total_time=21600` — exactly GitHub's 6h hosted-job ceiling — so the fuzzer was
+  still running when the platform killed the job. Measured on the 2026-08-14 run: `inline_parse`,
+  `resp_parse` and `resp_parse_differential` each ended at 6h 00m 17s with conclusion `cancelled`.
+  A cancelled job reports no findings, and because the fuzz step never returned, the `Archive
+  corpus` step never ran either — so every night's accumulated corpus was discarded and the next
+  night restarted from scratch. Only targets that fail fast enough to finish inside the ceiling
+  (`mq_registry_blob`, ~7 min) were ever visible, which is why the workflow looked merely "red"
+  rather than broken. The budget is now 5h under an explicit 350-minute job timeout, leaving
+  headroom for setup, build and archiving; an overrun is now a clean job timeout instead of a
+  silent platform cancellation. This is the gap that let a pre-auth inline-parser hang reach
+  `main` undetected.
 - **RESP3 pub/sub confirmations arrived as Arrays where Redis sends Push frames.** Moon's
   *deliveries* were already correct — `message` and `pmessage` lead with `>` — but `subscribe`,
   `unsubscribe`, `psubscribe` and `punsubscribe` were built by four functions that hardcoded

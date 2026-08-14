@@ -74,6 +74,15 @@ jobs:
     if: github.event_name == 'schedule'
     name: Fuzz nightly
     runs-on: ubuntu-latest
+    # GitHub hard-kills a hosted job at 6h. A 6h fuzz budget therefore consumed the
+    # entire allowance, so every long-running target was cancelled mid-run (measured
+    # 2026-08-14: inline_parse / resp_parse / resp_parse_differential all ended at
+    # 6h 00m 17s, conclusion `cancelled`), the step never returned, and `Archive
+    # corpus` never ran — discarding the accumulated corpus every night. Only targets
+    # that fail fast ever reported. An explicit budget below the platform ceiling
+    # leaves room for setup, build, and archiving, and makes an overrun a clean job
+    # timeout rather than a silent platform cancellation.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
@@ -116,9 +125,11 @@ jobs:
           name: fuzz-corpus
           path: fuzz/corpus/
         continue-on-error: true
-      - name: Run fuzzer (6h, multi-process)
+      - name: Run fuzzer (5h, multi-process)
         # Explicit --target: see fuzz-pr note (prebuilt musl cargo-fuzz).
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
+        # 5h, not 6h: the job's 350-minute ceiling must outlast fuzzing PLUS the
+        # corpus archive, or the archive is lost with the job. See timeout-minutes.
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=18000 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
