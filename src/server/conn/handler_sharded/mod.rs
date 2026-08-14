@@ -675,6 +675,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     ),
                                 );
                                 if !matches!(&response, Frame::Error(_)) {
+                                    // Recorded BEFORE the push, so the index is
+                                    // the one this reply will occupy and the
+                                    // switch covers it. Replies already queued
+                                    // were produced under the OLD protocol and
+                                    // keep it — see `encode_response_batch`.
+                                    crate::server::conn::shared::note_protocol_switch(
+                                        &mut conn,
+                                        responses.len(),
+                                        new_proto,
+                                    );
                                     conn.protocol_version = new_proto;
                                 }
                                 if let Some(name) = new_name {
@@ -808,7 +818,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx.cluster_state.is_some(),
                             ),
                         );
-                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
+                        if !matches!(&response, Frame::Error(_)) {
+                            crate::server::conn::shared::note_protocol_switch(&mut conn, responses.len(), new_proto);
+                            conn.protocol_version = new_proto;
+                        }
                         if let Some(name) = new_name { conn.client_name = Some(name); }
                         if let Some(ref uname) = opt_user {
                             conn.adopt_user(uname.clone(), &ctx.acl_table);
@@ -1415,13 +1428,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                         )
                         .await;
                         write_buf.clear();
-                        for response in responses.iter() {
-                            if conn.protocol_version >= 3 {
-                                crate::protocol::serialize_resp3(response, &mut write_buf);
-                            } else {
-                                crate::protocol::serialize(response, &mut write_buf);
-                            }
-                        }
+                        // Not a per-response version test: a pipelined HELLO
+                        // moves the protocol partway through the batch, and the
+                        // replies produced before it must keep the old encoding.
+                        crate::server::conn::shared::encode_response_batch(
+                            &mut conn,
+                            &responses,
+                            &mut write_buf,
+                        );
                         if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
@@ -2711,13 +2725,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 write_buf.clear();
-                for response in &responses {
-                    if conn.protocol_version >= 3 {
-                        crate::protocol::serialize_resp3(response, &mut write_buf);
-                    } else {
-                        crate::protocol::serialize(response, &mut write_buf);
-                    }
-                }
+                // Not a per-response version test: a pipelined HELLO moves the
+                // protocol partway through the batch, and the replies produced
+                // before it must keep the old encoding.
+                crate::server::conn::shared::encode_response_batch(
+                    &mut conn,
+                    &responses,
+                    &mut write_buf,
+                );
                 if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
                     return (HandlerResult::Done, None);
                 }
