@@ -834,6 +834,16 @@ pub enum ShardMessage {
         pairs: Vec<(Bytes, Bytes)>,
         slot: std::sync::Arc<PubSubResponseSlot>,
     },
+    /// Cross-shard `SPUBLISH`: deliver into the target shard's SHARDED
+    /// registry, never its plain one.
+    ///
+    /// A separate variant rather than a flag on `PubSubPublish` because the
+    /// two namespaces are different destinations that may share a channel
+    /// NAME — a bool here would be one `if` away from cross-delivering.
+    SPublishBatch {
+        pairs: Vec<(Bytes, Bytes)>,
+        slot: std::sync::Arc<PubSubResponseSlot>,
+    },
     /// Keyspace-notification fan-out: publish these `(channel, payload)` pairs
     /// into the target shard's registry.
     ///

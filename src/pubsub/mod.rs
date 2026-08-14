@@ -50,6 +50,9 @@ pub fn next_subscriber_id() -> u64 {
 pub struct PubSubRegistry {
     channels: HashMap<Bytes, Vec<Subscriber>>,
     patterns: Vec<(Bytes, Vec<Subscriber>)>,
+    /// Sharded (`SSUBSCRIBE`) channels — a separate namespace from `channels`,
+    /// so `SPUBLISH ch` structurally cannot reach a `SUBSCRIBE ch`.
+    shard_channels: HashMap<Bytes, Vec<Subscriber>>,
 }
 
 impl PubSubRegistry {
@@ -57,6 +60,7 @@ impl PubSubRegistry {
         Self {
             channels: HashMap::new(),
             patterns: Vec::new(),
+            shard_channels: HashMap::new(),
         }
     }
 
@@ -302,10 +306,221 @@ impl PubSubRegistry {
             .count()
     }
 
-    /// Total subscription count (channels + patterns) for a subscriber.
+    /// Total subscription count (channels + patterns + sharded) for a
+    /// subscriber.
     pub fn total_subscription_count(&self, sub_id: u64) -> usize {
-        self.channel_subscription_count(sub_id) + self.pattern_subscription_count(sub_id)
+        self.channel_subscription_count(sub_id)
+            + self.pattern_subscription_count(sub_id)
+            + self.shard_subscription_count(sub_id)
     }
+
+    // ── Sharded pub/sub ─────────────────────────────────────────────────
+    //
+    // A SEPARATE map, not a flag on the existing one. The namespaces must not
+    // leak in either direction — `SPUBLISH ch` never reaches a `SUBSCRIBE ch`
+    // and vice versa — and sharing one map keyed by name with a discriminator
+    // would make that a filtering rule every call site has to remember rather
+    // than a structural guarantee.
+    //
+    // Standalone semantics only: in a real cluster `SSUBSCRIBE` is served by
+    // the slot's owner, which is `cluster-client-bootstrap`'s territory. What
+    // is contracted here is what a standalone redis-server does.
+
+    /// Subscribe to a sharded channel.
+    pub fn ssubscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        self.shard_channels.entry(channel).or_default().push(sub);
+    }
+
+    /// Unsubscribe from a sharded channel by subscriber ID.
+    pub fn sunsubscribe(&mut self, channel: &[u8], sub_id: u64) {
+        if let Some(subs) = self.shard_channels.get_mut(channel) {
+            subs.retain(|s| s.id != sub_id);
+            if subs.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+    }
+
+    /// Remove a subscriber from every sharded channel. Returns those channels.
+    pub fn sunsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
+        let mut removed = Vec::new();
+        self.shard_channels.retain(|channel, subs| {
+            let before = subs.len();
+            subs.retain(|s| s.id != sub_id);
+            if subs.len() < before {
+                removed.push(channel.clone());
+            }
+            !subs.is_empty()
+        });
+        removed
+    }
+
+    /// Count sharded channels this subscriber is subscribed to.
+    pub fn shard_subscription_count(&self, sub_id: u64) -> usize {
+        self.shard_channels
+            .values()
+            .filter(|subs| subs.iter().any(|s| s.id == sub_id))
+            .count()
+    }
+
+    /// List active sharded channels, optionally filtered by glob pattern.
+    pub fn active_shard_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
+        self.shard_channels
+            .keys()
+            .filter(|ch| match pattern {
+                Some(pat) => crate::command::key::glob_match(pat, ch),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Subscriber counts for specific sharded channels.
+    pub fn shard_numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
+        channels
+            .iter()
+            .map(|ch| {
+                let count = self
+                    .shard_channels
+                    .get(ch)
+                    .map(|subs| subs.len() as i64)
+                    .unwrap_or(0);
+                (ch.clone(), count)
+            })
+            .collect()
+    }
+
+    /// Publish to a sharded channel. Returns how many subscribers received it.
+    ///
+    /// Deliberately has no pattern leg: `PSUBSCRIBE` does not match sharded
+    /// channels in Redis either.
+    pub fn spublish(&mut self, channel: &Bytes, message: &Bytes) -> i64 {
+        let mut count: i64 = 0;
+        let mut slow_drops: i64 = 0;
+        if let Some(subs) = self.shard_channels.get_mut(channel) {
+            let mut resp2_bytes: Option<Bytes> = None;
+            let mut resp3_bytes: Option<Bytes> = None;
+            let before = subs.len();
+            subs.retain(|sub| {
+                let data = if sub.is_resp3 {
+                    resp3_bytes
+                        .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
+                        .clone()
+                } else {
+                    resp2_bytes
+                        .get_or_insert_with(|| serialize_smessage_bytes(channel, message, false))
+                        .clone()
+                };
+                if sub.try_send(data) {
+                    count += 1;
+                    true
+                } else {
+                    false // slow subscriber, remove
+                }
+            });
+            slow_drops += (before - subs.len()) as i64;
+            if subs.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+        if count > 0 {
+            crate::admin::metrics_setup::record_pubsub_published();
+        }
+        for _ in 0..slow_drops {
+            crate::admin::metrics_setup::record_pubsub_slow_drop();
+        }
+        count
+    }
+}
+
+/// `SPUBLISH` with the fan-out OUTSIDE the registry lock.
+///
+/// Mirrors [`publish_shared`] and exists for the same reason: holding the
+/// per-shard registry lock across an O(N) subscriber loop stalls every other
+/// connection on that shard. Simpler than its plain counterpart because there
+/// is no pattern leg — `PSUBSCRIBE` does not match sharded channels.
+pub fn spublish_shared(
+    lock: &parking_lot::RwLock<PubSubRegistry>,
+    channel: &Bytes,
+    message: &Bytes,
+) -> i64 {
+    use smallvec::SmallVec;
+
+    // Phase 1: snapshot under the read lock.
+    let subs: SmallVec<[Subscriber; 8]> = {
+        let reg = lock.read();
+        reg.shard_channels
+            .get(channel)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    if subs.is_empty() {
+        return 0;
+    }
+
+    // Phase 2: serialize once per protocol variant, fan out lock-free.
+    let mut count: i64 = 0;
+    let mut slow: SmallVec<[u64; 4]> = SmallVec::new();
+    {
+        let mut resp2: Option<Bytes> = None;
+        let mut resp3: Option<Bytes> = None;
+        for sub in &subs {
+            let data = if sub.is_resp3 {
+                resp3
+                    .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
+                    .clone()
+            } else {
+                resp2
+                    .get_or_insert_with(|| serialize_smessage_bytes(channel, message, false))
+                    .clone()
+            };
+            if sub.try_send(data) {
+                count += 1;
+            } else {
+                slow.push(sub.id);
+            }
+        }
+    }
+
+    // Phase 3: reconcile slow subscribers under the write lock.
+    if !slow.is_empty() {
+        let mut reg = lock.write();
+        if let Some(entry) = reg.shard_channels.get_mut(channel) {
+            entry.retain(|s| !slow.contains(&s.id));
+            if entry.is_empty() {
+                reg.shard_channels.remove(channel);
+            }
+        }
+        for _ in 0..slow.len() {
+            crate::admin::metrics_setup::record_pubsub_slow_drop();
+        }
+    }
+    if count > 0 {
+        crate::admin::metrics_setup::record_pubsub_published();
+    }
+    count
+}
+
+/// Pre-serialize an `smessage` delivery.
+///
+/// `smessage`, not `message`: the sharded delivery carries its own event name,
+/// so a client subscribed to both namespaces can tell them apart.
+#[inline]
+fn serialize_smessage_bytes(channel: &Bytes, payload: &Bytes, resp3: bool) -> Bytes {
+    let capacity = 32 + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    let frame = Frame::Push(framevec![
+        Frame::BulkString(Bytes::from_static(b"smessage")),
+        Frame::BulkString(channel.clone()),
+        Frame::BulkString(payload.clone()),
+    ]);
+    if resp3 {
+        crate::protocol::serialize_resp3(&frame, &mut buf);
+    } else {
+        // RESP2 downgrades Push to Array — the same rule the confirmations use.
+        crate::protocol::serialize(&frame, &mut buf);
+    }
+    buf.freeze()
 }
 
 /// Publish with the fan-out OUTSIDE the registry lock (P1, 2026-07 pub/sub
@@ -465,40 +680,88 @@ fn serialize_pmessage_bytes_push(pattern: &Bytes, channel: &Bytes, payload: &Byt
 
 // -- Message frame helpers --
 
-/// Build a subscribe confirmation response frame.
-pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"subscribe")),
-        Frame::BulkString(channel.clone()),
+/// Build a pub/sub confirmation frame (`subscribe`, `unsubscribe`, …).
+///
+/// Always a [`Frame::Push`], never an `Array`, and that is the whole fix for
+/// the RESP3 confirmation divergence. A confirmation IS out-of-band pub/sub
+/// traffic — the same kind of thing a `message` delivery is — so the frame is
+/// built as what it means and each protocol's serializer renders it in that
+/// protocol's form: `serialize_resp3` writes `>`, while RESP2 `serialize`
+/// downgrades Push to `*` (`src/protocol/serialize.rs`, the same mechanism
+/// `Frame::Set` relies on). RESP2 clients therefore see byte-for-byte what
+/// they saw before.
+///
+/// The alternative — threading a `resp3: bool` down to every call site — was
+/// rejected once it became clear the serializer already encodes exactly this
+/// rule: a second copy of the decision is a second thing to get out of sync,
+/// and the three handlers drifting apart is precisely what this task is
+/// cleaning up.
+///
+/// `name` is a static verb; `channel` is `None` only for the
+/// `UNSUBSCRIBE`-with-no-arguments case on a connection subscribed to nothing,
+/// where Redis sends a Null channel name rather than an empty string.
+#[inline]
+fn confirmation(name: &'static [u8], channel: Option<&Bytes>, count: usize) -> Frame {
+    Frame::Push(framevec![
+        Frame::BulkString(Bytes::from_static(name)),
+        match channel {
+            Some(c) => Frame::BulkString(c.clone()),
+            None => Frame::Null,
+        },
         Frame::Integer(count as i64),
     ])
+}
+
+/// Build a subscribe confirmation response frame.
+pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"subscribe", Some(channel), count)
 }
 
 /// Build an unsubscribe confirmation response frame.
 pub fn unsubscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"unsubscribe")),
-        Frame::BulkString(channel.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"unsubscribe", Some(channel), count)
+}
+
+/// Build the `UNSUBSCRIBE`-with-no-arguments reply when no CHANNEL was removed.
+///
+/// Redis names a Null channel (`$-1`) here, not an empty bulk string (`$0`) —
+/// measured, and a statically-typed client decodes the two differently.
+///
+/// `count` is the connection's REMAINING total subscription count, not zero: a
+/// connection holding only pattern subscriptions removes no channel here but
+/// still reports what it is subscribed to.
+pub fn unsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"unsubscribe", None, count)
 }
 
 /// Build a psubscribe confirmation response frame.
 pub fn psubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"psubscribe")),
-        Frame::BulkString(pattern.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"psubscribe", Some(pattern), count)
 }
 
 /// Build a punsubscribe confirmation response frame.
 pub fn punsubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"punsubscribe")),
-        Frame::BulkString(pattern.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"punsubscribe", Some(pattern), count)
+}
+
+/// Build the `PUNSUBSCRIBE`-with-no-arguments reply when nothing is subscribed.
+pub fn punsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"punsubscribe", None, count)
+}
+
+/// Build an ssubscribe confirmation response frame (sharded pub/sub).
+pub fn ssubscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"ssubscribe", Some(channel), count)
+}
+
+/// Build an sunsubscribe confirmation response frame (sharded pub/sub).
+pub fn sunsubscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"sunsubscribe", Some(channel), count)
+}
+
+/// Build the `SUNSUBSCRIBE`-with-no-arguments reply when nothing is subscribed.
+pub fn sunsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"sunsubscribe", None, count)
 }
 
 /// Build a message delivery frame for exact-channel subscription.
@@ -843,6 +1106,95 @@ mod tests {
             0
         );
         assert_eq!(lock.read().channel_subscription_count(1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_namespace_is_isolated_from_plain() {
+        // The invariant the whole sharded design rests on. `SPUBLISH ch` and
+        // `SUBSCRIBE ch` name the SAME channel and must still be different
+        // destinations — which is why the registry keeps two maps rather than
+        // one map with a flag every call site has to remember to check.
+        let mut registry = PubSubRegistry::new();
+        let (tx_plain, rx_plain) = channel::mpsc_bounded::<Bytes>(16);
+        let (tx_shard, rx_shard) = channel::mpsc_bounded::<Bytes>(16);
+        let ch = Bytes::from_static(b"news");
+
+        registry.subscribe(ch.clone(), Subscriber::new(tx_plain, 1));
+        registry.ssubscribe(ch.clone(), Subscriber::new(tx_shard, 2));
+
+        // Each publish reaches exactly its own namespace — never both, never
+        // the other one.
+        assert_eq!(registry.spublish(&ch, &Bytes::from_static(b"s")), 1);
+        assert_eq!(registry.publish(&ch, &Bytes::from_static(b"p")), 1);
+
+        let got_shard = rx_shard.recv_async().await.unwrap();
+        assert_eq!(
+            parse_resp(&got_shard),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"smessage")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"s")),
+            ]),
+            "the sharded subscriber gets `smessage`, and gets it exactly once"
+        );
+        assert!(
+            rx_shard.try_recv().is_err(),
+            "the plain PUBLISH must not have leaked into the sharded namespace"
+        );
+
+        let got_plain = rx_plain.recv_async().await.unwrap();
+        assert_eq!(
+            parse_resp(&got_plain),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"p")),
+            ])
+        );
+        assert!(
+            rx_plain.try_recv().is_err(),
+            "the SPUBLISH must not have leaked into the plain namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spublish_shared_removes_slow_subscriber() {
+        // Parity with test_publish_shared_removes_slow_subscriber: the sharded
+        // fan-out reconciles a subscriber that cannot keep up, rather than
+        // blocking the publisher on it.
+        let lock = parking_lot::RwLock::new(PubSubRegistry::new());
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
+        let ch = Bytes::from_static(b"news");
+        lock.write().ssubscribe(ch.clone(), Subscriber::new(tx, 1));
+
+        assert_eq!(spublish_shared(&lock, &ch, &Bytes::from_static(b"m1")), 1);
+        assert_eq!(spublish_shared(&lock, &ch, &Bytes::from_static(b"m2")), 0);
+        assert_eq!(lock.read().shard_subscription_count(1), 0);
+        assert!(
+            lock.read().active_shard_channels(None).is_empty(),
+            "reconciling the last subscriber must retire the channel, not leave it empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sunsubscribe_all_returns_channels_for_unpropagation() {
+        // Teardown depends on this return value: RESET and disconnect feed it
+        // to `unpropagate_shard_subscription`. A version that cleaned the
+        // registry but returned nothing would leave every other shard fanning
+        // SPUBLISH at a shard with no receiver, forever.
+        let mut registry = PubSubRegistry::new();
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        registry.ssubscribe(Bytes::from_static(b"a"), Subscriber::new(tx.clone(), 7));
+        registry.ssubscribe(Bytes::from_static(b"b"), Subscriber::new(tx, 7));
+
+        let mut gone = registry.sunsubscribe_all(7);
+        gone.sort();
+        assert_eq!(
+            gone,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            "every sharded channel the connection held must come back for unpropagation"
+        );
+        assert_eq!(registry.shard_subscription_count(7), 0);
     }
 
     #[tokio::test]

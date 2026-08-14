@@ -108,8 +108,9 @@ use super::affinity::MigratedConnectionState;
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, propagate_subscription, resp3_shape_for,
-    try_inline_dispatch_loop, unpropagate_subscription,
+    handle_config, is_multi_key_command, propagate_shard_subscription, propagate_subscription,
+    resp3_shape_for, try_inline_dispatch_loop, unpropagate_shard_subscription,
+    unpropagate_subscription,
 };
 use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
@@ -520,8 +521,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             break;
         }
 
-        // Subscriber mode: bidirectional select on client commands + published messages
-        if conn.subscription_count > 0 {
+        // Subscriber mode: bidirectional select on client commands + published messages.
+        //
+        // RESP2 ONLY. Under RESP3 a subscribed connection stays in the normal
+        // command loop and takes the delivery branch further down instead —
+        // that is what lets it keep issuing commands while subscribed, which
+        // is a reason RESP3 exists and which Redis allows. Entering this loop
+        // for a RESP3 connection is what put it in the RESP2 jail.
+        if conn.subscription_count > 0 && conn.protocol_version < 3 {
             #[allow(clippy::unwrap_used)]
             // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
@@ -626,6 +633,88 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                     }
                                                 }
+                                                _ if cmd.eq_ignore_ascii_case(b"SSUBSCRIBE") => {
+                                                    // Sharded subscribe from INSIDE RESP2
+                                                    // subscriber mode. On Redis's allow-list, so
+                                                    // it must be served here rather than refused.
+                                                    //
+                                                    // The arity guard is not decoration: without
+                                                    // it the loop below simply does not run and
+                                                    // the client is answered with NOTHING, which
+                                                    // it cannot tell from a slow server. The
+                                                    // sharded handler already guards here; this
+                                                    // arm did not.
+                                                    if cmd_args.is_empty() {
+                                                        let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'ssubscribe' command"));
+                                                        let mut resp_buf = BytesMut::new();
+                                                        codec.encode_frame(&err, &mut resp_buf);
+                                                        let data = resp_buf.freeze();
+                                                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        continue;
+                                                    }
+                                                    for arg in cmd_args {
+                                                        if let Some(channel) = extract_bytes(arg) {
+                                                            let denied = {
+                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
+                                                            };
+                                                            if let Some(deny_reason) = denied {
+                                                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&err, &mut resp_buf);
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                continue;
+                                                            }
+                                                            #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                                            let sub = Subscriber::with_protocol(
+                                                                conn.pubsub_tx.clone().unwrap(),
+                                                                conn.subscriber_id,
+                                                                conn.protocol_version >= 3,
+                                                            );
+                                                            ctx.pubsub_registry.write().ssubscribe(channel.clone(), sub);
+                                                            propagate_shard_subscription(&ctx.all_remote_sub_maps, &channel, ctx.shard_id, ctx.num_shards);
+                                                            conn.subscription_count += 1;
+                                                            let resp = crate::pubsub::ssubscribe_response(&channel, conn.subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        }
+                                                    }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"SUNSUBSCRIBE") => {
+                                                    let targets: Vec<Bytes> = if cmd_args.is_empty() {
+                                                        ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id)
+                                                    } else {
+                                                        cmd_args.iter().filter_map(extract_bytes).collect()
+                                                    };
+                                                    if targets.is_empty() {
+                                                        conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
+                                                        let resp = crate::pubsub::sunsubscribe_none_response(conn.subscription_count);
+                                                        let mut resp_buf = BytesMut::new();
+                                                        codec.encode_frame(&resp, &mut resp_buf);
+                                                        let data = resp_buf.freeze();
+                                                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    } else {
+                                                        for ch in &targets {
+                                                            ctx.pubsub_registry.write().sunsubscribe(ch.as_ref(), conn.subscriber_id);
+                                                            unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
+                                                            conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                            let resp = crate::pubsub::sunsubscribe_response(ch, conn.subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        }
+                                                    }
+                                                }
                                                 _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
                                                         let removed = ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id);
@@ -634,7 +723,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                         if removed.is_empty() {
                                                             conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
-                                                            let resp = crate::pubsub::unsubscribe_response(&Bytes::from_static(b""), conn.subscription_count);
+                                                            let resp = crate::pubsub::unsubscribe_none_response(conn.subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
@@ -726,7 +815,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                         if removed.is_empty() {
                                                             conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
-                                                            let resp = crate::pubsub::punsubscribe_response(&Bytes::from_static(b""), conn.subscription_count);
+                                                            let resp = crate::pubsub::punsubscribe_none_response(conn.subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
@@ -779,12 +868,47 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     let _ = wr; // ignore write error on quit
                                                     return (MonoioHandlerResult::Done, None); // exit connection
                                                 }
+                                                _ if cmd.eq_ignore_ascii_case(b"RESET") => {
+                                                    // The sanctioned way out of subscriber mode.
+                                                    // Only the SHARDED handler used to accept it,
+                                                    // so which answer a client got depended on the
+                                                    // shard count.
+                                                    //
+                                                    // All THREE namespaces, and the remote maps
+                                                    // with them. Clearing only two leaves the
+                                                    // connection listed under `shard_channels`
+                                                    // while it believes it is back to issuing
+                                                    // ordinary commands — an unsolicited
+                                                    // `smessage` then lands in its reply stream
+                                                    // and desynchronises every reply after it,
+                                                    // which is the very defect this task exists
+                                                    // to fix.
+                                                    let gone_ch = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
+                                                    let gone_pat = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
+                                                    let gone_shard = { ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id) };
+                                                    for ch in &gone_ch {
+                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
+                                                    }
+                                                    for pat in &gone_pat {
+                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
+                                                    }
+                                                    for ch in &gone_shard {
+                                                        unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
+                                                    }
+                                                    conn.subscription_count = 0;
+                                                    let resp = Frame::SimpleString(Bytes::from_static(b"RESET"));
+                                                    let mut resp_buf = BytesMut::new();
+                                                    codec.encode_frame(&resp, &mut resp_buf);
+                                                    let data = resp_buf.freeze();
+                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    break;
+                                                }
                                                 _ => {
-                                                    let cmd_str = String::from_utf8_lossy(cmd);
-                                                    let err = Frame::Error(Bytes::from(format!(
-                                                        "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
-                                                        cmd_str.to_lowercase()
-                                                    )));
+                                                    // One allow-list, one text — see
+                                                    // `server::conn::subscriber_mode`. This loop is
+                                                    // RESP2-only now, so the refusal always applies.
+                                                    let err = crate::server::conn::subscriber_mode::subscriber_mode_error(cmd);
                                                     let mut resp_buf = BytesMut::new();
                                                     codec.encode_frame(&err, &mut resp_buf);
                                                     let data = resp_buf.freeze();
@@ -863,6 +987,55 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // structurally unreachable whenever `timeout` was set.
         if std::mem::take(&mut carried_input) {
             // Nothing to read: `read_buf` already holds unparsed input.
+        } else if conn.protocol_version >= 3 && conn.subscription_count > 0 {
+            // RESP3 subscriber: deliver pub/sub messages while parked in
+            // read(), instead of diverting the connection into the RESP2
+            // subscriber loop. This is the whole mechanism behind "RESP3 lets
+            // one connection subscribe AND issue commands" — the connection
+            // never leaves this loop, so every command still dispatches
+            // normally and the deliveries arrive between replies.
+            //
+            // The channel carries ALREADY-SERIALIZED bytes, framed by
+            // `publish()` according to the subscriber's own protocol (Push for
+            // RESP3), so this arm writes them verbatim. That also means a
+            // delivery can never be spliced into a half-written reply: both
+            // are whole frames handed to `write_all` from the same task, and
+            // this loop only reaches here when no reply is mid-flight.
+            #[allow(clippy::unwrap_used)] // guarded by subscription_count > 0
+            let rx = conn.pubsub_rx.as_ref().unwrap();
+            let sub_buf = std::mem::take(&mut tmp_buf);
+            let mut delivery: Option<bytes::Bytes> = None;
+            monoio::select! {
+                _ = shutdown.cancelled() => { break; }
+                read_result = stream.read(sub_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                msg = rx.recv_async() => {
+                    // The read future loses its buffer here (io_uring cancel
+                    // semantics), exactly as the RESP2 subscriber select
+                    // above documents; the pre-park sizing re-arms it.
+                    delivery = msg.ok();
+                }
+            }
+            if let Some(data) = delivery {
+                if !write_all_bounded!(
+                    stream,
+                    data,
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                ) {
+                    break;
+                }
+                continue;
+            }
         } else if conn.tracking_rx.is_some() {
             // CLIENT TRACKING: deliver invalidation Push frames while parked
             // in read(). Only tracking connections take this select — the
@@ -1261,8 +1434,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
         responses.clear();
         remote_groups.clear();
         local_leg_write_idxs.clear();
-        let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>> =
-            std::collections::HashMap::new();
+        // The trailing bool marks a SHARDED publish. One batch map, split at flush:
+        // the two namespaces share the fan-out plumbing but never the destination.
+        let mut publish_batches: std::collections::HashMap<
+            usize,
+            Vec<(usize, Bytes, Bytes, bool)>,
+        > = std::collections::HashMap::new();
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         crate::shard::slice::with_shard_db(conn.selected_db, |db| {
@@ -1686,6 +1863,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 pubsub::SubscribeResult::NotSubscribe => {}
                 pubsub::SubscribeResult::ArgError => continue,
                 pubsub::SubscribeResult::Subscribed => {
+                    // RESP3 never diverts into subscriber mode, so there is
+                    // nothing to defer: the rest of the batch keeps running in
+                    // THIS loop, which is the point. Breaking here would jump
+                    // to a subscriber loop that the RESP3 gate above no longer
+                    // enters, stranding the connection.
+                    if conn.protocol_version >= 3 {
+                        continue;
+                    }
                     // #438: carry the parsed-but-unconsumed batch tail into
                     // the next iteration (subscriber mode) instead of
                     // dropping it — `[SUBSCRIBE ch, PING]` in one pipelined
@@ -2864,23 +3049,44 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>,
                 Vec<usize>,
             )> = Vec::new();
+            let mut split: Vec<(usize, Vec<(usize, Bytes, Bytes, bool)>)> = Vec::new();
             for (target, entries) in publish_batches.drain() {
+                let (sharded, plain): (Vec<_>, Vec<_>) =
+                    entries.into_iter().partition(|(_, _, _, s)| *s);
+                if !plain.is_empty() {
+                    split.push((target, plain));
+                }
+                if !sharded.is_empty() {
+                    split.push((target, sharded));
+                }
+            }
+            for (target, entries) in split {
                 let n = entries.len();
+                let is_sharded = entries[0].3;
                 let slot = std::sync::Arc::new(
                     crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
                 );
-                let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
-                let pairs: Vec<(Bytes, Bytes)> =
-                    entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+                let resp_indices: Vec<usize> = entries.iter().map(|(idx, ..)| *idx).collect();
+                let pairs: Vec<(Bytes, Bytes)> = entries
+                    .into_iter()
+                    .map(|(_, ch, msg, _)| (ch, msg))
+                    .collect();
 
                 let idx = ChannelMesh::target_index(ctx.shard_id, target);
                 // E1: bounded backpressure retry instead of one bare try_push
                 // — a transiently-full ring no longer loses the batch. Borrow
                 // taken+released per attempt, never held across the backoff
                 // await (tokio parity — handler_sharded).
-                let mut pending = Some(ShardMessage::PubSubPublishBatch {
-                    pairs,
-                    slot: slot.clone(),
+                let mut pending = Some(if is_sharded {
+                    ShardMessage::SPublishBatch {
+                        pairs,
+                        slot: slot.clone(),
+                    }
+                } else {
+                    ShardMessage::PubSubPublishBatch {
+                        pairs,
+                        slot: slot.clone(),
+                    }
                 });
                 let outcome = crate::shard::dispatch::push_with_backpressure(
                     &shutdown,
@@ -3346,6 +3552,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 .write()
                 .punsubscribe_all(conn.subscriber_id)
         };
+        // The sharded namespace partly self-heals — `spublish_shared` drops a
+        // subscriber whose channel is closed — but the REMOTE maps never do.
+        // Without this, every other shard keeps fanning SPUBLISH batches at a
+        // shard with no local receiver, for the life of the process, and the
+        // map grows one entry per disconnected sharded subscriber.
+        let removed_shard = {
+            ctx.pubsub_registry
+                .write()
+                .sunsubscribe_all(conn.subscriber_id)
+        };
         for ch in removed_channels {
             unpropagate_subscription(
                 &ctx.all_remote_sub_maps,
@@ -3353,6 +3569,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx.shard_id,
                 ctx.num_shards,
                 false,
+            );
+        }
+        for ch in removed_shard {
+            unpropagate_shard_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
             );
         }
         for pat in removed_patterns {

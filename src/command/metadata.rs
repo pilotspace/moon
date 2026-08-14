@@ -398,6 +398,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "PSUBSCRIBE" => CommandMeta { name: "PSUBSCRIBE", arity: -2, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
     "PUNSUBSCRIBE" => CommandMeta { name: "PUNSUBSCRIBE", arity: -1, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
     "PUBLISH" => CommandMeta { name: "PUBLISH", arity: 3, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
+    "SPUBLISH" => CommandMeta { name: "SPUBLISH", arity: 3, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
     "SSUBSCRIBE" => CommandMeta { name: "SSUBSCRIBE", arity: -2, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
     "SUNSUBSCRIBE" => CommandMeta { name: "SUNSUBSCRIBE", arity: -1, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
 

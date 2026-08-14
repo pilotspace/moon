@@ -9,6 +9,7 @@ pub mod handler_sharded;
 pub mod handler_single;
 pub mod park_policy;
 pub mod shared;
+pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
 pub mod util;
@@ -36,8 +37,9 @@ pub(crate) use shared::{
 };
 #[allow(unused_imports)]
 pub(crate) use util::{
-    apply_resp3_conversion, extract_bytes, extract_command, propagate_subscription,
-    resp3_shape_for, restore_migrated_state, unpropagate_subscription,
+    apply_resp3_conversion, extract_bytes, extract_command, propagate_shard_subscription,
+    propagate_subscription, resp3_shape_for, restore_migrated_state,
+    unpropagate_shard_subscription, unpropagate_subscription,
 };
 
 // Re-export handler functions at the module level so external callers

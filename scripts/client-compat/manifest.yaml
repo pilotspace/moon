@@ -274,3 +274,46 @@ entries:
     setup: ["DEL k", "LPUSH k v"]
     command: "GET k"
     policy: exact
+
+  # ── Pub/sub: RESP3 framing and the subscriber-mode allow-list ─────────
+  #
+  # The oracle keeps these honest because both are things a unit test can
+  # assert against Moon's own idea of correct and still be wrong. The
+  # confirmation FRAME TYPE in particular: Moon's deliveries were already
+  # Push while its confirmations were Arrays, and only a byte-level
+  # comparison against a real server shows that.
+
+  - name: pubsub_subscribe_confirmation_framing
+    command: "SUBSCRIBE compat_ch"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_psubscribe_confirmation_framing
+    command: "PSUBSCRIBE compat_p.*"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_unsubscribe_from_nothing_names_null_channel
+    command: "UNSUBSCRIBE"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_numpat_counts_distinct_patterns
+    command: "PUBSUB NUMPAT"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_shardchannels_is_a_separate_namespace
+    command: "PUBSUB SHARDCHANNELS"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_ssubscribe_confirmation_framing
+    command: "SSUBSCRIBE compat_sch"
+    policy: exact
+    contexts: [standalone]
+
+  - name: pubsub_spublish_to_nobody
+    command: "SPUBLISH compat_sch hello"
+    policy: exact
+    contexts: [standalone]

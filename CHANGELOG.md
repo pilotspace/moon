@@ -6,7 +6,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Sharded pub/sub: `SSUBSCRIBE`, `SUNSUBSCRIBE`, `SPUBLISH`, and `PUBSUB SHARDCHANNELS` /
+  `SHARDNUMSUB`.** Deliveries carry the `smessage` event name. The sharded namespace is a
+  genuinely separate map from the plain one in both the per-shard registry and the
+  remote-subscriber map, so `SPUBLISH ch` cannot reach a `SUBSCRIBE ch` and vice versa — the two
+  may share a channel *name* while being different destinations, and that separation is
+  structural rather than a filter each call site has to remember. Cross-shard delivery reuses the
+  existing batched fan-out with a sharded marker on each entry, and is proven at `--shards 4`:
+  a local-only registry would have passed every single-shard test while dropping (N-1)/N of
+  deliveries in production. `SPUBLISH` was absent from `COMMAND_META` entirely, while
+  `SSUBSCRIBE` and `SUNSUBSCRIBE` were declared there but answered "unknown command" by the
+  dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
+
 ### Fixed
+- **RESP3 pub/sub confirmations arrived as Arrays where Redis sends Push frames.** Moon's
+  *deliveries* were already correct — `message` and `pmessage` lead with `>` — but `subscribe`,
+  `unsubscribe`, `psubscribe` and `punsubscribe` were built by four functions that hardcoded
+  `Frame::Array` and took no protocol argument. That half-correctness is worse than no RESP3
+  support at all: a client that separates out-of-band pushes from command replies by the leading
+  byte reads the Array confirmation as the reply to whatever it sends *next*, and every later
+  reply on that connection is off by one. Confirmations are now built as what they mean — Push —
+  and each protocol's serializer renders it in that protocol's form, so RESP2 clients see
+  byte-for-byte what they saw before. The tokio handler additionally serialized every pub/sub
+  frame through the RESP2 serializer regardless of the connection's protocol, which downgraded
+  Push back to Array; it now picks the serializer the way the codec already does.
+- **RESP3 no longer keeps a subscribed connection in the RESP2 jail.** Redis lets a subscribed
+  RESP3 connection run any command — that is a large part of why RESP3 exists — while Moon
+  diverted every subscribed connection into a loop that answers only pub/sub verbs. RESP3
+  connections now stay in the normal command loop and take a delivery branch alongside it. A
+  reply and a delivery cannot tear: both are whole frames written by the same task. Two further
+  divergences closed themselves as a consequence: a subscribed RESP3 `PING` now answers `+PONG`
+  instead of the RESP2 `*2 pong ""` shape (the shape follows the protocol, not the mode), and a
+  subscribed RESP3 connection can now run `GET`/`SET` at all, where Moon used to refuse both.
+- **The subscriber-mode allow-list was stated in three handlers with two different texts and two
+  different behaviours.** Only the sharded handler accepted `RESET`; `handler_single` advertised
+  `HELLO` as allowed in its error message while refusing it; and none matched Redis, which names
+  `(P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET`. The rule now lives in one module.
+  `RESET` works everywhere, the sharded verbs are admitted, and `HELLO` stays refused (measured —
+  a RESP2 subscriber genuinely cannot upgrade mid-subscription).
+- **`PUBSUB NUMPAT` counted subscribers instead of distinct patterns**, and double-counted a
+  pattern whose subscribers landed on different shard threads. Two clients on `p.*` answered `2`
+  where Redis answers `1`. It now reuses the same gather `INFO` uses, so `pubsub_patterns` and
+  `NUMPAT` cannot disagree. The bug survived because it is only visible while both subscribers
+  are live — after one leaves, the buggy and correct answers coincide. (#480)
+- **`UNSUBSCRIBE` with no arguments on a connection subscribed to nothing** named an empty
+  channel (`$0`) where Redis sends a Null channel (`$-1`); a statically-typed client decodes the
+  two differently.
 - **`keyspace_hits` and `keyspace_misses` had been reporting zero for plain `GET`s on the shipped
   runtime.** `try_inline_dispatch` — the route a plain `GET key` actually takes under monoio —
   frames its reply straight into the write buffer and returns, reaching neither `string::get` nor
