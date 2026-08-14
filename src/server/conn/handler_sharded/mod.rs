@@ -736,6 +736,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         break;
                     }
 
+                    // MONITOR feed for the two ACL-EXEMPT commands below.
+                    // AUTH and HELLO are intercepted above the ACL gate, hence
+                    // above the main feed hook, so they would never be fed —
+                    // and they are precisely the two carrying credentials.
+                    // Their intercepts `continue`, so no double-feed.
+                    if cmd.eq_ignore_ascii_case(b"AUTH") || cmd.eq_ignore_ascii_case(b"HELLO") {
+                        crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
+                    }
+
                     // === ACL-EXEMPT COMMANDS ===
                     //
                     // AUTH and HELLO carry Redis's `NO_AUTH` flag and are
@@ -913,6 +922,62 @@ pub(crate) async fn handle_connection_sharded_inner<
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;
                     }
+
+                    // --- MONITOR: attach, and the rules once attached ---
+                    //
+                    // Identical placement to handler_monoio: BELOW the ACL gate
+                    // (above it, MONITOR would exempt itself from ACL — the
+                    // v0.8.6 P0 shape, and MONITOR reads every other user's
+                    // arguments) and BELOW the MULTI queue gate (so a queued
+                    // command `continue`s before the feed, which is how "queued
+                    // commands are fed at EXEC, not at queue time" falls out
+                    // without a special case).
+                    if cmd.eq_ignore_ascii_case(b"MONITOR") {
+                        if !cmd_args.is_empty() {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR wrong number of arguments for 'monitor' command",
+                            )));
+                        } else if !conn.monitor_attached {
+                            let (tx, rx) = crate::runtime::channel::mpsc_bounded::<Bytes>(4096);
+                            if crate::monitor::attach(conn.client_id, tx) {
+                                conn.monitor_rx = Some(rx);
+                                responses
+                                    .push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            }
+                            conn.monitor_attached = true;
+                        }
+                        // Already attached: Redis answers NOTHING. Measured —
+                        // silence, not an error.
+                        continue;
+                    }
+                    if conn.monitor_attached
+                        && let Some(refusal) =
+                            crate::server::conn::monitor_mode::refuse_if_keyspace(cmd)
+                    {
+                        responses.push(refusal);
+                        continue;
+                    }
+
+                    // --- MONITOR feed ---
+                    //
+                    // Before dispatch, so a blocking command appears when it is
+                    // issued rather than when it unblocks. One Relaxed atomic
+                    // load when unattached; everything else is behind it in a
+                    // #[cold] path. EXEC replays its queue first, in order,
+                    // followed by the EXEC line.
+                    if cmd.eq_ignore_ascii_case(b"EXEC") && !conn.multi_dirty {
+                        for queued in &conn.command_queue {
+                            if let Some((qcmd, qargs)) = extract_command(queued) {
+                                crate::monitor::feed_frames(
+                                    conn.selected_db,
+                                    &peer_addr,
+                                    qcmd,
+                                    qargs,
+                                );
+                            }
+                        }
+                    }
+                    crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
 
                     // --- CLUSTER subcommands ---
                     if cmd.eq_ignore_ascii_case(b"CLUSTER") {
@@ -2689,6 +2754,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                 }
             }
+            // MONITOR: deliver feed lines while the connection is idle in
+            // read(). Pending-branch when unattached, so a non-monitor
+            // connection pays nothing. The channel carries already-formatted
+            // `+…\r\n` lines, written verbatim.
+            mon_line = async {
+                match conn.monitor_rx {
+                    Some(ref rx) => rx.recv_async().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                match mon_line {
+                    Some(data) => {
+                        if !write_all_bounded!(stream, &data, write_timeout, out_cap_normal, client_live, client_id) {
+                            break;
+                        }
+                    }
+                    // The registry dropped this sink because the connection
+                    // could not keep up. Contracted policy: the monitor dies
+                    // loudly rather than silently receiving a partial feed.
+                    None => break,
+                }
+            }
             // CLIENT TRACKING: deliver invalidation Push frames while the
             // connection is idle in read(). Pending-branch when tracking is
             // off — zero cost for non-tracking connections.
@@ -2738,6 +2825,13 @@ pub(crate) async fn handle_connection_sharded_inner<
             *txn,
         ))
         .await;
+    }
+
+    // Detach from the MONITOR feed. A retained dead sink would keep the feed
+    // formatting into a closed channel and keep `any_attached()` true, which
+    // also holds the inline fast path down for the rest of the process.
+    if conn.monitor_attached {
+        crate::monitor::detach(client_id);
     }
 
     // Clean up pub/sub subscriptions on disconnect

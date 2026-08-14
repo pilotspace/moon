@@ -53,6 +53,7 @@ pub mod error;
 pub mod graph;
 pub mod io;
 pub mod memory_ctl;
+pub mod monitor;
 pub mod mq;
 pub mod notify;
 pub mod notify_fanout;

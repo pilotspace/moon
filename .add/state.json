@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "pubsub-resp3-push",
+  "active_task": "monitor-command-feed",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -418,14 +418,49 @@
     },
     "monitor-command-feed": {
       "title": "MONITOR command feed \u2014 stream executed commands, redacted, zero-cost when unattached",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-compat-harness"
       ],
       "created": "2026-08-11T16:13:33+00:00",
-      "updated": "2026-08-11T16:13:33+00:00"
+      "updated": "2026-08-14T06:47:34+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "b0ac9bbaae7f8226060b7aefcde0d5fe",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          "src/monitor/",
+          "src/server/conn/",
+          "src/scripting/bridge.rs",
+          "src/command/metadata.rs",
+          "src/acl/rules.rs",
+          "src/lib.rs",
+          "tests/monitor_command_feed.rs",
+          "scripts/client-compat/manifest.yaml",
+          "CHANGELOG.md",
+          "tmp/"
+        ],
+        "snapshot_md5": "9a0aefc4568a02fb916c7b201b53bdd9"
+      },
+      "heal": {
+        "attempts": 2,
+        "history": [
+          {
+            "at": "2026-08-14T06:45:35+00:00",
+            "reason": "scope_violation: task 'monitor-command-feed' touched outside its declared \u00a75 Scope \u2014 CHANGELOG.md \u00b7 scripts/client-compat/manifest.yaml \u00b7 src/acl/rules.rs \u00b7 src/command/metadata.rs \u00b7 src/lib.rs (16 total)",
+            "source": "scope"
+          },
+          {
+            "at": "2026-08-14T06:46:32+00:00",
+            "reason": "scope_violation: task 'monitor-command-feed' touched outside its declared \u00a75 Scope \u2014 CHANGELOG.md \u00b7 scripts/client-compat/manifest.yaml \u00b7 src/acl/rules.rs \u00b7 src/command/metadata.rs \u00b7 src/lib.rs (16 total)",
+            "source": "scope"
+          }
+        ]
+      }
     },
     "batch-protocol-version-fidelity": {
       "title": "Response batch must be encoded in the protocol in effect when each reply was produced",
@@ -540,7 +575,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-14T03:44:37+00:00",
+  "updated": "2026-08-14T06:47:34+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

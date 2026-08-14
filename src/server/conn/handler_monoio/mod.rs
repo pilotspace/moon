@@ -1036,6 +1036,56 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 continue;
             }
+        } else if let Some(rx) = conn.monitor_rx.as_ref()
+            && conn.monitor_attached
+        {
+            // MONITOR: deliver feed lines while parked in read(). A monitor
+            // connection stays in this loop — it is not diverted anywhere —
+            // because Redis keeps serving it (PING, INFO, RESET all work while
+            // attached); only keyspace commands are refused, and that refusal
+            // is a gate below, not a separate mode loop.
+            //
+            // The channel carries already-formatted `+…\r\n` lines, so this
+            // arm writes them verbatim. Same tearing argument as the RESP3
+            // subscriber arm above: both a reply and a feed line are whole
+            // frames written by this one task, and the loop only parks here
+            // when no reply is in flight.
+            let mon_buf = std::mem::take(&mut tmp_buf);
+            let mut line: Option<bytes::Bytes> = None;
+            monoio::select! {
+                _ = shutdown.cancelled() => { break; }
+                read_result = stream.read(mon_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                msg = rx.recv_async() => {
+                    line = msg.ok();
+                }
+            }
+            if let Some(data) = line {
+                if !write_all_bounded!(
+                    stream,
+                    data,
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                ) {
+                    break;
+                }
+                continue;
+            } else if conn.monitor_attached && !crate::monitor::is_attached(client_id) {
+                // The registry dropped this sink because the connection could
+                // not keep up. Contracted policy: the monitor DIES, loudly,
+                // rather than silently receiving an incomplete feed that an
+                // operator would read as a quiet server.
+                break;
+            }
         } else if conn.tracking_rx.is_some() {
             // CLIENT TRACKING: deliver invalidation Push frames while parked
             // in read(). Only tracking connections take this select — the
@@ -1341,9 +1391,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // `*1[$1 v]`. `MGET`, not being inline-eligible, queued correctly
             // all along, which is what isolated the path.
             // See `tests/multi_queues_inline_get.rs`.
+            // MONITOR: the inline path answers straight from the read buffer
+            // and never sees `peer_addr`, so it cannot format a feed line. Rather
+            // than thread the address through the hottest function in the
+            // codebase, the fast path stands down while any monitor is attached
+            // — the feed is then correct BY CONSTRUCTION on this path instead of
+            // by a hook someone must remember to keep in sync. The cost is
+            // throughput while monitoring, which is the moment an operator has
+            // already accepted diagnostic overhead; when unattached this is one
+            // Relaxed load that the branch below would take anyway.
+            let monitored = crate::monitor::any_attached();
             let can_inline_reads =
-                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
+                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled && !monitored;
             let can_inline_writes = acl_unrestricted
+                && !monitored
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
                 && !crate::tracking::tracking_active()
@@ -1529,6 +1590,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 should_quit = true;
                 break;
             }
+
             // --- ASKING ---
             if cmd.eq_ignore_ascii_case(b"ASKING") {
                 conn.asking = true;
@@ -1564,6 +1626,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // connection-level command names. Cut per-command dispatch cost
             // from ~14 non-matching function calls to ~1 on SET/GET workloads.
             let cmd_len = cmd.len();
+            // MONITOR feed for the two ACL-EXEMPT commands below.
+            //
+            // AUTH and HELLO carry Redis's NO_AUTH flag and are therefore
+            // intercepted ABOVE the ACL gate — which puts them above the main
+            // feed hook further down, so they would never be fed at all. They
+            // are also the only two commands carrying credentials, i.e. exactly
+            // the ones whose absence from the feed is least acceptable and
+            // whose arguments must be redacted. Fed here, once; the intercepts
+            // `continue`, so they cannot reach the main hook and double-feed.
+            if cmd.eq_ignore_ascii_case(b"AUTH") || cmd.eq_ignore_ascii_case(b"HELLO") {
+                crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
+            }
+
             // === ACL-EXEMPT COMMANDS ===
             //
             // AUTH and HELLO carry Redis's `NO_AUTH` flag and are permitted
@@ -1697,6 +1772,55 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                 continue;
             }
+
+            // --- MONITOR: attach, and the rules that apply once attached ---
+            //
+            // BELOW the ACL gate and BELOW the MULTI queue gate, deliberately.
+            // Above the ACL gate it would exempt itself from ACL, which is the
+            // exact shape of the v0.8.6 P0 — and MONITOR is the last command
+            // that should be reachable without permission, since it reads every
+            // other user's arguments. Below the MULTI gate, a queued command
+            // `continue`s before reaching the feed, which is how M9 (queued
+            // commands are fed at EXEC, not at queue time) falls out for free
+            // rather than needing its own special case.
+            if cmd.eq_ignore_ascii_case(b"MONITOR") {
+                match dispatch::handle_monitor(cmd_args, &mut conn, ctx, &peer_addr) {
+                    Some(reply) => responses.push(reply),
+                    // Already attached: Redis answers NOTHING here. Measured —
+                    // it is not an error, it is silence.
+                    None => {}
+                }
+                continue;
+            }
+            if conn.monitor_attached
+                && let Some(refusal) = crate::server::conn::monitor_mode::refuse_if_keyspace(cmd)
+            {
+                responses.push(refusal);
+                continue;
+            }
+
+            // --- MONITOR feed ---
+            //
+            // Before dispatch, so a BLOCKING command appears when it is issued
+            // rather than when it unblocks — that ordering is the whole reason
+            // an operator watches the feed. Costs one Relaxed atomic load when
+            // no monitor is attached; everything else (the hidden-set check,
+            // the registry/arity check, formatting, redaction, fan-out) lives
+            // behind that load in a #[cold] path.
+            //
+            // EXEC first replays its queue: Redis feeds a queued command when
+            // it EXECUTES, so the body lines appear at EXEC time, in order,
+            // followed by the EXEC line itself (measured 5µs apart). A dirty
+            // transaction is refused wholesale and never runs, so it feeds
+            // nothing.
+            if cmd.eq_ignore_ascii_case(b"EXEC") && !conn.multi_dirty {
+                for queued in &conn.command_queue {
+                    if let Some((qcmd, qargs)) = extract_command(queued) {
+                        crate::monitor::feed_frames(conn.selected_db, &peer_addr, qcmd, qargs);
+                    }
+                }
+            }
+            crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
 
             if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
                 continue;
@@ -3593,6 +3717,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             ctx.pubsub_affinity.write().remove_pubsub(&addr.ip());
         }
+    }
+
+    // --- Disconnect cleanup: detach from the MONITOR feed ---
+    //
+    // Unconditional and cheap: `detach` is a no-op for a connection that was
+    // never a monitor. Leaving a dead sink registered would keep the feed
+    // formatting and fanning out to a closed channel, and would keep
+    // `any_attached()` true — which also holds the inline fast path down for
+    // the rest of the process.
+    if conn.monitor_attached {
+        crate::monitor::detach(client_id);
     }
 
     // --- Disconnect cleanup: release CLIENT TRACKING registration ---

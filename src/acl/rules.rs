@@ -507,6 +507,10 @@ pub fn get_category_commands(category: &str) -> &'static [&'static str] {
             "config",
             "info",
             "debug",
+            // MONITOR streams every other client's traffic, arguments included.
+            // Without membership here, `+@all -@admin` would still be able to
+            // read every other user's commands.
+            "monitor",
             "bgsave",
             "bgrewriteaof",
             "save",

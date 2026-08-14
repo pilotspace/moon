@@ -1229,6 +1229,16 @@ pub(crate) fn try_handle_reset(
     }
     conn.subscription_count = 0;
 
+    // MONITOR — detach from the command feed. RESET is contracted to return
+    // the connection to its normal state, and a connection still receiving
+    // feed lines after RESET would have `+…` lines injected into the reply
+    // stream of a client that believes it is issuing ordinary commands.
+    if conn.monitor_attached {
+        crate::monitor::detach(client_id);
+        conn.monitor_attached = false;
+        conn.monitor_rx = None;
+    }
+
     // Identity + protocol, from the one definition of "default".
     let (proto, db, authed, user, name) =
         crate::server::conn::util::restore_migrated_state(None, requirepass);
