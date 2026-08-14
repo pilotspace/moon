@@ -77,6 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Remote panic on the cluster bus: a truncated v3 gossip header killed the process.** The gossip
+  wire v3 (#493) appended a 40-byte `sender_master_id`, but the deserializer's length guard still
+  admitted any frame of at least the v2 header size so that a genuine v2 peer would still parse —
+  and the v3 branch then read `data[2130..2170]` unconditionally. Any frame carrying version 3 with
+  a length in `2130..2170` indexed past the end. The cluster bus listener hands this function
+  peer-supplied bytes, so a single unauthenticated 2130-byte frame to the bus port panicked the
+  `cluster-ctl` thread, which by policy aborts the whole server. A short v3 header is now rejected
+  as malformed. Seeded into `fuzz/corpus/gossip_deser` — the target was correct but had not
+  synthesised the 4-byte magic plus that 40-byte length window within its PR budget.
 - **`CLUSTER INFO` no longer claims `cluster_enabled`, and a slotless node no longer claims health.**
   Two integration assertions encoded the pre-fix behaviour and contradicted the measured oracle:
   redis-server 8.6.1 reports `cluster_enabled` in `INFO` only — `CLUSTER INFO` never carries it —
