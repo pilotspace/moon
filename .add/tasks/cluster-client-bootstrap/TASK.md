@@ -317,7 +317,7 @@ Routing
   slot owned by self                  -> serve locally
   slot owned by another live node     -> -MOVED <slot> <host>:<port>
   slot claimed by NO node, cluster of one   -> serve locally      (bootstrap; preserved)
-  slot claimed by NO node, formed cluster   -> -CLUSTERDOWN The cluster is down
+  slot claimed by NO node, formed cluster   -> -CLUSTERDOWN Hash slot not served   (v2, see AMENDMENT 1)
   READONLY on a replica, READ  of a slot its master owns  -> serve locally
   READONLY on a replica, WRITE of that slot               -> -MOVED to the master
   READWRITE                                               -> restore redirection
@@ -361,7 +361,29 @@ Not in scope, stated so the boundary is explicit: resharding and `CLUSTER SETSLO
 choreography, automatic failover election, `cluster-require-full-coverage no`, and
 `CLUSTER LINKS` / `SLOT-STATS`.
 
-Status: FROZEN @ v1 — approved by Tin Dang, 2026-08-14.
+Status: FROZEN @ v2 — v1 approved by Tin Dang, 2026-08-14; AMENDMENT 1 below.
+
+AMENDMENT 1 (2026-08-14, during batch 1) — unclaimed-slot error text.
+v1 said an unclaimed slot in a formed cluster answers `-CLUSTERDOWN The cluster is down`. That is
+wrong, and it is wrong in the way this contract's own header forbids: it was *derived* from the
+fail-closed clause's wording rather than measured. Redis has TWO CLUSTERDOWN messages and a client
+can tell them apart:
+  - `CLUSTERDOWN Hash slot not served`  — THIS slot has no owner; the cluster may be otherwise healthy
+  - `CLUSTERDOWN The cluster is down`   — cluster_state is fail (the fail-closed gate)
+Measured: redis-server, 3 masters, `cluster-require-full-coverage no`, `CLUSTER DELSLOTS 12182` on
+the owner, then GET and SET of a key hashing to 12182 **on that same node** — both answered
+`CLUSTERDOWN Hash slot not served`, and `cluster_state` stayed `ok`, which is what confirms the
+per-slot reading rather than a cluster-wide one. A peer that had not yet learned of the DELSLOTS
+still answered `MOVED 12182 127.0.0.1:7403`, so the message is the ex-owner's own reply.
+
+Conflating the two is not cosmetic: it tells an operator the whole cluster is down when one slot
+lost its owner. The fail-closed clause further down is UNCHANGED and correct — `The cluster is down`
+is right there, and batch 3 still owns it. Only the routing line moved.
+
+Recorded as an amendment rather than a silent edit because §3 is frozen. This is a correction toward
+the oracle the contract already names as its authority, not a relaxation to accommodate the build —
+the build was written to v1 and had to CHANGE to satisfy v2 (`SlotRoute::Down` renamed to
+`SlotRoute::SlotNotServed` with the measured text), and `cb21` was added to pin it.
 
 Both open assumptions were confirmed against the code before freezing rather than during build,
 which is what caught M19: confirming that the PFAIL machinery could be reused revealed that reusing
@@ -453,6 +475,11 @@ assertion confirmed to fail before its batch, not just the shared precondition.
 
 Numbering note: the plan lists 18 tests, numbered cb1..cb20 with 13 and 14 unused. That is a hole in
 the numbering, not missing coverage — every Must M1-M19 and every Reject R1-R3 maps to a written test.
+
+  - cb21 an unclaimed slot answers `CLUSTERDOWN Hash slot not served`, NOT `The cluster is down`,
+         for both a read and a write. Added during batch 1 by AMENDMENT 1; red for the right reason
+         twice over — it asserts an exact string the build did not contain, and before batch 1 the
+         same command was *served* rather than refused. (M2, AMENDMENT 1)
 
 POST-BATCH-1 RE-READ (2026-08-14, tokio leg): **4 passed, 14 failed**. The cascade note above is
 discharged — no test now fails inside `await_slot_convergence`. Each remaining failure names its own

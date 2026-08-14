@@ -185,7 +185,11 @@ pub enum SlotRoute {
     /// No node in a FORMED cluster claims this slot, so there is nobody to
     /// redirect to and nobody who can answer. Serving it locally would hand the
     /// client a partial view of the keyspace it cannot detect.
-    Down,
+    ///
+    /// Distinct from the cluster-wide fail-closed state: Redis has TWO
+    /// CLUSTERDOWN messages and this is the per-slot one. See
+    /// `into_error_frame`.
+    SlotNotServed,
 }
 
 impl SlotRoute {
@@ -201,7 +205,21 @@ impl SlotRoute {
             SlotRoute::CrossSlot => Frame::Error(Bytes::from_static(
                 b"CROSSSLOT Keys in request don't hash to the same slot",
             )),
-            SlotRoute::Down => Frame::Error(Bytes::from_static(b"CLUSTERDOWN The cluster is down")),
+            // Redis has TWO CLUSTERDOWN messages and they are not
+            // interchangeable. This is the PER-SLOT one: the slot has no owner,
+            // so there is nobody to redirect to. `CLUSTERDOWN The cluster is
+            // down` is the CLUSTER-WIDE one, sent when cluster_state is fail,
+            // and belongs to the fail-closed gate rather than here.
+            //
+            // Measured against redis-server (3 masters,
+            // cluster-require-full-coverage no, CLUSTER DELSLOTS 12182 on the
+            // owner, then GET/SET of a key hashing to 12182 on that node):
+            //   CLUSTERDOWN Hash slot not served
+            // A peer that still believed the old owner answered MOVED, which is
+            // why this must be the ex-owner's own reply and not a redirect.
+            SlotRoute::SlotNotServed => {
+                Frame::Error(Bytes::from_static(b"CLUSTERDOWN Hash slot not served"))
+            }
             SlotRoute::Local => unreachable!("Local routes do not produce error frames"),
         }
     }
@@ -336,7 +354,7 @@ impl ClusterState {
         if self.nodes.len() <= 1 {
             SlotRoute::Local
         } else {
-            SlotRoute::Down
+            SlotRoute::SlotNotServed
         }
     }
 

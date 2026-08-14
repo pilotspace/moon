@@ -504,6 +504,53 @@ fn cb4_lone_node_with_no_slots_still_serves_locally() {
     assert_eq!(c.cmd(&["GET", "k"]), Val::Str("v".into()));
 }
 
+#[test]
+fn cb21_an_unclaimed_slot_says_hash_slot_not_served_not_cluster_is_down() {
+    // Redis has TWO CLUSTERDOWN messages and a client can distinguish them:
+    // `Hash slot not served` means THIS slot has no owner (the cluster may be
+    // perfectly healthy otherwise), while `The cluster is down` means
+    // cluster_state is fail. Conflating them tells an operator the whole
+    // cluster is down when one slot lost its owner.
+    //
+    // Measured against redis-server (3 masters, cluster-require-full-coverage
+    // no, CLUSTER DELSLOTS 12182 on the owner, then GET and SET of a key
+    // hashing to 12182 on that same node): both answered
+    //   CLUSTERDOWN Hash slot not served
+    // and cluster_state stayed `ok`, confirming the per-slot reading.
+    let cl = form_cluster(3);
+    assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
+
+    let key = "foo";
+    let owner = owner_of(&cl, key);
+    let slot = 12182; // CRC16("foo") & 16383
+
+    let mut oc = cl.conn(owner);
+    assert_eq!(
+        oc.cmd(&["CLUSTER", "DELSLOTS", &slot.to_string()]),
+        Val::Str("OK".into()),
+        "DELSLOTS on the owner must succeed to create the coverage hole"
+    );
+
+    // Ask the EX-OWNER, which is the node that knows nobody owns the slot. A
+    // peer that has not yet learned of the DELSLOTS still answers MOVED, so
+    // this assertion only means anything against the ex-owner itself.
+    for cmd in [
+        vec!["GET", key],
+        vec!["SET", key, "must-not-be-served-anywhere"],
+    ] {
+        match oc.cmd(&cmd) {
+            Val::Err(e) => assert_eq!(
+                e, "CLUSTERDOWN Hash slot not served",
+                "{cmd:?} on a slot nobody owns must name the SLOT, not the cluster"
+            ),
+            other => panic!(
+                "{cmd:?} on an unowned slot must be refused, got {other:?} — \
+                 serving it is #485 with extra steps"
+            ),
+        }
+    }
+}
+
 // ── M4-M9: CLUSTER SHARDS ──────────────────────────────────────────────────
 
 fn shards(c: &mut Conn) -> Vec<Val> {
