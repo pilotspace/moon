@@ -9,6 +9,7 @@ pub mod handler_sharded;
 pub mod handler_single;
 pub mod park_policy;
 pub mod shared;
+pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
 pub mod util;

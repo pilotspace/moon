@@ -465,40 +465,88 @@ fn serialize_pmessage_bytes_push(pattern: &Bytes, channel: &Bytes, payload: &Byt
 
 // -- Message frame helpers --
 
-/// Build a subscribe confirmation response frame.
-pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"subscribe")),
-        Frame::BulkString(channel.clone()),
+/// Build a pub/sub confirmation frame (`subscribe`, `unsubscribe`, …).
+///
+/// Always a [`Frame::Push`], never an `Array`, and that is the whole fix for
+/// the RESP3 confirmation divergence. A confirmation IS out-of-band pub/sub
+/// traffic — the same kind of thing a `message` delivery is — so the frame is
+/// built as what it means and each protocol's serializer renders it in that
+/// protocol's form: `serialize_resp3` writes `>`, while RESP2 `serialize`
+/// downgrades Push to `*` (`src/protocol/serialize.rs`, the same mechanism
+/// `Frame::Set` relies on). RESP2 clients therefore see byte-for-byte what
+/// they saw before.
+///
+/// The alternative — threading a `resp3: bool` down to every call site — was
+/// rejected once it became clear the serializer already encodes exactly this
+/// rule: a second copy of the decision is a second thing to get out of sync,
+/// and the three handlers drifting apart is precisely what this task is
+/// cleaning up.
+///
+/// `name` is a static verb; `channel` is `None` only for the
+/// `UNSUBSCRIBE`-with-no-arguments case on a connection subscribed to nothing,
+/// where Redis sends a Null channel name rather than an empty string.
+#[inline]
+fn confirmation(name: &'static [u8], channel: Option<&Bytes>, count: usize) -> Frame {
+    Frame::Push(framevec![
+        Frame::BulkString(Bytes::from_static(name)),
+        match channel {
+            Some(c) => Frame::BulkString(c.clone()),
+            None => Frame::Null,
+        },
         Frame::Integer(count as i64),
     ])
+}
+
+/// Build a subscribe confirmation response frame.
+pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"subscribe", Some(channel), count)
 }
 
 /// Build an unsubscribe confirmation response frame.
 pub fn unsubscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"unsubscribe")),
-        Frame::BulkString(channel.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"unsubscribe", Some(channel), count)
+}
+
+/// Build the `UNSUBSCRIBE`-with-no-arguments reply when no CHANNEL was removed.
+///
+/// Redis names a Null channel (`$-1`) here, not an empty bulk string (`$0`) —
+/// measured, and a statically-typed client decodes the two differently.
+///
+/// `count` is the connection's REMAINING total subscription count, not zero: a
+/// connection holding only pattern subscriptions removes no channel here but
+/// still reports what it is subscribed to.
+pub fn unsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"unsubscribe", None, count)
 }
 
 /// Build a psubscribe confirmation response frame.
 pub fn psubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"psubscribe")),
-        Frame::BulkString(pattern.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"psubscribe", Some(pattern), count)
 }
 
 /// Build a punsubscribe confirmation response frame.
 pub fn punsubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"punsubscribe")),
-        Frame::BulkString(pattern.clone()),
-        Frame::Integer(count as i64),
-    ])
+    confirmation(b"punsubscribe", Some(pattern), count)
+}
+
+/// Build the `PUNSUBSCRIBE`-with-no-arguments reply when nothing is subscribed.
+pub fn punsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"punsubscribe", None, count)
+}
+
+/// Build an ssubscribe confirmation response frame (sharded pub/sub).
+pub fn ssubscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"ssubscribe", Some(channel), count)
+}
+
+/// Build an sunsubscribe confirmation response frame (sharded pub/sub).
+pub fn sunsubscribe_response(channel: &Bytes, count: usize) -> Frame {
+    confirmation(b"sunsubscribe", Some(channel), count)
+}
+
+/// Build the `SUNSUBSCRIBE`-with-no-arguments reply when nothing is subscribed.
+pub fn sunsubscribe_none_response(count: usize) -> Frame {
+    confirmation(b"sunsubscribe", None, count)
 }
 
 /// Build a message delivery frame for exact-channel subscription.

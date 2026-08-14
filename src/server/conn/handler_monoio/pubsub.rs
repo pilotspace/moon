@@ -93,17 +93,15 @@ pub(super) fn try_handle_publish(
 /// Returns `true` if the command was consumed.
 pub(super) fn try_handle_unsubscribe(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
     if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
-        responses.push(crate::pubsub::unsubscribe_response(
-            &Bytes::from_static(b""),
-            0,
-        ));
+        responses.push(crate::pubsub::unsubscribe_none_response(0));
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-        responses.push(crate::pubsub::punsubscribe_response(
-            &Bytes::from_static(b""),
-            0,
-        ));
+        responses.push(crate::pubsub::punsubscribe_none_response(0));
+        return true;
+    }
+    if cmd.eq_ignore_ascii_case(b"SUNSUBSCRIBE") {
+        responses.push(crate::pubsub::sunsubscribe_none_response(0));
         return true;
     }
     false
@@ -315,11 +313,13 @@ pub(super) fn try_handle_pubsub_introspection(
             responses.push(Frame::Array(arr.into()));
         }
         Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
-            let mut total: usize = 0;
-            for reg in &ctx.all_pubsub_registries {
-                total += reg.read().numpat();
-            }
-            responses.push(Frame::Integer(total as i64));
+            // DISTINCT patterns, not pattern SUBSCRIPTIONS. Summing
+            // `numpat()` was wrong twice over: it counted two clients on one
+            // pattern as two, and it counted one pattern twice when its
+            // subscribers landed on different shard threads. Reusing the
+            // INFO gather means `pubsub_patterns` and NUMPAT cannot disagree.
+            let (_, patterns) = crate::pubsub::instance_pubsub_counts(&ctx.all_pubsub_registries);
+            responses.push(Frame::Integer(patterns as i64));
         }
         _ => {
             responses.push(Frame::Error(Bytes::from_static(

@@ -634,7 +634,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                         if removed.is_empty() {
                                                             conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
-                                                            let resp = crate::pubsub::unsubscribe_response(&Bytes::from_static(b""), conn.subscription_count);
+                                                            let resp = crate::pubsub::unsubscribe_none_response(conn.subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
@@ -726,7 +726,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                         if removed.is_empty() {
                                                             conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
-                                                            let resp = crate::pubsub::punsubscribe_response(&Bytes::from_static(b""), conn.subscription_count);
+                                                            let resp = crate::pubsub::punsubscribe_none_response(conn.subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();

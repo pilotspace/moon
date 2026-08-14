@@ -161,7 +161,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     if removed.is_empty() {
                                         conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                         write_buf.clear();
-                                        crate::protocol::serialize(&pubsub::unsubscribe_response(&Bytes::from_static(b""), conn.subscription_count), write_buf);
+                                        crate::protocol::serialize(&pubsub::unsubscribe_none_response(conn.subscription_count), write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     } else {
                                         for ch in &removed {
@@ -190,7 +190,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                     if removed.is_empty() {
                                         conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                         write_buf.clear();
-                                        crate::protocol::serialize(&pubsub::punsubscribe_response(&Bytes::from_static(b""), conn.subscription_count), write_buf);
+                                        crate::protocol::serialize(&pubsub::punsubscribe_none_response(conn.subscription_count), write_buf);
                                         if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                                     } else {
                                         for pat in &removed {
@@ -429,9 +429,9 @@ pub(super) fn try_handle_unsubscribe(cmd: &[u8], responses: &mut Vec<Frame>) -> 
     }
     let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
     let resp = if is_pattern {
-        pubsub::punsubscribe_response(&Bytes::from_static(b""), 0)
+        pubsub::punsubscribe_none_response(conn.subscription_count)
     } else {
-        pubsub::unsubscribe_response(&Bytes::from_static(b""), 0)
+        pubsub::unsubscribe_none_response(conn.subscription_count)
     };
     responses.push(resp);
     true
@@ -559,11 +559,13 @@ pub(super) fn try_handle_pubsub_introspection(
             responses.push(Frame::Array(arr.into()));
         }
         Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
-            let mut total: usize = 0;
-            for reg in &ctx.all_pubsub_registries {
-                total += reg.read().numpat();
-            }
-            responses.push(Frame::Integer(total as i64));
+            // DISTINCT patterns, not pattern SUBSCRIPTIONS. Summing
+            // `numpat()` was wrong twice over: it counted two clients on one
+            // pattern as two, and it counted one pattern twice when its
+            // subscribers landed on different shard threads. Reusing the
+            // INFO gather means `pubsub_patterns` and NUMPAT cannot disagree.
+            let (_, patterns) = crate::pubsub::instance_pubsub_counts(&ctx.all_pubsub_registries);
+            responses.push(Frame::Integer(patterns as i64));
         }
         _ => {
             responses.push(Frame::Error(Bytes::from_static(
