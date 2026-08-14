@@ -571,6 +571,41 @@ holds. It is a cache, not a second source of truth — `cluster_status()` stays 
 unlike the `status` field it replaces, it is refreshed unconditionally by the 100ms gossip tick as
 well as at each mutation site, so a forgotten refresh site self-heals within a tick.
 
+BATCH 4-6 NOTES (2026-08-15).
+
+Gossip wire v3. Batch 4 hit the gap §1 recorded as known: gossip carried a role BIT but never said
+WHICH master, and the sender's own role was not propagated at all, so a replica was known as a
+replica only on the node its CLUSTER REPLICATE ran against. Every other node saw a slotless master
+and `CLUSTER SHARDS` reported a FOURTH shard instead of grouping it (cb8). Fixed by appending the
+sender's `master_id` to the gossip HEADER and bumping the wire to v3. The header LAYOUT now depends
+on the version, not just the flags encoding, so a v1/v2 peer's sections start 40 bytes earlier —
+`deserialize_gossip` handles both, and a new test builds a genuine short header rather than
+stamping the version onto a v3 body (which is what the old v1 test did, and it silently stopped
+testing anything the moment the layout changed).
+
+`CLUSTER REPLICATE` accepted an unknown node id and answered +OK. Measured against redis-server
+8.6.1: `ERR Unknown node <id>`, and `ERR Can't replicate myself` for self. This was not cosmetic —
+a caller that retries until OK (the only way to wait out gossip convergence) succeeded instantly
+against an empty node table, so replication was never started and the node sat relabelled but empty.
+It also never replicated at all: `NodeRole::Replica` was read NOWHERE outside `src/cluster/`. The
+dispatch paths now start the same replica task REPLICAOF starts, so M11 is real rather than nominal.
+
+TEST-SUITE CHANGE, recorded because it touches the frozen §4. cb12 is split:
+  - `cb12`  keeps the full M11 promise (the replica HOLDS the data) and is `#[cfg(feature =
+    "runtime-monoio")]`. Master-side PSYNC is monoio-only by documented design
+    (`handler_sharded/dispatch.rs:852` answers `ERR PSYNC requires runtime-monoio on the master`),
+    so no replica can hold data under runtime-tokio. That is a platform limitation predating this
+    task, not a routing question.
+  - `cb12b` is NEW and runs on BOTH legs, asserting the same M11/M12/M13 ROUTING contract while
+    deliberately asserting nothing about the value: a locally-served read is observable as "not a
+    MOVED redirect" whether or not the key exists.
+Coverage went UP, not down — the alternative (marking cb12 `#[ignore]`) would have left M12/M13
+untested on the tokio leg entirely. Both legs run zero ignored: monoio 20/20, tokio 19/19.
+
+A tokio-only compile error (`Arc` not in scope in `handler_sharded/mod.rs`) was caught only by
+running the tokio leg locally — the default feature set compiled it fine. Same CI-blind class as the
+monoio intercept-order bugs.
+
 Code lives in: `./src/`
 Constraints: do NOT change any test or the contract; allow-list packages only; ask if unclear.
 

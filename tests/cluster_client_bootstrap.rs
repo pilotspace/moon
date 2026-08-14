@@ -561,7 +561,6 @@ fn shards(c: &mut Conn) -> Vec<Val> {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER SHARDS) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb5_cluster_shards_reports_every_shard_cluster_wide() {
     let cl = form_cluster(3);
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
@@ -598,7 +597,6 @@ fn cb5_cluster_shards_reports_every_shard_cluster_wide() {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER SHARDS) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb6_shard_and_node_entries_are_maps_under_resp3_and_arrays_under_resp2() {
     // Measured: the top level stays an Array in BOTH protocols; only the shard
     // and node entries change shape. Copying the RESP2 form into RESP3 is the
@@ -637,7 +635,6 @@ fn cb6_shard_and_node_entries_are_maps_under_resp3_and_arrays_under_resp2() {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER SHARDS) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb7_node_entry_carries_exactly_the_seven_measured_fields() {
     let cl = form_cluster(3);
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
@@ -670,7 +667,6 @@ fn cb7_node_entry_carries_exactly_the_seven_measured_fields() {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER SHARDS) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb8_a_master_and_its_replica_share_one_shard_entry() {
     let cl = form_cluster(3);
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
@@ -730,7 +726,6 @@ fn cb8_a_master_and_its_replica_share_one_shard_entry() {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER SHARDS) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb9_a_failed_node_is_reported_with_health_fail_and_empty_slots() {
     // Measured: the dead node stays listed as `role: master, health: fail`, and
     // its shard's slots array becomes empty. Reporting `role` and `health`
@@ -780,7 +775,6 @@ fn cb9_a_failed_node_is_reported_with_health_fail_and_empty_slots() {
 }
 
 #[test]
-#[ignore = "red until batch 4 (CLUSTER MYSHARDID) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb10_myshardid_is_stable_and_identical_within_a_shard() {
     let cl = form_cluster(3);
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
@@ -809,7 +803,6 @@ fn cb10_myshardid_is_stable_and_identical_within_a_shard() {
 // ── M10-M13: READONLY / READWRITE ──────────────────────────────────────────
 
 #[test]
-#[ignore = "red until batch 5 (READONLY/READWRITE) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb11_readonly_and_readwrite_are_accepted_on_a_cluster_instance() {
     let dir = tempfile::tempdir().unwrap();
     let port = reserve_cluster_ports(1)[0];
@@ -819,8 +812,16 @@ fn cb11_readonly_and_readwrite_are_accepted_on_a_cluster_instance() {
     assert_eq!(c.cmd(&["READWRITE"]), Val::Str("OK".into()));
 }
 
+/// The full M11 promise: the replica actually HOLDS the data and serves it.
+///
+/// Gated to the shipped runtime because the master side of PSYNC is
+/// monoio-only — under `runtime-tokio` the master answers
+/// `ERR PSYNC requires runtime-monoio on the master`
+/// (`handler_sharded/dispatch.rs`), so no replica can ever hold data there.
+/// That is a pre-existing platform limitation, not a routing question, which
+/// is why the ROUTING half is split into `cb12b` below and runs on BOTH legs.
+#[cfg(feature = "runtime-monoio")]
 #[test]
-#[ignore = "red until batch 5 (READONLY/READWRITE) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb12_readonly_serves_replica_reads_but_never_replica_writes() {
     // The measured asymmetry, and the reason READONLY is not just a flag that
     // returns +OK: reads are served locally, writes still redirect.
@@ -880,6 +881,79 @@ fn cb12_readonly_serves_replica_reads_but_never_replica_writes() {
     }
 
     // And READWRITE restores redirection for reads.
+    assert_eq!(rc.cmd(&["READWRITE"]), Val::Str("OK".into()));
+    match rc.cmd(&["GET", &key]) {
+        Val::Err(e) => assert!(e.starts_with("MOVED "), "expected MOVED, got {e:?}"),
+        other => panic!("READWRITE must restore redirection, got {other:?}"),
+    }
+}
+
+/// M11/M12/M13 as a pure ROUTING contract, on both runtime legs.
+///
+/// Deliberately asserts nothing about the VALUE, only about who answers. That
+/// is what makes it runnable under `runtime-tokio`, where the master cannot
+/// serve PSYNC and the replica therefore holds nothing: a locally-served read
+/// is observable as "not a MOVED redirect" whether or not the key exists.
+/// `cb12` covers the data half on the shipped runtime.
+#[test]
+fn cb12b_readonly_routing_holds_on_both_runtimes() {
+    let cl = form_cluster(3);
+    assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let rport = reserve_cluster_ports(1)[0];
+    let _replica = Fleet(vec![Some(spawn_node(dir.path(), rport, &[]))]);
+    let mut rc = Conn::ready(rport);
+    let mut c0 = cl.conn(0);
+    assert_eq!(
+        c0.cmd(&["CLUSTER", "MEET", "127.0.0.1", &rport.to_string()]),
+        Val::Str("OK".into())
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rc.cmd(&["CLUSTER", "REPLICATE", &cl.ids[0]]) != Val::Str("OK".into()) {
+        assert!(Instant::now() < deadline, "CLUSTER REPLICATE kept failing");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let key = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| owner_of(&cl, k) == 0)
+        .expect("a key in node 0's range");
+
+    // Without READONLY a replica redirects reads.
+    match rc.cmd(&["GET", &key]) {
+        Val::Err(e) => assert!(e.starts_with("MOVED "), "expected MOVED, got {e:?}"),
+        other => panic!("a replica must redirect reads until READONLY, got {other:?}"),
+    }
+
+    assert_eq!(rc.cmd(&["READONLY"]), Val::Str("OK".into()));
+
+    // Now the read is SERVED here rather than redirected. The value is not
+    // asserted — only that nobody sent us elsewhere.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match rc.cmd(&["GET", &key]) {
+            Val::Err(e) if e.starts_with("MOVED ") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "READONLY must stop the replica redirecting reads"
+                );
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            _ => break,
+        }
+    }
+
+    // A WRITE is still redirected — replica reads never become replica writes.
+    match rc.cmd(&["SET", &key, "v2"]) {
+        Val::Err(e) => assert!(
+            e.starts_with("MOVED "),
+            "a WRITE on a READONLY replica must still redirect, got {e:?}"
+        ),
+        other => panic!("replica accepted a write under READONLY: {other:?}"),
+    }
+
+    // READWRITE restores redirection for reads.
     assert_eq!(rc.cmd(&["READWRITE"]), Val::Str("OK".into()));
     match rc.cmd(&["GET", &key]) {
         Val::Err(e) => assert!(e.starts_with("MOVED "), "expected MOVED, got {e:?}"),
@@ -975,7 +1049,6 @@ fn cb16_a_degraded_cluster_refuses_keyspace_traffic_even_for_local_slots() {
 // ── M17 / M18: a client can tell what it is talking to ─────────────────────
 
 #[test]
-#[ignore = "red until batch 6 (INFO identity) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb17_info_reports_cluster_mode_honestly() {
     let dir = tempfile::tempdir().unwrap();
     let port = reserve_cluster_ports(1)[0];
@@ -1011,7 +1084,6 @@ fn cb18_cluster_info_does_not_emit_cluster_enabled() {
 // ── rejections ─────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "red until batch 4/5 (argument rejections) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb19_argument_rejections_are_verbatim() {
     let dir = tempfile::tempdir().unwrap();
     let port = reserve_cluster_ports(1)[0];
@@ -1040,7 +1112,6 @@ fn cb19_argument_rejections_are_verbatim() {
 }
 
 #[test]
-#[ignore = "red until batch 4/5 (standalone refusals) lands; see .add/tasks/cluster-client-bootstrap TASK.md §5"]
 fn cb20_cluster_verbs_are_refused_on_a_standalone_instance() {
     let dir = tempfile::tempdir().unwrap();
     let (child, port) = common::spawn_listening(|port| {

@@ -361,6 +361,24 @@ impl ClusterState {
     ///
     /// `asking` is the per-connection ASKING flag (consumed by caller after this call).
     pub fn route_slot(&self, slot: u16, asking: bool) -> SlotRoute {
+        self.route_slot_for(slot, asking, false, false)
+    }
+
+    /// Route a slot, taking the connection's READONLY flag into account.
+    ///
+    /// `readonly` is the per-connection flag set by `READONLY` and cleared by
+    /// `READWRITE`; `is_write` says whether the command about to run mutates.
+    /// The asymmetry between them is the entire point of the verb — a replica
+    /// under READONLY serves reads locally, and still redirects writes to its
+    /// master. An implementation that just answers `+OK` to READONLY gets the
+    /// write half wrong and silently accepts writes on a replica.
+    pub fn route_slot_for(
+        &self,
+        slot: u16,
+        asking: bool,
+        readonly: bool,
+        is_write: bool,
+    ) -> SlotRoute {
         // If client sent ASKING and this slot is IMPORTING, allow it through.
         if asking && self.importing.contains_key(&slot) {
             return SlotRoute::Local;
@@ -411,6 +429,19 @@ impl ClusterState {
                     };
                 }
             }
+            return SlotRoute::Local;
+        }
+
+        // A READONLY replica serves READS for slots its own master owns.
+        //
+        // Scoped to this node's master deliberately: a replica is only a valid
+        // reader for the shard it actually follows, so a key belonging to some
+        // OTHER shard still redirects even under READONLY.
+        if readonly
+            && !is_write
+            && let Some(master_id) = my_node.master_id()
+            && self.nodes.get(master_id).is_some_and(|m| m.owns_slot(slot))
+        {
             return SlotRoute::Local;
         }
 
@@ -540,6 +571,32 @@ pub static CLUSTER_ENABLED: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn cluster_enabled() -> bool {
     CLUSTER_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Validate a `READONLY` / `READWRITE` invocation.
+///
+/// Returns `Some(error)` if the verb must be refused, `None` if the caller
+/// should apply it. Both rejections are measured against redis-server 8.6.1:
+/// a standalone instance refuses the verb outright rather than answering a
+/// misleading `+OK`, and either verb takes no arguments.
+pub fn readonly_verb_reply(cmd: &[u8], args: &[Frame]) -> Option<Frame> {
+    if !cluster_enabled() {
+        return Some(Frame::Error(Bytes::from_static(
+            b"ERR This instance has cluster support disabled",
+        )));
+    }
+    if !args.is_empty() {
+        // Redis lower-cases the command name in an arity error.
+        let name = if cmd.eq_ignore_ascii_case(b"READONLY") {
+            "readonly"
+        } else {
+            "readwrite"
+        };
+        return Some(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{name}' command"
+        ))));
+    }
+    None
 }
 
 #[cfg(test)]

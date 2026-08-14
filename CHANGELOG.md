@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`CLUSTER SHARDS`, `CLUSTER MYSHARDID`, `READONLY` and `READWRITE`** — the four verbs a
+  cluster-aware client needs to bootstrap. `CLUSTER SHARDS` reports every shard cluster-wide, one
+  entry per master with its replicas, master first; a shard that has lost every live node reports an
+  empty `slots` array while still listing the dead node as `role: master, health: fail`. The top
+  level is an Array under both protocols and only the shard and node entries change shape — a Map
+  under RESP3, a flat array under RESP2 — which falls out of building them as `Frame::Map` and
+  letting each serializer render it, the same approach the RESP3 pub/sub work used. A node entry
+  carries exactly `id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`, in that
+  order, because under RESP2 a client may read it positionally. `READONLY` lets a replica serve
+  reads for slots its own master owns; a WRITE still answers `MOVED`, the asymmetry a
+  "just return +OK" implementation gets wrong.
+- **`INFO` reports cluster identity honestly.** `redis_mode` and `cluster_enabled` were the hardcoded
+  literals `standalone` and `0`, under a comment promising the cluster subsystem would say otherwise
+  — nothing ever did. An SDK branches on `redis_mode` before it ever calls `CLUSTER SHARDS`, so a
+  server answering SHARDS correctly while reporting `standalone` stayed undiscoverable as a cluster.
 - **`MONITOR` — the command feed.** `redis-cli monitor` now works against Moon, in Redis's exact
   line format: `+<unix>.<micros> [<db> <addr>] "CMD" "arg" …`, arguments quoted and escaped per
   byte (`sdscatrepr` semantics — `"` `\`, `\n` `\r` `\t`, `\a` `\b`, and `\xHH` for everything
@@ -62,6 +77,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Gossip never said WHICH master a replica follows, so replicas were reported as their own
+  shards.** The flags word carried a role bit but no master id, and a sender's own role was not
+  propagated at all — a replica was known as one only on the node its `CLUSTER REPLICATE` ran
+  against, and every other node saw a slotless master. The sender's `master_id` now rides in the
+  gossip header (wire v3). The header LAYOUT, not just the flags encoding, now depends on the
+  version, so a v1/v2 peer's sections begin 40 bytes earlier and are still parsed.
+- **`CLUSTER REPLICATE` neither validated its argument nor replicated anything.** It answered `+OK`
+  for a node id it had never heard of, and `NodeRole::Replica` was read nowhere outside
+  `src/cluster/` — so a cluster "replica" held no data and could serve no read. It now rejects with
+  the measured `ERR Unknown node <id>` / `ERR Can't replicate myself`, and starts the same
+  replication the `REPLICAOF` path starts. The validation is not cosmetic: a caller retrying until
+  `OK` — the only way to wait out gossip convergence — succeeded instantly against an empty node
+  table, leaving the node relabelled but permanently empty.
 - **An inline closing quote followed by `\r`, vertical tab or form feed was rejected as unbalanced.**
   Redis's `sdssplitargs` tests `isspace(p[1])` after a closing quote; Moon tested only `' '` and
   `'\t'`, so `ECHO "hi"\rx` answered `-ERR Protocol error: unbalanced quotes in request` where Redis

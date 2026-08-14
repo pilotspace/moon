@@ -37,6 +37,25 @@ pub fn handle_cluster_command(
         b"MYID" => handle_cluster_myid(cluster_state),
         b"NODES" => handle_cluster_nodes(cluster_state, self_addr),
         b"SLOTS" => handle_cluster_slots(cluster_state),
+        b"SHARDS" => {
+            // Arity is exact: Redis rejects any argument with the combined
+            // "Unknown subcommand or wrong number of arguments" text rather
+            // than a plain arity error.
+            if args.len() != 1 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Unknown subcommand or wrong number of arguments for 'SHARDS'",
+                ));
+            }
+            handle_cluster_shards(cluster_state)
+        }
+        b"MYSHARDID" => {
+            if args.len() != 1 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Unknown subcommand or wrong number of arguments for 'MYSHARDID'",
+                ));
+            }
+            handle_cluster_myshardid(cluster_state)
+        }
         b"MEET" => handle_cluster_meet(&args[1..], cluster_state),
         b"ADDSLOTS" => handle_cluster_addslots(&args[1..], cluster_state),
         b"DELSLOTS" => handle_cluster_delslots(&args[1..], cluster_state),
@@ -98,6 +117,34 @@ pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAdd
         recv
     );
     Frame::BulkString(Bytes::from(info))
+}
+
+/// The address to replicate from, for a `CLUSTER REPLICATE <node-id>` that
+/// just succeeded.
+///
+/// `CLUSTER REPLICATE` previously did nothing but relabel this node's role:
+/// `NodeRole::Replica` was never read outside `src/cluster/`, so a cluster
+/// "replica" held no data and could serve no read. The caller runs the same
+/// replication start-up `REPLICAOF` uses — the role change and the data path
+/// are separate concerns and only the caller owns a runtime to spawn on.
+///
+/// Returns `None` when the subcommand was not REPLICATE, or when the named
+/// master is unknown (the handler has already answered in that case).
+pub fn cluster_replicate_target(
+    args: &[Frame],
+    cs: &Arc<RwLock<ClusterState>>,
+) -> Option<(String, u16)> {
+    let sub = match args.first() {
+        Some(Frame::BulkString(b)) | Some(Frame::SimpleString(b)) => b,
+        _ => return None,
+    };
+    if !sub.eq_ignore_ascii_case(b"REPLICATE") {
+        return None;
+    }
+    let master_id = extract_string(args.get(1)?);
+    let state = cs.read();
+    let master = state.nodes.get(&master_id)?;
+    Some((master.addr.ip().to_string(), master.addr.port()))
 }
 
 /// CLUSTER MYID -- return this node's 40-char hex node ID.
@@ -462,6 +509,23 @@ pub fn handle_cluster_replicate(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) 
     let master_id = extract_string(&args[0]);
     let mut state = cs.write();
     let my_id = state.node_id.clone();
+
+    // Measured against redis-server 8.6.1:
+    //   CLUSTER REPLICATE <unknown>  -> ERR Unknown node <id>
+    //   CLUSTER REPLICATE <self>     -> ERR Can't replicate myself
+    //
+    // Answering +OK for a master this node has never heard of is not a
+    // cosmetic difference: a caller that retries until OK — the only way to
+    // wait out gossip convergence — succeeds instantly against a node table
+    // that still holds nobody, so replication is never started and the node
+    // sits relabelled but empty.
+    if master_id == my_id {
+        return Frame::Error(Bytes::from_static(b"ERR Can't replicate myself"));
+    }
+    if !state.nodes.contains_key(&master_id) {
+        return Frame::Error(Bytes::from(format!("ERR Unknown node {master_id}")));
+    }
+
     if let Some(my_node) = state.nodes.get_mut(&my_id) {
         my_node.role = NodeRole::Replica { master_id };
     }
@@ -609,6 +673,197 @@ fn extract_string(frame: &Frame) -> String {
 
 /// Convert a 2048-byte slot bitmap to a space-separated string of slot ranges.
 /// E.g., bits 0-8192 set -> "0-8192"
+/// Collect a node's owned slots as inclusive `(start, end)` pairs.
+///
+/// The integer form `CLUSTER SHARDS` wants, as opposed to `bitmap_to_ranges`,
+/// which renders the `CLUSTER NODES` text form ("0-5460", or "-" when empty).
+fn bitmap_to_pairs(bitmap: &[u8; 2048]) -> Vec<(u16, u16)> {
+    let mut pairs = Vec::new();
+    let mut start: Option<u16> = None;
+    let mut prev: u16 = 0;
+    for slot in 0u16..=16383 {
+        let owned = bitmap[slot as usize / 8] & (1 << (slot as usize % 8)) != 0;
+        if owned {
+            if start.is_none() {
+                start = Some(slot);
+            }
+            prev = slot;
+        } else if let Some(s) = start.take() {
+            pairs.push((s, prev));
+        }
+    }
+    if let Some(s) = start {
+        pairs.push((s, prev));
+    }
+    pairs
+}
+
+/// Health as `CLUSTER SHARDS` reports it: `online` or `fail`.
+///
+/// PFAIL reports as `online` on purpose. It is one node's unconfirmed
+/// suspicion, not consensus; surfacing it would make two healthy nodes disagree
+/// about a third in a reply clients use for routing. Only the quorum-confirmed
+/// FAIL is client-visible, which is also what Redis does.
+fn shard_health(node: &ClusterNode) -> &'static str {
+    if node.is_failed() { "fail" } else { "online" }
+}
+
+/// One node entry: exactly seven fields, in the measured order.
+///
+/// Built as a `Frame::Map` regardless of protocol. The RESP2 serializer
+/// downgrades a Map to the flat `[k1, v1, ...]` array Redis sends under RESP2,
+/// and the RESP3 serializer emits `%7` — so the one frame renders correctly in
+/// both without the handler knowing which protocol it is answering. Same
+/// approach as the RESP3 pub/sub Push work: build what it MEANS, let each
+/// serializer render it.
+///
+/// Field ORDER is part of the contract, not an implementation detail: under
+/// RESP2 the reply is a flat array and a client may read it positionally.
+fn shard_node_entry(node: &ClusterNode, repl_offset: i64) -> Frame {
+    let role = if node.is_master() {
+        "master"
+    } else {
+        "replica"
+    };
+    let ip = node.addr.ip().to_string();
+    Frame::Map(vec![
+        (
+            Frame::BulkString(Bytes::from_static(b"id")),
+            Frame::BulkString(Bytes::from(node.node_id.clone())),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"port")),
+            Frame::Integer(node.addr.port() as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"ip")),
+            Frame::BulkString(Bytes::from(ip.clone())),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"endpoint")),
+            Frame::BulkString(Bytes::from(ip)),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"role")),
+            Frame::BulkString(Bytes::from_static(role.as_bytes())),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"replication-offset")),
+            Frame::Integer(repl_offset),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"health")),
+            Frame::BulkString(Bytes::from_static(shard_health(node).as_bytes())),
+        ),
+    ])
+}
+
+/// Deterministic 40-hex shard id for the shard a given master heads.
+///
+/// Derived from the master's node id rather than carried on the wire: the
+/// gossip header is a fixed 2130 bytes, so a real shard-id field would be a
+/// protocol-version change. Every node in a shard derives the same value from
+/// the same master id, which is what `CLUSTER MYSHARDID` promises.
+///
+/// Known divergence, contracted: a real Redis shard id survives failover
+/// because a promoted replica keeps it, while a derived one changes. Failover
+/// is out of scope for this task and the divergence is filed as a spec delta.
+fn shard_id_for_master(master_node_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"moon-shard-id:");
+    hasher.update(master_node_id.as_bytes());
+    let digest = hasher.finalize();
+    // 20 bytes -> 40 hex chars, matching a Redis node/shard id's width.
+    digest[..20]
+        .iter()
+        .fold(String::with_capacity(40), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Group the cluster into shards: one entry per MASTER, with its replicas.
+///
+/// Returns `(master_node_id, members)` with the master first in `members`,
+/// ordered so the reply is stable across calls on one node.
+fn group_into_shards(state: &ClusterState) -> Vec<(String, Vec<&ClusterNode>)> {
+    let mut masters: Vec<&ClusterNode> = state.nodes.values().filter(|n| n.is_master()).collect();
+    // HashMap iteration order is arbitrary; sort so repeated calls agree.
+    // Redis does NOT sort shards by slot (measured), so any stable order is
+    // conformant — node id is the cheapest one that is actually stable.
+    masters.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    masters
+        .into_iter()
+        .map(|master| {
+            let mut members = vec![master];
+            let mut replicas: Vec<&ClusterNode> = state
+                .nodes
+                .values()
+                .filter(|n| n.master_id() == Some(master.node_id.as_str()))
+                .collect();
+            replicas.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            members.extend(replicas);
+            (master.node_id.clone(), members)
+        })
+        .collect()
+}
+
+/// CLUSTER SHARDS -- one entry per shard, cluster-wide.
+///
+/// Top level is an Array under BOTH protocols; only the shard and node entries
+/// change shape (Map under RESP3, flat array under RESP2). Measured against
+/// redis-server 8.6.1.
+pub fn handle_cluster_shards(cs: &Arc<RwLock<ClusterState>>) -> Frame {
+    let state = cs.read();
+    let mut out = Vec::new();
+    for (master_id, members) in group_into_shards(&state) {
+        // A shard with no live node serves nothing, so its slots array is
+        // empty even though the dead master still claims the bits. Measured:
+        // the node stays listed with health `fail` and the shard reports `*0`.
+        let any_live = members.iter().any(|n| !n.is_failed());
+        let slot_pairs = if any_live {
+            state
+                .nodes
+                .get(&master_id)
+                .map(|m| bitmap_to_pairs(&m.slots))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut slots = Vec::with_capacity(slot_pairs.len() * 2);
+        for (lo, hi) in slot_pairs {
+            slots.push(Frame::Integer(lo as i64));
+            slots.push(Frame::Integer(hi as i64));
+        }
+
+        let nodes: Vec<Frame> = members.iter().map(|n| shard_node_entry(n, 0)).collect();
+
+        out.push(Frame::Map(vec![
+            (
+                Frame::BulkString(Bytes::from_static(b"slots")),
+                Frame::Array(crate::protocol::FrameVec::from_vec(slots)),
+            ),
+            (
+                Frame::BulkString(Bytes::from_static(b"nodes")),
+                Frame::Array(crate::protocol::FrameVec::from_vec(nodes)),
+            ),
+        ]));
+    }
+    Frame::Array(crate::protocol::FrameVec::from_vec(out))
+}
+
+/// CLUSTER MYSHARDID -- the 40-hex id of the shard this node belongs to.
+pub fn handle_cluster_myshardid(cs: &Arc<RwLock<ClusterState>>) -> Frame {
+    let state = cs.read();
+    let my = state.my_node();
+    // A replica belongs to its master's shard; a master heads its own.
+    let master_id = my.master_id().unwrap_or(my.node_id.as_str());
+    Frame::BulkString(Bytes::from(shard_id_for_master(master_id)))
+}
+
 fn bitmap_to_ranges(bitmap: &[u8; 2048]) -> String {
     let mut ranges = Vec::new();
     let mut start: Option<u16> = None;
