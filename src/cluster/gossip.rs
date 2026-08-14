@@ -271,10 +271,21 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
     // v3 appended the sender's master id. A v2 (or v1) peer sent no such field
     // and its sections start 40 bytes earlier — so the header layout, not just
     // the flags encoding, depends on the version.
+    // The length guard above admits anything >= HEADER_SIZE_V2 so a legitimate
+    // v2 peer parses; a v3 header cut off inside this field would otherwise
+    // index past the end. A real v3 sender always writes the full 40 bytes, so
+    // a short one is malformed and is rejected rather than zero-filled.
     let mut sender_master_id = [0u8; 40];
     let header_len = if version <= GOSSIP_VERSION_NO_MASTER_ID {
         HEADER_SIZE_V2
     } else {
+        if data.len() < HEADER_SIZE {
+            return Err(format!(
+                "v{version} header truncated inside sender_master_id: {} < {}",
+                data.len(),
+                HEADER_SIZE
+            ));
+        }
         sender_master_id.copy_from_slice(&data[HEADER_SIZE_V2..HEADER_SIZE]);
         HEADER_SIZE
     };
@@ -981,6 +992,44 @@ mod tests {
 
     /// A v2 peer sends no master id, and must still parse — sections included.
     ///
+    /// A v3 header truncated INSIDE `sender_master_id` must be rejected, not
+    /// panic.
+    ///
+    /// The length guard at the top of `deserialize_gossip` admits any frame of
+    /// at least `HEADER_SIZE_V2` (2130) bytes so a legitimate v2 peer can be
+    /// parsed — but the v3 branch then reads `data[2130..2170]`
+    /// unconditionally. Every length in `2130..2170` carrying version 3 or
+    /// above therefore indexes past the end. The cluster bus listener feeds
+    /// this function peer-supplied bytes, so the failure mode is a remote
+    /// panic — and `cluster-ctl` aborts the process — not a bad parse.
+    #[test]
+    fn test_deserialize_rejects_v3_header_truncated_inside_master_id() {
+        let msg = GossipMessage {
+            msg_type: GossipMsgType::Ping,
+            sender_node_id: [b'a'; 40],
+            sender_slots: Box::new([0u8; 2048]),
+            config_epoch: 1,
+            sender_ip: [
+                b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0, 0, 0, 0, 0, 0, 0,
+            ],
+            sender_port: 7000,
+            sender_bus_port: 17000,
+            sender_master_id: [b'm'; 40],
+            gossip_sections: vec![],
+        };
+        let full = serialize_gossip(&msg);
+        assert!(full.len() >= HEADER_SIZE);
+
+        // Every truncation point strictly inside the appended field.
+        for len in HEADER_SIZE_V2..HEADER_SIZE {
+            let truncated = &full[..len];
+            assert!(
+                deserialize_gossip(truncated).is_err(),
+                "a v3 header cut at {len} bytes must be rejected, not panic"
+            );
+        }
+    }
+
     /// The field decodes as absent, which is indistinguishable from "I am a
     /// master". That is exactly the pre-v3 behaviour and the reason adding it
     /// required a version bump rather than a silent field append.
