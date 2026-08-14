@@ -24,7 +24,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::cluster::gossip::{GossipMsgType, build_message, deserialize_gossip, serialize_gossip};
-use crate::cluster::{ClusterState, FailoverState, NodeFlags};
+use crate::cluster::{ClusterState, FailoverState, NodeHealth, NodeRole};
 
 /// Check if we should initiate failover.
 ///
@@ -32,10 +32,10 @@ use crate::cluster::{ClusterState, FailoverState, NodeFlags};
 /// and we should start the election. Caller spawns the election task.
 pub fn check_and_initiate_failover(state: &mut ClusterState, my_repl_offset: u64) -> bool {
     let my_id = state.node_id.clone();
-    let my_flags = state.my_node().flags.clone();
+    let my_flags = state.my_node().role.clone();
 
     let master_id = match &my_flags {
-        NodeFlags::Replica { master_id } => master_id.clone(),
+        NodeRole::Replica { master_id } => master_id.clone(),
         _ => return false, // we are a master, nothing to do
     };
 
@@ -43,7 +43,7 @@ pub fn check_and_initiate_failover(state: &mut ClusterState, my_repl_offset: u64
     let master_is_fail = state
         .nodes
         .get(&master_id)
-        .map(|n| matches!(n.flags, NodeFlags::Fail))
+        .map(|n| matches!(n.health, NodeHealth::Fail))
         .unwrap_or(false);
 
     if !master_is_fail {
@@ -73,7 +73,7 @@ pub fn check_and_initiate_failover(state: &mut ClusterState, my_repl_offset: u64
 /// (FORCE/TAKEOVER, via `check_and_initiate_failover`) bump the epoch
 /// themselves before calling.
 pub fn promote_self_to_master(state: &mut ClusterState, master_id: &str) {
-    state.my_node_mut().flags = NodeFlags::Master;
+    state.my_node_mut().role = NodeRole::Master;
     let epoch = state.epoch;
     state.my_node_mut().epoch = epoch;
 
@@ -91,7 +91,7 @@ pub fn promote_self_to_master(state: &mut ClusterState, master_id: &str) {
 
     // Remove the failed master from active routing (keep in nodes for history)
     if let Some(failed) = state.nodes.get_mut(master_id) {
-        failed.flags = NodeFlags::Fail;
+        failed.health = NodeHealth::Fail;
     }
 }
 
@@ -160,7 +160,7 @@ pub fn try_mark_fail_with_consensus(state: &mut ClusterState, node_id: &str) -> 
         if let Some(node) = state.nodes.get_mut(node_id) {
             // Remove stale reports
             node.pfail_reports.retain(|_, ts| *ts > stale_cutoff);
-            let is_pfail = matches!(node.flags, NodeFlags::Pfail);
+            let is_pfail = matches!(node.health, NodeHealth::Pfail);
             let count = node.pfail_reports.len() as u32;
             (is_pfail, count)
         } else {
@@ -179,7 +179,7 @@ pub fn try_mark_fail_with_consensus(state: &mut ClusterState, node_id: &str) -> 
             "Node {} PFAIL->FAIL: {}/{} masters agree (quorum={})",
             node_id, report_count, master_count, quorum
         );
-        node.flags = NodeFlags::Fail;
+        node.health = NodeHealth::Fail;
     }
     true
 }
@@ -231,7 +231,7 @@ pub async fn run_election_task(
         let addrs: Vec<SocketAddr> = cs
             .nodes
             .values()
-            .filter(|n| n.node_id != my_id && matches!(n.flags, NodeFlags::Master))
+            .filter(|n| n.node_id != my_id && matches!(n.role, NodeRole::Master))
             .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port))
             .collect();
 
@@ -357,8 +357,8 @@ pub async fn run_election_task(
         // Promote at the epoch the votes were granted for — NOT via
         // check_and_initiate_failover, whose extra epoch increment claimed
         // an unvoted epoch (deep-review C4).
-        let master_id = match &cs.my_node().flags {
-            NodeFlags::Replica { master_id } => Some(master_id.clone()),
+        let master_id = match &cs.my_node().role {
+            NodeRole::Replica { master_id } => Some(master_id.clone()),
             _ => None,
         };
         if let Some(master_id) = master_id {
@@ -389,16 +389,17 @@ mod tests {
         let my_id = "a".repeat(40);
         let master_id = "b".repeat(40);
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
-        state.my_node_mut().flags = NodeFlags::Replica {
+        state.my_node_mut().role = NodeRole::Replica {
             master_id: master_id.clone(),
         };
-        // Master is Pfail, not Fail
-        let master = crate::cluster::ClusterNode::new(
+        // Master is Pfail, not Fail — still a MASTER while suspected.
+        let mut master = crate::cluster::ClusterNode::new(
             master_id.clone(),
             test_addr(6380),
-            NodeFlags::Pfail,
+            NodeRole::Master,
             0,
         );
+        master.health = crate::cluster::NodeHealth::Pfail;
         state.nodes.insert(master_id, master);
 
         let result = check_and_initiate_failover(&mut state, 1000);
@@ -410,17 +411,20 @@ mod tests {
         let my_id = "a".repeat(40);
         let master_id = "b".repeat(40);
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
-        state.my_node_mut().flags = NodeFlags::Replica {
+        state.my_node_mut().role = NodeRole::Replica {
             master_id: master_id.clone(),
         };
 
-        // Master owns slots 0-100; mark as FAIL
+        // Master owns slots 0-100; mark as FAIL. It remains role=master —
+        // failover promotes a replica BECAUSE a master failed, so both axes
+        // have to be readable at once.
         let mut master = crate::cluster::ClusterNode::new(
             master_id.clone(),
             test_addr(6380),
-            NodeFlags::Fail,
+            NodeRole::Master,
             0,
         );
+        master.health = crate::cluster::NodeHealth::Fail;
         for s in 0u16..=100 {
             master.set_slot(s);
         }
@@ -429,7 +433,7 @@ mod tests {
         let result = check_and_initiate_failover(&mut state, 5000);
         assert!(result, "expected failover to initiate");
         // After promotion, we should be a master
-        assert!(matches!(state.my_node().flags, NodeFlags::Master));
+        assert!(matches!(state.my_node().role, NodeRole::Master));
         // We should have inherited master's slots
         assert!(state.my_node().owns_slot(50));
     }
@@ -443,15 +447,19 @@ mod tests {
         let my_id = "a".repeat(40);
         let master_id = "b".repeat(40);
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
-        state.my_node_mut().flags = NodeFlags::Replica {
+        state.my_node_mut().role = NodeRole::Replica {
             master_id: master_id.clone(),
         };
         let mut master = crate::cluster::ClusterNode::new(
             master_id.clone(),
             test_addr(6380),
-            NodeFlags::Fail,
+            NodeRole::Master,
             0,
         );
+        // The scenario is a failover FROM a failed master, so say so. Under the
+        // old single-enum type this was `NodeFlags::Fail`, which silently also
+        // meant "not a master"; with the axes split the setup has to state both.
+        master.health = NodeHealth::Fail;
         for s in 0u16..=100 {
             master.set_slot(s);
         }
@@ -462,12 +470,17 @@ mod tests {
         let voted_epoch = state.epoch;
 
         promote_self_to_master(&mut state, &master_id);
-        assert!(matches!(state.my_node().flags, NodeFlags::Master));
+        assert!(matches!(state.my_node().role, NodeRole::Master));
         assert!(state.my_node().owns_slot(50));
         assert_eq!(
             state.epoch, voted_epoch,
             "promotion must not claim an epoch nobody voted for"
         );
+        // The demoted master keeps role=master and stays FAIL — the pairing the
+        // old type could not express.
+        let old = state.nodes.get(&master_id).expect("old master retained");
+        assert!(old.is_master(), "a failed master is still a master");
+        assert!(old.is_failed(), "the master we failed over from stays FAIL");
         assert_eq!(state.my_node().epoch, voted_epoch);
     }
 
@@ -480,7 +493,7 @@ mod tests {
         let requester = crate::cluster::ClusterNode::new(
             requester_id.clone(),
             test_addr(6381),
-            NodeFlags::Master,
+            NodeRole::Master,
             0,
         );
         state.nodes.insert(requester_id.clone(), requester);
@@ -511,23 +524,26 @@ mod tests {
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
 
         // Add target node as Pfail
-        let target = crate::cluster::ClusterNode::new(
+        let mut target = crate::cluster::ClusterNode::new(
             target_id.clone(),
             test_addr(6380),
-            NodeFlags::Pfail,
+            NodeRole::Master,
             0,
         );
+        // Suspected, but still a master — the two axes are independent.
+        target.health = crate::cluster::NodeHealth::Pfail;
         state.nodes.insert(target_id.clone(), target);
 
-        // Add 3 more masters (total 5 masters: a, c, d, e + target b is Pfail not Master)
-        // Actually for quorum we count masters. Target is Pfail, not Master.
-        // So masters = a, c, d, e = 4. Quorum = 4/2+1 = 3.
+        // Masters are a, b, c, d, e = 5, because the PFAIL target is STILL a
+        // master (it was excluded from this count under the old single enum,
+        // which conflated role with health). Quorum = 5/2+1 = 3 either way, so
+        // the expectations below are unchanged.
         for ch in ['c', 'd', 'e'] {
             let nid = format!("{}", ch).repeat(40);
             let node = crate::cluster::ClusterNode::new(
                 nid.clone(),
                 test_addr(6381 + ch as u16),
-                NodeFlags::Master,
+                NodeRole::Master,
                 0,
             );
             state.nodes.insert(nid, node);
@@ -560,8 +576,8 @@ mod tests {
             .insert("e".repeat(40), now_ms());
         assert!(try_mark_fail_with_consensus(&mut state, &target_id));
         assert!(matches!(
-            state.nodes.get(&target_id).unwrap().flags,
-            NodeFlags::Fail
+            state.nodes.get(&target_id).unwrap().health,
+            NodeHealth::Fail
         ));
     }
 

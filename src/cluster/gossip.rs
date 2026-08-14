@@ -16,10 +16,49 @@ use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::cluster::bus::SharedVoteTx;
-use crate::cluster::{ClusterNode, ClusterState, FailoverState, NodeFlags};
+use crate::cluster::{ClusterNode, ClusterState, FailoverState, NodeHealth, NodeRole};
 
 pub const GOSSIP_MAGIC: u32 = 0x52656469; // "Redi"
-pub const GOSSIP_VERSION: u16 = 1;
+
+/// Wire version. Bumped 1 -> 2 when `GossipSection::flags` stopped being a
+/// single enum discriminant and became two packed axes (role + health).
+///
+/// The two encodings COLLIDE, so the version has to be honoured rather than
+/// ignored: v1's `3` meant FAIL, while in v2 `3` is replica+PFAIL. A v2 reader
+/// that ignored the version would silently downgrade a confirmed failure to a
+/// suspicion. `deserialize_gossip` translates v1 sections into v2 semantics so
+/// the rest of the code only ever sees one encoding.
+///
+/// The reverse direction cannot be fixed from here: a v1 peer tests
+/// `flags == 2 || flags == 3` exactly, so it reads v2's FAIL values (4, 5) as
+/// healthy and never learns of the failure. Accepted rather than worked around,
+/// because no v1 population exists to protect — a multi-node cluster could not
+/// form at all before #450, so no released build ever exchanged these bytes in
+/// anger. A v1<->v2 mixed cluster is unsupported and says so in the log.
+pub const GOSSIP_VERSION: u16 = 2;
+const GOSSIP_VERSION_LEGACY_FLAGS: u16 = 1;
+
+/// Translate a v1 `flags` discriminant into the v2 role+health packing.
+///
+/// v1 was mutually exclusive — `0` master, `1` replica, `2` PFAIL, `3` FAIL —
+/// so a health value carried no role at all. v1's own reader defaulted every
+/// rumored node to master, so that is the faithful reading here.
+fn translate_legacy_flags(flags: u16) -> u16 {
+    match flags {
+        0 => gossip_flags(&NodeRole::Master, NodeHealth::Online),
+        1 => gossip_flags(
+            &NodeRole::Replica {
+                master_id: String::new(),
+            },
+            NodeHealth::Online,
+        ),
+        2 => gossip_flags(&NodeRole::Master, NodeHealth::Pfail),
+        3 => gossip_flags(&NodeRole::Master, NodeHealth::Fail),
+        // v1 emitted nothing else. Treat anything unexpected as healthy rather
+        // than guessing a failure into existence.
+        _ => gossip_flags(&NodeRole::Master, NodeHealth::Online),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GossipMsgType {
@@ -43,6 +82,38 @@ impl GossipMsgType {
     }
 }
 
+/// Pack role + health into the gossip `flags` word.
+///
+/// bit 0   : 0 = master, 1 = replica
+/// bits 1-2: 0 = online, 1 = pfail, 2 = fail
+///
+/// Both axes travel together; the previous scheme could express only one, so a
+/// PFAIL rumor about a replica erased the fact that it was a replica.
+pub fn gossip_flags(role: &crate::cluster::NodeRole, health: crate::cluster::NodeHealth) -> u16 {
+    let role_bit = match role {
+        crate::cluster::NodeRole::Master => 0u16,
+        crate::cluster::NodeRole::Replica { .. } => 1,
+    };
+    let health_bits = match health {
+        crate::cluster::NodeHealth::Online => 0u16,
+        crate::cluster::NodeHealth::Pfail => 1,
+        crate::cluster::NodeHealth::Fail => 2,
+    };
+    role_bit | (health_bits << 1)
+}
+
+/// Unpack the gossip `flags` word. Unknown health bits read as Online — a
+/// forward-compatible peer must never be treated as failed by accident.
+pub fn parse_gossip_flags(flags: u16) -> (bool, crate::cluster::NodeHealth) {
+    let is_replica = flags & 1 != 0;
+    let health = match (flags >> 1) & 0b11 {
+        1 => crate::cluster::NodeHealth::Pfail,
+        2 => crate::cluster::NodeHealth::Fail,
+        _ => crate::cluster::NodeHealth::Online,
+    };
+    (is_replica, health)
+}
+
 /// Rumor section about a peer node included in a PING/PONG.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GossipSection {
@@ -50,7 +121,14 @@ pub struct GossipSection {
     pub ip: [u8; 16], // null-padded ASCII
     pub port: u16,
     pub bus_port: u16,
-    pub flags: u16, // 0=master,1=replica,2=pfail,3=fail
+    /// Packed role + health, v2 encoding: bit 0 is the role (0 master, 1
+    /// replica), bits 1-2 the health (0 online, 1 pfail, 2 fail). Build it with
+    /// `gossip_flags` and read it with `parse_gossip_flags` — never compare the
+    /// raw word, because v2 values overlap v1's old discriminants
+    /// (`0=master,1=replica,2=pfail,3=fail`) with DIFFERENT meanings.
+    /// `deserialize_gossip` translates v1 sections on arrival, so a section
+    /// reaching this struct always carries v2 semantics.
+    pub flags: u16,
     pub epoch: u64,
     pub ping_sent_ms: u64,
     pub pong_recv_ms: u64,
@@ -146,7 +224,12 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
     if magic != GOSSIP_MAGIC {
         return Err(format!("bad magic: 0x{:08X}", magic));
     }
-    // total_len at [4..8], ver at [8..10] -- we don't enforce version for forward compat
+    // total_len at [4..8]. The version at [8..10] is NOT enforced — an unknown
+    // future version is still parsed, since the header layout is fixed and
+    // unknown flag bits already decode as healthy. It IS read, though: v1 and
+    // v2 disagree about what `flags` means, so a v1 sender's sections must be
+    // translated (see `translate_legacy_flags`) instead of being read as v2.
+    let version = u16::from_be_bytes([data[8], data[9]]);
     let msg_type_raw = u16::from_be_bytes([data[10], data[11]]);
     let msg_type = GossipMsgType::from_u16(msg_type_raw)
         .ok_or_else(|| format!("unknown msg type: {}", msg_type_raw))?;
@@ -172,10 +255,23 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<GossipMessage, String> {
         if offset + GossipSection::SIZE > data.len() {
             return Err("truncated gossip section".to_string());
         }
-        let section = GossipSection::deserialize(&data[offset..])
+        let mut section = GossipSection::deserialize(&data[offset..])
             .ok_or_else(|| "invalid gossip section".to_string())?;
+        if version == GOSSIP_VERSION_LEGACY_FLAGS {
+            section.flags = translate_legacy_flags(section.flags);
+        }
         gossip_sections.push(section);
         offset += GossipSection::SIZE;
+    }
+
+    if version == GOSSIP_VERSION_LEGACY_FLAGS {
+        // Loud, because the reverse direction is broken and silent: this peer
+        // cannot understand OUR failure rumors at all.
+        warn!(
+            "gossip peer speaks v1 flags; its rumors are translated, but it \
+             cannot read v2 FAIL values and will not learn of failures we \
+             report. Mixed v1/v2 clusters are unsupported — upgrade all nodes."
+        );
     }
 
     Ok(GossipMessage {
@@ -229,12 +325,12 @@ pub fn build_message(
             let mut node_id_bytes = [0u8; 40];
             let nb = n.node_id.as_bytes();
             node_id_bytes[..nb.len().min(40)].copy_from_slice(&nb[..nb.len().min(40)]);
-            let flags_val = match &n.flags {
-                NodeFlags::Master => 0u16,
-                NodeFlags::Replica { .. } => 1,
-                NodeFlags::Pfail => 2,
-                NodeFlags::Fail => 3,
-            };
+            // Two orthogonal axes packed into the existing u16, so the wire
+            // header keeps its fixed 2130-byte size: bit 0 is the role, bits
+            // 1-2 the health. The old encoding (0=master 1=replica 2=pfail
+            // 3=fail) could only carry ONE of them, so gossiping a failed
+            // master told the receiver nothing about its role.
+            let flags_val = gossip_flags(&n.role, n.health);
             GossipSection {
                 node_id: node_id_bytes,
                 ip: encode_ip(&n.addr),
@@ -286,12 +382,32 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
         ClusterNode::new(
             node_id_str.clone(),
             sender_addr,
-            NodeFlags::Master,
+            NodeRole::Master,
             msg.config_epoch,
         )
     });
     entry.pong_recv_ms = now_ms();
-    if msg.config_epoch > entry.epoch {
+
+    // We just heard from this node DIRECTLY, so any suspicion about it is
+    // stale. Nothing else clears health: `check_failure_states` only ever sets
+    // PFAIL, so without this a node that recovered stayed suspected forever and
+    // its slots never counted as covered again.
+    entry.health = crate::cluster::NodeHealth::Online;
+    entry.pfail_reports.clear();
+
+    // A node is AUTHORITATIVE for its own slot bitmap at EQUAL epoch, not only
+    // at a strictly higher one.
+    //
+    // The `>` here was the root cause of #485: `CLUSTER ADDSLOTS` never bumps
+    // the config epoch, so a hand-built cluster sits at epoch 0 forever,
+    // `0 > 0` is false, and peer ownership NEVER merged. Every node then
+    // believed it owned everything it had been given and nothing else existed,
+    // so `route_slot` found no owner for a peer's slot and served the key
+    // locally — a write accepted by the wrong node, invisible to the right one.
+    //
+    // A strictly LOWER epoch is still ignored, which preserves Redis's
+    // "highest epoch wins" tie-break for genuinely conflicting claims.
+    if msg.config_epoch >= entry.epoch {
         entry.epoch = msg.config_epoch;
         entry.slots = msg.sender_slots.clone();
     }
@@ -315,7 +431,7 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
     // learn about EACH OTHER and the mesh cannot complete.
     let my_addr = state.nodes.get(&self_id).map(|n| n.addr);
     for section in &msg.gossip_sections {
-        let section_flags = section.flags;
+        let (_rumor_is_replica, rumor_health) = parse_gossip_flags(section.flags);
         let target_node_id = std::str::from_utf8(&section.node_id)
             .unwrap_or("")
             .trim_end_matches('\0')
@@ -323,7 +439,11 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
         if target_node_id.is_empty() || target_node_id == state.node_id {
             continue;
         }
-        if section_flags == 2 || section_flags == 3 {
+        // Any non-Online rumor feeds the PFAIL consensus. Read through
+        // `parse_gossip_flags` rather than comparing the raw word: the flags
+        // now pack role AND health, so the old `== 2 || == 3` test would read a
+        // suspected REPLICA (0b011) as a confirmed failure.
+        if rumor_health != crate::cluster::NodeHealth::Online {
             let reporter_id = node_id_str.clone();
             let now = now_ms();
 
@@ -359,7 +479,7 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
             let mut node = ClusterNode::new(
                 target_node_id.clone(),
                 addr,
-                NodeFlags::Master,
+                NodeRole::Master,
                 section.epoch,
             );
             node.bus_port = section.bus_port;
@@ -387,13 +507,13 @@ pub fn check_failure_states(state: &mut ClusterState, node_timeout_ms: u64) {
         }
         if node.pong_recv_ms > 0
             && now.saturating_sub(node.pong_recv_ms) > node_timeout_ms
-            && !matches!(node.flags, NodeFlags::Fail | NodeFlags::Pfail)
+            && !matches!(node.health, NodeHealth::Fail | NodeHealth::Pfail)
         {
             warn!(
                 "Node {} not heard from in {}ms, marking PFAIL",
                 node.node_id, node_timeout_ms
             );
-            node.flags = NodeFlags::Pfail;
+            node.health = NodeHealth::Pfail;
         }
     }
 }
@@ -434,10 +554,10 @@ pub async fn run_gossip_ticker(
 
                     // Check if we should initiate failover (replica with FAIL master)
                     if !election_spawned {
-                        let my_flags = cs.my_node().flags.clone();
-                        if let NodeFlags::Replica { ref master_id } = my_flags {
+                        let my_flags = cs.my_node().role.clone();
+                        if let NodeRole::Replica { ref master_id } = my_flags {
                             let master_is_fail = cs.nodes.get(master_id)
-                                .map(|n| matches!(n.flags, NodeFlags::Fail))
+                                .map(|n| matches!(n.health, NodeHealth::Fail))
                                 .unwrap_or(false);
                             if master_is_fail && cs.failover_state == FailoverState::None {
                                 election_spawned = true;
@@ -583,7 +703,7 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
         state.nodes.insert(
             id40(b'p'),
-            ClusterNode::new(id40(b'p'), peer_addr, NodeFlags::Master, 0),
+            ClusterNode::new(id40(b'p'), peer_addr, NodeRole::Master, 0),
         );
         assert_eq!(state.nodes.len(), 2);
 
@@ -728,6 +848,88 @@ mod tests {
         assert_eq!(buf.len(), GossipSection::SIZE);
         let decoded = GossipSection::deserialize(&buf).expect("section deserialize failed");
         assert_eq!(decoded, section);
+    }
+
+    /// v1 and v2 disagree about what `flags` means, and the disagreement is not
+    /// benign: v1's `3` meant FAIL, but read as v2 it is replica+PFAIL — a
+    /// confirmed failure silently downgraded to a suspicion. A v1 sender's
+    /// sections must therefore be translated at the wire boundary.
+    #[test]
+    fn test_v1_flags_are_translated_not_reinterpreted() {
+        // The collision itself, stated as an assertion so it cannot be
+        // "fixed" by dropping the translation.
+        assert_eq!(
+            parse_gossip_flags(3),
+            (true, NodeHealth::Pfail),
+            "v2 reads 3 as replica+PFAIL — this is why v1's 3 cannot be passed through"
+        );
+
+        // v1 FAIL (3) must arrive as FAIL, not PFAIL.
+        let (_, health) = parse_gossip_flags(translate_legacy_flags(3));
+        assert_eq!(health, NodeHealth::Fail, "v1 FAIL must survive translation");
+
+        // v1 PFAIL (2) stays PFAIL; v1 carried no role, so master is assumed —
+        // the same default v1's own reader applied.
+        let (is_replica, health) = parse_gossip_flags(translate_legacy_flags(2));
+        assert_eq!(health, NodeHealth::Pfail);
+        assert!(!is_replica);
+
+        // v1 healthy values keep both meanings.
+        assert_eq!(
+            parse_gossip_flags(translate_legacy_flags(0)),
+            (false, NodeHealth::Online)
+        );
+        assert_eq!(
+            parse_gossip_flags(translate_legacy_flags(1)),
+            (true, NodeHealth::Online)
+        );
+
+        // A value v1 never emitted must not invent a failure.
+        assert_eq!(
+            parse_gossip_flags(translate_legacy_flags(9)).1,
+            NodeHealth::Online
+        );
+    }
+
+    /// End-to-end: a v1 message on the wire is translated during deserialize,
+    /// so nothing downstream ever sees a v1 discriminant.
+    #[test]
+    fn test_deserialize_translates_v1_message_sections() {
+        let section = GossipSection {
+            node_id: [b'd'; 40],
+            ip: [
+                b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0, 0, 0, 0, 0, 0, 0,
+            ],
+            port: 7000,
+            bus_port: 17000,
+            flags: 3, // v1 FAIL
+            epoch: 7,
+            ping_sent_ms: 1,
+            pong_recv_ms: 2,
+        };
+        let msg = GossipMessage {
+            msg_type: GossipMsgType::Ping,
+            sender_node_id: [b'a'; 40],
+            sender_slots: Box::new([0u8; 2048]),
+            config_epoch: 1,
+            sender_ip: [
+                b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0, 0, 0, 0, 0, 0, 0,
+            ],
+            sender_port: 6379,
+            sender_bus_port: 16379,
+            gossip_sections: vec![section],
+        };
+        let mut bytes = serialize_gossip(&msg);
+        // Stamp the header back to v1, simulating an old peer.
+        bytes[8..10].copy_from_slice(&1u16.to_be_bytes());
+
+        let decoded = deserialize_gossip(&bytes).expect("v1 message must still parse");
+        let (_, health) = parse_gossip_flags(decoded.gossip_sections[0].flags);
+        assert_eq!(
+            health,
+            NodeHealth::Fail,
+            "a v1 peer's FAIL rumor must not arrive as a mere suspicion"
+        );
     }
 
     /// Magic bytes mismatch on deserialize returns Err.

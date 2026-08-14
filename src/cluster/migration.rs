@@ -13,7 +13,7 @@ use std::path::Path;
 use bytes::Bytes;
 
 use crate::cluster::slots::slot_for_key;
-use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
+use crate::cluster::{ClusterNode, ClusterState, NodeHealth, NodeRole};
 
 // --- nodes.conf persistence ---
 
@@ -27,26 +27,26 @@ pub fn save_nodes_conf(state: &ClusterState, dir: &Path) -> std::io::Result<()> 
     let mut buf: Vec<u8> = Vec::new();
 
     for node in state.nodes.values() {
-        let flags_str = if node.node_id == state.node_id {
-            match &node.flags {
-                NodeFlags::Master => "myself,master".to_string(),
-                NodeFlags::Replica { .. } => "myself,slave".to_string(),
-                NodeFlags::Pfail => "myself,pfail".to_string(),
-                NodeFlags::Fail => "myself,fail".to_string(),
-            }
-        } else {
-            match &node.flags {
-                NodeFlags::Master => "master".to_string(),
-                NodeFlags::Replica { .. } => "slave".to_string(),
-                NodeFlags::Pfail => "pfail".to_string(),
-                NodeFlags::Fail => "fail".to_string(),
-            }
-        };
-        let master_id_field = match &node.flags {
-            NodeFlags::Replica { master_id } => master_id.clone(),
-            _ => "-".to_string(),
-        };
-        let link_state = if matches!(node.flags, NodeFlags::Fail) {
+        // Comma-separated, exactly as CLUSTER NODES renders it: role and health
+        // are independent, so `master,fail` is a normal line. The previous
+        // single-enum form could only write one of them, which meant a failed
+        // node reloaded from disk came back with its ROLE erased.
+        let mut flags_parts: Vec<&str> = Vec::with_capacity(3);
+        if node.node_id == state.node_id {
+            flags_parts.push("myself");
+        }
+        flags_parts.push(if node.is_master() { "master" } else { "slave" });
+        match node.health {
+            NodeHealth::Online => {}
+            NodeHealth::Pfail => flags_parts.push("fail?"),
+            NodeHealth::Fail => flags_parts.push("fail"),
+        }
+        let flags_str = flags_parts.join(",");
+        let master_id_field = node
+            .master_id()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let link_state = if matches!(node.health, NodeHealth::Fail) {
             "disconnected"
         } else {
             "connected"
@@ -135,22 +135,29 @@ pub fn load_nodes_conf(state: &mut ClusterState, dir: &Path) -> std::io::Result<
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
         let flags_str = parts[2];
-        let flags = if flags_str.contains("slave") {
-            NodeFlags::Replica {
+        // Two independent axes read from one comma-separated column. Order
+        // matters: `fail?` must be tested BEFORE `fail`, because `"fail?"`
+        // contains `"fail"`.
+        let role = if flags_str.contains("slave") {
+            NodeRole::Replica {
                 master_id: parts[3].to_string(),
             }
-        } else if flags_str.contains("pfail") {
-            NodeFlags::Pfail
-        } else if flags_str.contains("fail") {
-            NodeFlags::Fail
         } else {
-            NodeFlags::Master
+            NodeRole::Master
+        };
+        let health = if flags_str.contains("fail?") {
+            NodeHealth::Pfail
+        } else if flags_str.contains("fail") {
+            NodeHealth::Fail
+        } else {
+            NodeHealth::Online
         };
         let ping_sent_ms: u64 = parts[4].parse().unwrap_or(0);
         let pong_recv_ms: u64 = parts[5].parse().unwrap_or(0);
         let epoch: u64 = parts[6].parse().unwrap_or(0);
 
-        let mut node = ClusterNode::new(node_id.clone(), addr, flags, epoch);
+        let mut node = ClusterNode::new(node_id.clone(), addr, role, epoch);
+        node.health = health;
         node.bus_port = bus_port;
         node.ping_sent_ms = ping_sent_ms;
         node.pong_recv_ms = pong_recv_ms;
@@ -293,6 +300,84 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from("nodes.conf")]);
     }
 
+    /// nodes.conf must round-trip BOTH axes for every combination, not just a
+    /// healthy master.
+    ///
+    /// The flags column is one comma-separated string parsed by substring, and
+    /// `"fail?"` CONTAINS `"fail"` — so testing them in the wrong order silently
+    /// reloads every PFAIL node as confirmed FAIL. The existing round-trip test
+    /// covers a healthy master only, which is exactly the shape that lets that
+    /// bug through: the ordering is correct today and nothing pinned it.
+    #[test]
+    fn test_nodes_conf_roundtrips_role_and_health_independently() {
+        let my_id = "a".repeat(40);
+        let master_id = "m".repeat(40);
+
+        // Every role x health pairing, including the ones the old single enum
+        // could not represent at all (a failed node that is still a master).
+        let cases: Vec<(&str, NodeRole, NodeHealth)> = vec![
+            ("master-online", NodeRole::Master, NodeHealth::Online),
+            ("master-pfail", NodeRole::Master, NodeHealth::Pfail),
+            ("master-fail", NodeRole::Master, NodeHealth::Fail),
+            (
+                "replica-online",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Online,
+            ),
+            (
+                "replica-pfail",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Pfail,
+            ),
+            (
+                "replica-fail",
+                NodeRole::Replica {
+                    master_id: master_id.clone(),
+                },
+                NodeHealth::Fail,
+            ),
+        ];
+
+        for (label, role, health) in cases {
+            let tmp = TempDir::new().unwrap();
+            let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
+            let peer_id = "p".repeat(40);
+            let mut peer =
+                crate::cluster::ClusterNode::new(peer_id.clone(), test_addr(6380), role.clone(), 3);
+            peer.health = health;
+            peer.set_slot(42);
+            state.nodes.insert(peer_id.clone(), peer);
+
+            save_nodes_conf(&state, tmp.path()).unwrap();
+
+            let mut fresh = ClusterState::new("z".repeat(40), test_addr(6381));
+            load_nodes_conf(&mut fresh, tmp.path()).unwrap();
+            let loaded = fresh
+                .nodes
+                .get(&peer_id)
+                .unwrap_or_else(|| panic!("{label}: peer not reloaded"));
+
+            assert_eq!(loaded.health, health, "{label}: health did not survive");
+            assert_eq!(
+                loaded.is_master(),
+                matches!(role, NodeRole::Master),
+                "{label}: role did not survive"
+            );
+            if let NodeRole::Replica { .. } = role {
+                assert_eq!(
+                    loaded.master_id(),
+                    Some(master_id.as_str()),
+                    "{label}: a replica that forgets its master cannot be grouped into a shard"
+                );
+            }
+            assert!(loaded.owns_slot(42), "{label}: slots did not survive");
+        }
+    }
+
     /// handle_get_keys_in_slot returns matching keys only.
     #[test]
     fn test_get_keys_in_slot_filters_correctly() {
@@ -329,12 +414,8 @@ mod tests {
         // foo hashes to slot 12182
         let foo_slot = crate::cluster::slots::slot_for_key(b"foo");
         state.my_node_mut().set_slot(foo_slot);
-        let peer = crate::cluster::ClusterNode::new(
-            peer_id.clone(),
-            test_addr(6380),
-            NodeFlags::Master,
-            0,
-        );
+        let peer =
+            crate::cluster::ClusterNode::new(peer_id.clone(), test_addr(6380), NodeRole::Master, 0);
         state.nodes.insert(peer_id.clone(), peer);
         // Mark slot as migrating to peer
         state.migrating.insert(foo_slot, peer_id.clone());
