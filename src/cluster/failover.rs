@@ -456,6 +456,10 @@ mod tests {
             NodeRole::Master,
             0,
         );
+        // The scenario is a failover FROM a failed master, so say so. Under the
+        // old single-enum type this was `NodeFlags::Fail`, which silently also
+        // meant "not a master"; with the axes split the setup has to state both.
+        master.health = NodeHealth::Fail;
         for s in 0u16..=100 {
             master.set_slot(s);
         }
@@ -472,6 +476,11 @@ mod tests {
             state.epoch, voted_epoch,
             "promotion must not claim an epoch nobody voted for"
         );
+        // The demoted master keeps role=master and stays FAIL — the pairing the
+        // old type could not express.
+        let old = state.nodes.get(&master_id).expect("old master retained");
+        assert!(old.is_master(), "a failed master is still a master");
+        assert!(old.is_failed(), "the master we failed over from stays FAIL");
         assert_eq!(state.my_node().epoch, voted_epoch);
     }
 
