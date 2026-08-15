@@ -200,6 +200,15 @@ pub fn footprint_correction() -> f64 {
 /// Staleness bound is the caller's tick. That is the right trade: the
 /// correction scales a budget in the GB range, so reacting a second late is
 /// invisible, while measuring per write is a 2.4x throughput collapse.
+///
+/// A `footprint` of 0 means the platform could not answer — Windows has no
+/// reader at all, and the Linux/macOS ones can fail transiently. Call it
+/// anyway: the zero is refused as a sample (so a failed read cannot erase a
+/// good one), the correction resolves to its neutral 1.0, and the refresh
+/// counter still advances. That last part is the point — the counter answers
+/// "is the chore running", which is a different question from "can this
+/// platform measure", and conflating them is what made this function's first
+/// version untestable on Windows.
 pub fn refresh_footprint_correction(footprint: u64) {
     publish_footprint_sample(footprint);
     let used = crate::admin::metrics_setup::logical_used_memory_bytes() as u64;
@@ -217,6 +226,11 @@ pub fn refresh_footprint_correction(footprint: u64) {
 /// BOTH runtimes: the shard loop has a monoio arm and a tokio arm, and a
 /// correction that silently never refreshes on one of them would restore the
 /// swap-death bug #478 fixed, invisibly.
+///
+/// Counts chore TICKS, not successful measurements. On a platform with no
+/// footprint reader (Windows) it advances while the correction stays 1.00
+/// forever, which is the documented inert state — pair it with
+/// `maxmemory_footprint_correction` to tell inert from active.
 static CORRECTION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
 /// Number of correction refreshes so far.

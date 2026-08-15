@@ -736,8 +736,9 @@ fn io20_footprint_correction_sampler_advances() {
     );
 
     // And the correction it publishes must be a usable divisor. Below the
-    // noise floor that is exactly 1.00; anything else here (0, NaN, inf) would
-    // divide the eviction budget into nonsense.
+    // noise floor that is exactly 1.00 — as it also is, permanently, on a
+    // platform with no footprint reader. Anything else here (0, NaN, inf)
+    // would divide the eviction budget into nonsense.
     let reply = c.send(&["INFO", "memory"]);
     let corr = field(&reply, "maxmemory_footprint_correction")
         .unwrap_or_else(|| panic!("INFO memory has no maxmemory_footprint_correction:\n{reply}"))

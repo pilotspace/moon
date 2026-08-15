@@ -102,9 +102,14 @@ pub(crate) fn run_active_expiry(
             let footprint = rss;
             #[cfg(not(target_os = "linux"))]
             let footprint = crate::admin::metrics_setup::process_footprint_bytes();
-            if footprint > 0 {
-                crate::admin::footprint::refresh_footprint_correction(footprint);
-            }
+            // Unconditional, including when the read returned 0. A platform
+            // with no footprint reader (Windows) must still tick the chore:
+            // the refresh treats 0 as "unknown" and leaves the correction
+            // neutral, and the counter it advances is what proves the chore
+            // itself is alive. Guarding this call on `footprint > 0` made the
+            // liveness signal indistinguishable from an unwired chore on every
+            // platform that cannot measure.
+            crate::admin::footprint::refresh_footprint_correction(footprint);
         }
     }
 }
