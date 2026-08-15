@@ -172,8 +172,30 @@ class TestVersionExported:
     """Test package metadata."""
 
     def test_version(self) -> None:
+        """`__version__` must be the version the package publishes as.
+
+        This assertion used to be `== "0.1.0"`, a second copy of the literal in
+        `moondb/__init__.py`. When the package was published as 0.1.1 the
+        literal was not updated, and because the test restated it rather than
+        deriving it, the suite stayed green while every caller reading
+        `__version__` was told the wrong release. Pinned to the packaging
+        source of truth instead; see `tests/test_version.py` for the guard on
+        the derivation itself.
+        """
+        import pathlib
+        import sys
+
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:  # pragma: no cover - Python 3.10 and older
+            import tomli as tomllib
+
         import moondb
-        assert moondb.__version__ == "0.1.0"
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        with (root / "pyproject.toml").open("rb") as fh:
+            published = tomllib.load(fh)["project"]["version"]
+        assert moondb.__version__ == published
 
     def test_all_exports(self) -> None:
         import moondb

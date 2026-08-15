@@ -1029,6 +1029,16 @@ fn dispatch_inner(
         _ => {}
     }
 
+    // `TXN` reaches here only when none of the three subcommand intercepts in
+    // `command::transaction` claimed it — i.e. a bare `TXN` or an unrecognised
+    // subcommand. Falling through to `unknown command` was wrong twice over:
+    // the command plainly exists (`TXN BEGIN` answers `+OK`), and Redis answers
+    // a container command missing its subcommand with an arity error, which is
+    // what a driver's error handling keys on. Same shape as `MQ`/`WS`.
+    if cmd.eq_ignore_ascii_case(b"TXN") {
+        return DispatchResult::Response(transaction::err_txn_subcommand(args));
+    }
+
     DispatchResult::Response(err_unknown(cmd))
 }
 

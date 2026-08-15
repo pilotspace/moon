@@ -412,6 +412,52 @@ jobs:
         # Reports the missing-field set; not yet a gate — info-observability
         # owns closing it, and this flips to a hard gate when that task lands.
         continue-on-error: true
+      # ── SDK wire-form guards ────────────────────────────────────────────
+      # The SDK tree had no CI of any kind, which is how five helpers shipped
+      # sending wire forms the server rejects on every call. They live here
+      # rather than in `check` because this is the job that already proves a
+      # real client works against a real Moon, and two of the three need a
+      # live server. The third guard (the command-NAME sweep,
+      # tests/sdk_wire_forms.rs) is in the main test tree and already runs in
+      # `check` / `check-monoio`; it spawns its own server.
+      - name: Rust SDK round trip (every public helper, live)
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          "$CARGO_TARGET_DIR/release/moon" --port 6488 --shards 1 \
+            --dir "$dir" --disk-free-min-pct 0 > "$dir/server.log" 2>&1 &
+          pid=$!
+          # Armed before the readiness wait, not after: the wait can exit
+          # non-zero, and a trap installed later would leak the server.
+          trap 'kill -9 $pid 2>/dev/null || true' EXIT
+          # Fail loudly if it never comes up: a silently-absent server would
+          # make the suite error at connect() rather than report a wire-form
+          # defect, and a green-because-it-never-ran guard is worse than none.
+          for _ in $(seq 1 60); do
+            if redis-cli -p 6488 PING 2>/dev/null | grep -q PONG; then break; fi
+            sleep 0.5
+          done
+          redis-cli -p 6488 PING | grep -q PONG || { cat "$dir/server.log"; exit 1; }
+          MOON_TEST_URL=redis://127.0.0.1:6488 \
+            cargo test --manifest-path sdk/rust/Cargo.toml --test round_trip -- --ignored
+        timeout-minutes: 20
+      - name: Python SDK version derivation
+        # Plain `unittest`, matching the differ steps above, because the runner
+        # has NO pytest and cannot get one: Ubuntu 24.04 / Python 3.14 ships
+        # PEP 668 EXTERNALLY-MANAGED (so `pip install --user` aborts) and
+        # `python3.14-venv` is not installed (so `python3 -m venv` fails at
+        # ensurepip). Both verified on the runner rather than assumed. The
+        # guard is written as `unittest.TestCase` so it needs only stdlib —
+        # pytest still collects it for local development.
+        #
+        # Scoped to the version guards, not the whole offline suite: seven
+        # tests in tests/test_text.py need pytest-asyncio and fail identically
+        # on main, so gating this job on them would gate it on the runner's
+        # Python environment rather than on the SDK.
+        run: python3 -m unittest discover -s tests -p 'test_version.py' -v
+        working-directory: sdk/python
+        timeout-minutes: 10
+
       - name: Upload record
         if: always()
         uses: actions/upload-artifact@v4

@@ -418,6 +418,14 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "EXEC" => CommandMeta { name: "EXEC", arity: 1, flags: CommandFlags(CommandFlags::NOSCRIPT.0), first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
     "DISCARD" => CommandMeta { name: "DISCARD", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
     "WATCH" => CommandMeta { name: "WATCH", arity: -2, flags: RF, first_key: 1, last_key: -1, step: 1, acl_categories: TXN },
+    // Moon's cross-store transaction (`TXN BEGIN|COMMIT|ABORT`), served by the
+    // intercept in `command::transaction` that runs BEFORE this table — which
+    // is why it worked while `COMMAND INFO TXN` answered nothing and a bare
+    // `TXN` fell through to the registry gate and got `unknown command`. The
+    // entry fixes both without touching routing: the three real subcommands
+    // never reach the gate. WRITE like WS/MQ above, because COMMIT applies
+    // buffered writes and a replica must refuse it under readonly enforcement.
+    "TXN" => CommandMeta { name: "TXN", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
     "UNWATCH" => CommandMeta { name: "UNWATCH", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
 
     // ---- Change Data Capture (CDC) ----
@@ -442,6 +450,13 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "FT.EXPAND" => CommandMeta { name: "FT.EXPAND", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.NAVIGATE" => CommandMeta { name: "FT.NAVIGATE", arity: -6, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.RECOMMEND" => CommandMeta { name: "FT.RECOMMEND", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+    // FT.AGGREGATE dispatches through the `FT.` intercept, which runs BEFORE
+    // this table is consulted — so it worked while being invisible to
+    // COMMAND INFO / COMMAND COUNT, and a driver that introspects before
+    // calling concluded it was unsupported. Adding the entry changes nothing
+    // about routing; it makes the command discoverable. Arity -3: the handler
+    // rejects `args.len() < 2` (index + query), and arity counts the name.
+    "FT.AGGREGATE" => CommandMeta { name: "FT.AGGREGATE", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
 
     // ---- Workspace / message-queue commands (Wave B readonly-enforcement fix) ----
     // WS and MQ are single-token commands dispatched as `WS <SUB> ...` / `MQ

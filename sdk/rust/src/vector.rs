@@ -132,29 +132,18 @@ impl VectorClient {
             .await
     }
 
-    /// Upsert a vector record at `id` with `embedding_bytes` (LE-f32 encoded) and
-    /// `metadata_json` via `FT.UPSERT`.
-    ///
-    /// Lunaris-shaped helper: callers that already have an LE-f32 byte buffer
-    /// (because they encoded it themselves at the trait boundary) can use this
-    /// directly without re-decoding. Use [`encode_vector`] to produce the bytes
-    /// from a `&[f32]`.
-    pub async fn upsert(
-        &mut self,
-        index: &str,
-        id: &[u8],
-        embedding_bytes: &[u8],
-        metadata_json: &str,
-    ) -> Result<()> {
-        redis::cmd("FT.UPSERT")
-            .arg(index)
-            .arg(id)
-            .arg(embedding_bytes)
-            .arg(metadata_json)
-            .query_async::<()>(&mut self.conn)
-            .await?;
-        Ok(())
-    }
+    // `upsert` was removed in 0.3.0.
+    //
+    // It sent `FT.UPSERT`, which Moon does not implement — the `FT.` dispatcher
+    // answered `ERR unknown FT.* command` on every call. It was not
+    // reimplemented over the real wire form because there isn't a faithful one:
+    // Moon indexes a vector by `HSET`-ing a hash whose vector FIELD NAME comes
+    // from the index definition, and this signature (`index, id,
+    // embedding_bytes, metadata_json`) never carried that field name. Guessing
+    // it would trade a loud error for a silent wrong write.
+    //
+    // Create the index with `FT.CREATE`, then `HSET` the key with the index's
+    // own vector field; auto-indexing picks it up.
 
     /// Lower-level `FT.SEARCH` invocation that exposes the full Lunaris-shaped
     /// query: a custom filter expression (built by the caller from its own

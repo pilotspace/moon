@@ -37,52 +37,16 @@ impl MqClient {
             .await?)
     }
 
-    /// Push a message onto a partitioned topic (`MQ.PUSH <topic> <partition> <payload>`).
-    ///
-    /// Lunaris-shaped helper: Lunaris models queues as `(topic, partition)` pairs
-    /// (matching Kafka semantics) and expects a numeric offset back rather than
-    /// a Redis-stream entry ID. Returns the broker-assigned monotonic offset
-    /// within `(topic, partition)`.
-    pub async fn push_partitioned(
-        &mut self,
-        topic: &str,
-        partition: u16,
-        payload: &[u8],
-    ) -> Result<u64> {
-        Ok(redis::cmd("MQ.PUSH")
-            .arg(topic)
-            .arg(partition)
-            .arg(payload)
-            .query_async(&mut self.conn)
-            .await?)
-    }
-
-    /// Long-poll pop one message from a partitioned topic, blocking up to
-    /// `block_ms` milliseconds (`MQ.POP <group> <topic> <partition> COUNT 1
-    /// BLOCK <ms>`).
-    ///
-    /// Lunaris-shaped helper. Returns the raw `redis::Value` so callers can
-    /// distinguish `Value::Nil` (no message in the poll window) from
-    /// `Value::Array` (at least one message ready) without paying for a typed
-    /// parse pass that would lose the Nil signal.
-    pub async fn pop_partitioned(
-        &mut self,
-        group: &str,
-        topic: &str,
-        partition: u16,
-        block_ms: u64,
-    ) -> Result<redis::Value> {
-        Ok(redis::cmd("MQ.POP")
-            .arg(group)
-            .arg(topic)
-            .arg(partition)
-            .arg("COUNT")
-            .arg(1)
-            .arg("BLOCK")
-            .arg(block_ms)
-            .query_async(&mut self.conn)
-            .await?)
-    }
+    // `push_partitioned` / `pop_partitioned` were removed in 0.3.0.
+    //
+    // They sent `MQ.PUSH` / `MQ.POP` as COMMAND names, modelling queues as
+    // `(topic, partition)` pairs with a numeric broker offset — Lunaris's
+    // shape, not Moon's. Moon has no such commands and no partition model:
+    // every call answered `ERR unknown command` on its first round trip, so
+    // nothing could depend on their behaviour, only on them compiling.
+    //
+    // Use [`MqClient::push`] / [`MqClient::pop`], which speak the real wire
+    // form (`MQ PUSH|POP <key> …`) and return a stream entry ID.
 
     /// Pop up to `count` messages from the queue.
     ///
