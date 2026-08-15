@@ -77,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **A test waiver went stale and hid five working commands from the registry sweep.**
+  `cdg1_registry_sweep_no_unknowns` enumerates `COMMAND_META` and asserts nothing answers
+  `unknown command`, skipping a list of 10 backlogged-unimplemented names. Five of them had since
+  shipped — `WATCH`/`UNWATCH` (`+OK`), `RESET` (`+RESET`), `SSUBSCRIBE`/`SUNSUBSCRIBE` (a 3-element
+  confirmation), all delivered by the v0.9 client-compat tasks — and none was removed from the
+  list, so for the whole milestone the sweep reported green over a surface it had quietly stopped
+  covering. The list is now the five that genuinely do not dispatch (`LATENCY`, `MODULE`, `DUMP`,
+  `RESTORE`, `RECLAMATION`), and the sweep passes with the other five included on both feature legs.
+  The waiver now also expires by itself: each backlogged command is asserted to STILL answer
+  `unknown command`, so implementing one fails the test and names it rather than letting the
+  exemption outlive its reason. A skip nobody re-checks is indistinguishable from coverage.
 - **Five Rust SDK helpers sent wire forms Moon rejects on every call; two server-side gaps that
   hid them are closed.** `moondb` 0.2.1 → **0.3.0** (breaking: five `pub` methods removed).
 

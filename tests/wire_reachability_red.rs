@@ -269,23 +269,21 @@ fn cdg1_registry_sweep_no_unknowns() {
     drop(wait_ready(port));
 
     // Backlogged by user decision (contract v2, 2026-06-11 "Fix 26, backlog the
-    // 10"): these are advertised in COMMAND_META but implemented NOWHERE —
-    // verified unknown on both runtimes including the v0.3.0 release binary.
-    // They are missing FEATURES (WATCH semantics, DUMP/RESTORE serialization,
-    // sharded pub/sub, latency/module admin), not dispatch-routing bugs, and
-    // are tracked as an observe-phase delta: implement or deregister.
-    const BACKLOGGED_UNIMPLEMENTED: &[&str] = &[
-        "WATCH",
-        "UNWATCH",
-        "RESET",
-        "SSUBSCRIBE",
-        "SUNSUBSCRIBE",
-        "LATENCY",
-        "MODULE",
-        "DUMP",
-        "RESTORE",
-        "RECLAMATION",
-    ];
+    // 10"): advertised in COMMAND_META but implemented NOWHERE. They are
+    // missing FEATURES (DUMP/RESTORE serialization, latency/module admin), not
+    // dispatch-routing bugs, and are tracked as an observe-phase delta:
+    // implement or deregister.
+    //
+    // Shrunk 10 -> 5 (2026-08-15). WATCH, UNWATCH, RESET, SSUBSCRIBE and
+    // SUNSUBSCRIBE were delivered by the v0-9-client-compat tasks
+    // `watch-cas-transactions`, `client-identity-introspection` and
+    // `pubsub-resp3-push`, but were never removed from this list — so for the
+    // whole milestone this sweep skipped five commands it should have been
+    // checking, and its green meant less than it appeared to. Measured live
+    // before removal: WATCH `+OK`, UNWATCH `+OK`, RESET `+RESET`,
+    // SSUBSCRIBE/SUNSUBSCRIBE a 3-element confirmation.
+    const BACKLOGGED_UNIMPLEMENTED: &[&str] =
+        &["LATENCY", "MODULE", "DUMP", "RESTORE", "RECLAMATION"];
 
     let mut violations: Vec<String> = Vec::new();
     for name in moon::command::metadata::COMMAND_META.keys() {
@@ -332,6 +330,36 @@ fn cdg1_registry_sweep_no_unknowns() {
     assert!(
         r.is_error_containing("unknown command"),
         "FOOBAR must remain an unknown command, got: {r:?}"
+    );
+
+    // The waiver must expire by itself.
+    //
+    // Every name above is skipped on the claim that it is unimplemented. A
+    // skip nobody re-checks is how this list kept five commands that had
+    // already shipped — the sweep stayed green over a surface it had quietly
+    // stopped covering. So assert the claim: each backlogged command must
+    // STILL answer "unknown command". The moment one is implemented, this
+    // fails and names it, forcing its removal from the list instead of
+    // letting the exemption outlive its reason.
+    let mut resurrected: Vec<String> = Vec::new();
+    for name in BACKLOGGED_UNIMPLEMENTED {
+        let mut c = Conn::new(connect(port, Duration::from_secs(10)));
+        let reply =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.cmd(&[name.as_bytes()])));
+        if let Ok(r) = reply
+            && !r.is_error_containing("unknown command")
+        {
+            resurrected.push(format!("{name}: {}", r.flat()));
+        }
+    }
+    assert!(
+        resurrected.is_empty(),
+        "{} command(s) are on BACKLOGGED_UNIMPLEMENTED but now ANSWER — the \
+         waiver is stale and the sweep is skipping working commands:\n  {}\n\n\
+         Remove them from BACKLOGGED_UNIMPLEMENTED so the registry sweep \
+         covers them.",
+        resurrected.len(),
+        resurrected.join("\n  ")
     );
 }
 
