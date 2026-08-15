@@ -1368,7 +1368,9 @@ pub fn get_rss_bytes() -> u64 {
 /// Real-footprint measurement lives in its own module; re-exported here
 /// so `metrics_setup::footprint_ratio` and friends keep resolving.
 pub use crate::admin::footprint::{
-    capture_footprint_baseline, footprint_baseline_bytes, footprint_ratio, process_footprint_bytes,
+    capture_footprint_baseline, footprint_baseline_bytes, footprint_correction,
+    footprint_correction_refreshes, footprint_ratio, footprint_sample_bytes,
+    process_footprint_bytes, publish_footprint_sample, refresh_footprint_correction,
 };
 
 // ── INFO helpers ────────────────────────────────────────────────────────

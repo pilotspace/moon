@@ -687,3 +687,65 @@ fn io19_sync_counters_present_and_zero_without_replicas() {
         );
     }
 }
+
+/// The footprint sampler must actually run on whichever runtime this binary
+/// was built for.
+///
+/// `maxmemory` is scaled by `footprint_correction()` on every write, and that
+/// correction is computed by a chore in the shard loop — which has a monoio
+/// arm and a tokio arm. If the chore were wired on only one of them, the
+/// correction on the other would sit at its neutral 1.00 forever and the cap
+/// would silently stop tracking real memory again, which is exactly the
+/// swap-death bug the correction exists to prevent. Nothing about that failure
+/// is visible in a unit test, in INFO's ratio (1.00 on any small instance,
+/// healthy or wedged), or in a crash.
+///
+/// So assert on the refresh COUNTER, which advances once a second regardless
+/// of instance size. This test costs its sleep and buys the one signal that
+/// distinguishes "correction is neutral" from "correction is dead".
+#[test]
+fn io20_footprint_correction_sampler_advances() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+
+    let read = |c: &mut Conn| -> u64 {
+        let reply = c.send(&["INFO", "memory"]);
+        field(&reply, "maxmemory_footprint_samples")
+            .unwrap_or_else(|| panic!("INFO memory has no maxmemory_footprint_samples:\n{reply}"))
+            .parse::<u64>()
+            .expect("sample counter must be an integer")
+    };
+
+    let first = read(&mut c);
+    // The chore fires on shard 0's ~1s cadence; allow several periods so a
+    // slow CI box does not fail a wiring assertion for being slow.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut second = first;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        second = read(&mut c);
+        if second > first {
+            break;
+        }
+    }
+    assert!(
+        second > first,
+        "maxmemory_footprint_samples stuck at {first} after 15s — the \
+         footprint chore is not running on this runtime, so maxmemory is no \
+         longer corrected for real process footprint"
+    );
+
+    // And the correction it publishes must be a usable divisor. Below the
+    // noise floor that is exactly 1.00; anything else here (0, NaN, inf) would
+    // divide the eviction budget into nonsense.
+    let reply = c.send(&["INFO", "memory"]);
+    let corr = field(&reply, "maxmemory_footprint_correction")
+        .unwrap_or_else(|| panic!("INFO memory has no maxmemory_footprint_correction:\n{reply}"))
+        .parse::<f64>()
+        .expect("correction must parse as a float");
+    assert!(
+        corr.is_finite() && (1.0..=8.0).contains(&corr),
+        "correction {corr} is outside the clamp — it divides the eviction \
+         budget, so a 0 or a NaN evicts the entire keyspace"
+    );
+}
