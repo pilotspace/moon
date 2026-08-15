@@ -17,13 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshakes, `WATCH` optimistic locking — rather than hand-rolled sockets. Stdlib `unittest` and
   the distro `python3-redis` package, because the runner has no pytest and PEP 668 blocks pip.
 
-  It found two multi-shard defects on its first run, both now pinned inside it as
-  `unittest.expectedFailure` so that fixing either breaks the run loudly (an *unexpected success*)
-  instead of leaving a stale skip: `MGET` in the same pipeline batch as the `SET`s that wrote its
-  keys returns nulls at `--shards >= 2` despite those `SET`s acking `+OK` earlier in the batch, and
-  `EVALSHA` of a **single-key** script is rejected with `CROSSSLOT`, which breaks
-  `redis.lock.Lock.release()`. A third, `CLIENT INFO` reporting a literal `cmd=NULL` for every
-  connection, is pinned the same way.
+  It found three defects on its first run, each pinned inside the suite so that fixing one breaks
+  the run with an actionable message rather than leaving a stale skip: at `--shards >= 2`, an
+  `MGET` in the same pipeline batch as the `SET`s that wrote its keys returns nulls despite those
+  `SET`s acking `+OK` earlier in the batch (a silent read-your-own-writes violation), `EVALSHA` of
+  a **single-key** script is rejected with `CROSSSLOT` (which breaks `redis.lock.Lock.release()`),
+  and `CLIENT INFO` reports a literal `cmd=NULL` for every connection.
+
+  The two multi-shard defects fire for roughly **half** of keys — decided by which shard owns the
+  key relative to the connection's own shard — so each pin runs twenty distinct keys rather than
+  one. A single-trial pin was tried first and made CI flaky, which is how the ~50% rate was found;
+  the amplified form is 0/10 flaky runs on both macOS and Linux, and still fails loudly when the
+  underlying bug is fixed.
 
 - **Nine INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
   `uptime_in_days`, `aof_last_write_status`, `aof_last_bgrewrite_status`,

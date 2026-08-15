@@ -226,27 +226,60 @@ class RedisPyAcceptance(unittest.TestCase):
 
     # -- pipelining and transactions ---------------------------------------
 
-    @unittest.expectedFailure  # KNOWN GAP — moon#507
     def test_rp7_pipeline_without_transaction(self):
-        """KNOWN GAP (moon#507): pinned as an expected failure, not weakened.
-
-        At `--shards >= 2` an MGET in the same batch as the SETs that wrote its
-        keys returns nulls, though those SETs acked `+OK` earlier in the batch.
-        Redis executes a pipeline in order, so this is a read-your-own-writes
-        violation, and it is silent — the caller gets `None`, not an error.
-
-        `expectedFailure` rather than an inverted assertion: unittest reports an
-        *unexpected success* (which fails the run) the moment #507 is fixed, so
-        the pin cannot go stale, and the assertion below still states what
-        correct behaviour is.
-        """
+        """A pipeline must execute in order and be visible to its own later commands."""
         c = self.client()
+        c.delete("rp7:a", "rp7:b")
         with c.pipeline(transaction=False) as p:
             p.set("rp7:a", "1")
             p.set("rp7:b", "2")
-            p.mget("rp7:a", "rp7:b")
+            p.get("rp7:a")
+            p.get("rp7:b")
             out = p.execute()
-        self.assertEqual(out[-1], ["1", "2"])
+        self.assertEqual(out[:2], [True, True])
+        self.assertEqual(out[-2:], ["1", "2"])
+
+    def test_rp7b_mget_in_a_pipeline_is_a_known_gap(self):
+        """KNOWN GAP (moon#507), amplified so it cannot pass by luck.
+
+        At `--shards >= 2`, an MGET in the same batch as the SETs that wrote
+        its keys returns nulls — though those SETs acked `+OK` earlier in that
+        same batch and the values are readable the instant the batch ends.
+        Redis executes a pipeline in order, so this is a silent
+        read-your-own-writes violation.
+
+        It fires for roughly HALF of all key groups: whether it happens is
+        decided by which shard owns the keys relative to the connection's own
+        shard. A single trial is therefore a coin flip, which is exactly how an
+        earlier `expectedFailure` version of this test made CI flaky. Twenty
+        independent key groups drop the odds of a spurious pass to ~1e-6, and
+        the assertion is written so that ZERO failures — the state after a fix —
+        breaks the run.
+        """
+        c = self.client()
+        broken = []
+        for i in range(20):
+            a, b = f"{{rp7b{i}}}a", f"{{rp7b{i}}}b"
+            c.delete(a, b)
+            with c.pipeline(transaction=False) as p:
+                p.set(a, "1")
+                p.set(b, "2")
+                p.mget(a, b)
+                out = p.execute()
+            self.assertEqual(out[:2], [True, True], "the SETs themselves failed")
+            if out[-1] != ["1", "2"]:
+                broken.append((a, out[-1]))
+            self.assertEqual(
+                c.mget(a, b), ["1", "2"],
+                f"{a}/{b} are wrong even AFTER the batch — #507 is a visibility "
+                f"bug, not a durability one; this is a different, worse defect",
+            )
+        self.assertTrue(
+            broken,
+            "all 20 pipelined MGETs returned the values written in their own "
+            "batch — moon#507 is fixed. Delete this probe and assert the "
+            "correct behaviour directly in rp7.",
+        )
 
     def test_rp8_multi_exec_transaction(self):
         c = self.client()
@@ -342,30 +375,49 @@ class RedisPyAcceptance(unittest.TestCase):
 
     # -- library-level constructs -----------------------------------------
 
-    @unittest.expectedFailure  # KNOWN GAP — moon#508
-    def test_rp14_lock_acquires_and_releases(self):
-        """KNOWN GAP (moon#508): `redis.lock.Lock` is SET NX PX plus a Lua release script.
+    def test_rp14_lock_is_exclusive(self):
+        """`redis.lock.Lock` acquisition is SET NX PX — a held lock is exclusive.
 
-        It fails if either half is wrong, and it is what most applications
-        actually reach for — so it belongs in an acceptance suite even though
-        both halves are covered separately.
-
-        At `--shards >= 2` the release EVALSHA is rejected with `CROSSSLOT Keys
-        in script don't hash to the same slot and shard` for a script with ONE
-        key. Pinned as an expected failure so the run breaks loudly when #508
-        is fixed rather than leaving a stale skip behind.
+        Release is covered separately: it goes through EVALSHA, which has its
+        own known gap (moon#508, see below).
         """
         c = self.client()
         lock = c.lock("rp14", timeout=5, blocking_timeout=2)
         self.assertTrue(lock.acquire())
-        try:
-            self.assertFalse(
-                c.lock("rp14", timeout=5, blocking_timeout=0.2).acquire(),
-                "a held lock was acquired twice — SET NX is not exclusive",
-            )
-        finally:
-            lock.release()
-        self.assertTrue(c.lock("rp14", timeout=5).acquire(blocking=False))
+        self.assertFalse(
+            c.lock("rp14", timeout=5, blocking_timeout=0.2).acquire(),
+            "a held lock was acquired twice — SET NX is not exclusive",
+        )
+
+    def test_rp14b_single_key_evalsha_is_a_known_gap(self):
+        """KNOWN GAP (moon#508), amplified for the same reason as rp7b.
+
+        At `--shards >= 2`, EVALSHA of a script declaring ONE key is rejected
+        with `CROSSSLOT Keys in script don't hash to the same slot and shard`.
+        One key cannot cross slots. `SCRIPT EXISTS` returns `[True]`, so it is
+        the key-slot check and not a cache miss.
+
+        This is what breaks `redis.lock.Lock.release()`, which is a single-key
+        EVALSHA — so the most-used construct in redis-py fails for about half
+        of all lock names. Like moon#507 it fires per-KEY (~50% at two shards),
+        which is why this probe runs twenty distinct keys instead of one.
+        """
+        c = self.client()
+        sha = c.script_load("return redis.call('get', KEYS[1])")
+        self.assertEqual(c.script_exists(sha), [True], "the script did not cache")
+        rejected = []
+        for i in range(20):
+            key = f"rp14b:{i}"
+            c.set(key, "v")
+            try:
+                self.assertEqual(c.evalsha(sha, 1, key), "v")
+            except redis.exceptions.RedisError as e:
+                rejected.append((key, str(e)))
+        self.assertTrue(
+            rejected,
+            "all 20 single-key EVALSHA calls succeeded — moon#508 is fixed. "
+            "Delete this probe and restore the release half of rp14.",
+        )
 
     def test_rp15_from_url_and_pool_reuse(self):
         """`from_url` is how most applications construct a client at all."""
