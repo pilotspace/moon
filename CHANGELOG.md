@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
+  into the `client-compat` CI job. The raw-RESP differ compares bytes against a real redis-server;
+  it is precise and blind to everything a client library does *around* the reply — the handshake it
+  opens with, the connection it reuses, the Python type it decodes into, the second command it
+  issues on your behalf. A server can answer every byte correctly and still be unusable from
+  redis-py. The suite therefore drives redis-py's own idioms — connection pools, `pipeline()`,
+  `pubsub()`, `scan_iter()`/`hscan_iter()`, `redis.lock.Lock`, `from_url`, RESP2 and RESP3
+  handshakes, `WATCH` optimistic locking — rather than hand-rolled sockets. Stdlib `unittest` and
+  the distro `python3-redis` package, because the runner has no pytest and PEP 668 blocks pip.
+
+  It found two multi-shard defects on its first run, both now pinned inside it as
+  `unittest.expectedFailure` so that fixing either breaks the run loudly (an *unexpected success*)
+  instead of leaving a stale skip: `MGET` in the same pipeline batch as the `SET`s that wrote its
+  keys returns nulls at `--shards >= 2` despite those `SET`s acking `+OK` earlier in the batch, and
+  `EVALSHA` of a **single-key** script is rejected with `CROSSSLOT`, which breaks
+  `redis.lock.Lock.release()`. A third, `CLIENT INFO` reporting a literal `cmd=NULL` for every
+  connection, is pinned the same way.
+
 - **Nine INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
   `uptime_in_days`, `aof_last_write_status`, `aof_last_bgrewrite_status`,
   `rdb_changes_since_last_save`, `sync_full`, `sync_partial_ok` and `sync_partial_err` are now
