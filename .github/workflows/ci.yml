@@ -472,6 +472,32 @@ jobs:
         working-directory: sdk/python
         timeout-minutes: 10
 
+      # ── EC2: acceptance suite driven by UNMODIFIED redis-py ──────────────
+      # The raw-RESP differ above compares bytes against a real redis-server.
+      # It is precise and blind to everything a client library does AROUND the
+      # reply — the handshake it opens with, the connection it reuses, the
+      # Python type it decodes into, the second command it issues for you. A
+      # server can answer every byte correctly and still be unusable from
+      # redis-py, so this drives redis-py's own idioms instead of sockets:
+      # connection pools, pipeline(), pubsub(), scan_iter(), Lock, from_url.
+      #
+      # redis-py comes from the distro package (python3-redis 6.4.0) for the
+      # same reason the version guard uses plain unittest — PEP 668 blocks pip
+      # and python3.14-venv is absent. Verified on the runner.
+      #
+      # Runs at --shards 2 deliberately: single-shard hides the multi-shard
+      # defects this suite found (#507, #508), which are pinned inside it as
+      # expected failures so a fix breaks the run loudly instead of leaving a
+      # stale skip.
+      - name: redis-py acceptance suite (unmodified client, live server)
+        run: |
+          python3 -c 'import redis; print("redis-py", redis.__version__)'
+          python3 -m unittest discover \
+            -s scripts/client-compat/redis_py -p 'test_acceptance.py' -v
+        env:
+          MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
+        timeout-minutes: 15
+
       - name: Upload record
         if: always()
         uses: actions/upload-artifact@v4

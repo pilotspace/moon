@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
+  into the `client-compat` CI job. The raw-RESP differ compares bytes against a real redis-server;
+  it is precise and blind to everything a client library does *around* the reply — the handshake it
+  opens with, the connection it reuses, the Python type it decodes into, the second command it
+  issues on your behalf. A server can answer every byte correctly and still be unusable from
+  redis-py. The suite therefore drives redis-py's own idioms — connection pools, `pipeline()`,
+  `pubsub()`, `scan_iter()`/`hscan_iter()`, `redis.lock.Lock`, `from_url`, RESP2 and RESP3
+  handshakes, `WATCH` optimistic locking — rather than hand-rolled sockets. Stdlib `unittest` and
+  the distro `python3-redis` package, because the runner has no pytest and PEP 668 blocks pip.
+
+  It found three defects on its first run, each pinned inside the suite so that fixing one breaks
+  the run with an actionable message rather than leaving a stale skip: at `--shards >= 2`, an
+  `MGET` in the same pipeline batch as the `SET`s that wrote its keys returns nulls despite those
+  `SET`s acking `+OK` earlier in the batch (a silent read-your-own-writes violation), `EVALSHA` of
+  a **single-key** script is rejected with `CROSSSLOT` (which breaks `redis.lock.Lock.release()`),
+  and `CLIENT INFO` reports a literal `cmd=NULL` for every connection.
+
+  The two multi-shard defects fire for roughly **half** of keys — decided by which shard owns the
+  key relative to the connection's own shard — so each pin runs twenty distinct keys rather than
+  one. A single-trial pin was tried first and made CI flaky, which is how the ~50% rate was found;
+  the amplified form is 0/10 flaky runs on both macOS and Linux, and still fails loudly when the
+  underlying bug is fixed.
+
 - **Nine INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
   `uptime_in_days`, `aof_last_write_status`, `aof_last_bgrewrite_status`,
   `rdb_changes_since_last_save`, `sync_full`, `sync_partial_ok` and `sync_partial_err` are now
