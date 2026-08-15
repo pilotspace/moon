@@ -442,16 +442,19 @@ jobs:
             cargo test --manifest-path sdk/rust/Cargo.toml --test round_trip -- --ignored
         timeout-minutes: 20
       - name: Python SDK version derivation
-        run: |
-          set -euo pipefail
-          python3 -c 'import pytest' 2>/dev/null || python3 -m pip install --quiet --user pytest
-          # Scoped to the version guards, NOT the whole offline suite: seven
-          # tests in tests/test_text.py need pytest-asyncio and fail without
-          # it, and they fail identically on main. Gating this job on them
-          # would be gating it on the runner's Python environment rather than
-          # on the SDK. Widen the selector once that dependency is declared.
-          python3 -m pytest tests/test_version.py \
-            'tests/test_client.py::TestVersionExported' -q
+        # Plain `unittest`, matching the differ steps above, because the runner
+        # has NO pytest and cannot get one: Ubuntu 24.04 / Python 3.14 ships
+        # PEP 668 EXTERNALLY-MANAGED (so `pip install --user` aborts) and
+        # `python3.14-venv` is not installed (so `python3 -m venv` fails at
+        # ensurepip). Both verified on the runner rather than assumed. The
+        # guard is written as `unittest.TestCase` so it needs only stdlib —
+        # pytest still collects it for local development.
+        #
+        # Scoped to the version guards, not the whole offline suite: seven
+        # tests in tests/test_text.py need pytest-asyncio and fail identically
+        # on main, so gating this job on them would gate it on the runner's
+        # Python environment rather than on the SDK.
+        run: python3 -m unittest discover -s tests -p 'test_version.py' -v
         working-directory: sdk/python
         timeout-minutes: 10
 
