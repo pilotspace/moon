@@ -372,6 +372,7 @@ pub(super) async fn try_handle_info(
     let pubsub_facts = conn_cmd::InstanceFacts {
         pubsub_channels,
         pubsub_patterns,
+        tcp_port: ctx.config_port,
     };
     let resp_frame = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
         conn_cmd::info_with_facts(db, cmd_args, &keyspace, real_repl.as_deref(), &pubsub_facts)

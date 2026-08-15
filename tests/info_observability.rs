@@ -44,9 +44,21 @@ fn spawn_moon(shards: &str) -> Moon {
     spawn_moon_in(shards, None)
 }
 
+/// A server with persistence ON. BGSAVE only completes when a durability
+/// backstop is configured — with `appendonly no` and no `--save`, Moon logs
+/// "BGSAVE triggered" and the snapshot epoch is never advanced, so a test that
+/// waits for a save on the default spawner waits forever.
+fn spawn_moon_persistent(shards: &str) -> Moon {
+    spawn_moon_with(shards, None, &["--appendonly", "yes"])
+}
+
 /// `dir` lets a restart test reuse the SAME data dir, which is the only way
 /// to prove run_id changes for reasons other than a fresh dataset.
 fn spawn_moon_in(shards: &str, dir: Option<std::path::PathBuf>) -> Moon {
+    spawn_moon_with(shards, dir, &["--appendonly", "no"])
+}
+
+fn spawn_moon_with(shards: &str, dir: Option<std::path::PathBuf>, extra: &[&str]) -> Moon {
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
     let fixed_dir = dir.clone();
     let (child, port) = common::spawn_listening(|port| {
@@ -62,13 +74,12 @@ fn spawn_moon_in(shards: &str, dir: Option<std::path::PathBuf>) -> Moon {
                 shards,
                 "--admin-port",
                 "0",
-                "--appendonly",
-                "no",
                 "--disk-free-min-pct",
                 "0",
                 "--dir",
                 tmp_dir.to_str().unwrap(),
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(
                 std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
@@ -501,4 +512,178 @@ fn io13_pubsub_counts_are_instance_wide() {
         Some("1"),
         "one subscribed pattern must be visible instance-wide"
     );
+}
+
+// ---------------------------------------------------------------------------
+// io14..io18 — the ten INFO fields the pinned client manifest reads but Moon
+// did not answer. Each is backed by a real source; a field Moon cannot answer
+// truthfully is waived in scripts/client-compat/info_fields.txt with a reason,
+// not emitted as a constant. See `# Server`/`# Stats` in command/connection.rs.
+// ---------------------------------------------------------------------------
+
+/// `tcp_port` is how a client that reached the server via a proxy, a container
+/// port map, or a sentinel handoff learns the port to hand to a peer. Reporting
+/// the port the connection arrived on would be wrong behind a NAT — this must
+/// be the listener's own configured port.
+#[test]
+fn io14_tcp_port_is_the_configured_listener_port() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    let reply = c.send(&["INFO", "server"]);
+    let got = field(&reply, "tcp_port")
+        .unwrap_or_else(|| panic!("INFO server has no tcp_port field; got:\n{reply}"));
+    assert_eq!(
+        got,
+        m.port.to_string(),
+        "tcp_port must be the port this instance listens on ({}), not {got}",
+        m.port
+    );
+}
+
+/// `uptime_in_seconds` is the field every restart-detector keys on: a drop to
+/// near zero is how a dashboard learns the process died. A constant, or a value
+/// that never advances, makes a crash-looping server indistinguishable from a
+/// healthy one.
+#[test]
+fn io15_uptime_advances_and_days_agree() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+
+    let first = field(&c.send(&["INFO", "server"]), "uptime_in_seconds")
+        .unwrap_or_else(|| panic!("INFO server has no uptime_in_seconds"))
+        .parse::<u64>()
+        .expect("uptime_in_seconds must be an integer");
+    assert!(
+        first < 60,
+        "a just-spawned server reported uptime_in_seconds={first} — the start \
+         instant is not being captured at startup"
+    );
+
+    std::thread::sleep(Duration::from_millis(1600));
+    let reply = c.send(&["INFO", "server"]);
+    let second = field(&reply, "uptime_in_seconds")
+        .expect("uptime_in_seconds")
+        .parse::<u64>()
+        .expect("integer");
+    assert!(
+        second > first,
+        "uptime_in_seconds did not advance across 1.6s ({first} -> {second}); \
+         a frozen uptime hides a restart from every monitoring agent"
+    );
+
+    let days = field(&reply, "uptime_in_days")
+        .expect("uptime_in_days")
+        .parse::<u64>()
+        .expect("integer");
+    assert_eq!(
+        days,
+        second / 86_400,
+        "uptime_in_days must be uptime_in_seconds/86400, not an independent counter"
+    );
+}
+
+/// The two AOF status fields are the ones an operator reads after a disk
+/// incident. Redis reports `ok`/`err`; anything else breaks the parse in
+/// stock tooling. With AOF off they must still report a defined status.
+#[test]
+fn io17_aof_status_fields_are_ok_or_err() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    let reply = c.send(&["INFO", "persistence"]);
+
+    for name in ["aof_last_write_status", "aof_last_bgrewrite_status"] {
+        let got = field(&reply, name)
+            .unwrap_or_else(|| panic!("INFO persistence has no {name}; got:\n{reply}"));
+        assert!(
+            got == "ok" || got == "err",
+            "{name} must be `ok` or `err` (Redis parity — tooling string-matches \
+             these), got {got:?}"
+        );
+    }
+}
+
+/// `rdb_changes_since_last_save` is the "is a save worth doing" signal. It must
+/// rise with writes and reset when a save completes; a field pinned at 0 tells
+/// a backup script there is nothing to persist.
+#[test]
+fn io18_rdb_changes_tracks_writes_and_resets_on_save() {
+    let m = spawn_moon_persistent("1");
+    let mut c = Conn::open(m.port);
+
+    let base = field(
+        &c.send(&["INFO", "persistence"]),
+        "rdb_changes_since_last_save",
+    )
+    .unwrap_or_else(|| panic!("INFO persistence has no rdb_changes_since_last_save"))
+    .parse::<u64>()
+    .expect("integer");
+
+    for i in 0..25 {
+        c.send(&["SET", &format!("io18:{i}"), "v"]);
+    }
+    let after_writes = field(
+        &c.send(&["INFO", "persistence"]),
+        "rdb_changes_since_last_save",
+    )
+    .expect("field")
+    .parse::<u64>()
+    .expect("integer");
+    assert!(
+        after_writes >= base + 25,
+        "25 SETs advanced rdb_changes_since_last_save by {} (expected >= 25) — \
+         the counter is not fed by the write path",
+        after_writes - base
+    );
+
+    // BGSAVE, not SAVE: SAVE is refused in sharded mode, and Moon spawns
+    // every instance sharded. BGSAVE returns before the save finishes, so the
+    // reset must be observed by polling `rdb_bgsave_in_progress` rather than
+    // read immediately — reading too early would pass for the wrong reason
+    // (the counter simply had not been reset yet).
+    let saved = c.send(&["BGSAVE"]);
+    assert!(
+        saved.starts_with('+'),
+        "BGSAVE failed, test proves nothing: {saved}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut after_save = after_writes;
+    while Instant::now() < deadline {
+        let reply = c.send(&["INFO", "persistence"]);
+        let in_progress = field(&reply, "rdb_bgsave_in_progress").unwrap_or_default();
+        after_save = field(&reply, "rdb_changes_since_last_save")
+            .expect("field")
+            .parse::<u64>()
+            .expect("integer");
+        if in_progress == "0" && after_save < after_writes {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        after_save < after_writes,
+        "a completed SAVE did not reset rdb_changes_since_last_save \
+         ({after_writes} -> {after_save}); the field never returns to a \
+         'nothing to persist' state"
+    );
+}
+
+/// The three `sync_*` counters are how an operator sees replicas thrashing:
+/// a climbing `sync_full` means partial resync keeps failing. On a standalone
+/// master with no replicas they must be present and zero — present, because a
+/// missing field breaks the scrape; zero, because nothing has synced.
+#[test]
+fn io19_sync_counters_present_and_zero_without_replicas() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    let reply = c.send(&["INFO", "stats"]);
+    for name in ["sync_full", "sync_partial_ok", "sync_partial_err"] {
+        let got = field(&reply, name)
+            .unwrap_or_else(|| panic!("INFO stats has no {name}; got:\n{reply}"))
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("{name} must be an integer"));
+        assert_eq!(
+            got, 0,
+            "{name} is {got} on an instance no replica ever contacted"
+        );
+    }
 }

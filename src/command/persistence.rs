@@ -101,6 +101,8 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
             Ok(()) => {
                 info!("Background RDB save completed: {}", path.display());
                 BGSAVE_LAST_STATUS.store(true, Ordering::Relaxed);
+                // A completed save is the reset point for `rdb_changes_since_last_save`.
+                crate::admin::metrics_setup::mark_save_completed();
                 LAST_SAVE_TIME.store(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -126,6 +128,8 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
             Ok(()) => {
                 info!("Background RDB save completed: {}", path.display());
                 BGSAVE_LAST_STATUS.store(true, Ordering::Relaxed);
+                // A completed save is the reset point for `rdb_changes_since_last_save`.
+                crate::admin::metrics_setup::mark_save_completed();
                 LAST_SAVE_TIME.store(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -205,6 +209,8 @@ pub fn bgsave_shard_done(success: bool) {
                 if prev == 1 {
                     // Last shard to finish
                     SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                    // A completed save is the reset point for `rdb_changes_since_last_save`.
+                    crate::admin::metrics_setup::mark_save_completed();
                     LAST_SAVE_TIME.store(
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -372,6 +378,8 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
     let path = PathBuf::from(dir).join(dbfilename);
     match rdb::save_from_snapshot(&snapshot, &path) {
         Ok(()) => {
+            // A completed save is the reset point for `rdb_changes_since_last_save`.
+            crate::admin::metrics_setup::mark_save_completed();
             LAST_SAVE_TIME.store(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

@@ -188,6 +188,100 @@ fn total_commands_sum() -> u64 {
         .sum()
 }
 
+// ── EC9: keyspace-change counter behind `rdb_changes_since_last_save` ────
+// The "is a save worth doing" signal every backup script reads. Sharded over
+// the same padded per-thread slots as the total-commands counter for the same
+// reason (a single line would bounce across every shard core at write rate);
+// the increment is one relaxed fetch_add on the thread's own line.
+//
+// Counted at the storage funnels (`Database::set` / `remove` / `get_mut` /
+// `clear` / `set_expiry`), not at dispatch: dispatch does not know whether a
+// command mutated, and a phf flags lookup on the hot path is exactly the cost
+// this codebase's perf invariants forbid. `get_mut` hands out mutable access
+// that the caller may or may not use, so the count can run slightly HIGH.
+// That direction is deliberate: over-counting says "changes pending" and
+// triggers a save that was not needed, while under-counting would tell a
+// backup script the dataset was clean when it was not.
+static KEYSPACE_CHANGE_COUNTERS: [PaddedCounter; COMMAND_COUNTER_SLOTS] =
+    [PADDED_COUNTER_ZERO; COMMAND_COUNTER_SLOTS];
+/// Value of the change counter when the last save completed. `rdb_changes_
+/// since_last_save` is the difference; a save that completes concurrently with
+/// writes can only make the difference smaller, never negative (saturating).
+static KEYSPACE_CHANGES_AT_LAST_SAVE: AtomicU64 = AtomicU64::new(0);
+
+/// Record one keyspace mutation. Hot path: one relaxed add, no allocation.
+#[inline]
+pub fn record_keyspace_change() {
+    COMMAND_COUNTER_SLOT.with(|&slot| {
+        KEYSPACE_CHANGE_COUNTERS[slot]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Exact sum across all slots. Read paths only (INFO).
+fn keyspace_changes_sum() -> u64 {
+    KEYSPACE_CHANGE_COUNTERS
+        .iter()
+        .map(|c| c.0.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Keyspace mutations since the last completed save (INFO `rdb_changes_since_last_save`).
+pub fn rdb_changes_since_last_save() -> u64 {
+    keyspace_changes_sum().saturating_sub(KEYSPACE_CHANGES_AT_LAST_SAVE.load(Ordering::Relaxed))
+}
+
+/// Mark a save as complete: subsequent changes count from here.
+///
+/// Called on SAVE / BGSAVE success, never on failure — a failed save left the
+/// dataset unpersisted, so the pending-change count must survive it.
+pub fn mark_save_completed() {
+    KEYSPACE_CHANGES_AT_LAST_SAVE.store(keyspace_changes_sum(), Ordering::Relaxed);
+}
+
+// ── EC9: replica sync counters (INFO `sync_full` / `sync_partial_*`) ─────
+// How an operator sees replicas thrashing: a climbing `sync_full` against a
+// flat `sync_partial_ok` means partial resync keeps failing and every replica
+// reconnect is re-shipping the whole dataset. Plain atomics — these fire once
+// per replica handshake, not per command.
+static SYNC_FULL: AtomicU64 = AtomicU64::new(0);
+static SYNC_PARTIAL_OK: AtomicU64 = AtomicU64::new(0);
+static SYNC_PARTIAL_ERR: AtomicU64 = AtomicU64::new(0);
+
+/// A replica was served a full resync (`+FULLRESYNC`).
+#[inline]
+pub fn record_sync_full() {
+    SYNC_FULL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A replica's `PSYNC <id> <offset>` was satisfied from the backlog.
+#[inline]
+pub fn record_sync_partial_ok() {
+    SYNC_PARTIAL_OK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A replica asked for a partial resync that could not be served.
+#[inline]
+pub fn record_sync_partial_err() {
+    SYNC_PARTIAL_ERR.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Full resyncs served since start.
+pub fn sync_full() -> u64 {
+    SYNC_FULL.load(Ordering::Relaxed)
+}
+
+/// Partial resyncs served from the backlog since start.
+pub fn sync_partial_ok() -> u64 {
+    SYNC_PARTIAL_OK.load(Ordering::Relaxed)
+}
+
+/// Partial-resync requests that had to fall back to a full resync.
+pub fn sync_partial_err() -> u64 {
+    SYNC_PARTIAL_ERR.load(Ordering::Relaxed)
+}
+
 // ── P6: WAL aggressive reclamation counters (read by P10 INFO emitter) ───
 // Incremented by WalWriterV3::recycle_aggressive(). P10 reads these via the
 // public getters below to populate the `# Reclamation` INFO section.

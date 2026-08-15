@@ -79,16 +79,29 @@ pub async fn handle_psync_inline_single_shard(
     };
 
     // Decide full vs partial resync against the single-shard backlog.
+    //
+    // EC9: the three INFO `sync_*` counters are recorded here, at the one
+    // point where the distinction is still visible. `PSYNC ? -1` is a replica
+    // ASKING for a full resync, not a partial resync that failed — counting it
+    // as `sync_partial_err` would make a healthy first-time replica look like
+    // a backlog problem. Only a replica that offered a replid+offset and was
+    // refused counts as a partial-resync failure.
     let decision = if client_offset < 0 {
+        crate::admin::metrics_setup::record_sync_full();
         PsyncDecision::FullResync
     } else if client_repl_id != repl_id && client_repl_id != repl_id2 {
+        crate::admin::metrics_setup::record_sync_partial_err();
+        crate::admin::metrics_setup::record_sync_full();
         PsyncDecision::FullResync
     } else {
         let off = client_offset as u64;
         let g = backlog_slot.lock();
         if g.as_ref().is_some_and(|b| b.contains_offset(off)) {
+            crate::admin::metrics_setup::record_sync_partial_ok();
             PsyncDecision::PartialResync { from_offset: off }
         } else {
+            crate::admin::metrics_setup::record_sync_partial_err();
+            crate::admin::metrics_setup::record_sync_full();
             PsyncDecision::FullResync
         }
     };

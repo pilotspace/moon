@@ -612,9 +612,47 @@ class Runner:
         return Result(entry.name, protocol, context, r_sent, r_raw, m_raw,
                       verdict, v.divergence, v.detail, entry.expect_diff)
 
+    @staticmethod
+    def _parse_info_manifest(path: str) -> list[tuple[str, str | None]]:
+        """Pinned INFO fields as (name, waiver_reason | None).
+
+        A line may carry an inline waiver:
+
+            latest_fork_usec  # WAIVED: Moon never calls fork(2)
+
+        A waiver is for a field Moon cannot answer TRUTHFULLY -- the INFO
+        emitter's standing rule is that such a field is omitted rather than
+        reported as a constant, because a hardcoded zero is indistinguishable
+        from a healthy server on a dashboard. The waiver records why, so the
+        omission is a decision on the record instead of a gap.
+
+        A waiver with no reason is rejected at load: an unexplained waiver is
+        how a real gap gets parked forever.
+        """
+        out: list[tuple[str, str | None]] = []
+        with open(path) as f:
+            for lineno, ln in enumerate(f, 1):
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                name, _, comment = ln.partition("#")
+                name = name.strip()
+                comment = comment.strip()
+                waiver = None
+                if comment.upper().startswith("WAIVED"):
+                    reason = comment.partition(":")[2].strip()
+                    if not reason:
+                        raise HarnessError(
+                            "ERR_UNREASONED_WAIVER",
+                            f"{path}:{lineno}: '{name}' is waived with no reason. "
+                            f"Write `{name}  # WAIVED: <why moon cannot answer "
+                            f"this truthfully>`.")
+                    waiver = reason
+                out.append((name, waiver))
+        return out
+
     def _info_coverage(self, rport: int, mport: int) -> list[Result]:
-        with open(self.cfg.info_manifest) as f:
-            fields = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        fields = self._parse_info_manifest(self.cfg.info_manifest)
         rc, mc = RespConn(rport, "resp2"), RespConn(mport, "resp2")
         try:
             sent = encode_command(["INFO"])
@@ -628,10 +666,29 @@ class Runner:
         moon_body = (m_node.value or b"").decode("latin1") if m_node else ""
         redis_body = (r_node.value or b"").decode("latin1") if r_node else ""
         out = []
-        for fname in fields:
+        for fname, waiver in fields:
             pat = rf"^{re.escape(fname)}:"
             in_moon = re.search(pat, moon_body, re.M) is not None
             in_redis = re.search(pat, redis_body, re.M) is not None
+            if waiver is not None:
+                if in_moon:
+                    # Self-invalidating waiver: the field SHIPPED. Leaving the
+                    # waiver in place would keep the manifest green over a
+                    # surface it had stopped needing to excuse -- exactly the
+                    # stale-waiver failure mode the registry sweep hit.
+                    verdict, div = "diff", "value"
+                    detail = (f"'{fname}' is waived ({waiver}) but moon now "
+                              f"EMITS it — delete the waiver, the gap is closed")
+                    out.append(Result(f"info:{fname}", "resp2", "standalone",
+                                      sent, r_raw, m_raw, verdict, div, detail))
+                    continue
+                # Carry the reason on `waiver_reason`, the field the reporter
+                # and the JSON record both read — a waiver whose reason prints
+                # as `None` is indistinguishable from an unreasoned one.
+                out.append(Result(f"info:{fname}", "resp2", "standalone", sent,
+                                  r_raw, m_raw, "waived", None,
+                                  f"waived: {waiver}", waiver_reason=waiver))
+                continue
             if not in_redis:
                 # The oracle does not emit it either: the pinned list is wrong,
                 # not Moon. Reporting this as a Moon defect would manufacture a

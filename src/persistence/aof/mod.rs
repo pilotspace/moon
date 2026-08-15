@@ -146,6 +146,20 @@ pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
 pub static AOF_LAST_APPEND_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Whether the last AOF rewrite (`BGREWRITEAOF`, or the #433 auto-rewrite)
+/// completed. Surfaces as INFO `aof_last_bgrewrite_status` — the field an
+/// operator reads after a disk incident to learn whether the rewrite that was
+/// supposed to reclaim the backlog actually finished.
+///
+/// `true` before any rewrite has run: Redis reports `ok` on a fresh instance
+/// too, and reporting `err` for "never attempted" would page someone for a
+/// rewrite that was never asked for. Set on every rewrite completion, both
+/// directions — a later success clears an earlier failure, because unlike
+/// `AOF_LAST_APPEND_OK` (which latches a permanently-missing record) a
+/// successful rewrite genuinely restores the invariant.
+pub static AOF_REWRITE_LAST_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Reason-DELs (eviction/expiry) dropped at the writer channel (#452.4).
 /// Strictly worse than a dropped client write: replay RESURRECTS a key the
 /// server told clients was gone. Kept as a dedicated counter so a non-zero
@@ -464,6 +478,7 @@ impl PerShardRewriteCoord {
                 // Publish BEFORE clearing the in-progress flag so every blocked
                 // writer wakes and reopens onto the (still-authoritative) old gen.
                 self.publish_outcome(self.old_seq);
+                AOF_REWRITE_LAST_OK.store(false, Ordering::SeqCst);
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
@@ -481,6 +496,7 @@ impl PerShardRewriteCoord {
                 // writers must roll back to it (their phase-6 reopen targeted
                 // new_seq, which never committed).
                 self.publish_outcome(self.old_seq);
+                AOF_REWRITE_LAST_OK.store(false, Ordering::SeqCst);
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
@@ -540,6 +556,7 @@ impl PerShardRewriteCoord {
             // new_seq in phase 6, so the barrier is a no-op for them — but it must
             // still unblock them.
             self.publish_outcome(self.new_seq);
+            AOF_REWRITE_LAST_OK.store(true, Ordering::SeqCst);
             crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
     }

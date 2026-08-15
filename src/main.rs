@@ -73,6 +73,13 @@ fn main() -> anyhow::Result<()> {
     // into ONE re-spawn with ONE conf string (see `build_malloc_conf`).
     malloc_respawn::maybe_respawn_with_memory_overrides()?;
 
+    // EC9: capture the start instant for INFO `uptime_in_seconds`. Placed
+    // immediately after the (at most one) malloc re-exec so uptime measures
+    // THIS process image, not the one that exec'd away — and before every
+    // subsystem, so a slow index reload counts as uptime rather than
+    // disappearing from it.
+    moon::command::connection::record_server_start();
+
     // Block SIGTERM in the main thread BEFORE any child threads are spawned
     // (TLS reload thread, Prometheus admin thread, ctrlc internal thread,
     // shard threads). All child threads inherit the blocked mask, so SIGTERM
