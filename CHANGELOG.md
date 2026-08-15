@@ -77,6 +77,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Five commands were advertised by `COMMAND`/ACL but dispatched nowhere; they are deregistered.**
+  `LATENCY`, `MODULE`, `DUMP`, `RESTORE` and `RECLAMATION` sat in `metadata.rs` while answering
+  `unknown command` on every dispatch path, so `COMMAND`, `COMMAND COUNT` (267 -> 262) and ACL all
+  described a surface Moon cannot serve — a client that introspects before calling was told it
+  could. Three were never top-level commands at all: `RECLAMATION` is reachable only as
+  `DEBUG RECLAMATION`, and `DUMP`/`RESTORE` only as `FUNCTION DUMP` / `FUNCTION RESTORE`, both of
+  which are unaffected. With these gone the registry sweep
+  (`cdg1_registry_sweep_no_unknowns`) runs with **no waiver list at all** — every entry in the
+  registry is now proven reachable on both feature legs, which is what the v0.9 exit criterion
+  asked for.
+- **CI now proves reply shapes match across MULTI and pipeline, not just standalone.** The compat
+  harness has always supported `--contexts standalone,multi,pipeline` and CI only ever ran
+  `--strict`, so the "a command must not change shape by context" rule was asserted by hand and
+  never gated. Wired in as its own step (PASS=201 FAIL=0 across all three contexts).
 - **A test waiver went stale and hid five working commands from the registry sweep.**
   `cdg1_registry_sweep_no_unknowns` enumerates `COMMAND_META` and asserts nothing answers
   `unknown command`, skipping a list of 10 backlogged-unimplemented names. Five of them had since

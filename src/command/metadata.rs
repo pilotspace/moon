@@ -302,8 +302,6 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "OBJECT" => CommandMeta { name: "OBJECT", arity: -2, flags: R, first_key: 2, last_key: 2, step: 1, acl_categories: GEN },
     "DBSIZE" => CommandMeta { name: "DBSIZE", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
     "RANDOMKEY" => CommandMeta { name: "RANDOMKEY", arity: 1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
-    "DUMP" => CommandMeta { name: "DUMP", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "RESTORE" => CommandMeta { name: "RESTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "SORT" => CommandMeta { name: "SORT", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "SORT_RO" => CommandMeta { name: "SORT_RO", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "COPY" => CommandMeta { name: "COPY", arity: -3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
@@ -380,10 +378,21 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     //           VACUUM VECTOR <idx> | VACUUM GRAPH <name>
     // Admin + Dangerous category (FREEZE kills all snapshots; treat all variants as dangerous).
     "VACUUM" => CommandMeta { name: "VACUUM", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
-    // MA5: RECLAMATION SCHEDULE — maintenance-window scheduler for autovacuum budget multipliers.
-    // Arity -3: RECLAMATION SCHEDULE <cron> <mult> | RECLAMATION SCHEDULE LIST | RECLAMATION SCHEDULE CLEAR
-    // Admin only (no data mutation, no snapshot impact).
-    "RECLAMATION" => CommandMeta { name: "RECLAMATION", arity: -3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    // DEREGISTERED 2026-08-15 (v0-9-client-compat exit criterion: "no command
+    // registered here answers unknown command"): DUMP, RESTORE, RECLAMATION,
+    // MODULE and LATENCY were advertised but dispatched NOWHERE, so COMMAND,
+    // COMMAND COUNT and ACL all described a surface Moon cannot serve — the
+    // milestone's own wording was "implement or deregister", and this is the
+    // deregister half.
+    //
+    // Three of the five were never top-level commands at all: `RECLAMATION` is
+    // reachable only as `DEBUG RECLAMATION`, and `DUMP`/`RESTORE` only as
+    // `FUNCTION DUMP` / `FUNCTION RESTORE`. Their entries here described
+    // commands that had no counterpart anywhere in dispatch.
+    //
+    // Re-add an entry only together with the arm that serves it —
+    // `cdg1_registry_sweep_no_unknowns` now enumerates this table with NO
+    // waiver list, so a registered-but-unreachable command fails the suite.
     "MEMORY" => CommandMeta { name: "MEMORY", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "FLUSHDB" => CommandMeta { name: "FLUSHDB", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "FLUSHALL" => CommandMeta { name: "FLUSHALL", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
@@ -392,8 +401,6 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "SHUTDOWN" => CommandMeta { name: "SHUTDOWN", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "TIME" => CommandMeta { name: "TIME", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "LOLWUT" => CommandMeta { name: "LOLWUT", arity: -1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
-    "MODULE" => CommandMeta { name: "MODULE", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
-    "LATENCY" => CommandMeta { name: "LATENCY", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
 
     // ---- Pub/Sub commands ----
     "SUBSCRIBE" => CommandMeta { name: "SUBSCRIBE", arity: -2, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
