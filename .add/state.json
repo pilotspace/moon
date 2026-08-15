@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "batch-protocol-version-fidelity",
+  "active_task": "sdk-wire-form-fixes",
   "active_milestone": "v0-9-client-compat",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -338,14 +338,14 @@
     },
     "sdk-wire-form-fixes": {
       "title": "First-party Rust/Python SDK wire forms + MQ/WS registry entries",
-      "phase": "ground",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v0-9-client-compat",
       "depends_on": [
         "client-identity-introspection"
       ],
       "created": "2026-08-09T07:32:04+00:00",
-      "updated": "2026-08-09T07:32:04+00:00"
+      "updated": "2026-08-15T09:21:03+00:00"
     },
     "watch-cas-transactions": {
       "title": "WATCH/UNWATCH optimistic locking on both production dispatch paths",
@@ -609,7 +609,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-14T22:25:41+00:00",
+  "updated": "2026-08-15T09:21:03+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

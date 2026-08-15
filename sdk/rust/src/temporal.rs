@@ -11,11 +11,18 @@ pub struct TemporalClient {
 }
 
 impl TemporalClient {
-    /// Take a temporal snapshot at the current wall-clock time.
+    /// Publish a temporal checkpoint at the current wall-clock time.
     ///
-    /// After this command, reads on this connection see the state of the world
-    /// at the moment this command was executed. The server captures the timestamp
-    /// internally — no argument is accepted.
+    /// The server captures the timestamp itself — no argument is accepted — and
+    /// records a `wall_ms -> LSN` binding in the shard's temporal registry.
+    ///
+    /// This does NOT pin the connection to a snapshot view; nothing about
+    /// subsequent reads on this connection changes. The binding exists so a
+    /// LATER query can name that instant: `FT.SEARCH … AS_OF <wall_ms>`
+    /// resolves through this registry (see
+    /// [`VectorClient::search_opts`](crate::VectorClient::search_opts)'s
+    /// `as_of`). Take a checkpoint first, keep the timestamp, query against it
+    /// afterwards.
     pub async fn snapshot_at(&mut self) -> Result<()> {
         redis::cmd("TEMPORAL.SNAPSHOT_AT")
             .query_async::<()>(&mut self.conn)
@@ -23,40 +30,36 @@ impl TemporalClient {
         Ok(())
     }
 
-    /// Take a temporal snapshot at the explicitly-provided packed HLC value.
-    ///
-    /// Bi-temporal databases (e.g., Lunaris) need to pin AS_OF reads to a
-    /// historical timestamp, not "now". The packed HLC layout is
-    /// `(wall_ms as u128) << 32 | (counter as u128)`; Moon parses the
-    /// stringified value via BIGNUM.
-    ///
-    /// After this command, reads on this connection see the state of the world
-    /// at `packed_hlc`. Pair with [`release_snapshot`](Self::release_snapshot)
-    /// when done so the connection can be returned to live mode.
-    pub async fn snapshot_at_packed(&mut self, packed_hlc: u128) -> Result<()> {
-        redis::cmd("TEMPORAL.SNAPSHOT_AT")
-            .arg(packed_hlc.to_string())
-            .query_async::<()>(&mut self.conn)
-            .await?;
-        Ok(())
-    }
+    // `snapshot_at_packed` was removed in 0.3.0.
+    //
+    // It sent `TEMPORAL.SNAPSHOT_AT <packed_hlc>`, and the server's
+    // `validate_snapshot_at` rejects ANY argument — the command captures the
+    // timestamp itself. Every call answered `ERR wrong number of arguments`.
+    // The doc claimed "Moon parses the stringified value via BIGNUM"; nothing
+    // in the server ever did.
+    //
+    // This one is why the wire-form guard sends real arguments as well as bare
+    // names: the command name was right, so a name-only sweep saw nothing
+    // wrong. Pinning AS_OF to a historical timestamp has no server support at
+    // all — use [`snapshot_at`](Self::snapshot_at), which pins to now.
 
-    /// Release the current snapshot pin via `TEMPORAL.INVALIDATE` (no args).
-    ///
-    /// After a [`snapshot_at`](Self::snapshot_at) /
-    /// [`snapshot_at_packed`](Self::snapshot_at_packed) call, the connection
-    /// is pinned to that snapshot view. This call returns the connection to
-    /// live mode so subsequent reads see current data.
-    ///
-    /// Best-effort: callers typically discard errors here because the connection
-    /// may already be in an error state and the pin will eventually time out
-    /// server-side.
-    pub async fn release_snapshot(&mut self) -> Result<()> {
-        redis::cmd("TEMPORAL.INVALIDATE")
-            .query_async::<()>(&mut self.conn)
-            .await?;
-        Ok(())
-    }
+    // `release_snapshot` was removed in 0.3.0.
+    //
+    // It sent a bare `TEMPORAL.INVALIDATE`, but that command is the 3-arg
+    // entity form below (`validate_invalidate` requires exactly
+    // `<entity_id> <NODE|EDGE> <graph>`), so every call answered `ERR wrong
+    // number of arguments`. Found by the round-trip guard, not by review —
+    // this one had survived a name-level audit because `TEMPORAL.INVALIDATE`
+    // is a command Moon really does have.
+    //
+    // There is no replacement because there is nothing to release: the doc's
+    // premise was wrong. `TEMPORAL.SNAPSHOT_AT` never pinned the connection to
+    // a snapshot view — it records a shard-global `wall_ms -> LSN` binding
+    // that `AS_OF` resolves later. No pin is taken, so no pin can be dropped,
+    // and a connection is never in "snapshot mode" to return from.
+    //
+    // Callers that were relying on this to restore live reads can simply
+    // delete the call; their reads were already live.
 
     /// Invalidate (logically delete) a graph entity at the current wall-clock time.
     ///

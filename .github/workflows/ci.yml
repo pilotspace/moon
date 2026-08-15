@@ -412,6 +412,49 @@ jobs:
         # Reports the missing-field set; not yet a gate — info-observability
         # owns closing it, and this flips to a hard gate when that task lands.
         continue-on-error: true
+      # ── SDK wire-form guards ────────────────────────────────────────────
+      # The SDK tree had no CI of any kind, which is how five helpers shipped
+      # sending wire forms the server rejects on every call. They live here
+      # rather than in `check` because this is the job that already proves a
+      # real client works against a real Moon, and two of the three need a
+      # live server. The third guard (the command-NAME sweep,
+      # tests/sdk_wire_forms.rs) is in the main test tree and already runs in
+      # `check` / `check-monoio`; it spawns its own server.
+      - name: Rust SDK round trip (every public helper, live)
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          "$CARGO_TARGET_DIR/release/moon" --port 6488 --shards 1 \
+            --dir "$dir" --disk-free-min-pct 0 > "$dir/server.log" 2>&1 &
+          pid=$!
+          # Armed before the readiness wait, not after: the wait can exit
+          # non-zero, and a trap installed later would leak the server.
+          trap 'kill -9 $pid 2>/dev/null || true' EXIT
+          # Fail loudly if it never comes up: a silently-absent server would
+          # make the suite error at connect() rather than report a wire-form
+          # defect, and a green-because-it-never-ran guard is worse than none.
+          for _ in $(seq 1 60); do
+            if redis-cli -p 6488 PING 2>/dev/null | grep -q PONG; then break; fi
+            sleep 0.5
+          done
+          redis-cli -p 6488 PING | grep -q PONG || { cat "$dir/server.log"; exit 1; }
+          MOON_TEST_URL=redis://127.0.0.1:6488 \
+            cargo test --manifest-path sdk/rust/Cargo.toml --test round_trip -- --ignored
+        timeout-minutes: 20
+      - name: Python SDK version derivation
+        run: |
+          set -euo pipefail
+          python3 -c 'import pytest' 2>/dev/null || python3 -m pip install --quiet --user pytest
+          # Scoped to the version guards, NOT the whole offline suite: seven
+          # tests in tests/test_text.py need pytest-asyncio and fail without
+          # it, and they fail identically on main. Gating this job on them
+          # would be gating it on the runner's Python environment rather than
+          # on the SDK. Widen the selector once that dependency is declared.
+          python3 -m pytest tests/test_version.py \
+            'tests/test_client.py::TestVersionExported' -q
+        working-directory: sdk/python
+        timeout-minutes: 10
+
       - name: Upload record
         if: always()
         uses: actions/upload-artifact@v4

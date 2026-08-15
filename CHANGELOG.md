@@ -77,6 +77,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Five Rust SDK helpers sent wire forms Moon rejects on every call; two server-side gaps that
+  hid them are closed.** `moondb` 0.2.1 → **0.3.0** (breaking: five `pub` methods removed).
+
+  Each removed method failed on its first round trip, always, for the whole published lifetime of
+  the crate — so no caller can have depended on its behaviour, only on it compiling. Two named
+  commands Moon does not have, and three named real commands with the wrong arguments, which is
+  why a name-level audit had already cleared them:
+
+  | Removed | Sent | Server answered | Use instead |
+  | --- | --- | --- | --- |
+  | `MqClient::push_partitioned` | `MQ.PUSH` (a command name) | `unknown command` | `MqClient::push` |
+  | `MqClient::pop_partitioned` | `MQ.POP` (a command name) | `unknown command` | `MqClient::pop` |
+  | `VectorClient::upsert` | `FT.UPSERT` | `unknown FT.* command` | `FT.CREATE`, then `HSET` the index's vector field |
+  | `TemporalClient::snapshot_at_packed` | `TEMPORAL.SNAPSHOT_AT <hlc>` | `wrong number of arguments` | `snapshot_at` (the server captures the timestamp) |
+  | `TemporalClient::release_snapshot` | `TEMPORAL.INVALIDATE` (no args) | `wrong number of arguments` | nothing — delete the call |
+
+  `upsert` was not reimplemented over the real wire form because there is no faithful one: Moon
+  indexes a vector by `HSET`-ing a hash whose vector FIELD NAME comes from the index definition,
+  and the signature never carried it. Guessing would trade a loud error for a silent wrong write.
+  `release_snapshot` has no replacement because its premise was false: `TEMPORAL.SNAPSHOT_AT` never
+  pinned the connection to a snapshot view — it records a shard-global `wall_ms → LSN` binding that
+  `AS_OF` resolves later — so no pin is taken and none can be dropped. Callers can simply delete
+  the call; their reads were already live. `snapshot_at`'s documentation, which described the
+  imaginary pin, is corrected.
+
+  **`TXN` was NOT removed** — `txn_begin` / `txn_commit` / `txn_abort` are correct and stay. An
+  earlier shell probe appeared to show `TXN` dead; the probe was wrong (zsh does not word-split an
+  unquoted parameter expansion, so the server received one argument literally named `TXN BEGIN`).
+
+  Server-side, two commands were unreachable through introspection because they are served by
+  intercepts that run *before* the metadata table: `TXN` and `FT.AGGREGATE` are now registered, so
+  `COMMAND INFO` and `COMMAND COUNT` (265 → 267) report them. Registration is metadata only and
+  does not reroute either command. Separately, a bare `TXN` or an unrecognised subcommand answered
+  `unknown command 'TXN'`, which is false — the command exists — and misleads a driver into
+  concluding Moon has no cross-store transactions. It now answers an arity/subcommand error, the
+  shape Redis uses for container commands and the one driver error handling keys on.
+
+  The SDK tree had no CI of any kind, which is how all five shipped. Three guards now run:
+  a command-NAME sweep over the SDK sources (`tests/sdk_wire_forms.rs`), a live round trip through
+  every one of the 52 public Rust helpers (`sdk/rust/tests/round_trip.rs`), and a Python
+  `__version__` derivation check. The round trip is what found `release_snapshot`, after review had
+  already passed the file — and mutating a helper's argument order fails it while the name sweep
+  stays green, which is the point of having both.
+- **`moondb.__version__` reported a release the package had not been for two versions.** The Python
+  SDK published as `0.1.1` while `__version__` was a hand-maintained literal still answering
+  `"0.1.0"`, and the test covering it asserted the same stale literal — so the suite stayed green
+  while every caller reading `__version__`, every bug report quoting it, and anything gating on
+  "SDK >= x" got the wrong number. It is now derived from installed distribution metadata (falling
+  back to `pyproject.toml` for an uninstalled source checkout), so it cannot drift again, and the
+  test asserts the derivation rather than restating the value.
 - **Remote panic on the cluster bus: a truncated v3 gossip header killed the process.** The gossip
   wire v3 (#493) appended a 40-byte `sender_master_id`, but the deserializer's length guard still
   admitted any frame of at least the v2 header size so that a genuine v2 peer would still parse —

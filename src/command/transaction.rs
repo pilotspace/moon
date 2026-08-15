@@ -122,6 +122,31 @@ pub fn is_txn_abort(cmd: &[u8], args: &[Frame]) -> bool {
     matches!(args.first(), Some(Frame::BulkString(sub)) if sub.eq_ignore_ascii_case(b"ABORT"))
 }
 
+/// The error a `TXN` invocation earns when no subcommand intercept claimed it.
+///
+/// `TXN` is served entirely by the three predicates above, which run before
+/// dispatch. Anything reaching dispatch is therefore a bare `TXN` or an
+/// unrecognised subcommand — previously answered `unknown command 'TXN'`, which
+/// is false (the command exists) and misleads a driver into concluding Moon has
+/// no cross-store transactions at all.
+///
+/// Shapes follow Redis's container commands: a missing subcommand is an arity
+/// error, an unrecognised one names the offending token.
+pub fn err_txn_subcommand(args: &[Frame]) -> Frame {
+    let Some(sub) = args.first() else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'txn' command",
+        ));
+    };
+    let name = match sub {
+        Frame::BulkString(s) | Frame::SimpleString(s) => String::from_utf8_lossy(s).into_owned(),
+        _ => String::new(),
+    };
+    Frame::Error(Bytes::from(format!(
+        "ERR Unknown TXN subcommand or wrong number of arguments for '{name}'"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
