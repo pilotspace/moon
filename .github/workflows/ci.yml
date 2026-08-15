@@ -405,6 +405,18 @@ jobs:
         env:
           MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
         timeout-minutes: 15
+      # A command must not change shape by context. The harness could always
+      # prove this and CI never asked it to — it ran `--strict` alone, which
+      # covers standalone only, while the milestone exit criterion is about all
+      # three contexts. Measured before wiring: PASS=201 FAIL=0 WAIVED=17.
+      - name: Compatibility diff across contexts (standalone · MULTI · pipeline)
+        run: |
+          ./scripts/test-client-compat.sh --strict \
+            --contexts standalone,multi,pipeline \
+            --record tmp/client-compat-contexts.json
+        env:
+          MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
+        timeout-minutes: 20
       - name: INFO field coverage
         run: ./scripts/test-client-compat.sh --filter __none__ --info-manifest --record tmp/client-compat-info.json
         env:

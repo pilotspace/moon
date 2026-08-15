@@ -268,22 +268,26 @@ fn cdg1_registry_sweep_no_unknowns() {
     let _guard = ServerGuard(child);
     drop(wait_ready(port));
 
-    // Backlogged by user decision (contract v2, 2026-06-11 "Fix 26, backlog the
-    // 10"): advertised in COMMAND_META but implemented NOWHERE. They are
-    // missing FEATURES (DUMP/RESTORE serialization, latency/module admin), not
-    // dispatch-routing bugs, and are tracked as an observe-phase delta:
-    // implement or deregister.
+    // The waiver list is EMPTY, and stays empty.
     //
-    // Shrunk 10 -> 5 (2026-08-15). WATCH, UNWATCH, RESET, SSUBSCRIBE and
-    // SUNSUBSCRIBE were delivered by the v0-9-client-compat tasks
-    // `watch-cas-transactions`, `client-identity-introspection` and
-    // `pubsub-resp3-push`, but were never removed from this list — so for the
-    // whole milestone this sweep skipped five commands it should have been
-    // checking, and its green meant less than it appeared to. Measured live
-    // before removal: WATCH `+OK`, UNWATCH `+OK`, RESET `+RESET`,
-    // SSUBSCRIBE/SUNSUBSCRIBE a 3-element confirmation.
-    const BACKLOGGED_UNIMPLEMENTED: &[&str] =
-        &["LATENCY", "MODULE", "DUMP", "RESTORE", "RECLAMATION"];
+    // It held 10 names, waived as "advertised in COMMAND_META but implemented
+    // nowhere". It reached zero in two steps, both on 2026-08-15:
+    //
+    //   10 -> 5  WATCH, UNWATCH, RESET, SSUBSCRIBE, SUNSUBSCRIBE had SHIPPED
+    //            during v0-9-client-compat and nobody removed them, so this
+    //            sweep spent the whole milestone skipping five working
+    //            commands. Measured live: `+OK`, `+OK`, `+RESET`, `*3`, `*3`.
+    //   5  -> 0  LATENCY, MODULE, DUMP, RESTORE and RECLAMATION were
+    //            DEREGISTERED from COMMAND_META instead — they dispatched
+    //            nowhere, so advertising them made COMMAND and ACL lie about
+    //            the surface. (Three were never top-level commands at all:
+    //            `DEBUG RECLAMATION`, `FUNCTION DUMP`, `FUNCTION RESTORE`.)
+    //
+    // So the sweep now covers EVERY entry in the registry with no exemptions,
+    // which is what the milestone exit criterion actually asked for. Do not
+    // reintroduce this list: an unreachable command is a registry bug, and the
+    // fix is to remove the entry or add the dispatch arm, not to waive it.
+    const BACKLOGGED_UNIMPLEMENTED: &[&str] = &[];
 
     let mut violations: Vec<String> = Vec::new();
     for name in moon::command::metadata::COMMAND_META.keys() {
