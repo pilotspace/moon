@@ -86,6 +86,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cluster-ctl` thread, which by policy aborts the whole server. A short v3 header is now rejected
   as malformed. Seeded into `fuzz/corpus/gossip_deser` — the target was correct but had not
   synthesised the 4-byte magic plus that 40-byte length window within its PR budget.
+- **A pipelined `HELLO` no longer re-encodes the replies that came before it.** Moon accumulates a
+  read batch's replies and serialized them all at flush time under whichever protocol version was in
+  effect at the END of the batch, so a `HELLO 2` sent in the same write as an earlier command
+  retro-downgraded that earlier reply: `CONFIG GET maxmemory` produced under RESP3 went out as `*2`
+  instead of `%1`. Every reply is now encoded in the protocol that was in effect when that reply was
+  produced, with a switch taking effect from its own index onward — inclusive, so a `HELLO`'s own
+  reply is rendered in the protocol it establishes, which is what redis-server 8.6.1 does. Only the
+  downgrade direction was ever visible: the frame *shape* is already fixed correctly at dispatch, and
+  a RESP2-flattened array re-serialized as RESP3 still emits `*`, which is why the upgrade direction
+  looked fine by accident. It is now pinned in both directions. `RESET` is covered too: it is
+  contracted to return the connection to its default state, RESP2 included, so it moves the protocol
+  exactly as a pipelined `HELLO 2` does — and a fix that covered only the two `HELLO` sites left
+  `HELLO 3` + `RESET` in one write still retro-downgrading. `redis-cli` cannot express two commands
+  in one `write()`, which is how this survived — the new suite drives a raw socket, and runs on both
+  runtimes at 1 and 4 shards. Batches without a protocol switch — essentially all of them — keep the
+  previous single-version loop, one branch and no allocation.
+- **`CONFIG GET` answers every parameter, not just the first.** `CONFIG GET maxmemory appendonly`
+  reported only `maxmemory`; the rest were silently dropped, which is what `redis-py`'s
+  `config_get(*params)` and monitoring agents that read several settings per call send. The reply is
+  now the union over all patterns, deduplicated (`maxmemory` plus `maxmemory*` reports it once), in
+  the server's own table order rather than the caller's argument order, with unknown patterns skipped
+  rather than erroring — all four properties measured against redis-server 8.6.1.
 - **`CLUSTER INFO` no longer claims `cluster_enabled`, and a slotless node no longer claims health.**
   Two integration assertions encoded the pre-fix behaviour and contradicted the measured oracle:
   redis-server 8.6.1 reports `cluster_enabled` in `INFO` only — `CLUSTER INFO` never carries it —

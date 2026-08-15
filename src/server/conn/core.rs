@@ -12,6 +12,7 @@
 
 use bytes::Bytes;
 use ringbuf::HeapProd;
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -225,6 +226,24 @@ pub(crate) struct ConnectionState {
     /// asymmetry is the whole point of the verb, and a "just return +OK"
     /// implementation is what gets it wrong.
     pub readonly: bool,
+    /// Protocol switch points inside the batch currently being built:
+    /// `(response_index, version_from_that_index_on)`.
+    ///
+    /// A pipelined `HELLO` changes the protocol for the replies AFTER it and
+    /// for its own reply, never for the ones already produced — but a batch is
+    /// serialized in ONE pass at flush, by which time `protocol_version` has
+    /// already moved on. Without these points the batch's final version
+    /// retro-encodes every earlier reply, and a `Frame::Map` produced under
+    /// RESP3 goes out flattened as a RESP2 array.
+    ///
+    /// Empty for every batch containing no `HELLO` — essentially all of them —
+    /// and [`encode_response_batch`] branches on that, so the hot path keeps
+    /// its single-version loop and allocates nothing.
+    pub proto_switches: SmallVec<[(usize, u8); 2]>,
+    /// Version in effect at index 0 of the current batch, captured when the
+    /// FIRST switch is recorded — by then `protocol_version` already holds the
+    /// new one.
+    pub proto_batch_start: u8,
     pub acl_log: AclLog,
 
     /// Cached per-connection: true when the current user has no ACL
@@ -371,6 +390,8 @@ impl ConnectionState {
             client_name,
             asking: false,
             readonly: false,
+            proto_switches: SmallVec::new(),
+            proto_batch_start: 2,
             acl_log: AclLog::new(acl_max_len),
             subscription_count: 0,
             subscriber_id: 0,

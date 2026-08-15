@@ -100,9 +100,15 @@ pub(super) fn check_auth_gate(
                 ),
             );
             if !matches!(&response, Frame::Error(_)) {
+                // MUST come before `conn.protocol_version` moves: the helper
+                // reads it to learn what this batch STARTED in. Recorded at
+                // `responses.len()`, the index this reply will occupy, so the
+                // switch covers HELLO's own answer; replies already queued were
+                // produced under the OLD protocol and keep it. See
+                // `shared::encode_response_batch`.
+                crate::server::conn::shared::note_protocol_switch(conn, responses.len(), new_proto);
                 conn.protocol_version = new_proto;
-                // Keep the wire codec in lockstep: the HELLO reply itself must
-                // already be serialized in the negotiated protocol (RESP3 map).
+                // Keep the wire codec in lockstep for single-frame encodes.
                 codec.set_protocol_version(new_proto);
             }
             if let Some(name) = new_name {
@@ -408,9 +414,14 @@ pub(super) fn try_handle_hello(
         ),
     );
     if !matches!(&response, Frame::Error(_)) {
+        // MUST come before `conn.protocol_version` moves: the helper reads it
+        // to learn what this batch STARTED in. Recorded at `responses.len()`,
+        // the index this reply will occupy, so the switch covers HELLO's own
+        // answer; replies already queued were produced under the OLD protocol
+        // and keep it. See `shared::encode_response_batch`.
+        crate::server::conn::shared::note_protocol_switch(conn, responses.len(), new_proto);
         conn.protocol_version = new_proto;
-        // Keep the wire codec in lockstep: the HELLO reply itself must
-        // already be serialized in the negotiated protocol (RESP3 map).
+        // Keep the wire codec in lockstep for single-frame encodes.
         codec.set_protocol_version(new_proto);
     }
     if let Some(name) = new_name {

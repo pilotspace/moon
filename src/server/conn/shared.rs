@@ -6,7 +6,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use bytes::Bytes;
-#[cfg(feature = "runtime-tokio")]
 use bytes::BytesMut;
 
 use crate::command::config as config_cmd;
@@ -26,6 +25,107 @@ use super::util::extract_command;
 /// Type alias for the per-database RwLock container (tokio single-thread mode only).
 #[cfg(feature = "runtime-tokio")]
 pub(crate) type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
+/// Record that the reply at `at` — and every reply after it in this batch — is
+/// produced under `version`.
+///
+/// Call from the `HELLO` handler with `responses.len()` BEFORE pushing the
+/// HELLO reply, so the switch covers that reply too: Redis renders `HELLO`'s own
+/// answer in the protocol it has just negotiated.
+///
+/// **Call this BEFORE assigning `conn.protocol_version`.** The first call in a
+/// batch reads that field to learn what the batch STARTED in; calling it after
+/// the assignment records the new version as the batch start and silently
+/// restores the very bug this exists to fix. Only an end-to-end test can catch
+/// that mistake — `tests/batch_protocol_version.rs::bpv1` and `::bpv3` are the
+/// pins, and they DID catch it during development.
+pub(crate) fn note_protocol_switch(
+    conn: &mut super::core::ConnectionState,
+    at: usize,
+    version: u8,
+) {
+    if conn.proto_switches.is_empty() {
+        conn.proto_batch_start = conn.protocol_version;
+    }
+    conn.proto_switches.push((at, version));
+}
+
+/// Walks a batch index-by-index, yielding the protocol version in effect at
+/// each one.
+///
+/// Split out from `encode_response_batch` so the version arithmetic — the part
+/// that is easy to get subtly wrong and expensive to observe on the wire — can
+/// be tested directly. Indices must be visited in ascending order; the cursor
+/// never rewinds, which keeps the walk O(batch) rather than O(batch x switches).
+struct ProtoWalk<'a> {
+    switches: &'a [(usize, u8)],
+    next: usize,
+    version: u8,
+}
+
+impl<'a> ProtoWalk<'a> {
+    fn new(start: u8, switches: &'a [(usize, u8)]) -> Self {
+        Self {
+            switches,
+            next: 0,
+            version: start,
+        }
+    }
+
+    /// Version for reply `idx`. A switch recorded AT `idx` applies to it —
+    /// `HELLO`'s own reply is rendered in the protocol it just negotiated.
+    fn version_at(&mut self, idx: usize) -> u8 {
+        while let Some(&(at, to)) = self.switches.get(self.next)
+            && at <= idx
+        {
+            self.version = to;
+            self.next += 1;
+        }
+        self.version
+    }
+}
+
+/// Serialize a whole response batch, honouring any protocol switch recorded
+/// inside it, then clear the switch list ready for the next batch.
+///
+/// A pipelined `HELLO` moves `conn.protocol_version` the instant it is handled,
+/// but the batch is not serialized until every command in it has run. Encoding
+/// the batch under one final version therefore RETRO-encodes the replies
+/// produced before the switch — measured against redis-server 8.6.1, a
+/// `CONFIG GET` answered under RESP3 then followed by `HELLO 2` in the same
+/// pipeline must still go out as `%1`, not `*2`.
+///
+/// With no switch recorded — every batch that contains no `HELLO`, which is
+/// essentially all of them — this is exactly the single-version loop it
+/// replaces, with one branch and no allocation.
+pub(crate) fn encode_response_batch(
+    conn: &mut super::core::ConnectionState,
+    responses: &[Frame],
+    buf: &mut BytesMut,
+) {
+    if conn.proto_switches.is_empty() {
+        if conn.protocol_version >= 3 {
+            for item in responses {
+                crate::protocol::serialize_resp3(item, buf);
+            }
+        } else {
+            for item in responses {
+                crate::protocol::serialize(item, buf);
+            }
+        }
+        return;
+    }
+
+    let mut walk = ProtoWalk::new(conn.proto_batch_start, &conn.proto_switches);
+    for (idx, item) in responses.iter().enumerate() {
+        if walk.version_at(idx) >= 3 {
+            crate::protocol::serialize_resp3(item, buf);
+        } else {
+            crate::protocol::serialize(item, buf);
+        }
+    }
+    conn.proto_switches.clear();
+}
 
 /// Resolve FT.SEARCH `as_of_lsn` with the canonical precedence (TEMP-04, ACID-09):
 ///
@@ -1244,6 +1344,15 @@ pub(crate) fn try_handle_reset(
     // Identity + protocol, from the one definition of "default".
     let (proto, db, authed, user, name) =
         crate::server::conn::util::restore_migrated_state(None, requirepass);
+    // RESET is the SECOND protocol switch in the command set, and it moves the
+    // protocol the same way a pipelined `HELLO 2` does. Recorded before the
+    // assignment, at the index `+RESET` will occupy, so replies produced
+    // earlier in this batch keep the protocol they were produced under. A fix
+    // that covered only HELLO left `HELLO 3` + `RESET` in one write still
+    // retro-downgrading — see `note_protocol_switch`.
+    if proto != conn.protocol_version {
+        note_protocol_switch(conn, responses.len(), proto);
+    }
     conn.protocol_version = proto;
     conn.selected_db = db;
     conn.authenticated = authed;
@@ -1839,5 +1948,47 @@ mod watch_locality_tests {
             merge_locality(TxnLocality::SingleShard(1), TxnLocality::SingleShard(2)),
             TxnLocality::CrossShard
         );
+    }
+}
+
+#[cfg(test)]
+mod proto_walk_tests {
+    use super::ProtoWalk;
+
+    fn seq(start: u8, switches: &[(usize, u8)], n: usize) -> Vec<u8> {
+        let mut w = ProtoWalk::new(start, switches);
+        (0..n).map(|i| w.version_at(i)).collect()
+    }
+
+    /// The defect this whole mechanism exists for: a reply produced under RESP3
+    /// keeps RESP3 even though a later HELLO 2 downgraded the connection.
+    #[test]
+    fn a_switch_does_not_reach_backwards() {
+        assert_eq!(seq(3, &[(1, 2)], 3), vec![3, 2, 2]);
+    }
+
+    /// HELLO's own reply is rendered in the protocol it just negotiated, so the
+    /// switch applies AT its index, not after it.
+    #[test]
+    fn a_switch_applies_at_its_own_index_not_the_next_one() {
+        assert_eq!(seq(2, &[(0, 3)], 2), vec![3, 3]);
+    }
+
+    /// Two HELLOs in one batch: each takes effect from its own index.
+    #[test]
+    fn every_switch_in_a_batch_is_honoured_in_order() {
+        assert_eq!(seq(3, &[(1, 2), (3, 3)], 5), vec![3, 2, 2, 3, 3]);
+    }
+
+    /// The overwhelmingly common case — no HELLO in the batch.
+    #[test]
+    fn no_switches_means_one_version_throughout() {
+        assert_eq!(seq(3, &[], 4), vec![3, 3, 3, 3]);
+    }
+
+    /// A switch past the end of the batch cannot affect it, and must not panic.
+    #[test]
+    fn a_switch_beyond_the_last_reply_is_inert() {
+        assert_eq!(seq(2, &[(9, 3)], 3), vec![2, 2, 2]);
     }
 }

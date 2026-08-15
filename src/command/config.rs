@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::command::key::glob_match;
 use crate::config::{RuntimeConfig, ServerConfig};
@@ -16,13 +17,26 @@ pub fn config_get(
         ));
     }
 
-    let pattern = match &args[0] {
-        Frame::BulkString(s) => s.to_ascii_lowercase(),
-        Frame::SimpleString(s) => s.to_ascii_lowercase(),
-        _ => {
-            return Frame::Error(Bytes::from_static(b"ERR invalid argument"));
+    // Redis accepts MANY parameters, not one: `CONFIG GET maxmemory appendonly`
+    // answers both. Reading only `args[0]` silently dropped the rest, which is
+    // what `redis-py`'s `config_get(*params)` and every monitoring agent that
+    // reads two settings in one call send.
+    //
+    // Measured on redis-server 8.6.1: the result is the UNION over the
+    // patterns, deduplicated (`maxmemory` + `maxmemory*` reports `maxmemory`
+    // once), in the server's own table order rather than the caller's argument
+    // order, with unknown patterns silently skipped. Filtering the table once
+    // per entry — rather than looping the patterns outermost — gives all three
+    // properties for free.
+    let mut patterns: SmallVec<[Vec<u8>; 4]> = SmallVec::new();
+    for arg in args {
+        match arg {
+            Frame::BulkString(s) | Frame::SimpleString(s) => patterns.push(s.to_ascii_lowercase()),
+            _ => {
+                return Frame::Error(Bytes::from_static(b"ERR invalid argument"));
+            }
         }
-    };
+    }
 
     // Build list of all known config parameters
     let params: Vec<(&[u8], String)> = vec![
@@ -80,7 +94,7 @@ pub fn config_get(
 
     let mut result = Vec::new();
     for (name, value) in params {
-        if glob_match(&pattern, name) {
+        if patterns.iter().any(|p| glob_match(p, name)) {
             result.push(Frame::BulkString(Bytes::copy_from_slice(name)));
             result.push(Frame::BulkString(Bytes::from(value)));
         }

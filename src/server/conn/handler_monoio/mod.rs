@@ -1919,9 +1919,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         &mut responses,
                     )
                     .await;
-                    for resp in &responses {
-                        codec.encode_frame(resp, &mut write_buf);
-                    }
+                    crate::server::conn::shared::encode_response_batch(
+                        &mut conn,
+                        &responses,
+                        &mut write_buf,
+                    );
                     if !write_buf.is_empty() {
                         let data = write_buf.split().freeze();
                         if !write_all_bounded!(
@@ -3536,9 +3538,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
 
         // Serialize all responses into write_buf, then do ONE write_all syscall.
-        for response in &responses {
-            codec.encode_frame(response, &mut write_buf);
-        }
+        // `encode_batch`, not a bare loop: a pipelined HELLO changes the protocol
+        // partway through and the replies before it must keep the old encoding.
+        crate::server::conn::shared::encode_response_batch(&mut conn, &responses, &mut write_buf);
 
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {

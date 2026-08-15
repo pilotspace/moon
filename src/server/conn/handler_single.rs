@@ -530,6 +530,16 @@ pub async fn handle_connection(
                 // Phase 1: Handle connection-level intercepts, collect dispatchable frames
                 // Phase 2: Acquire ONE write lock, execute ALL dispatchable frames
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
+                // This handler flushes through `Framed::send`, which encodes each frame
+                // with the codec's version at send time, so it does NOT consume the
+                // per-reply switch record the two SHIPPED handlers use — and it shares
+                // `try_handle_reset`, which writes one. Dropped at the batch boundary so
+                // the record cannot accumulate across batches on a connection that
+                // RESETs repeatedly. This path is a library/embedding entry point
+                // (`server::run`); `main.rs` drives `run_sharded` at both call sites, so
+                // the binary never reaches it. Its own retro-encode behaviour is
+                // unchanged and recorded as a spec delta.
+                conn.proto_switches.clear();
                 // Each entry carries (resp_idx, db, bytes) so the Always-policy flush
                 // path can patch responses[resp_idx] with WRITEFAIL when fsync fails,
                 // before any response is sent to the client (H1 fix — FIX-W1-1).
