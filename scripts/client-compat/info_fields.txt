@@ -19,8 +19,8 @@ uptime_in_days
 # clients
 connected_clients
 blocked_clients
-client_recent_max_input_buffer
-client_recent_max_output_buffer
+client_recent_max_input_buffer  # WAIVED: per-client input/output buffer high-water marks are not tracked. CLIENT LIST reports qbuf=0 for the same reason. Sampling them means touching a counter on every read and write in the connection hot path, and a hardcoded 0 here would tell an operator hunting a buffer blowup that no client has ever buffered anything.
+client_recent_max_output_buffer  # WAIVED: see client_recent_max_input_buffer — same untracked source, same hot-path cost.
 
 # memory
 used_memory
@@ -58,7 +58,7 @@ keyspace_hits
 keyspace_misses
 pubsub_channels
 pubsub_patterns
-latest_fork_usec
+latest_fork_usec  # WAIVED: Moon never calls fork(2). BGSAVE snapshots in-process via a copy-on-write epoch cursor, so there is no fork to time. Redis's own value is a fork-duration measurement; emitting 0 would read as 'forks are instant' rather than 'this server does not fork'.
 
 # replication
 role

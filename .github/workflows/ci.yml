@@ -421,9 +421,11 @@ jobs:
         run: ./scripts/test-client-compat.sh --filter __none__ --info-manifest --record tmp/client-compat-info.json
         env:
           MOON_BIN: ${{ env.CARGO_TARGET_DIR }}/release/moon
-        # Reports the missing-field set; not yet a gate — info-observability
-        # owns closing it, and this flips to a hard gate when that task lands.
-        continue-on-error: true
+        # HARD GATE as of EC9. Every pinned field is either emitted from a real
+        # source or waived in info_fields.txt with a recorded reason, and the
+        # harness refuses an unreasoned waiver (exit 2) as well as a waiver on
+        # a field Moon has since started emitting — so the waiver list cannot
+        # silently go stale the way the registry sweep's did.
       # ── SDK wire-form guards ────────────────────────────────────────────
       # The SDK tree had no CI of any kind, which is how five helpers shipped
       # sending wire forms the server rejects on every call. They live here

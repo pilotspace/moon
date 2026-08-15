@@ -1088,6 +1088,7 @@ pub async fn handle_connection(
                                     conn_cmd::InstanceFacts {
                                         pubsub_channels: reg.active_channels(None).len(),
                                         pubsub_patterns: reg.pattern_names().len(),
+                                        tcp_port: config.port,
                                     }
                                 };
                                 let guard = db[conn.selected_db].read();

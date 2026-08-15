@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Ten INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
+  `uptime_in_days`, `used_memory_lua`, `aof_last_write_status`, `aof_last_bgrewrite_status`,
+  `rdb_changes_since_last_save`, `sync_full`, `sync_partial_ok` and `sync_partial_err` are now
+  emitted, each from a real source rather than a constant: uptime from a start instant captured
+  before the listener binds, `used_memory_lua` from each shard publishing its lazily-created
+  `mlua` VM's footprint on the periodic tick, `rdb_changes_since_last_save` from a sharded
+  keyspace-mutation counter reset at save completion, and the three `sync_*` counters recorded at
+  the one point in the PSYNC handshake where full-vs-partial is still distinguishable (`PSYNC ? -1`
+  counts as a full resync the replica ASKED for, not a partial that failed). `tcp_port` reports the
+  configured listener port, not the port the INFO connection arrived on — behind a container port
+  map the two differ, and the field exists so a client can hand a peer a reachable address.
+  The three fields Moon cannot answer truthfully — `latest_fork_usec` (Moon never calls `fork(2)`;
+  BGSAVE snapshots in-process) and the two `client_recent_max_*_buffer` high-water marks (untracked,
+  and tracking them means a counter on every connection read and write) — are recorded as waivers
+  with reasons instead of being emitted as zeros, keeping the INFO emitter's standing rule that a
+  hardcoded zero is indistinguishable from a healthy server on a dashboard.
+
+### Changed
+- **The `INFO field coverage` CI step is now a hard gate**, no longer `continue-on-error`. The
+  pinned-field harness gained a waiver syntax (`field  # WAIVED: <reason>`) that refuses an
+  unreasoned waiver at load time (exit 2) and reports a waiver on a field Moon has since started
+  emitting as a failure — so the list cannot go stale unnoticed the way the registry sweep's did.
+
 - **`CLUSTER SHARDS`, `CLUSTER MYSHARDID`, `READONLY` and `READWRITE`** — the four verbs a
   cluster-aware client needs to bootstrap. `CLUSTER SHARDS` reports every shard cluster-wide, one
   entry per master with its replicas, master first; a shard that has lost every live node reports an

@@ -1555,6 +1555,18 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
+                    // EC9: publish this shard's Lua VM footprint for INFO
+                    // `used_memory_lua` (summed across shards by the reader).
+                    // The VM is created lazily on first script use, so `None`
+                    // publishes nothing and the field stays 0 — which is the
+                    // truth, not a placeholder. `used_memory()` is an mlua
+                    // allocator-counter read, not a walk; this runs on the
+                    // periodic tick, never on the command path.
+                    if let Some(lua) = lua_rc.borrow().as_ref() {
+                        shard_databases.store_memory_per_shard[shard_id]
+                            .lua
+                            .store(lua.used_memory(), std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Sync file ID from shared Cell (handlers may have incremented it)
                     next_file_id = next_file_id.max(spill_file_id.get());
 

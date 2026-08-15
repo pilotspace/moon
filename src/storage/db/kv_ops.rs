@@ -292,6 +292,10 @@ impl Database {
     /// Optimized: immutable check for expiry (rare path), then single get_mut
     /// for LRU touch + return. Reduces from 3 lookups to 2 for non-expired keys.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
+        // Mutable access is a write intent; see `record_keyspace_change`
+        // for why counting the intent (rather than the mutation) is the
+        // safe direction for `rdb_changes_since_last_save`.
+        crate::admin::metrics_setup::record_keyspace_change();
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
         // Immutable check for expiry (avoids get_mut + remove + get_mut triple lookup)
@@ -315,6 +319,7 @@ impl Database {
     /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
     /// miss (PERF-08).
     pub fn set(&mut self, key: Bytes, entry: Entry) {
+        crate::admin::metrics_setup::record_keyspace_change();
         // An overwrite makes any in-flight spill payload for this key stale.
         // Retiring the record here stops its completion publishing the OLD
         // value into `cold_index`, where it would sit as a shadow behind the
@@ -414,6 +419,7 @@ impl Database {
     /// before loading the authoritative base RDB + incr log. Without this,
     /// non-idempotent commands from pre-existing state would be double-applied.
     pub fn clear(&mut self) {
+        crate::admin::metrics_setup::record_keyspace_change();
         self.data = DashTable::new();
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
@@ -497,6 +503,7 @@ impl Database {
     /// key returns `None` (no in-RAM entry exists); callers that must COUNT
     /// cold-only removals (DEL/UNLINK) use [`Self::remove_counting_cold`].
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
+        crate::admin::metrics_setup::record_keyspace_change();
         let _ = self.remove_cold_only(key);
         self.remove_hot(key)
     }
@@ -509,6 +516,7 @@ impl Database {
     /// removed hot entry, when present, is also returned so UNLINK can
     /// size its async-drop decision.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
+        crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         let cold_alive = self
             .cold_index
@@ -878,6 +886,7 @@ impl Database {
     /// Performs lazy expiry check first. Returns `false` if the key does not
     /// exist (or has already expired). Pass 0 to remove expiry.
     pub fn set_expiry(&mut self, key: &[u8], expires_at_ms: u64) -> bool {
+        crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {

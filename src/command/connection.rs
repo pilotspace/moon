@@ -204,6 +204,29 @@ fn run_id() -> &'static str {
     })
 }
 
+/// Process start instant, captured once at startup by [`record_server_start`].
+static SERVER_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Capture the server start instant. Called from `main` before the listener
+/// binds, so `uptime_in_seconds` counts from a point that precedes the first
+/// client rather than from whenever INFO was first asked.
+pub fn record_server_start() {
+    let _ = SERVER_START.set(std::time::Instant::now());
+}
+
+/// Seconds since [`record_server_start`].
+///
+/// Falls back to initialising on first read, which keeps a unit test or an
+/// embedded harness that never calls `record_server_start` reporting a
+/// monotonic uptime instead of a constant — the only wrong answer here is one
+/// that never advances, because that is what makes a crash loop invisible.
+fn server_uptime_secs() -> u64 {
+    SERVER_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
+}
+
 /// Build the full INFO payload with every section present.
 ///
 /// Callers must pass this through [`crate::command::info_sections::finalize`],
@@ -238,6 +261,17 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         sections.push_str("cluster_enabled:0\r\n");
     }
     let _ = write!(sections, "process_id:{}\r\n", std::process::id());
+    // The port this instance LISTENS on, not the port this connection arrived
+    // on. Behind a container port map or a proxy they differ, and a client
+    // handing a peer the arrival port would send it somewhere unreachable.
+    let _ = write!(sections, "tcp_port:{}\r\n", facts.tcp_port);
+    // Uptime is the field every restart-detector keys on: a drop to near zero
+    // is how a dashboard learns the process died. Sourced from the start
+    // instant captured before the listener binds, so it can never read as a
+    // constant.
+    let uptime_secs = server_uptime_secs();
+    let _ = write!(sections, "uptime_in_seconds:{uptime_secs}\r\n");
+    let _ = write!(sections, "uptime_in_days:{}\r\n", uptime_secs / 86_400);
     let _ = write!(sections, "os:{}\r\n", std::env::consts::OS);
     let _ = write!(
         sections,
@@ -315,9 +349,23 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
                 .map(|mem| mem.pagecache.load(std::sync::atomic::Ordering::Relaxed))
                 .sum::<usize>()
         });
+    // Bytes held by the per-shard Lua VMs, summed across shards. Each shard
+    // publishes `mlua::Lua::used_memory()` on its periodic tick and the VM is
+    // created lazily on first script use, so 0 before any EVAL is the truth,
+    // not a placeholder. Tells an operator whether a runaway script is holding
+    // memory the eviction cap never sees (the Lua plane is outside it).
+    let used_memory_lua =
+        crate::admin::metrics_setup::get_global_shard_databases().map_or(0, |shard_dbs| {
+            shard_dbs
+                .store_memory_per_shard
+                .iter()
+                .map(|mem| mem.lua.load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<usize>()
+        });
     let _ = write!(
         sections,
-        "used_memory:{used_memory}\r\n\
+        "used_memory_lua:{used_memory_lua}\r\n\
+         used_memory:{used_memory}\r\n\
          used_memory_human:{human}\r\n\
          used_memory_rss:{rss}\r\n\
          used_memory_peak:{rss}\r\n\
@@ -401,9 +449,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     };
     sections.push_str(&format!(
         "loading:0\r\n\
+         rdb_changes_since_last_save:{}\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
          rdb_last_bgsave_status:{}\r\n\
+         aof_last_write_status:{}\r\n\
+         aof_last_bgrewrite_status:{}\r\n\
          aof_enabled:{}\r\n\
          aof_rewrite_in_progress:{}\r\n\
          aof_base_size:{}\r\n\
@@ -419,6 +470,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_failed_reinserted:{}\r\n\
          spill_completion_superseded:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n",
+        // Keyspace mutations since the last COMPLETED save — the "is a save
+        // worth doing" signal a backup script reads. A failed save does not
+        // reset it: the dataset is still unpersisted.
+        crate::admin::metrics_setup::rdb_changes_since_last_save(),
         if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
         {
             1
@@ -429,6 +484,20 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         if crate::command::persistence::BGSAVE_LAST_STATUS
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            "ok"
+        } else {
+            "err"
+        },
+        // Redis parity names for the two AOF statuses stock tooling
+        // string-matches. `aof_last_write_status` shares its source with
+        // Moon's own `aof_last_append_status` below — the same fact under the
+        // name a redis-py/ioredis health check actually looks for.
+        if crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed) {
+            "ok"
+        } else {
+            "err"
+        },
+        if crate::persistence::aof::AOF_REWRITE_LAST_OK.load(std::sync::atomic::Ordering::Relaxed) {
             "ok"
         } else {
             "err"
@@ -533,6 +602,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          total_net_input_bytes:{}\r\n\
          total_net_output_bytes:{}\r\n\
          instantaneous_ops_per_sec:{}\r\n\
+         sync_full:{}\r\n\
+         sync_partial_ok:{}\r\n\
+         sync_partial_err:{}\r\n\
          pubsub_channels:{}\r\n\
          pubsub_patterns:{}\r\n",
         crate::admin::metrics_setup::keyspace_hits(),
@@ -543,6 +615,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::total_net_input_bytes(),
         crate::admin::metrics_setup::total_net_output_bytes(),
         crate::admin::metrics_setup::instantaneous_ops_per_sec(),
+        // Replica-sync health: a climbing `sync_full` against a flat
+        // `sync_partial_ok` means partial resync keeps failing and every
+        // replica reconnect re-ships the whole dataset.
+        crate::admin::metrics_setup::sync_full(),
+        crate::admin::metrics_setup::sync_partial_ok(),
+        crate::admin::metrics_setup::sync_partial_err(),
         facts.pubsub_channels,
         facts.pubsub_patterns,
     );
@@ -655,6 +733,13 @@ pub struct InstanceFacts {
     pub pubsub_channels: usize,
     /// Distinct subscribed patterns, across all shards.
     pub pubsub_patterns: usize,
+    /// The port this instance's listener is bound to (`--port`).
+    ///
+    /// Deliberately the CONFIGURED port and not the local port of the socket
+    /// INFO arrived on: behind a container port map or a proxy the two differ,
+    /// and `tcp_port` exists so a client can hand a peer an address that
+    /// actually reaches this server.
+    pub tcp_port: u16,
 }
 
 /// As [`info_with_keyspace_and_replication`], plus the instance-wide facts
