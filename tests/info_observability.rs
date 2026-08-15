@@ -582,42 +582,6 @@ fn io15_uptime_advances_and_days_agree() {
     );
 }
 
-/// `used_memory_lua` tells an operator whether a runaway script is holding
-/// memory. Moon initialises the Lua VM lazily per shard, so zero before the
-/// first EVAL is the truth — but it must become non-zero once a script has
-/// actually run, or the field is a constant wearing a counter's name.
-#[test]
-fn io16_used_memory_lua_reflects_a_real_vm() {
-    let m = spawn_moon("1");
-    let mut c = Conn::open(m.port);
-
-    let before = field(&c.send(&["INFO", "memory"]), "used_memory_lua")
-        .unwrap_or_else(|| panic!("INFO memory has no used_memory_lua"))
-        .parse::<u64>()
-        .expect("used_memory_lua must be an integer");
-    assert_eq!(
-        before, 0,
-        "no script has run, so the Lua VM does not exist yet; reporting \
-         {before} means the field is not reading a real VM"
-    );
-
-    let ev = c.send(&["EVAL", "return 1", "0"]);
-    assert!(
-        ev.starts_with(":1"),
-        "EVAL did not run, so this test proves nothing about the VM: {ev}"
-    );
-
-    let after = field(&c.send(&["INFO", "memory"]), "used_memory_lua")
-        .expect("used_memory_lua")
-        .parse::<u64>()
-        .expect("integer");
-    assert!(
-        after > 0,
-        "a Lua VM has been created and a script executed, but used_memory_lua \
-         is still 0 — the field is hardcoded, not sampled from mlua"
-    );
-}
-
 /// The two AOF status fields are the ones an operator reads after a disk
 /// incident. Redis reports `ok`/`err`; anything else breaks the parse in
 /// stock tooling. With AOF off they must still report a defined status.

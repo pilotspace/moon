@@ -349,23 +349,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
                 .map(|mem| mem.pagecache.load(std::sync::atomic::Ordering::Relaxed))
                 .sum::<usize>()
         });
-    // Bytes held by the per-shard Lua VMs, summed across shards. Each shard
-    // publishes `mlua::Lua::used_memory()` on its periodic tick and the VM is
-    // created lazily on first script use, so 0 before any EVAL is the truth,
-    // not a placeholder. Tells an operator whether a runaway script is holding
-    // memory the eviction cap never sees (the Lua plane is outside it).
-    let used_memory_lua =
-        crate::admin::metrics_setup::get_global_shard_databases().map_or(0, |shard_dbs| {
-            shard_dbs
-                .store_memory_per_shard
-                .iter()
-                .map(|mem| mem.lua.load(std::sync::atomic::Ordering::Relaxed))
-                .sum::<usize>()
-        });
     let _ = write!(
         sections,
-        "used_memory_lua:{used_memory_lua}\r\n\
-         used_memory:{used_memory}\r\n\
+        "used_memory:{used_memory}\r\n\
          used_memory_human:{human}\r\n\
          used_memory_rss:{rss}\r\n\
          used_memory_peak:{rss}\r\n\

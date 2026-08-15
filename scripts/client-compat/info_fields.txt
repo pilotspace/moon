@@ -26,7 +26,7 @@ client_recent_max_output_buffer  # WAIVED: see client_recent_max_input_buffer â€
 used_memory
 used_memory_rss
 used_memory_peak
-used_memory_lua
+used_memory_lua  # WAIVED: the per-shard `mlua` VM's used_memory() is reachable, but on the SHIPPED monoio runtime the value the shard can publish is ~2 orders of magnitude below the real footprint (80 bytes for a VM that reports 26183 under tokio, same setup_lua_vm, same mlua features -- measured both ways, and ruled out as feature unification by building tokio WITH graph+text-index). Emitting it would put a number on a dashboard that is wrong on the runtime that ships. Tracked separately; unwaive when the monoio path samples the VM that actually executes scripts.
 maxmemory
 maxmemory_policy
 mem_fragmentation_ratio

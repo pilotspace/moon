@@ -106,6 +106,8 @@ tmp/
 /target-check-tokio/
 /target-check-monoio/
 /target-check/
+/target-fu/
+/target-rf/
 target-fast/
 # CARGO_TARGET_DIR used for the local release-fast build+test loop
 /target-rf/
