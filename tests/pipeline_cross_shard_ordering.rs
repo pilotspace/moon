@@ -121,7 +121,14 @@ fn spawn_moon(shards: &str) -> Moon {
     panic!("moon never became ready on port {port} ({status})\n--- stderr ---\n{log}");
 }
 
-struct Conn(TcpStream);
+struct Conn {
+    sock: TcpStream,
+    /// Bytes read from the socket but not yet consumed by a reply. A pipelined
+    /// reply stream arrives in arbitrary chunks, so a read can overshoot the
+    /// replies asked for; keeping the remainder here stops the next call from
+    /// mistaking it for its own reply.
+    spill: Vec<u8>,
+}
 
 fn encode(parts: &[&str]) -> Vec<u8> {
     let mut out = format!("*{}\r\n", parts.len()).into_bytes();
@@ -131,12 +138,77 @@ fn encode(parts: &[&str]) -> Vec<u8> {
     out
 }
 
+/// Bytes consumed by exactly `want` complete top-level RESP replies at the
+/// start of `buf`, or `None` when `buf` does not hold that many yet.
+///
+/// This exists because the obvious harness — "read until the socket goes quiet
+/// for 250ms" — silently TRUNCATES a reply whenever the server pauses longer
+/// than that mid-stream, and then the test reports a wrong VALUE rather than a
+/// short READ. The fix under test makes such pauses more likely, not less:
+/// every deferral adds a shard dispatch/await boundary inside a single batch's
+/// reply stream. Counting frames removes the timing assumption entirely.
+///
+/// `pending` counts array elements still outstanding: an item read while
+/// `pending > 0` is an ELEMENT of an array already counted, not a reply of its
+/// own. Nested arrays work because their children add to the same counter.
+fn framed_len(buf: &[u8], want: usize) -> Option<usize> {
+    let mut i = 0usize;
+    let mut done = 0usize;
+    let mut pending = 0usize;
+    while done < want || pending > 0 {
+        let tag = *buf.get(i)?;
+        let end = (i..buf.len().checked_sub(1)?).find(|&j| &buf[j..j + 2] == b"\r\n")?;
+        let line = std::str::from_utf8(&buf[i + 1..end]).ok()?;
+        i = end + 2;
+
+        if pending > 0 {
+            pending -= 1;
+        } else {
+            done += 1;
+        }
+
+        match tag {
+            // Bulk-ish: a length header followed by that many bytes + CRLF.
+            // A negative length is a null and carries no payload.
+            b'$' | b'=' | b'!' => {
+                let n: i64 = line.parse().ok()?;
+                if n >= 0 {
+                    i = i.checked_add(n as usize + 2)?;
+                    if buf.len() < i {
+                        return None;
+                    }
+                }
+            }
+            // Aggregates. A map's declared length counts PAIRS.
+            b'*' | b'~' | b'>' => {
+                let n: i64 = line.parse().ok()?;
+                if n > 0 {
+                    pending += n as usize;
+                }
+            }
+            b'%' => {
+                let n: i64 = line.parse().ok()?;
+                if n > 0 {
+                    pending += (n as usize) * 2;
+                }
+            }
+            // Single-line: +simple, -error, :int, ,double, #bool, (bignum.
+            _ => {}
+        }
+    }
+    Some(i)
+}
+
 impl Conn {
     fn open(port: u16) -> Self {
-        let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-        Conn(s)
+        let sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        Conn {
+            sock,
+            spill: Vec::new(),
+        }
     }
 
     /// Send several commands as ONE write — the whole point of the test. The
@@ -147,34 +219,51 @@ impl Conn {
         for c in cmds {
             out.extend_from_slice(&encode(c));
         }
-        self.0.write_all(&out).expect("write");
-        self.read_reply()
+        self.sock.write_all(&out).expect("write");
+        self.read_replies(cmds.len())
     }
 
     fn send(&mut self, parts: &[&str]) -> String {
-        self.0.write_all(&encode(parts)).expect("write");
-        self.read_reply()
+        self.sock.write_all(&encode(parts)).expect("write");
+        self.read_replies(1)
     }
 
-    fn read_reply(&mut self) -> String {
-        let mut buf = [0u8; 65536];
-        let mut acc = Vec::new();
+    /// Read until exactly `want` complete top-level replies have arrived.
+    ///
+    /// Panics rather than returning short: a truncated read surfacing as a
+    /// wrong value is the failure mode that would make this suite lie about
+    /// which defect it caught.
+    fn read_replies(&mut self, want: usize) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut chunk = [0u8; 65536];
         loop {
-            match self.0.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    self.0
-                        .set_read_timeout(Some(Duration::from_millis(250)))
-                        .unwrap();
-                }
-                Err(_) => break,
+            if let Some(n) = framed_len(&self.spill, want) {
+                let reply = String::from_utf8_lossy(&self.spill[..n]).into_owned();
+                self.spill.drain(..n);
+                return reply;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {want} replies; got {} bytes: {:?}",
+                    self.spill.len(),
+                    String::from_utf8_lossy(&self.spill)
+                );
+            }
+            match self.sock.read(&mut chunk) {
+                Ok(0) => panic!(
+                    "server closed after {} bytes while {want} replies were expected: {:?}",
+                    self.spill.len(),
+                    String::from_utf8_lossy(&self.spill)
+                ),
+                Ok(n) => self.spill.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("read failed after {} bytes: {e}", self.spill.len()),
             }
         }
-        self.0
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        String::from_utf8_lossy(&acc).into_owned()
     }
 }
 
@@ -473,8 +562,8 @@ fn pco9_inline_commands_survive_the_defer_path() {
             "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$1\r\n1\r\nPING\r\n",
             k.len()
         );
-        c.0.write_all(batch.as_bytes()).expect("write");
-        let reply = c.read_reply();
+        c.sock.write_all(batch.as_bytes()).expect("write");
+        let reply = c.read_replies(2);
         if reply != "+OK\r\n+PONG\r\n" {
             return Some(format!(
                 "inline PING after a deferred write replied {reply:?}"
@@ -534,4 +623,58 @@ fn pco10_inline_intercepted_commands_see_their_own_batch() {
         }
         None
     });
+}
+
+/// The reply framer is the one piece of this suite that can make every other
+/// case lie — a short read reports a wrong VALUE, not a short read. So it is
+/// tested directly, including the boundary where a reply is one byte short.
+#[test]
+fn pco0_reply_framer_counts_top_level_replies() {
+    let cases: &[(&str, usize)] = &[
+        ("+OK\r\n", 1),
+        (":42\r\n", 1),
+        ("-ERR nope\r\n", 1),
+        ("$3\r\nabc\r\n", 1),
+        ("$-1\r\n", 1),
+        ("$0\r\n\r\n", 1),
+        ("*2\r\n$1\r\na\r\n$1\r\nb\r\n", 1),
+        ("*-1\r\n", 1),
+        ("*0\r\n", 1),
+        // an MGET whose elements are all null — the shape the BUG produced
+        ("*2\r\n$-1\r\n$-1\r\n", 1),
+        // nested: SCAN's [cursor, [keys...]]
+        ("*2\r\n$1\r\n0\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n", 1),
+        // a whole pipelined batch: +OK +OK *2
+        ("+OK\r\n+OK\r\n*2\r\n$1\r\n1\r\n$1\r\n2\r\n", 3),
+    ];
+
+    for (raw, want) in cases {
+        let bytes = raw.as_bytes();
+
+        assert_eq!(
+            framed_len(bytes, *want),
+            Some(bytes.len()),
+            "did not frame {raw:?} as {want} complete repl(y|ies)"
+        );
+
+        // Every proper prefix must be judged INCOMPLETE. This is the property
+        // that matters: the old silence-based reader accepted any prefix that
+        // happened to arrive before a 250ms lull.
+        for cut in 1..bytes.len() {
+            assert_eq!(
+                framed_len(&bytes[..cut], *want),
+                None,
+                "accepted a {cut}-byte prefix of {raw:?} as {want} complete repl(y|ies)"
+            );
+        }
+
+        // Trailing bytes belong to the NEXT reply and must not be consumed.
+        let mut over = bytes.to_vec();
+        over.extend_from_slice(b"+NEXT\r\n");
+        assert_eq!(framed_len(&over, *want), Some(bytes.len()));
+    }
+
+    // Asking for more replies than the buffer holds never over-reports.
+    assert_eq!(framed_len(b"+OK\r\n", 2), None);
+    assert_eq!(framed_len(b"", 1), None);
 }
