@@ -125,6 +125,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **A pipeline did not execute in order at `--shards >= 2`, and writes were silently lost.**
+  Reported as "MGET in the same pipeline as its SETs returns nulls" (#507). The cause is wider than
+  the symptom: the sharded pipeline handlers DEFER a single-key command whose key lives on another
+  shard into `remote_groups`, dispatching the whole group as one `PipelineBatchSlotted` at the end
+  of the batch — while multi-key and keyless commands execute INLINE, mid-loop. An inline command
+  therefore ran against a shard whose earlier writes in the same batch had not been sent yet.
+
+  Measured at `--shards 2`, 20 trials each, before the fix:
+
+  | in one pipeline batch | wrong | consequence |
+  |---|---|---|
+  | `SET a`, `MSET a` | 7/20 | **the MSET's value is lost** — the earlier SET lands on top of it |
+  | `SET`, `FLUSHALL` | 10/20 | the key survives a flush that returned `+OK` |
+  | `SET`,`SET`, `DEL` | 6/20 | the keys survive a `DEL` that returned success |
+  | `SET`,`SET`, `MGET` | 10/20 | the reported symptom |
+  | `SET`, `DBSIZE` | 12/20 | also `KEYS`, `RANDOMKEY`, `EXISTS`, `UNLINK`, `COPY`, `BITOP`, `INFO keyspace` |
+  | `SET`, `TOUCH k` | 0/20 | single-key: always correct, and the shape of the fix |
+
+  So this was not only the stale read it was filed as — same-key write ordering inverted, which is
+  silent data loss. The rate rises with shard count (a key is remote with probability
+  `1 - 1/shards`).
+
+  The fix defers such a command and the unconsumed batch tail to the next iteration, reusing the
+  mechanism #438 already built for early-flush commands: phase 2 resolves the pending remote replies
+  first, and the tail re-parses with `remote_groups` empty, so it cannot loop. Applied to both
+  sharded handlers (`handler_monoio` and `handler_sharded`); `handler_single` has no deferral and
+  was never affected.
+
+  The predicate is keyed on ROUTABILITY, not on a list of command names: a command routed by its own
+  single key needs no wait, because a key maps to exactly one shard — if that shard is local the key
+  cannot be pending, and if it is remote the command is appended behind the pending ones and the
+  slotted batch preserves order. Everything else waits. A name list written for an MGET bug would
+  not have contained `INFO keyspace` or `RANDOMKEY`, both of which were wrong. The one case
+  routability cannot see — commands intercepted inline BEFORE routing, which still have a key-shaped
+  first argument (`EVAL`, `SWAPDB`, …) — is named explicitly and carries a test that fails if an
+  entry is dropped.
+
+  Deferring is the conservative direction: a command sent down this path unnecessarily is merely
+  executed at the start of the next batch, which is always correct.
+
+  **This costs throughput, and the cost is per interleaving rather than per pipeline** — each
+  deferral is one extra shard dispatch/await boundary (~50µs). Measured at `--shards 2` on one
+  connection, 9 reps, alternating leg order, median; "floor" is the worst within-leg spread, so a
+  delta smaller than its floor resolved nothing:
+
+  | pipeline shape | guard fires | before | after | delta | floor |
+  |---|---|---|---|---|---|
+  | `MGET` after every 2 `SET`s | 64×/flush | 125,885 | 59,889 | **−52.4%** | 5.8% |
+  | 128 `SET`s, then one `MGET` | 1×/flush | 528,764 | 512,686 | −3.0% | 22.2% |
+  | `SET`,`SET`,`GET` (guard never fires) | never | 873,526 | 867,715 | −0.7% | 33.9% |
+
+  A multi-key or keyless command at the END of a pipeline — the shape #507 was filed from, and the
+  shape `redis-py`'s `pipeline()` produces — costs nothing measurable. One interleaved after every
+  pair of writes halves throughput. `redis-benchmark` cannot express any of these shapes (it sends a
+  single command type, so the guard never fires), so this came from a purpose-built harness that
+  refuses to report unless the pre-fix binary actually reproduces the bug first.
+
+  Recovering that cost means letting multi-key commands participate in the slotted batch instead of
+  executing inline — a cross-shard-coordinator change well outside a correctness fix, filed
+  separately.
+
 - **Writes were paying for a memory measurement on every SET.** The `maxmemory` real-footprint
   correction (#478) was computed inside `evict_to_budget`, which runs on the write path, so every
   write performed `open`/`read`/`close` on `/proc/self/statm` *and* an instance-wide accounting sum

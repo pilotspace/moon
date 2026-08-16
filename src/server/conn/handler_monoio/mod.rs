@@ -1631,6 +1631,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 deferred_tail_from = Some(frame_idx - 1);
                 break;
             }
+
+            // #507 pipeline ordering: a command that does NOT route by its own
+            // single key executes inline, against shards whose earlier writes
+            // in this same batch are still sitting in `remote_groups`
+            // undispatched. Reading there returns state the client already
+            // wrote; writing there is overwritten when the pending write lands.
+            // Defer it and the unconsumed tail exactly as #438 does above —
+            // phase 2 resolves the pending replies first, and the tail
+            // re-parses at the top of the next batch with `remote_groups`
+            // empty, so this cannot loop.
+            if !remote_groups.is_empty()
+                && crate::server::conn::shared::must_wait_for_pending_remote(cmd, cmd_args)
+            {
+                frames[frame_idx - 1] = frame;
+                deferred_tail_from = Some(frame_idx - 1);
+                break;
+            }
             // --- Connection-level commands (dispatched to dispatch.rs) ---
             //
             // Length-gated dispatch: each `try_handle_*` starts with a
