@@ -1106,6 +1106,60 @@ fn is_inline_intercepted(cmd: &[u8]) -> bool {
     }
 }
 
+/// If this script's keys all live on ANOTHER shard, run it there and return
+/// that shard's reply. `None` means "run it here" — no keys, one shard, or the
+/// keys are already local.
+///
+/// This is the moon#508 fix. Previously any script whose keys were not on the
+/// connection's own shard was answered `CROSSSLOT`, which is only true when the
+/// keys span shards — a single key never crosses anything, it just lives
+/// somewhere else.
+///
+/// A genuinely cross-shard key set still returns `CROSSSLOT` here, before the
+/// hop: a script executes against one shard's database and cannot reach
+/// another's, so there is no target to send it to.
+pub(crate) async fn route_script_elsewhere(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    db_index: usize,
+    ctx: &crate::server::conn::core::ConnectionContext,
+) -> Option<Frame> {
+    if ctx.num_shards <= 1 {
+        return None;
+    }
+    // EVALSHA carries a sha where EVAL carries the body, but `parse_eval_args`
+    // only reads args[1..] for numkeys/keys — so the same parse serves both and
+    // the sha never has to be resolved just to decide where to run.
+    let keys = match crate::scripting::parse_eval_args(cmd_args) {
+        // Malformed args: let the local handler produce the exact error it
+        // always did rather than inventing a routing-flavoured one here.
+        Err(_) => return None,
+        Ok((_script, _numkeys, keys, _argv)) => keys,
+    };
+    match crate::scripting::route_script_keys(&keys, ctx.shard_id, ctx.num_shards) {
+        crate::scripting::ScriptRoute::Local => None,
+        crate::scripting::ScriptRoute::CrossShard => Some(Frame::Error(Bytes::from_static(
+            b"CROSSSLOT Keys in script don't hash to the same slot and shard",
+        ))),
+        crate::scripting::ScriptRoute::Remote(target) => {
+            let mut parts = Vec::with_capacity(cmd_args.len() + 1);
+            parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
+            parts.extend_from_slice(cmd_args);
+            Some(
+                crate::shard::coordinator::coordinate_script(
+                    std::sync::Arc::new(Frame::Array(parts.into())),
+                    target,
+                    ctx.shard_id,
+                    db_index,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
+                )
+                .await,
+            )
+        }
+    }
+}
+
 /// Check if a command is a multi-key command requiring VLL coordination.
 ///
 /// These commands operate on multiple keys that may live on different shards.

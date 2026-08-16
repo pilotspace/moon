@@ -1097,6 +1097,20 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- Lua scripting: EVAL / EVALSHA ---
                     if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                        // moon#508: a script whose keys all live on another
+                        // shard runs THERE. Same helper as handler_monoio —
+                        // one routing policy, not two that can drift.
+                        if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
+                            cmd,
+                            cmd_args,
+                            conn.selected_db,
+                            ctx,
+                        )
+                        .await
+                        {
+                            responses.push(routed);
+                            continue;
+                        }
                         let db_count = ctx.shard_databases.db_count();
                         // Unconditional slice path: ShardSlice is always initialized.
                         let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {

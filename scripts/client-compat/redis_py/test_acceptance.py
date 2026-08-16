@@ -364,11 +364,12 @@ class RedisPyAcceptance(unittest.TestCase):
 
     # -- library-level constructs -----------------------------------------
 
-    def test_rp14_lock_is_exclusive(self):
-        """`redis.lock.Lock` acquisition is SET NX PX — a held lock is exclusive.
+    def test_rp14_lock_acquires_and_releases(self):
+        """`redis.lock.Lock` end to end — the most-used construct in redis-py.
 
-        Release is covered separately: it goes through EVALSHA, which has its
-        own known gap (moon#508, see below).
+        Acquisition is SET NX PX; RELEASE is a single-key EVALSHA, which is why
+        this test was split in half while moon#508 was open. Both halves are
+        asserted again now that a script routes to the shard owning its key.
         """
         c = self.client()
         lock = c.lock("rp14", timeout=5, blocking_timeout=2)
@@ -377,36 +378,40 @@ class RedisPyAcceptance(unittest.TestCase):
             c.lock("rp14", timeout=5, blocking_timeout=0.2).acquire(),
             "a held lock was acquired twice — SET NX is not exclusive",
         )
+        # The half that moon#508 broke: release() is EVALSHA of a one-key
+        # script, so it failed for whichever lock names did not hash to the
+        # connection's own shard.
+        lock.release()
+        self.assertTrue(
+            c.lock("rp14", timeout=5, blocking_timeout=2).acquire(),
+            "the lock could not be re-acquired after release()",
+        )
 
-    def test_rp14b_single_key_evalsha_is_a_known_gap(self):
-        """KNOWN GAP (moon#508), amplified for the same reason as rp7b.
+    def test_rp14b_single_key_evalsha_runs_on_the_keys_shard(self):
+        """moon#508, fixed: EVALSHA of a one-key script must run.
 
-        At `--shards >= 2`, EVALSHA of a script declaring ONE key is rejected
-        with `CROSSSLOT Keys in script don't hash to the same slot and shard`.
-        One key cannot cross slots. `SCRIPT EXISTS` returns `[True]`, so it is
-        the key-slot check and not a cache miss.
+        Was an inverted probe (assert at least one of twenty is rejected). It
+        is a direct assertion now, which is what the probe asked for when it
+        started failing.
 
-        This is what breaks `redis.lock.Lock.release()`, which is a single-key
-        EVALSHA — so the most-used construct in redis-py fails for about half
-        of all lock names. Like moon#507 it fires per-KEY (~50% at two shards),
-        which is why this probe runs twenty distinct keys instead of one.
+        Still twenty distinct keys rather than one, and for the probe's own
+        reason: the defect fired per-KEY, decided by which shard owned the key
+        relative to the connection's, so a single trial only samples one
+        placement.
         """
         c = self.client()
         sha = c.script_load("return redis.call('get', KEYS[1])")
         self.assertEqual(c.script_exists(sha), [True], "the script did not cache")
-        rejected = []
         for i in range(20):
             key = f"rp14b:{i}"
             c.set(key, "v")
-            try:
-                self.assertEqual(c.evalsha(sha, 1, key), "v")
-            except redis.exceptions.RedisError as e:
-                rejected.append((key, str(e)))
-        self.assertTrue(
-            rejected,
-            "all 20 single-key EVALSHA calls succeeded — moon#508 is fixed. "
-            "Delete this probe and restore the release half of rp14.",
-        )
+            self.assertEqual(
+                c.evalsha(sha, 1, key),
+                "v",
+                f"single-key EVALSHA on {key} did not run — a script whose one "
+                f"key lives on another shard must be ROUTED there (moon#508 "
+                f"regressed)",
+            )
 
     def test_rp15_from_url_and_pool_reuse(self):
         """`from_url` is how most applications construct a client at all."""

@@ -1655,6 +1655,54 @@ async fn coordinate_multi_del_or_exists(
     Frame::Integer(total_count)
 }
 
+/// Send a script to the ONE shard that owns all of its keys, and return that
+/// shard's reply verbatim (moon#508).
+///
+/// Unlike every other coordinator here this is not a fan-out: a script runs
+/// against a single shard's database, so there is exactly one correct place
+/// for it. `scripting::route_script_keys` has already established that every
+/// key maps to `target`; this only moves the call there.
+///
+/// The reply is passed through untouched, including errors — a `NOSCRIPT` from
+/// the target shard is a real answer about the target's script cache, and
+/// rewriting it here would hide a cache fan-out gap.
+pub async fn coordinate_script(
+    command: std::sync::Arc<Frame>,
+    target: usize,
+    my_shard: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    let (reply_tx, reply_rx) = channel::oneshot();
+    let msg = ShardMessage::Execute {
+        db_index,
+        command,
+        reply_tx,
+    };
+    // Both failure outcomes mean the script was NEVER executed, so each can be
+    // reported as a clean reject rather than an ambiguous "maybe it ran".
+    match spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await {
+        crate::shard::dispatch::PushOutcome::Pushed => {}
+        crate::shard::dispatch::PushOutcome::Backpressure => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR shard owning the script's keys is not draining; script not executed",
+            ));
+        }
+        crate::shard::dispatch::PushOutcome::Cancelled => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR shutting down; script not executed",
+            ));
+        }
+    }
+    match recv_reply_bounded(reply_rx).await {
+        Ok(frame) => frame,
+        Err(_) => Frame::Error(Bytes::from_static(
+            b"ERR cross-shard reply channel closed during script execution",
+        )),
+    }
+}
+
 /// Coordinate KEYS across all shards.
 ///
 /// Dispatches KEYS command to every shard, collects and merges results.

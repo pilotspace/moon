@@ -827,6 +827,27 @@ impl super::Shard {
             .as_ref()
             .map(|rs| rs.read().is_replica_mirror.clone());
 
+        // moon#508: a script whose keys all live on THIS shard is now routed
+        // here over the SPSC mesh, so the shard must be able to run one even
+        // when no connection ever landed on it. Shares `lua_rc` — the same slot
+        // `conn_accept` lazily fills — so a shard still builds exactly one VM
+        // whichever path reaches it first.
+        let shard_lua_rt = crate::scripting::ShardLuaRuntime::new(
+            lua_rc.clone(),
+            crate::scripting::bridge::LuaEvictionCtx::new(
+                shard_databases.clone(),
+                runtime_config.clone(),
+                shard_id,
+                spill_sender.clone(),
+                spill_file_id.clone(),
+                disk_offload_dir.clone(),
+                num_shards,
+                repl_state.clone(),
+                aof_pool.as_ref().map(Arc::clone),
+            ),
+            num_shards,
+        );
+
         // Track last seen snapshot epoch to detect watch channel triggers
         // Test-only fault injection: delay every non-zero shard's loop start so
         // integration tests can deterministically exercise the startup window
@@ -1445,7 +1466,7 @@ impl super::Shard {
                         &shard_databases, &mut consumers, &pubsub_arc,
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &repl_backlog, &mut replica_txs,
-                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &repl_offsets, shard_id, &script_cache_rc, Some(&shard_lua_rt), &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
                         &mut shard_manifest,
@@ -1564,7 +1585,7 @@ impl super::Shard {
                         &shard_databases, &mut consumers, &pubsub_arc,
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &repl_backlog, &mut replica_txs,
-                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &repl_offsets, shard_id, &script_cache_rc, Some(&shard_lua_rt), &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
                         &mut shard_manifest,
@@ -2304,6 +2325,7 @@ impl super::Shard {
                     &repl_offsets,
                     shard_id,
                     &script_cache_rc,
+                    Some(&shard_lua_rt),
                     &cached_clock,
                     &mut pending_migrations,
                     &mut pending_cdc_subscribes,

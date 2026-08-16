@@ -204,7 +204,7 @@ pub(super) fn try_handle_cluster(
 /// `#[inline]`: see `try_handle_cluster` rationale — name check inlines to the
 /// caller so non-EVALSHA commands cost only a length + byte compare.
 #[inline]
-pub(super) fn try_handle_evalsha(
+pub(super) async fn try_handle_evalsha(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &ConnectionState,
@@ -213,6 +213,13 @@ pub(super) fn try_handle_evalsha(
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"EVALSHA") {
         return false;
+    }
+    if let Some(routed) =
+        crate::server::conn::shared::route_script_elsewhere(cmd, cmd_args, conn.selected_db, ctx)
+            .await
+    {
+        responses.push(routed);
+        return true;
     }
     let response = crate::shard::slice::with_shard(|s| {
         let db_count = s.databases.len();
@@ -236,7 +243,7 @@ pub(super) fn try_handle_evalsha(
 /// `#[inline]`: see `try_handle_cluster` rationale — name check inlines so
 /// non-matching commands cost only a length + byte compare.
 #[inline]
-pub(super) fn try_handle_eval(
+pub(super) async fn try_handle_eval(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &ConnectionState,
@@ -245,6 +252,13 @@ pub(super) fn try_handle_eval(
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"EVAL") {
         return false;
+    }
+    if let Some(routed) =
+        crate::server::conn::shared::route_script_elsewhere(cmd, cmd_args, conn.selected_db, ctx)
+            .await
+    {
+        responses.push(routed);
+        return true;
     }
     let response = crate::shard::slice::with_shard(|s| {
         let db_count = s.databases.len();

@@ -129,6 +129,10 @@ pub(crate) fn drain_spsc_shared(
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+    // moon#508: the shard's Lua VM, so a script ROUTED here (because this
+    // shard owns its keys) can actually run. `None` in unit tests that
+    // drive the SPSC path without a shard runtime.
+    lua_rt: Option<&crate::scripting::ShardLuaRuntime>,
     cached_clock: &CachedClock,
     pending_migrations: &mut Vec<(
         crate::shard::dispatch::MigrateFd,
@@ -330,6 +334,7 @@ pub(crate) fn drain_spsc_shared(
                 repl_state,
                 shard_id,
                 script_cache,
+                lua_rt,
                 cached_clock,
                 shard_manifest,
                 mvcc_prune_margin,
@@ -366,6 +371,7 @@ pub(crate) fn drain_spsc_shared(
             repl_state,
             shard_id,
             script_cache,
+            lua_rt,
             cached_clock,
             shard_manifest,
             mvcc_prune_margin,
@@ -416,6 +422,10 @@ pub(crate) fn handle_shard_message_shared(
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+    // moon#508: the shard's Lua VM, so a script ROUTED here (because this
+    // shard owns its keys) can actually run. `None` in unit tests that
+    // drive the SPSC path without a shard runtime.
+    lua_rt: Option<&crate::scripting::ShardLuaRuntime>,
     cached_clock: &CachedClock,
     // P8: optional manifest for VACUUM manifest/WAL passes; None when no persistence_dir.
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
@@ -459,6 +469,59 @@ pub(crate) fn handle_shard_message_shared(
                         return;
                     }
                 };
+
+                // EVAL/EVALSHA routed here because THIS shard owns the
+                // script's keys (moon#508). `cmd_dispatch` has no scripting
+                // arm — scripts are intercepted at the connection layer — so
+                // without this a routed script would come back as an unknown
+                // command. Intercepted before cmd_dispatch for the same reason
+                // the FT. block below is.
+                let is_plain_eval = cmd.eq_ignore_ascii_case(b"EVAL");
+                if is_plain_eval || cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                    let Some(rt) = lua_rt else {
+                        let _ = reply_tx.send(crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(
+                                b"ERR scripting is unavailable on this shard",
+                            ),
+                        ));
+                        return;
+                    };
+                    let Some(vm) = rt.vm() else {
+                        let _ = reply_tx.send(crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(b"ERR Lua VM initialization failed"),
+                        ));
+                        return;
+                    };
+                    let frame = crate::shard::slice::with_shard(|s| {
+                        let db_count = s.databases.len();
+                        let db = &mut s.databases[db_idx];
+                        if is_plain_eval {
+                            crate::scripting::handle_eval(
+                                &vm,
+                                script_cache,
+                                args,
+                                db,
+                                shard_id,
+                                rt.num_shards(),
+                                db_idx,
+                                db_count,
+                            )
+                        } else {
+                            crate::scripting::handle_evalsha(
+                                &vm,
+                                script_cache,
+                                args,
+                                db,
+                                shard_id,
+                                rt.num_shards(),
+                                db_idx,
+                                db_count,
+                            )
+                        }
+                    });
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
 
                 // FT.* commands route to VectorStore, not the KV Database.
                 // Intercept before cmd_dispatch so the console gateway's
@@ -4519,6 +4582,7 @@ mod drain_cap_tests {
             &offsets,
             0,
             &script_cache,
+            None, // no shard Lua runtime in this unit test
             &clock,
             &mut migrations,
             &mut cdc,
@@ -4553,6 +4617,7 @@ mod drain_cap_tests {
             &offsets,
             0,
             &script_cache,
+            None, // no shard Lua runtime in this unit test
             &clock,
             &mut migrations,
             &mut cdc,
