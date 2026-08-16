@@ -192,27 +192,69 @@ fn run_local(
 // single constant so the two reply paths can't drift apart.
 use crate::shard::dispatch::XSHARD_REPLY_TIMEOUT;
 
+/// Why a bounded cross-shard receive produced no reply.
+///
+/// The distinction is load-bearing for RETRY SAFETY, which is why it is an enum
+/// and not a bool: `Closed` and `TimedOut` say different things about whether
+/// the command ran. Collapsing them lets a caller report "never executed" for a
+/// target that is still executing — and a client that believes a non-idempotent
+/// command never ran will happily re-send it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyFailure {
+    /// The target dropped the reply sender without sending. It may have dropped
+    /// it *after* applying writes (e.g. a panic between apply and reply), so
+    /// this is "no reply", NOT "no effect".
+    Closed,
+    /// [`XSHARD_REPLY_TIMEOUT`] expired. The target may still be executing, or
+    /// may have already applied its writes. Execution status is UNKNOWN.
+    TimedOut,
+}
+
+/// Await `reply_rx` for at most `timeout`, reporting WHICH failure occurred.
+///
+/// Split out from [`recv_reply_bounded_reason`] purely so tests can drive both
+/// arms without waiting out the real 30s [`XSHARD_REPLY_TIMEOUT`].
+async fn recv_reply_within<T: Send + 'static>(
+    reply_rx: channel::OneshotReceiver<T>,
+    timeout: std::time::Duration,
+) -> Result<T, ReplyFailure> {
+    use crate::runtime::race::{Arm, race2};
+    let recv = std::pin::pin!(reply_rx);
+    #[cfg(feature = "runtime-tokio")]
+    let sleep = std::pin::pin!(tokio::time::sleep(timeout));
+    #[cfg(feature = "runtime-monoio")]
+    let sleep = std::pin::pin!(monoio::time::sleep(timeout));
+    // race2 polls the recv arm first, so a ready reply always wins the tie and
+    // the timer future is dropped un-fired (cheap deregister on both runtimes).
+    match race2(recv, sleep).await {
+        Arm::First(Ok(v)) => Ok(v),
+        Arm::First(Err(_)) => Err(ReplyFailure::Closed),
+        Arm::Second(()) => Err(ReplyFailure::TimedOut),
+    }
+}
+
+/// Await a cross-shard `reply_rx` with a bounded timeout (#11), preserving the
+/// reason. Prefer this at any call site whose error text makes a claim about
+/// whether the command executed.
+pub(crate) async fn recv_reply_bounded_reason<T: Send + 'static>(
+    reply_rx: channel::OneshotReceiver<T>,
+) -> Result<T, ReplyFailure> {
+    recv_reply_within(reply_rx, XSHARD_REPLY_TIMEOUT).await
+}
+
 /// Await a cross-shard `reply_rx` with a bounded timeout (#11).
 ///
 /// Returns `Err(RecvError)` on EITHER a closed channel (the target shard
 /// dropped the reply sender) OR expiry of [`XSHARD_REPLY_TIMEOUT`] — both mean
 /// "no usable reply", so every call site's existing error handling applies
 /// unchanged; the point is that neither case can hang the connection forever.
+/// Use [`recv_reply_bounded_reason`] when the two need telling apart.
 pub(crate) async fn recv_reply_bounded<T: Send + 'static>(
     reply_rx: channel::OneshotReceiver<T>,
 ) -> Result<T, channel::RecvError> {
-    use crate::runtime::race::{Arm, race2};
-    let recv = std::pin::pin!(reply_rx);
-    #[cfg(feature = "runtime-tokio")]
-    let sleep = std::pin::pin!(tokio::time::sleep(XSHARD_REPLY_TIMEOUT));
-    #[cfg(feature = "runtime-monoio")]
-    let sleep = std::pin::pin!(monoio::time::sleep(XSHARD_REPLY_TIMEOUT));
-    // race2 polls the recv arm first, so a ready reply always wins the tie and
-    // the timer future is dropped un-fired (cheap deregister on both runtimes).
-    match race2(recv, sleep).await {
-        Arm::First(r) => r,
-        Arm::Second(()) => Err(channel::RecvError),
-    }
+    recv_reply_bounded_reason(reply_rx)
+        .await
+        .map_err(|_| channel::RecvError)
 }
 
 /// Send one full command to a REMOTE shard and await its reply.
@@ -1695,10 +1737,22 @@ pub async fn coordinate_script(
             ));
         }
     }
-    match recv_reply_bounded(reply_rx).await {
+    // Past this point the script IS in the target's queue, so no failure here
+    // can claim it did not run — only that we never heard back. Saying
+    // otherwise invites a client to re-send a non-idempotent script that
+    // already applied its writes.
+    match recv_reply_bounded_reason(reply_rx).await {
         Ok(frame) => frame,
-        Err(_) => Frame::Error(Bytes::from_static(
-            b"ERR cross-shard reply channel closed during script execution",
+        Err(ReplyFailure::TimedOut) => {
+            // Mirrors the handler reply paths, which already record this;
+            // without it a wedged owner shard is invisible in metrics.
+            crate::admin::metrics_setup::record_xshard_reply_timeout("script");
+            Frame::Error(Bytes::from_static(
+                b"ERR timeout waiting for the shard owning the script's keys; script execution status is unknown",
+            ))
+        }
+        Err(ReplyFailure::Closed) => Frame::Error(Bytes::from_static(
+            b"ERR cross-shard reply channel closed; script execution status is unknown",
         )),
     }
 }
@@ -3158,6 +3212,47 @@ pub async fn coordinate_swapdb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Both arms are driven at a millisecond timeout via `recv_reply_within`
+    // rather than the real 30s constant. Gated to runtime-tokio because the
+    // timer arm is the tokio one under this cfg (the monoio sleep needs a
+    // monoio runtime); the logic under test is runtime-independent.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn recv_reply_reports_closed_when_sender_is_dropped() {
+        let (tx, rx) = channel::oneshot::<Frame>();
+        drop(tx);
+        let got = recv_reply_within(rx, std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            got.err(),
+            Some(ReplyFailure::Closed),
+            "a dropped sender is a closed channel, not a timeout"
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn recv_reply_reports_timeout_when_target_never_replies() {
+        // Hold the sender alive and never send: a wedged owner shard. This is
+        // the case that must NOT be reported as "closed" — the target may still
+        // be executing, so the caller cannot claim the command never ran.
+        let (_tx, rx) = channel::oneshot::<Frame>();
+        let got = recv_reply_within(rx, std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            got.err(),
+            Some(ReplyFailure::TimedOut),
+            "a silent-but-open target is a timeout, not a closed channel"
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn recv_reply_returns_the_reply_when_one_arrives() {
+        let (tx, rx) = channel::oneshot::<Frame>();
+        let _ = tx.send(Frame::SimpleString(Bytes::from_static(b"PONG")));
+        let got = recv_reply_within(rx, std::time::Duration::from_millis(50)).await;
+        assert!(matches!(got, Ok(Frame::SimpleString(ref s)) if s.as_ref() == b"PONG"));
+    }
 
     #[test]
     fn test_btreemap_ascending_order() {

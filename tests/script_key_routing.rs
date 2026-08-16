@@ -238,6 +238,11 @@ fn skr5_genuinely_cross_shard_keys_are_still_rejected() {
             panic!("2-key script replied neither a value pair nor CROSSSLOT: {r:?}");
         }
     }
+    assert_eq!(
+        rejected + accepted,
+        24,
+        "every pair must be classified as exactly one of ran / CROSSSLOT"
+    );
     assert!(
         rejected > 0,
         "no 2-key script was rejected across 24 tag pairs — the cross-shard \
@@ -245,9 +250,31 @@ fn skr5_genuinely_cross_shard_keys_are_still_rejected() {
          (empty) view of a key. Fixing #508 must ROUTE same-shard scripts, \
          not delete the check."
     );
+    // NOT asserted on the loop above: whether any {x<i>}/{y<i>} pair happens to
+    // co-locate is chance (~1/SHARDS each), so "some pair was accepted" fails
+    // roughly (1 - 1/SHARDS)^24 of the time — ~1/1000 at 4 shards, which across
+    // four CI platforms is a flake that would read as a real regression.
+    // A SHARED tag is co-located by construction, so this leg is deterministic.
+    let mut c = Conn::open(m.port);
+    let (k1, k2) = ("{same}one", "{same}two");
+    c.send(&["SET", k1, "1"]);
+    c.send(&["SET", k2, "2"]);
+    let r = c.send(&[
+        "EVAL",
+        "return {redis.call('get',KEYS[1]),redis.call('get',KEYS[2])}",
+        "2",
+        k1,
+        k2,
+    ]);
     assert!(
-        accepted > 0,
-        "every 2-key script was rejected across 24 tag pairs — pairs that DO \
-         co-locate must still run, or this is just the old bug with extra steps"
+        r.contains('1') && r.contains('2'),
+        "a 2-key script whose keys share a hash tag is co-located BY \
+         CONSTRUCTION and must run, not be rejected — got {r:?}. Rejecting it \
+         is the old bug with extra steps."
+    );
+    assert!(
+        !r.contains("CROSSSLOT"),
+        "same-tag keys cannot cross slots; CROSSSLOT here means routing is \
+         hashing something other than the tag — got {r:?}"
     );
 }

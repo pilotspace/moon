@@ -502,6 +502,19 @@ fn pco0_reply_framer_counts_top_level_replies() {
         ("*2\r\n$1\r\n0\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n", 1),
         // a whole pipelined batch: +OK +OK *2
         ("+OK\r\n+OK\r\n*2\r\n$1\r\n1\r\n$1\r\n2\r\n", 3),
+        // RESP3 attribute (`|N`): metadata for the reply that FOLLOWS, so the
+        // pair AND the attributed reply must all be consumed for ONE reply. If
+        // `|` were counted as a reply of its own, this would frame after the
+        // header and leave the rest to be misread as the next reply.
+        ("|1\r\n$3\r\nttl\r\n:99\r\n+OK\r\n", 1),
+        // attributed reply inside an aggregate: the attribute must not eat an
+        // element slot either.
+        ("*2\r\n|1\r\n$3\r\nttl\r\n:99\r\n$1\r\na\r\n$1\r\nb\r\n", 1),
+        // two attributed replies back to back
+        (
+            "|1\r\n$1\r\nk\r\n:1\r\n+OK\r\n|1\r\n$1\r\nk\r\n:2\r\n:7\r\n",
+            2,
+        ),
     ];
 
     for (raw, want) in cases {

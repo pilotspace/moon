@@ -163,6 +163,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so routing alone would trade `CROSSSLOT` for `ERR Function not found` at the same rate. Filed as
   #514 rather than half-fixed here.
 
+  A routed script that gets no reply no longer claims it did not run. `recv_reply_bounded` returns
+  the same error for a closed channel and for a 30s reply timeout, and the first cut of this path
+  reported both as "cross-shard reply channel closed during script execution". Those have opposite
+  retry semantics: a timeout means the target may still be executing, or may have already applied
+  its writes, so a client told the script never ran will re-send a non-idempotent script that did.
+  The two are now distinguished (`ReplyFailure::{Closed, TimedOut}`), both say execution status is
+  **unknown**, and the timeout records `moon_xshard_reply_timeout_total{kind="script"}` so a wedged
+  owner shard is visible in metrics like every other cross-shard reply path.
+
+  Not fixed here, and pre-existing rather than introduced: script writes skip `cow_intercept` on
+  every path, and under `runtime-tokio` `emit_effect` is compiled out entirely, so script writes
+  emit no AOF or replication record. Routed scripts persist exactly as well as local ones do —
+  which is the bug. Filed as #517, since a fix needs replication parity, kill-9 durability and a
+  VM A/B bench of its own.
+
 - **A pipeline did not execute in order at `--shards >= 2`, and writes were silently lost.**
   Reported as "MGET in the same pipeline as its SETs returns nulls" (#507). The cause is wider than
   the symptom: the sharded pipeline handlers DEFER a single-key command whose key lives on another

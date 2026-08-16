@@ -266,6 +266,19 @@ pub fn framed_len(buf: &[u8], want: usize) -> Option<usize> {
         let line = std::str::from_utf8(&buf[i + 1..end]).ok()?;
         i = end + 2;
 
+        // RESP3 attribute (`|N`): N key/value pairs of metadata attached to the
+        // reply that FOLLOWS. It is not a reply of its own, and not an element
+        // of an enclosing aggregate — so it must consume neither a `done` nor a
+        // `pending` slot, or the attributed reply is mistaken for the reply
+        // itself and every later frame is read one position out of step.
+        if tag == b'|' {
+            let n: i64 = line.parse().ok()?;
+            if n > 0 {
+                pending += (n as usize) * 2;
+            }
+            continue;
+        }
+
         if pending > 0 {
             pending -= 1;
         } else {
