@@ -603,13 +603,13 @@
       "title": "Client & SDK Compatibility",
       "goal": "a stock Redis client, driver, and monitoring agent works against Moon without special-casing \u2014 RESP3 reply types, feature negotiation, pub/sub push frames, cluster bootstrap, and INFO telemetry all match Redis 7.4 semantics",
       "stage": "production",
-      "status": "active",
+      "status": "done",
       "created": "2026-08-09T07:18:13+00:00",
-      "updated": "2026-08-09T07:18:13+00:00"
+      "updated": "2026-08-16T10:50:04+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-15T09:21:03+00:00",
+  "updated": "2026-08-16T10:50:04+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
