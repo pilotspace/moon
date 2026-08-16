@@ -359,6 +359,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          pagecache_bytes:{pagecache_bytes}\r\n\
          mem_fragmentation_ratio:{frag:.2}\r\n\
          maxmemory:{maxmemory}\r\n\
+         maxmemory_footprint_correction:{footprint_correction:.2}\r\n\
+         maxmemory_footprint_samples:{footprint_samples}\r\n\
          maxmemory_policy:{maxmemory_policy}\r\n",
         used_memory = used_memory,
         human = format_memory_human(used_memory),
@@ -380,6 +382,15 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // Read from the same atomic the eviction gate enforces, so INFO can
         // never report a cap different from the one actually applied.
         maxmemory = crate::storage::eviction::maxmemory_bytes(),
+        // The divisor `maxmemory` is actually scaled by. 1.00 means the cap is
+        // being enforced as written; 2.30 means eviction starts at 43% of it
+        // because the process really costs 2.3x what the allocator accounts
+        // for. Without this line an operator cannot tell a cap that is being
+        // honoured from one that is being silently tightened.
+        footprint_correction = crate::admin::metrics_setup::footprint_correction(),
+        // Liveness of the sampler behind that number — see
+        // `footprint_correction_refreshes`. Advances once a second.
+        footprint_samples = crate::admin::metrics_setup::footprint_correction_refreshes(),
         // Named from the same published atomic the gate reads, so INFO cannot
         // claim `noeviction` while the instance is in fact evicting.
         maxmemory_policy = crate::storage::eviction::maxmemory_policy_name(),

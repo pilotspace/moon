@@ -526,14 +526,19 @@ pub fn evict_to_budget(
     // once accounted memory passes ~8.3 GB, holding REAL footprint near the
     // configured limit — which is what the operator asked for.
     let budget = {
-        // Denominator must be the WHOLE instance's accounted memory, not this
-        // shard's slice. `process_footprint_bytes()` covers the entire
-        // process, so dividing it by one shard's `estimated_memory()` inflates
-        // the ratio by roughly the shard count and would evict N times too
-        // aggressively at `--shards N`. Caught by the eviction budget tests.
-        let ratio = crate::admin::metrics_setup::footprint_ratio(
-            crate::admin::metrics_setup::logical_used_memory_bytes() as u64,
-        );
+        // ONE relaxed load. This function is on the write path, so the
+        // correction is READ here and COMPUTED once a second by shard 0's
+        // chore (`admin::footprint::refresh_footprint_correction`). Computing
+        // it here instead — the shape this shipped in originally — cost three
+        // syscalls plus a global-lock read per SET, and measured -57% on SET
+        // at c=8 P=16 against the release before it.
+        //
+        // The denominator inside that computation is the WHOLE instance's
+        // accounted memory, not this shard's slice: the footprint covers the
+        // entire process, so dividing it by one shard's `estimated_memory()`
+        // would inflate the ratio by roughly the shard count and evict N times
+        // too aggressively at `--shards N`.
+        let ratio = crate::admin::metrics_setup::footprint_correction();
         if ratio > 1.0 {
             ((budget as f64) / ratio) as usize
         } else {

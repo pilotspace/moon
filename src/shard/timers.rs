@@ -88,6 +88,28 @@ pub(crate) fn run_active_expiry(
             if rss > 0 {
                 crate::admin::metrics_setup::update_rss_bytes(rss);
             }
+            // Republish the maxmemory footprint correction that
+            // `evict_to_budget` reads on every write. This tick is where the
+            // measurement is paid for — once a second, on one shard — instead
+            // of three syscalls plus an instance-wide accounting sum per SET.
+            //
+            // On Linux the footprint IS this same `/proc/self/statm` read, so
+            // reuse the value rather than paying for it twice. On macOS the
+            // footprint is `phys_footprint` from `task_info`, a genuinely
+            // different field — resident_size under-reports a swapped-out
+            // process by ~20x — so it needs its own read.
+            #[cfg(target_os = "linux")]
+            let footprint = rss;
+            #[cfg(not(target_os = "linux"))]
+            let footprint = crate::admin::metrics_setup::process_footprint_bytes();
+            // Unconditional, including when the read returned 0. A platform
+            // with no footprint reader (Windows) must still tick the chore:
+            // the refresh treats 0 as "unknown" and leaves the correction
+            // neutral, and the counter it advances is what proves the chore
+            // itself is alive. Guarding this call on `footprint > 0` made the
+            // liveness signal indistinguishable from an unwired chore on every
+            // platform that cannot measure.
+            crate::admin::footprint::refresh_footprint_correction(footprint);
         }
     }
 }

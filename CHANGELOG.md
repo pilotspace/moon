@@ -125,6 +125,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Writes were paying for a memory measurement on every SET.** The `maxmemory` real-footprint
+  correction (#478) was computed inside `evict_to_budget`, which runs on the write path, so every
+  write performed `open`/`read`/`close` on `/proc/self/statm` *and* an instance-wide accounting sum
+  that takes a read lock on the global replication state. The early-out above it never fired,
+  because Moon auto-sets `maxmemory` to 75% of RAM, and the correction's own noise-floor guard sat
+  *inside* the callee with the expensive reader passed as its argument — Rust evaluates arguments
+  eagerly, so the syscalls ran to completion and only then were judged unnecessary.
+
+  Measured on the moon-dev VM against v0.8.5, interleaved legs and median-of-5: `SET` at c=8 P=16
+  fell **1.36M -> 0.58M ops/s (-57%)** and at c=1 P=1 **159K -> 134K (-16%)**, while `GET` was
+  neutral in both — the shape of a cost paid only by writers. `git bisect` named the commit.
+
+  The measurement now happens once a second, in the shard-0 chore that was already reading
+  `/proc/self/statm` for the RSS gauge (and already carried a comment about not doing it more
+  often); the write path reads one relaxed atomic. The correction is unchanged in value — a
+  budget divisor in the GB range does not care about a second of staleness — and stays neutral
+  (1.00) until the first sample lands, so an unmeasured process is never over-evicted.
+
+  Two new INFO fields make the mechanism observable: `maxmemory_footprint_correction` is the
+  divisor actually applied, so an operator can tell a cap being honoured from one being silently
+  tightened, and `maxmemory_footprint_samples` is the sampler's liveness counter. The counter
+  exists because the ratio alone cannot distinguish a healthy small instance from a wedged
+  sampler — both read 1.00 — and because the chore lives in a shard loop with separate monoio and
+  tokio arms, where a correction wired on only one runtime would restore the swap-death bug #478
+  fixed, invisibly. `io20` asserts the counter advances on whichever runtime the test binary was
+  built for.
 - **Five commands were advertised by `COMMAND`/ACL but dispatched nowhere; they are deregistered.**
   `LATENCY`, `MODULE`, `DUMP`, `RESTORE` and `RECLAMATION` sat in `metadata.rs` while answering
   `unknown command` on every dispatch path, so `COMMAND`, `COMMAND COUNT` (267 -> 262) and ACL all

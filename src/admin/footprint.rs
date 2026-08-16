@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Returns 0 when the platform cannot answer, which callers must treat as
 /// "unknown" and fall back to allocator accounting — never as "zero bytes".
 #[cfg(target_os = "macos")]
-pub fn process_footprint_bytes() -> u64 {
+fn platform_footprint_bytes() -> u64 {
     // SAFETY: identical contract to `macos_task_memory_info` above — stable
     // Mach ABI, and `vm_info` is 272 bytes = TASK_VM_INFO_COUNT x 4. Queried
     // directly rather than via that function because it tries
@@ -85,13 +85,61 @@ const PHYS_FOOTPRINT_MIN_COUNT: u32 = ((PHYS_FOOTPRINT_OFFSET + 8) / 4) as u32;
 /// swapped pages are not charged the same way, and `VmRSS` is what the OOM
 /// killer and cgroup limits act on.
 #[cfg(target_os = "linux")]
-pub fn process_footprint_bytes() -> u64 {
+fn platform_footprint_bytes() -> u64 {
     crate::admin::metrics_setup::get_rss_bytes()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn process_footprint_bytes() -> u64 {
+fn platform_footprint_bytes() -> u64 {
     0
+}
+
+/// Platform reads performed so far. Test-only: the counter exists so a test
+/// can assert that the WRITE path performs none of these, which is the whole
+/// content of the fix. The shipped build must not pay for its own
+/// instrumentation, hence `cfg(test)` rather than a feature flag.
+#[cfg(test)]
+static PLATFORM_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the platform's footprint figure. THREE SYSCALLS on Linux
+/// (`open`/`read`/`close` on `/proc/self/statm`), one `task_info` trap on
+/// macOS. Call from periodic chores, from INFO, and from startup — never from
+/// a command path. [`footprint_ratio`] is the per-write consumer and reads
+/// [`FOOTPRINT_SAMPLE`] instead.
+pub fn process_footprint_bytes() -> u64 {
+    #[cfg(test)]
+    PLATFORM_READS.fetch_add(1, Ordering::Relaxed);
+    platform_footprint_bytes()
+}
+
+/// Most recent footprint sample, published by the 1s shard-0 chore.
+///
+/// `evict_to_budget` runs on the WRITE path and calls [`footprint_ratio`] on
+/// every write, so that function must never touch the platform reader: on
+/// Linux `process_footprint_bytes()` is `open("/proc/self/statm")` + `read` +
+/// `close`, three syscalls. Measured cost of doing that per write, v0.8.5 vs
+/// the tip that introduced it: SET at c=8 P=16 fell 1.34M -> 0.57M ops/s, a
+/// 2.4x collapse, with reads unaffected. `timers.rs` already samples RSS once
+/// a second and says why in its own comment ("to reduce /proc/self/statm
+/// open/read/close churn"); this atomic is how the write path shares that
+/// sample instead of re-reading it.
+///
+/// 0 means "never sampled", which [`footprint_ratio`] treats as unknown and
+/// therefore neutral — the correction only ever SHRINKS a budget, so an
+/// unknown must not shrink it.
+static FOOTPRINT_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+/// Publish a footprint sample. Called from the periodic chore that already
+/// pays for the platform read, never from a command path.
+pub fn publish_footprint_sample(bytes: u64) {
+    if bytes > 0 {
+        FOOTPRINT_SAMPLE.store(bytes, Ordering::Relaxed);
+    }
+}
+
+/// The last published footprint sample, 0 when never sampled.
+pub fn footprint_sample_bytes() -> u64 {
+    FOOTPRINT_SAMPLE.load(Ordering::Relaxed)
 }
 
 /// How far real footprint exceeds what the allocator says is live.
@@ -99,12 +147,95 @@ pub fn process_footprint_bytes() -> u64 {
 /// Returns 1.0 when the platform cannot measure footprint, when nothing is
 /// allocated yet, or when footprint is below accounted memory — the value is
 /// only ever used to make a budget SMALLER, so an unknown must not shrink it.
+///
+/// Reads the published sample rather than measuring. This is called per write;
+/// see [`FOOTPRINT_SAMPLE`] for what measuring here cost. Staleness up to the
+/// 1s sample interval is the right trade: the correction scales a budget in
+/// the GB range, and a budget that reacts one second late is invisible next to
+/// a write path that is 2.4x slower.
 pub fn footprint_ratio(used_memory: u64) -> f64 {
+    // Cheap guard FIRST. This check already existed inside `ratio_from`, but
+    // the expensive reader was passed as its argument — Rust evaluates
+    // arguments eagerly, so the syscalls ran before the guard could skip them.
+    // A guard that the caller has already paid to get past is not a guard.
+    if used_memory < RATIO_NOISE_FLOOR {
+        return 1.0;
+    }
     ratio_from(
-        process_footprint_bytes(),
+        FOOTPRINT_SAMPLE.load(Ordering::Relaxed),
         FOOTPRINT_BASELINE.load(Ordering::Relaxed),
         used_memory,
     )
+}
+
+/// The published budget correction, as `f64` bits. 1.0 = no correction.
+///
+/// `evict_to_budget` runs on the WRITE path, so the correction it applies must
+/// cost one relaxed load. Computing it there instead cost, per SET: three
+/// syscalls for the footprint (see [`FOOTPRINT_SAMPLE`]) AND a
+/// `logical_used_memory_bytes()` that sums four atomics per shard and takes a
+/// read lock on the GLOBAL replication state — a cross-core round trip on a
+/// path whose whole design rule is "per-shard locks only".
+static CORRECTION_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// The correction the eviction budget should divide by. Neutral (1.0) until
+/// the first sample lands, which under-corrects for up to a second rather than
+/// over-evicting on an unmeasured process.
+#[inline]
+pub fn footprint_correction() -> f64 {
+    let bits = CORRECTION_BITS.load(Ordering::Relaxed);
+    if bits == 0 {
+        return 1.0;
+    }
+    f64::from_bits(bits)
+}
+
+/// Re-measure the footprint and republish the correction.
+///
+/// Called once a second from shard 0's chore — the only place that pays for
+/// the platform read and the instance-wide accounting sum. `footprint` is
+/// passed in because the caller often already has it (on Linux it is the same
+/// `/proc/self/statm` read that feeds the RSS gauge).
+///
+/// Staleness bound is the caller's tick. That is the right trade: the
+/// correction scales a budget in the GB range, so reacting a second late is
+/// invisible, while measuring per write is a 2.4x throughput collapse.
+///
+/// A `footprint` of 0 means the platform could not answer — Windows has no
+/// reader at all, and the Linux/macOS ones can fail transiently. Call it
+/// anyway: the zero is refused as a sample (so a failed read cannot erase a
+/// good one), the correction resolves to its neutral 1.0, and the refresh
+/// counter still advances. That last part is the point — the counter answers
+/// "is the chore running", which is a different question from "can this
+/// platform measure", and conflating them is what made this function's first
+/// version untestable on Windows.
+pub fn refresh_footprint_correction(footprint: u64) {
+    publish_footprint_sample(footprint);
+    let used = crate::admin::metrics_setup::logical_used_memory_bytes() as u64;
+    CORRECTION_BITS.store(footprint_ratio(used).to_bits(), Ordering::Relaxed);
+    CORRECTION_REFRESHES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many times the correction has been republished.
+///
+/// Exposed as `maxmemory_footprint_samples` in INFO. The correction reads 1.00
+/// on any instance below the noise floor, so the ratio alone cannot tell an
+/// operator whether the sampler is alive or wedged — a stuck sampler and a
+/// healthy small instance print the same thing. A counter that stops advancing
+/// says which. It is also the only end-to-end proof that the chore is wired on
+/// BOTH runtimes: the shard loop has a monoio arm and a tokio arm, and a
+/// correction that silently never refreshes on one of them would restore the
+/// swap-death bug #478 fixed, invisibly.
+///
+/// Counts chore TICKS, not successful measurements. On a platform with no
+/// footprint reader (Windows) it advances while the correction stays 1.00
+/// forever, which is the documented inert state — pair it with
+/// `maxmemory_footprint_correction` to tell inert from active.
+static CORRECTION_REFRESHES: AtomicU64 = AtomicU64::new(0);
+
+/// Number of correction refreshes so far.
+pub fn footprint_correction_refreshes() -> u64 {
+    CORRECTION_REFRESHES.load(Ordering::Relaxed)
 }
 
 /// Accounted memory below which the footprint correction is inert.
@@ -144,7 +275,11 @@ static FOOTPRINT_BASELINE: AtomicU64 = AtomicU64::new(0);
 /// Leaving it unset (0) is safe: the correction then measures whole-process
 /// footprint, which over-corrects slightly rather than under-correcting.
 pub fn capture_footprint_baseline() {
-    FOOTPRINT_BASELINE.store(process_footprint_bytes(), Ordering::Relaxed);
+    let now = process_footprint_bytes();
+    FOOTPRINT_BASELINE.store(now, Ordering::Relaxed);
+    // Seed the sample as well, so writes arriving before the first periodic
+    // chore compare against a real reading rather than the unsampled 0.
+    publish_footprint_sample(now);
 }
 
 /// The recorded pre-dataset footprint, 0 when never captured.
@@ -155,6 +290,104 @@ pub fn footprint_baseline_bytes() -> u64 {
 #[cfg(test)]
 mod footprint_tests {
     use super::*;
+
+    /// Serialises the tests that read [`PLATFORM_READS`] or write
+    /// [`FOOTPRINT_SAMPLE`]. Both are process-global, and `cargo test` runs
+    /// these threads concurrently — without this the counter assertions would
+    /// be timing-dependent, which is exactly the kind of half-flaky gate that
+    /// proves nothing.
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn correction_is_neutral_until_first_sampled() {
+        // An unmeasured process must not be corrected. 1.0 is the only safe
+        // default: the correction divides the budget, so anything above 1.0
+        // here would evict on the strength of a measurement nobody took.
+        assert_eq!(f64::from_bits(0u64).to_bits(), 0);
+        let saved = CORRECTION_BITS.swap(0, Ordering::Relaxed);
+        assert_eq!(footprint_correction(), 1.0);
+        CORRECTION_BITS.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn correction_round_trips_a_published_ratio() {
+        let saved = CORRECTION_BITS.swap(2.5f64.to_bits(), Ordering::Relaxed);
+        assert_eq!(footprint_correction(), 2.5);
+        CORRECTION_BITS.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn ratio_reads_the_published_sample_never_the_platform() {
+        // THE regression. `evict_to_budget` calls `footprint_ratio` on every
+        // write; before this fix that call reached
+        // `process_footprint_bytes()`, i.e. open+read+close on
+        // /proc/self/statm, three syscalls per SET. Measured cost on the
+        // moon-dev VM, v0.8.5 vs the tip that introduced it: SET c=8 P=16
+        // 1.36M -> 0.58M ops/s (-57%), SET c=1 P=1 159K -> 134K (-16%), GET
+        // unaffected in both. The read is not skippable by a cheap guard
+        // either: the `maxmemory == 0` early return never fires because Moon
+        // auto-sets maxmemory to 75% of RAM.
+        //
+        // Two assertions, and BOTH are needed. The count proves no syscall
+        // happened; the value proves the function still answers from the
+        // sample rather than having been neutered into a constant.
+        let _g = TEST_LOCK.lock();
+        const GB: u64 = 1024 * 1024 * 1024;
+        publish_footprint_sample(400 * GB);
+        let before = PLATFORM_READS.load(Ordering::Relaxed);
+        let mut last = 0.0;
+        for _ in 0..1000 {
+            last = footprint_ratio(100 * GB);
+        }
+        assert_eq!(
+            PLATFORM_READS.load(Ordering::Relaxed),
+            before,
+            "footprint_ratio read the platform — that is 3 syscalls on every \
+             write through evict_to_budget"
+        );
+        assert_eq!(
+            last, 4.0,
+            "the ratio must still be computed from the published sample \
+             (400 GB over 100 GB accounted); a constant 1.0 here would mean \
+             the correction was disabled rather than made cheap"
+        );
+    }
+
+    #[test]
+    fn below_the_floor_costs_nothing_at_all() {
+        // The noise-floor guard already existed — inside `ratio_from`, with
+        // `process_footprint_bytes()` passed as its argument. Rust evaluates
+        // arguments eagerly, so the syscalls ran to completion and only then
+        // did the guard decide they were unnecessary. A guard the caller has
+        // already paid to get past is not a guard; it must be checked first.
+        let _g = TEST_LOCK.lock();
+        let before = PLATFORM_READS.load(Ordering::Relaxed);
+        for _ in 0..1000 {
+            assert_eq!(footprint_ratio(4 * 1024 * 1024), 1.0);
+        }
+        assert_eq!(
+            PLATFORM_READS.load(Ordering::Relaxed),
+            before,
+            "an inert correction still paid for a platform read"
+        );
+    }
+
+    #[test]
+    fn an_unsampled_process_is_neutral_not_zero() {
+        // 0 means "never sampled", and the correction only ever SHRINKS a
+        // budget. Treating an unknown as a real reading of zero bytes would
+        // make `marginal` 0 and the ratio 1.0 by luck; assert it explicitly so
+        // a future change to `ratio_from` cannot turn unknown into "evict".
+        let _g = TEST_LOCK.lock();
+        const GB: u64 = 1024 * 1024 * 1024;
+        FOOTPRINT_SAMPLE.store(0, Ordering::Relaxed);
+        assert_eq!(footprint_ratio(100 * GB), 1.0);
+        // A zero is also refused as a sample, so a failed platform read
+        // cannot erase a good one.
+        publish_footprint_sample(400 * GB);
+        publish_footprint_sample(0);
+        assert_eq!(footprint_sample_bytes(), 400 * GB);
+    }
 
     #[test]
     fn ratio_is_one_when_nothing_allocated() {
@@ -256,6 +489,7 @@ mod footprint_tests {
         // Discriminator: a clean file-backed mapping is charged to
         // `resident_size` but NOT to `phys_footprint`. Touch 64 MiB of one and
         // the two fields must move differently.
+        let _g = TEST_LOCK.lock();
         const LEN: usize = 64 << 20;
         let path = std::env::temp_dir().join("moon_footprint_probe.bin");
         if std::fs::write(&path, vec![0u8; LEN]).is_err() {
@@ -317,6 +551,7 @@ mod footprint_tests {
 
     #[test]
     fn footprint_is_measurable_on_this_platform() {
+        let _g = TEST_LOCK.lock();
         // Guards the offset/flavor constants: a wrong TASK_VM_INFO layout
         // reads as 0 and silently disables the whole mechanism.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
