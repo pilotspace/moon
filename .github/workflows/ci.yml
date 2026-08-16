@@ -486,9 +486,11 @@ jobs:
       # and python3.14-venv is absent. Verified on the runner.
       #
       # Runs at --shards 2 deliberately: single-shard hides the multi-shard
-      # defects this suite found (#507, #508), which are pinned inside it as
-      # expected failures so a fix breaks the run loudly instead of leaving a
-      # stale skip.
+      # defects this suite found (#507, #508). Each is pinned inside the suite
+      # so a fix breaks the run loudly instead of leaving a stale skip — which
+      # is exactly what happened to #507: its pin started failing once the
+      # ordering fix landed and is now a direct assertion (rp7b). #508
+      # (single-key EVAL/EVALSHA rejected CROSSSLOT) is still pinned as a gap.
       - name: redis-py acceptance suite (unmodified client, live server)
         run: |
           python3 -c 'import redis; print("redis-py", redis.__version__)'

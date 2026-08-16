@@ -1010,6 +1010,102 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
     }
 }
 
+/// Must this command wait for the batch's already-deferred remote commands to
+/// land before it may execute? (moon#507)
+///
+/// The sharded pipeline handlers DEFER a single-key command whose key lives on
+/// another shard into `remote_groups`, dispatching the whole group as one
+/// `PipelineBatchSlotted` at the end of the batch. Anything that executes
+/// INLINE in the meantime runs against a shard whose earlier writes in the same
+/// batch have not been sent yet — so it reads state the client already wrote,
+/// or writes state the pending command then overwrites. Measured at
+/// `--shards 2`: `SET a` + `MSET a` in one batch lost the MSET's value in 7 of
+/// 20 trials, and `SET` + `FLUSHALL` left the key alive in 10 of 20.
+///
+/// The safe case is narrow and worth stating positively, because it is what
+/// makes the rest of the pipeline fast: a command routed by its OWN single key
+/// needs no wait. A key maps to exactly one shard, so if that shard is local
+/// the key cannot be in `remote_groups` at all, and if it is remote the command
+/// is appended BEHIND the pending ones on the same target and the slotted batch
+/// preserves order. That is why `SET k` + `GET k` and `SET k` + `TYPE k` were
+/// always correct while `MGET` was not.
+///
+/// Everything else waits. Three ways a command fails to be "routed by its own
+/// single key":
+///
+/// 1. it is multi-key (MGET/MSET/DEL/EXISTS/…) — consumed by the cross-shard
+///    coordinator before routing;
+/// 2. it is keyless (`extract_primary_key` → `None`) — DBSIZE, KEYS, SCAN,
+///    RANDOMKEY, FLUSHALL, INFO … all aggregate across shards inline. None of
+///    these is a "multi-key command" in the registry sense, which is why this
+///    predicate is keyed on ROUTABILITY rather than on a list of command names;
+/// 3. it is intercepted inline by a `try_handle_*` handler BEFORE routing runs,
+///    even though it does have an args[0] that `extract_primary_key` would
+///    happily hash. That is the one case routability cannot see, so those
+///    families are named in [`is_inline_intercepted`].
+///
+/// Deferring is conservative: a command wrongly sent down this path is merely
+/// executed at the start of the next batch, which is always correct and costs
+/// one batch boundary. Wrongly calling something SAFE is the direction that
+/// corrupts data, so when in doubt, add it to the wait set.
+pub(crate) fn must_wait_for_pending_remote(cmd: &[u8], args: &[Frame]) -> bool {
+    is_multi_key_command(cmd, args)
+        || is_inline_intercepted(cmd)
+        || extract_primary_key(cmd, args).is_none()
+}
+
+/// Commands handled INLINE by a `try_handle_*` interceptor before the routing
+/// step, and which `extract_primary_key` would nonetheless answer for.
+///
+/// Derived by reading the interceptor chain in `handler_monoio::dispatch` /
+/// `handler_sharded`, not guessed: every other interceptor there guards a
+/// command that `extract_primary_key` already reports keyless (AUTH, HELLO,
+/// CLUSTER, CONFIG, CLIENT, INFO, WAIT, SELECT, KEYS, SCAN, DBSIZE, HOTKEYS,
+/// the persistence verbs …), so those are caught by the keyless arm.
+///
+/// **Adding a new inline interceptor means adding its command here.** A new
+/// interceptor for a command with a key-shaped first argument would silently
+/// re-open moon#507 for that command.
+/// `pco10_inline_intercepted_commands_see_their_own_batch` in
+/// `tests/pipeline_cross_shard_ordering.rs` drives EVAL and SWAPDB — the two
+/// entries that touch real keys — and fails if either is dropped from this
+/// list. It cannot prove the list is COMPLETE against a future interceptor;
+/// that is why the doc above says to err toward waiting.
+fn is_inline_intercepted(cmd: &[u8]) -> bool {
+    // Dotted families first, and deliberately so: a length-keyed match below
+    // would swallow `FT.ALIAS` (8 bytes, 'f') into the FCALL_RO/FUNCTION arm
+    // and answer false for it.
+    const DOTTED: [&[u8]; 4] = [b"FT.", b"GRAPH.", b"CDC.", b"TS."];
+    if DOTTED
+        .iter()
+        .any(|p| cmd.len() > p.len() && cmd[..p.len()].eq_ignore_ascii_case(p))
+    {
+        return true;
+    }
+    let len = cmd.len();
+    if len == 0 {
+        return false;
+    }
+    let b0 = cmd[0] | 0x20;
+    match (len, b0) {
+        // Lua and functions read and write real keys through the interceptor,
+        // never through routing.
+        (4, b'e') => cmd.eq_ignore_ascii_case(b"EVAL"),
+        (7, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA"),
+        (5, b'f') => cmd.eq_ignore_ascii_case(b"FCALL"),
+        (8, b'f') => cmd.eq_ignore_ascii_case(b"FCALL_RO") || cmd.eq_ignore_ascii_case(b"FUNCTION"),
+        // SWAPDB exchanges whole databases across every shard.
+        // SCRIPT/ACL touch no keyspace data, but they are inline and cost
+        // nothing to serialise behind pending writes.
+        (6, b's') => cmd.eq_ignore_ascii_case(b"SCRIPT") || cmd.eq_ignore_ascii_case(b"SWAPDB"),
+        (3, b'a') => cmd.eq_ignore_ascii_case(b"ACL"),
+        // Container commands for the message-queue and workspace stores.
+        (2, b'm') => cmd.eq_ignore_ascii_case(b"MQ"),
+        (2, b'w') => cmd.eq_ignore_ascii_case(b"WS"),
+        _ => false,
+    }
+}
+
 /// Check if a command is a multi-key command requiring VLL coordination.
 ///
 /// These commands operate on multiple keys that may live on different shards.

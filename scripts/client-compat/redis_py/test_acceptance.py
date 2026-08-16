@@ -239,25 +239,20 @@ class RedisPyAcceptance(unittest.TestCase):
         self.assertEqual(out[:2], [True, True])
         self.assertEqual(out[-2:], ["1", "2"])
 
-    def test_rp7b_mget_in_a_pipeline_is_a_known_gap(self):
-        """KNOWN GAP (moon#507), amplified so it cannot pass by luck.
+    def test_rp7b_mget_in_a_pipeline_sees_its_own_batch(self):
+        """moon#507, fixed: MGET must observe the SETs from its own batch.
 
-        At `--shards >= 2`, an MGET in the same batch as the SETs that wrote
-        its keys returns nulls — though those SETs acked `+OK` earlier in that
-        same batch and the values are readable the instant the batch ends.
-        Redis executes a pipeline in order, so this is a silent
-        read-your-own-writes violation.
+        This was a KNOWN GAP pinned as an inverted probe (assert that at least
+        one trial is broken). It is now a direct assertion, which is the shape
+        the probe itself asked for when it started failing.
 
-        It fires for roughly HALF of all key groups: whether it happens is
-        decided by which shard owns the keys relative to the connection's own
-        shard. A single trial is therefore a coin flip, which is exactly how an
-        earlier `expectedFailure` version of this test made CI flaky. Twenty
-        independent key groups drop the odds of a spurious pass to ~1e-6, and
-        the assertion is written so that ZERO failures — the state after a fix —
-        breaks the run.
+        Still twenty independent key groups rather than one, and for the same
+        reason the probe needed them: whether a group is affected depends on
+        which shard owns its keys relative to the connection's own shard, so a
+        single trial only samples one placement. Twenty makes a regression that
+        reaches even half of placements essentially certain to be caught.
         """
         c = self.client()
-        broken = []
         for i in range(20):
             a, b = f"{{rp7b{i}}}a", f"{{rp7b{i}}}b"
             c.delete(a, b)
@@ -267,19 +262,13 @@ class RedisPyAcceptance(unittest.TestCase):
                 p.mget(a, b)
                 out = p.execute()
             self.assertEqual(out[:2], [True, True], "the SETs themselves failed")
-            if out[-1] != ["1", "2"]:
-                broken.append((a, out[-1]))
             self.assertEqual(
-                c.mget(a, b), ["1", "2"],
-                f"{a}/{b} are wrong even AFTER the batch — #507 is a visibility "
-                f"bug, not a durability one; this is a different, worse defect",
+                out[-1], ["1", "2"],
+                f"MGET of {a}/{b} did not see the SETs that acked earlier in "
+                f"its OWN pipeline batch — read-your-own-writes violated "
+                f"(moon#507 regressed)",
             )
-        self.assertTrue(
-            broken,
-            "all 20 pipelined MGETs returned the values written in their own "
-            "batch — moon#507 is fixed. Delete this probe and assert the "
-            "correct behaviour directly in rp7.",
-        )
+            self.assertEqual(c.mget(a, b), ["1", "2"])
 
     def test_rp8_multi_exec_transaction(self):
         c = self.client()
