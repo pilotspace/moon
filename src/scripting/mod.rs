@@ -180,7 +180,113 @@ pub fn handle_script_subcommand(
     }
 }
 
+/// The shard's own Lua VM, plus what is needed to build it on first use.
+///
+/// Exists because moon#508's fix ROUTES a script to the shard owning its keys,
+/// so a script can now arrive over the SPSC mesh at a shard that has no
+/// connection of its own and has therefore never built a VM. Before routing,
+/// the VM was only ever created from `conn_accept`, on the connection's shard.
+///
+/// The `Rc<RefCell<Option<..>>>` slot is the SAME one `conn_accept` fills, so a
+/// shard still has exactly one VM however it is first reached — whichever path
+/// gets there first wins and the other reuses it.
+pub struct ShardLuaRuntime {
+    slot: Rc<RefCell<Option<Rc<Lua>>>>,
+    eviction_ctx: bridge::LuaEvictionCtx,
+    /// Carried here rather than added to the SPSC handler's already very wide
+    /// signature: both are per-shard constants, which is what this struct is.
+    num_shards: usize,
+}
+
+impl ShardLuaRuntime {
+    pub fn new(
+        slot: Rc<RefCell<Option<Rc<Lua>>>>,
+        eviction_ctx: bridge::LuaEvictionCtx,
+        num_shards: usize,
+    ) -> Self {
+        Self {
+            slot,
+            eviction_ctx,
+            num_shards,
+        }
+    }
+
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+
+    /// The shard's VM, built on first use.
+    ///
+    /// Returns `None` instead of panicking when the VM cannot be created: this
+    /// runs on the shard thread, where a panic aborts the whole process, and a
+    /// malformed-script client must never be able to do that. `conn_accept`
+    /// still `expect()`s at startup, where failing loudly is right.
+    pub fn vm(&self) -> Option<Rc<Lua>> {
+        let mut slot = self.slot.borrow_mut();
+        if slot.is_none() {
+            match setup_lua_vm(self.eviction_ctx.clone()) {
+                Ok(vm) => *slot = Some(vm),
+                Err(e) => {
+                    tracing::error!("Lua VM initialization failed on shard thread: {e}");
+                    return None;
+                }
+            }
+        }
+        slot.clone()
+    }
+}
+
+/// Where a script must run, decided by the shard ownership of its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptRoute {
+    /// Run here: no keys at all, single shard, or every key is local.
+    Local,
+    /// Every key lives on this OTHER shard — send the script there.
+    Remote(usize),
+    /// The keys span shards. A script executes against ONE shard's database,
+    /// so this genuinely cannot be served and must be refused.
+    CrossShard,
+}
+
+/// Decide where a script's keys require it to run (moon#508).
+///
+/// Before this existed, [`validate_keys_same_shard`] was the whole policy, and
+/// it asked the wrong question: it required every key to hash to the shard the
+/// CONNECTION happened to occupy. One key cannot cross slots, but it very
+/// easily lives on another shard, so a single-key script was refused with
+/// `CROSSSLOT` about `1 - 1/shards` of the time — 7 of 8 measured at
+/// `--shards 4`. `CROSSSLOT` was standing in for "I cannot run this *here*",
+/// and nothing ever asked where it *could* run.
+///
+/// Keyless scripts stay local deliberately: with no key there is nothing to
+/// route by, every shard is equally correct, and running in place avoids a
+/// pointless hop. That is also why `numkeys=0` always worked and made the
+/// defect look intermittent instead of systematic.
+pub fn route_script_keys(keys: &[Bytes], shard_id: usize, num_shards: usize) -> ScriptRoute {
+    if num_shards <= 1 || keys.is_empty() {
+        return ScriptRoute::Local;
+    }
+    use crate::shard::dispatch::key_to_shard;
+    let target = key_to_shard(&keys[0], num_shards);
+    if keys[1..]
+        .iter()
+        .any(|k| key_to_shard(k, num_shards) != target)
+    {
+        return ScriptRoute::CrossShard;
+    }
+    if target == shard_id {
+        ScriptRoute::Local
+    } else {
+        ScriptRoute::Remote(target)
+    }
+}
+
 /// Validate that all keys hash to the current shard. Returns Some(error) on violation.
+///
+/// Retained as the shard-side backstop AFTER [`route_script_keys`] has already
+/// sent the script to the owning shard: at that point every key must be local,
+/// so a violation here means the routing decision and the execution site
+/// disagree — which would silently read another shard's (empty) view of a key.
 pub fn validate_keys_same_shard(
     keys: &[Bytes],
     shard_id: usize,

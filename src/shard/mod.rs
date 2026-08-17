@@ -462,6 +462,7 @@ mod tests {
             &None,
             0,
             &script_cache,
+            None, // no shard Lua runtime in this unit test
             &clock,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -527,6 +528,7 @@ mod tests {
             &None,
             0,
             &script_cache,
+            None, // no shard Lua runtime in this unit test
             &clock,
             &mut Vec::new(),
             &mut Vec::new(),

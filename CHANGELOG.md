@@ -125,6 +125,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **A script whose keys all lived on one shard was refused instead of routed (`CROSSSLOT`).**
+  Reported as "EVALSHA of a single-key script fails with `CROSSSLOT`" (#508), with the guess that a
+  1-element key list was being mis-folded. It was not. `validate_keys_same_shard` required every key
+  to hash to the shard the CONNECTION happened to occupy — so `CROSSSLOT` was standing in for "I
+  cannot run this *here*", and nothing ever asked where it *could* run. One key cannot cross slots;
+  it just lives somewhere else. Measured at `--shards 4`: **7 of 8** single-key `EVAL`s rejected,
+  only the key that happened to land on the connection's own shard running. `numkeys=0` always
+  worked, which is why the defect read as intermittent rather than total.
+
+  This broke `redis.lock.Lock.release()` — a single-key `EVALSHA`, and one of the most-used
+  constructs in `redis-py`. Through the `Script.__call__` wrapper the caller saw a `NoScriptError`
+  followed by a cross-slot error, neither of which names the cause.
+
+  A script now ROUTES to the shard owning its keys (`scripting::route_script_keys` →
+  `coordinator::coordinate_script` → a shard-side `EVAL`/`EVALSHA` arm on the SPSC `Execute` path),
+  because a script executes against one shard's database and the correct place to run it is where
+  that data is. Keys that GENUINELY span shards are still refused — there is no single target for
+  them — and that refusal is now doubly held: the routing decision rejects it before the hop, and
+  `validate_keys_same_shard` remains as the shard-side backstop, so the two must agree before a
+  script can read another shard's (empty) view of a key. Shards build their Lua VM lazily on first
+  use and share the one slot `conn_accept` fills, so a shard reached only by routing still gets
+  exactly one VM.
+
+  One thing this changes rather than fixes: `EVAL` caches its script only on the shard that ran it
+  and, unlike `SCRIPT LOAD`, never fans out — so a bare `EVAL` followed by a direct `EVALSHA` on a
+  key owned by another shard now answers `NOSCRIPT` where it previously answered `CROSSSLOT`.
+  Measured after the fix at `--shards 4`: one bare `EVAL`, then `EVALSHA` of that sha across 12
+  other keys — 4 ok, 8 `NOSCRIPT`. Neither ever worked, and
+  `NOSCRIPT` is the better failure because every client library retries it — `redis-py`'s
+  `Script.__call__` re-issues `EVAL` and self-heals, whereas `CROSSSLOT` was unrecoverable. Anything
+  built on `register_script`/`SCRIPT LOAD`, including `redis.lock.Lock`, is unaffected (12/12).
+  Filed as #515.
+
+  Applied to both handlers through one shared helper rather than two implementations that can drift.
+  `FCALL` has the same defect *plus* a second one — `FUNCTION LOAD` never fans out to other shards,
+  so routing alone would trade `CROSSSLOT` for `ERR Function not found` at the same rate. Filed as
+  #514 rather than half-fixed here.
+
+  A routed script that gets no reply no longer claims it did not run. `recv_reply_bounded` returns
+  the same error for a closed channel and for a 30s reply timeout, and the first cut of this path
+  reported both as "cross-shard reply channel closed during script execution". Those have opposite
+  retry semantics: a timeout means the target may still be executing, or may have already applied
+  its writes, so a client told the script never ran will re-send a non-idempotent script that did.
+  The two are now distinguished (`ReplyFailure::{Closed, TimedOut}`), both say execution status is
+  **unknown**, and the timeout records `moon_xshard_reply_timeout_total{kind="script"}` so a wedged
+  owner shard is visible in metrics like every other cross-shard reply path.
+
+  Not fixed here, and pre-existing rather than introduced: script writes skip `cow_intercept` on
+  every path, and under `runtime-tokio` `emit_effect` is compiled out entirely, so script writes
+  emit no AOF or replication record. Routed scripts persist exactly as well as local ones do —
+  which is the bug. Filed as #517, since a fix needs replication parity, kill-9 durability and a
+  VM A/B bench of its own.
+
 - **A pipeline did not execute in order at `--shards >= 2`, and writes were silently lost.**
   Reported as "MGET in the same pipeline as its SETs returns nulls" (#507). The cause is wider than
   the symptom: the sharded pipeline handlers DEFER a single-key command whose key lives on another

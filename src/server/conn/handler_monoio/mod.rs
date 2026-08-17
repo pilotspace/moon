@@ -1868,11 +1868,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if cmd_len == 7
-                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
+                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses).await
             {
                 continue;
             }
-            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
+            if cmd_len == 4
+                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses).await
             {
                 continue;
             }
