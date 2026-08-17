@@ -948,6 +948,26 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
             _ => None,
         };
     }
+    // MEMORY USAGE <key> [SAMPLES n]: the key is args[1]. Without this arm
+    // MEMORY fell through to "args[0] is the key" and hashed the literal
+    // "USAGE" — one fixed shard for every key — so an existing key read as
+    // absent unless it happened to live on that shard (moon#511; 22/24 wrong
+    // at --shards 4, the 1-1/shards signature of a constant route).
+    //
+    // Matched on the SUBCOMMAND rather than blindly taking args[1], because
+    // USAGE is the only MEMORY subcommand that takes a key: DOCTOR, STATS,
+    // PURGE, MALLOC-STATS and HELP are keyless and must stay local, and a
+    // blind args[1] would hash a future subcommand's first OPTION as a key.
+    if (len, b0) == (6, b'm') && cmd.eq_ignore_ascii_case(b"MEMORY") {
+        return match (args.first(), args.get(1)) {
+            (Some(Frame::BulkString(sub)), Some(Frame::BulkString(key)))
+                if sub.eq_ignore_ascii_case(b"USAGE") =>
+            {
+                Some(key)
+            }
+            _ => None,
+        };
+    }
     // XGROUP <subcommand> <key> ...: args[0] is the subcommand ("CREATE",
     // "SETID", "DESTROY", "DELCONSUMER", "CREATECONSUMER") and args[1] is
     // the stream key. Same pattern as OBJECT above.
@@ -1742,6 +1762,55 @@ mod as_of_tests {
         // OBJECT HELP has no key — executes locally.
         let help = vec![frame_bulk(b"HELP")];
         assert!(extract_primary_key(b"OBJECT", &help).is_none());
+    }
+
+    #[test]
+    fn extract_primary_key_memory_usage_routes_by_real_key() {
+        // MEMORY USAGE <key>: routing must hash the key (arg 2), never the
+        // literal "USAGE" (moon#511).
+        let args = vec![frame_bulk(b"USAGE"), frame_bulk(b"mykey")];
+        let got = extract_primary_key(b"MEMORY", &args);
+        assert_eq!(got.map(|b| b.as_ref()), Some(&b"mykey"[..]));
+
+        // Trailing options must not shift the key position.
+        let sampled = vec![
+            frame_bulk(b"USAGE"),
+            frame_bulk(b"mykey"),
+            frame_bulk(b"SAMPLES"),
+            frame_bulk(b"0"),
+        ];
+        let got = extract_primary_key(b"MEMORY", &sampled);
+        assert_eq!(got.map(|b| b.as_ref()), Some(&b"mykey"[..]));
+
+        // Subcommand casing is not the client's problem.
+        let lower = vec![frame_bulk(b"usage"), frame_bulk(b"mykey")];
+        let got = extract_primary_key(b"MEMORY", &lower);
+        assert_eq!(got.map(|b| b.as_ref()), Some(&b"mykey"[..]));
+    }
+
+    #[test]
+    fn extract_primary_key_keyless_memory_subcommands_stay_local() {
+        // USAGE is the ONLY MEMORY subcommand with a key. The others must not
+        // route by whatever happens to sit at args[1], or a future option
+        // would be hashed as a key.
+        for sub in [
+            &b"DOCTOR"[..],
+            &b"STATS"[..],
+            &b"PURGE"[..],
+            &b"MALLOC-STATS"[..],
+            &b"HELP"[..],
+        ] {
+            let args = vec![frame_bulk(sub)];
+            assert!(
+                extract_primary_key(b"MEMORY", &args).is_none(),
+                "MEMORY {} must be keyless",
+                String::from_utf8_lossy(sub)
+            );
+        }
+        // A bare MEMORY, and USAGE with no key, have nothing to route by.
+        assert!(extract_primary_key(b"MEMORY", &[]).is_none());
+        let usage_only = vec![frame_bulk(b"USAGE")];
+        assert!(extract_primary_key(b"MEMORY", &usage_only).is_none());
     }
 
     #[test]

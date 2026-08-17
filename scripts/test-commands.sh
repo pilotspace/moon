@@ -223,6 +223,25 @@ assert_moon_contains() {
     fi
 }
 
+# Test moon response matches an extended regex.
+# `assert_moon_contains` greps -F, so it cannot express "some positive
+# integer" -- the shape you need when the exact value is not fixed.
+assert_moon_matches() {
+    local desc="$1" pattern="$2"
+    shift 2
+    TOTAL=$((TOTAL + 1))
+    local moon_out
+    moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
+    if echo "$moon_out" | grep -qE "$pattern"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (expected match /$pattern/)"
+        echo "    CMD:  redis-cli $*"
+        echo "    GOT:  $(echo "$moon_out" | head -3)"
+    fi
+}
+
 # Test that moon returns non-error response
 assert_moon_ok() {
     local desc="$1"
@@ -689,6 +708,11 @@ if should_run "connection"; then
     assert_moon_contains "RESET arity" "wrong number of arguments" RESET now
     assert_moon_contains "CLIENT INFO laddr is not port 0" "laddr=127.0.0.1:$PORT_RUST" CLIENT INFO
     assert_moon_contains "MEMORY DOCTOR" "Per-subsystem (resident):" MEMORY DOCTOR
+    # task #511: MEMORY USAGE must hash the KEY, not the literal "USAGE".
+    # Single-shard here, so this catches the arity/shape regression; the
+    # cross-shard routing itself is covered in test-consistency.sh.
+    redis-cli -p "$PORT_RUST" SET memusagekey hello-value >/dev/null 2>&1
+    assert_moon_matches "MEMORY USAGE sizes an existing key" '^[1-9][0-9]*$' MEMORY USAGE memusagekey
 fi
 
 # ===========================================================================

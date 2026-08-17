@@ -125,6 +125,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **`MEMORY USAGE <key>` reported existing keys as absent at `--shards >= 2`.** It routed by
+  hashing the literal subcommand `"USAGE"` rather than the key (#511), so every invocation went to
+  one fixed shard and read that shard's slice for a key it does not own. Measured at `--shards 4`:
+  22 of 24 existing keys reported absent. The rate is `1 - 1/shards` — the signature of a constant
+  route, not a race — and at `--shards 1` it was always correct, which is why it survived.
+
+  `extract_primary_key` treats `args[0]` as the key for anything not in its keyless list, and
+  `MEMORY` was in neither that list nor the set of commands with an explicit subcommand arm
+  (`OBJECT`, `XGROUP`, `XINFO`, `BITOP`, `ZDIFF`/`ZINTER`/`ZUNION`/`ZINTERCARD`, `XREAD` — each
+  added for exactly this reason). `MEMORY USAGE` now routes by `args[1]`, matched on the
+  **subcommand** rather than blindly: `USAGE` is the only `MEMORY` subcommand that takes a key, so
+  a bare `args[1]` would work today and silently hash a future subcommand's first *option* as a key
+  tomorrow. `DOCTOR`, `STATS`, `PURGE`, `MALLOC-STATS` and `HELP` are keyless and now execute
+  locally instead of routing by `"DOCTOR"`/`"STATS"`; they aggregate across shards internally, so
+  the answer is unchanged.
+
+  Neither shell suite covered it — `test-commands.sh` tested only `MEMORY DOCTOR`, and
+  `test-consistency.sh` explicitly noted `MEMORY` as out of scope — so a 75%-failure-rate bug was
+  invisible to both. `test-consistency.sh` now sizes 20 keys at 1/4/12 shards (a single key passes
+  by luck at 12 shards), and `test-commands.sh` asserts the single-shard shape via a new
+  `assert_moon_matches` helper, since `assert_moon_contains` greps `-F` and cannot express
+  "some positive integer".
+
 - **A script whose keys all lived on one shard was refused instead of routed (`CROSSSLOT`).**
   Reported as "EVALSHA of a single-key script fails with `CROSSSLOT`" (#508), with the guess that a
   1-element key list was being mis-folded. It was not. `validate_keys_same_shard` required every key
