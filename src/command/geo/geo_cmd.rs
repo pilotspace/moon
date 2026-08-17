@@ -160,7 +160,11 @@ pub fn geopos(db: &mut Database, args: &[Frame]) -> Frame {
                     .into(),
                 )
             }
-            None => Frame::Null,
+            // Null ARRAY, nested inside the outer array: `GEOPOS k absent` is
+            // `*1\r\n*-1\r\n`. GEOHASH — same file, same command family —
+            // answers `$-1` for the same miss, so the two must NOT be made to
+            // agree (moon#482; both measured against redis-server 8.6.1).
+            None => Frame::NullArray,
         })
         .collect();
 
@@ -802,7 +806,11 @@ pub fn geopos_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms
                     .into(),
                 )
             }
-            None => Frame::Null,
+            // Null ARRAY, nested inside the outer array: `GEOPOS k absent` is
+            // `*1\r\n*-1\r\n`. GEOHASH — same file, same command family —
+            // answers `$-1` for the same miss, so the two must NOT be made to
+            // agree (moon#482; both measured against redis-server 8.6.1).
+            None => Frame::NullArray,
         })
         .collect();
 

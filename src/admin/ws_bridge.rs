@@ -218,6 +218,10 @@ fn frame_type_name(frame: &crate::protocol::Frame) -> &'static str {
         Frame::BulkString(_) => "bulk_string",
         Frame::Array(_) => "array",
         Frame::Null => "null",
+        // See the note on the console's copy of this function: the reply TYPE
+        // is the thing being reported, so the two nulls stay distinct
+        // (moon#482).
+        Frame::NullArray => "null_array",
         Frame::Map(_) => "map",
         Frame::Set(_) => "set",
         Frame::Double(_) => "double",

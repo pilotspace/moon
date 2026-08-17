@@ -170,6 +170,9 @@ fn hash_frame_bytes(frame: &Frame) -> u64 {
             cypher::planner::hash_query(if *b { b"\x01true" } else { b"\x01false" })
         }
         Frame::Null => cypher::planner::hash_query(b"\x01null"),
+        // Distinct from Null: this feeds a result-cache KEY, so two inputs
+        // that are different on the wire must not collide (moon#482).
+        Frame::NullArray => cypher::planner::hash_query(b"\x01nullarray"),
         _ => cypher::planner::hash_query(b"\x01other"),
     }
 }

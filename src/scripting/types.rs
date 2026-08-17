@@ -76,7 +76,12 @@ pub fn frame_to_lua_value(lua: &Lua, frame: &Frame) -> mlua::Result<LuaValue> {
             t.set("err", lua.create_string(e.as_ref())?)?;
             Ok(LuaValue::Table(t))
         }
-        Frame::Null => Ok(LuaValue::Boolean(false)),
+        // Redis converts BOTH RESP2 nulls to Lua `false` — `redis.call('BLPOP',
+        // k, 0)` that times out yields `false`, exactly like a `GET` miss. So
+        // NullArray shares this arm rather than the catch-all below: the VALUE
+        // would be the same either way, but stating it here means a future
+        // Frame variant does not silently inherit "false" (moon#482).
+        Frame::Null | Frame::NullArray => Ok(LuaValue::Boolean(false)),
         Frame::Array(items) => {
             let t = lua.create_table()?;
             for (i, item) in items.iter().enumerate() {

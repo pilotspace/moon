@@ -1,8 +1,8 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "sdk-wire-form-fixes",
-  "active_milestone": "v0-9-client-compat",
+  "active_task": "resp2-null-array",
+  "active_milestone": "v0-9-1-wire-parity",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -504,6 +504,15 @@
         ],
         "snapshot_md5": "c4d153dadf22e877b4096bf8f937812b"
       }
+    },
+    "resp2-null-array": {
+      "title": "RESP2 null array: Frame::NullArray so BLPOP, EXEC-abort and friends reply *-1",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v0-9-1-wire-parity",
+      "depends_on": [],
+      "created": "2026-08-17T03:07:54+00:00",
+      "updated": "2026-08-17T05:17:55+00:00"
     }
   },
   "milestones": {
@@ -606,10 +615,18 @@
       "status": "done",
       "created": "2026-08-09T07:18:13+00:00",
       "updated": "2026-08-16T10:50:04+00:00"
+    },
+    "v0-9-1-wire-parity": {
+      "title": "Wire parity: reply types and command surface match Redis byte-for-byte",
+      "goal": "every reply Moon puts on the wire decodes in a statically-typed Redis client exactly as the same reply from redis-server does \u2014 verified by diffing Moon against a live redis-server, command for command, not by reading the docs",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-08-17T03:06:57+00:00",
+      "updated": "2026-08-17T03:06:57+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-16T10:50:04+00:00",
+  "updated": "2026-08-17T05:17:55+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

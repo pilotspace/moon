@@ -87,6 +87,12 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
         Frame::Null => {
             buf.put_slice(b"$-1\r\n");
         }
+        // RESP2 has TWO nulls. `$-1` above is the missing STRING; `*-1` here is
+        // the missing ARRAY (BLPOP timeout, aborted EXEC, GEOPOS of an absent
+        // member). A typed client decodes them differently — moon#482.
+        Frame::NullArray => {
+            buf.put_slice(b"*-1\r\n");
+        }
         // RESP3 types downgraded to RESP2 format
         Frame::Map(entries) => {
             // Downgrade: flat array [k1, v1, k2, v2, ...]
@@ -204,6 +210,12 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
         }
         // RESP3 Null uses `_\r\n` instead of `$-1\r\n`
         Frame::Null => {
+            buf.put_slice(b"_\r\n");
+        }
+        // RESP3 has ONE null for both shapes — verified against redis-server
+        // 8.6.1, where `BLPOP` timeout and `GET` miss both answer `_\r\n`.
+        // That is why the divergence moon#482 fixes is RESP2-only.
+        Frame::NullArray => {
             buf.put_slice(b"_\r\n");
         }
         Frame::Boolean(b) => {
@@ -335,6 +347,42 @@ mod tests {
     fn test_serialize_empty_bulk_string() {
         let buf = serialize_frame(&Frame::BulkString(Bytes::new()));
         assert_eq!(&buf[..], b"$0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null_array_resp2_is_star_minus_one() {
+        // RESP2's two nulls. `$-1` (Frame::Null) says the missing value is a
+        // STRING; `*-1` says it is an ARRAY. moon#482.
+        assert_eq!(&serialize_frame(&Frame::NullArray)[..], b"*-1\r\n");
+        assert_eq!(&serialize_frame(&Frame::Null)[..], b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null_array_resp3_collapses_to_underscore() {
+        // RESP3 has ONE null for both shapes — verified against redis-server
+        // 8.6.1, which answers `_\r\n` to both a BLPOP timeout and a GET miss.
+        assert_eq!(&serialize_resp3_frame(&Frame::NullArray)[..], b"_\r\n");
+        assert_eq!(&serialize_resp3_frame(&Frame::Null)[..], b"_\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null_array_nests_inside_an_array() {
+        // GEOPOS of an absent member is `*1\r\n*-1\r\n` — the variant has to
+        // be composable, not a top-level-reply special case.
+        let f = Frame::Array(framevec![Frame::NullArray]);
+        assert_eq!(&serialize_frame(&f)[..], b"*1\r\n*-1\r\n");
+
+        // And the contrast in the same shape: GEOHASH's miss stays a bulk.
+        let g = Frame::Array(framevec![Frame::Null]);
+        assert_eq!(&serialize_frame(&g)[..], b"*1\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn test_null_array_is_not_an_empty_array() {
+        // `*-1` (no array) and `*0` (an array with nothing in it) are
+        // different replies; conflating them is the other half of moon#482.
+        assert_eq!(&serialize_frame(&Frame::NullArray)[..], b"*-1\r\n");
+        assert_eq!(&serialize_frame(&Frame::Array(framevec![]))[..], b"*0\r\n");
     }
 
     #[test]

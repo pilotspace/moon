@@ -134,8 +134,26 @@ pub enum Frame {
     BulkString(Bytes),
     /// `*<count>\r\n<elements...>` -- Ordered collection of frames
     Array(FrameVec),
-    /// `$-1\r\n` (RESP2) or `_\r\n` (RESP3) -- Null value
+    /// `$-1\r\n` (RESP2) or `_\r\n` (RESP3) -- Null value.
+    ///
+    /// This is the null whose missing value is a STRING. For a reply whose
+    /// missing value is an array, use [`Frame::NullArray`] -- RESP2 spells the
+    /// two differently and a statically-typed client decodes them differently.
     Null,
+    /// `*-1\r\n` (RESP2) or `_\r\n` (RESP3) -- Null ARRAY.
+    ///
+    /// RESP2 has two nulls and they are not interchangeable: `$-1` says "the
+    /// string you asked for is missing", `*-1` says "the array you asked for is
+    /// missing". A client that decodes `BLPOP` as an array errors on `$-1`.
+    /// RESP3 collapses both to `_` (verified against redis-server 8.6.1), which
+    /// is why the divergence is RESP2-only.
+    ///
+    /// Composable: as an element of a [`Frame::Array`] it emits `*-1` inline,
+    /// which is how `GEOPOS` reports an absent member (`*1\r\n*-1\r\n`).
+    ///
+    /// Never produced by a parse FAILURE -- that sentinel stays [`Frame::Null`]
+    /// (see `parse_frame_zerocopy`). Only a well-formed `*-1` yields this.
+    NullArray,
 
     // === RESP3 variants ===
     /// `%<count>\r\n<key><value>...` -- Key-value map
@@ -190,6 +208,11 @@ impl PartialEq for Frame {
             (Self::BulkString(a), Self::BulkString(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => a == b,
             (Self::Null, Self::Null) => true,
+            // Explicit, NOT left to the `_ => false` arm below: without this a
+            // NullArray would not even equal itself. The two nulls stay
+            // distinct from each other on purpose — that distinction is the
+            // whole point of the variant (moon#482).
+            (Self::NullArray, Self::NullArray) => true,
             (Self::Map(a), Self::Map(b)) => a == b,
             (Self::Set(a), Self::Set(b)) => a == b,
             (Self::Double(a), Self::Double(b)) => OrderedFloat(*a) == OrderedFloat(*b),
@@ -363,6 +386,16 @@ mod tests {
     #[test]
     fn test_frame_null_not_equal_to_empty_bulk_string() {
         assert_ne!(Frame::Null, Frame::BulkString(Bytes::new()));
+    }
+
+    #[test]
+    fn test_null_array_is_distinct_from_null_and_equal_to_itself() {
+        // Equality is hand-written with a `_ => false` catch-all, so without
+        // an explicit arm a NullArray would not even equal itself (moon#482).
+        assert_eq!(Frame::NullArray, Frame::NullArray);
+        assert_ne!(Frame::NullArray, Frame::Null);
+        assert_ne!(Frame::Null, Frame::NullArray);
+        assert_ne!(Frame::NullArray, Frame::Array(framevec![]));
     }
 
     #[test]

@@ -265,7 +265,11 @@ pub(crate) fn execute_transaction(
     for (key, watched_version) in watched_keys {
         let current_version = guard.get_version(key);
         if current_version != watched_version.version {
-            return (Frame::Null, Vec::new()); // Transaction aborted
+            // Null ARRAY, not null bulk: Redis answers an aborted EXEC with
+            // `*-1`, and every client library decodes EXEC as an array — so
+            // the abort path is precisely the one optimistic-locking code is
+            // written to handle (moon#482).
+            return (Frame::NullArray, Vec::new()); // Transaction aborted
         }
     }
 
@@ -377,7 +381,8 @@ pub(crate) fn execute_transaction_sharded(
     // had no equivalent, so a transaction that declared a dependency on a key
     // committed straight over a conflicting write.
     if !watched_keys.is_empty() && watch_conflict(selected_db, watched_keys) {
-        return (Frame::Null, Vec::new(), Vec::new());
+        // Null ARRAY — same reply as the embedded executor above (moon#482).
+        return (Frame::NullArray, Vec::new(), Vec::new());
     }
 
     let mut results = Vec::with_capacity(command_queue.len());

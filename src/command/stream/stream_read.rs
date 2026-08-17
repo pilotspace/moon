@@ -264,7 +264,8 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
     if has_entries {
         Frame::Array(results.into())
     } else {
-        Frame::Null
+        // No stream had data: XREAD's miss is a null ARRAY (moon#482).
+        Frame::NullArray
     }
 }
 
@@ -784,7 +785,8 @@ pub fn xread_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
     if has_entries {
         Frame::Array(results.into())
     } else {
-        Frame::Null
+        // No stream had data: XREAD's miss is a null ARRAY (moon#482).
+        Frame::NullArray
     }
 }
 

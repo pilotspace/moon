@@ -140,7 +140,13 @@ pub fn apply_shape(shape: Resp3Shape, response: Frame, proto: u8) -> Frame {
         return response;
     }
     // Errors and nulls are shape-independent and always pass through.
-    if matches!(&response, Frame::Error(_) | Frame::Null) {
+    //
+    // `NullArray` is listed explicitly rather than left to the converters'
+    // `other => other` arms. Those arms do preserve it today, but this guard
+    // is where the doc comment above promises nulls are untouched, and the
+    // commands that reach it with a null array are real: BZPOPMIN/BZPOPMAX
+    // carry a shape and answer `NullArray` on timeout (moon#482).
+    if matches!(&response, Frame::Error(_) | Frame::Null | Frame::NullArray) {
         return response;
     }
 

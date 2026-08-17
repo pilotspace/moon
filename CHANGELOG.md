@@ -125,6 +125,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **RESP2 replies whose missing value is an *array* sent the null *string* instead** (#482).
+  RESP2 has two nulls — `$-1` says "the string you asked for is missing", `*-1` says "the array
+  you asked for is missing" — and `Frame` had a single `Null` variant that always serialised
+  `$-1`. A statically-typed client decodes the two differently, so this was a decode error
+  client-side, not a cosmetic difference. `Frame::NullArray` now carries the second one: `*-1`
+  under RESP2, `_` under RESP3 (which has only one null), and composable inside an array.
+
+  Sixteen sites were wrong, each measured against a live `redis-server 8.6.1` rather than read
+  from the docs: the eight blocking commands on timeout (`BLPOP`, `BRPOP`, `BLMOVE`,
+  `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`), `LMPOP`/`ZMPOP` finding nothing,
+  `XREAD` with no data, `GEOPOS` of an absent member (nested inside the outer array),
+  `LPOP`/`RPOP` with a count on an absent key, `EXEC` aborted by a broken `WATCH`, and the
+  parser, which collapsed an inbound `*-1` so a reply relayed from a peer went back out as `$-1`.
+
+  Two of those are worth calling out. **`EXEC`-abort was the highest-impact one and was not in
+  the original report**: every client library decodes `EXEC` as an array, so the abort path — the
+  one optimistic-locking code is written to handle — was the one that mis-decoded. And
+  **`LPOP key <count>` was never a `Frame::Null` at all**; it returned an *empty* array (`*0`),
+  so an audit that only rewrote null sites would have missed it. That cuts both ways: roughly
+  thirty sites already answered correctly (nineteen `$-1`, twelve `*0`) and had to stay put —
+  including `GEOHASH`, which answers `$-1` for the same absent member on which `GEOPOS` answers
+  `*-1`, in the same source file. `tests/resp2_null_array.rs` pins both directions, and
+  `scripts/test-consistency.sh` now diffs the reply TYPE against a live Redis over a raw socket,
+  because `redis-cli` renders both nulls as `(nil)` and so cannot see this class of defect at all.
+
+  One case in the original report is deliberately **not** fixed here. `BLPOP` inside `MULTI` still
+  answers a null bulk, because that path rewrites the queued command to `LPOP`, whose own null
+  correctly is `$-1`. Measuring the hit path showed the rewrite is wrong in shape rather than in
+  null type — Redis answers `[["q","v1"]]`, Moon answers `["v1"]`, dropping the key that `BLPOP`
+  exists to report — so patching the null alone would have turned its test green over a command
+  that still answers wrongly. Filed as #524; the test stays ignored with its reason moved there.
+
 - **`MEMORY USAGE <key>` reported existing keys as absent at `--shards >= 2`.** It routed by
   hashing the literal subcommand `"USAGE"` rather than the key (#511), so every invocation went to
   one fixed shard and read that shard's slice for a key it does not own. Measured at `--shards 4`:

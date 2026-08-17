@@ -400,6 +400,11 @@ fn frame_type_name(frame: &crate::protocol::Frame) -> &'static str {
         Frame::BulkString(_) => "bulk_string",
         Frame::Array(_) => "array",
         Frame::Null => "null",
+        // Distinct from "null": the console shows the reply TYPE, and the
+        // whole point of moon#482 is that a missing array is not a missing
+        // string. Collapsing them here would hide the very thing an operator
+        // opens the console to check.
+        Frame::NullArray => "null_array",
         Frame::Map(_) => "map",
         Frame::Set(_) => "set",
         Frame::Double(_) => "double",

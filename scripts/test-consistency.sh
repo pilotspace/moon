@@ -661,6 +661,103 @@ assert_both "WATCH arity" WATCH
 assert_both "UNWATCH outside MULTI" UNWATCH
 
 # ===========================================================================
+# RESP2 null TYPE parity (moon#482)
+# ===========================================================================
+# RESP2 has two nulls: `$-1` (the missing value is a string) and `*-1` (the
+# missing value is an array). A typed client decodes them differently, so
+# answering the wrong one is a decode error client-side.
+#
+# `redis-cli` renders BOTH as "(nil)", so no assertion built on its output can
+# see this defect at all — that is precisely why it survived every existing
+# suite. These probes read the RAW first line off the socket instead.
+#
+# Failure markers embed the PORT on purpose. An earlier draft returned a bare
+# "__CONNECT_FAILED__" from both servers, so when the probe could not connect
+# at all the two sides compared EQUAL and every assertion passed vacuously —
+# a green suite that had tested nothing. A per-port marker can never match its
+# counterpart, so a broken probe now fails loudly instead of silently.
+null_type_of() {
+    local port="$1"; shift
+    local line=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf '%s\r\n' "$*" >&3
+    IFS= read -r -t 5 line <&3
+    exec 3>&-
+    line="${line%$'\r'}"
+    # A RESP reply always opens with a type byte. Anything else (empty read,
+    # timeout, truncated line) is an instrument failure, not a null type.
+    #
+    # The first character is tested on its own rather than with a bracket
+    # expression: a `[...$*...]` pattern looks right but bash expands the `$*`
+    # inside it to the positional parameters, so every real reply fell through
+    # to the failure branch.
+    case "${line:0:1}" in
+        '+'|'-'|':'|'$'|'*'|'%'|'~'|'#'|','|'('|'_'|'='|'>') echo "$line" ;;
+        *) echo "__NO_RESP_REPLY__:${port}:${line}" ;;
+    esac
+}
+
+# Every probe gets its OWN never-written key (%K below). Sharing one key made
+# the results lie: a timed-out BLPOP leaves a phantom empty list behind in Moon
+# (#523), so a later `LPOP <same-key> 2` legitimately answered `*0` instead of
+# `*-1` and looked like a null-type bug that was not there.
+nulltype_i=0
+null_probe() {
+    local kind="$1"; shift
+    nulltype_i=$((nulltype_i + 1))
+    local key="nulltype:${nulltype_i}"
+    local -a argv=()
+    local a
+    for a in "$@"; do argv+=("${a//%K/$key}"); done
+    assert_eq "null type ${kind}: ${argv[0]}" \
+        "$(null_type_of "$PORT_REDIS" "${argv[@]}")" \
+        "$(null_type_of "$PORT_RUST" "${argv[@]}")"
+}
+
+# Must be `*-1` on both servers.
+null_probe parity BLPOP %K 0.05
+null_probe parity BRPOP %K 0.05
+null_probe parity BLMOVE %K %K-d LEFT RIGHT 0.05
+null_probe parity BRPOPLPUSH %K %K-d 0.05
+null_probe parity BZPOPMIN %K 0.05
+null_probe parity LPOP %K 2
+null_probe parity RPOP %K 2
+null_probe parity LMPOP 1 %K LEFT
+null_probe parity ZMPOP 1 %K MIN
+null_probe parity XREAD COUNT 1 STREAMS %K 0-0
+
+# The fence: these misses are a null BULK or an EMPTY array and must NOT have
+# moved. Without this half, "make everything *-1" would pass the block above.
+null_probe fence GET %K
+null_probe fence HGET %K f
+null_probe fence LPOP %K
+null_probe fence ZSCORE %K m
+null_probe fence GETDEL %K
+null_probe fence ZPOPMIN %K
+null_probe fence SMEMBERS %K
+null_probe fence HGETALL %K
+null_probe fence XRANGE %K - +
+
+# EXEC aborted by a broken WATCH: the reply TYPE, not the committed value.
+# Needs two connections interleaved, like watch_cas_outcome above, but reads
+# EXEC's own reply line rather than the key's final value.
+exec_abort_reply_type() {
+    local port="$1" line=""
+    redis-cli -p "$port" SET nulltype:cas base >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'WATCH nulltype:cas\r\nMULTI\r\nGET nulltype:cas\r\n' >&3
+    # Drain the three acks (+OK, +OK, +QUEUED) so the next line read is EXEC's.
+    IFS= read -r -t 5 line <&3; IFS= read -r -t 5 line <&3; IFS= read -r -t 5 line <&3
+    redis-cli -p "$port" SET nulltype:cas from-other >/dev/null 2>&1 || true
+    printf 'EXEC\r\n' >&3
+    IFS= read -r -t 5 line <&3
+    exec 3>&-
+    echo "${line%$'\r'}"
+}
+assert_eq "null type parity: EXEC aborted by WATCH" \
+    "$(exec_abort_reply_type "$PORT_REDIS")" "$(exec_abort_reply_type "$PORT_RUST")"
+
+# ===========================================================================
 # Identity / introspection (COMMAND, ROLE, RESET)
 # ===========================================================================
 log "=== IDENTITY/INTROSPECTION ==="
