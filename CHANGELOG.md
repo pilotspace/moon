@@ -125,6 +125,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **Commands whose key is not their first argument were routed by hashing a literal** (#533, #534).
+  `extract_primary_key` special-cases the commands whose key is not `args[0]` and falls through to
+  `args[0]` for everything else. `LMPOP`, `ZMPOP` and `SINTERCARD` take `numkeys` first, and
+  `XREADGROUP` takes the literal token `GROUP`, so each hashed a **constant**: every invocation
+  landed on one fixed shard regardless of the key, and a key any other shard owned read as absent.
+
+  The failure is quiet, which is why it survived. A mis-routed `LMPOP`/`ZMPOP` answers `*-1` and a
+  mis-routed `SINTERCARD` answers `:0` — byte-identical to the honest answer for a key that really
+  is empty. `XREADGROUP` at least errors. `BLMPOP`/`BZMPOP` were fixed in the same arm for their
+  other consumers (cluster slot resolution asks the same function, and hashing the `timeout`
+  yields a wrong `MOVED` target); their blocking path extracts keys separately and was correct.
+  Also corrected: the `XREAD` arm's `len == 5` guard could never match `XREADGROUP` despite the
+  comment above it naming both.
+
+  Two rules, both learned by having the previous instrument miss this class entirely, govern the
+  regression tests in `tests/shard_routing_parity.rs` and the `route_probe` rows in
+  `scripts/test-consistency.sh`: probe **populated** keys, because on an absent key a mis-routed
+  command and a correct one return the same bytes; and probe **many** keys, because a constant
+  route is still right for ~1/N of them, so a single-key test at `--shards 4` passes a quarter of
+  the time and reads as a flake. Against the pre-fix binary the four parity rows fail with 9, 11,
+  10 and 7 of 12 keys wrong; the fence rows (`LPOP`, `ZDIFF`, `XREAD`) pass on both.
+
 - **RESP2 replies whose missing value is an *array* sent the null *string* instead** (#482).
   RESP2 has two nulls — `$-1` says "the string you asked for is missing", `*-1` says "the array
   you asked for is missing" — and `Frame` had a single `Null` variant that always serialised

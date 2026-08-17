@@ -12,11 +12,14 @@ set -euo pipefail
 #   ./scripts/test-consistency.sh [--shards N] [--skip-build] [--port-rust N]
 ###############################################################################
 
-PORT_REDIS=6399
-PORT_RUST=6400
+PORT_REDIS="${PORT_REDIS:-6399}"
+PORT_RUST="${PORT_RUST:-6400}"
 SHARDS=1
 SKIP_BUILD=false
-RUST_BINARY="./target/release/moon"
+# Overridable: `./target/release/moon` is whatever was built there last, by
+# any branch or feature set. A run that silently exercises a days-old binary
+# reports a confident, false result, so pin it with MOON_BIN when it matters.
+RUST_BINARY="${MOON_BIN:-./target/release/moon}"
 PASS=0
 FAIL=0
 RUST_PID=""
@@ -27,6 +30,7 @@ while [[ $# -gt 0 ]]; do
         --shards)     SHARDS="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --port-rust)  PORT_RUST="$2"; shift 2 ;;
+        --port-redis) PORT_REDIS="$2"; shift 2 ;;
         *) echo "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -109,6 +113,40 @@ RUST_PID=$!
 
 wait_for_port "$PORT_REDIS"
 wait_for_port "$PORT_RUST"
+
+# The oracle must actually BE the oracle.
+#
+# `redis-server --port N` exits immediately when N is taken, but `wait_for_port`
+# still succeeds — whatever already owns the port answers instead. When that
+# squatter is a stale `moon` (a leaked dev instance, another worktree's server),
+# every comparison below silently becomes moon-vs-moon and the suite reports a
+# confident result while never touching Redis. Observed: a leaked moon on :6399
+# made 14 genuine parity rows read as failures, printing a stale Moon's answers
+# as "expected".
+#
+# Checking `kill -0 $REDIS_PID` is NOT sufficient: a child that died without
+# being reaped is a zombie, and a zombie still answers `kill -0`. So identify
+# the listener by what it can do. `DUMP` is implemented by Redis and not by
+# moon, which makes it a one-command discriminator that needs no version
+# parsing and cannot be faked by a compatible INFO section.
+oracle_dump=$(redis-cli -p "$PORT_REDIS" DUMP __oracle_identity_probe__ 2>&1 | head -1)
+if [[ "$oracle_dump" == *"unknown command"* ]]; then
+    echo "FATAL: whatever is listening on :$PORT_REDIS is not redis-server —"
+    echo "       it does not implement DUMP, which means it is almost certainly moon."
+    echo "       Every 'expected' value below would come from that process, so the"
+    echo "       whole run would compare moon against moon and prove nothing."
+    lsof -nP -iTCP:"$PORT_REDIS" -sTCP:LISTEN 2>/dev/null | head -5 || true
+    echo "       Re-run with --port-redis <free port>, or stop the squatter."
+    exit 1
+fi
+# And moon must be moon, for the same reason in reverse.
+moon_mq=$(redis-cli -p "$PORT_RUST" MQ LIST 2>&1 | head -1)
+if [[ "$moon_mq" == *"unknown command"* ]]; then
+    echo "FATAL: whatever is listening on :$PORT_RUST is not moon — it does not"
+    echo "       implement MQ. Re-run with --port-rust <free port>."
+    lsof -nP -iTCP:"$PORT_RUST" -sTCP:LISTEN 2>/dev/null | head -5 || true
+    exit 1
+fi
 both FLUSHALL
 
 # ===========================================================================
@@ -744,6 +782,80 @@ null_probe fence ZPOPMIN %K
 null_probe fence SMEMBERS %K
 null_probe fence HGETALL %K
 null_probe fence XRANGE %K - +
+
+# ---------------------------------------------------------------------------
+# Shard-routing parity (moon#533, moon#534)
+#
+# A command whose key is not its first argument used to be routed by hashing
+# whatever WAS first — a numkeys count, a timeout, the literal "GROUP" — so
+# every invocation landed on one fixed shard and reported every other shard's
+# keys as absent.
+#
+# Two rules make these probes able to see that; drop either and the block goes
+# quietly vacuous:
+#
+#   1. POPULATE the key first. On an absent key a mis-routed command and a
+#      correct one return identical bytes, so an absent-key probe proves
+#      nothing. The null-type probes above are absent-key by design and did
+#      report LMPOP/ZMPOP clean while they were broken.
+#   2. Use MANY keys. A constant route still serves ~1/N of keys, so one key
+#      passes 1-in-N of the time and reads as a flake, not a bug.
+#
+# At --shards 1 there is no routing and these cannot fail; they are still run
+# so the block is exercised in every config rather than silently skipped.
+ROUTE_KEYS=12
+
+# Run `setup` then `probe` on both servers for one key, and compare. The key
+# name is substituted for %K; the SETUP output is discarded but its effect is
+# asserted by the probe having something to find.
+route_probe() {
+    local label="$1"; shift
+    local setup="$1"; shift
+    local probe="$1"; shift
+    local setup2="${1:-}"
+    local mismatched=0 i key
+    for i in $(seq 1 "$ROUTE_KEYS"); do
+        key="route:${label}:${i}"
+        # shellcheck disable=SC2086  # deliberate word-split: templates are ours
+        redis-cli -p "$PORT_REDIS" ${setup//%K/$key} >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        redis-cli -p "$PORT_RUST"  ${setup//%K/$key} >/dev/null 2>&1 || true
+        if [ -n "$setup2" ]; then
+            # shellcheck disable=SC2086
+            redis-cli -p "$PORT_REDIS" ${setup2//%K/$key} >/dev/null 2>&1 || true
+            # shellcheck disable=SC2086
+            redis-cli -p "$PORT_RUST"  ${setup2//%K/$key} >/dev/null 2>&1 || true
+        fi
+        # shellcheck disable=SC2086
+        local r; r=$(redis-cli -p "$PORT_REDIS" ${probe//%K/$key} 2>&1)
+        # shellcheck disable=SC2086
+        local m; m=$(redis-cli -p "$PORT_RUST"  ${probe//%K/$key} 2>&1)
+        [ "$r" = "$m" ] || mismatched=$((mismatched + 1))
+    done
+    # Compare COUNTS, not one key's bytes: "0 of 12" vs "9 of 12" is the
+    # difference between correct and a constant route, and asserting on a
+    # single key would make those two outcomes indistinguishable.
+    assert_eq "shard routing ${label} (shards=${SHARDS}, ${ROUTE_KEYS} keys)" \
+        "0 mismatched" "${mismatched} mismatched"
+}
+
+route_probe lmpop      "RPUSH %K v1"                 "LMPOP 1 %K LEFT"
+route_probe zmpop      "ZADD %K 1 m"                 "ZMPOP 1 %K MIN"
+route_probe sintercard "SADD %K a b"                 "SINTERCARD 1 %K"
+route_probe xreadgroup "XADD %K 1-1 f v"             "XREADGROUP GROUP g c COUNT 1 STREAMS %K >" \
+                       "XGROUP CREATE %K g 0"
+
+# The fence: commands that already routed correctly. Without this half, a fix
+# that routed EVERYTHING by args[1] would pass the block above.
+route_probe f_lpop     "RPUSH %K v1"                 "LPOP %K"
+route_probe f_zdiff    "ZADD %K 1 m"                 "ZDIFF 1 %K"
+route_probe f_xread    "XADD %K 1-1 f v"             "XREAD COUNT 1 STREAMS %K 0-0"
+# MEMORY USAGE is deliberately NOT fenced here even though it has a routing
+# arm (moon#511): it answers a BYTE COUNT, and Redis's allocator and moon's
+# legitimately disagree on it, so a cross-server equality check fails for a
+# reason that has nothing to do with routing. Its routing fence lives in
+# tests/shard_routing_parity.rs, which asserts the reply is an integer for
+# every key rather than that the two servers agree on the number.
 
 # EXEC aborted by a broken WATCH: the reply TYPE, not the committed value.
 # Needs two connections interleaved, like watch_cas_outcome above, but reads

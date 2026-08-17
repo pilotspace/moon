@@ -1013,10 +1013,56 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
             _ => None,
         };
     }
-    // XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]:
+    // LMPOP/ZMPOP numkeys key [key ...] <LEFT|RIGHT|MIN|MAX>, and
+    // SINTERCARD numkeys key [key ...]: args[0] is the numkeys LITERAL and the
+    // first real key is args[1] — the same layout as ZDIFF above.
+    //
+    // Routing by args[0] hashed the count, so every invocation landed on one
+    // fixed shard and a populated key read as EMPTY from every other shard —
+    // `*-1` for the two MPOPs, `:0` for SINTERCARD, neither distinguishable
+    // from a key that really is empty (moon#534).
+    if (len == 5
+        && ((b0 == b'l' && cmd.eq_ignore_ascii_case(b"LMPOP"))
+            || (b0 == b'z' && cmd.eq_ignore_ascii_case(b"ZMPOP"))))
+        || (len == 10 && b0 == b's' && cmd.eq_ignore_ascii_case(b"SINTERCARD"))
+    {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
+    // BLMPOP/BZMPOP timeout numkeys key [key ...] <dir>: args[0] is the
+    // TIMEOUT and args[1] the numkeys, so the first real key is args[2].
+    //
+    // The blocking decision itself does NOT come through here —
+    // `handle_blocking_command_*` extracts these keys directly, which is why
+    // BLMPOP routes correctly today. This arm exists for the other consumers:
+    // cluster slot resolution asks the same function, and hashing "0.05"
+    // there yields a wrong slot and therefore a wrong MOVED target.
+    if len == 6
+        && b0 == b'b'
+        && (cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP"))
+    {
+        return match args.get(2) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
+    // XREAD  [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
+    // XREADGROUP GROUP g c [COUNT n] [BLOCK ms] STREAMS key [key ...] id [...]
     // Scan args for the STREAMS token; the key immediately follows it.
     // No allocation — scan &[Frame] linearly.
-    if len == 5 && b0 == b'x' && cmd.eq_ignore_ascii_case(b"XREAD") {
+    //
+    // XREADGROUP is matched here rather than left to the fallthrough because
+    // its args[0] is the literal token "GROUP": one hash, one shard, for every
+    // stream on the server. It answered "-ERR ... requires the key to exist"
+    // for every key that shard did not own (moon#533). It is 10 bytes, so the
+    // original `len == 5` guard could never have caught it even though the
+    // comment above it named both commands.
+    if b0 == b'x'
+        && ((len == 5 && cmd.eq_ignore_ascii_case(b"XREAD"))
+            || (len == 10 && cmd.eq_ignore_ascii_case(b"XREADGROUP")))
+    {
         for (i, arg) in args.iter().enumerate() {
             if let Frame::BulkString(tok) = arg {
                 if tok.eq_ignore_ascii_case(b"STREAMS") {
@@ -1767,6 +1813,145 @@ mod as_of_tests {
         // OBJECT HELP has no key — executes locally.
         let help = vec![frame_bulk(b"HELP")];
         assert!(extract_primary_key(b"OBJECT", &help).is_none());
+    }
+
+    #[test]
+    fn extract_primary_key_numkeys_commands_route_by_real_key() {
+        // LMPOP/ZMPOP/SINTERCARD numkeys key [key ...]: routing must hash the
+        // key at args[1], never the numkeys literal at args[0] (moon#534).
+        for cmd in [&b"LMPOP"[..], &b"ZMPOP"[..]] {
+            let args = vec![frame_bulk(b"1"), frame_bulk(b"mykey"), frame_bulk(b"LEFT")];
+            let got = extract_primary_key(cmd, &args);
+            assert_eq!(
+                got.map(|b| b.as_ref()),
+                Some(&b"mykey"[..]),
+                "{} routed by the numkeys literal",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        let sic = vec![frame_bulk(b"2"), frame_bulk(b"mykey"), frame_bulk(b"other")];
+        assert_eq!(
+            extract_primary_key(b"SINTERCARD", &sic).map(|b| b.as_ref()),
+            Some(&b"mykey"[..])
+        );
+        // Lower case reaches the same arm — clients are not required to shout.
+        let lower = vec![frame_bulk(b"1"), frame_bulk(b"mykey"), frame_bulk(b"MIN")];
+        assert_eq!(
+            extract_primary_key(b"zmpop", &lower).map(|b| b.as_ref()),
+            Some(&b"mykey"[..])
+        );
+        // A truncated form must not index past the end.
+        let short = vec![frame_bulk(b"1")];
+        assert!(extract_primary_key(b"LMPOP", &short).is_none());
+    }
+
+    #[test]
+    fn extract_primary_key_blocking_mpop_routes_by_real_key() {
+        // BLMPOP/BZMPOP timeout numkeys key [key ...]: the key is args[2],
+        // because args[0] is the TIMEOUT and args[1] the numkeys. The blocking
+        // path extracts its own keys, but cluster slot resolution asks this
+        // function and would otherwise hash "0.05" (moon#534).
+        for cmd in [&b"BLMPOP"[..], &b"BZMPOP"[..]] {
+            let args = vec![
+                frame_bulk(b"0.05"),
+                frame_bulk(b"1"),
+                frame_bulk(b"mykey"),
+                frame_bulk(b"LEFT"),
+            ];
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"mykey"[..]),
+                "{} routed by the timeout literal",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        let short = vec![frame_bulk(b"0.05"), frame_bulk(b"1")];
+        assert!(extract_primary_key(b"BZMPOP", &short).is_none());
+    }
+
+    #[test]
+    fn extract_primary_key_xreadgroup_routes_by_stream_key() {
+        // XREADGROUP GROUP g c STREAMS key id: the key follows the STREAMS
+        // token. args[0] is the literal "GROUP", which is what it used to
+        // hash — one shard for every stream on the server (moon#533).
+        let args = vec![
+            frame_bulk(b"GROUP"),
+            frame_bulk(b"mygroup"),
+            frame_bulk(b"myconsumer"),
+            frame_bulk(b"STREAMS"),
+            frame_bulk(b"mystream"),
+            frame_bulk(b">"),
+        ];
+        assert_eq!(
+            extract_primary_key(b"XREADGROUP", &args).map(|b| b.as_ref()),
+            Some(&b"mystream"[..])
+        );
+
+        // COUNT/BLOCK before STREAMS must not shift the key: the arm scans for
+        // the token rather than counting positions.
+        let opts = vec![
+            frame_bulk(b"GROUP"),
+            frame_bulk(b"g"),
+            frame_bulk(b"c"),
+            frame_bulk(b"COUNT"),
+            frame_bulk(b"10"),
+            frame_bulk(b"BLOCK"),
+            frame_bulk(b"0"),
+            frame_bulk(b"STREAMS"),
+            frame_bulk(b"mystream"),
+            frame_bulk(b">"),
+        ];
+        assert_eq!(
+            extract_primary_key(b"XREADGROUP", &opts).map(|b| b.as_ref()),
+            Some(&b"mystream"[..])
+        );
+
+        // No STREAMS token: malformed. Answer None (execute locally and let
+        // the command itself produce the syntax error) rather than hashing
+        // some other argument.
+        let malformed = vec![frame_bulk(b"GROUP"), frame_bulk(b"g")];
+        assert!(extract_primary_key(b"XREADGROUP", &malformed).is_none());
+
+        // XREAD keeps working — the arm now matches two command names and it
+        // would be easy to break the original one.
+        let xread = vec![
+            frame_bulk(b"COUNT"),
+            frame_bulk(b"1"),
+            frame_bulk(b"STREAMS"),
+            frame_bulk(b"mystream"),
+            frame_bulk(b"0-0"),
+        ];
+        assert_eq!(
+            extract_primary_key(b"XREAD", &xread).map(|b| b.as_ref()),
+            Some(&b"mystream"[..])
+        );
+    }
+
+    #[test]
+    fn extract_primary_key_lookalike_commands_are_not_captured() {
+        // The new arms match on (length, first byte) then a full compare. This
+        // pins that commands sharing a length and prefix are NOT swept in —
+        // routing them by args[1] or args[2] would break keys that really are
+        // at args[0].
+        let args = vec![frame_bulk(b"mykey"), frame_bulk(b"1"), frame_bulk(b"2")];
+        for cmd in [
+            &b"LPUSH"[..],  // 5 bytes, 'l', like LMPOP
+            &b"ZRANK"[..],  // 5 bytes, 'z', like ZMPOP
+            &b"BITPOS"[..], // 6 bytes, 'b', like BLMPOP/BZMPOP
+        ] {
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"mykey"[..]),
+                "{} must still route by args[0]",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // SINTERCARD is 10 bytes starting 's'; SUBSCRIBE-alikes must not match.
+        let s10 = vec![frame_bulk(b"mykey"), frame_bulk(b"other")];
+        assert_eq!(
+            extract_primary_key(b"SDIFFSTORE", &s10).map(|b| b.as_ref()),
+            Some(&b"mykey"[..])
+        );
     }
 
     #[test]
