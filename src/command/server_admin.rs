@@ -1895,6 +1895,22 @@ mod tests {
     }
 
     #[test]
+    fn memory_usage_samples_zero_is_accepted() {
+        // `SAMPLES 0` is VALID in Redis — it means "sample every nested
+        // value" — so it must not be rejected as a bad argument. Pinned
+        // because a stricter duplicate of this parser exists in
+        // `key_extra::memory_usage` (currently unreferenced) which rejects
+        // a zero count; if that one is ever wired up, this test fails
+        // instead of silently breaking valid client syntax.
+        let mut db = db_with_key();
+        let f = memory_usage(&mut db, &[bulk(b"mykey"), bulk(b"SAMPLES"), bulk(b"0")]);
+        assert!(
+            matches!(f, Frame::Integer(_)),
+            "MEMORY USAGE key SAMPLES 0 must return a size, got {f:?}"
+        );
+    }
+
+    #[test]
     fn memory_usage_samples_rejects_non_integer() {
         let mut db = db_with_key();
         let f = memory_usage(&mut db, &[bulk(b"mykey"), bulk(b"SAMPLES"), bulk(b"abc")]);

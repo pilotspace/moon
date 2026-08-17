@@ -1519,6 +1519,10 @@ MQ_DLQ_RESULT_1=""
 MQ_DLQ_RESULT_4=""
 MQ_DLQ_RESULT_12=""
 
+MEM_USAGE_RESULT_1=""
+MEM_USAGE_RESULT_4=""
+MEM_USAGE_RESULT_12=""
+
 for NSHARDS in 1 4 12; do
     log "  -- MQ shards=$NSHARDS --"
     start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
@@ -1550,6 +1554,23 @@ for NSHARDS in 1 4 12; do
         1)  MQ_DLQ_RESULT_1="$DLQ_LEN" ;;
         4)  MQ_DLQ_RESULT_4="$DLQ_LEN" ;;
         12) MQ_DLQ_RESULT_12="$DLQ_LEN" ;;
+    esac
+
+    # MEMORY USAGE routing (task #511): the subcommand sits at args[0], so a
+    # router that takes args[0] as the key hashes the literal "USAGE" and asks
+    # ONE fixed shard about every key. Twenty keys, because the failure rate is
+    # 1-1/shards: a single key passes by luck at 1/12 shards.
+    # Counts keys that report a size; anything else (nil/error) is a miss.
+    MEM_HITS=0
+    for i in $(seq 1 20); do
+        redis-cli -p "$PORT_RUST" SET "memusage:$i" "v$i" >/dev/null 2>&1
+        MU=$(redis-cli -p "$PORT_RUST" MEMORY USAGE "memusage:$i" 2>&1)
+        echo "$MU" | grep -qE '^\(integer\) [1-9][0-9]*$|^[1-9][0-9]*$' && MEM_HITS=$((MEM_HITS + 1))
+    done
+    case "$NSHARDS" in
+        1)  MEM_USAGE_RESULT_1="$MEM_HITS" ;;
+        4)  MEM_USAGE_RESULT_4="$MEM_HITS" ;;
+        12) MEM_USAGE_RESULT_12="$MEM_HITS" ;;
     esac
 
     # Cleanup
@@ -1595,6 +1616,30 @@ fi
 
 # MEMORY DOCTOR: Moon-specific schema, not parity-tested against Redis.
 # Coverage: integration test tests/memory_doctor_response.rs + test-commands.sh.
+
+# MEMORY USAGE routing consistency (task #511): every one of the 20 keys must
+# report a size at every shard count. Before the fix, MEMORY USAGE hashed the
+# literal "USAGE" instead of the key, so it asked one fixed shard about every
+# key and answered nil for the rest -- 1-shard was perfect and 4/12-shard were
+# not, which is exactly the divergence this suite exists to catch.
+MEM_USAGE_OK=true
+for NSHARDS_LABEL in 1 4 12; do
+    case "$NSHARDS_LABEL" in
+        1)  MEM_R="$MEM_USAGE_RESULT_1" ;;
+        4)  MEM_R="$MEM_USAGE_RESULT_4" ;;
+        12) MEM_R="$MEM_USAGE_RESULT_12" ;;
+    esac
+    [[ "$MEM_R" == "20" ]] || MEM_USAGE_OK=false
+done
+if $MEM_USAGE_OK; then
+    PASS=$((PASS + 1)); echo "  PASS: MEMORY USAGE routes by key across 1/4/12 shards (20/20)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: MEMORY USAGE cross-shard divergence (want 20/20 keys sized)"
+    echo "    1-shard:  $MEM_USAGE_RESULT_1/20"
+    echo "    4-shard:  $MEM_USAGE_RESULT_4/20"
+    echo "    12-shard: $MEM_USAGE_RESULT_12/20"
+fi
 
 # ===========================================================================
 # SHUTDOWN [NOSAVE|SAVE] -- task #27
