@@ -40,16 +40,16 @@ Out: reply *content* correctness where the type is already right (that is per-co
   either consumes it or must not disturb it. -> owning task `resp2-null-array`
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
-- [ ] resp2-null-array      depends-on: none                — #482: add `Frame::NullArray`; audit every `Frame::Null` site per the measured table; fix the 16 divergences incl. EXEC-abort and nested GEOPOS
+- [x] resp2-null-array      depends-on: none                — #482: add `Frame::NullArray`; audit every `Frame::Null` site per the measured table; fix the 16 divergences incl. EXEC-abort and nested GEOPOS
 - [ ] rpoplpush-command     depends-on: none                — #520: `RPOPLPUSH` is unknown-command; delegate to LMOVE semantics, add metadata, wire all dispatch paths
 - [ ] zrank-withscore       depends-on: resp2-null-array    — #521: `ZRANK/ZREVRANK ... WITHSCORE`; hit path returns `[rank, score]`, miss path returns the null array
 - [ ] introspection-shapes  depends-on: none                — #469 COMMAND COUNT returns an array not an integer; #480 PUBSUB NUMPAT counts subscribers not patterns; #491 arity errors upper-case the command name
 
 ## Exit criteria (observable; map each to the task that delivers it)
-- [ ] A client that decodes `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` as an array gets a null array on timeout, not a null bulk        (← resp2-null-array)
-- [ ] `EXEC` aborted by a broken `WATCH` replies `*-1`, so optimistic-locking client code decodes the abort path instead of erroring        (← resp2-null-array)
-- [ ] `LPOP key <count>` / `RPOP key <count>` on an absent key reply `*-1`, while `ZPOPMIN`/`SPOP n`/`SMEMBERS`/`HGETALL`/`XRANGE` on an absent key still reply `*0`        (← resp2-null-array)
-- [ ] `GEOPOS` of an absent member nests a null array inside the outer array        (← resp2-null-array)
+- [x] A client that decodes `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` as an array gets a null array on timeout, not a null bulk        (← resp2-null-array)
+- [x] `EXEC` aborted by a broken `WATCH` replies `*-1`, so optimistic-locking client code decodes the abort path instead of erroring        (← resp2-null-array)
+- [x] `LPOP key <count>` / `RPOP key <count>` on an absent key reply `*-1`, while `ZPOPMIN`/`SPOP n`/`SMEMBERS`/`HGETALL`/`XRANGE` on an absent key still reply `*0`        (← resp2-null-array)
+- [x] `GEOPOS` of an absent member nests a null array inside the outer array        (← resp2-null-array)
 - [ ] `RPOPLPUSH source destination` moves the element and appears in `COMMAND INFO`        (← rpoplpush-command)
 - [ ] `ZRANK key member WITHSCORE` returns `[rank, score]` for a present member and a null array for an absent one        (← zrank-withscore)
 - [ ] `COMMAND COUNT` replies an integer; `PUBSUB NUMPAT` counts unique patterns; an arity error names the command in lower case        (← introspection-shapes)

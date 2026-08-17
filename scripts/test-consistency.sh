@@ -720,11 +720,18 @@ null_probe parity BRPOP %K 0.05
 null_probe parity BLMOVE %K %K-d LEFT RIGHT 0.05
 null_probe parity BRPOPLPUSH %K %K-d 0.05
 null_probe parity BZPOPMIN %K 0.05
+null_probe parity BZPOPMAX %K 0.05
+null_probe parity BLMPOP 0.05 1 %K LEFT
+null_probe parity BZMPOP 0.05 1 %K MIN
 null_probe parity LPOP %K 2
 null_probe parity RPOP %K 2
 null_probe parity LMPOP 1 %K LEFT
 null_probe parity ZMPOP 1 %K MIN
 null_probe parity XREAD COUNT 1 STREAMS %K 0-0
+# XREADGROUP is deliberately NOT probed here. It needs an XGROUP CREATE first,
+# and `null_probe` sends exactly one command — without the group both servers
+# answer `-NOGROUP`, so the probe would compare equal while testing nothing.
+# Its coverage is `rna6` in tests/resp2_null_array.rs, which does the setup.
 
 # The fence: these misses are a null BULK or an EMPTY array and must NOT have
 # moved. Without this half, "make everything *-1" would pass the block above.

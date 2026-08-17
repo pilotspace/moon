@@ -132,11 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client-side, not a cosmetic difference. `Frame::NullArray` now carries the second one: `*-1`
   under RESP2, `_` under RESP3 (which has only one null), and composable inside an array.
 
-  Sixteen sites were wrong, each measured against a live `redis-server 8.6.1` rather than read
+  Seventeen sites were wrong, each measured against a live `redis-server 8.6.1` rather than read
   from the docs: the eight blocking commands on timeout (`BLPOP`, `BRPOP`, `BLMOVE`,
   `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`), `LMPOP`/`ZMPOP` finding nothing,
-  `XREAD` with no data, `GEOPOS` of an absent member (nested inside the outer array),
-  `LPOP`/`RPOP` with a count on an absent key, `EXEC` aborted by a broken `WATCH`, and the
+  `XREAD` and `XREADGROUP` with no data, `GEOPOS` of an absent member (nested inside the outer
+  array), `LPOP`/`RPOP` with a count on an absent key, `EXEC` aborted by a broken `WATCH`, and the
   parser, which collapsed an inbound `*-1` so a reply relayed from a peer went back out as `$-1`.
 
   Two of those are worth calling out. **`EXEC`-abort was the highest-impact one and was not in
@@ -156,6 +156,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   null type — Redis answers `[["q","v1"]]`, Moon answers `["v1"]`, dropping the key that `BLPOP`
   exists to report — so patching the null alone would have turned its test green over a command
   that still answers wrongly. Filed as #524; the test stays ignored with its reason moved there.
+
+  `XREADGROUP` was added to the list in review rather than by the original sweep: `XREAD` lives in
+  `stream_read.rs`, which the audit walked, while `XREADGROUP` lives in `stream_write.rs`, which it
+  did not. Splitting a command family across a read and a write file is exactly what makes a
+  file-scoped audit miss a case.
 
 - **`MEMORY USAGE <key>` reported existing keys as absent at `--shards >= 2`.** It routed by
   hashing the literal subcommand `"USAGE"` rather than the key (#511), so every invocation went to

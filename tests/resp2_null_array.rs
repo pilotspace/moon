@@ -346,6 +346,31 @@ fn rna6_lmpop_zmpop_and_xread_are_null_array() {
         NULL_ARRAY,
         "moon#482 — XREAD past the end of a LIVE stream is also *-1",
     );
+
+    // XREADGROUP lives in stream_write.rs while XREAD lives in
+    // stream_read.rs, so the first sweep for #482 walked past it. Measured
+    // against redis-server 8.6.1: `*-1`, same as XREAD.
+    let created = c.send(&["XGROUP", "CREATE", "mp5", "g", "$", "MKSTREAM"]);
+    assert!(
+        created.starts_with('+'),
+        "XGROUP CREATE failed: {created:?}"
+    );
+    assert_reply(
+        &mut c,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "consumer",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "mp5",
+            ">",
+        ],
+        NULL_ARRAY,
+        "moon#482 — XREADGROUP with no new entries is *-1",
+    );
 }
 
 #[test]

@@ -418,9 +418,12 @@ mod tests {
             other => panic!("Expected Array, got {:?}", other),
         }
 
-        // Reading > again should return Null (all delivered)
+        // Reading > again finds nothing: the null ARRAY (`*-1`), not the null
+        // bulk. Same reasoning as XREAD — the reply is an array of streams.
+        // Updated with the contract in moon#482; this assertion previously
+        // pinned the defect.
         let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b">"]);
-        assert_eq!(xreadgroup(&mut db, &args), Frame::Null);
+        assert_eq!(xreadgroup(&mut db, &args), Frame::NullArray);
     }
 
     #[test]

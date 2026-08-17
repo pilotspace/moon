@@ -259,11 +259,26 @@ Scope (may touch): `src/protocol/frame.rs` `src/protocol/serialize.rs` `src/prot
 `src/command/geo/geo_cmd.rs` `tests/resp2_null_array.rs` `scripts/test-consistency.sh`
 `scripts/test-commands.sh` `CHANGELOG.md`
 
+Added to Scope DURING build, each recorded rather than absorbed silently:
+- `src/command/graph/graph_read.rs` — `hash_frame_bytes`, a result-cache key, needed an arm for the
+  new variant or two different frames would collide on one cache entry. 3 lines, additive.
+- `src/command/stream/stream_write.rs` — `xreadgroup`'s no-entry reply. §0 declared
+  `stream_read.rs` and the sweep walked that file; `XREADGROUP` lives in the WRITE file and was
+  missed. Caught in review on PR #525 and measured before fixing (`*-1` on redis 8.6.1).
+- `src/command/geo/mod.rs` · `src/command/stream/mod.rs` · `tests/multi_exec_queue_semantics.rs` —
+  test files holding assertions that pinned the old behaviour.
+
 Strategy (ordered batches):
 1. Add the variant + both serializer arms + `PartialEq` + the parse arm. Compile — the
    error list from `serialize.rs` and every other wildcard-free match IS the audit worklist.
 2. Walk the 23 censused wildcard arms by hand; make each explicit. Nothing behavioural yet.
-3. Change the 15 reply sites in the contract table, one command family per commit-sized batch.
+3. Change the reply sites in the contract table, one command family per commit-sized batch.
+   Two different counts appear in this file and they measure different things — stated once here so
+   they are not read as a contradiction: **17 semantic rows** (contract table entries: one per
+   command-and-situation, e.g. "BLPOP timeout"), realised by **21 concrete code sites**
+   (`Frame::NullArray` constructions). The gap is mostly `blocking.rs`, where one semantic row
+   ("blocking command times out") is four code shapes — tokio and monoio × single-key and
+   multi-key — each with a deadline and a no-deadline exit.
 4. Regression fence + oracle re-run; then the shell suites and CHANGELOG.
 
 Safety rule (feature-specific): the parse-failure sentinel stays `Frame::Null`. `NullArray` is
@@ -278,7 +293,7 @@ Constraints: do NOT change any test or the contract; no new `unsafe`; no allocat
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [x] all tests pass — see the two-runtime record below
+- [x] all tests pass — **with a declared exception**: each full-suite invocation ended with 2 failures, all four accepted as flakes on the evidence below. The invocations did NOT exit 0; saying otherwise would misreport the run.
 - [x] coverage did not decrease — 8 new integration tests + 9 new unit tests, none removed
 - [x] no test or contract was altered during build — one exception, declared and justified below (`test_parse_null_array` pinned the defect)
 - [x] the green was EARNED, not gamed — proven three independent ways (mutation, pre-fix binary A/B, no-server vacuity check)
@@ -289,14 +304,21 @@ Constraints: do NOT change any test or the contract; no new `unsafe`; no allocat
 
 ### Two-runtime test record (measured, not inferred)
 
-| leg | invocation | passed | failed | `rna*` seen |
-|---|---|---|---|---|
-| monoio (SHIPPED runtime, default features) | `cargo test --profile release-fast --no-fail-fast` | 5416 | 2 (both load flakes) | 9 |
-| tokio (CI portability leg) | `MOON_NO_URING=1 cargo test --profile release-fast --no-default-features --features runtime-tokio,jemalloc --no-fail-fast` | 4646 | 2 (both load flakes) | 9 |
+**As-run result — the invocation's own exit, before any interpretation:**
 
-All four failures are **server-spawning suites failing on connection setup under build load**, all four are
-**green when run isolated**, and the two sets are **disjoint between the legs** — which is what a flake looks
-like and what a real regression does not. None of them touches a reply type:
+| leg | invocation | exit | passed | failed | `rna*` seen |
+|---|---|---|---|---|---|
+| monoio (SHIPPED runtime, default features) | `cargo test --profile release-fast --no-fail-fast` | **101 (FAIL)** | 5416 | 2 | 9 |
+| tokio (CI portability leg) | `MOON_NO_URING=1 cargo test --profile release-fast --no-default-features --features runtime-tokio,jemalloc --no-fail-fast` | **101 (FAIL)** | 4646 | 2 | 9 |
+
+Neither invocation exited 0. That is the record; the flake classification below is a **separate,
+explicit decision** taken on top of it, not a restatement of it.
+
+**Accepted-flake decision (mine, on this evidence):** all four failures are server-spawning suites
+failing on *connection setup* under build load, all four are **green when re-run isolated** (a second
+measurement, not a re-reading of the first), and the two sets are **disjoint between the legs** —
+which is what a flake looks like and what a real regression does not. None of them touches a reply
+type, and none is in a file this task changed. Accepted as pre-existing environmental noise:
 
 - monoio: `cb12_readonly_serves_replica_reads_but_never_replica_writes` (`connect to :25533 kept failing`) → isolated 20/20 ok · `parked_connection_serves_all_traffic_after_wake` (`Connection reset by peer`) → isolated 7/7 ok
 - tokio: `persistence::manifest::tests::test_overflow_compaction_bounds_growth` (`injected persist failure (test)` — a fault-injection toggle bleeding across parallel tests) → isolated ok · `killed_node_is_flagged_by_survivors` (`BrokenPipe` writing to the node the test itself kills) → isolated 3/3 ok
@@ -341,10 +363,11 @@ assertion itself was left unweakened.
 - Pre-existing and NOT fixed here: `cargo clippy --all-targets --features console` fails on `approx_constant` in `console_gateway.rs` test code. Confirmed identical on `origin/main`. CI's console job does not pass `--all-targets`, and that exact invocation is green.
 
 ### Deep checks — do not skim
-- [x] WIRING (code) — enumerated, not eyeballed. **20 reply-construction sites**, not the 15 §3 estimated
-  (`blocking.rs` 10 · `shared.rs` 2 · `list_write.rs` 3 · `stream_read.rs` 2 · `geo_cmd.rs` 2 ·
-  `sorted_set_write.rs` 1), plus **1 parser site** (`parse.rs:169`, the `*-1` arm). The count came in
-  above the estimate because `blocking.rs` carries the same wait shape four times (tokio and monoio ×
+- [x] WIRING (code) — enumerated, not eyeballed. **21 concrete reply-construction sites** realising the
+  17 semantic contract rows (see §5 for why the two counts differ):
+  `blocking.rs` 10 · `shared.rs` 2 · `list_write.rs` 3 · `stream_read.rs` 2 · `stream_write.rs` 1 ·
+  `geo_cmd.rs` 2 · `sorted_set_write.rs` 1, plus **1 parser site** (`parse.rs:169`, the `*-1` arm).
+  `blocking.rs` carries the same wait shape four times (tokio and monoio ×
   single-key and multi-key) and each has both a deadline and a no-deadline exit. Consumed by both
   serializers (`serialize` → `*-1`, `serialize_resp3` → `_`), and passed through by `resp3.rs`'s shape
   guard, `scripting/types.rs` (→ Lua `false`), and the three console matches.

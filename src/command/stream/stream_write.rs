@@ -629,7 +629,14 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
     if has_entries {
         Frame::Array(results.into())
     } else {
-        Frame::Null
+        // Null ARRAY, like `XREAD`: the reply is an array of streams, so its
+        // "nothing" is a missing array. Measured against redis-server 8.6.1,
+        // which answers `*-1` here (moon#482).
+        //
+        // This site sits in `stream_write.rs` while its twin sits in
+        // `stream_read.rs`, which is exactly why the first sweep for #482
+        // missed it — the audit walked the read file. Caught in review.
+        Frame::NullArray
     }
 }
 
