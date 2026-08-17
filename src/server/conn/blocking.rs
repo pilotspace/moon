@@ -298,6 +298,12 @@ async fn cancel_multikey_registrations(
 /// early-flush accumulated responses and await outside the batch loop).
 /// Keep in sync with the dispatch guards in `try_handle_blocking`
 /// (handler_monoio) and the sharded handler's blocking arm.
+///
+/// Every command in this list answers a timeout with the RESP2 **Null Array**
+/// (`*-1`), which is why the wait paths below resolve to `Frame::NullArray`
+/// rather than `Frame::Null`. That includes `BRPOPLPUSH` and `BLMOVE`, whose
+/// SUCCESSFUL reply is a bulk string — measured against redis-server 8.6.1,
+/// not inferred from the success shape (moon#482).
 pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
     cmd.eq_ignore_ascii_case(b"BLPOP")
         || cmd.eq_ignore_ascii_case(b"BRPOP")
@@ -485,12 +491,12 @@ where
                     res = &mut reply_rx => {
                         break match res {
                             Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::Null),
+                            Ok(None) | Err(_) => Some(Frame::NullArray),
                         };
                     }
                     _ = &mut sleep => {
                         blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Null);
+                        break Some(Frame::NullArray);
                     }
                     _ = shutdown.cancelled() => {
                         blocking_registry.borrow_mut().remove_wait(wait_id);
@@ -510,7 +516,7 @@ where
                     res = &mut reply_rx => {
                         break match res {
                             Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::Null),
+                            Ok(None) | Err(_) => Some(Frame::NullArray),
                         };
                     }
                     _ = shutdown.cancelled() => {
@@ -649,7 +655,7 @@ where
     let frame = if let Some(dl) = deadline {
         let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
         tokio::pin!(sleep);
-        let mut result_frame = Frame::Null;
+        let mut result_frame = Frame::NullArray;
         loop {
             tokio::select! {
                 result = receivers.next() => {
@@ -671,7 +677,7 @@ where
         }
         result_frame
     } else {
-        let mut result_frame = Frame::Null;
+        let mut result_frame = Frame::NullArray;
         loop {
             tokio::select! {
                 result = receivers.next() => {
@@ -850,12 +856,12 @@ where
                     res = &mut reply_rx => {
                         break match res {
                             Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::Null),
+                            Ok(None) | Err(_) => Some(Frame::NullArray),
                         };
                     }
                     _ = &mut sleep => {
                         blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Null);
+                        break Some(Frame::NullArray);
                     }
                     _ = shutdown.cancelled() => {
                         blocking_registry.borrow_mut().remove_wait(wait_id);
@@ -874,7 +880,7 @@ where
                     res = &mut reply_rx => {
                         break match res {
                             Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::Null),
+                            Ok(None) | Err(_) => Some(Frame::NullArray),
                         };
                     }
                     _ = shutdown.cancelled() => {
@@ -994,7 +1000,7 @@ where
         let mut sleep = std::pin::pin!(monoio::time::sleep(
             dl.saturating_duration_since(std::time::Instant::now())
         ));
-        let mut result_frame = Frame::Null;
+        let mut result_frame = Frame::NullArray;
         loop {
             let ready = monoio::select! {
                 result = receivers.next() => {
@@ -1018,7 +1024,7 @@ where
         }
         result_frame
     } else {
-        let mut result_frame = Frame::Null;
+        let mut result_frame = Frame::NullArray;
         loop {
             let ready = monoio::select! {
                 result = receivers.next() => {

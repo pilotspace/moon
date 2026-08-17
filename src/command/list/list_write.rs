@@ -173,8 +173,13 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     // Check if the key exists first (for the no-list case)
     match db.get_list(&key) {
         Ok(None) => {
+            // The count form's miss is a null ARRAY, not an EMPTY array: Redis
+            // distinguishes "no such list" (`*-1`) from "a list that yielded
+            // nothing" (`*0`). Measured, because this site was never a
+            // `Frame::Null` at all and so is invisible to a null-site audit
+            // (moon#482).
             return if args.len() == 2 {
-                Frame::Array(framevec![])
+                Frame::NullArray
             } else {
                 Frame::Null
             };
@@ -264,8 +269,13 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
 
     match db.get_list(&key) {
         Ok(None) => {
+            // The count form's miss is a null ARRAY, not an EMPTY array: Redis
+            // distinguishes "no such list" (`*-1`) from "a list that yielded
+            // nothing" (`*0`). Measured, because this site was never a
+            // `Frame::Null` at all and so is invisible to a null-site audit
+            // (moon#482).
             return if args.len() == 2 {
-                Frame::Array(framevec![])
+                Frame::NullArray
             } else {
                 Frame::Null
             };
@@ -879,5 +889,6 @@ pub fn lmpop(db: &mut Database, args: &[Frame]) -> Frame {
         ]);
     }
 
-    Frame::Null
+    // No key held anything: LMPOP's miss is a null ARRAY (moon#482).
+    Frame::NullArray
 }

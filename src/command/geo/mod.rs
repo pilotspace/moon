@@ -279,7 +279,10 @@ mod tests {
             Frame::Array(ref arr) => {
                 assert_eq!(arr.len(), 2);
                 assert!(matches!(&arr[0], Frame::Array(_)));
-                assert_eq!(arr[1], Frame::Null);
+                // Null ARRAY, not null bulk: `GEOPOS k absent` is
+                // `*1\r\n*-1\r\n` in Redis. Updated with the contract in
+                // moon#482 — this assertion previously pinned the defect.
+                assert_eq!(arr[1], Frame::NullArray);
             }
             _ => panic!("Expected array"),
         }

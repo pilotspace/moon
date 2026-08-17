@@ -845,5 +845,6 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         ]);
     }
 
-    Frame::Null
+    // No key held anything: ZMPOP's miss is a null ARRAY (moon#482).
+    Frame::NullArray
 }

@@ -154,6 +154,20 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             Frame::BulkString(data)
         }
         b'*' => {
+            // `*-1` is the RESP2 Null Array — a well-formed frame, not a
+            // failure. It is handled HERE rather than in `parse_count!`
+            // because that macro is shared with `%`, `~` and `>`, where a
+            // `-1` count has no such meaning and must stay a parse failure
+            // (moon#482).
+            //
+            // Any other negative count, and any malformed length, still falls
+            // through to `parse_count!` and yields `Frame::Null` — the
+            // failure sentinel is unchanged.
+            let crlf = crlf_or_null!(buf, pos);
+            if &buf[*pos..crlf] == b"-1" {
+                *pos = crlf + 2;
+                return Frame::NullArray;
+            }
             let count = parse_count!(buf, pos);
             let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
@@ -955,8 +969,76 @@ mod tests {
 
     #[test]
     fn test_parse_null_array() {
+        // CHANGED by moon#482. This test previously asserted `Frame::Null`,
+        // i.e. it pinned the defect: `*-1` collapsed into the null-BULK
+        // variant, so a reply parsed from a peer re-serialised as `$-1`. The
+        // frozen contract requires the two nulls to stay distinct, so the
+        // expectation moves with it.
         let result = parse_bytes(b"*-1\r\n").unwrap().unwrap();
-        assert_eq!(result, Frame::Null);
+        assert_eq!(result, Frame::NullArray);
+        assert_ne!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_null_array_round_trips_through_parse_and_serialize() {
+        // Moon parses REPLIES too (replication, peers). A `*-1` that came in
+        // must go back out as `*-1`, not as `$-1`.
+        let mut buf = BytesMut::new();
+        let f = parse_bytes(b"*-1\r\n").unwrap().unwrap();
+        crate::protocol::serialize(&f, &mut buf);
+        assert_eq!(&buf[..], b"*-1\r\n");
+
+        // The RESP3 null keeps its own identity in the other direction.
+        let n = parse_bytes(b"_\r\n").unwrap().unwrap();
+        assert_eq!(n, Frame::Null);
+        buf.clear();
+        crate::protocol::serialize(&n, &mut buf);
+        assert_eq!(&buf[..], b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_malformed_aggregate_is_null_not_null_array() {
+        // The parse-FAILURE sentinel stays `Frame::Null`. Only a well-formed
+        // `*-1` yields `NullArray` — otherwise the new variant would become a
+        // second failure sentinel and callers could not tell a hostile frame
+        // from a legitimate empty reply (moon#482, CLAUDE.md parser
+        // defensiveness).
+        // The outcome that matters is "never NullArray". Which NON-NullArray
+        // outcome a given input takes differs by API: `parse()` reports a
+        // truncated frame as `Ok(None)` (needs more bytes), while the
+        // zero-copy inner parser collapses a malformed one to `Frame::Null`.
+        // Both are acceptable here; a `NullArray` never is.
+        for bad in [
+            &b"*-7\r\n"[..],  // negative, but not -1
+            &b"*-1x\r\n"[..], // trailing junk after the -1
+            &b"*abc\r\n"[..], // not a number at all
+            &b"%-1\r\n"[..],  // -1 has no null meaning for a map
+            &b"~-1\r\n"[..],  // nor for a set
+        ] {
+            let shown = String::from_utf8_lossy(bad);
+            match parse_bytes(bad) {
+                Ok(Some(Frame::NullArray)) => panic!(
+                    "malformed input {shown:?} produced a NullArray — the new \
+                     variant must never become a parse-failure sentinel"
+                ),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        // And the zero-copy parser specifically: its documented sentinel is
+        // `Frame::Null`, and a bad aggregate length must still hit it.
+        let mut pos = 0usize;
+        let got = parse_frame_zerocopy(
+            &Bytes::from_static(b"*-7\r\n"),
+            &mut pos,
+            &ParseConfig::default(),
+            0,
+        );
+        assert_eq!(
+            got,
+            Frame::Null,
+            "a negative-but-not--1 aggregate length must stay the Null sentinel"
+        );
     }
 
     // === Empty Array tests ===

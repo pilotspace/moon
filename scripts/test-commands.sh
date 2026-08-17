@@ -223,6 +223,39 @@ assert_moon_contains() {
     fi
 }
 
+# Assert moon's RAW first reply line, read straight off the socket.
+#
+# Needed because `redis-cli` renders `$-1` (null bulk) and `*-1` (null array)
+# identically as "(nil)" -- the two RESP2 nulls a typed client decodes
+# differently. Every `assert_moon_*` above is built on `mcli`, so none of them
+# can express "which null was it" (moon#482).
+#
+# A failure to connect returns a marker that can never equal an expected RESP
+# line, so a broken probe fails loudly instead of passing vacuously.
+assert_moon_raw_reply() {
+    local desc="$1" expected="$2"
+    shift 2
+    TOTAL=$((TOTAL + 1))
+    local line=""
+    if ! exec 3<>"/dev/tcp/127.0.0.1/${PORT_RUST}"; then
+        line="__CONNECT_FAILED__"
+    else
+        printf '%s\r\n' "$*" >&3
+        IFS= read -r -t 5 line <&3
+        exec 3>&-
+        line="${line%$'\r'}"
+    fi
+    if [[ "$line" == "$expected" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc"
+        echo "    CMD:  $*"
+        echo "    WANT: $expected"
+        echo "    GOT:  $line"
+    fi
+}
+
 # Test moon response matches an extended regex.
 # `assert_moon_contains` greps -F, so it cannot express "some positive
 # integer" -- the shape you need when the exact value is not fixed.
@@ -713,6 +746,15 @@ if should_run "connection"; then
     # cross-shard routing itself is covered in test-consistency.sh.
     redis-cli -p "$PORT_RUST" SET memusagekey hello-value >/dev/null 2>&1
     assert_moon_matches "MEMORY USAGE sizes an existing key" '^[1-9][0-9]*$' MEMORY USAGE memusagekey
+
+    # moon#482: RESP2's two nulls are not interchangeable, and `redis-cli`
+    # renders both as "(nil)" — so this reads the raw reply line instead.
+    # Cross-server parity lives in test-consistency.sh; this is the shape check.
+    # Distinct keys per probe: a timed-out BLPOP leaves an empty list behind
+    # (#523), which would change a later probe's answer on a shared key.
+    assert_moon_raw_reply "BLPOP timeout is a null ARRAY" '*-1' BLPOP nulltype:t1 0.05
+    assert_moon_raw_reply "GET miss is still a null BULK" '$-1' GET nulltype:t2
+    assert_moon_raw_reply "ZPOPMIN miss is still an EMPTY array" '*0' ZPOPMIN nulltype:t3
 fi
 
 # ===========================================================================

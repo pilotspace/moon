@@ -202,7 +202,11 @@ impl ConsoleGateway {
                 let items: Vec<serde_json::Value> = v.iter().map(Self::frame_to_json).collect();
                 serde_json::Value::Array(items)
             }
-            Frame::Null => serde_json::Value::Null,
+            // JSON has ONE null, so both RESP2 nulls render as `null` here.
+            // That is a property of JSON, not a shortcut: the console reports
+            // the distinguishing type separately via `frame_type_name`
+            // ("null" vs "null_array"), so nothing is lost (moon#482).
+            Frame::Null | Frame::NullArray => serde_json::Value::Null,
             Frame::Map(m) => {
                 let obj: serde_json::Map<String, serde_json::Value> = m
                     .iter()

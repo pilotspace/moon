@@ -292,21 +292,29 @@ fn me6_bad_frame_inside_multi_names_itself_before_closing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs Frame::NullArray — RESP2 `*-1` is inexpressible in Moon today; \
-            filed as its own task, see the comment below"]
+#[ignore = "moon#524 — blocking commands inside MULTI are rewritten to a \
+            non-blocking sibling with a different reply SHAPE; #482 supplied \
+            Frame::NullArray but this path's null comes from LPOP, whose own \
+            null is correctly $-1. Un-ignore when #524 lands"]
 fn me7_blpop_in_multi_returns_null_array_not_null_bulk() {
-    // IGNORED, not deleted, and not weakened: the divergence is real and
-    // measured (Moon `*1\r\n$-1\r\n`, Redis `*1\r\n*-1\r\n`).
+    // Still ignored, and the reason has MOVED rather than being restated.
     //
-    // It cannot be fixed here. `Frame` has no null-array variant at all —
-    // `Frame::Null` serialises to `$-1` in RESP2, full stop — so this is not a
-    // MULTI bug: a plain `BLPOP key 1` that times out OUTSIDE a transaction
-    // returns the wrong type too, as does every command whose null shape is an
-    // array. The fix is a `Frame::NullArray` variant threaded through the ~14
-    // `Frame::Null` arms in `serialize.rs` / `resp3.rs`, which touches every
-    // reply path and deserves its own contract and review.
+    // The original reason — "Moon has no null-array variant" — was discharged
+    // by moon#482: `Frame::NullArray` exists, and a plain `BLPOP k 0.05` that
+    // times out now answers `*-1` (see `tests/resp2_null_array.rs::rna1`).
     //
-    // Un-ignore this test in that task; it is already the right assertion.
+    // This test was un-ignored during that task and still failed, which is how
+    // #524 was found. Inside MULTI the queued command is rewritten
+    // `BLPOP k t` -> `LPOP k`, so the reply is LPOP's — and LPOP's null really
+    // is `$-1`. Measured against redis-server 8.6.1, the rewrite is wrong on
+    // the HIT path too, which matters more than the null:
+    //
+    //     Redis  MULTI; BLPOP q 0; EXEC -> [["q", "v1"]]   (key AND value)
+    //     Moon   MULTI; BLPOP q 0; EXEC -> ["v1"]          (key dropped)
+    //
+    // So a fix that only made the null a `*-1` would turn this test green over
+    // a command that still answers the wrong shape. The assertion below stays
+    // as-is — correct, unweakened — and #524 owns the capability.
 
     let m = spawn_moon("1");
     let mut c = Conn::open(m.port);
