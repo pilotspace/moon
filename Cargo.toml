@@ -86,7 +86,7 @@ hyper-tungstenite = { version = "0.30", optional = true }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 mime_guess = { version = "2", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 hmac = { version = "0.13", optional = true }
 subtle = { version = "2.5", optional = true }
 unicode-segmentation = { version = "1.12", optional = true }
