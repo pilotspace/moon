@@ -191,6 +191,12 @@ fn mur2_memory_usage_of_a_missing_key_is_null() {
 fn mur3_memory_usage_honours_samples_after_the_key() {
     // `MEMORY USAGE key SAMPLES n` — the key is still args[1]; trailing
     // options must not shift routing.
+    //
+    // `SAMPLES 0` on purpose, and it is not a typo to "fix": zero is VALID in
+    // Redis (sample every nested value) and it is the boundary value, so it
+    // catches an over-strict parser as well as a routing regression. Moon's
+    // live parser (`server_admin::parse_memory_usage_args`) accepts and
+    // ignores the count; pinned by `memory_usage_samples_zero_is_accepted`.
     let m = spawn_moon(SHARDS);
     each_trial(
         m.port,
