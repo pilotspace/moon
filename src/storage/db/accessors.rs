@@ -27,11 +27,14 @@ impl Database {
     // unchanged and dispatch is fully static.
 
     /// Remove `key` if it is expired at `now_ms`, crediting its memory.
+    ///
+    /// Write-path expired drop (get_or_create*): the incoming streamed write
+    /// supersedes the key everywhere, so no #542 hide/queue here — but the
+    /// removal must still go through `remove_hot` so the expiry index stays
+    /// in lock-step (moon#541).
     fn drop_if_expired(&mut self, key: &[u8], now_ms: u64) {
         if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
+            self.remove_hot(key);
         }
     }
 
@@ -194,11 +197,7 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
+        self.drop_if_expired(key, now_ms);
         if !self.data.contains_key(key) {
             // P0 fix: promote a cold-spilled set before fabricating an empty
             // intset — a promoted value always decodes as `RedisValue::Set`
@@ -255,11 +254,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
+        self.drop_if_expired(key, now_ms);
         if !self.data.contains_key(key) {
             // P0 fix: promote a cold-spilled hash before fabricating an
             // empty listpack — a promoted value always decodes as
@@ -318,11 +313,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
+        self.drop_if_expired(key, now_ms);
         if !self.data.contains_key(key) {
             // P0 fix: promote a cold-spilled list before fabricating an
             // empty listpack — a promoted value always decodes as
@@ -393,11 +384,9 @@ impl Database {
 
     /// Collect keys that have an expiration set.
     pub fn keys_with_expiry(&self) -> Vec<CompactKey> {
-        self.data
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
+        // moon#541: read the deadline index (deadline order) instead of
+        // scanning the whole data map — O(volatile) instead of O(N).
+        self.expiry_index.iter().map(|(_, k)| k.clone()).collect()
     }
 
     /// Collect keys whose value is a `HashWithTtl` (hash with per-field TTLs).
@@ -725,11 +714,7 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-        }
+        self.drop_if_expired(key, now_ms);
         if !self.data.contains_key(key) {
             self.promote_cold_if_present(key, now_ms);
         }

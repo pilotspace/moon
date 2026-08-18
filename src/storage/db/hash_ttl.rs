@@ -135,6 +135,10 @@ impl Database {
             *min_expiry_ms = ts_ms;
         }
         self.maybe_has_expiring_keys = true;
+        // moon#541: arm the hash-specific latch too, so the sweep's
+        // HashWithTtl scan only runs for databases that actually use
+        // field TTLs.
+        self.hash_field_ttl_latch = true;
         Ok(1)
     }
 
@@ -470,7 +474,10 @@ impl Database {
                 _ => false,
             });
         if should_delete {
-            self.data.remove(key);
+            // Through `remove_hot` (moon#541): keeps the expiry index in
+            // lock-step and credits the (now empty) entry shell's memory,
+            // which the raw `data.remove` here never did.
+            self.remove_hot(key);
         }
     }
 }
