@@ -611,6 +611,27 @@ assert_both "PEXPIRETIME" PEXPIRETIME edge:eat
 assert_both "EXPIRETIME missing" EXPIRETIME edge:nokey
 assert_both "PEXPIRETIME missing" PEXPIRETIME edge:nokey
 
+# EXPIRE NX|XX|GT|LT conditions (moon#544; Redis 7.0). TTL replies are
+# timing-sensitive across separate cli spawns, so the rows assert the
+# CONDITION VERDICT (0/1/err), never a remaining-time value.
+both SET edge:exc "val"
+assert_both "EXPIRE NX fresh" EXPIRE edge:exc 100 NX
+assert_both "EXPIRE NX refused on ttl" EXPIRE edge:exc 999 NX
+assert_both "EXPIRE XX on ttl" EXPIRE edge:exc 200 XX
+assert_both "EXPIRE GT shorter refused" EXPIRE edge:exc 10 GT
+assert_both "EXPIRE GT longer" EXPIRE edge:exc 300 GT
+assert_both "EXPIRE LT longer refused" EXPIRE edge:exc 999 LT
+assert_both "EXPIRE LT shorter" EXPIRE edge:exc 50 LT
+assert_both "EXPIRE NX GT incompatible" EXPIRE edge:exc 100 NX GT
+assert_both "EXPIRE GT LT incompatible" EXPIRE edge:exc 100 GT LT
+assert_both "EXPIRE unknown option" EXPIRE edge:exc 100 BOGUS
+assert_both "EXPIRE XX missing key" EXPIRE edge:nokey 100 XX
+both SET edge:exc2 "val"
+assert_both "PEXPIRE NX fresh" PEXPIRE edge:exc2 100000 NX
+assert_both "EXPIREAT GT far" EXPIREAT edge:exc2 9999999999 GT
+assert_both "PEXPIREAT LT past deletes" PEXPIREAT edge:exc2 1 LT
+assert_both "PEXPIREAT after delete" EXISTS edge:exc2
+
 # TOUCH
 both SET edge:touch "val"
 assert_both "TOUCH" TOUCH edge:touch
