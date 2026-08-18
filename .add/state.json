@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "resp2-null-array",
+  "active_task": "shard-routing-literals",
   "active_milestone": "v0-9-1-wire-parity",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -513,6 +513,15 @@
       "depends_on": [],
       "created": "2026-08-17T03:07:54+00:00",
       "updated": "2026-08-17T05:17:55+00:00"
+    },
+    "shard-routing-literals": {
+      "title": "Route commands whose key follows numkeys/timeout/subcommand by the real key, not the literal",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v0-9-1-wire-parity",
+      "depends_on": [],
+      "created": "2026-08-17T16:30:35+00:00",
+      "updated": "2026-08-17T17:39:14+00:00"
     }
   },
   "milestones": {
@@ -626,7 +635,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-08-17T05:17:55+00:00",
+  "updated": "2026-08-17T17:39:14+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
