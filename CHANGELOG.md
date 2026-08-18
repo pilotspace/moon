@@ -124,6 +124,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SSUBSCRIBE` and `SUNSUBSCRIBE` were declared there but answered "unknown command" by the
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
+### Changed
+- **CI migration: hosted-only PR gate + local merge bar** — the three self-hosted jobs
+  (`Check`, `Check (monoio)`, `Client compat`) serialized on the single moon-dev runner on every
+  PR (17–24m wall, with manual dispatches queueing behind them). The PR gate is now entirely
+  GitHub-hosted and parallel (Lint, Check on ubuntu-latest with sccache + rust-cache, MSRV,
+  Memory gate, ~5–8m); the monoio and client-compat legs moved to main-push + `workflow_dispatch`,
+  and — before every push — to the new **`scripts/ci-local.sh`** (host lint gates + both full
+  suites in the moon-dev VM; `--full` adds the client-compat harness and the macOS host suite).
+  The script captures exit codes directly (no piped gates), keeps VM builds on VM-local target
+  dirs, pins `MOON_BIN` for the compat harness, and fingerprints the working tree at start/end —
+  a branch switch or edit mid-run marks the run INVALID (exit 3) rather than reporting a false
+  green (both the fail path and the tripwire were attack-tested before landing).
+  `tests/ci_covers_monoio.rs` still guards the monoio job's integrity; its trigger scope is the
+  documented tradeoff. Console Integration was already path-gated and Integration Tests
+  label-gated; both unchanged.
+
 ### Fixed
 - **`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` now accept the Redis 7.0 `NX | XX | GT | LT`
   conditions** (#544) — previously any option token was rejected with a wrong-arity error, which

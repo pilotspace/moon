@@ -86,35 +86,36 @@ jobs:
   # Clippy checks compile the crate; test reuses those artifacts via
   # cargo's incremental cache in the same runner. Saves ~5 min vs
   # separate jobs that each compile from scratch.
-  # Runs on the self-hosted moon-dev runner (OrbStack VM, aarch64 Linux):
-  # zero queue time vs the org-wide hosted-runner concurrency cap, and a
-  # persistent CARGO_TARGET_DIR outside the runner workspace (checkout's
-  # git clean can't wipe it) makes warm builds incremental — no cache
-  # download/upload at all. Fork-PR safety: repo requires manual approval
-  # for ALL outside-collaborator workflow runs. If the runner is offline
-  # the job queues — bring the VM up or retag runs-on to ubuntu-latest.
+  #
+  # 2026-08 CI migration: back on GitHub-hosted ubuntu. The PR path now
+  # runs ZERO self-hosted jobs — `check`, `check-monoio` and
+  # `client-compat` used to queue serially on the single moon-dev runner
+  # (17-24m wall per PR, and every manual dispatch queued behind them).
+  # The PR gate is this job + lint + msrv + memory-gate, all hosted and
+  # parallel; the self-hosted legs run on main-push/dispatch and — before
+  # every push — locally via `scripts/ci-local.sh` (the merge bar).
   check:
     name: Check
-    runs-on: [self-hosted, moon-dev]
+    runs-on: ubuntu-latest
     env:
-      CARGO_TARGET_DIR: /home/tindang/ci-target/check
       # tokio's io_uring bridge is off in CI (it floods errors under load).
       # Per-job, never workflow-level: `check-monoio` must not inherit it.
       MOON_NO_URING: "1"
-      # Spawned test servers must not trip the diskfull write-pause on the
-      # VM's shared-volume mounts.
+      # Spawned test servers must not trip the diskfull write-pause on
+      # runners with low free disk.
       MOON_DISK_FREE_MIN_PCT: "0"
-      # Cap rustc parallelism: the first run OOM-killed the runner service
-      # (kernel oom-kill at 3G peak + 2.5G swap) when -j<cores> rustc
-      # processes ran concurrently in the VM. VM memory is 12G now, but
-      # keep headroom for nextest's spawned test servers.
-      CARGO_BUILD_JOBS: "6"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-tokio
 
       # Clippy (3 feature configurations — shares compilation between runs)
       - name: Clippy (default)
@@ -167,9 +168,17 @@ jobs:
   #
   # Guarded by tests/ci_covers_monoio.rs — weakening this job (wrong features,
   # continue-on-error, bare `cargo test`, shared target dir) fails that suite.
+  #
+  # 2026-08 CI migration: main-push + dispatch, no longer per-PR. The single
+  # self-hosted runner serialized this job behind `check` and `client-compat`
+  # on every PR. Pre-push coverage of the shipped runtime now comes from
+  # `scripts/ci-local.sh` (runs this exact suite in the moon-dev VM with
+  # io_uring live); this job remains the authoritative gate on every main
+  # push and on `gh workflow run ci.yml --ref <branch>` before a merge.
   check-monoio:
     name: Check (monoio — the shipped runtime)
     runs-on: [self-hosted, moon-dev]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     env:
       # MUST differ from `check`'s dir: the two jobs build incompatible feature
       # sets from one checkout and can run concurrently on this runner.
@@ -375,9 +384,14 @@ jobs:
   # The manifest ships with a recorded BASELINE of waived, reasoned divergences,
   # so this job is a ratchet: a NEW divergence fails it, and `--strict` fails
   # the moment a waived one is fixed and its waiver goes stale.
+  # 2026-08 CI migration: main-push + dispatch, no longer per-PR (see
+  # check-monoio's note — same single-runner serialization). Run locally
+  # before push via `scripts/ci-local.sh --full` (the VM carries the same
+  # redis-server oracle this job insists on).
   client-compat:
     name: Client compat (RESP2/RESP3 diff vs Redis)
     runs-on: [self-hosted, moon-dev]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     env:
       CARGO_TARGET_DIR: /home/tindang/ci-target/client-compat
       # Kept from when this was a workflow-level global, so this job's recorded
