@@ -125,6 +125,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
 
 ### Fixed
+- **`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` now accept the Redis 7.0 `NX | XX | GT | LT`
+  conditions** (#544) — previously any option token was rejected with a wrong-arity error, which
+  breaks typed clients that call them directly (redis-py `expire(k, t, nx=True)`). Semantics match
+  Redis exactly, oracle-diffed against a live redis-server: `NX` sets only when the key has no
+  expiry; `XX` only when it has one; `GT`/`LT` only move the expiry later/earlier, with a
+  no-TTL key counting as infinite (so `GT` never sets it and `LT` always does); `XX` composes with
+  `GT`/`LT`; `NX` composes with nothing (`ERR NX and XX, GT or LT options at the same time are not
+  compatible`), and `GT`+`LT` is its own error — Redis's exact strings. The gate runs after the
+  invalid-expire-time range check and **before** the past-time delete, so `EXPIRE k -1 GT` on a
+  TTL'd key refuses (`:0`, key intact) while `EXPIRE k -1 LT` deletes — Redis's evaluation order.
+  `COMMAND INFO` arity for the four commands corrected from `3` to `-3`. In the same file: **`TTL`
+  now rounds to the nearest second** like Redis (`(ms+500)/1000`) — the old floor answered `99` for
+  a fresh `EXPIRE k 100`, a divergence the oracle probe surfaced and a pipelined `/dev/tcp` probe
+  (spawn-latency-free) confirmed fixed byte-for-byte.
 - **Commands whose key is not their first argument were routed by hashing a literal** (#533, #534).
   `extract_primary_key` special-cases the commands whose key is not `args[0]` and falls through to
   `args[0]` for everything else. `LMPOP`, `ZMPOP` and `SINTERCARD` take `numkeys` first, and

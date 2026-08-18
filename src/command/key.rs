@@ -65,13 +65,100 @@ pub fn exists(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(count)
 }
 
-/// EXPIRE key seconds
+/// The `NX | XX | GT | LT` condition flags of the EXPIRE family (Redis 7.0),
+/// moon#544. Parsed by [`parse_expire_flags`], evaluated by
+/// [`expire_cond_blocks`]. `XX` may combine with `GT`/`LT`; `NX` combines
+/// with nothing; `GT` and `LT` exclude each other — Redis's exact rules and
+/// error strings.
+#[derive(Default, Clone, Copy)]
+struct ExpireFlags {
+    nx: bool,
+    xx: bool,
+    gt: bool,
+    lt: bool,
+}
+
+/// Parse the option tokens after `key <time>`. Returns the flags or the
+/// RESP error to reply verbatim.
+fn parse_expire_flags(extra: &[Frame]) -> Result<ExpireFlags, Frame> {
+    let mut f = ExpireFlags::default();
+    for tok in extra {
+        let Frame::BulkString(t) = tok else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR Unsupported option")));
+        };
+        if t.eq_ignore_ascii_case(b"NX") {
+            f.nx = true;
+        } else if t.eq_ignore_ascii_case(b"XX") {
+            f.xx = true;
+        } else if t.eq_ignore_ascii_case(b"GT") {
+            f.gt = true;
+        } else if t.eq_ignore_ascii_case(b"LT") {
+            f.lt = true;
+        } else {
+            let mut msg = Vec::with_capacity(24 + t.len());
+            msg.extend_from_slice(b"ERR Unsupported option ");
+            msg.extend_from_slice(t);
+            return Err(Frame::Error(Bytes::from(msg)));
+        }
+    }
+    if f.nx && (f.xx || f.gt || f.lt) {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR NX and XX, GT or LT options at the same time are not compatible",
+        )));
+    }
+    if f.gt && f.lt {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR GT and LT options at the same time are not compatible",
+        )));
+    }
+    Ok(f)
+}
+
+/// Whether the condition flags block setting `when_ms` as the new expiry,
+/// given the key's current expiry (`None` = no TTL). Redis's evaluation
+/// order verbatim: a key with no TTL counts as an infinite expiry, so GT
+/// never sets it and LT always does.
+fn expire_cond_blocks(f: ExpireFlags, current: Option<u64>, when_ms: u64) -> bool {
+    (f.nx && current.is_some())
+        || (f.xx && current.is_none())
+        || (f.gt && current.is_none_or(|cur| when_ms <= cur))
+        || (f.lt && current.is_some_and(|cur| when_ms >= cur))
+}
+
+/// Shared condition gate for the four EXPIRE-family commands: parse flags,
+/// probe the key (lazy-expiring it), and decide. `when_ms` is the absolute
+/// candidate expiry, saturated to 0 for past times — only its ORDER versus
+/// the current expiry matters to GT/LT.
+///
+/// `Ok(true)` = proceed with the set/delete; `Ok(false)` = reply `:0`
+/// (condition blocked, or the key is missing while any flag is present —
+/// Redis answers 0 for a missing key on every path). `Err` = reply the
+/// syntax error verbatim.
+fn expire_condition_allows(
+    db: &mut Database,
+    key: &[u8],
+    extra: &[Frame],
+    when_ms: u64,
+) -> Result<bool, Frame> {
+    let f = parse_expire_flags(extra)?;
+    if !(f.nx || f.xx || f.gt || f.lt) {
+        return Ok(true);
+    }
+    let Some(entry) = db.get(key) else {
+        return Ok(false);
+    };
+    let current = entry.has_expiry().then(|| entry.expires_at_ms());
+    Ok(!expire_cond_blocks(f, current, when_ms))
+}
+
+/// EXPIRE key seconds [NX | XX | GT | LT]
 ///
 /// Set a timeout on key. Returns 1 if the timeout was set (or the key was
-/// deleted because of a non-positive/past TTL), 0 if the key does not exist.
+/// deleted because of a non-positive/past TTL), 0 if the key does not exist
+/// or a condition flag blocked the set (moon#544).
 /// A non-positive TTL deletes the key immediately (Redis past-time semantics).
 pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return err_wrong_args("EXPIRE");
     }
     let key = match extract_key(&args[0]) {
@@ -95,7 +182,15 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
     }
     // Redis parity: a non-positive TTL is a past-time expiry -> delete the key now
     // (return 1 if it existed, 0 otherwise) rather than erroring. Mirrors EXPIREAT.
+    // moon#544: the condition gate runs first — GT must not delete via a past
+    // time; LT must. The saturated when_ms only needs correct ORDER vs current.
     if seconds <= 0 {
+        let when_ms = current_time_ms().saturating_add_signed(seconds.saturating_mul(1000));
+        match expire_condition_allows(db, key, &args[2..], when_ms) {
+            Err(e) => return e,
+            Ok(false) => return Frame::Integer(0),
+            Ok(true) => {}
+        }
         return if db.remove(key).is_some() {
             Frame::Integer(1)
         } else {
@@ -104,7 +199,8 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
     }
     // Guard the u64 arithmetic (seconds*1000 + now_ms can overflow) AND bound the
     // result to the i64 domain so PTTL — which casts the stored u64 back to i64 —
-    // never wraps negative on a live key. Redis rejects an out-of-range expiry.
+    // never wraps negative on a live key. Redis rejects an out-of-range expiry —
+    // BEFORE evaluating condition flags, so the gate sees a valid when_ms.
     let expires_at_ms = match (seconds as u64)
         .checked_mul(1000)
         .and_then(|delta| current_time_ms().checked_add(delta))
@@ -117,6 +213,11 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
+    match expire_condition_allows(db, key, &args[2..], expires_at_ms) {
+        Err(e) => return e,
+        Ok(false) => return Frame::Integer(0),
+        Ok(true) => {}
+    }
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -129,7 +230,7 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
 /// Like EXPIRE but the timeout is specified in milliseconds. A non-positive TTL
 /// deletes the key immediately (Redis past-time semantics).
 pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return err_wrong_args("PEXPIRE");
     }
     let key = match extract_key(&args[0]) {
@@ -144,8 +245,15 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
-    // Redis parity: a non-positive TTL is a past-time expiry -> delete the key now.
+    // Redis parity: a non-positive TTL is a past-time expiry -> delete the key
+    // now. moon#544: condition gate first (see `expire`).
     if millis <= 0 {
+        let when_ms = current_time_ms().saturating_add_signed(millis);
+        match expire_condition_allows(db, key, &args[2..], when_ms) {
+            Err(e) => return e,
+            Ok(false) => return Frame::Integer(0),
+            Ok(true) => {}
+        }
         return if db.remove(key).is_some() {
             Frame::Integer(1)
         } else {
@@ -165,6 +273,11 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
+    match expire_condition_allows(db, key, &args[2..], expires_at_ms) {
+        Err(e) => return e,
+        Ok(false) => return Frame::Integer(0),
+        Ok(true) => {}
+    }
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -196,7 +309,10 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
                     // Edge case: expired between get and now
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer(((exp_ms - now_ms) / 1000) as i64)
+                    // Redis rounds to the NEAREST second ((ms+500)/1000): a
+                    // fresh `EXPIRE k 100` answers TTL 100, not 99. Oracle-
+                    // diffed vs redis-server (moon#544 probe run).
+                    Frame::Integer(((exp_ms - now_ms + 500) / 1000) as i64)
                 }
             }
         }
@@ -264,7 +380,7 @@ pub fn persist(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Set the expiration for a key as a UNIX timestamp (seconds).
 pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return err_wrong_args("EXPIREAT");
     }
     let key = match extract_key(&args[0]) {
@@ -286,8 +402,15 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
             b"ERR invalid expire time in 'EXPIREAT' command",
         ));
     }
-    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key immediately)
+    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key
+    // immediately). moon#544: condition gate first (see `expire`).
     if timestamp <= 0 {
+        let when_ms = 0u64.saturating_add_signed(timestamp.saturating_mul(1000));
+        match expire_condition_allows(db, key, &args[2..], when_ms) {
+            Err(e) => return e,
+            Ok(false) => return Frame::Integer(0),
+            Ok(true) => {}
+        }
         return if db.remove(key).is_some() {
             Frame::Integer(1)
         } else {
@@ -307,6 +430,11 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
+    match expire_condition_allows(db, key, &args[2..], expires_at_ms) {
+        Err(e) => return e,
+        Ok(false) => return Frame::Integer(0),
+        Ok(true) => {}
+    }
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -318,7 +446,7 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Set the expiration for a key as a UNIX timestamp in milliseconds.
 pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return err_wrong_args("PEXPIREAT");
     }
     let key = match extract_key(&args[0]) {
@@ -333,13 +461,25 @@ pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
-    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key immediately)
+    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key
+    // immediately). moon#544: condition gate first (see `expire`).
     if timestamp_ms <= 0 {
+        let when_ms = 0u64.saturating_add_signed(timestamp_ms);
+        match expire_condition_allows(db, key, &args[2..], when_ms) {
+            Err(e) => return e,
+            Ok(false) => return Frame::Integer(0),
+            Ok(true) => {}
+        }
         return if db.remove(key).is_some() {
             Frame::Integer(1)
         } else {
             Frame::Integer(0)
         };
+    }
+    match expire_condition_allows(db, key, &args[2..], timestamp_ms as u64) {
+        Err(e) => return e,
+        Ok(false) => return Frame::Integer(0),
+        Ok(true) => {}
     }
     if db.set_expiry(key, timestamp_ms as u64) {
         Frame::Integer(1)
@@ -2962,6 +3102,222 @@ mod tests {
         fn unlink_of_alive_cold_key_still_counts() {
             let mut db = db_with_planes(&[], &[(b"alive", None)]);
             assert_eq!(unlink(&mut db, &[bs(b"alive")]), Frame::Integer(1));
+        }
+    }
+
+    // --- moon#544: EXPIRE family NX | XX | GT | LT conditions (Redis 7.0) ---
+    mod expire_conditions {
+        use super::*;
+
+        fn ttl_of(db: &mut Database, key: &[u8]) -> Frame {
+            pttl(db, &[bs(key)])
+        }
+
+        fn assert_ttl_roughly(db: &mut Database, key: &[u8], expect_ms: u64) {
+            let Frame::Integer(ms) = ttl_of(db, key) else {
+                panic!("PTTL must return an integer");
+            };
+            let expect = expect_ms as i64;
+            assert!(
+                (expect - 2_000..=expect).contains(&ms),
+                "PTTL {ms} not within 2s below {expect}"
+            );
+        }
+
+        /// NX sets only when the key has no TTL.
+        #[test]
+        fn nx_sets_on_no_ttl_and_refuses_on_existing_ttl() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"NX")]),
+                Frame::Integer(1)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+            // Second NX must refuse and leave the TTL untouched.
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"999"), bs(b"nx")]),
+                Frame::Integer(0)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+        }
+
+        /// XX sets only when the key already has a TTL.
+        #[test]
+        fn xx_refuses_on_no_ttl_and_sets_on_existing_ttl() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"XX")]),
+                Frame::Integer(0)
+            );
+            assert_eq!(ttl_of(&mut db, b"k"), Frame::Integer(-1));
+            db.set_expiry(b"k", current_time_ms() + 50_000);
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"XX")]),
+                Frame::Integer(1)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+        }
+
+        /// GT sets only a LATER expiry; a key with no TTL counts as infinite,
+        /// so GT never sets it.
+        #[test]
+        fn gt_only_extends_and_treats_no_ttl_as_infinite() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"GT")]),
+                Frame::Integer(0)
+            );
+            assert_eq!(ttl_of(&mut db, b"k"), Frame::Integer(-1));
+            db.set_expiry(b"k", current_time_ms() + 50_000);
+            // Shorter → refused.
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"10"), bs(b"GT")]),
+                Frame::Integer(0)
+            );
+            assert_ttl_roughly(&mut db, b"k", 50_000);
+            // Longer → set.
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"GT")]),
+                Frame::Integer(1)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+        }
+
+        /// LT sets only an EARLIER expiry; a key with no TTL counts as
+        /// infinite, so LT always sets it.
+        #[test]
+        fn lt_only_shortens_and_always_sets_on_no_ttl() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"LT")]),
+                Frame::Integer(1)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+            // Longer → refused.
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"999"), bs(b"LT")]),
+                Frame::Integer(0)
+            );
+            assert_ttl_roughly(&mut db, b"k", 100_000);
+            // Shorter → set.
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"10"), bs(b"LT")]),
+                Frame::Integer(1)
+            );
+            assert_ttl_roughly(&mut db, b"k", 10_000);
+        }
+
+        /// LT with a past-time expiry on a longer-TTL key deletes it (the
+        /// past time IS earlier); GT with a past time never deletes.
+        #[test]
+        fn past_time_respects_the_condition() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            db.set_expiry(b"k", current_time_ms() + 50_000);
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"-1"), bs(b"GT")]),
+                Frame::Integer(0)
+            );
+            assert!(db.exists(b"k"), "GT must not delete via a past time");
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"-1"), bs(b"LT")]),
+                Frame::Integer(1)
+            );
+            assert!(!db.exists(b"k"), "LT past-time must delete");
+        }
+
+        /// NX with XX/GT/LT is a syntax error; GT with LT is a syntax error.
+        #[test]
+        fn incompatible_flag_combinations_error() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            for combo in [[b"NX" as &[u8], b"XX"], [b"NX", b"GT"], [b"NX", b"LT"]] {
+                let r = expire(&mut db, &[bs(b"k"), bs(b"100"), bs(combo[0]), bs(combo[1])]);
+                let Frame::Error(e) = r else {
+                    panic!("NX+{:?} must error", String::from_utf8_lossy(combo[1]));
+                };
+                assert!(
+                    e.starts_with(b"ERR NX and XX"),
+                    "wrong error: {}",
+                    String::from_utf8_lossy(&e)
+                );
+            }
+            let r = expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"GT"), bs(b"LT")]);
+            let Frame::Error(e) = r else {
+                panic!("GT+LT must error");
+            };
+            assert!(
+                e.starts_with(b"ERR GT and LT"),
+                "wrong error: {}",
+                String::from_utf8_lossy(&e)
+            );
+            // XX GT is legal (Redis accepts it).
+            db.set_expiry(b"k", current_time_ms() + 50_000);
+            assert_eq!(
+                expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"XX"), bs(b"GT")]),
+                Frame::Integer(1)
+            );
+        }
+
+        /// TTL rounds to the NEAREST second like Redis: a fresh 100s expiry
+        /// answers 100 (the old floor answered 99 for 99.999s remaining).
+        #[test]
+        fn ttl_rounds_to_nearest_second() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            assert_eq!(expire(&mut db, &[bs(b"k"), bs(b"100")]), Frame::Integer(1));
+            assert_eq!(ttl(&mut db, &[bs(b"k")]), Frame::Integer(100));
+        }
+
+        /// An unknown option errors with Redis's message shape.
+        #[test]
+        fn unknown_option_errors() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            let r = expire(&mut db, &[bs(b"k"), bs(b"100"), bs(b"BOGUS")]);
+            let Frame::Error(e) = r else {
+                panic!("unknown option must error");
+            };
+            assert!(
+                e.starts_with(b"ERR Unsupported option"),
+                "wrong error: {}",
+                String::from_utf8_lossy(&e)
+            );
+        }
+
+        /// A missing key answers 0 under every condition, never an error.
+        #[test]
+        fn missing_key_answers_zero_under_conditions() {
+            let mut db = Database::new();
+            for flag in [b"NX" as &[u8], b"XX", b"GT", b"LT"] {
+                assert_eq!(
+                    expire(&mut db, &[bs(b"nokey"), bs(b"100"), bs(flag)]),
+                    Frame::Integer(0),
+                    "flag {}",
+                    String::from_utf8_lossy(flag)
+                );
+            }
+        }
+
+        /// All four commands of the family accept the options.
+        #[test]
+        fn whole_family_accepts_conditions() {
+            let mut db = setup_db_with_key(b"k", b"v");
+            let far_s = (current_time_ms() / 1000 + 100).to_string();
+            // Strictly EARLIER than the ~+100s TTL the expireat leg sets, so
+            // the LT leg genuinely shortens (LT refuses >= — see lt test).
+            let far_ms = (current_time_ms() + 50_000).to_string();
+            assert_eq!(
+                pexpire(&mut db, &[bs(b"k"), bs(b"100000"), bs(b"NX")]),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                expireat(&mut db, &[bs(b"k"), bs(far_s.as_bytes()), bs(b"XX")]),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                pexpireat(
+                    &mut db,
+                    &[bs(b"k"), bs(far_ms.as_bytes()), bs(b"XX"), bs(b"LT")]
+                ),
+                Frame::Integer(1)
+            );
         }
     }
 }
