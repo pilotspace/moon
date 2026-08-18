@@ -248,22 +248,39 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 
 ## CI
 
-- `cargo test --no-default-features --features runtime-tokio,jemalloc` — runs on ubuntu-latest with `MOON_NO_URING=1`
-- `cargo clippy -- -D warnings` — zero warnings policy (default features)
-- `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings` — zero warnings policy (tokio + jemalloc)
-- `cargo fmt --check` — enforced formatting
+**2026-08 CI migration**: the PR gate on GitHub Actions is hosted-only and fast; the heavyweight
+legs run locally via `scripts/ci-local.sh` before every push, and again on Actions at main-push.
+
+**Per-PR (GitHub-hosted, parallel, ~5–8m):**
+- Lint — `cargo fmt --check`, safety audits (`scripts/audit-unsafe.sh` + `scripts/audit-unwrap.sh`), CHANGELOG gate (`skip-changelog` label is the escape hatch)
+- Check — clippy ×3 (default / graph / tokio) + `cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc` on ubuntu-latest with `MOON_NO_URING=1`
 - MSRV check — `cargo build` with Rust 1.94 toolchain
-- **Safety audit** — `scripts/audit-unsafe.sh` (100% SAFETY comment coverage on unsafe blocks) + `scripts/audit-unwrap.sh` (unwrap ratchet prevents new unannotated unwraps)
-- **Fuzz** — `cargo-fuzz` 15 min/target on PR, 6h nightly (all 12 targets: resp/inline/RESP-differential, wal_v3_record, gossip_deser, acl_rule, rdb_load, cypher_parse, conf_parse, csr_from_bytes, graph_props_record, fts_query_parse). Uses nightly compiler; `rust-toolchain.toml` is removed in CI for this job.
-- CodeQL (Rust) — weekly + on push/PR
-- Claude Code Review — runs on PRs
+- Memory steady-state gate
+- Fuzz (only with `ci-fuzz` label), Console Integration (only when console-relevant paths change), Integration Tests (only with `ci-full` label)
 
-### Local CI Parity (via OrbStack)
+**Main-push + `workflow_dispatch` only** (the pre-merge dispatch matrix):
+- Check (monoio — the shipped runtime; self-hosted, io_uring live; guarded by `tests/ci_covers_monoio.rs`)
+- Client compat (self-hosted, real redis-server oracle)
+- Check (macOS), Check (Windows), Check (console feature)
 
-Before pushing, run the full CI matrix locally:
+**Scheduled:** fuzz nightly 6h (12 targets, nightly compiler, `rust-toolchain.toml` removed for the job), Crash Matrix nightly + weekly soak, CodeQL weekly, supply-chain weekly.
+
+### Local CI (the merge bar)
+
 ```bash
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo fmt --check && cargo clippy -- -D warnings && cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings && cargo test --release && cargo test --no-default-features --features runtime-tokio,jemalloc'
+scripts/ci-local.sh            # host lint gates + VM monoio suite + VM tokio suite
+scripts/ci-local.sh --quick    # host lint gates only (fmt, audits, clippy ×2)
+scripts/ci-local.sh --full     # + client-compat harness (VM) + macOS host suite
 ```
+
+Run the default mode before every push — it covers exactly what the PR gate no longer runs
+(most importantly the **monoio suite, the runtime that ships**). The script captures every
+exit code directly (no piped gates), keeps VM builds on VM-local target dirs, pins
+`MOON_BIN` for the compat harness, and fingerprints the tree at start/end — a branch switch
+or edit mid-run marks the whole result INVALID (exit 3) instead of reporting a false green.
+Windows cannot run locally: before merging, still dispatch the hosted matrix with
+`gh workflow run ci.yml --ref <branch>` (add `console-integration.yml` / `crash-matrix.yml`
+when the change warrants them).
 
 <!-- ADD:BEGIN — managed by `add.py sync-guidelines`; do not edit inside -->
 ## ADD — how to work in this repo
