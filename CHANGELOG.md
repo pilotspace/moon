@@ -146,6 +146,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route is still right for ~1/N of them, so a single-key test at `--shards 4` passes a quarter of
   the time and reads as a flake. Against the pre-fix binary the four parity rows fail with 9, 11,
   10 and 7 of 12 keys wrong; the fence rows (`LPOP`, `ZDIFF`, `XREAD`) pass on both.
+- **A blocking waker destroyed waiters it could not serve** (#535). `try_wake_list_waiter`,
+  `try_wake_zset_waiter` and `try_wake_stream_waiter` each popped whatever waiter sat at the
+  front of a key's queue. A command outside the waker's family fell through a `_ => (None, None)`
+  arm into the cleanup that runs for every waiter it pops — `remove_wait(wait_id)` plus
+  `reply_tx.send(None)` — so the registration was dropped across all its keys and the client was
+  answered a null it never earned.
+
+  Two independent paths reached it, which is why the fix is in the wakers rather than at one call
+  site. `ShardMessage::BlockRegister` registers a remote waiter and then, **gated on the key
+  existing**, runs all three wakers in sequence, list first — so a `BZPOPMIN` on a populated zset
+  owned by another shard was eaten by the list waker during its own registration and answered
+  `*-1` in microseconds instead of returning the member sitting right there. Separately, an
+  ordinary `RPUSH` on a key name that also carried a zset waiter destroyed it the same way.
+
+  Measured at `--shards 4` before the fix: 9, 8 and 10 of 12 populated zsets answered `*-1`
+  through `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` — the ~3-of-4 signature of a key the client's own
+  shard does not own — each in 130µs–1.5ms despite a 3-second timeout, because the null is sent
+  during registration and the command never blocks.
+
+  `BlockedCommand::family()` now maps every variant to the one waker entitled to serve it, and
+  `pop_front_of_family` takes only that family's waiters, leaving the rest queued in order. The
+  mapping is exhaustive with no `_` arm, so a new blocking command will not compile until it
+  declares its family instead of silently becoming edible. The wakers' loop condition moved from
+  `has_waiters` to the pop itself — a queue holding only foreign waiters is not empty, and the
+  old condition would have spun forever.
 
 - **RESP2 replies whose missing value is an *array* sent the null *string* instead** (#482).
   RESP2 has two nulls — `$-1` says "the string you asked for is missing", `*-1` says "the array

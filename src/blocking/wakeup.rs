@@ -96,11 +96,17 @@ pub fn try_wake_list_waiter(
     key: &Bytes,
 ) -> bool {
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
-    while registry.has_waiters(db_index, key) {
-        let waiter = match registry.pop_front(db_index, key) {
-            Some(w) => w,
-            None => return false,
-        };
+    // moon#535: pop only waiters THIS waker can serve. The old blind
+    // `pop_front` handed us waiters of every family, and the cleanup below —
+    // `remove_wait` + `send(None)` — runs for every waiter we pop, so an
+    // unservable one was destroyed rather than left for its own waker.
+    //
+    // The loop condition moved from `has_waiters` to the pop itself: a queue
+    // holding only foreign waiters is not empty, so the old condition would
+    // now spin forever.
+    while let Some(waiter) =
+        registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::List)
+    {
         let crate::blocking::WaitEntry {
             wait_id,
             cmd,
@@ -203,7 +209,11 @@ pub fn try_wake_list_waiter(
                     )
                 }
             }
-            _ => (None, None), // BZPopMin/BZPopMax don't watch list keys
+            // Unreachable since moon#535: `pop_front_of_family(List)` cannot
+            // hand us a zset or stream waiter. Kept as a total match rather
+            // than an `unreachable!()` — a panic here would take the shard
+            // down, and answering "no data" is the safe direction.
+            _ => (None, None),
         };
 
         // Clean up all other key registrations for this wait_id
@@ -237,11 +247,17 @@ pub fn try_wake_zset_waiter(
     db_index: usize,
     key: &Bytes,
 ) -> bool {
-    while registry.has_waiters(db_index, key) {
-        let waiter = match registry.pop_front(db_index, key) {
-            Some(w) => w,
-            None => return false,
-        };
+    // moon#535: pop only waiters THIS waker can serve. The old blind
+    // `pop_front` handed us waiters of every family, and the cleanup below —
+    // `remove_wait` + `send(None)` — runs for every waiter we pop, so an
+    // unservable one was destroyed rather than left for its own waker.
+    //
+    // The loop condition moved from `has_waiters` to the pop itself: a queue
+    // holding only foreign waiters is not empty, so the old condition would
+    // now spin forever.
+    while let Some(waiter) =
+        registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::ZSet)
+    {
         let crate::blocking::WaitEntry {
             wait_id,
             cmd,
@@ -313,7 +329,8 @@ pub fn try_wake_zset_waiter(
                     )
                 }
             }
-            _ => (None, None), // List commands don't watch zset keys
+            // Unreachable since moon#535 — see try_wake_list_waiter.
+            _ => (None, None),
         };
 
         registry.remove_wait(wait_id);
@@ -347,11 +364,17 @@ pub fn try_wake_stream_waiter(
     use crate::command::stream::format_entry;
     use crate::storage::stream::StreamId;
 
-    while registry.has_waiters(db_index, key) {
-        let waiter = match registry.pop_front(db_index, key) {
-            Some(w) => w,
-            None => return false,
-        };
+    // moon#535: pop only waiters THIS waker can serve. The old blind
+    // `pop_front` handed us waiters of every family, and the cleanup below —
+    // `remove_wait` + `send(None)` — runs for every waiter we pop, so an
+    // unservable one was destroyed rather than left for its own waker.
+    //
+    // The loop condition moved from `has_waiters` to the pop itself: a queue
+    // holding only foreign waiters is not empty, so the old condition would
+    // now spin forever.
+    while let Some(waiter) =
+        registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::Stream)
+    {
         let crate::blocking::WaitEntry {
             wait_id,
             cmd,
@@ -437,7 +460,8 @@ pub fn try_wake_stream_waiter(
                     None
                 }
             }
-            _ => None, // List/zset commands don't watch stream keys
+            // Unreachable since moon#535 — see try_wake_list_waiter.
+            _ => None,
         };
 
         // Clean up all other key registrations for this wait_id

@@ -46,6 +46,41 @@ pub enum BlockedCommand {
     },
 }
 
+/// Which waker is entitled to serve a given blocked command.
+///
+/// A waker must never CONSUME a waiter outside its own family. Before moon#535
+/// each waker popped whatever was at the front of the queue, let an unhandled
+/// command fall through a `_ => (None, None)` arm, and then ran the same
+/// unconditional cleanup it uses for a served waiter — `remove_wait` plus
+/// `reply_tx.send(None)`. That destroyed the registration and answered the
+/// client a null it never earned.
+///
+/// The mapping is exhaustive on purpose: a new `BlockedCommand` will not
+/// compile until it declares the family that may wake it, rather than silently
+/// inheriting a `_` arm and becoming edible again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFamily {
+    List,
+    ZSet,
+    Stream,
+}
+
+impl BlockedCommand {
+    /// The waker family entitled to serve this command.
+    pub fn family(&self) -> WaitFamily {
+        match self {
+            BlockedCommand::BLPop
+            | BlockedCommand::BRPop
+            | BlockedCommand::BLMove { .. }
+            | BlockedCommand::BLMPop { .. } => WaitFamily::List,
+            BlockedCommand::BZPopMin | BlockedCommand::BZPopMax | BlockedCommand::BZMPop { .. } => {
+                WaitFamily::ZSet
+            }
+            BlockedCommand::XRead { .. } | BlockedCommand::XReadGroup { .. } => WaitFamily::Stream,
+        }
+    }
+}
+
 /// A single blocked client waiting for data on a key.
 pub struct WaitEntry {
     /// Unique ID shared across all keys this client is waiting on (for dedup).
@@ -145,6 +180,37 @@ impl BlockingRegistry {
         };
         // Clean up empty queue
         if self.waiters.get(&queue_key).map_or(true, |q| q.is_empty()) {
+            self.waiters.remove(&queue_key);
+        }
+        Some(entry)
+    }
+
+    /// Pop the first waiter of `family` from the FIFO queue for (db_index, key),
+    /// leaving every other waiter in place and in order.
+    ///
+    /// This is what `pop_front` should always have been for the wakers
+    /// (moon#535). A key's queue can hold waiters of different families at
+    /// once — `BZPOPMIN k` registers on a key that does not exist yet, and a
+    /// later `RPUSH k` creates it as a LIST — and the blind `pop_front` handed
+    /// the list waker a zset waiter, which it then destroyed.
+    ///
+    /// Skipping foreign families does not violate FIFO: ordering is only
+    /// meaningful among clients competing for the SAME data, and a zset waiter
+    /// was never a candidate for a list push. The scan is over one key's queue
+    /// and stops at the first match; no allocation.
+    pub fn pop_front_of_family(
+        &mut self,
+        db_index: usize,
+        key: &Bytes,
+        family: WaitFamily,
+    ) -> Option<WaitEntry> {
+        let queue_key = (db_index, key.clone());
+        let entry = {
+            let queue = self.waiters.get_mut(&queue_key)?;
+            let idx = queue.iter().position(|e| e.cmd.family() == family)?;
+            queue.remove(idx)?
+        };
+        if self.waiters.get(&queue_key).is_none_or(|q| q.is_empty()) {
             self.waiters.remove(&queue_key);
         }
         Some(entry)
@@ -454,5 +520,126 @@ mod deadline_heap_tests {
         assert_eq!(visited, 2);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk1")));
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk2")));
+    }
+
+    /// moon#535: a waker must be able to take ITS waiter out of a queue that
+    /// also holds other families, without disturbing them.
+    #[test]
+    fn pop_front_of_family_skips_foreign_waiters_and_leaves_them_queued() {
+        let mut reg = BlockingRegistry::new(0);
+        let key = Bytes::from_static(b"mixed");
+        // Order matters: the zset waiter is FIRST, which is exactly the case
+        // that used to let the list waker eat it.
+        for cmd in [
+            BlockedCommand::BZPopMin,
+            BlockedCommand::BLPop,
+            BlockedCommand::BZPopMax,
+        ] {
+            let (tx, _rx) = crate::runtime::channel::oneshot();
+            let id = reg.next_wait_id();
+            reg.register(
+                0,
+                key.clone(),
+                WaitEntry {
+                    wait_id: id,
+                    cmd,
+                    reply_tx: tx,
+                    deadline: None,
+                },
+            );
+        }
+
+        // The list waker reaches past the leading zset waiter to its own.
+        let got = reg
+            .pop_front_of_family(0, &key, WaitFamily::List)
+            .expect("the list waiter is there");
+        assert_eq!(got.cmd.family(), WaitFamily::List);
+        // ...and there is not a second one.
+        assert!(reg.pop_front_of_family(0, &key, WaitFamily::List).is_none());
+
+        // Both zset waiters are untouched, still in registration order.
+        assert!(reg.has_waiters(0, &key));
+        let first = reg
+            .pop_front_of_family(0, &key, WaitFamily::ZSet)
+            .expect("first zset waiter survived");
+        assert!(matches!(first.cmd, BlockedCommand::BZPopMin));
+        let second = reg
+            .pop_front_of_family(0, &key, WaitFamily::ZSet)
+            .expect("second zset waiter survived");
+        assert!(matches!(second.cmd, BlockedCommand::BZPopMax));
+
+        // Draining every family empties the queue entirely.
+        assert!(!reg.has_waiters(0, &key));
+        assert!(
+            reg.pop_front_of_family(0, &key, WaitFamily::Stream)
+                .is_none()
+        );
+    }
+
+    /// A queue holding ONLY foreign waiters must report "nothing for me"
+    /// rather than handing one over — the wakers loop on this, so a wrong
+    /// answer here is an infinite loop on the shard thread, not a wrong reply.
+    #[test]
+    fn pop_front_of_family_returns_none_when_only_foreign_waiters_remain() {
+        let mut reg = BlockingRegistry::new(0);
+        let key = Bytes::from_static(b"zsetonly");
+        let (tx, _rx) = crate::runtime::channel::oneshot();
+        let id = reg.next_wait_id();
+        reg.register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id: id,
+                cmd: BlockedCommand::BZPopMin,
+                reply_tx: tx,
+                deadline: None,
+            },
+        );
+        assert!(reg.has_waiters(0, &key), "the queue is NOT empty");
+        assert!(
+            reg.pop_front_of_family(0, &key, WaitFamily::List).is_none(),
+            "a non-empty queue with no list waiter must still answer None"
+        );
+        assert!(
+            reg.has_waiters(0, &key),
+            "the refused waiter must still be registered"
+        );
+    }
+
+    /// The family map is the fix's whole contract; pin it so a re-classified
+    /// command has to change this test deliberately.
+    #[test]
+    fn every_blocked_command_declares_its_waker_family() {
+        use WaitFamily::*;
+        let cases = [
+            (BlockedCommand::BLPop, List),
+            (BlockedCommand::BRPop, List),
+            (
+                BlockedCommand::BLMPop {
+                    dir: Direction::Left,
+                    count: 1,
+                },
+                List,
+            ),
+            (BlockedCommand::BZPopMin, ZSet),
+            (BlockedCommand::BZPopMax, ZSet),
+            (
+                BlockedCommand::BZMPop {
+                    min: true,
+                    count: 1,
+                },
+                ZSet,
+            ),
+            (
+                BlockedCommand::XRead {
+                    streams: Vec::new(),
+                    count: None,
+                },
+                Stream,
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(cmd.family(), want, "{cmd:?} is classified wrong");
+        }
     }
 }
