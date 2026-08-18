@@ -101,10 +101,14 @@ if [ "$MODE" != "quick" ]; then
   # ── Phase 1: the two full suites, in the Linux VM ───────────────────
   # Sequential, monoio (shipped runtime) first: parallel VM builds of two
   # feature sets contend on memory and the shared-volume virtiofs.
+  # `export VAR=...;` (not a bare env prefix): $VM_TEST_* expands to an
+  # `if` COMPOUND command, and `VAR=x if ...` is a bash syntax error —
+  # phase 1 exited in <1s with rc=2 without running a single test the
+  # first time --full was exercised (2026-08-19).
   run_step "VM monoio suite (shipped runtime)" \
-    vm "CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0 $VM_TEST_MONOIO"
+    vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0; $VM_TEST_MONOIO"
   run_step "VM tokio suite" \
-    vm "CARGO_TARGET_DIR=\$HOME/ci-target/local-tokio MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 $VM_TEST_TOKIO"
+    vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-tokio MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0; $VM_TEST_TOKIO"
 fi
 
 if [ "$MODE" = "full" ]; then
