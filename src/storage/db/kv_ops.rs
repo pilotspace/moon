@@ -35,10 +35,12 @@ impl Database {
             // Hot path: single re-probe, borrow returned to caller.
             KeyState::Live => self.data.get(key),
             KeyState::Expired => {
-                let removed = self.data.remove(key)?;
-                self.used_memory = self
-                    .used_memory
-                    .saturating_sub(entry_overhead(key, &removed));
+                // moon#542: HIDE, don't remove. Deletion belongs to the
+                // active-expiry drain, which emits the keyspace `expired`
+                // notification and the dual-plane DEL this layer cannot
+                // (no plane handles here) — and a replica must never
+                // delete on read at all (it waits for the master's DEL).
+                self.note_lazy_expired(key);
                 None
             }
             KeyState::Absent => {
@@ -301,10 +303,8 @@ impl Database {
         // Immutable check for expiry (avoids get_mut + remove + get_mut triple lookup)
         let expired = self.data.get(key).is_some_and(|e| e.is_expired_at(now_ms));
         if expired {
-            let removed = self.data.remove(key)?;
-            self.used_memory = self
-                .used_memory
-                .saturating_sub(entry_overhead(key, &removed));
+            // moon#542: hide + defer to the emitting drain (see `get`).
+            self.note_lazy_expired(key);
             return None;
         }
         // Single get_mut: touch LRU + return
@@ -618,17 +618,16 @@ impl Database {
     /// A cold-only key (spilled by eviction, no in-RAM `Entry`) still counts
     /// as existing — checked via the cheap in-RAM [`Self::cold_contains_alive`]
     /// (no disk I/O, no promotion; P0 cold-collection-visibility fix).
-    #[allow(clippy::unwrap_used)] // remove() after get() returned Some — key guaranteed present
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let now_ms = self.cached_now_ms;
         match self.data.get(key) {
             None => self.cold_contains_alive(key, now_ms),
             Some(entry) => {
                 if entry.is_expired_at(now_ms) {
-                    let removed = self.data.remove(key).unwrap();
-                    self.used_memory = self
-                        .used_memory
-                        .saturating_sub(entry_overhead(key, &removed));
+                    // moon#542: hide + defer to the emitting drain (see
+                    // `get`). Cold fallback preserved: an expired hot entry
+                    // never shadows a still-alive cold copy.
+                    self.note_lazy_expired(key);
                     self.cold_contains_alive(key, now_ms)
                 } else {
                     true
