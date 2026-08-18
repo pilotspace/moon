@@ -155,6 +155,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now rounds to the nearest second** like Redis (`(ms+500)/1000`) — the old floor answered `99` for
   a fresh `EXPIRE k 100`, a divergence the oracle probe surfaced and a pipelined `/dev/tcp` probe
   (spawn-latency-free) confirmed fixed byte-for-byte.
+- **Lazy expiry now emits — reads no longer delete expired keys silently** (#542). The removal
+  `Database::get`/`get_mut`/`exists` performed when a read touched an expired key fired neither the
+  `expired` keyspace notification nor the dual-plane (AOF + replication) `DEL` — only the active
+  sweep did both. Two consequences: subscribers to `__keyevent@<db>__:expired` never heard about
+  any key that was *read* after expiring (the common case for cache/session patterns, where the
+  read is what discovers the expiry), and once the master lazily removed a key its sweep could
+  never emit the authoritative `DEL`, so an attached replica kept the entry resident forever
+  (logically hidden, but RAM/`DBSIZE`/`used_memory` diverging unboundedly). The lazy paths now
+  HIDE the key (answer absent, leave it in place) and record it in a bounded per-db queue
+  (`PENDING_EXPIRED_CAP` = 8192, adjacent-dedup); the shard's next active-expiry tick drains the
+  queue, re-verifies expiry (a key overwritten in between is a new incarnation and is skipped),
+  and deletes through the same emitting sink as sweep victims — identical notification + DEL
+  treatment. This also fixes the replica-side divergence for free: a replica's reads now hide
+  without deleting (Redis semantics — the replica waits for the master's `DEL`), its queue sits
+  bounded at ≤ cap since replicas never drain, and promotion resumes draining with re-verification.
+  Past the cap the lazy path still hides but stops recording; the probabilistic sweep remains the
+  backstop. Write-path expired-entry replacement (`get_or_create_*`) is intentionally unchanged —
+  the streamed write itself supersedes the key.
 - **Commands whose key is not their first argument were routed by hashing a literal** (#533, #534).
   `extract_primary_key` special-cases the commands whose key is not `args[0]` and falls through to
   `args[0]` for everything else. `LMPOP`, `ZMPOP` and `SINTERCARD` take `numkeys` first, and

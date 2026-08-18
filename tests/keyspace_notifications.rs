@@ -327,6 +327,33 @@ fn kn6_expired_event() {
     );
 }
 
+/// moon#542 fence: a key READ after its TTL elapsed (the lazy-expiry path,
+/// which HIDES the key and defers deletion to the sweep drain) must still
+/// publish `expired`. Before #542 the lazy path deleted the key silently —
+/// whichever of read/sweep won the race decided whether subscribers heard
+/// about it at all. The read must answer nil AND the event must arrive.
+#[test]
+fn kn6b_expired_event_after_lazy_read() {
+    let m = spawn_moon("1");
+    enable(m.port, "KEA");
+    let mut sub = psubscriber(m.port, "__keyevent@0__:expired");
+
+    let mut w = Conn::open(m.port);
+    w.send(&["SET", "kn6lazy", "v", "PX", "40"]);
+    std::thread::sleep(Duration::from_millis(60));
+    let got = w.send(&["GET", "kn6lazy"]);
+    assert!(
+        got.contains("$-1") || got.contains("nil") || got.starts_with("_"),
+        "elapsed key must read as absent; got {got:?}"
+    );
+
+    let msgs = sub.collect_pmessages(Duration::from_secs(3));
+    assert!(
+        msgs.iter().any(|(_, key)| key == "kn6lazy"),
+        "a lazily-read expired key must still publish 'expired'; got {msgs:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gating — the cases where NOTHING must arrive
 // ---------------------------------------------------------------------------

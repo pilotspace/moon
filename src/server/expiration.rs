@@ -49,7 +49,9 @@ pub async fn run_active_expiration(
                     // monoio-only (CLAUDE.md), so a tokio-runtime process is
                     // never a replication master; a no-op sink preserves
                     // today's behavior exactly.
-                    expire_cycle(&mut guard, &mut |_| {});
+                    // moon#542: route through `_direct` so the lazy-expiry
+                    // pending queue physically drains under tokio too.
+                    expire_cycle_direct(&mut guard, &mut |_| {});
                 }
             }
             _ = shutdown.cancelled() => {
@@ -75,6 +77,11 @@ pub async fn run_active_expiration(
 /// (replicas run the identical reaper against the identical TTLs, a bounded
 /// divergence documented in CHANGELOG rather than wired up here).
 pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    // moon#542: delete-and-emit the keys the LAZY paths discovered expired
+    // since the last tick. Runs before the latch fast-path — the queue check
+    // is one branch on an empty Vec, and a lazily-hidden key implies the
+    // flag is latched true anyway (it had an expiry when it was hidden).
+    drain_lazy_expired(db, on_removed);
     // Fast path: if the DB-level flag latches "no expiring keys", skip the
     // O(N) `keys_with_expiry()` scan entirely. Discovered by flamegraph:
     // with 100K TTL-less keys, the per-tick scan was consuming ~26% of
@@ -85,6 +92,27 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
         return;
     }
     expire_cycle(db, on_removed);
+}
+
+/// Delete-and-emit the lazily-discovered expired keys (moon#542).
+///
+/// Each key is RE-VERIFIED before deletion: a write between the lazy read
+/// and this tick replaced the entry with a new incarnation (fresh value, or
+/// a fresh TTL that has not yet passed), and deleting that — or emitting a
+/// DEL for it — would destroy live data on this node and on every replica.
+/// A key that re-verifies as expired is deleted through the same
+/// `on_removed` sink the probabilistic sweep uses, so it gets the identical
+/// keyspace-notification + dual-plane DEL treatment.
+fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    if !db.has_pending_lazy_expired() {
+        return;
+    }
+    for key in db.take_pending_lazy_expired() {
+        if db.is_key_expired(key.as_bytes()) {
+            db.remove(key.as_bytes());
+            on_removed(key.as_bytes());
+        }
+    }
 }
 
 /// Run one probabilistic expiration cycle on a single database.
@@ -292,5 +320,121 @@ mod tests {
 
         // Key must be entirely removed.
         assert_eq!(db.len(), 0);
+    }
+
+    // ── moon#542: lazy expiry must DEFER deletion to the sweep so the
+    // deletion is EMITTED (keyspace notification + dual-plane DEL). The old
+    // behavior removed the key inside `get`/`get_mut`/`exists` where no
+    // emission plane exists — the key vanished silently and an attached
+    // replica kept it forever. ─────────────────────────────────────────────
+    mod lazy_expiry_deferral {
+        use super::*;
+
+        fn db_with_expired_key(key: &[u8]) -> Database {
+            let mut db = Database::new();
+            let past_ms = current_time_ms() - 1_000;
+            db.set(
+                Bytes::copy_from_slice(key),
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
+            );
+            // `get`/`exists` judge expiry against the db-cached clock.
+            db.set_cached_now_ms_for_test(current_time_ms());
+            db
+        }
+
+        fn drained_keys(db: &mut Database) -> Vec<Vec<u8>> {
+            let mut got = Vec::new();
+            expire_cycle_direct(db, &mut |k| got.push(k.to_vec()));
+            got
+        }
+
+        /// `get` answers None but must NOT physically remove: the sweep tick
+        /// deletes and emits.
+        #[test]
+        fn lazy_get_hides_and_defers_removal_until_sweep_emits() {
+            let mut db = db_with_expired_key(b"k");
+            assert!(db.get(b"k").is_none(), "expired key must read as absent");
+            assert!(
+                db.data().get(b"k").is_some(),
+                "lazy read must HIDE, not remove — deletion belongs to the \
+                 sweep so it can be emitted"
+            );
+            let got = drained_keys(&mut db);
+            assert!(
+                got.iter().any(|k| k == b"k"),
+                "sweep must emit the lazily-read key (got {got:?})"
+            );
+            assert!(db.data().get(b"k").is_none(), "sweep must delete it");
+            // Pins the DRAIN specifically: the probabilistic sweep could
+            // mask a deleted drain in this 1-key db, but only the drain
+            // consumes the queue.
+            assert_eq!(
+                db.pending_lazy_expired_len(),
+                0,
+                "drain must consume the queue"
+            );
+        }
+
+        /// Same contract through `exists`.
+        #[test]
+        fn lazy_exists_hides_and_defers() {
+            let mut db = db_with_expired_key(b"k");
+            assert!(!db.exists(b"k"));
+            assert!(db.data().get(b"k").is_some());
+            let got = drained_keys(&mut db);
+            assert!(got.iter().any(|k| k == b"k"));
+        }
+
+        /// Same contract through `get_mut`.
+        #[test]
+        fn lazy_get_mut_hides_and_defers() {
+            let mut db = db_with_expired_key(b"k");
+            assert!(db.get_mut(b"k").is_none());
+            assert!(db.data().get(b"k").is_some());
+            let got = drained_keys(&mut db);
+            assert!(got.iter().any(|k| k == b"k"));
+        }
+
+        /// A key overwritten between the lazy read and the sweep is a NEW
+        /// incarnation — the drain must not delete it or emit a DEL for it.
+        #[test]
+        fn overwritten_key_is_not_deleted_by_the_drain() {
+            let mut db = db_with_expired_key(b"k");
+            assert!(db.get(b"k").is_none());
+            db.set(
+                Bytes::from_static(b"k"),
+                Entry::new_string(Bytes::from_static(b"fresh")),
+            );
+            let got = drained_keys(&mut db);
+            assert!(
+                !got.iter().any(|k| k == b"k"),
+                "drain must skip the overwritten key"
+            );
+            assert!(db.get(b"k").is_some(), "fresh incarnation must survive");
+        }
+
+        /// The pending queue is bounded; past the cap the lazy path still
+        /// hides (the probabilistic sweep is the backstop), it just stops
+        /// recording.
+        #[test]
+        fn pending_queue_is_capped_and_still_hides() {
+            let mut db = Database::new();
+            let past_ms = current_time_ms() - 1_000;
+            let n = crate::storage::db::PENDING_EXPIRED_CAP + 10;
+            for i in 0..n {
+                db.set(
+                    Bytes::from(format!("k{i}")),
+                    Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
+                );
+            }
+            db.set_cached_now_ms_for_test(current_time_ms());
+            for i in 0..n {
+                assert!(db.get(format!("k{i}").as_bytes()).is_none());
+            }
+            assert!(
+                db.pending_lazy_expired_len() <= crate::storage::db::PENDING_EXPIRED_CAP,
+                "queue must not grow past the cap"
+            );
+        }
     }
 }

@@ -268,7 +268,27 @@ pub struct Database {
     /// a full incarnation field (a wider `Entry`) removes the residue entirely;
     /// see the task's §7.
     birth_counter: u32,
+    /// Keys a LAZY read discovered expired (moon#542). The lazy paths
+    /// (`get` / `get_mut` / `exists`) HIDE an expired key instead of
+    /// removing it, and record it here; the shard's next active-expiry tick
+    /// drains this queue, re-verifies expiry, deletes, and EMITS the
+    /// deletion (keyspace `expired` notification + dual-plane DEL) — the
+    /// emission the lazy paths structurally cannot perform (no plane
+    /// handles in the storage layer). Bounded by [`PENDING_EXPIRED_CAP`];
+    /// past the cap the lazy path still hides but stops recording (the
+    /// probabilistic sweep is the backstop that eventually samples the
+    /// key). On a REPLICA the sweep never drains (replicas wait for the
+    /// master's authoritative DEL), so the queue sits at ≤ cap — bounded
+    /// memory — and hidden keys are exactly Redis's replica semantics:
+    /// logically absent, physically present until the master says so.
+    pending_expired: Vec<CompactKey>,
 }
+
+/// Bound on [`Database::pending_expired`]. 8192 keys ≈ 200KB of inline
+/// `CompactKey`s at worst — small enough to hold on a replica forever,
+/// large enough that a read-heavy burst over expired keys rarely overflows
+/// into sweep-sampling fallback.
+pub const PENDING_EXPIRED_CAP: usize = 8192;
 
 /// A spill that has left hot RAM but has not yet landed in `cold_index`.
 ///
@@ -296,6 +316,7 @@ impl Database {
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
             maybe_has_expiring_keys: false,
+            pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
@@ -323,6 +344,7 @@ impl Database {
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
             maybe_has_expiring_keys: false,
+            pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
@@ -455,6 +477,46 @@ impl Database {
     #[inline]
     pub fn clear_maybe_has_expiring_keys(&mut self) {
         self.maybe_has_expiring_keys = false;
+    }
+
+    /// Record a key a lazy read discovered expired (moon#542) so the next
+    /// active-expiry tick can delete it WITH emission. Bounded: past
+    /// [`PENDING_EXPIRED_CAP`] the key is silently not recorded — the
+    /// probabilistic sweep remains the backstop.
+    #[inline]
+    pub(crate) fn note_lazy_expired(&mut self, key: &[u8]) {
+        // Adjacent-dedup: a hot loop re-reading ONE expired key before the
+        // next tick must not flood the queue with duplicates (the drain
+        // re-verifies, so dups are harmless to correctness — they just
+        // evict capacity other keys could use).
+        if self
+            .pending_expired
+            .last()
+            .is_some_and(|k| k.as_ref() == key)
+        {
+            return;
+        }
+        if self.pending_expired.len() < PENDING_EXPIRED_CAP {
+            self.pending_expired.push(CompactKey::from(key));
+        }
+    }
+
+    /// Take the lazily-discovered expired keys for the drain (moon#542).
+    #[inline]
+    pub fn take_pending_lazy_expired(&mut self) -> Vec<CompactKey> {
+        std::mem::take(&mut self.pending_expired)
+    }
+
+    /// Whether any lazily-discovered expired keys await the drain.
+    #[inline]
+    pub fn has_pending_lazy_expired(&self) -> bool {
+        !self.pending_expired.is_empty()
+    }
+
+    /// Current pending-queue length (tests + observability).
+    #[inline]
+    pub fn pending_lazy_expired_len(&self) -> usize {
+        self.pending_expired.len()
     }
 
     /// Update the cached timestamp from a shared [`CachedClock`].
@@ -773,9 +835,17 @@ mod tests {
             Bytes::from_static(b"expired"),
             Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
-        // get should return None and remove the key
+        // moon#542: `get` HIDES the expired key (answers None) but must NOT
+        // physically remove it — deletion belongs to the active-expiry drain,
+        // which emits the keyspace notification + dual-plane DEL this layer
+        // cannot. The key is queued for that drain instead.
         assert!(db.get(b"expired").is_none());
-        assert_eq!(db.len(), 0);
+        assert_eq!(db.len(), 1, "hidden, not removed");
+        assert_eq!(db.pending_lazy_expired_len(), 1, "queued for the drain");
+        // Every subsequent read must keep hiding it — and must not enqueue
+        // a duplicate (adjacent-dedup).
+        assert!(db.get(b"expired").is_none());
+        assert_eq!(db.pending_lazy_expired_len(), 1, "no duplicate enqueue");
     }
 
     #[test]
