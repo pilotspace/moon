@@ -1913,4 +1913,158 @@ mod tests {
         assert!(!db.spill_inflight_alive(b"k", 1_001), "past its TTL");
         assert!(db.spill_inflight_entry(b"k", 1_001).is_none());
     }
+
+    // ── moon#523 / moon#539: blocking pops must never create their key ──
+    //
+    // `list_pop_front`/`list_pop_back`/`zset_pop_min`/`zset_pop_max` back the
+    // blocking fast path (`try_immediate_pop`) for BLPOP/BRPOP/BLMOVE/
+    // BRPOPLPUSH/BZPOPMIN/BZPOPMAX/BZMPOP. A miss on an absent key used to
+    // reach the value through `get_or_create_*`, materialising an empty
+    // list/zset that EXISTS/TYPE/DBSIZE then reported and that later RPUSHes
+    // tripped over with WRONGTYPE. A miss must leave the keyspace — and the
+    // memory estimate — byte-identical.
+
+    /// Assert that `db` holds no trace of `key` on any plane.
+    fn assert_keyspace_untouched(db: &Database, key: &[u8], used_before: usize) {
+        assert_eq!(db.data().len(), 0, "hot plane must stay empty");
+        assert_eq!(db.logical_len(), 0, "DBSIZE must stay 0");
+        assert!(!db.is_hot(key), "no phantom entry for the polled key");
+        assert!(
+            !db.exists_if_alive(key, current_time_ms()),
+            "EXISTS must still answer 0"
+        );
+        assert_eq!(
+            db.resident_bytes(),
+            used_before,
+            "a miss must not charge memory"
+        );
+    }
+
+    #[test]
+    fn test_list_pop_front_missing_key_creates_no_phantom() {
+        let mut db = Database::new();
+        let used_before = db.resident_bytes();
+        assert!(db.list_pop_front(b"ghost").is_none());
+        assert_keyspace_untouched(&db, b"ghost", used_before);
+    }
+
+    #[test]
+    fn test_list_pop_back_missing_key_creates_no_phantom() {
+        let mut db = Database::new();
+        let used_before = db.resident_bytes();
+        assert!(db.list_pop_back(b"ghost").is_none());
+        assert_keyspace_untouched(&db, b"ghost", used_before);
+    }
+
+    #[test]
+    fn test_zset_pop_min_missing_key_creates_no_phantom() {
+        let mut db = Database::new();
+        let used_before = db.resident_bytes();
+        assert!(db.zset_pop_min(b"ghost").is_none());
+        assert_keyspace_untouched(&db, b"ghost", used_before);
+    }
+
+    #[test]
+    fn test_zset_pop_max_missing_key_creates_no_phantom() {
+        let mut db = Database::new();
+        let used_before = db.resident_bytes();
+        assert!(db.zset_pop_max(b"ghost").is_none());
+        assert_keyspace_untouched(&db, b"ghost", used_before);
+    }
+
+    /// The #539 headline symptom: after a blocking pop misses, a producer
+    /// must still be able to create the key with its own type.
+    #[test]
+    fn test_push_after_missed_pop_is_not_wrongtype() {
+        let mut db = Database::new();
+        assert!(db.zset_pop_min(b"q").is_none());
+        // A list push on the same key must succeed — pre-fix the miss left a
+        // zset behind and `get_or_create_list` answered WRONGTYPE.
+        db.list_push_back(b"q", Bytes::from_static(b"job"));
+        assert_eq!(
+            db.get_list(b"q").unwrap().map(|l| l.len()),
+            Some(1),
+            "producer must own the key's type after a consumer's miss"
+        );
+    }
+
+    /// Wrong-type behaviour is unchanged: the pop reports "nothing" and
+    /// leaves the existing value alone (no clobber, no removal).
+    #[test]
+    fn test_pop_on_wrong_type_leaves_value_intact() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"s"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        assert!(db.list_pop_front(b"s").is_none());
+        assert!(db.zset_pop_min(b"s").is_none());
+        assert_eq!(db.logical_len(), 1);
+        match db.get(b"s").map(|e| e.value.as_redis_value()) {
+            Some(RedisValueRef::String(v)) => assert_eq!(v, b"v"),
+            _ => panic!("string must survive a wrong-type pop"),
+        }
+    }
+
+    /// Regression guard for the found-key path: the last pop still removes
+    /// the key, and a non-final pop still leaves it in place.
+    #[test]
+    fn test_list_pop_removes_key_only_when_it_empties() {
+        let mut db = Database::new();
+        db.list_push_back(b"l", Bytes::from_static(b"a"));
+        db.list_push_back(b"l", Bytes::from_static(b"b"));
+
+        assert_eq!(db.list_pop_front(b"l"), Some(Bytes::from_static(b"a")));
+        assert_eq!(db.logical_len(), 1, "one element left, key stays");
+
+        assert_eq!(db.list_pop_back(b"l"), Some(Bytes::from_static(b"b")));
+        assert_eq!(db.logical_len(), 0, "emptied list must be removed");
+        assert!(db.list_pop_front(b"l").is_none());
+        assert_eq!(db.logical_len(), 0, "and the re-poll must not resurrect it");
+    }
+
+    /// The non-creating lookup must still reach the COLD tier: a list that
+    /// eviction spilled to disk is a real key, and popping it has to promote
+    /// it back rather than answer "missing". (Guards the one behaviour the
+    /// #523/#539 fix could have silently dropped along with the fabrication.)
+    #[test]
+    fn test_list_pop_front_promotes_a_cold_spilled_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"first"));
+        list.push_back(Bytes::from_static(b"second"));
+        let mut db = db_with_spilled_value(tmp.path(), b"coldlist", TestRedisValue::List(list));
+
+        assert_eq!(
+            db.list_pop_front(b"coldlist"),
+            Some(Bytes::from_static(b"first")),
+            "a cold-spilled list must be promoted and popped, not treated as missing"
+        );
+        assert_eq!(
+            db.get_list(b"coldlist").unwrap().map(|l| l.len()),
+            Some(1),
+            "the promoted remainder stays in hot RAM"
+        );
+    }
+
+    /// Same guard on the sorted-set side.
+    #[test]
+    fn test_zset_pop_removes_key_only_when_it_empties() {
+        let mut db = Database::new();
+        {
+            let (members, tree) = db.get_or_create_sorted_set(b"z").unwrap();
+            members.insert(Bytes::from_static(b"a"), 1.0);
+            tree.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
+            members.insert(Bytes::from_static(b"b"), 2.0);
+            tree.insert(OrderedFloat(2.0), Bytes::from_static(b"b"));
+        }
+
+        assert_eq!(db.zset_pop_min(b"z"), Some((Bytes::from_static(b"a"), 1.0)));
+        assert_eq!(db.logical_len(), 1, "one member left, key stays");
+
+        assert_eq!(db.zset_pop_max(b"z"), Some((Bytes::from_static(b"b"), 2.0)));
+        assert_eq!(db.logical_len(), 0, "emptied zset must be removed");
+        assert!(db.zset_pop_max(b"z").is_none());
+        assert_eq!(db.logical_len(), 0, "and the re-poll must not resurrect it");
+    }
 }

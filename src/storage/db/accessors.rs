@@ -114,6 +114,41 @@ impl Database {
         }
     }
 
+    /// Mutable typed access to an **existing** key's full (non-compact)
+    /// encoding — `get_or_create` minus the fabrication step.
+    ///
+    /// A missing key answers `Ok(None)` and leaves the keyspace (and
+    /// `used_memory`) byte-identical: no entry inserted, no birth version
+    /// consumed. Everything else matches `get_or_create` exactly — expired
+    /// keys are dropped, a cold-spilled value is promoted back to hot RAM
+    /// before it is handed out, the kind's compact encoding is upgraded in
+    /// place, and a type mismatch is `Err(WRONGTYPE)`.
+    ///
+    /// This is what the blocking-pop helpers below take (moon#523/#539): a
+    /// pop that finds nothing is a *read* as far as the keyspace is
+    /// concerned, and reads never create.
+    pub fn get_mut_if_present<K: OwnedKind>(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<K::Mut<'_>>, Frame> {
+        let now_ms = self.cached_now_ms;
+        self.drop_if_expired(key, now_ms);
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
+        }
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+        K::upgrade(entry);
+        match entry.value.as_redis_value_mut() {
+            Some(v) => match K::project_mut(v) {
+                Ok(m) => Ok(Some(m)),
+                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
+            },
+            None => Err(Self::wrongtype_error()),
+        }
+    }
+
     /// Read typed access to the full (non-compact) encoding, promoting a
     /// cold-spilled value back to hot RAM on miss (this accessor takes
     /// `&mut self` — unlike the enum-based `get_ref_if_alive` it can
@@ -576,8 +611,14 @@ impl Database {
 
     /// Pop the front element from a list. Returns None if key missing/empty/wrong type.
     /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
+    ///
+    /// moon#523/#539: the lookup is deliberately NON-creating. This helper
+    /// backs the blocking fast path (`try_immediate_pop` → BLPOP/BLMOVE/…),
+    /// so a `get_or_create_list` here materialised an empty list on every
+    /// miss — a phantom key that EXISTS/TYPE/DBSIZE reported, that a later
+    /// RPUSH rejected with WRONGTYPE, and that no path ever removed.
     pub fn list_pop_front(&mut self, key: &[u8]) -> Option<Bytes> {
-        let list = self.get_or_create_list(key).ok()?;
+        let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
         let val = list.pop_front()?;
         let empty = list.is_empty();
         // `list`'s borrow of `self` ends above.
@@ -594,8 +635,10 @@ impl Database {
 
     /// Pop the back element from a list. Returns None if key missing/empty/wrong type.
     /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
+    ///
+    /// Non-creating on a missing key — see [`Self::list_pop_front`].
     pub fn list_pop_back(&mut self, key: &[u8]) -> Option<Bytes> {
-        let list = self.get_or_create_list(key).ok()?;
+        let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
         let val = list.pop_back()?;
         let empty = list.is_empty();
         if empty {
@@ -627,8 +670,12 @@ impl Database {
 
     /// Pop the minimum element from a sorted set. Returns (member, score) or None.
     /// Removes the key if the sorted set becomes empty.
+    ///
+    /// Non-creating on a missing key — see [`Self::list_pop_front`].
     pub fn zset_pop_min(&mut self, key: &[u8]) -> Option<(Bytes, f64)> {
-        let (members, tree) = self.get_or_create_sorted_set(key).ok()?;
+        let (members, tree) = self
+            .get_mut_if_present::<db_kind::SortedSetKind>(key)
+            .ok()??;
         let first = tree.iter().next().map(|(s, m)| (s, m.clone()))?;
         let (score, member) = first;
         tree.remove(score, &member);
@@ -642,8 +689,12 @@ impl Database {
 
     /// Pop the maximum element from a sorted set. Returns (member, score) or None.
     /// Removes the key if the sorted set becomes empty.
+    ///
+    /// Non-creating on a missing key — see [`Self::list_pop_front`].
     pub fn zset_pop_max(&mut self, key: &[u8]) -> Option<(Bytes, f64)> {
-        let (members, tree) = self.get_or_create_sorted_set(key).ok()?;
+        let (members, tree) = self
+            .get_mut_if_present::<db_kind::SortedSetKind>(key)
+            .ok()??;
         let last = tree.iter_rev().next().map(|(s, m)| (s, m.clone()))?;
         let (score, member) = last;
         tree.remove(score, &member);
