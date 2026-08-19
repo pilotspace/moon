@@ -362,28 +362,33 @@ jobs:
         with:
           shared-key: memory-gate
       - name: Install redis tools
-        # Hardened after three hangs-to-timeout on hosted runners (2026-08-19):
+        # Hardened after repeated hangs-to-timeout on hosted runners (2026-08-19):
         # force IPv4 (azure apt mirrors black-hole IPv6), bound every network
-        # operation, and retry — a hung apt must fail THIS step in minutes,
-        # not cancel the whole run at the workflow timeout.
-        timeout-minutes: 5
+        # operation, retry, and — crucially — try the install from the runner's
+        # PRE-BAKED apt lists BEFORE any network `update`. `apt-get update` was
+        # observed timing out at 120s repeatedly during an apt-mirror incident;
+        # redis-tools/jq are already indexed on the ubuntu-latest image, so a
+        # cache-first install succeeds without ever touching the failing mirror.
+        # timeout-minutes must exceed 3 full attempts (install+update+install) so
+        # the retry loop is not cut off mid-flight (the old 5m killed attempt 3).
+        timeout-minutes: 9
         run: |
           # set +e is load-bearing: GitHub's default `shell: bash` is `bash -e`,
           # so the FIRST `apt-get` non-zero (e.g. `timeout` exit 124) aborts the
           # whole step instantly -- the retry loop below never reaches attempt 2.
-          # Observed 2026-08-19: attempt-1 update timed out, step exited 124, no
-          # retry. Disable -e here so a failed attempt falls through to the next.
           set +e
           # DPkg::Lock::Timeout: fresh runners often hold the dpkg frontend
           # lock via unattended-upgrades; without it apt waits FOREVER with no
-          # output (observed: 5-min step timeout, zero log lines). The outer
-          # `timeout` bounds each attempt against any other silent stall.
+          # output. The outer `timeout` bounds each op against any silent stall.
           APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60"
+          install() { sudo timeout 120 apt-get $APT_OPTS install -y -qq redis-tools jq; }
           for i in 1 2 3; do
             echo "apt attempt $i"
-            sudo timeout 120 apt-get $APT_OPTS update -qq \
-              && sudo timeout 120 apt-get $APT_OPTS install -y -qq redis-tools jq \
-              && { echo "apt attempt $i ok"; exit 0; }
+            # 1) cache-first: no network `update`, works during a mirror outage.
+            install && { echo "apt attempt $i ok (cached lists)"; exit 0; }
+            # 2) fall back to refreshing lists, then install again.
+            sudo timeout 120 apt-get $APT_OPTS update -qq
+            install && { echo "apt attempt $i ok (after update)"; exit 0; }
             echo "apt attempt $i failed; retrying" >&2
             sleep 15
           done

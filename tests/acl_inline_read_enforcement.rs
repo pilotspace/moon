@@ -253,3 +253,155 @@ fn key_pattern_enforced_on_inline_get_single_shard() {
 fn key_pattern_enforced_on_inline_get_multi_shard() {
     assert_pattern_enforced("4", "scopedfour");
 }
+
+// ── multi-key commands: every key position must be checked (moon#566) ────
+//
+// The ACL key check used to read a command's keys from a hand-maintained
+// name-keyed match whose fallthrough was an empty list — and an empty key
+// list makes the permission loop a no-op, so `~pattern` was ignored outright
+// for every command it forgot. The commands below are the ones that had that
+// shape; they are exercised END TO END here (through the real dispatch path
+// of the handler the build actually ships) because the hole was invisible to
+// every unit test that only asked about GET/SET/MSET.
+//
+// `GET` in the same run is the inline-fast-path control: the fast path is
+// gated on `acl_skip_allowed()`, so a restricted user must fall back to the
+// generic path and be checked there — in-pattern GET still has to work.
+
+/// Out-of-pattern argv per command. Every entry must be answered `-NOPERM`.
+fn out_of_pattern_probes() -> Vec<Vec<String>> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    vec![
+        // two-key forms: SOURCE out of pattern, then DESTINATION out of pattern
+        s(&["SMOVE", "evil:src", "app:{t}:dst", "m"]),
+        s(&["SMOVE", "app:{t}:src", "evil:dst", "m"]),
+        s(&["COPY", "evil:src", "app:{t}:dst"]),
+        s(&["COPY", "app:{t}:src", "evil:dst"]),
+        s(&["ZRANGESTORE", "evil:dst", "app:{t}:src", "0", "-1"]),
+        s(&["ZRANGESTORE", "app:{t}:dst", "evil:src", "0", "-1"]),
+        s(&["LMOVE", "evil:src", "app:{t}:dst", "LEFT", "RIGHT"]),
+        s(&["LMOVE", "app:{t}:src", "evil:dst", "LEFT", "RIGHT"]),
+        // numkeys families: first slot, then a later slot
+        s(&["LMPOP", "2", "evil:a", "app:{t}:b", "LEFT"]),
+        s(&["LMPOP", "2", "app:{t}:a", "evil:b", "LEFT"]),
+        s(&["ZMPOP", "2", "app:{t}:a", "evil:b", "MIN"]),
+        s(&["BLMPOP", "0.01", "2", "app:{t}:a", "evil:b", "LEFT"]),
+        s(&["BZMPOP", "0.01", "2", "app:{t}:a", "evil:b", "MIN"]),
+        s(&["SINTERCARD", "2", "app:{t}:a", "evil:b"]),
+        s(&["ZDIFF", "2", "app:{t}:a", "evil:b"]),
+        s(&["ZINTER", "2", "app:{t}:a", "evil:b"]),
+        s(&["ZUNION", "2", "app:{t}:a", "evil:b"]),
+        s(&["ZINTERCARD", "2", "app:{t}:a", "evil:b"]),
+        s(&["ZUNIONSTORE", "evil:dst", "2", "app:{t}:a", "app:{t}:b"]),
+        s(&["ZUNIONSTORE", "app:{t}:dst", "2", "app:{t}:a", "evil:b"]),
+        // positional STORE clauses
+        s(&["SORT", "evil:src", "STORE", "app:{t}:dst"]),
+        s(&["SORT", "app:{t}:src", "STORE", "evil:dst"]),
+        s(&["SORT", "app:{t}:src", "BY", "evil:*"]),
+        s(&[
+            "GEORADIUS",
+            "app:{t}:geo",
+            "0",
+            "0",
+            "1",
+            "km",
+            "STORE",
+            "evil:dst",
+        ]),
+        // streams, scripting, subcommand-shaped key positions
+        s(&["XREAD", "COUNT", "1", "STREAMS", "evil:s", "0"]),
+        s(&["EVAL", "return 1", "1", "evil:a"]),
+        s(&["OBJECT", "ENCODING", "evil:a"]),
+        s(&["MEMORY", "USAGE", "evil:a"]),
+        // plain single-key control (was already enforced)
+        s(&["GET", "evil:a"]),
+        s(&["SET", "evil:a", "v"]),
+    ]
+}
+
+/// In-pattern argv that must NOT be refused: proves the fix is enforcement,
+/// not a blanket denial. Replies may be errors of other kinds (empty key,
+/// wrong type) — only `-NOPERM` is a failure.
+fn in_pattern_probes() -> Vec<Vec<String>> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    vec![
+        s(&["GET", "app:{t}:str"]),
+        s(&["SET", "app:{t}:str", "v"]),
+        s(&["SMOVE", "app:{t}:s1", "app:{t}:s2", "m"]),
+        s(&["COPY", "app:{t}:str", "app:{t}:copy"]),
+        s(&["ZRANGESTORE", "app:{t}:zd", "app:{t}:z1", "0", "-1"]),
+        s(&["LMPOP", "2", "app:{t}:l1", "app:{t}:l2", "LEFT"]),
+        s(&["SINTERCARD", "2", "app:{t}:s1", "app:{t}:s2"]),
+        s(&["ZDIFF", "2", "app:{t}:z1", "app:{t}:z2"]),
+        s(&["ZUNIONSTORE", "app:{t}:zd", "2", "app:{t}:z1", "app:{t}:z2"]),
+        s(&["SORT", "app:{t}:l1", "ALPHA", "STORE", "app:{t}:sorted"]),
+        s(&["EVAL", "return 1", "1", "app:{t}:str"]),
+        s(&["OBJECT", "ENCODING", "app:{t}:str"]),
+        // keyless commands must be completely unaffected by the key check
+        s(&["PING"]),
+        s(&["ECHO", "hi"]),
+        s(&["DBSIZE"]),
+        s(&["COMMAND", "COUNT"]),
+        s(&["SCAN", "0"]),
+    ]
+}
+
+fn assert_multi_key_patterns_enforced(shards: &str, user: &str) {
+    let m = spawn_moon(shards);
+    seed(m.port, user, &["+@all", "~app:*"]);
+
+    // Seed the in-pattern fixtures with an admin connection.
+    let mut admin = Resp::connect(m.port);
+    assert!(admin.cmd(&["SET", "app:{t}:str", "v"]).starts_with("+OK"));
+    admin.cmd(&["SADD", "app:{t}:s1", "m"]);
+    admin.cmd(&["SADD", "app:{t}:s2", "m2"]);
+    admin.cmd(&["ZADD", "app:{t}:z1", "1", "a"]);
+    admin.cmd(&["ZADD", "app:{t}:z2", "1", "b"]);
+    admin.cmd(&["RPUSH", "app:{t}:l1", "a"]);
+    admin.cmd(&["RPUSH", "app:{t}:l2", "b"]);
+
+    let mut c = Resp::connect(m.port);
+    assert!(c.cmd(&["AUTH", user, "pw"]).starts_with("+OK"));
+
+    let mut allowed_through = Vec::new();
+    for probe in out_of_pattern_probes() {
+        let argv: Vec<&str> = probe.iter().map(String::as_str).collect();
+        let reply = c.cmd(&argv);
+        if !reply.starts_with("-NOPERM") {
+            allowed_through.push((probe.join(" "), reply.replace("\r\n", "\\r\\n")));
+        }
+    }
+    assert!(
+        allowed_through.is_empty(),
+        "--shards {shards}: user '{user}' (~app:*) reached keys outside its pattern through \
+         {} command(s); every one must answer -NOPERM. Got: {:?}",
+        allowed_through.len(),
+        allowed_through
+    );
+
+    let mut over_denied = Vec::new();
+    for probe in in_pattern_probes() {
+        let argv: Vec<&str> = probe.iter().map(String::as_str).collect();
+        let reply = c.cmd(&argv);
+        if reply.starts_with("-NOPERM") {
+            over_denied.push((probe.join(" "), reply.replace("\r\n", "\\r\\n")));
+        }
+    }
+    assert!(
+        over_denied.is_empty(),
+        "--shards {shards}: user '{user}' (~app:*) was denied {} in-pattern or keyless \
+         command(s) — the fail-closed default must not over-deny. Got: {:?}",
+        over_denied.len(),
+        over_denied
+    );
+}
+
+#[test]
+fn multi_key_commands_enforce_key_patterns_single_shard() {
+    assert_multi_key_patterns_enforced("1", "multione");
+}
+
+#[test]
+fn multi_key_commands_enforce_key_patterns_multi_shard() {
+    assert_multi_key_patterns_enforced("4", "multifour");
+}

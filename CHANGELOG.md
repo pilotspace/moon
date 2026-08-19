@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **ACL `~pattern` restrictions were silently unenforced for most multi-key commands** (#566).
+  `AclTable::check_key_permission` read a command's keys from `extract_command_keys`, a
+  hand-maintained match on the command name whose fallthrough returned an EMPTY key list — and an
+  empty key list is not "checked less precisely", it makes the permission loop a no-op, so every
+  `~pattern` was ignored outright for any command the list forgot. Measured against a live server,
+  a user restricted to `~app:*` reached arbitrary keys through 21 distinct commands, in both
+  `--shards 1` and `--shards 4`: `COPY`, `ZRANGESTORE` (both positions), `SMOVE`'s DESTINATION (it
+  was listed, but as a single-key command), `LMPOP`/`ZMPOP`/`BLMPOP`/`BZMPOP`, `SINTERCARD`,
+  `ZDIFF`/`ZINTER`/`ZUNION`/`ZINTERCARD`, `SORT ... STORE`, `SORT ... BY <pattern>`,
+  `GEORADIUS ... STORE`, `EVAL`'s declared keys and `MEMORY USAGE`.
+  Key extraction is now **derived from the command registry's key specs**
+  (`COMMAND_META` `first_key`/`last_key`/`step`), so a command that declares its keys is enforced
+  automatically; hand-written arms remain only for layouts a fixed spec cannot express (`numkeys`
+  vectors, positional `STORE` clauses, the `STREAMS` token, subcommand-shaped key positions).
+  Extraction **fails closed**: a command that names keys but whose argv cannot be enumerated — or a
+  command missing from the registry entirely — is DENIED with the standard `NOPERM` error and
+  logged once per command name, so the next command that ships without a key spec fails safe
+  instead of falling open. `SORT`'s `BY`/`GET` patterns read key names computed at runtime and are
+  therefore refused for key-restricted users (`BY nosort` / `GET #` are unaffected). Commands that
+  genuinely name no key (`PING`, `CONFIG`, `SUBSCRIBE`, `KEYS`, the `FT.*`/`GRAPH.*` families, ...)
+  are unaffected, and a registry sweep test now fails if a NEW command declares no keys without
+  being reviewed. Unrestricted and `~*` users still short-circuit before any extraction; the new
+  path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
+
 ### Fixed
 - **Blocking pops queued inside `MULTI` answer the wrong reply SHAPE** (#524). `BLPOP`/`BRPOP`/
   `BZPOPMIN`/`BZPOPMAX` were rewritten at queue time into `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX`, whose
