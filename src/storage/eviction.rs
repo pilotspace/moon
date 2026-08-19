@@ -763,7 +763,7 @@ fn select_victim(
             find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
         }
         EvictionPolicy::VolatileRandom => find_victim_random(db, true),
-        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db),
     }
 }
 
@@ -1202,33 +1202,12 @@ fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> 
     sample_random_keys(db, 1, volatile_only).into_iter().next()
 }
 
-/// Find the victim key with the soonest TTL expiration from a random sample.
-fn find_victim_volatile_ttl(db: &Database, samples: usize) -> Option<CompactKey> {
-    let sampled = sample_random_keys(db, samples, true);
-    if sampled.is_empty() {
-        return None;
-    }
-
-    let mut evict_key: Option<CompactKey> = None;
-    let mut soonest_expiry: Option<u64> = None;
-
-    for key in sampled.iter() {
-        if let Some(entry) = db.data().get(key.as_bytes()) {
-            if entry.has_expiry() {
-                let exp = entry.expires_at_ms();
-                let should_evict = match soonest_expiry {
-                    None => true,
-                    Some(soonest) => exp < soonest,
-                };
-                if should_evict {
-                    evict_key = Some(key.clone());
-                    soonest_expiry = Some(exp);
-                }
-            }
-        }
-    }
-
-    evict_key
+/// Find the victim with the globally nearest expiry — exact, via the
+/// deadline-ordered expiry index (#541), O(log n). Replaces the old
+/// random-sampling approximation (#551), which could miss the soonest
+/// key entirely when it was buried among many far-future volatiles.
+fn find_victim_volatile_ttl(db: &Database) -> Option<CompactKey> {
+    db.peek_nearest_expiry().map(|(_, key)| key)
 }
 
 #[cfg(test)]
@@ -1243,8 +1222,8 @@ mod tests {
         }
     }
 
-    fn evict_one_volatile_ttl(db: &mut super::Database, samples: usize) -> bool {
-        if let Some(key) = super::find_victim_volatile_ttl(db, samples) {
+    fn evict_one_volatile_ttl(db: &mut super::Database, _samples: usize) -> bool {
+        if let Some(key) = super::find_victim_volatile_ttl(db) {
             db.remove(key.as_bytes());
             true
         } else {
@@ -1256,6 +1235,34 @@ mod tests {
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
+
+    /// moon#551: volatile-ttl must evict the GLOBALLY nearest-expiry key,
+    /// not the nearest within a random sample. With one soon-expiring key
+    /// buried among 5_000 far-future volatile keys, a 5-key sample picks
+    /// it with probability ~0.1%; the deadline-index head always does.
+    #[test]
+    fn volatile_ttl_evicts_globally_nearest_expiry() {
+        let mut db = super::Database::new();
+        let far_ms = current_time_ms() + 3_600_000;
+        for i in 0..5_000u32 {
+            db.set(
+                Bytes::from(format!("far_{i}")),
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), far_ms + u64::from(i)),
+            );
+        }
+        // Volatile and clearly the soonest, but NOT expired.
+        db.set(
+            Bytes::from_static(b"soonest"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
+        );
+
+        assert!(evict_one_volatile_ttl(&mut db, 5));
+        assert!(
+            db.data().get(&b"soonest"[..]).is_none(),
+            "the globally nearest-expiry key must be the victim"
+        );
+        assert_eq!(db.len(), 5_000, "exactly one key evicted");
+    }
 
     #[test]
     fn spill_payload_round_trips_through_rehydrate() {
