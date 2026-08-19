@@ -368,9 +368,16 @@ jobs:
         # not cancel the whole run at the workflow timeout.
         timeout-minutes: 5
         run: |
-          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          # DPkg::Lock::Timeout: fresh runners often hold the dpkg frontend
+          # lock via unattended-upgrades; without it apt waits FOREVER with no
+          # output (observed: 5-min step timeout, zero log lines). The outer
+          # `timeout 90` bounds each attempt against any other silent stall.
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60"
           for i in 1 2 3; do
-            sudo apt-get $APT_OPTS update -qq && sudo apt-get $APT_OPTS install -y -qq redis-tools jq && exit 0
+            echo "apt attempt $i: update"
+            sudo timeout 90 apt-get $APT_OPTS update -qq
+            echo "apt attempt $i: install"
+            sudo timeout 90 apt-get $APT_OPTS install -y -qq redis-tools jq && exit 0
             echo "apt attempt $i failed; retrying" >&2
             sleep 10
           done
