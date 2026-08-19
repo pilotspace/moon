@@ -252,6 +252,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are pinned as one test beside the live handler.
 
 ### Fixed
+- **ACL key patterns are now enforced for `RPOPLPUSH` and `BRPOPLPUSH`** (#520). The ACL layer
+  extracts a command's key arguments from a name table, and a command missing from that table
+  falls through to an empty key list — which makes the permission loop a no-op, so every `~pattern`
+  is ignored rather than merely approximated. `LMOVE`/`BLMOVE` were listed; their `RPOPLPUSH`
+  siblings, with the identical two-key layout, were not. A `~cache:*` user could therefore move an
+  element out of any key in the keyspace into any other. Found while wiring #520; `BRPOPLPUSH` was
+  already reachable, so this closes a live hole as well as pre-empting one in the new command.
 - **`XREADGROUP` in history mode answers the stream, not a null** (#526). `XREADGROUP ... STREAMS
   s 0` asks for the consumer's PENDING entries; Redis serves the stream before it knows whether
   the PEL slice has anything in it, so an empty PEL replies `*1\r\n*2\r\n$1\r\ns\r\n*0\r\n` —
