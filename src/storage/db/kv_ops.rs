@@ -331,7 +331,18 @@ impl Database {
         }
         let new_cost = entry_overhead(&key, &entry);
         let has_expiry = entry.has_expiry();
+        let new_ttl = entry.expires_at_ms();
+        // moon#541: a HashWithTtl value arriving whole (RESTORE, cold
+        // promotion, replication apply) must arm the hash-field-TTL latch —
+        // one discriminant match on the write path, no allocation.
+        if matches!(
+            entry.value.as_redis_value(),
+            crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
+        ) {
+            self.hash_field_ttl_latch = true;
+        }
         let mut old_cost: usize = 0;
+        let mut old_ttl: u64 = 0;
 
         // Cell enables interior mutability through shared references, allowing
         // both closures to capture &entry_cell without conflicting &mut borrows.
@@ -353,6 +364,7 @@ impl Database {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");
                 old_cost = entry_overhead(&key, existing);
+                old_ttl = existing.expires_at_ms();
                 let new_version = Entry::bump_version(existing.version());
                 *existing = new_entry;
                 existing.set_version(new_version);
@@ -410,6 +422,17 @@ impl Database {
         if has_expiry {
             self.maybe_has_expiring_keys = true;
         }
+        // moon#541: keep the deadline index in lock-step across all four
+        // TTL transitions (none→ttl, ttl→none, ttl→ttl', unchanged). The
+        // `Inserted` arm leaves `old_ttl` at 0, so this covers both paths.
+        if old_ttl != new_ttl {
+            if old_ttl != 0 {
+                self.expiry_index_remove(old_ttl, &key);
+            }
+            if new_ttl != 0 {
+                self.expiry_index_insert(new_ttl, &key);
+            }
+        }
     }
 
     /// Clear all entries and reset memory accounting.
@@ -423,6 +446,8 @@ impl Database {
         self.data = DashTable::new();
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
+        self.expiry_index.clear();
+        self.hash_field_ttl_latch = false;
         self.hot_keys.clear();
         // D1: FLUSH must clear the cold tier too, or flushed keys stay
         // readable via cold read-through. Files are queued for unlink and
@@ -454,6 +479,13 @@ impl Database {
     pub fn insert_for_load(&mut self, key: Bytes, mut entry: Entry) {
         if entry.has_expiry() {
             self.maybe_has_expiring_keys = true;
+            self.expiry_index_insert(entry.expires_at_ms(), &key);
+        }
+        if matches!(
+            entry.value.as_redis_value(),
+            crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
+        ) {
+            self.hash_field_ttl_latch = true;
         }
         entry.set_version(self.next_birth_version());
         self.data.insert(CompactKey::from(key), entry);
@@ -463,14 +495,30 @@ impl Database {
     pub fn recalculate_memory(&mut self) {
         let mut total = 0usize;
         let mut any_expiring = false;
+        // moon#541: this post-bulk-load pass is also the index's healer —
+        // rebuild it from scratch so any load path that bypassed
+        // `insert_for_load` still ends consistent.
+        let mut index = std::collections::BTreeSet::new();
+        let mut any_hash_ttl = false;
         for (key, entry) in self.data.iter() {
             total += entry_overhead(key.as_bytes(), entry);
             if entry.has_expiry() {
                 any_expiring = true;
+                index.insert((entry.expires_at_ms(), key.clone()));
+            }
+            if matches!(
+                entry.value.as_redis_value(),
+                crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
+            ) {
+                any_hash_ttl = true;
             }
         }
         self.used_memory = total;
         self.maybe_has_expiring_keys = any_expiring;
+        self.expiry_index = index;
+        if any_hash_ttl {
+            self.hash_field_ttl_latch = true;
+        }
     }
 
     /// Pre-size the internal hash table for an expected key count.
@@ -547,9 +595,13 @@ impl Database {
     }
 
     #[inline]
-    fn remove_hot(&mut self, key: &[u8]) -> Option<Entry> {
+    pub(super) fn remove_hot(&mut self, key: &[u8]) -> Option<Entry> {
         if let Some(entry) = self.data.remove(key) {
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            // moon#541: unindex — the removed entry knows its own pair.
+            if entry.has_expiry() {
+                self.expiry_index_remove(entry.expires_at_ms(), key);
+            }
             Some(entry)
         } else {
             None
@@ -888,30 +940,45 @@ impl Database {
         crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         if Self::check_expired(&self.data, key, now_ms) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
+            // moon#541 rides moon#542: HIDE the expired key and queue it for
+            // the emitting drain instead of removing it silently here — a
+            // physical removal on this path emitted neither the `expired`
+            // notification nor the dual-plane DEL, recreating for EXPIRE
+            // exactly the divergence #542 closed for reads.
+            self.note_lazy_expired(key);
             return false;
         }
-        match self.data.get_mut(key) {
+        let old_ttl = match self.data.get_mut(key) {
             Some(entry) => {
+                let old = entry.expires_at_ms();
                 entry.set_expires_at_ms(expires_at_ms);
-                // Latch the fast-path flag once a TTL is set. Persist (0) may
-                // clear the per-entry bit but we don't flip the DB-level flag
-                // down — the active-expiry scan's self-reset gate is the only
-                // authoritative downgrade path (avoids racy decrement logic).
-                if expires_at_ms != 0 {
-                    self.maybe_has_expiring_keys = true;
-                }
-                true
+                old
             }
-            None => false,
+            None => return false,
+        };
+        // Latch the fast-path flag once a TTL is set. Persist (0) may
+        // clear the per-entry bit but we don't flip the DB-level flag
+        // down — the active-expiry scan's self-reset gate is the only
+        // authoritative downgrade path (avoids racy decrement logic).
+        if expires_at_ms != 0 {
+            self.maybe_has_expiring_keys = true;
         }
+        // moon#541: retarget the index pair.
+        if old_ttl != expires_at_ms {
+            if old_ttl != 0 {
+                self.expiry_index_remove(old_ttl, key);
+            }
+            if expires_at_ms != 0 {
+                self.expiry_index_insert(expires_at_ms, key);
+            }
+        }
+        true
     }
 
-    /// Count entries that have an expiration set.
+    /// Count entries that have an expiration set. O(1) via the deadline
+    /// index (moon#541) — previously an O(N) scan.
     pub fn expires_count(&self) -> usize {
-        self.data.values().filter(|e| e.has_expiry()).count()
+        self.expiry_index_len()
     }
 
     /// Check if an entry is expired without requiring &mut self.

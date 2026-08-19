@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
+  Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
+  index, maintained O(log n) by the storage-layer writers; the 100ms sweep pops exactly the DUE
+  keys off the front — no 20-key random sample (which went blind when due keys were a small
+  fraction of the volatile population, leaving them resident for many ticks), and no O(N)
+  full-map scans (three per tick on any database with even one TTL'd key). Measured on a
+  100K-volatile-key database: 1.36ms → 47ns per tick, and the old cost exceeded the sweep's own
+  1ms budget before it had expired anything. The hash-field-TTL sweep is now latch-gated too, so
+  databases that never touch HEXPIRE skip its scan entirely (the scan itself when the latch is up
+  remains O(N) — #543). `INFO`'s `expires` count reads the index, O(1). Along the way, two
+  writers that bypassed the expiry machinery were rerouted: GETEX's TTL options now go through
+  `set_expiry` (previously a GETEX-only TTL never armed the sweep latch, so the key was invisible
+  to active expiry forever), and EXPIRE-family commands hitting an already-expired key now hide
+  and queue it for the emitting drain (#542 semantics) instead of deleting it silently with no
+  `expired` notification and no dual-plane DEL.
+
 ### Added
 - **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
   into the `client-compat` CI job. The raw-RESP differ compares bytes against a real redis-server;

@@ -282,6 +282,26 @@ pub struct Database {
     /// memory — and hidden keys are exactly Redis's replica semantics:
     /// logically absent, physically present until the master says so.
     pending_expired: Vec<CompactKey>,
+    /// Deadline-ordered whole-key expiry index (moon#541): one
+    /// `(expires_at_ms, key)` pair per HOT entry with `ttl_ms != 0`,
+    /// kept in lock-step by every writer that changes a key's TTL state
+    /// (`set` / `set_expiry` / `insert_for_load` / `remove_hot` / `clear`
+    /// / `recalculate_memory` — "sweep state writers, not command names").
+    /// The active-expiry sweep pops exactly the DUE pairs from the front —
+    /// no sampling, no O(N) scan; maintenance is O(log n) per TTL write.
+    /// Cold-spilled keys are NOT indexed (eviction removes the hot entry,
+    /// unindexing it) — exactly mirroring the old scan, which only ever
+    /// walked hot entries; cold TTLs stay lazy-only. The index's own
+    /// memory (~48B/pair) is metadata outside `used_memory`, like every
+    /// other side table here.
+    expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
+    /// Conservative "some `HashWithTtl` value may exist" latch (moon#541),
+    /// mirroring `maybe_has_expiring_keys` for hash-FIELD TTLs: raised when
+    /// a field TTL is stored (or a `HashWithTtl` value is written/loaded),
+    /// lowered only by the sweep's self-reset gate when its scan confirms
+    /// none remain. Lets `expire_cycle` skip the O(N) `HashWithTtl` scan
+    /// entirely for workloads that never touch HEXPIRE — the common case.
+    hash_field_ttl_latch: bool,
 }
 
 /// Bound on [`Database::pending_expired`]. 8192 keys ≈ 200KB of inline
@@ -323,6 +343,8 @@ impl Database {
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             birth_counter: 0,
+            expiry_index: std::collections::BTreeSet::new(),
+            hash_field_ttl_latch: false,
         }
     }
 
@@ -351,6 +373,8 @@ impl Database {
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             birth_counter: 0,
+            expiry_index: std::collections::BTreeSet::new(),
+            hash_field_ttl_latch: false,
         }
     }
 
@@ -477,6 +501,89 @@ impl Database {
     #[inline]
     pub fn clear_maybe_has_expiring_keys(&mut self) {
         self.maybe_has_expiring_keys = false;
+    }
+
+    // ── moon#541: deadline-ordered expiry index ─────────────────────────
+
+    /// Earliest `(expires_at_ms, key)` pair that is due at `now_ms`, or
+    /// `None` when nothing is due. O(log n). Returns a clone (inline for
+    /// keys ≤ 23B) so the sweep can mutate the db while holding it.
+    #[inline]
+    pub fn peek_due_expiry(&self, now_ms: u64) -> Option<(u64, CompactKey)> {
+        self.expiry_index
+            .first()
+            .filter(|(ts, _)| *ts <= now_ms)
+            .cloned()
+    }
+
+    /// Drop one specific index pair. The sweep calls this when a popped
+    /// pair fails re-verification (the entry is gone or carries a different
+    /// TTL — a stale pair): without dropping it, the sweep would peek the
+    /// same head pair forever.
+    #[inline]
+    pub fn drop_expiry_index_pair(&mut self, ts: u64, key: &CompactKey) {
+        self.expiry_index.remove(&(ts, key.clone()));
+    }
+
+    /// Number of indexed (hot, TTL-carrying) keys. Exact — backs
+    /// `expires_count` and the sweep's flag maintenance.
+    #[inline]
+    pub fn expiry_index_len(&self) -> usize {
+        self.expiry_index.len()
+    }
+
+    /// O(1) "zero hot keys carry a TTL" — the sweep's flag-maintenance
+    /// check, replacing the old O(N) `keys_with_expiry().is_empty()` scan.
+    #[inline]
+    pub fn expiry_index_is_empty(&self) -> bool {
+        self.expiry_index.is_empty()
+    }
+
+    /// Insert an index pair. Callers pass `ttl_ms != 0` only.
+    #[inline]
+    pub(crate) fn expiry_index_insert(&mut self, ttl_ms: u64, key: &[u8]) {
+        self.expiry_index.insert((ttl_ms, CompactKey::from(key)));
+    }
+
+    /// Remove an index pair. Callers pass the entry's CURRENT `ttl_ms`
+    /// (`!= 0`) — the pair the writers inserted for it.
+    #[inline]
+    pub(crate) fn expiry_index_remove(&mut self, ttl_ms: u64, key: &[u8]) {
+        self.expiry_index.remove(&(ttl_ms, CompactKey::from(key)));
+    }
+
+    /// Conservative hash-field-TTL latch (see field doc). `true` = a
+    /// `HashWithTtl` value MAY exist and the sweep must run its scan.
+    #[inline]
+    pub fn hash_field_ttl_possible(&self) -> bool {
+        self.hash_field_ttl_latch
+    }
+
+    /// Lower the latch. Only `expire_cycle`'s self-reset gate may call
+    /// this, and only after a scan proved zero `HashWithTtl` keys remain.
+    #[inline]
+    pub fn clear_hash_field_ttl_latch(&mut self) {
+        self.hash_field_ttl_latch = false;
+    }
+
+    /// Full-scan consistency oracle for the expiry index (tests + the
+    /// #541 property battery — O(N), never call on a hot path): the index
+    /// must equal the scan-derived pair set exactly, and the hash latch
+    /// must be conservative (any `HashWithTtl` present ⇒ latch raised).
+    pub fn debug_expiry_index_consistent(&self) -> bool {
+        let scan: std::collections::BTreeSet<(u64, CompactKey)> = self
+            .data
+            .iter()
+            .filter(|(_, e)| e.has_expiry())
+            .map(|(k, e)| (e.expires_at_ms(), k.clone()))
+            .collect();
+        let any_hash_ttl = self.data.iter().any(|(_, e)| {
+            matches!(
+                e.value.as_redis_value(),
+                crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
+            )
+        });
+        scan == self.expiry_index && (!any_hash_ttl || self.hash_field_ttl_latch)
     }
 
     /// Record a key a lazy read discovered expired (moon#542) so the next
@@ -989,6 +1096,138 @@ mod tests {
         );
         assert!(db.is_key_expired(b"expired"));
         assert!(!db.is_key_expired(b"missing"));
+    }
+
+    // ── moon#541: deadline-ordered expiry index ──────────────────────────
+
+    /// Every writer that changes a key's TTL state must keep the expiry
+    /// index in lock-step with the data map ("sweep state writers, not
+    /// command names"): a missed insert means the key never actively
+    /// expires; a missed remove means the sweep chews stale pairs.
+    #[test]
+    fn expiry_index_mirrors_every_ttl_writer() {
+        let mut db = Database::new();
+        assert!(db.debug_expiry_index_consistent());
+        let future_ms = current_time_ms() + 3_600_000;
+
+        // set: fresh key with TTL
+        db.set(
+            Bytes::from_static(b"a"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
+        );
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // set: fresh key without TTL
+        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"v"));
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // overwrite: TTL -> no TTL
+        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"v2"));
+        assert_eq!(db.expiry_index_len(), 0);
+        assert!(db.debug_expiry_index_consistent());
+
+        // overwrite: no TTL -> TTL
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
+        );
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // overwrite: TTL -> different TTL (old pair must go, not linger)
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v3"), future_ms + 500),
+        );
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // set_expiry: retarget, then PERSIST (0)
+        assert!(db.set_expiry(b"b", future_ms + 1_000));
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+        assert!(db.set_expiry(b"b", 0));
+        assert_eq!(db.expiry_index_len(), 0);
+        assert!(db.debug_expiry_index_consistent());
+
+        // set_expiry: arm a plain key
+        assert!(db.set_expiry(b"a", future_ms));
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // remove
+        db.remove(b"a");
+        assert_eq!(db.expiry_index_len(), 0);
+        assert!(db.debug_expiry_index_consistent());
+
+        // insert_for_load (bulk restore path)
+        db.insert_for_load(
+            Bytes::from_static(b"c"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
+        );
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+
+        // write-path expired drop (get_or_create on an expired key)
+        db.set_cached_now_ms_for_test(future_ms + 1);
+        let _ = db.get_or_create_hash(b"c").expect("fresh hash");
+        assert_eq!(db.expiry_index_len(), 0, "expired drop must unindex");
+        assert!(db.debug_expiry_index_consistent());
+
+        // clear
+        db.set(
+            Bytes::from_static(b"d"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms + 3_600_000),
+        );
+        db.clear();
+        assert_eq!(db.expiry_index_len(), 0);
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// moon#541 rides moon#542's machinery: EXPIRE hitting a lazily-expired
+    /// key must HIDE it and queue it for the emitting drain — the old code
+    /// physically removed it here, silently (no notification, no dual-plane
+    /// DEL), recreating exactly the divergence #542 closed for reads.
+    #[test]
+    fn set_expiry_on_lazily_expired_key_hides_and_queues() {
+        let mut db = Database::new();
+        let future_ms = db.now_ms() + 1_000;
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
+        );
+        db.set_cached_now_ms_for_test(future_ms + 1);
+
+        assert!(
+            !db.set_expiry(b"k", future_ms + 60_000),
+            "expired key: EXPIRE answers 0"
+        );
+        assert_eq!(db.data().len(), 1, "must hide, not silently delete");
+        assert_eq!(
+            db.pending_lazy_expired_len(),
+            1,
+            "must queue for the emitting drain"
+        );
+    }
+
+    /// The hash-field-TTL latch arms when a field TTL is stored and lets the
+    /// sweep skip the O(N) HashWithTtl scan for the (overwhelmingly common)
+    /// workloads that never touch HEXPIRE.
+    #[test]
+    fn hash_field_ttl_latch_arms_on_field_ttl() {
+        let mut db = Database::new();
+        assert!(!db.hash_field_ttl_possible());
+        {
+            let map = db.get_or_create_hash(b"h").expect("hash");
+            map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        }
+        assert!(!db.hash_field_ttl_possible(), "plain hash must not arm it");
+        let future_ms = db.now_ms() + 60_000;
+        let r = db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Always);
+        assert_eq!(r, Ok(1));
+        assert!(db.hash_field_ttl_possible());
     }
 
     #[test]
