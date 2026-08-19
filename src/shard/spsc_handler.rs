@@ -2057,7 +2057,38 @@ pub(crate) fn handle_shard_message_shared(
                 wait_id,
                 cmd,
                 reply_tx,
+                sole_key,
             } = *payload;
+            // moon#556: THIS shard owns the key, so it is the only one that
+            // can answer the type question for it. A blocking pop on an
+            // existing key of the wrong type is an immediate `-WRONGTYPE` in
+            // Redis; the client's own pre-registration scan cannot see a key
+            // it does not own, so the check has to happen here too or the
+            // remote case keeps the old behaviour (the waker finds nothing to
+            // pop and answers a null the client reads as "empty").
+            //
+            // Gated on `sole_key`: for a multi-key waiter the sibling keys are
+            // registered on other shards and may be serving right now, and an
+            // error raised here would race a real wake-up whose element has
+            // already left the keyspace. Those keep the pre-#556 behaviour.
+            let type_error = if sole_key {
+                crate::shard::slice::with_shard_db(db_index, |guard| {
+                    match cmd.family() {
+                        crate::blocking::WaitFamily::List => guard.get_list(&key).err(),
+                        crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
+                        // XREAD does its own type handling.
+                        crate::blocking::WaitFamily::Stream => None,
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(err) = type_error {
+                // Never registered, so there is nothing to unwind: the
+                // client's `BlockCancel` on the way out is a no-op.
+                let _ = reply_tx.send(Some(err));
+                return;
+            }
             let entry = crate::blocking::WaitEntry {
                 wait_id,
                 cmd,

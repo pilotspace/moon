@@ -189,27 +189,47 @@ pub fn try_wake_list_waiter(
                 wherefrom,
                 whereto,
             } => {
-                let val = match wherefrom {
-                    Direction::Left => db.list_pop_front(key),
-                    Direction::Right => db.list_pop_back(key),
+                // moon#556: a destination of the wrong type is the client's
+                // ERROR, never a reason to consume the element. Redis checks
+                // it before popping (`serveClientBlockedOnList`) and unblocks
+                // the waiter with `-WRONGTYPE`; moon used to pop, hand the
+                // value to the client in its reply, and lose it on the way to
+                // the destination — `list_push_*` swallows a wrong-typed
+                // target in an `if let Ok(list)`.
+                //
+                // `destination == key` is the rotate form: same key, same
+                // type, nothing to check.
+                let dest_err = if destination == key {
+                    None
+                } else {
+                    db.get_list(destination).err()
                 };
-                match val {
-                    Some(v) => {
-                        // Push to destination
-                        match whereto {
-                            Direction::Left => db.list_push_front(destination, v.clone()),
-                            Direction::Right => db.list_push_back(destination, v.clone()),
+                if let Some(err) = dest_err {
+                    // No undo: nothing was popped.
+                    (Some(err), None)
+                } else {
+                    let val = match wherefrom {
+                        Direction::Left => db.list_pop_front(key),
+                        Direction::Right => db.list_pop_back(key),
+                    };
+                    match val {
+                        Some(v) => {
+                            // Push to destination
+                            match whereto {
+                                Direction::Left => db.list_push_front(destination, v.clone()),
+                                Direction::Right => db.list_push_back(destination, v.clone()),
+                            }
+                            (
+                                Some(Frame::BulkString(v)),
+                                Some(WakeUndo::Moved {
+                                    destination: destination.clone(),
+                                    wherefrom: *wherefrom,
+                                    whereto: *whereto,
+                                }),
+                            )
                         }
-                        (
-                            Some(Frame::BulkString(v)),
-                            Some(WakeUndo::Moved {
-                                destination: destination.clone(),
-                                wherefrom: *wherefrom,
-                                whereto: *whereto,
-                            }),
-                        )
+                        None => (None, None),
                     }
-                    None => (None, None),
                 }
             }
             BlockedCommand::BLMPop { dir, count } => {
@@ -608,6 +628,55 @@ mod dead_waiter_tests {
         assert!(!woke);
         assert_eq!(list_len(&mut db, &src), 1, "source keeps the element");
         assert_eq!(list_len(&mut db, &dst), 0, "destination untouched");
+    }
+
+    /// moon#556: a woken BLMOVE whose DESTINATION holds the wrong type is
+    /// answered `-WRONGTYPE`, and the element stays in the source.
+    ///
+    /// Pre-fix the pop happened first and the push was swallowed by
+    /// `list_push_*`'s `if let Ok(list)`: the client received the element in
+    /// its reply while the element left the keyspace entirely — neither in the
+    /// source nor in the destination.
+    #[test]
+    fn woken_blmove_with_wrongtype_destination_keeps_the_element() {
+        let mut reg = BlockingRegistry::new(0);
+        let mut db = Database::new();
+        let src = Bytes::from_static(b"src");
+        let dst = Bytes::from_static(b"dst");
+        db.set(
+            dst.clone(),
+            crate::storage::entry::Entry::new_string(Bytes::from_static(b"iam-a-string")),
+        );
+
+        let rx = register(
+            &mut reg,
+            &src,
+            BlockedCommand::BLMove {
+                destination: dst.clone(),
+                wherefrom: Direction::Left,
+                whereto: Direction::Right,
+            },
+        );
+
+        db.list_push_back(&src, Bytes::from_static(b"v1"));
+        let woke = try_wake_list_waiter(&mut reg, &mut db, 0, &src);
+
+        assert!(woke, "the waiter was answered, so it is no longer blocked");
+        match rx.try_recv() {
+            Ok(Some(Frame::Error(e))) => assert!(
+                e.starts_with(b"WRONGTYPE"),
+                "expected WRONGTYPE, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("expected a WRONGTYPE error, got {other:?}"),
+        }
+        assert_eq!(list_len(&mut db, &src), 1, "source keeps the element");
+        assert_eq!(
+            db.get(b"dst")
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec)),
+            Some(b"iam-a-string".to_vec()),
+            "destination is untouched"
+        );
     }
 
     /// A2 for BLMPOP: every popped element must be restored, in order.
