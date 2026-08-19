@@ -295,6 +295,25 @@ pub(crate) fn execute_transaction(
             continue;
         }
 
+        // moon#524: same immediate-only execution of an unrewritten blocking
+        // pop as `execute_transaction_sharded` below — this executor sees the
+        // identical queued frame, so it needs the identical branch or the
+        // embedded (single-shard tokio) deployment answers "unknown command"
+        // for a queued BLPOP.
+        if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
+            if let Some(outcome) = crate::server::conn::blocking_txn::try_exec_blocking_in_txn(
+                cmd, cmd_args, &mut guard,
+            ) {
+                if let Some(effect) = outcome.effect {
+                    let mut buf = BytesMut::new();
+                    crate::protocol::serialize::serialize(&effect, &mut buf);
+                    aof_entries.push(buf.freeze());
+                }
+                results.push(outcome.reply);
+                continue;
+            }
+        }
+
         // Check if this is a write command for AOF logging.
         // `is_persisted_write` (PR #282 review): a SELECT queued inside MULTI
         // must not be persisted as a literal record — it would shift the AOF
@@ -426,6 +445,37 @@ pub(crate) fn execute_transaction_sharded(
         // placeholder the caller patches with the receiver count.
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
             continue;
+        }
+
+        // moon#524: a blocking pop queued inside MULTI runs here in
+        // immediate-only mode, as the ORIGINAL command — it was deliberately
+        // NOT rewritten at queue time, because `LPOP`/`ZPOPMIN` answer a
+        // different shape (and `LPOP k1 k2` is a COUNT, not a second key).
+        //
+        // No `apply_resp3_conversion`: the reply is produced by the very
+        // helper the live blocking path uses and is handed to the wire the
+        // same way there, so converting only here would make the in-MULTI
+        // reply differ from the standalone one — the exact class of bug this
+        // fixes. The RESP2/RESP3 null spelling is still right, because that is
+        // the serializer's job (`Frame::NullArray` -> `*-1` / `_`).
+        if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
+            let outcome = crate::shard::slice::with_shard_db(selected, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                crate::server::conn::blocking_txn::try_exec_blocking_in_txn(cmd, cmd_args, db)
+            });
+            if let Some(outcome) = outcome {
+                // The AOF/replication record is the SYNTHESISED single-key
+                // sibling, never the queued frame: a replica applying a
+                // literal `BLPOP` would block its apply loop. `None` when
+                // nothing popped, so a miss reaches neither plane.
+                if let Some(effect) = outcome.effect {
+                    let mut buf = bytes::BytesMut::new();
+                    crate::protocol::serialize::serialize(&effect, &mut buf);
+                    aof_entries.push((selected, buf.freeze()));
+                }
+                results.push(outcome.reply);
+                continue;
+            }
         }
 
         // task #52: GRAPH.* commands live in a separate per-shard store

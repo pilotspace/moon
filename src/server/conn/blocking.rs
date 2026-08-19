@@ -288,12 +288,6 @@ async fn cancel_multikey_registrations(
     }
 }
 
-/// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
-/// BLPOP key [key ...] timeout -> LPOP key [key ...]
-/// BRPOP key [key ...] timeout -> RPOP key [key ...]
-/// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout -> LMOVE src dst LEFT|RIGHT LEFT|RIGHT
-/// BZPOPMIN key [key ...] timeout -> ZPOPMIN key [key ...]
-/// BZPOPMAX key [key ...] timeout -> ZPOPMAX key [key ...]
 /// The full set of client-blocking commands (the ones whose handler may
 /// early-flush accumulated responses and await outside the batch loop).
 /// Keep in sync with the dispatch guards in `try_handle_blocking`
@@ -315,33 +309,39 @@ pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"BZMPOP")
 }
 
-pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
+/// The frame a blocking command is QUEUED as inside `MULTI`.
+///
+/// Two outcomes, and which one applies is the whole of moon#524:
+///
+/// * `BLMOVE`/`BLMPOP`/`BZMPOP`/`BRPOPLPUSH` are rewritten to their
+///   non-blocking sibling (`LMOVE`/`LMPOP`/`ZMPOP`/`LMOVE`). Those siblings
+///   take the same keys and answer the same shape, so the transaction executor
+///   can run them through the ordinary dispatch table.
+/// * `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` are queued UNCHANGED — the frame
+///   comes back out of this function as it went in. Their siblings answer a
+///   DIFFERENT shape (`LPOP` returns a bare element where `BLPOP` returns
+///   `[key, element]`), and `LPOP key1 key2` is not even the same command:
+///   LPOP's second argument is a COUNT. They are executed in immediate-only
+///   mode at EXEC instead — see [`super::blocking_txn`], which owns the
+///   matching predicate.
+///
+/// Not a hot path: this runs once per command QUEUED inside a transaction.
+pub(crate) fn queued_blocking_frame(cmd: &[u8], args: &[Frame]) -> Frame {
+    if super::blocking_txn::queues_unrewritten(cmd) {
+        // Reconstruct the original frame. Callers hand this straight to
+        // `command_queue`, so returning the input verbatim keeps all three
+        // queue sites (both sharded handlers + the monoio blocking arm)
+        // identical instead of each growing its own branch.
+        let mut original = Vec::with_capacity(args.len() + 1);
+        original.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
+        original.extend(args.iter().cloned());
+        return Frame::Array(original.into());
+    }
     let mut new_args = Vec::new();
-    if cmd.eq_ignore_ascii_case(b"BLPOP") {
-        new_args.push(Frame::BulkString(Bytes::from_static(b"LPOP")));
-        // All args except the last (timeout)
-        for arg in args.iter().take(args.len().saturating_sub(1)) {
-            new_args.push(arg.clone());
-        }
-    } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
-        new_args.push(Frame::BulkString(Bytes::from_static(b"RPOP")));
-        for arg in args.iter().take(args.len().saturating_sub(1)) {
-            new_args.push(arg.clone());
-        }
-    } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
+    if cmd.eq_ignore_ascii_case(b"BLMOVE") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"LMOVE")));
         // src dst LEFT|RIGHT LEFT|RIGHT (skip timeout which is last arg)
         for arg in args.iter().take(4) {
-            new_args.push(arg.clone());
-        }
-    } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
-        new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMIN")));
-        for arg in args.iter().take(args.len().saturating_sub(1)) {
-            new_args.push(arg.clone());
-        }
-    } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
-        new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMAX")));
-        for arg in args.iter().take(args.len().saturating_sub(1)) {
             new_args.push(arg.clone());
         }
     } else if cmd.eq_ignore_ascii_case(b"BLMPOP") {
@@ -1629,6 +1629,11 @@ pub(crate) fn try_inline_dispatch(
     num_shards: usize,
     can_inline_reads: bool,
     can_inline_writes: bool,
+    // moon#522: the connection's negotiated protocol. This path frames reply
+    // bytes itself, so it must be TOLD the protocol version — every other
+    // reply on the connection gets it from the serializer. Without it a RESP3
+    // client received the RESP2 null bulk for any key its own shard owned.
+    resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
     let buf = &read_buf[..];
@@ -1834,7 +1839,12 @@ pub(crate) fn try_inline_dispatch(
                     // inline with a fast `$-1`, no disk I/O either way.
                     Some(_) => return 0,
                     None => {
-                        write_buf.extend_from_slice(b"$-1\r\n");
+                        // moon#522: `_` on RESP3, `$-1` on RESP2. The two
+                        // other byte strings this path writes — `+OK` and the
+                        // `-WRONGTYPE` error — are spelled identically in both
+                        // protocols, so this is the only protocol-dependent
+                        // reply the inline path frames.
+                        write_buf.extend_from_slice(crate::io::static_responses::null_bulk(resp3));
                         crate::admin::metrics_setup::record_keyspace_miss();
                         // Queued, delivered by this shard's own drain. 'm' is
                         // not in the 'A' class, so this is inert unless an
@@ -2049,6 +2059,9 @@ pub(crate) fn try_inline_dispatch_loop(
     can_inline_reads: bool,
     can_inline_writes: bool,
     cluster_enabled: bool,
+    // moon#522: the connection's negotiated protocol version, forwarded to
+    // `try_inline_dispatch` so its self-framed GET miss picks the right null.
+    resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
     if cluster_enabled {
@@ -2068,6 +2081,7 @@ pub(crate) fn try_inline_dispatch_loop(
             num_shards,
             can_inline_reads,
             can_inline_writes,
+            resp3,
             runtime_config,
         );
         if n == 0 {

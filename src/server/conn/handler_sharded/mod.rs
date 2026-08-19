@@ -107,9 +107,9 @@ pub enum HandlerResult {
 }
 
 use super::{
-    apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
-    extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, resp3_shape_for, unpropagate_shard_subscription,
+    apply_resp3_conversion, execute_transaction_sharded, extract_bytes, extract_command,
+    extract_primary_key, handle_blocking_command, handle_config, is_multi_key_command,
+    queued_blocking_frame, resp3_shape_for, unpropagate_shard_subscription,
     unpropagate_subscription,
 };
 
@@ -972,12 +972,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             responses.push(err);
                             continue;
                         }
-                        // Blocking commands queue as their non-blocking twin:
-                        // a raw BLPOP reaching EXEC would BLOCK inside the
-                        // transaction — a hang, not a divergence.
+                        // Blocking commands must not block at EXEC. Most queue
+                        // as their non-blocking twin; the four whose twin
+                        // answers a different SHAPE queue unchanged and run in
+                        // immediate-only mode at EXEC instead (moon#524).
+                        // `queued_blocking_frame` owns that split.
                         if crate::server::conn::blocking::is_blocking_command(cmd) {
                             conn.command_queue
-                                .push(convert_blocking_to_nonblocking(cmd, cmd_args));
+                                .push(queued_blocking_frame(cmd, cmd_args));
                         } else {
                             conn.command_queue.push(frame);
                         }

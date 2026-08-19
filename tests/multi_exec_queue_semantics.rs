@@ -292,29 +292,25 @@ fn me6_bad_frame_inside_multi_names_itself_before_closing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "moon#524 — blocking commands inside MULTI are rewritten to a \
-            non-blocking sibling with a different reply SHAPE; #482 supplied \
-            Frame::NullArray but this path's null comes from LPOP, whose own \
-            null is correctly $-1. Un-ignore when #524 lands"]
 fn me7_blpop_in_multi_returns_null_array_not_null_bulk() {
-    // Still ignored, and the reason has MOVED rather than being restated.
+    // Un-ignored by moon#524 — this is that issue's acceptance criterion.
     //
     // The original reason — "Moon has no null-array variant" — was discharged
     // by moon#482: `Frame::NullArray` exists, and a plain `BLPOP k 0.05` that
     // times out now answers `*-1` (see `tests/resp2_null_array.rs::rna1`).
     //
     // This test was un-ignored during that task and still failed, which is how
-    // #524 was found. Inside MULTI the queued command is rewritten
-    // `BLPOP k t` -> `LPOP k`, so the reply is LPOP's — and LPOP's null really
-    // is `$-1`. Measured against redis-server 8.6.1, the rewrite is wrong on
+    // #524 was found. Inside MULTI the queued command used to be rewritten
+    // `BLPOP k t` -> `LPOP k`, so the reply was LPOP's — and LPOP's null really
+    // is `$-1`. Measured against redis-server 8.6.1, the rewrite was wrong on
     // the HIT path too, which matters more than the null:
     //
     //     Redis  MULTI; BLPOP q 0; EXEC -> [["q", "v1"]]   (key AND value)
     //     Moon   MULTI; BLPOP q 0; EXEC -> ["v1"]          (key dropped)
     //
-    // So a fix that only made the null a `*-1` would turn this test green over
-    // a command that still answers the wrong shape. The assertion below stays
-    // as-is — correct, unweakened — and #524 owns the capability.
+    // So a fix that only made the null a `*-1` would pass here over a command
+    // that still answered the wrong shape — which is why `me7b`/`me7c`/`me7d`
+    // below pin the HIT shape, and why this test is worthless without them.
 
     let m = spawn_moon("1");
     let mut c = Conn::open(m.port);
@@ -331,6 +327,156 @@ fn me7_blpop_in_multi_returns_null_array_not_null_bulk() {
     assert!(
         !exec.contains("$-1"),
         "the reply must not be a Null Bulk; got {exec:?}"
+    );
+    // And the miss must not have CREATED the key it failed to find. The fix
+    // executes the real blocking command, whose pop helper is a `get_or_create`
+    // — a phantom empty list would make EXISTS answer 1 for a key nobody ever
+    // wrote.
+    assert_eq!(
+        c.send(&["EXISTS", "me7missing"]),
+        ":0\r\n",
+        "a BLPOP miss inside MULTI must not conjure the key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// me7b/me7c/me7d — moon#524, the HIT shape. The null type (me7) is the cheap
+// half; the expensive half is that `BLPOP` answers `[key, value]` *because* it
+// takes many keys, and the queue-time rewrite to `LPOP` dropped the key.
+//
+// Every expectation is the byte string measured from redis-server 8.6.1 and
+// quoted in the issue, not derived from Moon's source.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn me7b_blpop_hit_in_multi_keeps_the_key() {
+    // Redis 8.6.1: RPUSH q v1 / MULTI / BLPOP q 0 / EXEC
+    //   -> *1\r\n*2\r\n$1\r\nq\r\n$2\r\nv1\r\n
+    //
+    // Run at 1 AND 4 shards: the body executes through a different transaction
+    // executor depending on locality (embedded vs the routed owner-shard hop),
+    // and a fix in only one of them is invisible to the other.
+    for shards in ["1", "4"] {
+        let m = spawn_moon(shards);
+        let mut c = Conn::open(m.port);
+        assert!(c.send(&["RPUSH", "q", "v1"]).starts_with(':'));
+        assert!(c.send(&["MULTI"]).starts_with("+OK"));
+        assert!(c.send(&["BLPOP", "q", "0"]).starts_with("+QUEUED"));
+        let exec = c.send(&["EXEC"]);
+        assert_eq!(
+            exec, "*1\r\n*2\r\n$1\r\nq\r\n$2\r\nv1\r\n",
+            "moon#524 at {shards} shards — BLPOP inside MULTI must answer the \
+             documented [key, value] pair. A bare value is unusable: BLPOP \
+             exists to say WHICH key served the caller. got {exec:?}"
+        );
+        // And the pop really happened — the shape fix must not turn the
+        // command into a read.
+        assert_eq!(c.send(&["LLEN", "q"]), ":0\r\n");
+    }
+}
+
+#[test]
+fn me7c_bzpopmin_hit_in_multi_keeps_the_key() {
+    // Redis 8.6.1: ZADD z 1 m / MULTI / BZPOPMIN z 0 / EXEC
+    //   -> *1\r\n*3\r\n$1\r\nz\r\n$1\r\nm\r\n$1\r\n1\r\n
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    assert!(c.send(&["ZADD", "z", "1", "m"]).starts_with(':'));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(c.send(&["BZPOPMIN", "z", "0"]).starts_with("+QUEUED"));
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        exec, "*1\r\n*3\r\n$1\r\nz\r\n$1\r\nm\r\n$1\r\n1\r\n",
+        "moon#524 — BZPOPMIN inside MULTI must answer [key, member, score]; \
+         the ZPOPMIN rewrite dropped the key. got {exec:?}"
+    );
+
+    // BZPOPMAX takes the same path and must not have been fixed by halves.
+    assert!(c.send(&["ZADD", "z2", "5", "hi"]).starts_with(':'));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(c.send(&["BZPOPMAX", "z2", "0"]).starts_with("+QUEUED"));
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        exec, "*1\r\n*3\r\n$2\r\nz2\r\n$2\r\nhi\r\n$1\r\n5\r\n",
+        "moon#524 — BZPOPMAX inside MULTI must answer [key, member, score]. \
+         got {exec:?}"
+    );
+}
+
+#[test]
+fn me7d_multi_key_blpop_in_multi_reports_the_serving_key() {
+    // The case the key actually pays for: several keys, only one populated.
+    // The old rewrite produced `LPOP q1 q2`, where `q2` is LPOP's optional
+    // COUNT — so Moon popped up to two elements from q1 and never looked at
+    // q2 at all. Redis 8.6.1 answers ["q2", "v2"].
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    assert!(c.send(&["RPUSH", "q2", "v2"]).starts_with(':'));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(c.send(&["BLPOP", "q1", "q2", "0"]).starts_with("+QUEUED"));
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        exec, "*1\r\n*2\r\n$2\r\nq2\r\n$2\r\nv2\r\n",
+        "moon#524 — a multi-key BLPOP inside MULTI must scan the keys in order \
+         and name the one that served. got {exec:?}"
+    );
+
+    // BRPOP takes the tail, and names its key too.
+    assert!(c.send(&["RPUSH", "r1", "a", "b"]).starts_with(':'));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(c.send(&["BRPOP", "r1", "0"]).starts_with("+QUEUED"));
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        exec, "*1\r\n*2\r\n$2\r\nr1\r\n$1\r\nb\r\n",
+        "moon#524 — BRPOP inside MULTI must answer [key, tail-element]. \
+         got {exec:?}"
+    );
+}
+
+#[test]
+fn me7f_multi_key_blpop_in_multi_works_under_routing() {
+    // The multi-key form at 4 shards, with both keys pinned to ONE shard by a
+    // shared hash tag so the body is a routable single-shard transaction and
+    // executes on the owner shard rather than locally.
+    //
+    // Keys that straddle shards are a different contract and not this test's:
+    // the queued frame now declares BLPOP's full key set (metadata
+    // first_key=1, last_key=-2), so `analyze_txn_locality` sees them and the
+    // body is refused CROSSSLOT like any other cross-shard MULTI. That is a
+    // loud refusal replacing a silent mis-execution — the old `LPOP k1 k2`
+    // rewrite declared only `k1`, routed there, and popped from it by COUNT.
+    let m = spawn_moon("4");
+    let mut c = Conn::open(m.port);
+    assert!(c.send(&["RPUSH", "{t}q2", "v2"]).starts_with(':'));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(
+        c.send(&["BLPOP", "{t}q1", "{t}q2", "0"])
+            .starts_with("+QUEUED")
+    );
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        exec, "*1\r\n*2\r\n$5\r\n{t}q2\r\n$2\r\nv2\r\n",
+        "moon#524 — a co-located multi-key BLPOP must survive the owner-shard \
+         hop with its key intact. got {exec:?}"
+    );
+    assert_eq!(c.send(&["EXISTS", "{t}q1"]), ":0\r\n");
+}
+
+#[test]
+fn me7e_blpop_on_a_wrong_type_key_in_multi_is_wrongtype() {
+    // Regression fence for the fix itself: executing the ORIGINAL blocking
+    // command at EXEC must not lose the type check the `LPOP` rewrite got for
+    // free from the dispatch table. Redis 8.6.1 answers -WRONGTYPE here.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    assert!(c.send(&["SET", "str", "v"]).starts_with("+OK"));
+    assert!(c.send(&["MULTI"]).starts_with("+OK"));
+    assert!(c.send(&["BLPOP", "str", "0"]).starts_with("+QUEUED"));
+    let exec = c.send(&["EXEC"]);
+    assert!(
+        exec.contains("WRONGTYPE"),
+        "BLPOP against a string inside MULTI must be a WRONGTYPE error, not a \
+         null — a null would silently read as 'queue empty'. got {exec:?}"
     );
 }
 
