@@ -262,9 +262,9 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             if args.len() < 3 {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
-            match parse_positive_i64(&args[2]) {
-                Some(secs) => {
-                    db.set_expiry(&key, current_time_ms() + (secs as u64) * 1000);
+            match parse_positive_i64(&args[2]).and_then(|secs| (secs as u64).checked_mul(1000)) {
+                Some(ms) => {
+                    db.set_expiry(&key, current_time_ms().saturating_add(ms));
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -290,9 +290,9 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             if args.len() < 3 {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
-            match parse_positive_i64(&args[2]) {
-                Some(ts) => {
-                    db.set_expiry(&key, (ts as u64) * 1000);
+            match parse_positive_i64(&args[2]).and_then(|ts| (ts as u64).checked_mul(1000)) {
+                Some(ms) => {
+                    db.set_expiry(&key, ms);
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(

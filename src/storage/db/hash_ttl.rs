@@ -106,6 +106,12 @@ impl Database {
 
         // 4. Promote to HashWithTtl if needed.
         promote_to_hash_with_ttl(rv);
+        // moon#541: arm the latch the moment the value IS HashWithTtl — the
+        // NX/XX/GT/LT gate below can return early AFTER promotion (e.g. GT
+        // on a non-volatile field), and a HashWithTtl existing with the
+        // latch down breaks the latch's conservativeness invariant (the
+        // debug_expiry_index_consistent oracle checks exactly that).
+        self.hash_field_ttl_latch = true;
         let RedisValue::HashWithTtl {
             ttls,
             min_expiry_ms,
@@ -135,10 +141,6 @@ impl Database {
             *min_expiry_ms = ts_ms;
         }
         self.maybe_has_expiring_keys = true;
-        // moon#541: arm the hash-specific latch too, so the sweep's
-        // HashWithTtl scan only runs for databases that actually use
-        // field TTLs.
-        self.hash_field_ttl_latch = true;
         Ok(1)
     }
 

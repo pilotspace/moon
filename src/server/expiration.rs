@@ -145,54 +145,70 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
 
     // ── Sweep 1: deadline-ordered whole-key expiry (moon#541) ───────────────
     let now_ms = current_time_ms();
+    let mut popped = 0u32;
     while let Some((ts, key)) = db.peek_due_expiry(now_ms) {
         if db.is_key_expired(key.as_bytes()) {
             // `remove` unindexes the entry's CURRENT pair via `remove_hot`.
             db.remove(key.as_bytes());
             on_removed(key.as_bytes());
-        } else {
-            // The pair failed re-verification: the entry is gone or carries
-            // a different TTL than when this pair was written — a stale
-            // pair a writer failed to retire (writer-coverage bug; the
+        } else if db
+            .data()
+            .get(key.as_bytes())
+            .is_none_or(|e| e.expires_at_ms() != ts)
+        {
+            // The pair is PROVABLY stale: the entry is gone or its TTL was
+            // retargeted since this pair was written — a pair a writer
+            // failed to retire (writer-coverage bug; the
             // debug_expiry_index_consistent oracle exists to catch those in
             // tests). Drop it or this loop would peek it forever.
             db.drop_expiry_index_pair(ts, &key);
+        } else {
+            // The pair matches the entry exactly, yet the fresh clock says
+            // "not expired" — the wall clock stepped backwards between the
+            // cycle-start peek and this re-verification. The pair is VALID,
+            // just not due; keep it for a later tick. The index is ordered,
+            // so nothing after the head is due either.
+            break;
         }
-        if start.elapsed() >= budget {
+        // Budget check every 64 pops, not per key: `Instant::elapsed` is a
+        // clock read, and the common tick pops far fewer than 64. At least
+        // one key is always processed before the first check can stop us.
+        popped += 1;
+        if popped % 64 == 0 && start.elapsed() >= budget {
             break;
         }
     }
 
     // ── Sweep 2: hash-field expiry (latch-gated, moon#541) ───────────────────
+    // The reap outcomes double as the latch's self-reset evidence: a key
+    // stays eligible only while it remains `HashWithTtl` (FieldsRemoved /
+    // NoOp); Downgraded and KeyDeleted leave the kind. When zero eligible
+    // keys remain after the sweep, the latch lowers — no second O(N) scan.
     if db.hash_field_ttl_possible() {
         // Collect keys up front to avoid borrow conflicts during mutation.
         let hash_keys = db.hashes_with_field_expiry();
+        let mut remaining = 0usize;
         for key in &hash_keys {
-            let outcome = db.reap_expired_fields_one_hash(key.as_bytes());
-            if outcome == ReapOutcome::KeyDeleted {
-                db.remove(key.as_bytes());
+            match db.reap_expired_fields_one_hash(key.as_bytes()) {
+                ReapOutcome::KeyDeleted => {
+                    db.remove(key.as_bytes());
+                }
+                ReapOutcome::Downgraded => {}
+                ReapOutcome::FieldsRemoved | ReapOutcome::NoOp => remaining += 1,
             }
+        }
+        if remaining == 0 {
+            db.clear_hash_field_ttl_latch();
         }
     }
 
     // ── Flag maintenance ─────────────────────────────────────────────────────
     // Clear the fast-path flag only when both sweeps have nothing left.
     // If hash-field TTLs remain, the flag must stay set so future ticks
-    // continue to run sweep 2. Both checks are O(1)-or-latch-gated now:
-    // the whole-key side reads the index's emptiness, and the hash side
-    // only rescans while the latch is up (lowering it once the scan
-    // proves zero HashWithTtl keys remain — the self-reset gate).
-    let no_whole_key_expiry = db.expiry_index_is_empty();
-    let no_hash_field_expiry = if db.hash_field_ttl_possible() {
-        let none_remain = db.hashes_with_field_expiry().is_empty();
-        if none_remain {
-            db.clear_hash_field_ttl_latch();
-        }
-        none_remain
-    } else {
-        true
-    };
-    if no_whole_key_expiry && no_hash_field_expiry {
+    // continue to run sweep 2. Both checks are O(1) now: the whole-key
+    // side reads the index's emptiness, and the hash side reads the latch
+    // sweep 2 just maintained from its own reap outcomes.
+    if db.expiry_index_is_empty() && !db.hash_field_ttl_possible() {
         db.clear_maybe_has_expiring_keys();
     }
 }
@@ -285,11 +301,75 @@ mod tests {
             );
         }
 
+        // Deterministic under CI preemption: a stalled runner can trip the
+        // 1ms budget mid-sweep, so allow a bounded number of cycles and
+        // assert the CUMULATIVE count. Still red on the sampling sweep: 20
+        // cycles × a 20-key sample of 10_050 finds ~2 due keys, not 50.
+        let mut removed = 0usize;
+        let mut cycles = 0;
+        while removed < 50 && cycles < 20 {
+            expire_cycle(&mut db, &mut |_| removed += 1);
+            cycles += 1;
+        }
+
+        assert_eq!(removed, 50, "the due keys must all be removed promptly");
+        assert_eq!(db.len(), 10_000, "live keys must all survive");
+    }
+
+    /// A pair that fails the expiry re-check but still matches its entry's
+    /// TTL exactly must be KEPT (the only honest explanation is a backwards
+    /// wall-clock step); only a provably-stale pair — entry gone or TTL
+    /// retargeted — is dropped, and the entry itself is never deleted.
+    #[test]
+    fn sweep_drops_only_provably_stale_pairs() {
+        let mut db = Database::new();
+        let future_ms = current_time_ms() + 3_600_000;
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
+        );
+        assert_eq!(db.expiry_index_len(), 1);
+
+        // Inject a bogus DUE pair for the same key (simulating a pair a
+        // buggy writer failed to retire): due by the clock, but the entry's
+        // real TTL differs -> provably stale -> dropped, entry untouched.
+        db.expiry_index_insert(current_time_ms() - 1_000, b"k");
+        assert_eq!(db.expiry_index_len(), 2);
+
         let mut removed = 0usize;
         expire_cycle(&mut db, &mut |_| removed += 1);
 
-        assert_eq!(removed, 50, "one cycle must remove exactly the due keys");
-        assert_eq!(db.len(), 10_000, "live keys must all survive");
+        assert_eq!(removed, 0, "a stale pair must never delete a live entry");
+        assert_eq!(db.len(), 1, "the entry survives");
+        assert_eq!(
+            db.expiry_index_len(),
+            1,
+            "the stale pair is dropped, the real pair is kept"
+        );
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// GETEX EX/EXAT with a seconds value near i64::MAX must answer the
+    /// range error, not overflow the *1000 conversion (debug builds
+    /// panicked; release builds silently wrapped to a bogus TTL).
+    #[test]
+    fn getex_rejects_overflowing_seconds() {
+        use crate::protocol::Frame;
+        let mut db = Database::new();
+        for opt in [&b"EX"[..], &b"EXAT"[..]] {
+            db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+            let args = [
+                Frame::BulkString(Bytes::from_static(b"k")),
+                Frame::BulkString(Bytes::copy_from_slice(opt)),
+                Frame::BulkString(Bytes::from(i64::MAX.to_string())),
+            ];
+            let reply = crate::command::string::getex(&mut db, &args);
+            assert!(
+                matches!(reply, Frame::Error(_)),
+                "overflowing {} must answer the range error",
+                String::from_utf8_lossy(opt)
+            );
+        }
     }
 
     /// GETEX wrote its TTL through a raw `get_mut` + `set_expires_at_ms`,

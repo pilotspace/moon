@@ -508,6 +508,13 @@ impl Database {
     /// Earliest `(expires_at_ms, key)` pair that is due at `now_ms`, or
     /// `None` when nothing is due. O(log n). Returns a clone (inline for
     /// keys ≤ 23B) so the sweep can mutate the db while holding it.
+    ///
+    /// "Due" here (`ts <= now_ms`) is aligned with `Entry::is_expired_at`
+    /// (`now >= ttl`): with a monotone clock, a pair this returns always
+    /// re-verifies as expired. A FAILED re-verification is therefore NOT
+    /// proof of staleness on its own — the wall clock may have stepped
+    /// backwards after `now_ms` was captured — so the sweep only drops a
+    /// pair when the entry is gone or its TTL differs from `ts`.
     #[inline]
     pub fn peek_due_expiry(&self, now_ms: u64) -> Option<(u64, CompactKey)> {
         self.expiry_index
@@ -517,9 +524,10 @@ impl Database {
     }
 
     /// Drop one specific index pair. The sweep calls this when a popped
-    /// pair fails re-verification (the entry is gone or carries a different
-    /// TTL — a stale pair): without dropping it, the sweep would peek the
-    /// same head pair forever.
+    /// pair is PROVABLY stale (the entry is gone or carries a different
+    /// TTL than `ts`): without dropping it, the sweep would peek the same
+    /// head pair forever. A pair that merely failed the expiry re-check is
+    /// not dropped — see [`Self::peek_due_expiry`].
     #[inline]
     pub fn drop_expiry_index_pair(&mut self, ts: u64, key: &CompactKey) {
         self.expiry_index.remove(&(ts, key.clone()));
@@ -570,7 +578,10 @@ impl Database {
     /// #541 property battery — O(N), never call on a hot path): the index
     /// must equal the scan-derived pair set exactly, and the hash latch
     /// must be conservative (any `HashWithTtl` present ⇒ latch raised).
-    pub fn debug_expiry_index_consistent(&self) -> bool {
+    /// Test-only: an oracle for the #541 battery, not part of the storage
+    /// API — compiled out of production builds entirely.
+    #[cfg(test)]
+    pub(crate) fn debug_expiry_index_consistent(&self) -> bool {
         let scan: std::collections::BTreeSet<(u64, CompactKey)> = self
             .data
             .iter()
@@ -1228,6 +1239,29 @@ mod tests {
         let r = db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Always);
         assert_eq!(r, Ok(1));
         assert!(db.hash_field_ttl_possible());
+    }
+
+    /// The NX/XX/GT/LT gate runs AFTER promotion: HEXPIRE GT on a
+    /// non-volatile field answers -2, but the value has already become
+    /// `HashWithTtl` — the latch must arm at promotion, not at success, or
+    /// a `HashWithTtl` exists with the latch down (breaking the latch's
+    /// conservativeness invariant the oracle checks).
+    #[test]
+    fn hash_field_ttl_latch_arms_even_when_condition_fails() {
+        let mut db = Database::new();
+        {
+            let map = db.get_or_create_hash(b"h").expect("hash");
+            map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        }
+        let future_ms = db.now_ms() + 60_000;
+        // GT on a field with NO current TTL: condition not met.
+        let r = db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Gt);
+        assert_eq!(r, Ok(-2));
+        assert!(
+            db.hash_field_ttl_possible(),
+            "promotion happened, so the latch must be up"
+        );
+        assert!(db.debug_expiry_index_consistent());
     }
 
     #[test]

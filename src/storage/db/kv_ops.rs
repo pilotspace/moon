@@ -516,9 +516,10 @@ impl Database {
         self.used_memory = total;
         self.maybe_has_expiring_keys = any_expiring;
         self.expiry_index = index;
-        if any_hash_ttl {
-            self.hash_field_ttl_latch = true;
-        }
+        // Authoritative, like the index rebuild above: the scan just proved
+        // exactly whether any HashWithTtl exists, so a restore WITHOUT them
+        // also clears a previously raised latch.
+        self.hash_field_ttl_latch = any_hash_ttl;
     }
 
     /// Pre-size the internal hash table for an expected key count.
@@ -540,6 +541,11 @@ impl Database {
             let new_table = DashTable::with_capacity(additional);
             self.data = new_table;
             self.maybe_has_expiring_keys = false;
+            // moon#541: the replaced table's index/latch state goes with it —
+            // matching `clear` (no-ops on the documented empty-db call, but
+            // the misuse case must not leave stale pairs behind).
+            self.expiry_index.clear();
+            self.hash_field_ttl_latch = false;
         }
     }
 
