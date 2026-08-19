@@ -32,6 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
 
 ### Fixed
+- **A blocking pop on a key of the WRONG TYPE blocked instead of erroring** (#556). `SET s v` then
+  `BLPOP s 0` sat there forever where Redis answers `-WRONGTYPE` immediately: the pop helpers reach
+  the store through `get_mut_if_present(..).ok()??`, which collapses `Err(WRONGTYPE)` into `None` —
+  indistinguishable from "empty" — so the connection registered a waiter on a key that can never
+  serve it and the client eventually read a null as "queue empty". All eight blocking pops
+  (`BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX`/`BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZMPOP`) now run a
+  read-only type gate over their keys, in argument order, BEFORE the pop attempt and before any
+  registration — the same gate the in-MULTI path has had since #524, so the live and transactional
+  replies agree by construction. The value itself is untouched (the #560 guarantee holds). Keys the
+  connection's own shard does not own are answered by their OWNING shard at `BlockRegister` time,
+  so the fix covers `--shards >= 2` and not just co-located keys; a multi-key waiter's remote keys
+  keep the old behaviour on purpose (an error raised there would race a sibling key's real wake-up).
+  `BLMOVE`/`BRPOPLPUSH` additionally check the DESTINATION's type once the move is about to happen,
+  matching `lmoveGenericCommand` and moon's own non-blocking `LMOVE`: previously the element was
+  popped from the source and then silently swallowed by `list_push_*`'s `if let Ok(list)`, so the
+  client received a value that had left the keyspace entirely — on the immediate path and on the
+  wake path alike.
 - **Blocking pops queued inside `MULTI` answer the wrong reply SHAPE** (#524). `BLPOP`/`BRPOP`/
   `BZPOPMIN`/`BZPOPMAX` were rewritten at queue time into `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX`, whose
   replies drop the key: `MULTI; BLPOP q 0; EXEC` answered `["v1"]` where Redis 8.6.1 answers

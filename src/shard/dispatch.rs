@@ -374,6 +374,16 @@ pub struct BlockRegisterPayload {
     pub wait_id: u64,
     pub cmd: crate::blocking::BlockedCommand,
     pub reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
+    /// moon#556: is `key` the ONLY key this waiter is blocked on?
+    ///
+    /// The owning shard answers `-WRONGTYPE` at registration time for a key it
+    /// finds holding the wrong type — but only when it is the whole command.
+    /// For a multi-key waiter the other keys are registered on other shards and
+    /// may be serving concurrently, so an error raised here would race a real
+    /// wake-up whose element has already left the keyspace. Multi-key remote
+    /// registrations therefore keep their pre-#556 behaviour (the key is
+    /// skipped, the client stays blocked on its remaining keys).
+    pub sole_key: bool,
 }
 
 /// Portable raw socket file descriptor type.

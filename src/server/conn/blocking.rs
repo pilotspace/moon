@@ -421,13 +421,7 @@ where
     {
         // Check immediate availability via the thread-local slice.
         let maybe_frame = crate::shard::slice::with_shard_db(selected_db, |db| {
-            for key in &keys {
-                let result = try_immediate_pop(cmd, db, key, args);
-                if result.is_some() {
-                    return result;
-                }
-            }
-            None
+            immediate_scan(cmd, args, &keys, db)
         });
         if let Some(frame) = maybe_frame {
             return BlockingOutcome::Reply(frame);
@@ -457,6 +451,9 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
+                    // The single-key fast path: this key IS the command, so
+                    // the owner may answer a type error for it (moon#556).
+                    sole_key: true,
                 },
             ));
             if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
@@ -609,6 +606,9 @@ where
                         wait_id,
                         cmd: blocked_cmd_factory(),
                         reply_tx: tx,
+                        // One of several keys — see `sole_key`'s docs for why
+                        // the owner must NOT decide the whole command here.
+                        sole_key: false,
                     },
                 ));
                 pending_remote.push((target, msg));
@@ -781,12 +781,7 @@ where
     // Use with_shard_db (thread-local ShardSlice) — no RwLock guard needed.
     {
         let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
-            for key in &keys {
-                if let Some(frame) = try_immediate_pop(cmd, db, key, args) {
-                    return Some(frame);
-                }
-            }
-            None
+            immediate_scan(cmd, args, &keys, db)
         });
         if let Some(frame) = immediate_result {
             return BlockingOutcome::Reply(frame);
@@ -816,6 +811,9 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
+                    // The single-key fast path: this key IS the command, so
+                    // the owner may answer a type error for it (moon#556).
+                    sole_key: true,
                 },
             ));
             if !push_block_msg(
@@ -951,6 +949,9 @@ where
                         wait_id,
                         cmd: blocked_cmd_factory(),
                         reply_tx: tx,
+                        // One of several keys — see `sole_key`'s docs for why
+                        // the owner must NOT decide the whole command here.
+                        sole_key: false,
                     },
                 ));
                 pending_remote.push((target, msg));
@@ -1389,6 +1390,116 @@ pub(crate) fn parse_blocking_args(
     }
 }
 
+/// Which collection a blocking command pops from, i.e. which type its key
+/// must hold. `None` for anything that is not a blocking pop.
+///
+/// Deliberately expressed as the registry's [`WaitFamily`](crate::blocking::WaitFamily)
+/// so the type gate below and the waker that will eventually serve the same
+/// waiter agree on what "the right type" means by construction.
+pub(crate) fn blocking_pop_family(cmd: &[u8]) -> Option<crate::blocking::WaitFamily> {
+    use crate::blocking::WaitFamily;
+    if cmd.eq_ignore_ascii_case(b"BLPOP")
+        || cmd.eq_ignore_ascii_case(b"BRPOP")
+        || cmd.eq_ignore_ascii_case(b"BLMOVE")
+        || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
+        || cmd.eq_ignore_ascii_case(b"BLMPOP")
+    {
+        Some(WaitFamily::List)
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN")
+        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+        || cmd.eq_ignore_ascii_case(b"BZMPOP")
+    {
+        Some(WaitFamily::ZSet)
+    } else {
+        None
+    }
+}
+
+/// moon#556: the `-WRONGTYPE` a blocking pop owes its client when `key`
+/// already exists holding a type this command cannot pop from.
+///
+/// Redis answers this at once and never blocks (`blockingPopGenericCommand`
+/// runs `checkType` on every key before it considers waiting). Moon used to
+/// block instead, because the pop helpers reach the store through
+/// `get_mut_if_present(..).ok()??` — an `Err(WRONGTYPE)` that becomes `None`,
+/// indistinguishable from "empty", so the caller registered and waited on a
+/// key that can never serve it.
+///
+/// Read-only: a missing key, an empty key and a right-typed key are all
+/// `None`, and nothing here mutates the keyspace. The in-MULTI path
+/// ([`super::blocking_txn`]) has had this gate since moon#524; this is the
+/// live path catching up to it.
+pub(crate) fn blocking_wrongtype_error(
+    cmd: &[u8],
+    db: &mut Database,
+    key: &Bytes,
+) -> Option<Frame> {
+    match blocking_pop_family(cmd)? {
+        crate::blocking::WaitFamily::List => db.get_list(key).err(),
+        crate::blocking::WaitFamily::ZSet => db.get_sorted_set(key).err(),
+        // Stream blocking (XREAD) does not come through this path.
+        crate::blocking::WaitFamily::Stream => None,
+    }
+}
+
+/// The scan a blocking pop runs over its keys BEFORE it decides to block.
+///
+/// Answers `Some(frame)` when the command can be completed right now — a
+/// served pop, or an error the client is owed — and `None` when it must
+/// register and wait.
+///
+/// Keys are visited left to right and the FIRST one that either errors or
+/// serves decides the reply, which is what Redis does: an existing key of the
+/// wrong type is an error even when a later key could have served the pop.
+///
+/// One shared implementation for both runtimes' `handle_blocking_command*`,
+/// so the two cannot drift.
+pub(crate) fn immediate_scan(
+    cmd: &[u8],
+    args: &[Frame],
+    keys: &[Bytes],
+    db: &mut Database,
+) -> Option<Frame> {
+    for key in keys {
+        // moon#556: the type gate runs BEFORE the pop attempt and before any
+        // registration, so a wrong-typed key is an error rather than a wait.
+        if let Some(err) = blocking_wrongtype_error(cmd, db, key) {
+            return Some(err);
+        }
+        if let Some(frame) = try_immediate_pop(cmd, db, key, args) {
+            return Some(frame);
+        }
+    }
+    None
+}
+
+/// moon#556: the `-WRONGTYPE` a `BLMOVE`/`BRPOPLPUSH` owes its client because
+/// the DESTINATION holds something that is not a list.
+///
+/// Two rules, both taken from `lmoveGenericCommand` (which moon's own
+/// non-blocking `LMOVE` already mirrors, `command/list/list_write.rs`):
+///
+/// * the destination's type is consulted only when the move is actually about
+///   to happen. An absent or empty source blocks, and Redis never looks at the
+///   destination on that path — so neither does this;
+/// * the error arrives INSTEAD of the move. Pre-fix the element was popped
+///   from the source and then silently swallowed by `list_push_*`'s
+///   `if let Ok(list)`: the client got the value in its reply while the value
+///   left the keyspace entirely.
+///
+/// `source == destination` is the rotate form: same key, therefore same type,
+/// nothing to check.
+fn move_destination_error(db: &mut Database, source: &Bytes, dest: &Bytes) -> Option<Frame> {
+    if source == dest {
+        return None;
+    }
+    match db.get_list(source) {
+        Ok(Some(list)) if !list.is_empty() => {}
+        _ => return None,
+    }
+    db.get_list(dest).err()
+}
+
 /// Try to pop data immediately (non-blocking fast path).
 pub(crate) fn try_immediate_pop(
     cmd: &[u8],
@@ -1441,6 +1552,9 @@ pub(crate) fn try_immediate_pop(
         } else {
             Direction::Right
         };
+        if let Some(err) = move_destination_error(db, key, &dest) {
+            return Some(err);
+        }
         let val = match wherefrom {
             Direction::Left => db.list_pop_front(key),
             Direction::Right => db.list_pop_back(key),
@@ -1516,6 +1630,9 @@ pub(crate) fn try_immediate_pop(
         // BRPOPLPUSH: immediate RPOP from source, LPUSH to destination
         // args: [source, destination, timeout]
         let dest = extract_bytes(&args[1])?;
+        if let Some(err) = move_destination_error(db, key, &dest) {
+            return Some(err);
+        }
         let val = db.list_pop_back(key)?;
         db.list_push_front(&dest, val.clone());
         Some(Frame::BulkString(val))
