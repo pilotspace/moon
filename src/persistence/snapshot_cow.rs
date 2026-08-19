@@ -118,6 +118,77 @@ pub(crate) fn capture_command_pre_image(db: &Database, db_index: usize, cmd_and_
     capture_key(db, db_index, key);
 }
 
+/// Capture the pre-image for a generic command about to run against `db`
+/// (moon#558).
+///
+/// This is the choke point for every write that executes on the shard's own
+/// stack instead of the event loop's: [`crate::command::dispatch`] is what
+/// the monoio local arm, the tokio sharded local arm, `handler_single`, both
+/// MULTI/EXEC executors, the coordinator's scatter arms and the SPSC drain
+/// all funnel through. `spsc_handler::cow_intercept` covers only the last of
+/// those — every other caller has no `&mut Option<SnapshotState>` in scope,
+/// so before this existed a local `INCR` during a BGSAVE was serialized at
+/// its POST-write value while the WAL still held the `INCR` to replay.
+///
+/// Double capture with `cow_intercept` on the routed arms is harmless:
+/// `SnapshotState::capture_cow` is first-wins deduped, and both captures are
+/// taken from the same pre-mutation state.
+///
+/// Cost when no snapshot is in flight — the overwhelmingly common case — is
+/// one thread-local `bool` load; the `is_write` PHF lookup and the key
+/// extraction are behind that gate.
+///
+/// Invariant: `db` MUST be `databases[db_index]` on the shard that armed the
+/// capture — the drain re-derives the segment from `db_index`, so a
+/// mismatched pair would file a pre-image against the wrong database. Every
+/// live caller satisfies it (`dispatch` is always handed
+/// `databases[*selected_db]`). The one structural exception,
+/// `conn::shared::execute_transaction`, holds a lock on the ENTRY db while
+/// `*selected_db` can be moved by a `SELECT` queued inside the same MULTI —
+/// that executor belongs to `handler_single`, which is not wired into the
+/// shipped server and runs no shard event loop, so it can never be armed.
+///
+/// Fidelity note: multi-key writes capture their PRIMARY key only, the same
+/// contract `cow_intercept` has always had. Every non-idempotent single-key
+/// write (`INCR`, `APPEND`, `SETRANGE`, `HINCRBY`, `LPUSH`, `ZINCRBY`, …) is
+/// therefore covered; a destination-key write like `LMOVE src dst` still
+/// captures only `src`. Widening that is one shared follow-up for both
+/// paths, not a local-path gap.
+#[inline]
+pub(crate) fn capture_dispatch_pre_image(
+    db: &Database,
+    db_index: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) {
+    if !is_armed() {
+        return;
+    }
+    if !crate::command::metadata::is_write(cmd) {
+        return;
+    }
+    let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) else {
+        return;
+    };
+    capture_key(db, db_index, key);
+}
+
+/// Capture the pre-image for a write whose key is already parsed — the
+/// monoio inline fast path (`server::conn::blocking::try_inline_dispatch`),
+/// which frames a plain `SET` straight from the read buffer and never builds
+/// a `Frame` or enters [`crate::command::dispatch`] at all (moon#558).
+///
+/// `cfg`-gated to match its sole caller — the inline fast path only exists
+/// under the monoio runtime.
+#[cfg(feature = "runtime-monoio")]
+#[inline]
+pub(crate) fn capture_key_pre_image(db: &Database, db_index: usize, key: &Bytes) {
+    if !is_armed() {
+        return;
+    }
+    capture_key(db, db_index, key);
+}
+
 /// Out-of-line slow path: look up and stash the old entry, first write wins.
 fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
     let fresh = PENDING_KEYS.with(|k| k.borrow_mut().insert((db_index, key.clone())));
@@ -306,6 +377,232 @@ mod tests {
             RedisValueRef::String(s) => assert_ne!(
                 s as &[u8], b"NEW_VALUE",
                 "already-serialized segment keeps its epoch-start bytes"
+            ),
+            _ => panic!("expected a string entry"),
+        }
+    }
+
+    /// moon#558: `spsc_handler::cow_intercept` only runs on the ROUTED /
+    /// queued arms. An ordinary LOCAL write — every write at `--shards 1`,
+    /// and the same-shard fraction at `--shards N` — reaches the database
+    /// through `command::dispatch` called straight from the connection task,
+    /// with no `&mut Option<SnapshotState>` anywhere in scope.
+    ///
+    /// RED before the fix: `pending` is empty, so the snapshot serializes the
+    /// POST-`INCR` value while the WAL still holds the `INCR` — recovery
+    /// double-applies it.
+    #[test]
+    fn generic_dispatch_captures_local_write_pre_image() {
+        disarm();
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+        arm();
+        let mut selected = 0usize;
+        let args = [Frame::BulkString(Bytes::from_static(b"n"))];
+        let _ = crate::command::dispatch(&mut db, b"INCR", &args, &mut selected, 16);
+        let pending = pending_for_test();
+        disarm();
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "a LOCAL INCR during a snapshot must capture its pre-image"
+        );
+        assert_eq!(pending[0].0, 0, "captured under the executing db index");
+        assert_eq!(pending[0].1.as_ref(), b"n");
+        match pending[0].2.value.as_redis_value() {
+            RedisValueRef::String(s) => assert_eq!(
+                s as &[u8], b"1",
+                "the pre-image must be the EPOCH-START value, not the INCR result"
+            ),
+            _ => panic!("expected a string entry"),
+        }
+    }
+
+    /// The capture is gated on `metadata::is_write`. A NON-idempotent write
+    /// that the flag table does not mark `WRITE` would silently fall back
+    /// through the gate and double-apply on replay — exactly the failure
+    /// moon#558 fixes, just moved one layer down. Pin the whole family of
+    /// read-modify-write commands (one per value type) so a flag-table edit
+    /// cannot quietly reopen it.
+    #[test]
+    fn every_read_modify_write_command_passes_the_is_write_gate() {
+        for (cmd, args) in [
+            (&b"INCR"[..], vec![Bytes::from_static(b"n")]),
+            (&b"DECR"[..], vec![Bytes::from_static(b"n")]),
+            (
+                &b"INCRBY"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"2")],
+            ),
+            (
+                &b"INCRBYFLOAT"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"1.5")],
+            ),
+            (
+                &b"APPEND"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"x")],
+            ),
+            (
+                &b"SETRANGE"[..],
+                vec![
+                    Bytes::from_static(b"n"),
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(b"x"),
+                ],
+            ),
+            (&b"GETDEL"[..], vec![Bytes::from_static(b"n")]),
+            (
+                &b"HINCRBY"[..],
+                vec![
+                    Bytes::from_static(b"n"),
+                    Bytes::from_static(b"f"),
+                    Bytes::from_static(b"1"),
+                ],
+            ),
+            (
+                &b"LPUSH"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"v")],
+            ),
+            (
+                &b"RPUSH"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"v")],
+            ),
+            (&b"LPOP"[..], vec![Bytes::from_static(b"n")]),
+            (
+                &b"ZINCRBY"[..],
+                vec![
+                    Bytes::from_static(b"n"),
+                    Bytes::from_static(b"1"),
+                    Bytes::from_static(b"m"),
+                ],
+            ),
+            (
+                &b"SETBIT"[..],
+                vec![
+                    Bytes::from_static(b"n"),
+                    Bytes::from_static(b"0"),
+                    Bytes::from_static(b"1"),
+                ],
+            ),
+            (
+                &b"EXPIRE"[..],
+                vec![Bytes::from_static(b"n"), Bytes::from_static(b"100")],
+            ),
+            (&b"PERSIST"[..], vec![Bytes::from_static(b"n")]),
+            (&b"DEL"[..], vec![Bytes::from_static(b"n")]),
+        ] {
+            disarm();
+            let mut db = Database::new();
+            // A STRING pre-image is all this asserts on: the point is that the
+            // gate LET THE COMMAND THROUGH, not that the command succeeded.
+            db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+            arm();
+            let frames: Vec<Frame> = args.into_iter().map(Frame::BulkString).collect();
+            let mut selected = 0usize;
+            let _ = crate::command::dispatch(&mut db, cmd, &frames, &mut selected, 16);
+            let pending = pending_for_test();
+            disarm();
+            assert_eq!(
+                pending.len(),
+                1,
+                "{} must capture a pre-image while a snapshot is armed",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    /// The choke point must stay inert for reads and for keyless commands —
+    /// otherwise every GET on an armed shard pays a DashTable lookup plus a
+    /// queue push for a key nothing is about to overwrite.
+    #[test]
+    fn generic_dispatch_does_not_capture_reads_or_keyless_commands() {
+        disarm();
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+        arm();
+        let mut selected = 0usize;
+        let key = [Frame::BulkString(Bytes::from_static(b"n"))];
+        let _ = crate::command::dispatch(&mut db, b"GET", &key, &mut selected, 16);
+        let _ = crate::command::dispatch(&mut db, b"TTL", &key, &mut selected, 16);
+        let _ = crate::command::dispatch(&mut db, b"PING", &[], &mut selected, 16);
+        let pending = pending_for_test();
+        disarm();
+        assert!(
+            pending.is_empty(),
+            "reads and keyless commands must not queue pre-images, got {}",
+            pending.len()
+        );
+    }
+
+    /// End-to-end statement of the corruption moon#558 describes: a local
+    /// `INCR` lands on a key whose segment has NOT been serialized yet, the
+    /// snapshot then finishes, and the loaded file must hold the EPOCH-START
+    /// value. If it holds the post-`INCR` value, WAL replay of that same
+    /// `INCR` on top of the snapshot double-counts the key.
+    ///
+    /// RED before the fix: the loaded value is `2` (post-INCR), so recovery
+    /// would land on `3`.
+    #[test]
+    fn local_incr_during_snapshot_does_not_double_apply_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard-0.rrdshard");
+        let mut dbs = vec![Database::new()];
+        for i in 0..100 {
+            dbs[0].set_string(
+                Bytes::from(format!("cow_{:04}", i)),
+                Bytes::from(format!("{}", i)),
+            );
+        }
+        assert!(
+            dbs[0].data().segment_count() > 1,
+            "fixture needs multiple segments"
+        );
+
+        let mut state = SnapshotState::new(0, 1, &dbs, path.clone());
+        // Serialize segment 0 only; segment 1 is still pending.
+        assert!(!state.advance_one_segment(&dbs));
+        let victim = dbs[0]
+            .data()
+            .segment(1)
+            .iter_occupied()
+            .next()
+            .unwrap()
+            .0
+            .to_bytes();
+        let epoch_start = match dbs[0].get(&victim).unwrap().value.as_redis_value() {
+            RedisValueRef::String(s) => s.to_vec(),
+            _ => panic!("expected a string entry"),
+        };
+
+        // The BGSAVE is in flight on this shard.
+        disarm();
+        arm();
+        // ... and a connection task on the same thread runs a LOCAL INCR
+        // between two `advance_snapshot_segment` ticks. This is exactly the
+        // call the monoio/tokio local dispatch arms make.
+        let mut selected = 0usize;
+        let args = [Frame::BulkString(victim.clone())];
+        let _ = crate::command::dispatch(&mut dbs[0], b"INCR", &args, &mut selected, 16);
+
+        // Next tick: drain, then advance (the real ordering in
+        // `shard::persistence_tick::advance_snapshot_segment`).
+        drain_into_with_dbs(&mut state, &dbs, {
+            let captured = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            PENDING_KEYS.with(|k| k.borrow_mut().clear());
+            captured
+        });
+        disarm();
+        while !state.advance_one_segment(&dbs) {}
+        state.finalize().unwrap();
+
+        let mut loaded = vec![Database::new()];
+        shard_snapshot_load(&mut loaded, &path).unwrap();
+        match loaded[0].get(&victim).unwrap().value.as_redis_value() {
+            RedisValueRef::String(s) => assert_eq!(
+                s as &[u8],
+                &epoch_start[..],
+                "snapshot must hold the epoch-start value; holding the post-INCR \
+                 value double-counts when the WAL replays that INCR"
             ),
             _ => panic!("expected a string entry"),
         }
