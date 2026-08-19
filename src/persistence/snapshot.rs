@@ -93,6 +93,15 @@ pub struct SnapshotState {
     /// COW overflow buffer: (db_index, segment_storage_idx, key, entry) for entries
     /// modified before their segment was serialized.
     overflow: Vec<(usize, usize, Bytes, Entry)>,
+    /// Keys already present in `overflow`, so a key written twice inside one
+    /// epoch keeps its FIRST pre-image (moon#517). Without this, the second
+    /// capture appended a second record for the same key and
+    /// `advance_segment_inner` — which writes every overflow record for the
+    /// segment in insertion order — let the LATER one win on load: the
+    /// snapshot then held a value that already includes the first write,
+    /// which the WAL replays on top of. Cheap: `Bytes` clones are refcount
+    /// bumps, and the set strictly shrinks the overflow buffer.
+    overflow_keys: HashSet<(usize, usize, Bytes)>,
     /// Per-database sets of segment storage indices that have already been serialized.
     /// Outer index = db_index. Used to determine if a segment is still "pending".
     serialized_segments: Vec<Vec<bool>>,
@@ -148,6 +157,7 @@ impl SnapshotState {
             segment_counts,
             output_buf: Vec::with_capacity(4096),
             overflow: Vec::new(),
+            overflow_keys: HashSet::new(),
             serialized_segments,
             shard_id,
             file_path,
@@ -213,6 +223,10 @@ impl SnapshotState {
     /// Capture an old entry value before overwrite for COW.
     ///
     /// Called when a write targets a segment that hasn't been serialized yet.
+    ///
+    /// First capture of a key wins (moon#517): it is the only one taken
+    /// before ANY write of this epoch touched the key, so it is the only one
+    /// that is the epoch-start value. Repeat captures are dropped.
     pub fn capture_cow(
         &mut self,
         db_index: usize,
@@ -220,6 +234,12 @@ impl SnapshotState {
         key: Bytes,
         old_entry: Entry,
     ) {
+        if !self
+            .overflow_keys
+            .insert((db_index, segment_storage_idx, key.clone()))
+        {
+            return;
+        }
         self.overflow
             .push((db_index, segment_storage_idx, key, old_entry));
     }
@@ -1112,6 +1132,61 @@ mod tests {
                     s as &[u8], b"NEW_VALUE",
                     "COW should have captured old value"
                 );
+            }
+            _ => panic!("Expected string"),
+        }
+    }
+
+    /// moon#517: a key written TWICE inside one snapshot epoch must keep the
+    /// pre-image taken before the FIRST write. `advance_segment_inner` writes
+    /// every overflow record for a segment in insertion order and load takes
+    /// the last one, so an un-deduped second capture silently published a
+    /// value that already contains the first write — which WAL replay then
+    /// applies a second time.
+    ///
+    /// RED before the dedupe in `capture_cow`: the snapshot held "mid".
+    #[test]
+    fn test_snapshot_cow_keeps_the_first_pre_image() {
+        let (_dir, path) = snap_path();
+        let mut dbs = vec![Database::new()];
+        for i in 0..100 {
+            dbs[0].set_string(
+                Bytes::from(format!("cow_{:04}", i)),
+                Bytes::from(format!("val_{:04}", i)),
+            );
+        }
+        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
+
+        let seg1 = dbs[0].data().segment(1);
+        #[allow(clippy::unwrap_used)]
+        let (key, first_entry) = seg1.iter_occupied().next().unwrap();
+        let key = key.to_bytes();
+        let first_entry = first_entry.clone();
+        assert!(state.is_segment_pending(0, 1));
+
+        // Write #1: capture the epoch-start value, then mutate.
+        state.capture_cow(0, 1, key.clone(), first_entry);
+        dbs[0].set_string(key.clone(), Bytes::from_static(b"mid"));
+
+        // Write #2: a second capture of the SAME key, now holding "mid".
+        #[allow(clippy::unwrap_used)]
+        let second_entry = dbs[0].data().get(&key).unwrap().clone();
+        state.capture_cow(0, 1, key.clone(), second_entry);
+        dbs[0].set_string(key.clone(), Bytes::from_static(b"NEW_VALUE"));
+
+        while !state.advance_one_segment(&dbs) {}
+        #[allow(clippy::unwrap_used)]
+        state.finalize().unwrap();
+
+        let mut loaded = vec![Database::new()];
+        #[allow(clippy::unwrap_used)]
+        let _count = shard_snapshot_load(&mut loaded, &path).unwrap();
+        #[allow(clippy::unwrap_used)]
+        let entry = loaded[0].get(&key).unwrap();
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(s) => {
+                assert_ne!(s as &[u8], b"mid", "second capture must not win");
+                assert_ne!(s as &[u8], b"NEW_VALUE", "live value must not win");
             }
             _ => panic!("Expected string"),
         }

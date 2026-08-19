@@ -230,6 +230,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyspace and `used_memory` byte-identical. `BLMPOP` was already correct (it length-checks
   through the read-only `get_list`) and is untouched. At `--shards >= 2` the phantom appeared only
   for client-local keys (~1/N of them), which is why it read as a flake.
+- **Lua script writes no longer skip the AOF plane under `runtime-tokio`, nor snapshot
+  copy-on-write on either runtime** (#517). Two independent holes, both pre-existing:
+  (1) `LuaEvictionCtx::emit_effect` was `#[cfg(feature = "runtime-monoio")]`-gated in full, with a
+  `let _ = (db_index, cmd_and_args)` arm that DISCARDED the effect off monoio — a `runtime-tokio`
+  build ran `EVAL "redis.call('SET',KEYS[1],'v')" 1 k`, mutated the keyspace, answered `OK`, and
+  wrote nothing to the AOF, so the write was gone after a restart while every ordinary write around
+  it survived. The gate now lives per plane inside `reason_del::record_bytes_conn`: the AOF leg (a
+  channel send to the writer pool, exactly what the tokio connection handler already does for
+  ordinary writes) runs on every runtime; the replication leg stays monoio-only because it pushes
+  through `shard::self_msg` and master-side PSYNC does not exist under tokio at all.
+  (2) All three `handle_eval` call sites (local monoio, local tokio, routed `ShardMessage::Execute`)
+  run inside a bare `with_shard(...)`, and `spsc_handler::cow_intercept` is only reachable from the
+  shard event loop's own stack — so a script writing while a `BGSAVE` was in flight left no
+  pre-image, and the snapshot captured the POST-write value that WAL replay then applies a second
+  time (`INCR` double-counts). Capture now happens in the scripting bridge at the `redis.call`
+  level, which is also the only level where a real key exists — `EVAL <script> <numkeys> k`'s own
+  `command[1]` is the script body, so wrapping the call sites in `cow_intercept` would have stashed
+  the script text under a bogus key. Pre-images go to a per-shard thread-local queue that the
+  persistence tick folds into the live `SnapshotState` before it advances another segment
+  (`persistence::snapshot_cow`); the whole path costs one thread-local `bool` load when no snapshot
+  is in flight. `SnapshotState::capture_cow` is now first-capture-wins, which also fixes a
+  pre-existing hole on the ordinary-command path: a key written twice in one epoch appended two
+  overflow records and load took the LATER one — a value that already contained the first write.
 - **`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` now accept the Redis 7.0 `NX | XX | GT | LT`
   conditions** (#544) — previously any option token was rejected with a wrong-arity error, which
   breaks typed clients that call them directly (redis-py `expire(k, t, nx=True)`). Semantics match

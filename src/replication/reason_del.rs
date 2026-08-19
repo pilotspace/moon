@@ -54,12 +54,17 @@
 //! `record_reason_del_conn`'s exact emission mechanics (extracted into
 //! `record_bytes_conn` below) but records the verbatim `cmd + args` the
 //! script issued instead of a synthetic `DEL`.
+//!
+//! moon#517: `record_effect_write` is the one entry point here that is NOT
+//! monoio-only. Its AOF leg runs on every runtime (see
+//! `record_bytes_conn`); only the replication leg stays gated. The
+//! `record_reason_del*` flavors keep their whole-function gate because
+//! every one of their call sites is itself monoio-only.
 
 use bytes::Bytes;
 
 use crate::persistence::aof::{AofWriterPool, serialize_command};
 use crate::protocol::Frame;
-#[cfg(feature = "runtime-monoio")]
 use crate::replication::state::ReplicationState;
 
 /// Serialize `DEL <key>` as a RESP command record — the same wire form
@@ -202,9 +207,19 @@ pub(crate) fn record_reason_del_conn(
 /// "replicate the command, not a derived form" approach every other write
 /// path in moon uses.
 ///
-/// Monoio-only for the same reason as [`record_reason_del_conn`]: master-side
-/// PSYNC and the shard self-msg relay this rides on are monoio-only.
-#[cfg(feature = "runtime-monoio")]
+/// Available on BOTH runtimes (moon#517). It used to be
+/// `#[cfg(feature = "runtime-monoio")]`-gated like
+/// [`record_reason_del_conn`], with the bridge discarding the effect
+/// entirely off monoio — but that gate confused two independent legs. The
+/// replication leg genuinely is monoio-only (it pushes through
+/// `shard::self_msg`, and master-side PSYNC does not exist under tokio); the
+/// AOF leg is a channel send to the writer pool, which the tokio connection
+/// handler already performs for every ordinary write. Gating both together
+/// meant a `runtime-tokio` build mutated the keyspace on `EVAL`, answered
+/// OK, and wrote NOTHING to the AOF — the script's writes vanished on
+/// restart while every non-script write around them survived.
+/// [`record_bytes_conn`] now splits the two legs; this entry point is
+/// unconditional.
 pub(crate) fn record_effect_write(
     repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -236,7 +251,6 @@ pub(crate) fn record_effect_write(
 /// `Bytes`/`Frame` allocation. Mirrors the exact pair of checks
 /// `record_bytes_conn` already runs per-leg — this is not a new decision,
 /// only an earlier exit for the case where NEITHER leg would do anything.
-#[cfg(feature = "runtime-monoio")]
 #[inline]
 fn conn_has_work(aof_pool: Option<&std::sync::Arc<AofWriterPool>>) -> bool {
     crate::replication::state::fanout_hint_active() || aof_pool.is_some()
@@ -246,7 +260,14 @@ fn conn_has_work(aof_pool: Option<&std::sync::Arc<AofWriterPool>>) -> bool {
 /// cheap `fanout_hint_active` Relaxed load) + AOF leg. Extracted from
 /// `record_reason_del_conn` so [`record_effect_write`] rides the identical
 /// mechanics for an arbitrary pre-serialized record instead of only `DEL`.
-#[cfg(feature = "runtime-monoio")]
+///
+/// moon#517: the two legs are gated INDEPENDENTLY. The replication leg is
+/// monoio-only — it hands the record to `shard::self_msg`, whose queue only
+/// a monoio shard thread may touch (a tokio work-stealing task pushing there
+/// would strand the record on a thread nobody drains), and master-side PSYNC
+/// is monoio-only regardless. The AOF leg is runtime-agnostic: it is a send
+/// on the writer pool's channel, exactly what the tokio connection handler
+/// does for every ordinary write.
 fn record_bytes_conn(
     repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -258,9 +279,12 @@ fn record_bytes_conn(
     // Cheap first gate (one Relaxed load): skip the replication leg entirely
     // until a replica has ever begun attaching — mirrors
     // `handler_monoio::ft::replication_fanout_active`'s first check.
+    #[cfg(feature = "runtime-monoio")]
     if crate::replication::state::fanout_hint_active() {
         push_record_db(repl_state, shard_id, num_shards, db, bytes.clone());
     }
+    #[cfg(not(feature = "runtime-monoio"))]
+    let _ = (repl_state, num_shards);
     if let Some(pool) = aof_pool {
         // #452.4: escalated bound + fail-loud accounting — see
         // `record_reason_del`'s comment for the resurrection rationale.

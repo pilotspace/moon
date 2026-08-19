@@ -90,6 +90,9 @@ pub(crate) fn handle_pending_snapshot(
             if wal_last_lsn > 0 {
                 state.set_last_lsn(wal_last_lsn);
             }
+            // moon#517: arm off-loop COW capture (Lua script writes) for
+            // the life of this snapshot. See `persistence::snapshot_cow`.
+            crate::persistence::snapshot_cow::arm();
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -151,6 +154,8 @@ pub(crate) fn check_auto_save_trigger(
             if wal_last_lsn > 0 {
                 state.set_last_lsn(wal_last_lsn);
             }
+            // moon#517: same arming as the explicit-BGSAVE path above.
+            crate::persistence::snapshot_cow::arm();
             *snapshot_state = Some(state);
         }
     }
@@ -166,6 +171,12 @@ pub(crate) fn advance_snapshot_segment(
 ) -> bool {
     let _ = shard_id; // E2 removes
     if let Some(snap) = snapshot_state {
+        // moon#517: fold pre-images captured off this stack (Lua script
+        // writes) into the snapshot BEFORE another segment is marked
+        // serialized — the drain filters on the segment bitmap, so advancing
+        // first would discard a pre-image that was still needed when it was
+        // taken.
+        crate::persistence::snapshot_cow::drain_into(snap);
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {
@@ -175,6 +186,13 @@ pub(crate) fn advance_snapshot_segment(
             true
         }
     } else {
+        // Belt-and-braces: whatever path cleared `snapshot_state` (normal
+        // finalize, an error finalize, or any future one), capture must not
+        // stay armed against a snapshot that no longer exists — a queue
+        // nobody drains would grow for the life of the shard.
+        if crate::persistence::snapshot_cow::is_armed() {
+            crate::persistence::snapshot_cow::disarm();
+        }
         false
     }
 }
@@ -198,6 +216,8 @@ pub(crate) fn finalize_snapshot_success(
             let _ = tx.send(Ok(()));
         }
     }
+    // moon#517: the file is closed — a pre-image has nowhere left to go.
+    crate::persistence::snapshot_cow::disarm();
     *snapshot_state = None;
 }
 
@@ -212,6 +232,8 @@ pub(crate) fn finalize_snapshot_error(
     if let Some(tx) = snapshot_reply_tx.take() {
         let _ = tx.send(Err(format!("finalize failed: {}", error)));
     }
+    // moon#517: the file is closed — a pre-image has nowhere left to go.
+    crate::persistence::snapshot_cow::disarm();
     *snapshot_state = None;
 }
 
