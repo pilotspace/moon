@@ -312,6 +312,106 @@ fn test_inline_set_executes_when_writes_enabled() {
     });
 }
 
+/// moon#558: the monoio inline fast path answers a plain `SET k v` entirely
+/// by itself — it never reaches `command::dispatch`, never reaches
+/// `spsc_handler::cow_intercept`, and has no `SnapshotState` in scope. While
+/// a BGSAVE is in flight it must still stash the key's epoch-start value, or
+/// the snapshot serializes the overwritten value for a segment it has not
+/// written yet.
+///
+/// RED before the fix: the pending queue is empty.
+#[test]
+fn test_inline_set_captures_snapshot_pre_image() {
+    use crate::persistence::snapshot_cow;
+
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"old")),
+        );
+    });
+    let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n";
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    // A BGSAVE just began on this shard (what `persistence_tick` does).
+    snapshot_cow::disarm();
+    snapshot_cow::arm();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,  // can_inline_reads
+        true,  // can_inline_writes
+        false, // resp3
+        &rt_config,
+    );
+    let pending = snapshot_cow::pending_for_test();
+    snapshot_cow::disarm();
+
+    assert_eq!(result, 1, "SET should still be inlined");
+    assert_eq!(&write_buf[..], b"+OK\r\n");
+    assert_eq!(
+        pending.len(),
+        1,
+        "inline SET during a snapshot must capture the pre-image"
+    );
+    assert_eq!(pending[0].1.as_ref(), b"foo");
+    #[allow(clippy::unwrap_used)]
+    let captured = pending[0].2.value.as_bytes().unwrap();
+    assert_eq!(captured, b"old", "must stash the EPOCH-START value");
+}
+
+/// The inline GET path must stay free of capture work even under an armed
+/// snapshot — it mutates nothing.
+#[test]
+fn test_inline_get_captures_nothing_under_snapshot() {
+    use crate::persistence::snapshot_cow;
+
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"bar")),
+        );
+    });
+    let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    snapshot_cow::disarm();
+    snapshot_cow::arm();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+    );
+    let pending = snapshot_cow::pending_for_test();
+    snapshot_cow::disarm();
+    assert_eq!(result, 1);
+    assert!(pending.is_empty(), "an inline GET must capture nothing");
+}
+
 #[test]
 fn test_inline_set_with_options_falls_through() {
     // SET with extra args (NX/XX/EX/PX) is NOT inlined — only plain *3 SET.

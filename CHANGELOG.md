@@ -86,6 +86,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only consumer of that number — so the optional `WITHSCORES` turned a legal command into a
   wrong-arity error at QUEUE time, aborting the whole transaction. Standalone it always worked,
   which is why no suite saw it.
+- **Ordinary LOCAL writes skipped snapshot copy-on-write, double-applying on recovery** (#558).
+  `spsc_handler::cow_intercept` — the only pre-image capture ordinary commands had — is reachable
+  exclusively from the routed/queued arms that run on the shard event loop's own stack, where
+  `&mut Option<SnapshotState>` is in scope. Every LOCAL write reaches the database from a
+  connection task instead: the monoio inline `SET` fast path frames the write straight from the
+  read buffer, and the monoio/tokio local dispatch arms, both MULTI/EXEC executors and the
+  coordinator scatter arms all call `command::dispatch` directly. None of them could capture
+  anything. At `--shards 1` that is *every* write; at `--shards N` it is the same-shard fraction.
+  Consequence: an `INCR` issued while a BGSAVE was in flight, on a key whose segment had not been
+  serialized yet, was written into the snapshot at its POST-increment value while the WAL still
+  held the `INCR` — recovery loaded the snapshot and replayed the `INCR` on top of it, so a key
+  that was 11 came back as 13. Silent, and worse the longer the snapshot runs. Capture is now
+  wired at the choke point every non-routed write funnels through (`command::dispatch`) plus the
+  inline `SET` path, reusing the per-shard thread-local queue #517 added for Lua writes (drained
+  into the live `SnapshotState` by the persistence tick, before it advances another segment).
+  Costs one thread-local `bool` load per command when no snapshot is in flight; the `is_write`
+  lookup, key extraction and entry clone are all behind that gate. Double capture on the routed
+  arms is harmless — `SnapshotState::capture_cow` is first-wins deduped.
 - **Blocking pops queued inside `MULTI` answer the wrong reply SHAPE** (#524). `BLPOP`/`BRPOP`/
   `BZPOPMIN`/`BZPOPMAX` were rewritten at queue time into `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX`, whose
   replies drop the key: `MULTI; BLPOP q 0; EXEC` answered `["v1"]` where Redis 8.6.1 answers

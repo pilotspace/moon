@@ -89,6 +89,20 @@ fn dispatch_inner(
     }
     let b0 = cmd[0] | 0x20; // lowercase first byte
 
+    // moon#558: snapshot copy-on-write for LOCAL writes. `dispatch` is the
+    // single point every non-routed write path funnels through (monoio local
+    // arm, tokio sharded local arm, handler_single, both MULTI/EXEC
+    // executors, the coordinator scatter arms) — none of them can see the
+    // event loop's `&mut Option<SnapshotState>`, so none of them could reach
+    // `spsc_handler::cow_intercept`. Without this an `INCR` issued while a
+    // BGSAVE is in flight is serialized at its POST-write value and the WAL
+    // replays the same `INCR` on top of it at recovery.
+    //
+    // One thread-local `bool` load when no snapshot is armed; everything
+    // else (the `is_write` lookup, the key extraction, the entry clone) is
+    // behind that gate.
+    crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, *selected_db, cmd, args);
+
     // Hot-key sampling: tick() is one relaxed fetch_add; the O(K) sketch
     // update only runs on 1-in-64 keyed commands, keeping the amortized
     // dispatch cost well under the hot-path allocation budget.

@@ -2113,6 +2113,15 @@ pub(crate) fn try_inline_dispatch(
             if db.hot_keys().tick() {
                 db.hot_keys().observe(&key);
             }
+            // moon#558: this path frames a plain SET straight from the read
+            // buffer — it never builds a `Frame`, never enters
+            // `command::dispatch`, and never reaches
+            // `spsc_handler::cow_intercept`. It must still stash the key's
+            // epoch-start value while a BGSAVE is in flight, or the snapshot
+            // serializes the overwritten value for a segment it has not
+            // written yet. One thread-local `bool` load when no snapshot is
+            // armed, which is every SET on a server that is not saving.
+            crate::persistence::snapshot_cow::capture_key_pre_image(db, selected_db, &key);
             let mut entry = crate::storage::entry::Entry::new_string(value);
             entry.set_last_access(db.now());
             entry.set_access_counter(5);
