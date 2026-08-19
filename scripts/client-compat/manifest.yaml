@@ -148,6 +148,38 @@ entries:
     command: "ZPOPMIN z"
     policy: exact
 
+  # moon#559: the KEYED pops. `ZPOPMIN z` was probed here from the start and
+  # was correct; its blocking cousin was not, because the reply prefixes the
+  # key and so needs its own shape rule. Both protocols, because the fix is
+  # RESP3-only and RESP2 must not move.
+  - name: shape_bzpopmin_score_is_double
+    setup: ["DEL z", "ZADD z 1.5 a"]
+    command: "BZPOPMIN z 0"
+    policy: exact
+
+  - name: shape_bzpopmax_score_is_double
+    setup: ["DEL z", "ZADD z 1.5 a"]
+    command: "BZPOPMAX z 0"
+    policy: exact
+
+  - name: shape_zmpop_score_is_double
+    setup: ["DEL z", "ZADD z 1.5 a"]
+    command: "ZMPOP 1 z MIN"
+    policy: exact
+
+  - name: shape_bzmpop_score_is_double
+    setup: ["DEL z", "ZADD z 1.5 a"]
+    command: "BZMPOP 0 1 z MIN"
+    policy: exact
+
+  # The same sweep found ZREVRANGE carrying arity 4 where Redis has -4, which
+  # only the MULTI queue gate consumes — standalone it always worked, so this
+  # probe pins the reply that the in-MULTI leg of the harness exercises.
+  - name: shape_zrevrange_withscores
+    setup: ["DEL z", "ZADD z 1 a 2 b"]
+    command: "ZREVRANGE z 0 -1 WITHSCORES"
+    policy: exact
+
   - name: shape_spop_with_count_is_set
     setup: ["DEL s", "SADD s a b c"]
     command: "SPOP s 2"

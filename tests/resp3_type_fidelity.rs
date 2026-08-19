@@ -948,3 +948,267 @@ fn r3f13_empty_replies_keep_their_type() {
         assert_eq!(got.shape(), want, "{what}. Got {got:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// r3f14 — the REST of the score family: keyed pops carry Doubles too (moon#559)
+//
+// Oracle (redis-server 8.x, RESP3). Every one of these replies is built by
+// `genericZpopCommand`, which emits the score through `addReplyDouble` — the
+// same call ZPOPMIN uses, and `addReplyDouble` is `,<score>` on RESP3 and
+// `$<len>\r\n<score>` on RESP2:
+//   BZPOPMIN k 0   -> *3  [key(bulk), member(bulk), score(DOUBLE)]
+//   BZPOPMAX k 0   -> same
+//   ZMPOP 1 k MIN  -> *2  [key(bulk), *N[ *2[member(bulk), score(DOUBLE)] ]]
+//   BZMPOP 0 1 k MIN -> same
+// The nesting is NOT the ZPOPMIN nesting: a blocking pop prefixes the key, so
+// the "is this two elements or a pair list?" rule that governs ZPOPMIN cannot
+// classify these — which is exactly why moon answered a BulkString score here
+// while getting ZPOPMIN right.
+// ---------------------------------------------------------------------------
+
+/// The shape of a keyed single pop: `[key, member, Double]`.
+const KEYED_POP: &str = "*3[$|,]";
+/// The shape of a keyed multi-pop: `[key, [[member, Double], ...]]`.
+const KEYED_MPOP: &str = "*2[$|*1[*2[$|,]]]";
+
+/// Setup that guarantees the pop finds something, per case.
+fn zset(key: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["DEL".into(), key.into()],
+        vec!["ZADD".into(), key.into(), "1.5".into(), "a".into()],
+    ]
+}
+
+/// `Vec<Vec<String>>` -> the borrowed form the runners take.
+fn as_setup(v: &[Vec<String>]) -> Vec<Vec<&str>> {
+    v.iter()
+        .map(|row| row.iter().map(String::as_str).collect())
+        .collect()
+}
+
+fn run_case(port: u16, proto: u8, key: &str, cmd: &[&str], ctx: &str) -> V {
+    let owned = zset(key);
+    let borrowed = as_setup(&owned);
+    let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+    match ctx {
+        "standalone" => standalone(port, proto, &setup, cmd),
+        "multi" => in_multi(port, proto, &setup, cmd),
+        "pipeline" => in_pipeline(port, proto, &setup, cmd),
+        other => panic!("unknown context {other}"),
+    }
+}
+
+#[test]
+fn r3f14_keyed_pop_scores_are_doubles_in_every_context() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("BZPOPMIN", &["BZPOPMIN", "r3f14:z", "0"], KEYED_POP),
+        ("BZPOPMAX", &["BZPOPMAX", "r3f14:z", "0"], KEYED_POP),
+        // Multi-key form: the reply still names the key that served.
+        (
+            "BZPOPMIN 2 keys",
+            &["BZPOPMIN", "r3f14:z", "r3f14:absent", "0"],
+            KEYED_POP,
+        ),
+        ("ZMPOP", &["ZMPOP", "1", "r3f14:z", "MIN"], KEYED_MPOP),
+        (
+            "BZMPOP",
+            &["BZMPOP", "0", "1", "r3f14:z", "MIN"],
+            KEYED_MPOP,
+        ),
+    ];
+
+    for (label, cmd, want) in cases {
+        for ctx in ["standalone", "multi", "pipeline"] {
+            let got = run_case(port, 3, "r3f14:z", cmd, ctx);
+            assert_shape(
+                &got,
+                want,
+                &format!("{label} ({ctx}) must carry a RESP3 Double score"),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r3f15 — RESP2 stays byte-identical, and the Double's digits match the bulk
+//
+// Two separate promises, both easy to break with a re-typing change:
+//   (a) RESP2 never sees a `,` (or any other RESP3-only type byte);
+//   (b) the RESP3 Double payload is the SAME TEXT as the RESP2 bulk payload —
+//       a re-typing that reformats the number is a silent precision change.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r3f15_keyed_pops_keep_resp2_bytes_and_score_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    // `1.5` is not representable as an integer and `3` is: the two branches of
+    // every score formatter in this codebase.
+    for (score, key) in [("1.5", "r3f15:a"), ("3", "r3f15:b"), ("-0.25", "r3f15:c")] {
+        for cmd_name in ["BZPOPMIN", "BZPOPMAX"] {
+            let setup: &[&[&str]] = &[&["DEL", key], &["ZADD", key, score, "m"]];
+            let r2 = standalone(port, 2, setup, &[cmd_name, key, "0"]);
+            let r3 = standalone(port, 3, setup, &[cmd_name, key, "0"]);
+
+            assert_shape(
+                &r2,
+                "*3[$]",
+                &format!("{cmd_name} under RESP2 must stay three BulkStrings"),
+            );
+            assert_shape(
+                &r3,
+                KEYED_POP,
+                &format!("{cmd_name} under RESP3 must carry a Double score"),
+            );
+            assert_eq!(
+                r3.items()[2].as_text(),
+                r2.items()[2].as_text(),
+                "{cmd_name}: the RESP3 Double text must equal the RESP2 bulk text — \
+                 re-typing must not reformat the score"
+            );
+        }
+
+        // ZMPOP: same two promises, one level deeper.
+        let setup: &[&[&str]] = &[&["DEL", key], &["ZADD", key, score, "m"]];
+        let r2 = standalone(port, 2, setup, &["ZMPOP", "1", key, "MIN"]);
+        let r3 = standalone(port, 3, setup, &["ZMPOP", "1", key, "MIN"]);
+        assert_shape(
+            &r2,
+            "*2[$|*1[*2[$]]]",
+            "ZMPOP under RESP2 is all BulkString",
+        );
+        assert_shape(&r3, KEYED_MPOP, "ZMPOP under RESP3 carries a Double score");
+        assert_eq!(
+            r3.items()[1].items()[0].items()[1].as_text(),
+            r2.items()[1].items()[0].items()[1].as_text(),
+            "ZMPOP: the RESP3 Double text must equal the RESP2 bulk text"
+        );
+    }
+
+    // The blanket RESP2 pin, mirroring r3f11 for the commands this task touches.
+    let setup: &[&[&str]] = &[&["DEL", "r3f15:z"], &["ZADD", "r3f15:z", "1.5", "a"]];
+    for cmd in [
+        &["BZPOPMIN", "r3f15:z", "0"][..],
+        &["BZMPOP", "0", "1", "r3f15:z", "MIN"][..],
+        &["ZMPOP", "1", "r3f15:z", "MIN"][..],
+    ] {
+        let shape = standalone(port, 2, setup, cmd).shape();
+        for forbidden in ['%', '~', ',', '#', '='] {
+            assert!(
+                !shape.contains(forbidden),
+                "RESP2 reply for {cmd:?} contains the RESP3-only type byte '{forbidden}': {shape}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r3f16 — the LIVE blocking path: a pop that really blocked, then was woken
+//
+// The immediate-hit path and the woken path both return through
+// `BlockingOutcome::Reply`, but only one of them is exercised by every other
+// test here. moon#559 was reported against the live path, so the live path is
+// asserted directly: connection A parks on an EMPTY key, connection B pushes,
+// A's reply must carry the Double.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r3f16_woken_blocking_pop_carries_a_double() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let mut a = Conn::new(port, 3);
+    a.setup(&["DEL", "r3f16:z"]);
+    // 10s is generous enough that a loaded CI box cannot time this out, and
+    // finite so a broken wake fails the test instead of hanging the suite.
+    a.send(&["BZPOPMIN", "r3f16:z", "10"]);
+
+    // Give A time to park before the push, so this is the WOKEN path and not
+    // an immediate hit racing the registration.
+    std::thread::sleep(Duration::from_millis(200));
+    let mut b = Conn::new(port, 2);
+    b.setup(&["ZADD", "r3f16:z", "2.5", "m"]);
+
+    let got = a.frame();
+    assert_shape(
+        &got,
+        KEYED_POP,
+        "a BZPOPMIN woken by another client must answer a Double score, \
+         exactly like the immediate-hit path",
+    );
+    assert_eq!(got.items()[2].as_text(), "2.5");
+}
+
+// ---------------------------------------------------------------------------
+// r3f18 — ZREVRANGE WITHSCORES survives MULTI (found by the #559 sweep)
+//
+// `ZREVRANGE` carried arity 4 in the command table where Redis has -4, and the
+// MULTI queue gate is the only consumer of that number: the optional
+// `WITHSCORES` made a legal command a wrong-arity error at QUEUE time, which
+// aborts the entire transaction. Standalone it always worked, so nothing in
+// the suite saw it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r3f18_zrevrange_withscores_is_queueable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let setup: &[&[&str]] = &[
+        &["DEL", "r3f18:z"],
+        &["ZADD", "r3f18:z", "1", "a", "2", "b"],
+    ];
+    let cmd: &[&str] = &["ZREVRANGE", "r3f18:z", "0", "-1", "WITHSCORES"];
+
+    for proto in [2u8, 3u8] {
+        let alone = standalone(port, proto, setup, cmd).shape();
+        let multi = in_multi(port, proto, setup, cmd).shape();
+        assert_eq!(
+            alone, multi,
+            "RESP{proto}: ZREVRANGE WITHSCORES must answer the same shape inside \
+             MULTI as it does standalone"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r3f17 — and the shape does not depend on which shard owned the key
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r3f17_keyed_pop_shape_is_identical_across_shards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 4);
+    let _g = ServerGuard(child);
+
+    for tag in ["t0", "t1", "t2", "t3", "t7"] {
+        let key = format!("{{{tag}}}r3f17");
+        let setup: &[&[&str]] = &[&["DEL", &key], &["ZADD", &key, "1.5", "a"]];
+        let got = standalone(port, 3, setup, &["BZPOPMIN", &key, "0"]);
+        assert_shape(
+            &got,
+            KEYED_POP,
+            &format!("BZPOPMIN on key {{{tag}}} must answer the Redis shape"),
+        );
+
+        // ZMPOP is NOT a blocking intercept: when its key lives on another
+        // shard the reply comes back over the cross-shard batch, where the
+        // shape is carried as a 1-byte tag classified at ENQUEUE time and
+        // applied on arrival. Different code from the local path, same answer.
+        let setup: &[&[&str]] = &[&["DEL", &key], &["ZADD", &key, "1.5", "a"]];
+        let got = standalone(port, 3, setup, &["ZMPOP", "1", &key, "MIN"]);
+        assert_shape(
+            &got,
+            KEYED_MPOP,
+            &format!("ZMPOP on key {{{tag}}} must answer the Redis shape"),
+        );
+    }
+}

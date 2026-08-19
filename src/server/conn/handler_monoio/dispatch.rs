@@ -1772,6 +1772,20 @@ pub(super) async fn try_handle_blocking<
         }
     };
 
+    // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the
+    // dispatch exit where every other reply meets the RESP3 policy — so it
+    // must apply that policy itself or the whole blocking family answers
+    // RESP2 shapes to a RESP3 client. It did not, which is why BZPOPMIN's
+    // score reached RESP3 clients as a BulkString on the shipped (monoio)
+    // runtime while the tokio handler, which does convert here, was right.
+    // Routed through the SAME choke point rather than a second table.
+    let blocking_response = crate::server::conn::util::apply_resp3_conversion(
+        cmd,
+        cmd_args,
+        blocking_response,
+        conn.protocol_version,
+    );
+
     // Encode blocking response directly
     codec.encode_frame(&blocking_response, write_buf);
     responses.clear();

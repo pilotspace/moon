@@ -259,7 +259,13 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "ZPOPMIN" => CommandMeta { name: "ZPOPMIN", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZPOPMAX" => CommandMeta { name: "ZPOPMAX", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREVRANK" => CommandMeta { name: "ZREVRANK", arity: -3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZREVRANGE" => CommandMeta { name: "ZREVRANGE", arity: 4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    // arity -4, not 4: `WITHSCORES` is optional, so the form is `>= 4`.
+    // Found by the moon#559 score-family sweep — the fixed arity made the
+    // MULTI queue gate reject `ZREVRANGE k 0 -1 WITHSCORES` with a wrong-arity
+    // error and abort the whole transaction, while the same command answered
+    // fine standalone (the gate is the only arity consumer). Redis 8:
+    // `COMMAND INFO ZREVRANGE` -> arity -4.
+    "ZREVRANGE" => CommandMeta { name: "ZREVRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZLEXCOUNT" => CommandMeta { name: "ZLEXCOUNT", arity: 4, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZUNIONSTORE" => CommandMeta { name: "ZUNIONSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZINTERSTORE" => CommandMeta { name: "ZINTERSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },

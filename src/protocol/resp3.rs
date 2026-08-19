@@ -45,7 +45,18 @@ pub enum Resp3Shape {
     ScoredPairs,
     /// `[member, score]` -> `[member, double]`, NOT wrapped.
     /// ZPOPMIN/ZPOPMAX with no count — Redis keeps this one flat.
+    /// Also `[rank, score]` for ZRANK/ZREVRANK WITHSCORE: the converter only
+    /// ever touches the SECOND element, so the Integer rank rides through.
     ScoredFlat,
+    /// `[key, member, score]` -> `[key, member, double]`. BZPOPMIN/BZPOPMAX.
+    ///
+    /// Its own shape rather than a case of [`Resp3Shape::ScoredFlat`] because
+    /// the key prefix moves the score by one: a blocking pop names the key
+    /// that served it, which the non-blocking twin has no need to (moon#559).
+    KeyedScoredFlat,
+    /// `[key, [[member, score], ...]]` -> the same with double scores.
+    /// ZMPOP/BZMPOP — pair-nested in RESP2 already, so only the score re-types.
+    KeyedScoredPairs,
     /// Flat `[field, value, ...]` -> `[[field, value], ...]`, values untouched.
     /// HRANDFIELD WITHVALUES. Note this is an array of pairs, NOT a Map —
     /// the inversion that made redis-py raise on Moon.
@@ -63,6 +74,35 @@ fn has_token(args: &[Frame], token: &[u8]) -> bool {
         Frame::BulkString(b) | Frame::SimpleString(b) => b.eq_ignore_ascii_case(token),
         _ => false,
     })
+}
+
+/// True when `ZADD`'s option list contains `INCR`.
+///
+/// Positional, not [`has_token`]: after the leading flags every remaining
+/// argument is a score or a MEMBER, and a member may legitimately be the text
+/// `INCR` (`ZADD z 1 INCR` adds a member called INCR and replies `:1`). Only
+/// the flag run is scanned, and it stops at the first argument that is not a
+/// flag — exactly where Redis's own parser stops.
+#[inline]
+fn zadd_has_incr(args: &[Frame]) -> bool {
+    // args[0] is the key.
+    for a in args.iter().skip(1) {
+        let (Frame::BulkString(b) | Frame::SimpleString(b)) = a else {
+            return false;
+        };
+        if b.eq_ignore_ascii_case(b"INCR") {
+            return true;
+        }
+        if !(b.eq_ignore_ascii_case(b"NX")
+            || b.eq_ignore_ascii_case(b"XX")
+            || b.eq_ignore_ascii_case(b"GT")
+            || b.eq_ignore_ascii_case(b"LT")
+            || b.eq_ignore_ascii_case(b"CH"))
+        {
+            return false;
+        }
+    }
+    false
 }
 
 /// True when `args[idx]` equals `token`, case-insensitively.
@@ -112,13 +152,45 @@ pub fn resp3_shape_of(cmd_upper: &[u8], args: &[Frame]) -> Resp3Shape {
         // ZPOPMIN/ZPOPMAX: `<count>` present -> wrapped pairs; absent -> ONE
         // flat [member, score] pair. Redis really does change the nesting on
         // the presence of the count.
-        b"ZPOPMIN" | b"ZPOPMAX" | b"BZPOPMIN" | b"BZPOPMAX" => {
+        b"ZPOPMIN" | b"ZPOPMAX" => {
             if args.len() >= 2 {
                 Resp3Shape::ScoredPairs
             } else {
                 Resp3Shape::ScoredFlat
             }
         }
+
+        // The BLOCKING pops are NOT that rule (moon#559). Their arguments are
+        // `key [key ...] timeout`, so `args.len() >= 2` is true for the
+        // simplest possible call — the old shared arm therefore classified
+        // every BZPOPMIN as ScoredPairs, and a 3-element reply is odd, so the
+        // pair-wrapper passed it through and the score stayed a BulkString.
+        // The reply is one flat `[key, member, score]` however many keys were
+        // asked for; there is no count form.
+        b"BZPOPMIN" | b"BZPOPMAX" => Resp3Shape::KeyedScoredFlat,
+
+        // ZMPOP/BZMPOP: `[key, [[member, score], ...]]`. Already pair-nested on
+        // RESP2, so unlike ZPOPMIN nothing re-nests — only the score re-types.
+        b"ZMPOP" | b"BZMPOP" => Resp3Shape::KeyedScoredPairs,
+
+        // ZRANK/ZREVRANK WITHSCORE -> `[integer rank, double score]`.
+        // Positional: `ZRANK key member` takes exactly one member, so a member
+        // literally named WITHSCORE is only the modifier in the third slot.
+        // (Moon does not implement WITHSCORE yet — moon#521/PR #564. The rule
+        // is here so the reply is right the day it lands, and it is inert
+        // until then: the classifier answers on arguments, and the converter
+        // passes through anything that is not the shape it expects.)
+        b"ZRANK" | b"ZREVRANK" if args.len() == 3 && arg_is(args, 2, b"WITHSCORE") => {
+            Resp3Shape::ScoredFlat
+        }
+
+        // `ZADD key ... INCR ... ` replies with the member's NEW SCORE, which
+        // Redis sends as a Double (and as a Null when NX/XX/GT/LT suppressed
+        // the update — `apply_shape` passes nulls through untouched). Without
+        // INCR the reply is an Integer count and must not be touched.
+        // (Moon does not implement ZADD INCR yet — the arity check rejects it.
+        // Same forward-compatibility argument as ZRANK WITHSCORE above.)
+        b"ZADD" if zadd_has_incr(args) => Resp3Shape::Double,
 
         // SPOP/SRANDMEMBER-style count switch: `SPOP key` is a single Bulk,
         // `SPOP key <count>` is a Set.
@@ -158,6 +230,8 @@ pub fn apply_shape(shape: Resp3Shape, response: Frame, proto: u8) -> Frame {
         Resp3Shape::DoubleArray => map_elements(response, bulk_to_double),
         Resp3Shape::ScoredPairs => pair_wrap(response, true),
         Resp3Shape::ScoredFlat => scored_flat(response),
+        Resp3Shape::KeyedScoredFlat => keyed_scored_flat(response),
+        Resp3Shape::KeyedScoredPairs => keyed_scored_pairs(response),
         Resp3Shape::ValuePairs => pair_wrap(response, false),
         Resp3Shape::CoordPairs => {
             map_elements(response, |inner| map_elements(inner, bulk_to_double))
@@ -261,6 +335,48 @@ fn scored_flat(frame: Frame) -> Frame {
     }
 }
 
+/// `[key, member, score]` -> `[key, member, Double(score)]` (BZPOPMIN/BZPOPMAX).
+///
+/// Anything that is not exactly three elements is passed through: the only
+/// other replies these commands produce are the timeout null and an error,
+/// both of which `apply_shape` already returned before reaching here.
+fn keyed_scored_flat(frame: Frame) -> Frame {
+    match frame {
+        Frame::Array(items) if items.len() == 3 => {
+            let mut iter = items.into_iter();
+            let (Some(k), Some(m), Some(s)) = (iter.next(), iter.next(), iter.next()) else {
+                // Unreachable: the length is checked above. Returning the
+                // empty array rather than unwrapping keeps the "never panics
+                // on a reply" promise structural.
+                return Frame::Array(FrameVec::new());
+            };
+            Frame::Array(FrameVec::from_vec(vec![k, m, bulk_to_double(s)]))
+        }
+        other => other,
+    }
+}
+
+/// `[key, [[member, score], ...]]` -> the same with Double scores (ZMPOP/BZMPOP).
+///
+/// The element list is already pair-nested on the wire in RESP2, so this only
+/// re-types the second member of each inner pair — via [`scored_flat`], the
+/// same helper ZPOPMIN uses, so the two cannot drift.
+fn keyed_scored_pairs(frame: Frame) -> Frame {
+    match frame {
+        Frame::Array(items) if items.len() == 2 => {
+            let mut iter = items.into_iter();
+            let (Some(k), Some(elems)) = (iter.next(), iter.next()) else {
+                return Frame::Array(FrameVec::new());
+            };
+            Frame::Array(FrameVec::from_vec(vec![
+                k,
+                map_elements(elems, scored_flat),
+            ]))
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +432,85 @@ mod tests {
         assert_eq!(
             resp3_shape_of(b"ZPOPMIN", &args(&["z", "2"])),
             Resp3Shape::ScoredPairs
+        );
+    }
+
+    #[test]
+    fn blocking_pops_are_keyed_not_the_zpopmin_rule() {
+        // moon#559. `BZPOPMIN key timeout` is TWO arguments, so the old
+        // shared arm with ZPOPMIN read the timeout as a count and answered
+        // ScoredPairs — which silently did nothing to a 3-element reply.
+        for cmd in [&b"BZPOPMIN"[..], b"BZPOPMAX"] {
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["z", "0"])),
+                Resp3Shape::KeyedScoredFlat,
+                "{} must not inherit ZPOPMIN's count rule",
+                String::from_utf8_lossy(cmd)
+            );
+            // Many keys, same reply shape — the key list never re-nests it.
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["z1", "z2", "z3", "0"])),
+                Resp3Shape::KeyedScoredFlat
+            );
+        }
+        for cmd in [&b"ZMPOP"[..], b"BZMPOP"] {
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["1", "z", "MIN"])),
+                Resp3Shape::KeyedScoredPairs,
+                "{} answers [key, [[member, score], ...]]",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn zrank_withscore_is_positional() {
+        assert_eq!(
+            resp3_shape_of(b"ZRANK", &args(&["z", "m", "WITHSCORE"])),
+            Resp3Shape::ScoredFlat
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZREVRANK", &args(&["z", "m", "withscore"])),
+            Resp3Shape::ScoredFlat
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZRANK", &args(&["z", "m"])),
+            Resp3Shape::None,
+            "plain ZRANK is an Integer and must not be touched"
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZRANK", &args(&["z", "WITHSCORE"])),
+            Resp3Shape::None,
+            "a MEMBER named WITHSCORE is not the modifier — the modifier is \
+             the third argument, and this reply is a bare Integer"
+        );
+    }
+
+    #[test]
+    fn zadd_incr_is_a_double_and_only_in_the_flag_run() {
+        assert_eq!(
+            resp3_shape_of(b"ZADD", &args(&["z", "INCR", "1", "m"])),
+            Resp3Shape::Double
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZADD", &args(&["z", "GT", "CH", "incr", "1", "m"])),
+            Resp3Shape::Double,
+            "INCR anywhere in the LEADING flag run counts"
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZADD", &args(&["z", "1", "m"])),
+            Resp3Shape::None,
+            "plain ZADD replies an Integer count"
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZADD", &args(&["z", "1", "INCR"])),
+            Resp3Shape::None,
+            "a MEMBER named INCR is not the flag — the flag run ended at `1`"
+        );
+        assert_eq!(
+            resp3_shape_of(b"ZADD", &args(&["z", "GT", "1", "a", "2", "INCR"])),
+            Resp3Shape::None,
+            "and it is still a member two pairs later"
         );
     }
 
@@ -479,6 +674,62 @@ mod tests {
             apply_shape(Resp3Shape::ScoredFlat, flat, 3),
             Frame::Array(framevec![bulk("a"), Frame::Double(1.5)]),
             "ZPOPMIN with no count is NOT wrapped"
+        );
+    }
+
+    #[test]
+    fn keyed_scored_flat_types_only_the_score() {
+        let flat = Frame::Array(framevec![bulk("z"), bulk("a"), bulk("1.5")]);
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredFlat, flat, 3),
+            Frame::Array(framevec![bulk("z"), bulk("a"), Frame::Double(1.5)]),
+            "BZPOPMIN keeps [key, member] as BulkStrings and re-types only the score"
+        );
+
+        // The timeout reply, which BZPOPMIN answers far more often than a hit.
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredFlat, Frame::NullArray, 3),
+            Frame::NullArray
+        );
+        // A reply that is not the expected arity passes through whole.
+        let odd = Frame::Array(framevec![bulk("z"), bulk("a")]);
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredFlat, odd.clone(), 3),
+            odd
+        );
+        // RESP2 is never touched.
+        let flat = Frame::Array(framevec![bulk("z"), bulk("a"), bulk("1.5")]);
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredFlat, flat.clone(), 2),
+            flat
+        );
+    }
+
+    #[test]
+    fn keyed_scored_pairs_types_every_inner_score() {
+        let reply = Frame::Array(framevec![
+            bulk("z"),
+            Frame::Array(framevec![
+                Frame::Array(framevec![bulk("a"), bulk("1")]),
+                Frame::Array(framevec![bulk("b"), bulk("2.5")]),
+            ]),
+        ]);
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredPairs, reply, 3),
+            Frame::Array(framevec![
+                bulk("z"),
+                Frame::Array(framevec![
+                    Frame::Array(framevec![bulk("a"), Frame::Double(1.0)]),
+                    Frame::Array(framevec![bulk("b"), Frame::Double(2.5)]),
+                ]),
+            ]),
+            "ZMPOP/BZMPOP re-type the score of EVERY popped element"
+        );
+
+        assert_eq!(
+            apply_shape(Resp3Shape::KeyedScoredPairs, Frame::NullArray, 3),
+            Frame::NullArray,
+            "ZMPOP on an empty key stays the null it was"
         );
     }
 

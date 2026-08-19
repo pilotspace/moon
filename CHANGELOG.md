@@ -60,6 +60,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   popped from the source and then silently swallowed by `list_push_*`'s `if let Ok(list)`, so the
   client received a value that had left the keyspace entirely — on the immediate path and on the
   wake path alike.
+- **RESP3: keyed sorted-set pops sent their score as a BulkString** (#559). `BZPOPMIN`, `BZPOPMAX`,
+  `ZMPOP` and `BZMPOP` answered `$3\r\n1.5` where redis-server 8.x answers the RESP3 Double
+  `,1.5` — every one of these replies is built by Redis's `genericZpopCommand`, which emits the
+  score through `addReplyDouble`, exactly like the `ZPOPMIN` Moon already got right. Two causes,
+  both fixed at the single seam rather than per command: (1) the shape classifier
+  (`protocol::resp3::resp3_shape_of`) lumped `BZPOPMIN`/`BZPOPMAX` in with `ZPOPMIN`, whose rule is
+  "a second argument is a COUNT" — but a blocking pop's second argument is the TIMEOUT, so every
+  call classified as pair-wrapped, and since the reply is `[key, member, score]` (odd) the
+  pair-wrapper passed it through untouched; `ZMPOP`/`BZMPOP` had no rule at all. They now have
+  their own shapes, `KeyedScoredFlat` and `KeyedScoredPairs`. (2) The monoio handler's blocking
+  branch is an **intercept**: it short-circuits the dispatch exit where every other reply meets the
+  RESP3 policy, and it never applied that policy itself (#462's class), so on the shipped runtime
+  the whole blocking family answered RESP2 shapes to RESP3 clients while the tokio handler, which
+  does convert there, was right. It now routes through the same choke point. The blocking-in-MULTI
+  executor converts too, so standalone, pipelined, in-`MULTI` and cross-shard all answer the one
+  shape. **RESP2 is byte-identical** — the conversion is gated on the negotiated protocol version,
+  and the Double's text is the same shortest-repr formatting the bulk carried, asserted directly.
+  Also pre-registered, inert until the commands land: `ZRANK`/`ZREVRANK WITHSCORE` (Double score)
+  and `ZADD ... INCR` (Double reply), both classified positionally so a member literally named
+  `WITHSCORE` or `INCR` is not mistaken for the modifier. Verified unchanged against the oracle:
+  `GEODIST` and `ZSCAN` scores stay BulkStrings in RESP3.
+- **`ZREVRANGE key start stop WITHSCORES` was rejected inside `MULTI`.** Found by the #559 sweep:
+  the command table gave `ZREVRANGE` arity 4 where Redis gives -4, and the MULTI queue gate is the
+  only consumer of that number — so the optional `WITHSCORES` turned a legal command into a
+  wrong-arity error at QUEUE time, aborting the whole transaction. Standalone it always worked,
+  which is why no suite saw it.
 - **Blocking pops queued inside `MULTI` answer the wrong reply SHAPE** (#524). `BLPOP`/`BRPOP`/
   `BZPOPMIN`/`BZPOPMAX` were rewritten at queue time into `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX`, whose
   replies drop the key: `MULTI; BLPOP q 0; EXEC` answered `["v1"]` where Redis 8.6.1 answers
