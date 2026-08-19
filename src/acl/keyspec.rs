@@ -267,10 +267,14 @@ fn numkeys_keys(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> CommandKey
     let first = nk_idx + 1;
     // `numkeys` larger than the argv is malformed; the command errors out
     // anyway, and enumerating fewer keys than declared must not silently
-    // reduce enforcement.
-    if args.len() < first + nk {
+    // reduce enforcement. `checked_add` is load-bearing, not defensive
+    // decoration: `nk` is attacker-controlled, so `first + nk` can overflow
+    // `usize` — in release (no overflow-checks) it WRAPS, the `<` guard then
+    // sees a tiny sum and the slice below panics `&args[1..0]`. A panic here
+    // is reachable by any key-restricted user = remote DoS inside ACL.
+    let Some(end) = first.checked_add(nk).filter(|&e| e <= args.len()) else {
         return CommandKeys::Indeterminate;
-    }
+    };
     let mut keys = KeyVec::new();
     if dest_at_zero {
         match args.first().and_then(key_bytes) {
@@ -278,7 +282,7 @@ fn numkeys_keys(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> CommandKey
             None => return CommandKeys::Indeterminate,
         }
     }
-    for frame in &args[first..first + nk] {
+    for frame in &args[first..end] {
         match key_bytes(frame) {
             Some(k) => keys.push(k),
             None => return CommandKeys::Indeterminate,
@@ -485,6 +489,28 @@ mod tests {
         assert!(is_indeterminate(b"LMPOP", &["4", "a", "b", "LEFT"]));
         assert!(is_indeterminate(b"LMPOP", &["notanumber", "a", "LEFT"]));
         assert!(is_indeterminate(b"LMPOP", &[]));
+    }
+
+    /// A numkeys big enough to overflow `first + nk` must fail closed, not
+    /// panic. Release builds wrap the addition (no overflow-checks), so the
+    /// old `args.len() < first + nk` guard saw `< 0` (false) and then sliced
+    /// `&args[first..first + nk]` = `&args[1..0]` — a panic reachable by any
+    /// key-restricted user, i.e. a remote DoS inside ACL enforcement.
+    #[test]
+    fn numkeys_overflow_fails_closed_without_panic() {
+        let huge = usize::MAX.to_string();
+        // nk at index 0 (LMPOP/ZMPOP/ZDIFF/ZINTER/ZUNION/SINTERCARD/…).
+        assert!(is_indeterminate(b"LMPOP", &[&huge, "a", "LEFT"]));
+        assert!(is_indeterminate(b"ZDIFF", &[&huge, "a"]));
+        assert!(is_indeterminate(b"SINTERCARD", &[&huge, "a"]));
+        // nk at index 1 (BLMPOP/BZMPOP/EVAL/EVALSHA/FCALL/Z*STORE).
+        assert!(is_indeterminate(b"BLMPOP", &["0", &huge, "a", "LEFT"]));
+        assert!(is_indeterminate(b"EVAL", &["script", &huge, "a"]));
+        assert!(is_indeterminate(b"ZUNIONSTORE", &["dst", &huge, "a"]));
+        // A near-boundary value that would overflow only when `first` is
+        // added — still must not panic.
+        let near = (usize::MAX - 1).to_string();
+        assert!(is_indeterminate(b"LMPOP", &[&near, "a", "LEFT"]));
     }
 
     #[test]
