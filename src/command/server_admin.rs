@@ -428,8 +428,10 @@ fn memory_doctor() -> Frame {
             vec_total += mem.vector.load(Ordering::Relaxed);
             text_total += mem.text.load(Ordering::Relaxed);
             csr_total += mem.graph.load(Ordering::Relaxed);
-            // C4 (wave-5 hygiene): Lua script-cache byte estimate.
-            lua_total += mem.lua.load(Ordering::Relaxed);
+            // C4 (wave-5 hygiene): Lua script-cache byte estimate, plus
+            // (moon#506) the `mlua` interpreter heap — ~25KB/shard the doctor
+            // previously charged to allocator overhead instead of to Lua.
+            lua_total += mem.lua.load(Ordering::Relaxed) + mem.lua_vm.load(Ordering::Relaxed);
         }
         hnsw_bytes = vec_total;
         text_bytes = text_total;
@@ -524,7 +526,7 @@ fn memory_doctor() -> Frame {
     let _ = writeln!(
         out,
         "  used_memory (INFO / moon_used_memory_bytes): {}  -- elastic budget \
-         + Lua script cache + replication backlog (Redis parity)",
+         + Lua (VM + script cache) + replication backlog (Redis parity)",
         humanize_bytes(used_memory_reported)
     );
     let _ = writeln!(
@@ -596,7 +598,7 @@ fn memory_doctor() -> Frame {
     );
     let _ = writeln!(
         out,
-        "  Lua scripts:            {}  ({:.1}%)",
+        "  Lua (VM + scripts):     {}  ({:.1}%)",
         humanize_bytes(lua_bytes),
         pct(lua_bytes, rss)
     );

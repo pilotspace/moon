@@ -51,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because rollback is the same best-effort `TXN.ABORT` path whose undo capture still has gaps
   (#500). Nothing changes for a transaction whose every op was accepted. Both handlers (monoio
   and sharded/tokio) carry the check, and both are covered end-to-end.
+- **`INFO memory` now reports `used_memory_lua`, and the Lua memory gauges stop reading ~48 bytes**
+  (#506). The reported defect was "monoio's shard event loop holds a different Lua VM than the one
+  executing scripts". Instrumenting both sites disproved that: on monoio the tick's `lua_rc` and
+  `handle_eval`'s VM are the *same* `Rc` pointer, reporting the same 24165 → 25403 → 4219542 bytes
+  the tokio leg reported. The real defect was the SOURCE of the published number.
+  `ShardStoreMemory::lua` carried `ScriptCache::resident_bytes()` — the cached script *text*, which
+  for `EVAL "return 1" 0` is exactly 48 bytes (a 40-char SHA1 key plus an 8-byte body), the very
+  figure the issue read as monoio's "wrong VM". Nothing anywhere sampled the interpreter heap, so
+  `moon_memory_bytes{kind="lua_scripts"}`, `moon_used_memory_bytes`, `INFO used_memory` and MEMORY
+  DOCTOR all under-reported Lua by three orders of magnitude, and a script that anchors megabytes
+  of tables in `_G` was invisible to every one of them. The VM is now sampled into its own
+  `ShardStoreMemory::lua_vm` atomic and summed into all four, with `used_memory_lua` emitted under
+  Redis's field name (its client-compat waiver is deleted). The sample deliberately lives in
+  `persistence_tick::run_eviction_tick` — the one tick body both event loops share — because the
+  shard periodic tick has TWO arms in `event_loop.rs` (a tokio `select!` arm and a monoio counter
+  arm) and a publish written into either one alone is invisible on the other runtime; that is the
+  trap the original investigation fell into, and a guard test now fails if the sample migrates back
+  into a runtime-specific arm.
 
 ### Changed
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).

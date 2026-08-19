@@ -30,6 +30,39 @@ pub fn setup_lua_vm(eviction_ctx: bridge::LuaEvictionCtx) -> mlua::Result<Rc<Lua
     Ok(lua)
 }
 
+/// A shard's one Lua VM slot: `None` until the first connection lands
+/// (`conn_accept`) or the first routed script arrives
+/// ([`ShardLuaRuntime::vm`]) — whichever gets there first builds it, and every
+/// later caller reuses it.
+pub type ShardLuaSlot = Rc<RefCell<Option<Rc<Lua>>>>;
+
+/// Bytes the shard's Lua VM currently holds — `Lua::used_memory()`, i.e. the
+/// interpreter heap, the figure Redis publishes as `used_memory_lua`.
+///
+/// `Some(0)` when the shard has not built a VM yet. `None` means the slot was
+/// already mutably borrowed and could not be sampled this tick; callers must
+/// leave the last published value in place rather than store a spurious 0.
+/// (No current caller can actually collide — every `borrow_mut` of the slot is
+/// a short synchronous block with no `.await` inside — but a publish path on
+/// the shard thread must not be one refactor away from a `RefCell` panic,
+/// which on a shard thread aborts the process.)
+///
+/// # moon#506
+///
+/// The only sanctioned way to sample a shard's Lua footprint. The bug this
+/// replaces was not two VMs: `ShardStoreMemory::lua` carried
+/// `ScriptCache::resident_bytes()` (48 bytes for `return 1` — a 40-char SHA1
+/// key plus an 8-byte body) while the VM executing that script held ~25KB, and
+/// a `used_memory_lua` built on the cache figure would have been wrong by
+/// three orders of magnitude on both runtimes.
+#[must_use]
+pub fn vm_used_memory(slot: &ShardLuaSlot) -> Option<usize> {
+    match slot.try_borrow() {
+        Ok(vm) => Some(vm.as_ref().map_or(0, |lua| lua.used_memory())),
+        Err(_) => None,
+    }
+}
+
 /// Handle the EVAL Redis command: parse args, validate keys, cache script, run.
 pub fn handle_eval(
     lua: &Rc<Lua>,
@@ -482,6 +515,61 @@ mod tests {
         // Should be sandboxed
         let load: LuaValue = lua.globals().get("load").unwrap();
         assert!(load == LuaValue::Nil);
+    }
+
+    // ── moon#506: the shard's Lua footprint must be samplable ──────────────
+
+    #[test]
+    fn test_vm_used_memory_no_vm_yet_is_zero() {
+        let slot: ShardLuaSlot = Rc::new(RefCell::new(None));
+        assert_eq!(vm_used_memory(&slot), Some(0));
+    }
+
+    #[test]
+    fn test_vm_used_memory_reports_a_real_sandboxed_vm() {
+        let slot: ShardLuaSlot = Rc::new(RefCell::new(Some(
+            setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap(),
+        )));
+        let bytes = vm_used_memory(&slot).expect("slot is free to borrow");
+        // The number this replaces was 48 -- ScriptCache::resident_bytes() for
+        // `return 1` (40-char SHA1 key + 8-byte body). A Lua state carrying
+        // setup_sandbox + register_redis_api measures in the tens of KB, so
+        // this floor separates "the VM" from "the script text" by a wide
+        // margin without pinning an mlua-version-specific constant.
+        assert!(
+            bytes > 4096,
+            "a sandboxed VM with the redis API registered reported {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn test_vm_used_memory_tracks_lua_allocation() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let slot: ShardLuaSlot = Rc::new(RefCell::new(Some(lua.clone())));
+        let before = vm_used_memory(&slot).expect("borrowable");
+
+        // Anchored in _G so the collector cannot reclaim it before the sample.
+        lua.load("local t = {} for i = 1, 100000 do t[i] = i end _G.KEEP = t")
+            .eval::<()>()
+            .unwrap();
+
+        let after = vm_used_memory(&slot).expect("borrowable");
+        assert!(
+            after > before + 100_000,
+            "VM memory went {before} -> {after} across a 100k-entry table"
+        );
+    }
+
+    #[test]
+    fn test_vm_used_memory_declines_to_sample_a_borrowed_slot() {
+        // The publish path runs on the shard thread, where a RefCell panic
+        // aborts the process. `None` tells the caller to keep the previously
+        // published value instead of storing a bogus 0.
+        let slot: ShardLuaSlot = Rc::new(RefCell::new(Some(
+            setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap(),
+        )));
+        let _held = slot.borrow_mut();
+        assert_eq!(vm_used_memory(&slot), None);
     }
 
     #[test]

@@ -29,6 +29,21 @@ pub struct ShardStoreMemory {
     /// hygiene). The cache itself stays unbounded (Redis parity -- `SCRIPT
     /// FLUSH` is the only eviction path); this is observability only.
     pub lua: AtomicUsize,
+    /// Bytes allocated by the shard's `mlua` VM itself — `Lua::used_memory()`,
+    /// the interpreter heap, which is what Redis reports as `used_memory_lua`.
+    ///
+    /// moon#506: this is a SEPARATE atomic from `lua` above on purpose. `lua`
+    /// carries only the script SOURCES (a 40-char SHA1 key plus the script
+    /// body: 48 bytes for `return 1`), while an empty sandboxed VM with the
+    /// redis API registered is already ~24KB and grows with whatever a script
+    /// anchors in `_G`. Publishing the cache figure under a "Lua memory" name
+    /// under-reported the real footprint by three orders of magnitude.
+    ///
+    /// 0 until the shard actually builds a VM (first connection or first
+    /// routed script). Sampled on the same 100ms tick as the fields above, via
+    /// `run_eviction_tick` — the ONE body both runtime event loops share, so
+    /// the monoio arm cannot silently miss the publish the tokio arm has.
+    pub lua_vm: AtomicUsize,
     /// Resident bytes of this shard's `PageCache` frame buffers (task #58,
     /// LOW-2): `PageCache::resident_buffer_bytes()` -- num 4KB frames actually
     /// grown * 4096 + num 64KB frames actually grown * 65536. Observability
@@ -118,6 +133,7 @@ impl ShardDatabases {
                     text: AtomicUsize::new(0),
                     graph: AtomicUsize::new(0),
                     lua: AtomicUsize::new(0),
+                    lua_vm: AtomicUsize::new(0),
                     pagecache: AtomicUsize::new(0),
                 })
             })

@@ -1551,7 +1551,12 @@ pub fn logical_used_memory_bytes() -> usize {
             mem.vector.load(Ordering::Relaxed)
                 + mem.text.load(Ordering::Relaxed)
                 + mem.graph.load(Ordering::Relaxed)
+                // moon#506: script sources AND the interpreter heap. The VM is
+                // real heap the process holds; a script that anchors megabytes
+                // of tables in `_G` has to be visible somewhere, and this is
+                // the ledger operators watch.
                 + mem.lua.load(Ordering::Relaxed)
+                + mem.lua_vm.load(Ordering::Relaxed)
         })
         .sum();
     let replication_backlog = get_global_repl_state_arc()
@@ -1560,6 +1565,29 @@ pub fn logical_used_memory_bytes() -> usize {
     dashtable_and_cold_index
         .saturating_add(store_total)
         .saturating_add(replication_backlog)
+}
+
+/// Bytes held by the per-shard `mlua` VMs, summed across shards — INFO's
+/// `used_memory_lua` (moon#506).
+///
+/// Reads only `ShardStoreMemory::lua_vm`, the interpreter heap sampled by
+/// `persistence_tick::run_eviction_tick`. Deliberately EXCLUDES
+/// `ShardStoreMemory::lua` (the cached script sources): Redis reports those
+/// under `used_memory_scripts`, and folding a 48-byte figure into a 25KB one
+/// would just blur which of the two an operator is watching grow.
+///
+/// 0 before any shard builds a VM (moon initialises Lua lazily), which is the
+/// truthful answer, not a missing sample.
+#[must_use]
+pub fn lua_vm_memory_bytes() -> usize {
+    let Some(shard_dbs) = get_global_shard_databases() else {
+        return 0;
+    };
+    shard_dbs
+        .store_memory_per_shard
+        .iter()
+        .map(|mem| mem.lua_vm.load(Ordering::Relaxed))
+        .sum()
 }
 
 // ── Global SLOWLOG ─────────────────────────────────────────────────────
@@ -1699,8 +1727,10 @@ fn update_moon_memory_bytes() {
             text += mem.text.load(Ordering::Relaxed);
             // graph is cfg-gated at publish time; the atomic is always present.
             csr += mem.graph.load(Ordering::Relaxed);
-            // C4 (wave-5 hygiene): Lua script-cache byte estimate.
-            lua += mem.lua.load(Ordering::Relaxed);
+            // C4 (wave-5 hygiene): Lua script-cache byte estimate, plus
+            // (moon#506) the `mlua` interpreter heap that actually dominates
+            // it — the gauge was previously a permanent ~48 bytes.
+            lua += mem.lua.load(Ordering::Relaxed) + mem.lua_vm.load(Ordering::Relaxed);
             pagecache += mem.pagecache.load(Ordering::Relaxed);
         }
     }

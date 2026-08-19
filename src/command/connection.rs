@@ -318,10 +318,13 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     // process RSS. Before this fix `used_memory` was literally `rss`,
     // which is why a disk-offload deployment at `--maxmemory 256MB` showed
     // `used_memory` in the 400-700MB range: RSS also carries the binary
-    // image, thread stacks, allocator arena fragmentation, mmap'd cold-read
-    // page-cache frames, the (intentionally unbounded) Lua script cache, and
-    // the replication backlog ring -- none of which the eviction system
-    // ever charges against the cap. Those components still get their own
+    // image, thread stacks, allocator arena fragmentation and mmap'd
+    // cold-read page-cache frames -- none of which the eviction system ever
+    // charges against the cap. The Lua footprint (interpreter heap +
+    // the intentionally unbounded script cache) and the replication backlog
+    // ring ARE included here, since both are unbounded process heap an
+    // operator has to be able to watch grow, but neither gates eviction
+    // either. Those components still get their own
     // truthful lines below (`used_memory_rss`, `allocator_overhead_bytes`,
     // `pagecache_bytes`) plus a full breakdown in `MEMORY DOCTOR` -- they are
     // not hidden, just no longer conflated with the gate-comparable figure.
@@ -346,6 +349,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          used_memory_human:{human}\r\n\
          used_memory_rss:{rss}\r\n\
          used_memory_peak:{rss}\r\n\
+         used_memory_lua:{used_memory_lua}\r\n\
          allocator_overhead_bytes:{allocator_overhead_bytes}\r\n\
          pagecache_bytes:{pagecache_bytes}\r\n\
          mem_fragmentation_ratio:{frag:.2}\r\n\
@@ -356,6 +360,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         used_memory = used_memory,
         human = format_memory_human(used_memory),
         rss = rss,
+        // moon#506: the per-shard `mlua` interpreter heap, summed. Redis's
+        // field name, so an existing dashboard picks the series up without
+        // translation. Was previously not emitted at all rather than emitted
+        // wrong — `ShardStoreMemory::lua` carried the cached script SOURCES
+        // (48 bytes for `return 1`) while the VM running them held ~25KB.
+        used_memory_lua = crate::admin::metrics_setup::lua_vm_memory_bytes(),
         allocator_overhead_bytes = allocator_overhead_bytes,
         pagecache_bytes = pagecache_bytes,
         // The gap operators currently cannot see, under Redis's field name so
