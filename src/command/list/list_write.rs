@@ -160,6 +160,26 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
 // LPOP key [count]
 // ---------------------------------------------------------------------------
 
+/// Parse the optional `count` of `LPOP`/`RPOP` (`args[1]`, when present).
+///
+/// Redis answers a NON-INTEGER and a NEGATIVE count with the SAME message —
+/// `ERR value is out of range, must be positive` — because both fall out of
+/// the one `getPositiveLongFromObject` call. Moon used to answer `ERR value is
+/// not an integer or out of range` here, which clients that classify retries by
+/// error string read as a different failure (moon#527).
+#[inline]
+fn parse_count_arg(args: &[Frame]) -> Result<Option<usize>, Frame> {
+    let Some(arg) = args.get(1) else {
+        return Ok(None);
+    };
+    match parse_i64(arg) {
+        Some(c) if c >= 0 => Ok(Some(c as usize)),
+        _ => Err(Frame::Error(Bytes::from_static(
+            b"ERR value is out of range, must be positive",
+        ))),
+    }
+}
+
 /// LPOP key [count]
 pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     if args.is_empty() || args.len() > 2 {
@@ -168,6 +188,17 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     let key = match extract_bytes(&args[0]) {
         Some(k) => k.clone(),
         None => return err_wrong_args("LPOP"),
+    };
+
+    // The optional count is validated BEFORE the key lookup, exactly as Redis
+    // does (`lpopGenericCommand` parses argv[2] and returns on error before it
+    // reaches `lookupKeyWrite`). Ordering it the other way made an argument
+    // error depend on whether the key happened to exist: `LPOP nokey abc`
+    // answered a miss and `LPOP existingkey abc` an error, so the same
+    // malformed command got opposite answers as keys came and went (moon#527).
+    let count = match parse_count_arg(args) {
+        Ok(c) => c,
+        Err(e) => return e,
     };
 
     // Check if the key exists first (for the no-list case)
@@ -187,24 +218,6 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
-
-    let count = if args.len() == 2 {
-        match parse_i64(&args[1]) {
-            Some(c) if c >= 0 => Some(c as usize),
-            Some(_) => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
-        }
-    } else {
-        None
-    };
 
     let list = match db.get_or_create_list(&key) {
         Ok(l) => l,
@@ -267,6 +280,12 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("RPOP"),
     };
 
+    // Count validated before the lookup — see `lpop` (moon#527).
+    let count = match parse_count_arg(args) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
     match db.get_list(&key) {
         Ok(None) => {
             // The count form's miss is a null ARRAY, not an EMPTY array: Redis
@@ -283,24 +302,6 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
-
-    let count = if args.len() == 2 {
-        match parse_i64(&args[1]) {
-            Some(c) if c >= 0 => Some(c as usize),
-            Some(_) => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
-        }
-    } else {
-        None
-    };
 
     let list = match db.get_or_create_list(&key) {
         Ok(l) => l,

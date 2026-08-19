@@ -804,6 +804,51 @@ null_probe fence SMEMBERS %K
 null_probe fence HGETALL %K
 null_probe fence XRANGE %K - +
 
+# ===========================================================================
+# LPOP/RPOP count-validation ordering + error text (moon#527)
+# ===========================================================================
+# Redis parses the optional count BEFORE looking the key up, so a malformed
+# count is an ERROR whether or not the key exists — and a non-integer and a
+# negative count share one message. Moon validated after the lookup, so
+# `LPOP nokey abc` answered a miss and only became an error once somebody
+# created the key.
+#
+# These read the RAW first line, like the null-type probes above: `redis-cli`
+# prints the error text but NOT the reply type, and the point here is that a
+# `-ERR ...` line replaced a `*-1` line.
+countarg_i=0
+countarg_probe() {
+    local kind="$1"; shift
+    countarg_i=$((countarg_i + 1))
+    local key="countarg:${countarg_i}"
+    local -a argv=()
+    local a
+    for a in "$@"; do argv+=("${a//%K/$key}"); done
+    # `%P` marks a probe that needs the key to EXIST first.
+    if [ "$kind" = "present" ]; then
+        redis-cli -p "$PORT_REDIS" RPUSH "$key" a b >/dev/null 2>&1 || true
+        redis-cli -p "$PORT_RUST"  RPUSH "$key" a b >/dev/null 2>&1 || true
+    fi
+    assert_eq "count arg ${kind}: ${argv[*]}" \
+        "$(null_type_of "$PORT_REDIS" "${argv[@]}")" \
+        "$(null_type_of "$PORT_RUST" "${argv[@]}")"
+}
+
+# A bad count on an ABSENT key must be the error, not the miss.
+countarg_probe absent LPOP %K abc
+countarg_probe absent LPOP %K -1
+countarg_probe absent RPOP %K abc
+countarg_probe absent RPOP %K -1
+# ...and the same bad count on a PRESENT key must be the SAME error text.
+countarg_probe present LPOP %K abc
+countarg_probe present LPOP %K -1
+countarg_probe present RPOP %K abc
+# The fence: a WELL-FORMED count on an absent key is still the null array
+# (`*-1`, moon#482) — without this half, "reject every count" would pass.
+countarg_probe absent LPOP %K 2
+countarg_probe absent RPOP %K 2
+countarg_probe absent LPOP %K 0
+
 # ---------------------------------------------------------------------------
 # Shard-routing parity (moon#533, moon#534)
 #

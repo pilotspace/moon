@@ -215,6 +215,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label-gated; both unchanged.
 
 ### Fixed
+- **`LPOP`/`RPOP` validate the optional count BEFORE the key lookup, with Redis's error text**
+  (#527). Both commands looked the key up first and returned the miss (`*-1`) without ever
+  reaching the count parser, so `LPOP nokey abc` answered "no such list" and the identical
+  command answered `-ERR ...` the moment somebody created the key — the same malformed request
+  getting opposite replies depending on unrelated keyspace state. Redis parses `argv[2]` before
+  `lookupKeyWrite`, so the argument error never depends on the key. The message now matches too:
+  a non-integer and a negative count both answer `ERR value is out of range, must be positive`
+  (Moon said `ERR value is not an integer or out of range`, which clients that classify retries
+  by error string read as a different failure). A well-formed count on an absent key still
+  answers the null array (#482), and validating first does not create the key. `LPOS`'s
+  `RANK`/`COUNT`/`MAXLEN` were already ordered and worded correctly and are untouched.
 - **Blocking pops no longer create the key they miss on** (#523, #539). `BLPOP`, `BRPOP`,
   `BLMOVE` (source), `BRPOPLPUSH` (source), `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` reached their
   value through `get_or_create_list` / `get_or_create_sorted_set`, so every miss materialised an
