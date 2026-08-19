@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_expiry` (previously a GETEX-only TTL never armed the sweep latch, so the key was invisible
   to active expiry forever), and EXPIRE-family commands hitting an already-expired key now hide
   and queue it for the emitting drain (#542 semantics) instead of deleting it silently with no
-  `expired` notification and no dual-plane DEL.
+  `expired` notification and no dual-plane DEL. Review follow-ups: GETEX `EX`/`EXAT` seconds
+  values that overflow the millisecond conversion now answer the range error instead of
+  wrapping (debug builds panicked); the sweep only drops an index pair that is provably stale
+  (entry gone or TTL retargeted) so a backwards wall-clock step can't discard live pairs; the
+  per-key budget clock read is batched to every 64 pops; and sweep 2 lowers the hash latch from
+  its own reap outcomes instead of a second O(N) rescan.
 
 ### Added
 - **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
