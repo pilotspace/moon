@@ -452,12 +452,14 @@ pub(crate) fn execute_transaction_sharded(
         // NOT rewritten at queue time, because `LPOP`/`ZPOPMIN` answer a
         // different shape (and `LPOP k1 k2` is a COUNT, not a second key).
         //
-        // No `apply_resp3_conversion`: the reply is produced by the very
-        // helper the live blocking path uses and is handed to the wire the
-        // same way there, so converting only here would make the in-MULTI
-        // reply differ from the standalone one — the exact class of bug this
-        // fixes. The RESP2/RESP3 null spelling is still right, because that is
-        // the serializer's job (`Frame::NullArray` -> `*-1` / `_`).
+        // It takes `apply_resp3_conversion` for the same reason every other
+        // arm of this loop does. The original note here said converting would
+        // make the in-MULTI reply differ from the standalone one — true at the
+        // time, because the LIVE monoio path did not convert either. moon#559
+        // fixed that side (the live path is an intercept that was skipping the
+        // choke point), so the two are equal again with BOTH converting, which
+        // is the side that matches redis-server. The RESP2/RESP3 null spelling
+        // remains the serializer's job (`Frame::NullArray` -> `*-1` / `_`).
         if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
             let outcome = crate::shard::slice::with_shard_db(selected, |db| {
                 db.refresh_now_from_cache(cached_clock);
@@ -473,7 +475,12 @@ pub(crate) fn execute_transaction_sharded(
                     crate::protocol::serialize::serialize(&effect, &mut buf);
                     aof_entries.push((selected, buf.freeze()));
                 }
-                results.push(outcome.reply);
+                results.push(super::util::apply_resp3_conversion(
+                    cmd,
+                    cmd_args,
+                    outcome.reply,
+                    proto,
+                ));
                 continue;
             }
         }
