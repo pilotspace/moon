@@ -420,3 +420,43 @@ entries:
     command: "XREADGROUP GROUP g c COUNT 10 STREAMS cl:xrg2 >"
     policy: exact
     contexts: [standalone, pipeline]
+  # #521 — ZRANK/ZREVRANK WITHSCORE (Redis 7.2) were an arity error. The miss
+  # is a null ARRAY here, unlike the plain form's null bulk, so the option
+  # changes the null type as well as the hit type.
+  - name: parity_zrank_withscore_hit
+    setup: ["DEL cl:zr", "ZADD cl:zr 1 m 2 n"]
+    command: "ZRANK cl:zr n WITHSCORE"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_zrevrank_withscore_hit
+    setup: ["DEL cl:zr2", "ZADD cl:zr2 1 m 2 n"]
+    command: "ZREVRANK cl:zr2 n WITHSCORE"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_zrank_withscore_absent_key_is_null_array
+    setup: ["DEL cl:zr-none"]
+    command: "ZRANK cl:zr-none m WITHSCORE"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_zrevrank_withscore_absent_key_is_null_array
+    setup: ["DEL cl:zr-none2"]
+    command: "ZREVRANK cl:zr-none2 m WITHSCORE"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_zrank_withscore_absent_member_is_null_array
+    setup: ["DEL cl:zr3", "ZADD cl:zr3 1 m"]
+    command: "ZRANK cl:zr3 nosuch WITHSCORE"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  # The fence: WITHOUT the option the same miss is a null BULK, not a null
+  # array. Without this row, "make every ZRANK miss *-1" would pass.
+  - name: parity_zrank_without_withscore_miss_is_null_bulk
+    setup: ["DEL cl:zr4", "ZADD cl:zr4 1 m"]
+    command: "ZRANK cl:zr4 nosuch"
+    policy: exact
+    contexts: [standalone, pipeline]

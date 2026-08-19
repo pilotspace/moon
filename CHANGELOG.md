@@ -215,6 +215,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label-gated; both unchanged.
 
 ### Added
+- **`ZRANK`/`ZREVRANK ... WITHSCORE`** (#521), the Redis 7.2 option — previously an arity error, so
+  a 7.2-aware client asking for the rank and the score in one round trip got a hard failure. A hit
+  is the two-element array `[rank, score]`; a miss (absent key or absent member) is the null ARRAY
+  `*-1`, not the null bulk the option-less form answers, so `WITHSCORE` changes the null type as
+  well as the hit type — measured against redis-server 8.6.1, and a statically-typed client decodes
+  the two differently. The token is SINGULAR, unlike the `WITHSCORES` that `ZRANGE` takes; the
+  plural is a syntax error here, and only a FOURTH argument is an arity error (Redis distinguishes
+  the two and so does Moon). The score is emitted as a RESP double, so RESP3 gets `,1` while RESP2
+  keeps the identical bulk-string bytes. Both entry points were fixed — `zrank` and
+  `zrank_readonly` each carried their own arity check, and which one answers is decided by shard
+  routing, so fixing one would have left the option working on some keys and failing on others.
+  `ZRANK`/`ZREVRANK` arity in `COMMAND INFO` is now `-3`, matching Redis 7.2+.
 - **`RPOPLPUSH source destination`** (#520) — previously "unknown command" even though `LMOVE` and
   `BRPOPLPUSH` both worked. It is deprecated in Redis but never removed, and it is the form baked
   into a decade of client code: `redis-py`, `jedis`, `go-redis` and `node-redis` all expose it as a

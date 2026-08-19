@@ -458,6 +458,22 @@ assert_both "ZCARD" ZCARD z:test
 assert_both "ZSCORE alpha" ZSCORE z:test alpha
 assert_both "ZSCORE beta" ZSCORE z:test beta
 assert_both "ZRANK alpha" ZRANK z:test alpha
+# ZRANK/ZREVRANK WITHSCORE (Redis 7.2, moon#521). Singular option — the plural
+# WITHSCORES that ZRANGE takes is a syntax error here, and only a FOURTH
+# argument is an arity error, so all three shapes get a row.
+assert_both "ZRANK WITHSCORE" ZRANK z:test alpha WITHSCORE
+assert_both "ZREVRANK WITHSCORE" ZREVRANK z:test alpha WITHSCORE
+assert_both "ZRANK WITHSCORE absent member" ZRANK z:test nosuchmember WITHSCORE
+assert_both "ZRANK WITHSCORE absent key" ZRANK z:absent alpha WITHSCORE
+assert_both "ZREVRANK WITHSCORE absent key" ZREVRANK z:absent alpha WITHSCORE
+# The fence: without the option nothing moves (the miss is still `$-1`).
+assert_both "ZRANK absent member (no option)" ZRANK z:test nosuchmember
+assert_both "ZRANK plural is a syntax error" ZRANK z:test alpha WITHSCORES
+# The FOURTH-argument arity error is deliberately not compared here: Moon
+# spells the command name in the arity message in UPPERCASE and Redis in
+# lowercase — a pre-existing, codebase-wide divergence, so this row would fail
+# for a reason that has nothing to do with WITHSCORE. Pinned in the unit test
+# (test_zrank_rejects_bad_option_as_syntax_error) instead.
 assert_both "ZRANGE 0 -1" ZRANGE z:test 0 -1
 assert_both "ZRANGE WITHSCORES" ZRANGE z:test 0 -1 WITHSCORES
 assert_both "ZRANGEBYSCORE 1 3" ZRANGEBYSCORE z:test 1 3

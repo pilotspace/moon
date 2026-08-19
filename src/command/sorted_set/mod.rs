@@ -1455,4 +1455,149 @@ mod tests {
             "ZPOPMIN must credit the removed member: grown={grown} after={after}"
         );
     }
+
+    // --- ZRANK/ZREVRANK WITHSCORE (Redis 7.2, moon#521) -------------------
+    //
+    // Oracle, redis-server 8.6.1:
+    //
+    //   ZADD z 1 m
+    //   ZRANK z m WITHSCORE      -> 1) (integer) 0   2) "1"
+    //   ZRANK absent-key m WITHSCORE   -> *-1   (null ARRAY, not $-1)
+    //   ZREVRANK absent-key m WITHSCORE -> *-1
+    //   ZRANK z m                -> :0
+    //   ZRANK z nosuch           -> $-1  (still the null BULK without the option)
+    //
+    // The option changes the null TYPE as well as the hit type, and the token
+    // is singular — `WITHSCORE`, not the `WITHSCORES` that ZRANGE takes.
+
+    /// Both entry points are exercised: `zrank` (the &mut Database path taken
+    /// by the write dispatcher) and `zrank_readonly` (the shared-read path).
+    /// The bug was an arity check, and there is one in each — fixing only the
+    /// one a unit test happens to call leaves the other answering the error on
+    /// whichever routing path reaches it.
+    fn both_zrank(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        let via_mut = zrank(db, &frames);
+        let via_ro = zrank_readonly(db, &frames, 0);
+        assert_eq!(
+            via_mut, via_ro,
+            "zrank and zrank_readonly must agree for {args:?}"
+        );
+        via_mut
+    }
+
+    fn both_zrevrank(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        let via_mut = zrevrank(db, &frames);
+        let via_ro = zrevrank_readonly(db, &frames, 0);
+        assert_eq!(
+            via_mut, via_ro,
+            "zrevrank and zrevrank_readonly must agree for {args:?}"
+        );
+        via_mut
+    }
+
+    #[test]
+    fn test_zrank_withscore_hit_is_rank_and_score() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"m", b"2", b"n"]);
+        assert_eq!(
+            both_zrank(&mut db, &[b"z", b"m", b"WITHSCORE"]),
+            Frame::Array(framevec![Frame::Integer(0), Frame::Double(1.0)])
+        );
+        assert_eq!(
+            both_zrank(&mut db, &[b"z", b"n", b"WITHSCORE"]),
+            Frame::Array(framevec![Frame::Integer(1), Frame::Double(2.0)])
+        );
+        // Lowercase and mixed case are the same option.
+        assert_eq!(
+            both_zrank(&mut db, &[b"z", b"m", b"withscore"]),
+            Frame::Array(framevec![Frame::Integer(0), Frame::Double(1.0)])
+        );
+    }
+
+    #[test]
+    fn test_zrevrank_withscore_hit_is_rank_and_score() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"m", b"2", b"n"]);
+        assert_eq!(
+            both_zrevrank(&mut db, &[b"z", b"n", b"WITHSCORE"]),
+            Frame::Array(framevec![Frame::Integer(0), Frame::Double(2.0)])
+        );
+        assert_eq!(
+            both_zrevrank(&mut db, &[b"z", b"m", b"WITHSCORE"]),
+            Frame::Array(framevec![Frame::Integer(1), Frame::Double(1.0)])
+        );
+    }
+
+    #[test]
+    fn test_zrank_withscore_miss_is_null_array() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"m"]);
+        assert_eq!(
+            both_zrank(&mut db, &[b"nosuchkey", b"m", b"WITHSCORE"]),
+            Frame::NullArray,
+            "absent KEY with WITHSCORE is the null array"
+        );
+        assert_eq!(
+            both_zrank(&mut db, &[b"z", b"nosuchmember", b"WITHSCORE"]),
+            Frame::NullArray,
+            "absent MEMBER with WITHSCORE is the null array"
+        );
+        assert_eq!(
+            both_zrevrank(&mut db, &[b"nosuchkey", b"m", b"WITHSCORE"]),
+            Frame::NullArray
+        );
+        assert_eq!(
+            both_zrevrank(&mut db, &[b"z", b"nosuchmember", b"WITHSCORE"]),
+            Frame::NullArray
+        );
+    }
+
+    /// The fence: WITHOUT the option nothing moves — the hit is a bare Integer
+    /// and the miss is the null BULK. Without this half, "make every ZRANK
+    /// miss `*-1`" would pass the test above while breaking every existing
+    /// client.
+    #[test]
+    fn test_zrank_without_withscore_is_unchanged() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"m"]);
+        assert_eq!(both_zrank(&mut db, &[b"z", b"m"]), Frame::Integer(0));
+        assert_eq!(both_zrank(&mut db, &[b"z", b"nosuch"]), Frame::Null);
+        assert_eq!(both_zrank(&mut db, &[b"nosuchkey", b"m"]), Frame::Null);
+        assert_eq!(both_zrevrank(&mut db, &[b"z", b"m"]), Frame::Integer(0));
+        assert_eq!(both_zrevrank(&mut db, &[b"z", b"nosuch"]), Frame::Null);
+        assert_eq!(both_zrevrank(&mut db, &[b"nosuchkey", b"m"]), Frame::Null);
+    }
+
+    /// A bad third token is a SYNTAX error, and only a FOURTH argument is an
+    /// arity error — Redis distinguishes the two and so must Moon. In
+    /// particular the PLURAL `WITHSCORES` (which ZRANGE takes) is not a
+    /// synonym here.
+    #[test]
+    fn test_zrank_rejects_bad_option_as_syntax_error() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"m"]);
+        for bad in [b"WITHSCORES".as_ref(), b"NOPE".as_ref()] {
+            match both_zrank(&mut db, &[b"z", b"m", bad]) {
+                Frame::Error(e) => assert_eq!(
+                    e,
+                    Bytes::from_static(b"ERR syntax error"),
+                    "bad option must be a syntax error, not an arity error"
+                ),
+                other => panic!("expected syntax error, got {other:?}"),
+            }
+        }
+        match both_zrank(&mut db, &[b"z", b"m", b"WITHSCORE", b"extra"]) {
+            Frame::Error(e) => assert!(
+                String::from_utf8_lossy(&e).contains("wrong number of arguments"),
+                "a fourth argument is an ARITY error"
+            ),
+            other => panic!("expected arity error, got {other:?}"),
+        }
+        match both_zrevrank(&mut db, &[b"z", b"m", b"WITHSCORES"]) {
+            Frame::Error(e) => assert_eq!(e, Bytes::from_static(b"ERR syntax error")),
+            other => panic!("expected syntax error, got {other:?}"),
+        }
+    }
 }
