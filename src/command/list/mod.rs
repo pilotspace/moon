@@ -51,6 +51,7 @@ pub use list_write::lrem;
 pub use list_write::lset;
 pub use list_write::ltrim;
 pub use list_write::rpop;
+pub use list_write::rpoplpush;
 pub use list_write::rpush;
 pub use list_write::rpushx;
 
@@ -618,5 +619,117 @@ mod tests {
             grown - trimmed > 40 * 200,
             "LTRIM's credit must be proportional to the ~45 dropped elements"
         );
+    }
+
+    // --- LPOP/RPOP count validation ordering (moon#527) ---
+    //
+    // Oracle: redis-server 8.6.1, raw socket, `--shards 1`.
+    //
+    //   LPOP nokey abc        -> -ERR value is out of range, must be positive
+    //   LPOP nokey -1         -> -ERR value is out of range, must be positive
+    //   LPOP existingkey abc  -> -ERR value is out of range, must be positive
+    //   LPOP nokey 2          -> *-1        (well-formed count, absent key)
+    //
+    // Redis parses the optional count BEFORE `lookupKeyWrite`, so an argument
+    // error never depends on whether the key happens to exist.
+
+    const COUNT_ERR: &[u8] = b"ERR value is out of range, must be positive";
+
+    fn err_bytes(f: &Frame) -> Bytes {
+        match f {
+            Frame::Error(e) => e.clone(),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lpop_bad_count_on_missing_key_is_an_error() {
+        let mut db = Database::new();
+        assert_eq!(
+            err_bytes(&lpop(&mut db, &[bs(b"nokey"), bs(b"abc")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+        assert_eq!(
+            err_bytes(&lpop(&mut db, &[bs(b"nokey"), bs(b"-1")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+    }
+
+    #[test]
+    fn test_rpop_bad_count_on_missing_key_is_an_error() {
+        let mut db = Database::new();
+        assert_eq!(
+            err_bytes(&rpop(&mut db, &[bs(b"nokey"), bs(b"abc")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+        assert_eq!(
+            err_bytes(&rpop(&mut db, &[bs(b"nokey"), bs(b"-1")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+    }
+
+    #[test]
+    fn test_lpop_rpop_bad_count_error_text_matches_redis() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"existing", &[b"a", b"b"]);
+        assert_eq!(
+            err_bytes(&lpop(&mut db, &[bs(b"existing"), bs(b"abc")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+        assert_eq!(
+            err_bytes(&lpop(&mut db, &[bs(b"existing"), bs(b"-1")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+        assert_eq!(
+            err_bytes(&rpop(&mut db, &[bs(b"existing"), bs(b"abc")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+        assert_eq!(
+            err_bytes(&rpop(&mut db, &[bs(b"existing"), bs(b"-1")])),
+            Bytes::from_static(COUNT_ERR)
+        );
+    }
+
+    /// A WELL-FORMED count against an absent key must still answer the null
+    /// ARRAY (`*-1`) — the #482 contract this reorder must not regress.
+    #[test]
+    fn test_lpop_rpop_good_count_on_missing_key_still_null_array() {
+        let mut db = Database::new();
+        assert_eq!(
+            lpop(&mut db, &[bs(b"nokey"), bs(b"2")]),
+            Frame::NullArray,
+            "LPOP nokey 2"
+        );
+        assert_eq!(
+            rpop(&mut db, &[bs(b"nokey"), bs(b"2")]),
+            Frame::NullArray,
+            "RPOP nokey 2"
+        );
+        // No-count form's miss stays the null STRING.
+        assert_eq!(lpop(&mut db, &[bs(b"nokey")]), Frame::Null, "LPOP nokey");
+        assert_eq!(rpop(&mut db, &[bs(b"nokey")]), Frame::Null, "RPOP nokey");
+        // A zero count on an absent key is still a miss, not an empty array.
+        assert_eq!(
+            lpop(&mut db, &[bs(b"nokey"), bs(b"0")]),
+            Frame::NullArray,
+            "LPOP nokey 0"
+        );
+        // ...and a zero count on a PRESENT key is the empty array.
+        setup_list(&mut db, b"present", &[b"a"]);
+        assert_eq!(
+            lpop(&mut db, &[bs(b"present"), bs(b"0")]),
+            Frame::Array(framevec![]),
+            "LPOP present 0"
+        );
+    }
+
+    /// Validating the count before the lookup must NOT create the key.
+    #[test]
+    fn test_lpop_bad_count_does_not_create_key() {
+        let mut db = Database::new();
+        let _ = lpop(&mut db, &[bs(b"ghost"), bs(b"abc")]);
+        let _ = lpop(&mut db, &[bs(b"ghost2"), bs(b"2")]);
+        assert_eq!(llen(&mut db, &[bs(b"ghost")]), Frame::Integer(0));
+        assert_eq!(llen(&mut db, &[bs(b"ghost2")]), Frame::Integer(0));
     }
 }

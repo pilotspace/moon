@@ -6,6 +6,40 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+/// Does `cmd` PUSH onto a list, and so possibly satisfy a blocked
+/// `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` waiter?
+///
+/// This decision is open-coded at eight dispatch sites (two connection
+/// handlers and six arms of the SPSC handler), which is why it is a function
+/// and not a literal at each one: a producer that one site wakes on and
+/// another does not is a routing-dependent hang — the waiter returns instantly
+/// or blocks to its timeout depending on which shard owns the key, which reads
+/// as a flake rather than as a bug. `RPOPLPUSH` is `LMOVE ... RIGHT LEFT` and
+/// so must answer identically here (moon#520).
+#[inline]
+pub fn is_list_producer(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"LPUSH")
+        || cmd.eq_ignore_ascii_case(b"RPUSH")
+        || cmd.eq_ignore_ascii_case(b"LMOVE")
+        || cmd.eq_ignore_ascii_case(b"RPOPLPUSH")
+}
+
+/// Index of the argument naming the key a producer WRITES to — the key a
+/// blocked client is waiting on.
+///
+/// `LMOVE`/`RPOPLPUSH` push to their DESTINATION (`args[1]`); everything else
+/// that shares these wakeup guards (`LPUSH`, `RPUSH`, `ZADD`, `XADD`) writes
+/// to `args[0]`. Waking on `LMOVE`'s source is a no-op dressed as a wakeup:
+/// the element left that key.
+#[inline]
+pub fn producer_wake_key_index(cmd: &[u8]) -> usize {
+    if cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"RPOPLPUSH") {
+        1
+    } else {
+        0
+    }
+}
+
 /// What a wake attempt consumed from the datastore, so it can be put back if
 /// the woken client turns out to be gone.
 ///

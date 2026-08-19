@@ -465,6 +465,15 @@ if should_run "list"; then
     assert_match "LPOS"                LPOS lst:k4 a
     rcli RPUSH lst:src x y z >/dev/null 2>&1; mcli RPUSH lst:src x y z >/dev/null 2>&1
     assert_match "LMOVE"               LMOVE lst:src lst:dst LEFT RIGHT
+    # RPOPLPUSH === LMOVE ... RIGHT LEFT (moon#520). Probe the reply, the
+    # source's remainder AND the destination: a no-op that answered the popped
+    # element without moving it would pass a reply-only assertion.
+    rcli RPUSH lst:rl x y z >/dev/null 2>&1; mcli RPUSH lst:rl x y z >/dev/null 2>&1
+    assert_match "RPOPLPUSH"           RPOPLPUSH lst:rl lst:rl-d
+    assert_match "RPOPLPUSH source"    LRANGE lst:rl 0 -1
+    assert_match "RPOPLPUSH dest"      LRANGE lst:rl-d 0 -1
+    assert_match "RPOPLPUSH miss"      RPOPLPUSH lst:rl-absent lst:rl-d
+    assert_match "RPOPLPUSH arity"     RPOPLPUSH lst:rl
 fi
 
 # ===========================================================================
@@ -545,6 +554,12 @@ if should_run "sorted_set"; then
     assert_match "ZSCORE (missing)"    ZSCORE z:k1 missing
     assert_match "ZRANK"               ZRANK z:k1 b
     assert_match "ZREVRANK"            ZREVRANK z:k1 b
+    # Redis 7.2 WITHSCORE (singular). The miss is a null ARRAY with the option
+    # and a null BULK without it, so both are probed (moon#521).
+    assert_match "ZRANK WITHSCORE"     ZRANK z:k1 b WITHSCORE
+    assert_match "ZREVRANK WITHSCORE"  ZREVRANK z:k1 b WITHSCORE
+    assert_match "ZRANK WITHSCORE miss" ZRANK z:k1 missing WITHSCORE
+    assert_match "ZRANK miss no option" ZRANK z:k1 missing
     assert_match "ZRANGE"              ZRANGE z:k1 0 -1
     assert_match "ZRANGE WITHSCORES"   ZRANGE z:k1 0 -1 WITHSCORES
     assert_match "ZREVRANGE"           ZREVRANGE z:k1 0 2

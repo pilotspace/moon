@@ -2042,12 +2042,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
                                 if !matches!(response, Frame::Error(_)) {
-                                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
+                                    let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
+                                        || cmd.eq_ignore_ascii_case(b"ZADD");
                                     if needs_wake {
-                                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                        // Destination for LMOVE/RPOPLPUSH, args[0] otherwise —
+                                        // see the matching comment in handler_monoio (moon#520).
+                                        let idx = crate::blocking::wakeup::producer_wake_key_index(cmd);
+                                        if let Some(key) = cmd_args.get(idx).and_then(|f| extract_bytes(f)) {
                                             let mut reg = ctx.blocking_registry.borrow_mut();
-                                            if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                            if crate::blocking::wakeup::is_list_producer(cmd) {
                                                 crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, conn.selected_db, &key);
                                             } else {
                                                 crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, conn.selected_db, &key);

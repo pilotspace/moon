@@ -60,11 +60,65 @@ pub fn zcard(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
-/// ZRANK key member
-pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("ZRANK");
+/// Parse the optional `WITHSCORE` of `ZRANK`/`ZREVRANK` (Redis 7.2).
+///
+/// The token is SINGULAR here, unlike the `WITHSCORES` that `ZRANGE` and
+/// friends take, and Redis does not accept the plural as a synonym — so
+/// neither does this (moon#521).
+///
+/// Redis distinguishes the two failure modes and they are not interchangeable:
+/// a bad THIRD token is `ERR syntax error`, and only a FOURTH argument is an
+/// arity error (`zrankGenericCommand` checks `argc > 4` first, then compares
+/// `argv[3]` against "withscore").
+#[inline]
+fn parse_withscore(cmd: &'static str, args: &[Frame]) -> Result<bool, Frame> {
+    match args.len() {
+        2 => Ok(false),
+        3 => match extract_bytes(&args[2]) {
+            Some(opt) if opt.eq_ignore_ascii_case(b"WITHSCORE") => Ok(true),
+            _ => Err(err("ERR syntax error")),
+        },
+        _ => Err(err_wrong_args(cmd)),
     }
+}
+
+/// The MISS reply for `ZRANK`/`ZREVRANK`.
+///
+/// `WITHSCORE` changes the null TYPE as well as the hit type: measured on
+/// redis-server 8.6.1, the miss is `*-1` with the option and `$-1` without.
+/// A statically-typed client decodes the two differently, so answering the
+/// wrong one is a decode error client-side, not a cosmetic difference.
+#[inline]
+fn rank_miss(withscore: bool) -> Frame {
+    if withscore {
+        Frame::NullArray
+    } else {
+        Frame::Null
+    }
+}
+
+/// The HIT reply for `ZRANK`/`ZREVRANK`.
+///
+/// The score is a `Frame::Double`, not a pre-formatted bulk string: that is
+/// Redis's `addReplyDouble`, which serialises as a bulk string under RESP2 and
+/// as a real `,double` under RESP3. Moon's serializer downgrades `Double` to
+/// the identical RESP2 bytes (both go through `write!("{}", f)`), so this
+/// costs nothing on RESP2 and gets RESP3 right for free.
+#[inline]
+fn rank_hit(rank: usize, score: f64, withscore: bool) -> Frame {
+    if withscore {
+        Frame::Array(framevec![Frame::Integer(rank as i64), Frame::Double(score)])
+    } else {
+        Frame::Integer(rank as i64)
+    }
+}
+
+/// ZRANK key member [WITHSCORE]
+pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
+    let withscore = match parse_withscore("ZRANK", args) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("ZRANK"),
@@ -77,21 +131,22 @@ pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_sorted_set(key) {
         Ok(Some((members, scores))) => match members.get(member) {
             Some(score) => match scores.rank(OrderedFloat(*score), member) {
-                Some(rank) => Frame::Integer(rank as i64),
-                None => Frame::Null,
+                Some(rank) => rank_hit(rank, *score, withscore),
+                None => rank_miss(withscore),
             },
-            None => Frame::Null,
+            None => rank_miss(withscore),
         },
-        Ok(None) => Frame::Null,
+        Ok(None) => rank_miss(withscore),
         Err(e) => e,
     }
 }
 
-/// ZREVRANK key member
+/// ZREVRANK key member [WITHSCORE]
 pub fn zrevrank(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("ZREVRANK");
-    }
+    let withscore = match parse_withscore("ZREVRANK", args) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("ZREVRANK"),
@@ -104,12 +159,12 @@ pub fn zrevrank(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_sorted_set(key) {
         Ok(Some((members, scores))) => match members.get(member) {
             Some(score) => match scores.rev_rank(OrderedFloat(*score), member) {
-                Some(rev_rank) => Frame::Integer(rev_rank as i64),
-                None => Frame::Null,
+                Some(rev_rank) => rank_hit(rev_rank, *score, withscore),
+                None => rank_miss(withscore),
             },
-            None => Frame::Null,
+            None => rank_miss(withscore),
         },
-        Ok(None) => Frame::Null,
+        Ok(None) => rank_miss(withscore),
         Err(e) => e,
     }
 }
@@ -650,11 +705,14 @@ pub fn zcard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
-/// ZRANK (read-only).
+/// ZRANK (read-only). Takes the same optional `WITHSCORE` as `zrank` — the
+/// option is parsed in BOTH, because both are reachable: which one answers is
+/// decided by shard routing, not by the command (moon#521).
 pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("ZRANK");
-    }
+    let withscore = match parse_withscore("ZRANK", args) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("ZRANK"),
@@ -669,8 +727,8 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             match (&zref, zref.score(member)) {
                 (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
                     match tree.rank(OrderedFloat(score), member) {
-                        Some(rank) => Frame::Integer(rank as i64),
-                        None => Frame::Null,
+                        Some(rank) => rank_hit(rank, score, withscore),
+                        None => rank_miss(withscore),
                     }
                 }
                 // Listpack has no O(log n) rank structure; Owned (P0
@@ -688,23 +746,25 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                         .iter()
                         .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
                     {
-                        Some(rank) => Frame::Integer(rank as i64),
-                        None => Frame::Null,
+                        Some(rank) => rank_hit(rank, score, withscore),
+                        None => rank_miss(withscore),
                     }
                 }
-                _ => Frame::Null,
+                _ => rank_miss(withscore),
             }
         }
-        Ok(None) => Frame::Null,
+        Ok(None) => rank_miss(withscore),
         Err(e) => e,
     }
 }
 
-/// ZREVRANK (read-only).
+/// ZREVRANK (read-only). See `zrank_readonly` for why the option is parsed
+/// here too.
 pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("ZREVRANK");
-    }
+    let withscore = match parse_withscore("ZREVRANK", args) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
         None => return err_wrong_args("ZREVRANK"),
@@ -717,8 +777,8 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Ok(Some(zref)) => match (&zref, zref.score(member)) {
             (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
                 match tree.rev_rank(OrderedFloat(score), member) {
-                    Some(rev_rank) => Frame::Integer(rev_rank as i64),
-                    None => Frame::Null,
+                    Some(rev_rank) => rank_hit(rev_rank, score, withscore),
+                    None => rank_miss(withscore),
                 }
             }
             // See the matching comment in `zrank_readonly`: Owned (P0
@@ -733,13 +793,13 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                     .iter()
                     .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
                 {
-                    Some(rank) => Frame::Integer((entries.len() - 1 - rank) as i64),
-                    None => Frame::Null,
+                    Some(rank) => rank_hit(entries.len() - 1 - rank, score, withscore),
+                    None => rank_miss(withscore),
                 }
             }
-            _ => Frame::Null,
+            _ => rank_miss(withscore),
         },
-        Ok(None) => Frame::Null,
+        Ok(None) => rank_miss(withscore),
         Err(e) => e,
     }
 }

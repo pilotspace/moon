@@ -582,8 +582,18 @@ fn extract_command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Vec<&'a [u8]> {
                 vec![]
             }
         }
-        // LMOVE, BLMOVE: first two args are keys
-        b"lmove" | b"blmove" => args.iter().take(2).filter_map(extract_key_bytes).collect(),
+        // LMOVE, BLMOVE, RPOPLPUSH, BRPOPLPUSH: first two args are keys.
+        //
+        // A command MISSING from this table is not merely checked less
+        // precisely — the fallthrough is `vec![]`, and an empty key list makes
+        // the permission loop in `check_key_permission` a no-op, so EVERY key
+        // pattern is ignored for it. `rpoplpush`/`brpoplpush` were absent while
+        // their `lmove`/`blmove` equivalents were present, so a `~cache:*` user
+        // could move an element out of any key in the keyspace into any other
+        // (moon#520).
+        b"lmove" | b"blmove" | b"rpoplpush" | b"brpoplpush" => {
+            args.iter().take(2).filter_map(extract_key_bytes).collect()
+        }
         // SINTER, SUNION, SDIFF: all args are keys
         b"sinter" | b"sunion" | b"sdiff" => args.iter().filter_map(extract_key_bytes).collect(),
         // SINTERSTORE, SUNIONSTORE, SDIFFSTORE: all args (dest + sources)
@@ -923,6 +933,54 @@ mod tests {
                 .check_key_permission("alice", b"MSET", &args2, true)
                 .is_some()
         );
+    }
+
+    /// `extract_command_keys` falls through to `vec![]` for any command it
+    /// does not name, and an empty key list makes the permission loop a no-op —
+    /// so a MISSING entry is not "less precise", it is a BYPASS: every key
+    /// pattern is ignored for that command.
+    ///
+    /// `RPOPLPUSH`/`BRPOPLPUSH` were missing (`LMOVE`/`BLMOVE`, the exact same
+    /// two-key layout, were present), so a `~cache:*` user could move an
+    /// element out of any key in the keyspace and into any other (moon#520).
+    /// Both directions are checked because both are writes.
+    #[test]
+    fn test_check_key_permission_two_key_list_moves() {
+        let mut table = AclTable::load_or_default(&make_config(None));
+        table.apply_setuser("alice", &["on", "nopass", "~cache:*", "+@all"]);
+        let f = |s: &'static [u8]| Frame::BulkString(Bytes::from_static(s));
+
+        for cmd in [
+            b"RPOPLPUSH".as_ref(),
+            b"LMOVE".as_ref(),
+            b"BRPOPLPUSH".as_ref(),
+        ] {
+            let ok = vec![f(b"cache:src"), f(b"cache:dst"), f(b"0")];
+            assert!(
+                table
+                    .check_key_permission("alice", cmd, &ok[..2], true)
+                    .is_none(),
+                "{} within ~cache:* must be allowed",
+                String::from_utf8_lossy(cmd)
+            );
+            let bad_src = vec![f(b"other:src"), f(b"cache:dst")];
+            assert!(
+                table
+                    .check_key_permission("alice", cmd, &bad_src, true)
+                    .is_some(),
+                "{} must be denied on an out-of-pattern SOURCE",
+                String::from_utf8_lossy(cmd)
+            );
+            let bad_dst = vec![f(b"cache:src"), f(b"other:dst")];
+            assert!(
+                table
+                    .check_key_permission("alice", cmd, &bad_dst, true)
+                    .is_some(),
+                "{} must be denied on an out-of-pattern DESTINATION",
+                String::from_utf8_lossy(cmd)
+            );
+            let _ = ok;
+        }
     }
 
     #[test]

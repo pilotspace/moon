@@ -568,8 +568,21 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
     let keys_start = idx;
     let ids_start = idx + num_streams;
 
+    // Redis emits a stream in the reply when it was SERVED, and the two modes
+    // are served on different conditions (`xreadCommand`):
+    //
+    //   * HISTORY mode (an explicit ID, not `>`) is always served — the stream
+    //     name and its entry array go out before Redis knows whether the
+    //     consumer's PEL slice has anything in it, so an empty PEL answers
+    //     `[["s", []]]`, not a null. Moon used to answer the null and a client
+    //     iterating the stream list got a decode error where Redis gives it
+    //     zero iterations (moon#526).
+    //   * `>` mode is served only when there ARE new entries; a stream with
+    //     nothing new is DROPPED from the reply rather than rendered as an
+    //     empty entry list.
+    //
+    // Only when nothing at all was served does the reply become the null array.
     let mut results = Vec::new();
-    let mut has_entries = false;
 
     for i in 0..num_streams {
         let key = match extract_bytes(&args[keys_start + i]) {
@@ -613,8 +626,9 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
 
-        if !entries.is_empty() {
-            has_entries = true;
+        // `>` with nothing new is not served at all; history always is.
+        if is_new && entries.is_empty() {
+            continue;
         }
         let entry_frames: Vec<Frame> = entries
             .iter()
@@ -626,12 +640,14 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
         ]));
     }
 
-    if has_entries {
+    if !results.is_empty() {
         Frame::Array(results.into())
     } else {
         // Null ARRAY, like `XREAD`: the reply is an array of streams, so its
         // "nothing" is a missing array. Measured against redis-server 8.6.1,
-        // which answers `*-1` here (moon#482).
+        // which answers `*-1` here (moon#482). Reachable only when every
+        // requested stream was a `>` read that found nothing — a history read
+        // always contributes a (possibly empty) entry (moon#526).
         //
         // This site sits in `stream_write.rs` while its twin sits in
         // `stream_read.rs`, which is exactly why the first sweep for #482

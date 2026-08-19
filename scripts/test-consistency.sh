@@ -405,6 +405,30 @@ LVAL=$(python3 -c "print('Y' * 512)")
 both RPUSH l:test "$LVAL"
 assert_both "LINDEX large value" LINDEX l:test -1
 
+# RPOPLPUSH === LMOVE src dst RIGHT LEFT (moon#520). Deprecated in Redis but
+# never removed, and what every major client's `rpoplpush()` sends. Assert the
+# reply AND both keys afterwards — a stub that returned the tail without moving
+# it would satisfy a reply-only check. Same-key rotation is the reliable-queue
+# idiom and takes the src == dst branch, so it gets its own row.
+both RPUSH l:rl a b c
+assert_both "RPOPLPUSH reply" RPOPLPUSH l:rl l:rl-d
+assert_both "RPOPLPUSH source" LRANGE l:rl 0 -1
+assert_both "RPOPLPUSH dest" LRANGE l:rl-d 0 -1
+assert_both "RPOPLPUSH equals LMOVE RIGHT LEFT" LMOVE l:rl l:rl-d RIGHT LEFT
+assert_both "RPOPLPUSH after LMOVE dest" LRANGE l:rl-d 0 -1
+assert_both "RPOPLPUSH absent source" RPOPLPUSH l:rl-absent l:rl-d
+assert_both "RPOPLPUSH wrong arity" RPOPLPUSH l:rl
+both RPUSH l:rot a b c
+assert_both "RPOPLPUSH rotate in place" RPOPLPUSH l:rot l:rot
+assert_both "RPOPLPUSH rotate result" LRANGE l:rot 0 -1
+both SET l:rl-str notalist
+assert_both "RPOPLPUSH WRONGTYPE source" RPOPLPUSH l:rl-str l:rl-d
+assert_both "RPOPLPUSH WRONGTYPE dest" RPOPLPUSH l:rl l:rl-str
+# `COMMAND INFO rpoplpush` is deliberately NOT compared here: the two servers
+# legitimately disagree on the tips/key-specs sub-arrays, so an equality check
+# would fail for a reason unrelated to whether the command exists. Its
+# registration is pinned by the unit test in src/command/mod.rs instead.
+
 # ===========================================================================
 # 8. Set operations
 # ===========================================================================
@@ -434,6 +458,22 @@ assert_both "ZCARD" ZCARD z:test
 assert_both "ZSCORE alpha" ZSCORE z:test alpha
 assert_both "ZSCORE beta" ZSCORE z:test beta
 assert_both "ZRANK alpha" ZRANK z:test alpha
+# ZRANK/ZREVRANK WITHSCORE (Redis 7.2, moon#521). Singular option — the plural
+# WITHSCORES that ZRANGE takes is a syntax error here, and only a FOURTH
+# argument is an arity error, so all three shapes get a row.
+assert_both "ZRANK WITHSCORE" ZRANK z:test alpha WITHSCORE
+assert_both "ZREVRANK WITHSCORE" ZREVRANK z:test alpha WITHSCORE
+assert_both "ZRANK WITHSCORE absent member" ZRANK z:test nosuchmember WITHSCORE
+assert_both "ZRANK WITHSCORE absent key" ZRANK z:absent alpha WITHSCORE
+assert_both "ZREVRANK WITHSCORE absent key" ZREVRANK z:absent alpha WITHSCORE
+# The fence: without the option nothing moves (the miss is still `$-1`).
+assert_both "ZRANK absent member (no option)" ZRANK z:test nosuchmember
+assert_both "ZRANK plural is a syntax error" ZRANK z:test alpha WITHSCORES
+# The FOURTH-argument arity error is deliberately not compared here: Moon
+# spells the command name in the arity message in UPPERCASE and Redis in
+# lowercase — a pre-existing, codebase-wide divergence, so this row would fail
+# for a reason that has nothing to do with WITHSCORE. Pinned in the unit test
+# (test_zrank_rejects_bad_option_as_syntax_error) instead.
 assert_both "ZRANGE 0 -1" ZRANGE z:test 0 -1
 assert_both "ZRANGE WITHSCORES" ZRANGE z:test 0 -1 WITHSCORES
 assert_both "ZRANGEBYSCORE 1 3" ZRANGEBYSCORE z:test 1 3
@@ -803,6 +843,78 @@ null_probe fence ZPOPMIN %K
 null_probe fence SMEMBERS %K
 null_probe fence HGETALL %K
 null_probe fence XRANGE %K - +
+
+# ===========================================================================
+# LPOP/RPOP count-validation ordering + error text (moon#527)
+# ===========================================================================
+# Redis parses the optional count BEFORE looking the key up, so a malformed
+# count is an ERROR whether or not the key exists — and a non-integer and a
+# negative count share one message. Moon validated after the lookup, so
+# `LPOP nokey abc` answered a miss and only became an error once somebody
+# created the key.
+#
+# These read the RAW first line, like the null-type probes above: `redis-cli`
+# prints the error text but NOT the reply type, and the point here is that a
+# `-ERR ...` line replaced a `*-1` line.
+countarg_i=0
+countarg_probe() {
+    local kind="$1"; shift
+    countarg_i=$((countarg_i + 1))
+    local key="countarg:${countarg_i}"
+    local -a argv=()
+    local a
+    for a in "$@"; do argv+=("${a//%K/$key}"); done
+    # `%P` marks a probe that needs the key to EXIST first.
+    if [ "$kind" = "present" ]; then
+        redis-cli -p "$PORT_REDIS" RPUSH "$key" a b >/dev/null 2>&1 || true
+        redis-cli -p "$PORT_RUST"  RPUSH "$key" a b >/dev/null 2>&1 || true
+    fi
+    assert_eq "count arg ${kind}: ${argv[*]}" \
+        "$(null_type_of "$PORT_REDIS" "${argv[@]}")" \
+        "$(null_type_of "$PORT_RUST" "${argv[@]}")"
+}
+
+# A bad count on an ABSENT key must be the error, not the miss.
+countarg_probe absent LPOP %K abc
+countarg_probe absent LPOP %K -1
+countarg_probe absent RPOP %K abc
+countarg_probe absent RPOP %K -1
+# ...and the same bad count on a PRESENT key must be the SAME error text.
+countarg_probe present LPOP %K abc
+countarg_probe present LPOP %K -1
+countarg_probe present RPOP %K abc
+# The fence: a WELL-FORMED count on an absent key is still the null array
+# (`*-1`, moon#482) — without this half, "reject every count" would pass.
+countarg_probe absent LPOP %K 2
+countarg_probe absent RPOP %K 2
+countarg_probe absent LPOP %K 0
+
+# ===========================================================================
+# XREADGROUP history mode replies the stream, not a null (moon#526)
+# ===========================================================================
+# `XREADGROUP ... STREAMS s 0` asks for the consumer's PENDING entries. Redis
+# serves the stream before it knows whether the PEL slice is empty, so an empty
+# PEL is `*1 *2 $1 s *0` — the stream with an empty entry list. Moon answered
+# `$-1`, and a client iterating the returned stream list got a decode error
+# where Redis gives it zero iterations.
+#
+# Needs an `XGROUP CREATE` first, which is why this cannot ride on `null_probe`
+# (one command per probe): without the group BOTH servers answer `-NOGROUP` and
+# the comparison passes while testing nothing.
+xrg_probe() {
+    local kind="$1" id="$2"
+    local key="xrghist:${kind}"
+    redis-cli -p "$PORT_REDIS" XGROUP CREATE "$key" g '$' MKSTREAM >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_RUST"  XGROUP CREATE "$key" g '$' MKSTREAM >/dev/null 2>&1 || true
+    assert_eq "xreadgroup ${kind}: STREAMS ${key} ${id}" \
+        "$(null_type_of "$PORT_REDIS" XREADGROUP GROUP g c COUNT 10 STREAMS "$key" "$id")" \
+        "$(null_type_of "$PORT_RUST"  XREADGROUP GROUP g c COUNT 10 STREAMS "$key" "$id")"
+}
+
+# History mode on an empty PEL: the stream array (`*1`), not a null.
+xrg_probe history 0
+# The fence: the `>` form with nothing new stays the null ARRAY (`*-1`, #482).
+xrg_probe newonly '>'
 
 # ---------------------------------------------------------------------------
 # Shard-routing parity (moon#533, moon#534)

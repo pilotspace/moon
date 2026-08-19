@@ -206,6 +206,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "LINSERT" => CommandMeta { name: "LINSERT", arity: 5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LTRIM" => CommandMeta { name: "LTRIM", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LMOVE" => CommandMeta { name: "LMOVE", arity: 5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: LST },
+    // Deprecated in favour of LMOVE but never removed, and still what every
+    // major client's `rpoplpush()` sends. Same two-key spec as LMOVE so
+    // cluster key extraction agrees; SLOW because Redis categorises it so
+    // (moon#520).
+    "RPOPLPUSH" => CommandMeta { name: "RPOPLPUSH", arity: 3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
     "LPUSHX" => CommandMeta { name: "LPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "RPUSHX" => CommandMeta { name: "RPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LMPOP" => CommandMeta { name: "LMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: LST },
@@ -245,7 +250,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "ZADD" => CommandMeta { name: "ZADD", arity: -4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREM" => CommandMeta { name: "ZREM", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZCARD" => CommandMeta { name: "ZCARD", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZRANK" => CommandMeta { name: "ZRANK", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANK" => CommandMeta { name: "ZRANK", arity: -3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZSCAN" => CommandMeta { name: "ZSCAN", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZSCORE" => CommandMeta { name: "ZSCORE", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZRANGE" => CommandMeta { name: "ZRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
@@ -253,7 +258,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "ZINCRBY" => CommandMeta { name: "ZINCRBY", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZPOPMIN" => CommandMeta { name: "ZPOPMIN", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZPOPMAX" => CommandMeta { name: "ZPOPMAX", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZREVRANK" => CommandMeta { name: "ZREVRANK", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREVRANK" => CommandMeta { name: "ZREVRANK", arity: -3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREVRANGE" => CommandMeta { name: "ZREVRANGE", arity: 4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZLEXCOUNT" => CommandMeta { name: "ZLEXCOUNT", arity: 4, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZUNIONSTORE" => CommandMeta { name: "ZUNIONSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
@@ -839,6 +844,7 @@ mod tests {
             b"LREM",
             b"LTRIM",
             b"LMOVE",
+            b"RPOPLPUSH",
             b"LPUSHX",
             b"RPUSHX",
             b"LMPOP",
@@ -1015,6 +1021,7 @@ mod tests {
             b"LREM",
             b"LTRIM",
             b"LMOVE",
+            b"RPOPLPUSH",
         ];
         let reads: &[&[u8]] = &[
             b"GET",

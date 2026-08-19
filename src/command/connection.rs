@@ -111,23 +111,14 @@ pub fn select(args: &[Frame], selected_db: &mut usize, db_count: usize) -> Frame
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
-/// COMMAND command handler.
-///
-/// COMMAND (bare): return integer 0.
-/// COMMAND DOCS: return empty array.
-/// Any other subcommand: return empty array.
-pub fn command(args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return Frame::Integer(0);
-    }
-    // Check for DOCS subcommand (case-insensitive, zero-alloc)
-    if let Some(Frame::BulkString(sub)) | Some(Frame::SimpleString(sub)) = args.first() {
-        if sub.eq_ignore_ascii_case(b"DOCS") || sub.eq_ignore_ascii_case(b"COUNT") {
-            return Frame::Array(framevec![]);
-        }
-    }
-    Frame::Array(framevec![])
-}
+// `command()` used to live here and answered from constants: bare `COMMAND`
+// replied `Integer(0)` and `COMMAND COUNT` replied an empty array — each
+// returning the OTHER'S RESP type (moon#469). `introspect::command`, which
+// derives every reply from `COMMAND_META`, replaced it at both dispatch sites
+// in #471, leaving this one unreachable. It is deleted rather than left in
+// place: an unreferenced second `command()` next to the real one is exactly
+// the shape that gets re-wired by a later edit, and this repo has more than
+// one dispatch path, so a wrong arm is CI-invisible.
 
 /// HEALTHZ command — liveness check. Always returns +OK if the server is running.
 pub fn healthz() -> Frame {
@@ -1405,23 +1396,13 @@ mod tests {
         assert!(matches!(result, Frame::Error(_)));
     }
 
-    #[test]
-    fn test_command_bare() {
-        let result = command(&[]);
-        assert_eq!(result, Frame::Integer(0));
-    }
-
-    #[test]
-    fn test_command_docs() {
-        let result = command(&[Frame::BulkString(Bytes::from_static(b"DOCS"))]);
-        assert_eq!(result, Frame::Array(framevec![]));
-    }
-
-    #[test]
-    fn test_command_docs_lowercase() {
-        let result = command(&[Frame::BulkString(Bytes::from_static(b"docs"))]);
-        assert_eq!(result, Frame::Array(framevec![]));
-    }
+    // `test_command_bare` / `test_command_docs` / `test_command_docs_lowercase`
+    // are gone with the stub they exercised: they asserted `Integer(0)` for
+    // bare COMMAND and `*0` for COMMAND DOCS — i.e. they PINNED moon#469 in
+    // place while the reachable handler had already been fixed (#471). A test
+    // that outlives the code it covers keeps a green CI pointed at nothing.
+    // The live coverage is `command::introspect::tests` plus the wire-level
+    // `ci1`..`ci7` in tests/client_identity_introspection.rs.
 
     #[test]
     fn test_info_basic() {

@@ -214,7 +214,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented tradeoff. Console Integration was already path-gated and Integration Tests
   label-gated; both unchanged.
 
+### Added
+- **`ZRANK`/`ZREVRANK ... WITHSCORE`** (#521), the Redis 7.2 option — previously an arity error, so
+  a 7.2-aware client asking for the rank and the score in one round trip got a hard failure. A hit
+  is the two-element array `[rank, score]`; a miss (absent key or absent member) is the null ARRAY
+  `*-1`, not the null bulk the option-less form answers, so `WITHSCORE` changes the null type as
+  well as the hit type — measured against redis-server 8.6.1, and a statically-typed client decodes
+  the two differently. The token is SINGULAR, unlike the `WITHSCORES` that `ZRANGE` takes; the
+  plural is a syntax error here, and only a FOURTH argument is an arity error (Redis distinguishes
+  the two and so does Moon). The score is emitted as a RESP double, so RESP3 gets `,1` while RESP2
+  keeps the identical bulk-string bytes. Both entry points were fixed — `zrank` and
+  `zrank_readonly` each carried their own arity check, and which one answers is decided by shard
+  routing, so fixing one would have left the option working on some keys and failing on others.
+  `ZRANK`/`ZREVRANK` arity in `COMMAND INFO` is now `-3`, matching Redis 7.2+.
+- **`RPOPLPUSH source destination`** (#520) — previously "unknown command" even though `LMOVE` and
+  `BRPOPLPUSH` both worked. It is deprecated in Redis but never removed, and it is the form baked
+  into a decade of client code: `redis-py`, `jedis`, `go-redis` and `node-redis` all expose it as a
+  first-class method, so `r.rpoplpush(...)` failed outright. The name was already in the workspace
+  routing table, in the metrics labels, and was the internal rewrite target of `BRPOPLPUSH` —
+  missing only from the two places a client reaches, the dispatch table and `metadata.rs`
+  (`COMMAND INFO rpoplpush` answered an empty array, so driver feature-detection concluded the
+  command did not exist). Implemented by delegating to `LMOVE`'s body with `RIGHT LEFT` rather than
+  by duplicating the list logic, and registered with LMOVE's two-key spec (arity 3, write,
+  first_key 1, last_key 2, step 1, ACL `@list @slow`). Along the way the blocking-wakeup guard —
+  open-coded at eight dispatch sites — moved behind one shared predicate, which fixed a drift the
+  duplication had hidden: the two connection handlers woke `LMOVE`'s SOURCE key, which no blocked
+  reader waits on, while the SPSC handler correctly woke its DESTINATION. A `BLPOP dst` was
+  therefore woken or left to time out depending on which shard owned the key.
+
+### Removed
+- **The dead `connection::command` stub** (#469). `COMMAND COUNT` replying an empty array (and
+  bare `COMMAND` replying `Integer(0)` — each returning the other's RESP type) was fixed in #471,
+  which routed both dispatch sites to `introspect::command`; verified on the wire, `COMMAND COUNT`
+  now answers `:262` and `COMMAND INFO`/`DOCS WATCH` answer real specs. The superseded stub was
+  left behind unreferenced, together with three unit tests that still asserted its wrong replies —
+  a green test pinned to code nothing could reach. Both are deleted, and the issue's three probes
+  are pinned as one test beside the live handler.
+
 ### Fixed
+- **ACL key patterns are now enforced for `RPOPLPUSH` and `BRPOPLPUSH`** (#520). The ACL layer
+  extracts a command's key arguments from a name table, and a command missing from that table
+  falls through to an empty key list — which makes the permission loop a no-op, so every `~pattern`
+  is ignored rather than merely approximated. `LMOVE`/`BLMOVE` were listed; their `RPOPLPUSH`
+  siblings, with the identical two-key layout, were not. A `~cache:*` user could therefore move an
+  element out of any key in the keyspace into any other. Found while wiring #520; `BRPOPLPUSH` was
+  already reachable, so this closes a live hole as well as pre-empting one in the new command.
+- **`XREADGROUP` in history mode answers the stream, not a null** (#526). `XREADGROUP ... STREAMS
+  s 0` asks for the consumer's PENDING entries; Redis serves the stream before it knows whether
+  the PEL slice has anything in it, so an empty PEL replies `*1\r\n*2\r\n$1\r\ns\r\n*0\r\n` —
+  `[["s", []]]`. Moon replied `$-1`, so a client that iterates the returned stream list got a
+  decode error (or a `None` branch) where Redis gives it zero iterations. This is a reply-SHAPE
+  divergence, not a null-type one. The two request modes are now served on Redis's own
+  conditions: history (an explicit ID) always contributes its stream, `>` contributes only when
+  there ARE new entries — a `>` stream with nothing new is dropped from the reply rather than
+  rendered as an empty entry list, which also fixes the mixed `STREAMS a b > 0` case. The reply
+  is the null array only when nothing at all was served, so the `>`-with-no-new-entries answer
+  stays `*-1` (#482).
+- **`LPOP`/`RPOP` validate the optional count BEFORE the key lookup, with Redis's error text**
+  (#527). Both commands looked the key up first and returned the miss (`*-1`) without ever
+  reaching the count parser, so `LPOP nokey abc` answered "no such list" and the identical
+  command answered `-ERR ...` the moment somebody created the key — the same malformed request
+  getting opposite replies depending on unrelated keyspace state. Redis parses `argv[2]` before
+  `lookupKeyWrite`, so the argument error never depends on the key. The message now matches too:
+  a non-integer and a negative count both answer `ERR value is out of range, must be positive`
+  (Moon said `ERR value is not an integer or out of range`, which clients that classify retries
+  by error string read as a different failure). A well-formed count on an absent key still
+  answers the null array (#482), and validating first does not create the key. `LPOS`'s
+  `RANK`/`COUNT`/`MAXLEN` were already ordered and worded correctly and are untouched.
 - **Blocking pops no longer create the key they miss on** (#523, #539). `BLPOP`, `BRPOP`,
   `BLMOVE` (source), `BRPOPLPUSH` (source), `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` reached their
   value through `get_or_create_list` / `get_or_create_sorted_set`, so every miss materialised an

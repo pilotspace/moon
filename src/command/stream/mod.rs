@@ -452,6 +452,106 @@ mod tests {
         }
     }
 
+    /// XREADGROUP in HISTORY mode (an explicit ID, not `>`) always answers with
+    /// the stream, even when the consumer's PEL slice is empty.
+    ///
+    /// Oracle, redis-server 8.6.1 over a raw socket:
+    ///
+    /// ```text
+    /// XGROUP CREATE s g $ MKSTREAM
+    /// XREADGROUP GROUP g c COUNT 10 STREAMS s 0
+    ///   -> *1\r\n*2\r\n$1\r\ns\r\n*0\r\n     i.e. [["s", []]]
+    /// ```
+    ///
+    /// Moon answered `$-1`. That is a reply-SHAPE divergence, not a null-type
+    /// one: a client that iterates the returned stream list gets zero
+    /// iterations from Redis and a decode error from a null (moon#526).
+    #[test]
+    fn test_xreadgroup_history_empty_pel_replies_empty_stream_array() {
+        let mut db = Database::new();
+        // XGROUP CREATE s g $ MKSTREAM — a stream with no entries at all.
+        let args = make_args(&[b"CREATE", b"s", b"g", b"$", b"MKSTREAM"]);
+        assert_eq!(
+            xgroup(&mut db, &args),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+
+        let args = make_args(&[
+            b"GROUP", b"g", b"c", b"COUNT", b"10", b"STREAMS", b"s", b"0",
+        ]);
+        assert_eq!(
+            xreadgroup(&mut db, &args),
+            Frame::Array(framevec![Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"s")),
+                Frame::Array(framevec![]),
+            ])]),
+            "XREADGROUP history mode must name the stream with an empty entry list"
+        );
+    }
+
+    /// The same shape once every pending entry has been ACKed — the stream
+    /// exists, has entries, and the consumer's PEL is empty.
+    #[test]
+    fn test_xreadgroup_history_after_ack_replies_empty_stream_array() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"s", 2, b"g");
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b">"]);
+        xreadgroup(&mut db, &args);
+        let args = make_args(&[b"s", b"g", b"1-0", b"2-0"]);
+        assert_eq!(xack(&mut db, &args), Frame::Integer(2));
+
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b"0"]);
+        assert_eq!(
+            xreadgroup(&mut db, &args),
+            Frame::Array(framevec![Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"s")),
+                Frame::Array(framevec![]),
+            ])])
+        );
+    }
+
+    /// The fence for #482: the `>` form with nothing new must stay `*-1`.
+    /// Without this half, "always build the array" would pass the two tests
+    /// above while silently changing the no-new-entries reply.
+    #[test]
+    fn test_xreadgroup_new_entries_miss_stays_null_array() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"s", 1, b"g");
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b">"]);
+        xreadgroup(&mut db, &args);
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b">"]);
+        assert_eq!(xreadgroup(&mut db, &args), Frame::NullArray);
+    }
+
+    /// Mixed request: one stream in `>` mode with nothing new, one in history
+    /// mode. Redis emits only the history stream — the `>` stream is dropped
+    /// from the reply, not rendered as an empty entry list.
+    #[test]
+    fn test_xreadgroup_mixed_modes_emits_only_served_streams() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"a", 1, b"g");
+        setup_stream_with_group(&mut db, b"b", 1, b"g");
+        // Drain `a`'s new entries so its `>` read finds nothing.
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"a", b">"]);
+        xreadgroup(&mut db, &args);
+
+        let args = make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"a", b"b", b">", b"0"]);
+        match xreadgroup(&mut db, &args) {
+            Frame::Array(streams) => {
+                assert_eq!(streams.len(), 1, "only the history stream is served");
+                match &streams[0] {
+                    Frame::Array(inner) => assert_eq!(
+                        inner[0],
+                        Frame::BulkString(Bytes::from_static(b"b")),
+                        "the served stream must be `b`, the history one"
+                    ),
+                    other => panic!("expected a stream pair, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_xack_removes_from_pel() {
         let mut db = Database::new();
