@@ -405,6 +405,30 @@ LVAL=$(python3 -c "print('Y' * 512)")
 both RPUSH l:test "$LVAL"
 assert_both "LINDEX large value" LINDEX l:test -1
 
+# RPOPLPUSH === LMOVE src dst RIGHT LEFT (moon#520). Deprecated in Redis but
+# never removed, and what every major client's `rpoplpush()` sends. Assert the
+# reply AND both keys afterwards — a stub that returned the tail without moving
+# it would satisfy a reply-only check. Same-key rotation is the reliable-queue
+# idiom and takes the src == dst branch, so it gets its own row.
+both RPUSH l:rl a b c
+assert_both "RPOPLPUSH reply" RPOPLPUSH l:rl l:rl-d
+assert_both "RPOPLPUSH source" LRANGE l:rl 0 -1
+assert_both "RPOPLPUSH dest" LRANGE l:rl-d 0 -1
+assert_both "RPOPLPUSH equals LMOVE RIGHT LEFT" LMOVE l:rl l:rl-d RIGHT LEFT
+assert_both "RPOPLPUSH after LMOVE dest" LRANGE l:rl-d 0 -1
+assert_both "RPOPLPUSH absent source" RPOPLPUSH l:rl-absent l:rl-d
+assert_both "RPOPLPUSH wrong arity" RPOPLPUSH l:rl
+both RPUSH l:rot a b c
+assert_both "RPOPLPUSH rotate in place" RPOPLPUSH l:rot l:rot
+assert_both "RPOPLPUSH rotate result" LRANGE l:rot 0 -1
+both SET l:rl-str notalist
+assert_both "RPOPLPUSH WRONGTYPE source" RPOPLPUSH l:rl-str l:rl-d
+assert_both "RPOPLPUSH WRONGTYPE dest" RPOPLPUSH l:rl l:rl-str
+# `COMMAND INFO rpoplpush` is deliberately NOT compared here: the two servers
+# legitimately disagree on the tips/key-specs sub-arrays, so an equality check
+# would fail for a reason unrelated to whether the command exists. Its
+# registration is pinned by the unit test in src/command/mod.rs instead.
+
 # ===========================================================================
 # 8. Set operations
 # ===========================================================================

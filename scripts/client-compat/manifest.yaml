@@ -344,3 +344,79 @@ entries:
     command: "MONITOR extra"
     policy: exact
     contexts: [standalone]
+
+  # ── Redis-parity batch: #527 / #526 / #520 / #521 ─────────────────────
+  #
+  # Four command-level divergences found by diffing Moon against a live
+  # redis-server 8.6.1. Each is pinned here as well as in a unit test, because
+  # a unit test can only assert Moon against Moon's own idea of correct — and
+  # three of these four were cases where that idea was wrong.
+  #
+  # Restricted to standalone + pipeline: the MULTI leg has its own known
+  # queueing gaps (see empty_config_get_in_multi) and would waive these for a
+  # reason that has nothing to do with the commands under test.
+
+  # #520 — RPOPLPUSH had no dispatch arm at all ("unknown command"), while
+  # LMOVE and BRPOPLPUSH both worked. Diff the reply AND both keys after it: a
+  # stub that returned the tail without moving it passes a reply-only check.
+  - name: parity_rpoplpush_moves_the_tail
+    setup: ["DEL cl:rl", "DEL cl:rl-d", "RPUSH cl:rl a b c"]
+    command: "RPOPLPUSH cl:rl cl:rl-d"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_rpoplpush_leaves_the_source_short
+    setup: ["DEL cl:rl2", "DEL cl:rl2-d", "RPUSH cl:rl2 a b c", "RPOPLPUSH cl:rl2 cl:rl2-d"]
+    command: "LRANGE cl:rl2 0 -1"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_rpoplpush_pushes_to_the_destination_head
+    setup: ["DEL cl:rl3", "DEL cl:rl3-d", "RPUSH cl:rl3 a b c", "RPUSH cl:rl3-d z", "RPOPLPUSH cl:rl3 cl:rl3-d"]
+    command: "LRANGE cl:rl3-d 0 -1"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_rpoplpush_absent_source_is_null_bulk
+    setup: ["DEL cl:rl-none", "DEL cl:rl-none-d"]
+    command: "RPOPLPUSH cl:rl-none cl:rl-none-d"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  # #527 — the count was validated AFTER the key lookup, so a malformed count
+  # against an absent key answered `*-1` instead of an error. The differ
+  # compares error CODES, not messages, so what this catches is precisely the
+  # reply KIND flip (error vs null array) that the defect produced.
+  - name: parity_lpop_bad_count_on_absent_key_is_an_error
+    setup: ["DEL cl:lp-none"]
+    command: "LPOP cl:lp-none abc"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: parity_lpop_negative_count_on_absent_key_is_an_error
+    setup: ["DEL cl:lp-none2"]
+    command: "LPOP cl:lp-none2 -1"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  # The fence: a WELL-FORMED count on an absent key is still the null array.
+  - name: parity_lpop_good_count_on_absent_key_is_null_array
+    setup: ["DEL cl:lp-none3"]
+    command: "LPOP cl:lp-none3 2"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  # #526 — history mode (an explicit ID) always names the stream, even when the
+  # consumer's PEL slice is empty; Moon answered a null.
+  - name: parity_xreadgroup_history_empty_pel_names_the_stream
+    setup: ["DEL cl:xrg", "XGROUP CREATE cl:xrg g $ MKSTREAM"]
+    command: "XREADGROUP GROUP g c COUNT 10 STREAMS cl:xrg 0"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  # The fence: the `>` form with nothing new stays the null array.
+  - name: parity_xreadgroup_new_only_miss_is_null_array
+    setup: ["DEL cl:xrg2", "XGROUP CREATE cl:xrg2 g $ MKSTREAM"]
+    command: "XREADGROUP GROUP g c COUNT 10 STREAMS cl:xrg2 >"
+    policy: exact
+    contexts: [standalone, pipeline]

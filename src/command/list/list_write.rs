@@ -665,7 +665,57 @@ pub fn lmove(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(d) => d,
         Err(e) => return e,
     };
+    lmove_inner(db, source, destination, wherefrom, whereto)
+}
 
+/// RPOPLPUSH source destination
+///
+/// Deprecated in Redis in favour of `LMOVE source destination RIGHT LEFT`, but
+/// NOT removed: it is the form baked into a decade of client code and every
+/// reliable-queue tutorial, and `redis-py`, `jedis`, `go-redis` and
+/// `node-redis` all expose it as a first-class method. Moon had it in the
+/// routing table, in the metrics labels, and as the internal rewrite target of
+/// `BRPOPLPUSH` — everywhere except the two places a client reaches, so
+/// `r.rpoplpush(...)` got "unknown command" (moon#520).
+///
+/// Implemented by DELEGATING to `lmove_inner`, not by re-deriving the list
+/// logic: identical replies, identical memory accounting, identical
+/// WRONGTYPE-before-pop ordering, and no second copy to drift.
+pub fn rpoplpush(db: &mut Database, args: &[Frame]) -> Frame {
+    // Lowercase in the arity message because that is what Redis emits
+    // (`ERR wrong number of arguments for 'rpoplpush' command`) and what the
+    // `BRPOPLPUSH` arity error in `server/conn/blocking.rs` already says. Much
+    // of the rest of this codebase passes the UPPERCASE name here and so
+    // diverges from Redis — a pre-existing, systemic difference that is not
+    // this change's to fix, but is also not one a NEW command should inherit.
+    if args.len() != 2 {
+        return err_wrong_args("rpoplpush");
+    }
+    let source = match extract_bytes(&args[0]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("rpoplpush"),
+    };
+    let destination = match extract_bytes(&args[1]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("rpoplpush"),
+    };
+    lmove_inner(
+        db,
+        source,
+        destination,
+        crate::blocking::Direction::Right,
+        crate::blocking::Direction::Left,
+    )
+}
+
+/// The shared body of `LMOVE` and `RPOPLPUSH`, after argument parsing.
+fn lmove_inner(
+    db: &mut Database,
+    source: Bytes,
+    destination: Bytes,
+    wherefrom: crate::blocking::Direction,
+    whereto: crate::blocking::Direction,
+) -> Frame {
     use crate::blocking::Direction;
 
     // Type check: source must be a list or not exist

@@ -206,6 +206,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "LINSERT" => CommandMeta { name: "LINSERT", arity: 5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LTRIM" => CommandMeta { name: "LTRIM", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LMOVE" => CommandMeta { name: "LMOVE", arity: 5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: LST },
+    // Deprecated in favour of LMOVE but never removed, and still what every
+    // major client's `rpoplpush()` sends. Same two-key spec as LMOVE so
+    // cluster key extraction agrees; SLOW because Redis categorises it so
+    // (moon#520).
+    "RPOPLPUSH" => CommandMeta { name: "RPOPLPUSH", arity: 3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
     "LPUSHX" => CommandMeta { name: "LPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "RPUSHX" => CommandMeta { name: "RPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LMPOP" => CommandMeta { name: "LMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: LST },
@@ -839,6 +844,7 @@ mod tests {
             b"LREM",
             b"LTRIM",
             b"LMOVE",
+            b"RPOPLPUSH",
             b"LPUSHX",
             b"RPUSHX",
             b"LMPOP",
@@ -1015,6 +1021,7 @@ mod tests {
             b"LREM",
             b"LTRIM",
             b"LMOVE",
+            b"RPOPLPUSH",
         ];
         let reads: &[&[u8]] = &[
             b"GET",

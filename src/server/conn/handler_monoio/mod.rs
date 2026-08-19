@@ -2742,18 +2742,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                         // Blocking wakeup: re-borrow db by index (NLL)
                         if !is_error {
-                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                                 || cmd.eq_ignore_ascii_case(b"ZADD");
                             if needs_wake {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                // The wake key is the DESTINATION for
+                                // LMOVE/RPOPLPUSH and args[0] otherwise. This
+                                // site used to hardcode `first()`, so a client
+                                // blocked on an LMOVE destination was never
+                                // woken here even though the SPSC path woke it
+                                // — same command, opposite outcome depending on
+                                // which shard owned the key (moon#520).
+                                let idx = crate::blocking::wakeup::producer_wake_key_index(cmd);
+                                if let Some(key) = cmd_args.get(idx).and_then(|f| extract_bytes(f))
+                                {
                                     let mut reg = ctx.blocking_registry.borrow_mut();
                                     let wake_db = &mut s.databases[new_sel_db];
-                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                    {
+                                    if crate::blocking::wakeup::is_list_producer(cmd) {
                                         crate::blocking::wakeup::try_wake_list_waiter(
                                             &mut reg, wake_db, new_sel_db, &key,
                                         );

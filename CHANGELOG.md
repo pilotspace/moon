@@ -214,6 +214,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented tradeoff. Console Integration was already path-gated and Integration Tests
   label-gated; both unchanged.
 
+### Added
+- **`RPOPLPUSH source destination`** (#520) — previously "unknown command" even though `LMOVE` and
+  `BRPOPLPUSH` both worked. It is deprecated in Redis but never removed, and it is the form baked
+  into a decade of client code: `redis-py`, `jedis`, `go-redis` and `node-redis` all expose it as a
+  first-class method, so `r.rpoplpush(...)` failed outright. The name was already in the workspace
+  routing table, in the metrics labels, and was the internal rewrite target of `BRPOPLPUSH` —
+  missing only from the two places a client reaches, the dispatch table and `metadata.rs`
+  (`COMMAND INFO rpoplpush` answered an empty array, so driver feature-detection concluded the
+  command did not exist). Implemented by delegating to `LMOVE`'s body with `RIGHT LEFT` rather than
+  by duplicating the list logic, and registered with LMOVE's two-key spec (arity 3, write,
+  first_key 1, last_key 2, step 1, ACL `@list @slow`). Along the way the blocking-wakeup guard —
+  open-coded at eight dispatch sites — moved behind one shared predicate, which fixed a drift the
+  duplication had hidden: the two connection handlers woke `LMOVE`'s SOURCE key, which no blocked
+  reader waits on, while the SPSC handler correctly woke its DESTINATION. A `BLPOP dst` was
+  therefore woken or left to time out depending on which shard owned the key.
+
 ### Removed
 - **The dead `connection::command` stub** (#469). `COMMAND COUNT` replying an empty array (and
   bare `COMMAND` replying `Integer(0)` — each returning the other's RESP type) was fixed in #471,

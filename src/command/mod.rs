@@ -853,9 +853,15 @@ fn dispatch_inner(
             }
         }
         (9, b'r') => {
-            // RANDOMKEY
+            // RANDOMKEY RPOPLPUSH
             if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
                 return resp(key::randomkey(db, &[]));
+            }
+            // RPOPLPUSH === LMOVE src dst RIGHT LEFT (moon#520). Deprecated in
+            // Redis, never removed, and still the method every major client
+            // exposes — it belongs beside the LMOVE arm at (5, b'l').
+            if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") {
+                return resp(list::rpoplpush(db, args));
             }
         }
         (9, b's') => {
@@ -2322,5 +2328,158 @@ mod tests {
             matches!(frame, Frame::Error(_)),
             "MOVE fallback in dispatch() must return Frame::Error, got {frame:?}"
         );
+    }
+
+    // ── RPOPLPUSH (moon#520) ──────────────────────────────────────────────
+    //
+    // `RPOPLPUSH source destination` is exactly `LMOVE source destination
+    // RIGHT LEFT`. It was registered in the routing/metrics tables and
+    // synthesised internally by BRPOPLPUSH, but had no dispatch arm and no
+    // `metadata.rs` entry, so the one thing clients reach answered
+    // "unknown command".
+
+    /// Drive both commands through `dispatch` on the SAME fixture and require
+    /// byte-identical replies and byte-identical resulting keyspaces. Asserting
+    /// equivalence rather than a hardcoded expectation is the point: RPOPLPUSH
+    /// must not be able to drift away from LMOVE later.
+    #[test]
+    fn rpoplpush_is_lmove_right_left() {
+        fn run(cmd: &[u8], args: &[&[u8]]) -> (Frame, Frame, Frame) {
+            let mut db = Database::new();
+            let mut selected = 0usize;
+            for e in [b"a".as_ref(), b"b".as_ref(), b"c".as_ref()] {
+                let _ = dispatch(
+                    &mut db,
+                    b"RPUSH",
+                    &make_args(&[b"src", e]),
+                    &mut selected,
+                    16,
+                );
+            }
+            let _ = dispatch(
+                &mut db,
+                b"RPUSH",
+                &make_args(&[b"dst", b"z"]),
+                &mut selected,
+                16,
+            );
+            let moved = match dispatch(&mut db, cmd, &make_args(args), &mut selected, 16) {
+                DispatchResult::Response(f) => f,
+                DispatchResult::Quit(_) => panic!("unexpected Quit"),
+            };
+            let src = match dispatch(
+                &mut db,
+                b"LRANGE",
+                &make_args(&[b"src", b"0", b"-1"]),
+                &mut selected,
+                16,
+            ) {
+                DispatchResult::Response(f) => f,
+                DispatchResult::Quit(_) => panic!("unexpected Quit"),
+            };
+            let dst = match dispatch(
+                &mut db,
+                b"LRANGE",
+                &make_args(&[b"dst", b"0", b"-1"]),
+                &mut selected,
+                16,
+            ) {
+                DispatchResult::Response(f) => f,
+                DispatchResult::Quit(_) => panic!("unexpected Quit"),
+            };
+            (moved, src, dst)
+        }
+
+        let via_rpoplpush = run(b"RPOPLPUSH", &[b"src", b"dst"]);
+        let via_lmove = run(b"LMOVE", &[b"src", b"dst", b"RIGHT", b"LEFT"]);
+        assert_eq!(
+            via_rpoplpush, via_lmove,
+            "RPOPLPUSH must be indistinguishable from LMOVE ... RIGHT LEFT"
+        );
+        assert_eq!(
+            via_rpoplpush.0,
+            Frame::BulkString(Bytes::from_static(b"c")),
+            "the reply is the popped element"
+        );
+    }
+
+    /// An empty or absent source is the null BULK (`$-1`), same as LMOVE —
+    /// not the null array, and not an error.
+    #[test]
+    fn rpoplpush_missing_source_is_null_bulk() {
+        assert_eq!(
+            dispatch_resp(b"RPOPLPUSH", &[b"nosrc", b"dst"]),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn rpoplpush_wrong_arity_is_an_error() {
+        // Assert the TEXT, not just "an error": "unknown command" is also an
+        // error, so `matches!(.., Error(_))` passes before the arm exists and
+        // proves nothing.
+        let short: &[&[u8]] = &[b"only-one"];
+        let long: &[&[u8]] = &[b"a", b"b", b"c"];
+        for args in [short, long] {
+            match dispatch_resp(b"RPOPLPUSH", args) {
+                Frame::Error(e) => {
+                    let text = String::from_utf8_lossy(&e);
+                    assert!(
+                        text.contains("wrong number of arguments"),
+                        "arity error expected, got {text}"
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Lowercase must reach the same arm — clients send whatever they send.
+    #[test]
+    fn rpoplpush_is_case_insensitive() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let _ = dispatch(
+            &mut db,
+            b"RPUSH",
+            &make_args(&[b"s", b"v"]),
+            &mut selected,
+            16,
+        );
+        match dispatch(
+            &mut db,
+            b"rpoplpush",
+            &make_args(&[b"s", b"d"]),
+            &mut selected,
+            16,
+        ) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from_static(b"v")))
+            }
+            DispatchResult::Quit(_) => panic!("unexpected Quit"),
+        }
+    }
+
+    /// `COMMAND INFO rpoplpush` answered an empty array, so drivers doing
+    /// feature detection concluded the command did not exist — while
+    /// `src/workspace/mod.rs` and the metrics labels already named it. The
+    /// registry entry must match LMOVE's shape (both are two-key writes) and
+    /// carry the LIST + SLOW ACL categories Redis gives it.
+    #[test]
+    fn rpoplpush_is_registered_in_the_metadata_registry() {
+        use crate::command::metadata::{AclCategories, CommandFlags};
+        let meta = crate::command::metadata::lookup(b"RPOPLPUSH")
+            .expect("RPOPLPUSH must be in COMMAND_META so COMMAND INFO/DOCS stop lying");
+        assert_eq!(meta.arity, 3, "RPOPLPUSH source destination");
+        assert!(meta.flags.contains(CommandFlags::WRITE));
+        assert!(crate::command::metadata::is_write(b"RPOPLPUSH"));
+        let lmove = crate::command::metadata::lookup(b"LMOVE").expect("LMOVE registered");
+        assert_eq!(
+            (meta.first_key, meta.last_key, meta.step),
+            (lmove.first_key, lmove.last_key, lmove.step),
+            "same two-key spec as LMOVE, so cluster key extraction agrees"
+        );
+        assert!(meta.acl_categories.contains(AclCategories::LIST));
+        assert!(meta.acl_categories.contains(AclCategories::SLOW));
     }
 }

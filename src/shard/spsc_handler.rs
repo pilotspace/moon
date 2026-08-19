@@ -838,27 +838,16 @@ pub(crate) fn handle_shard_message_shared(
 
                             // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                                     || cmd.eq_ignore_ascii_case(b"ZADD")
                                     || cmd.eq_ignore_ascii_case(b"XADD");
                                 if needs_wake {
-                                    let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                        args.get(1).and_then(|f| {
-                                            crate::server::connection::extract_bytes(f)
-                                        })
-                                    } else {
-                                        args.first().and_then(|f| {
-                                            crate::server::connection::extract_bytes(f)
-                                        })
-                                    };
+                                    let wake_key = args
+                                        .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                        .and_then(|f| crate::server::connection::extract_bytes(f));
                                     if let Some(key) = wake_key {
                                         let mut reg = blocking_registry.borrow_mut();
-                                        if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                            || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                        {
+                                        if crate::blocking::wakeup::is_list_producer(cmd) {
                                             crate::blocking::wakeup::try_wake_list_waiter(
                                                 &mut reg, db, db_idx, &key,
                                             );
@@ -1083,25 +1072,16 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                args.get(1)
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            } else {
-                                args.first()
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            };
+                            let wake_key = args
+                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                .and_then(|f| crate::server::connection::extract_bytes(f));
                             if let Some(key) = wake_key {
                                 let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
+                                if crate::blocking::wakeup::is_list_producer(cmd) {
                                     crate::blocking::wakeup::try_wake_list_waiter(
                                         &mut reg, guard, db_idx, &key,
                                     );
@@ -1347,25 +1327,16 @@ pub(crate) fn handle_shard_message_shared(
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                args.get(1)
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            } else {
-                                args.first()
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            };
+                            let wake_key = args
+                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                .and_then(|f| crate::server::connection::extract_bytes(f));
                             if let Some(key) = wake_key {
                                 let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
+                                if crate::blocking::wakeup::is_list_producer(cmd) {
                                     crate::blocking::wakeup::try_wake_list_waiter(
                                         &mut reg, guard, db_idx, &key,
                                     );
@@ -1539,27 +1510,16 @@ pub(crate) fn handle_shard_message_shared(
                             }
 
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                                     || cmd.eq_ignore_ascii_case(b"ZADD")
                                     || cmd.eq_ignore_ascii_case(b"XADD");
                                 if needs_wake {
-                                    let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                        args.get(1).and_then(|f| {
-                                            crate::server::connection::extract_bytes(f)
-                                        })
-                                    } else {
-                                        args.first().and_then(|f| {
-                                            crate::server::connection::extract_bytes(f)
-                                        })
-                                    };
+                                    let wake_key = args
+                                        .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                        .and_then(|f| crate::server::connection::extract_bytes(f));
                                     if let Some(key) = wake_key {
                                         let mut reg = blocking_registry.borrow_mut();
-                                        if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                            || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                        {
+                                        if crate::blocking::wakeup::is_list_producer(cmd) {
                                             crate::blocking::wakeup::try_wake_list_waiter(
                                                 &mut reg, db, db_idx, &key,
                                             );
@@ -1744,25 +1704,16 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                args.get(1)
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            } else {
-                                args.first()
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            };
+                            let wake_key = args
+                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                .and_then(|f| crate::server::connection::extract_bytes(f));
                             if let Some(key) = wake_key {
                                 let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
+                                if crate::blocking::wakeup::is_list_producer(cmd) {
                                     crate::blocking::wakeup::try_wake_list_waiter(
                                         &mut reg, guard, db_idx, &key,
                                     );
@@ -2009,25 +1960,16 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                args.get(1)
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            } else {
-                                args.first()
-                                    .and_then(|f| crate::server::connection::extract_bytes(f))
-                            };
+                            let wake_key = args
+                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                                .and_then(|f| crate::server::connection::extract_bytes(f));
                             if let Some(key) = wake_key {
                                 let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
+                                if crate::blocking::wakeup::is_list_producer(cmd) {
                                     crate::blocking::wakeup::try_wake_list_waiter(
                                         &mut reg, guard, db_idx, &key,
                                     );
