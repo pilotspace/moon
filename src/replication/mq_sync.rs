@@ -240,6 +240,7 @@ mod tests {
                 text: AtomicUsize::new(0),
                 graph: AtomicUsize::new(0),
                 lua: AtomicUsize::new(0),
+                lua_vm: AtomicUsize::new(0),
                 pagecache: AtomicUsize::new(0),
             }),
         })

@@ -370,6 +370,13 @@ pub(crate) fn run_eviction_tick(
     next_file_id: &mut u64,
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
+    // moon#506: the shard's ONE Lua VM slot (`event_loop`'s `lua_rc`, the same
+    // cell `conn_accept` and `ShardLuaRuntime` fill). Sampled here rather than
+    // at either event-loop tick site precisely because there are TWO tick sites
+    // — a tokio `select!` arm and a monoio counter arm — and a publish written
+    // into one of them is invisible on the other. This function is the body
+    // they share, so the sample cannot drift per runtime.
+    lua_vm_slot: &crate::scripting::ShardLuaSlot,
     spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
     // task/issue #45: `<offload>/shard-{id}`, precomputed ONCE at shard init
     // (event_loop's `disk_offload_dir`) instead of a per-tick
@@ -429,6 +436,16 @@ pub(crate) fn run_eviction_tick(
         s.store_memory
             .lua
             .store(script_cache.borrow().resident_bytes(), Ordering::Relaxed);
+        // moon#506: the script SOURCES published above are 48 bytes for
+        // `return 1`; the VM that ran it holds ~25KB before it touches
+        // anything, and unboundedly more once a script anchors tables in
+        // `_G`. Publish the interpreter heap separately so `used_memory_lua`,
+        // `moon_memory_bytes{kind="lua_scripts"}` and MEMORY DOCTOR report the
+        // real footprint instead of the string length of the script text.
+        // `None` = slot momentarily unsamplable: keep the previous value.
+        if let Some(vm_bytes) = crate::scripting::vm_used_memory(lua_vm_slot) {
+            s.store_memory.lua_vm.store(vm_bytes, Ordering::Relaxed);
+        }
         // Return the vector resident total (HOT + WARM) so the pressure check
         // below can factor it in (memory-triggered vector offload, C).
         mutable + immutable
@@ -502,7 +519,10 @@ pub(crate) fn run_eviction_tick(
             vector_bytes += mem.vector.load(Ordering::Relaxed);
             text_bytes += mem.text.load(Ordering::Relaxed);
             graph_bytes += mem.graph.load(Ordering::Relaxed);
-            lua_bytes += mem.lua.load(Ordering::Relaxed);
+            // moon#506: script sources + interpreter heap. Both are real
+            // allocations inside RSS, so both must be subtracted here or the
+            // VM's ~25KB/shard is misattributed to allocator overhead.
+            lua_bytes += mem.lua.load(Ordering::Relaxed) + mem.lua_vm.load(Ordering::Relaxed);
             pagecache_bytes += mem.pagecache.load(Ordering::Relaxed);
         }
         let repl_backlog_bytes = crate::admin::metrics_setup::get_global_repl_state_arc()
@@ -2105,6 +2125,69 @@ mod tests {
             .map(|m| m.pagecache.load(std::sync::atomic::Ordering::Relaxed))
             .sum();
         assert_eq!(total, 4096 * 10 + 65536 * 3);
+    }
+
+    /// moon#506 wire-through: the VM figure lands in its OWN atomic, separate
+    /// from the script-source cache, and both sum across shards the way INFO
+    /// memory / MEMORY DOCTOR / the Prometheus updater read them.
+    #[test]
+    fn test_lua_vm_and_script_cache_are_separate_published_atomics() {
+        use std::sync::atomic::Ordering;
+        let dbs: Vec<Vec<crate::storage::Database>> = vec![
+            vec![crate::storage::Database::new()],
+            vec![crate::storage::Database::new()],
+        ];
+        let (shared, _inits) = ShardDatabases::new(dbs);
+
+        // What the two really look like in production: 48 bytes of script
+        // text against a ~25KB interpreter heap.
+        shared.store_memory_per_shard[0]
+            .lua
+            .store(48, Ordering::Relaxed);
+        shared.store_memory_per_shard[0]
+            .lua_vm
+            .store(25_403, Ordering::Relaxed);
+        shared.store_memory_per_shard[1]
+            .lua_vm
+            .store(24_165, Ordering::Relaxed);
+
+        let vm_total: usize = shared
+            .store_memory_per_shard
+            .iter()
+            .map(|m| m.lua_vm.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(vm_total, 25_403 + 24_165);
+
+        let combined: usize = shared
+            .store_memory_per_shard
+            .iter()
+            .map(|m| m.lua.load(Ordering::Relaxed) + m.lua_vm.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(combined, 48 + 25_403 + 24_165);
+    }
+
+    /// moon#506 root cause, pinned structurally: the shard periodic tick has
+    /// TWO bodies in `event_loop.rs` — a tokio `select!` arm and a monoio
+    /// counter arm — and the defect was a sample written into one of them.
+    /// The VM sample must therefore live ONLY in `run_eviction_tick`, the body
+    /// both arms call, never inline in a runtime-specific arm.
+    #[test]
+    fn test_lua_vm_sample_lives_only_in_the_shared_tick_body() {
+        let event_loop_src = include_str!("event_loop.rs");
+        assert!(
+            !event_loop_src.contains("lua_vm"),
+            "event_loop.rs samples the Lua VM inline. Move it into \
+             persistence_tick::run_eviction_tick — a publish written into one \
+             runtime's tick arm is invisible on the other, which is exactly \
+             how moon#506 shipped a monoio-blind figure."
+        );
+        assert_eq!(
+            event_loop_src.matches("run_eviction_tick(").count(),
+            2,
+            "expected exactly two tick call sites (tokio select! arm + monoio \
+             counter arm). If a third runtime arm was added, confirm it also \
+             calls the shared body before updating this count."
+        );
     }
 
     #[test]
