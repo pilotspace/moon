@@ -116,6 +116,15 @@ pub struct CrossStoreTxn {
     pub graph_undo: Vec<GraphUndoOp>,
     /// MQ messages to enqueue on commit.
     pub mq_intents: SmallVec<[MqIntent; 4]>,
+    /// #499: number of operations a TXN guard REJECTED while this transaction
+    /// was open (cross-shard write, MOVE, COPY ... DB, SWAPDB, cross-shard
+    /// Cypher write). Non-zero poisons the transaction: `TXN.COMMIT` refuses
+    /// and rolls back instead of applying the accepted subset, mirroring
+    /// Redis's `CLIENT_DIRTY_EXEC` → `EXECABORT` contract for MULTI.
+    pub rejected_ops: u32,
+    /// Name of the FIRST rejected command, for the commit-time error message.
+    /// Captured once (an error path, never a hot path).
+    pub first_rejected_cmd: Option<Bytes>,
 }
 
 impl CrossStoreTxn {
@@ -133,7 +142,30 @@ impl CrossStoreTxn {
             #[cfg(feature = "graph")]
             graph_undo: Vec::new(),
             mq_intents: SmallVec::new(),
+            rejected_ops: 0,
+            first_rejected_cmd: None,
         }
+    }
+
+    /// #499: record that `cmd` was rejected by a TXN guard inside this
+    /// transaction body, poisoning it.
+    ///
+    /// The client already saw the per-op error; this is what makes
+    /// `TXN.COMMIT` refuse afterwards instead of silently committing the
+    /// accepted subset.
+    #[inline]
+    pub fn record_rejected_op(&mut self, cmd: &[u8]) {
+        self.rejected_ops = self.rejected_ops.saturating_add(1);
+        if self.first_rejected_cmd.is_none() {
+            self.first_rejected_cmd = Some(Bytes::copy_from_slice(cmd));
+        }
+    }
+
+    /// #499: true when at least one op in the body was rejected — the
+    /// transaction may not commit.
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.rejected_ops > 0
     }
 
     /// Record a KV insert (key did not exist).
@@ -227,6 +259,25 @@ mod tests {
         let txn = CrossStoreTxn::new(42, 41, 0);
         assert_eq!(txn.txn_id, 42);
         assert_eq!(txn.snapshot_lsn, 41);
+        assert!(!txn.has_modifications());
+    }
+
+    /// #499: a fresh transaction is clean; a guard rejection poisons it and
+    /// the FIRST rejected command name is what the commit error reports.
+    #[test]
+    fn test_rejected_ops_poison_txn() {
+        let mut txn = CrossStoreTxn::new(7, 6, 0);
+        assert!(!txn.is_dirty());
+        assert_eq!(txn.rejected_ops, 0);
+        assert!(txn.first_rejected_cmd.is_none());
+
+        txn.record_rejected_op(b"SET");
+        txn.record_rejected_op(b"MOVE");
+
+        assert!(txn.is_dirty());
+        assert_eq!(txn.rejected_ops, 2);
+        assert_eq!(txn.first_rejected_cmd.as_deref(), Some(&b"SET"[..]));
+        // A rejected op applied nothing, so it is not a "modification".
         assert!(!txn.has_modifications());
     }
 

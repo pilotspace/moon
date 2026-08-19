@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol version and selects between two static byte strings (`io::static_responses::null_bulk`,
   which also gives the previously caller-less `NULL_BULK` constant a home). `+OK` and `-WRONGTYPE`,
   the only other bytes this path frames, are spelled identically in both protocols.
+- **`TXN.COMMIT` no longer answers `+OK` for a transaction that was applied in part** (#499).
+  A TXN body whose ops are rejected by a TXN guard — a cross-shard write at `--shards > 1`,
+  `MOVE`, `COPY ... DB`, `SWAPDB`, a cross-shard Cypher write — used to commit the *accepted*
+  subset and reply `+OK`. The per-op errors did go back to the client, but a driver inspects the
+  COMMIT reply, not the replies of the body commands (exactly as it inspects `EXEC` and not the
+  `QUEUED`s), so a routing mistake became silent partial application. A rejection now poisons the
+  transaction the way a queue-time error poisons `MULTI`: `TXN.COMMIT` rolls the whole transaction
+  back through the `TXN.ABORT` path and answers
+  `EXECABORT TXN.COMMIT discarded because of previous errors: N operation(s) rejected inside the
+  transaction (first: <CMD>) -- rolled back and NOT committed`, leaving the connection out of the
+  transaction. The wording stops at what the code can guarantee — the commit did not happen —
+  because rollback is the same best-effort `TXN.ABORT` path whose undo capture still has gaps
+  (#500). Nothing changes for a transaction whose every op was accepted. Both handlers (monoio
+  and sharded/tokio) carry the check, and both are covered end-to-end.
 
 ### Changed
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).

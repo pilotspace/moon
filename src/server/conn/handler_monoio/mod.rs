@@ -2082,7 +2082,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // of every privileged intercept. Its old comment claimed exactly
             // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-            if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
+            if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
                 continue;
             }
             if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
@@ -2435,6 +2435,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // Reject during an active cross-store TXN so TXN.ABORT can
                     // still roll back cleanly (matches handler_sharded policy).
                     if conn.in_cross_txn() {
+                        // #499: poison the txn so COMMIT cannot report OK.
+                        conn.mark_cross_txn_rejected(cmd);
                         responses.push(Frame::Error(bytes::Bytes::from_static(
                             crate::command::transaction::ERR_TXN_CROSS_SHARD,
                         )));
@@ -2518,6 +2520,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Reject only when DB clause is present (cross-DB);
                         // same-DB COPY falls through to the normal write path.
                         if conn.in_cross_txn() {
+                            // #499: poison the txn so COMMIT cannot report OK.
+                            conn.mark_cross_txn_rejected(cmd);
                             responses.push(Frame::Error(bytes::Bytes::from_static(
                                 crate::command::transaction::ERR_TXN_CROSS_SHARD,
                             )));
@@ -3119,6 +3123,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             } else if let Some(target) = target_shard {
                 // TXN cross-shard guard: reject cross-shard writes in active TXN (no undo log).
                 if conn.in_cross_txn() && metadata::is_write(cmd) {
+                    // #499: poison the txn — the rejected write is NOT part of the
+                    // transaction, so TXN.COMMIT must refuse rather than commit the
+                    // accepted subset behind a `+OK`.
+                    conn.mark_cross_txn_rejected(cmd);
                     responses.push(Frame::Error(bytes::Bytes::from_static(
                         crate::command::transaction::ERR_TXN_CROSS_SHARD,
                     )));

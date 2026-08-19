@@ -59,6 +59,42 @@ pub(super) async fn try_handle_txn_commit(
     match txn_commit_validate(conn.in_cross_txn()) {
         Ok(()) => {
             if let Some(txn) = conn.active_cross_txn.take() {
+                // #499: a transaction whose body had ops REJECTED by a TXN guard
+                // may not commit. The accepted subset is real (already applied to
+                // the shard-local store) but the rejected ops are not, so a `+OK`
+                // here reports an atomic transaction that was in fact applied in
+                // part. Redis's MULTI has the same shape and answers EXECABORT;
+                // do the same here, and roll the accepted subset back through the
+                // TXN.ABORT path so the outcome is "nothing was applied".
+                //
+                // Checked BEFORE the killed-snapshot arm: rollback is the strictly
+                // stronger action and `txn_manager.abort()` retires a killed
+                // transaction just as `abort_killed` would.
+                if txn.is_dirty() {
+                    let rejected = txn.rejected_ops;
+                    tracing::warn!(
+                        txn_id = txn.txn_id,
+                        rejected,
+                        "TXN.COMMIT rejected: transaction contained rejected ops -- rolling back"
+                    );
+                    let err = crate::command::transaction::err_txn_commit_dirty(
+                        rejected,
+                        txn.first_rejected_cmd.as_deref(),
+                    );
+                    Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
+                        &ctx.shard_databases,
+                        ctx.shard_id,
+                        conn.selected_db,
+                        ctx.num_shards,
+                        &ctx.dispatch_tx,
+                        &ctx.spsc_notifiers,
+                        *txn,
+                    ))
+                    .await;
+                    responses.push(err);
+                    return true;
+                }
+
                 // MA2: reject commit if the snapshot was killed (by operator KILL SNAPSHOT
                 // or by the automatic old_snapshot_threshold sweep). A killed snapshot may
                 // have been excluded from oldest_snapshot, allowing prune_committed to
