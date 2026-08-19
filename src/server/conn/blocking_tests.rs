@@ -243,6 +243,10 @@ fn immediate_blmove_with_absent_source_ignores_the_destination_type() {
 }
 
 /// Pick a key that provably hashes to a shard other than `mine`.
+// expect: test helper — with shards >= 2, one of 1000 distinct keys is
+// guaranteed to hash off `mine`; a miss means the hash is degenerate and the
+// test SHOULD fail loudly.
+#[allow(clippy::expect_used)]
 fn key_owned_elsewhere(mine: usize, shards: usize) -> String {
     (0..1000)
         .map(|i| format!("k{i}"))
@@ -251,6 +255,9 @@ fn key_owned_elsewhere(mine: usize, shards: usize) -> String {
 }
 
 /// Pick a key that provably hashes to `mine`.
+// expect: test helper — one of 1000 distinct keys is guaranteed to hash onto
+// `mine`; a miss means the hash is degenerate and the test SHOULD fail loudly.
+#[allow(clippy::expect_used)]
 fn key_owned_here(mine: usize, shards: usize) -> String {
     (0..1000)
         .map(|i| format!("k{i}"))
