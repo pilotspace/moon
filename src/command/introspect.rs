@@ -333,6 +333,36 @@ mod tests {
         );
     }
 
+    /// The three probes from moon#469, pinned as ONE test so the surfaces
+    /// cannot drift apart again. The defect was reply TYPE, not value: the old
+    /// `connection::command` stub answered `*0` to `COMMAND COUNT` (where an
+    /// Integer belongs) and `*0` to `COMMAND INFO`/`DOCS` of a command that
+    /// dispatch handles perfectly well — a driver sizing a capability probe
+    /// reads that as "zero commands", not "unimplemented".
+    ///
+    /// `WATCH` is the name the issue measured, chosen because `ACL CAT
+    /// transaction` already listed it, so the two introspection surfaces
+    /// disagreed with each other as well as with dispatch.
+    #[test]
+    fn issue_469_probes_are_typed_and_non_empty() {
+        assert!(
+            matches!(command(&[bulk("COUNT")]), Frame::Integer(n) if n > 0),
+            "COMMAND COUNT must be a non-zero Integer, not an array"
+        );
+        let Frame::Array(info) = command(&[bulk("INFO"), bulk("WATCH")]) else {
+            panic!("COMMAND INFO must be an array");
+        };
+        assert_eq!(info.len(), 1, "one spec per requested name");
+        assert!(
+            !matches!(info[0], Frame::Null),
+            "WATCH is dispatchable and ACL-categorised, so its spec must exist"
+        );
+        let Frame::Array(docs) = command(&[bulk("DOCS"), bulk("WATCH")]) else {
+            panic!("COMMAND DOCS must be an array");
+        };
+        assert_eq!(docs.len(), 2, "DOCS is a flat name/doc pair per command");
+    }
+
     #[test]
     fn count_rejects_extra_arguments() {
         let r = command(&[bulk("COUNT"), bulk("extra")]);

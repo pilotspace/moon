@@ -214,6 +214,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented tradeoff. Console Integration was already path-gated and Integration Tests
   label-gated; both unchanged.
 
+### Removed
+- **The dead `connection::command` stub** (#469). `COMMAND COUNT` replying an empty array (and
+  bare `COMMAND` replying `Integer(0)` — each returning the other's RESP type) was fixed in #471,
+  which routed both dispatch sites to `introspect::command`; verified on the wire, `COMMAND COUNT`
+  now answers `:262` and `COMMAND INFO`/`DOCS WATCH` answer real specs. The superseded stub was
+  left behind unreferenced, together with three unit tests that still asserted its wrong replies —
+  a green test pinned to code nothing could reach. Both are deleted, and the issue's three probes
+  are pinned as one test beside the live handler.
+
 ### Fixed
 - **`XREADGROUP` in history mode answers the stream, not a null** (#526). `XREADGROUP ... STREAMS
   s 0` asks for the consumer's PENDING entries; Redis serves the stream before it knows whether
