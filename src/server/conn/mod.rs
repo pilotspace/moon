@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod blocking;
+pub mod blocking_txn;
 pub mod core;
 #[cfg(feature = "runtime-monoio")]
 pub mod handler_monoio;
@@ -21,11 +22,11 @@ pub mod watch;
 pub(crate) use self::core::{ConnectionContext, ConnectionState};
 #[allow(unused_imports)]
 pub(crate) use affinity::{AffinityTracker, MigratedConnectionState};
-pub(crate) use blocking::convert_blocking_to_nonblocking;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) use blocking::handle_blocking_command;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) use blocking::handle_blocking_command_monoio;
+pub(crate) use blocking::queued_blocking_frame;
 #[cfg(feature = "runtime-monoio")]
 #[allow(unused_imports)]
 pub(crate) use blocking::try_inline_dispatch;

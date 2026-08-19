@@ -323,3 +323,70 @@ fn multi_exec_write_survives_restart() {
         "MULTI/EXEC INCRBY lost on restart — transactional writes were not persisted"
     );
 }
+
+/// moon#524 — a blocking pop committed by EXEC must be durable too, and the
+/// record that carries it must be REPLAYABLE.
+///
+/// The command queued inside MULTI is now the blocking command itself, so the
+/// executor synthesises the AOF/replication record instead of serialising the
+/// queued frame. Two ways that can go wrong, both caught here:
+///
+///   * no record at all — the pop is undone by recovery and the element comes
+///     back from the dead (an at-least-once queue silently redelivering);
+///   * the literal `BLPOP` as the record — recovery replays a blocking command
+///     against a now-empty list and stalls, or errors out mid-stream.
+///
+/// The list must therefore come back with exactly the tail element, and the
+/// server must come back at all.
+#[test]
+fn multi_exec_blocking_pop_survives_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let Some(m1) = spawn_moon_persistent_first(dir.path()) else {
+        return;
+    };
+    let port = m1.port;
+
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["RPUSH", "bq", "first"]), Reply::Int(1));
+        assert_eq!(c.cmd(&["RPUSH", "bq", "second"]), Reply::Int(2));
+        assert_eq!(c.cmd(&["MULTI"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["BLPOP", "bq", "0"]), Reply::Simple("QUEUED".into()));
+        match c.cmd(&["EXEC"]) {
+            Reply::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0],
+                    Reply::Array(vec![
+                        Reply::Bulk(Some("bq".into())),
+                        Reply::Bulk(Some("first".into())),
+                    ]),
+                    "BLPOP inside MULTI answers [key, value]"
+                );
+            }
+            other => panic!("EXEC must return the results array, got: {other:?}"),
+        }
+    }
+
+    m1.kill9();
+
+    let Some(m2) = spawn_moon_persistent_restart(port, dir.path()) else {
+        panic!(
+            "moon failed to restart from {:?} — a blocking command written \
+             literally into the AOF stalls or breaks recovery",
+            dir.path()
+        );
+    };
+
+    let mut r = Client::connect(port);
+    let remaining = r.cmd(&["LRANGE", "bq", "0", "-1"]);
+    m2.kill9();
+
+    assert_eq!(
+        remaining,
+        Reply::Array(vec![Reply::Bulk(Some("second".into()))]),
+        "the EXEC'd BLPOP must be durable: recovery must show the element \
+         popped exactly once, not resurrected and not doubled"
+    );
+}

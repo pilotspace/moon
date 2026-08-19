@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Blocking pops queued inside `MULTI` answer the wrong reply SHAPE** (#524). `BLPOP`/`BRPOP`/
+  `BZPOPMIN`/`BZPOPMAX` were rewritten at queue time into `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX`, whose
+  replies drop the key: `MULTI; BLPOP q 0; EXEC` answered `["v1"]` where Redis 8.6.1 answers
+  `[["q","v1"]]`, and a miss came back as a null bulk (`$-1`) instead of a null array (`*-1` /
+  `_` on RESP3). The key is not decoration — `BLPOP` takes many keys precisely so the caller can
+  tell which one served, and a client unpacking the documented 2-element reply either errors or
+  silently reads the value as the key. The rewrite was also wrong beyond the shape: `BLPOP q1 q2 0`
+  became `LPOP q1 q2`, where `q2` is LPOP's optional COUNT — Moon popped up to two elements from
+  `q1` and never looked at `q2`. Those four commands are now queued **unrewritten** and executed at
+  EXEC in immediate-only mode (Redis's `CLIENT_DENY_BLOCKING` path) through the same helper the
+  live blocking fast path uses, so the in-MULTI reply is shape-identical to the standalone one by
+  construction. Both transaction executors and both runtimes. The AOF/replication record is the
+  synthesised single-key sibling scoped to the key that actually served — never the blocking
+  command itself, which a replica would block its apply loop on. `BLMOVE`/`BLMPOP`/`BZMPOP`/
+  `BRPOPLPUSH` keep the rewrite: their siblings are shape- and arity-correct. Three side effects
+  fall out: a queued blocking pop now appears in the `MONITOR` feed as the command the client
+  actually sent; a miss no longer conjures the key it failed to find (the pop helpers are
+  `get_or_create`, so an absent key was inserted as an empty collection and left behind, making
+  `EXISTS` answer 1); and a multi-key blocking pop whose keys straddle shards is now refused
+  `CROSSSLOT` like every other cross-shard `MULTI` body, because the queued frame finally declares
+  the full key set — a loud refusal replacing a silent mis-execution against the first key alone.
+- **RESP3: the inline `GET` fast path replied `$-1` for a miss** (#522), the RESP2 null bulk, where
+  Redis replies `_`. The path frames its own reply bytes and so never reached the
+  protocol-version-aware serializer. At `--shards >= 2` this made the null spelling depend on the
+  KEY: keys owned by the connection's own shard took the inline path and got `$-1`, keys that
+  routed elsewhere came back through the serializer and got `_` — on the same connection, so a
+  client could not even cache "this server speaks RESP3". The inline path now takes the negotiated
+  protocol version and selects between two static byte strings (`io::static_responses::null_bulk`,
+  which also gives the previously caller-less `NULL_BULK` constant a home). `+OK` and `-WRONGTYPE`,
+  the only other bytes this path frames, are spelled identically in both protocols.
+
 ### Changed
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
   Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered

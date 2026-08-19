@@ -172,13 +172,10 @@ fn rna2_resp3_collapses_both_nulls_to_underscore() {
 }
 
 #[test]
-#[ignore = "moon#522 — inline GET writes a hardcoded \\$-1, bypassing the \
-            protocol-version-aware serializer; un-ignore when #522 lands"]
 fn rna2b_resp3_get_miss_is_underscore() {
     // Written as the CONTRAST half of rna2 — "the null bulk collapses too" —
-    // and it failed, which is how #522 was found. Kept here rather than
-    // deleted: the assertion is already correct, only the capability is
-    // missing, so un-ignoring this test IS #522's acceptance criterion.
+    // and it failed, which is how #522 was found. Un-ignored by #522; this is
+    // that issue's acceptance criterion.
     //
     // 4 shards on purpose. The defect is per-KEY: a key the connection's own
     // shard owns takes the inline path and gets `$-1`, while a key that routes
@@ -201,6 +198,32 @@ fn rna2b_resp3_get_miss_is_underscore() {
         "moon#522 — RESP3 GET on a missing key must reply `_`; {} of 8 keys \
          replied the RESP2 null bulk instead (the split is by shard \
          ownership, not by server):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn rna2c_resp2_get_miss_stays_null_bulk_on_every_shard() {
+    // The other direction of #522, and the reason the fix is a protocol-version
+    // parameter rather than a changed constant: a connection that never said
+    // HELLO 3 must still get `$-1` for every key, local or remote. Same 4-shard
+    // split as rna2b so a fix that hardcodes `_` fails here.
+    let m = spawn_moon("4");
+    let mut c = Conn::open(m.port);
+
+    let mut wrong = Vec::new();
+    for i in 0..8 {
+        let key = format!("r2get{i}");
+        let got = c.send(&["GET", &key]);
+        if got != NULL_BULK {
+            wrong.push(format!("  {key}: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "moon#522 — a RESP2 connection's GET miss must stay `$-1`; {} of 8 \
+         keys diverged:\n{}",
         wrong.len(),
         wrong.join("\n")
     );

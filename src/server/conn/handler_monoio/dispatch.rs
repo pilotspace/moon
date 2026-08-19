@@ -1704,9 +1704,11 @@ pub(super) async fn try_handle_blocking<
         return BlockingResult::NotBlocking;
     }
 
-    // Inside MULTI: queue as non-blocking variant
+    // Inside MULTI: queue the form EXEC can run without blocking — the
+    // non-blocking twin, or the command itself for the four whose twin answers
+    // a different shape (moon#524).
     if conn.in_multi {
-        let nb_frame = super::convert_blocking_to_nonblocking(cmd, cmd_args);
+        let nb_frame = super::queued_blocking_frame(cmd, cmd_args);
         conn.command_queue.push(nb_frame);
         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
         return BlockingResult::Queued;

@@ -54,6 +54,7 @@ fn test_inline_get_hit() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 1);
@@ -94,6 +95,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             1,
             true,  // can_inline_reads
             false, // can_inline_writes
+            false, // resp3: a RESP2 connection (moon#522)
             &rt_config,
         );
 
@@ -140,11 +142,101 @@ fn test_inline_get_miss() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$-1\r\n");
+}
+
+/// moon#522 — the inline GET miss must be spelled in the connection's OWN
+/// protocol. This path frames reply bytes itself and so never reaches the
+/// protocol-aware serializer; before the fix it wrote `$-1` unconditionally,
+/// which made the null type depend on which shard owned the key rather than on
+/// what the client negotiated.
+///
+/// Byte-level on purpose: `$-1` and `_` are the same "missing value" to a
+/// dynamically-typed client and a decode error to a statically-typed one, so
+/// the only assertion that can see the defect is on the wire bytes.
+#[test]
+fn test_inline_get_miss_null_spelling_follows_protocol() {
+    for (resp3, want) in [(false, &b"$-1\r\n"[..]), (true, &b"_\r\n"[..])] {
+        let dbs = make_dbs();
+        let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+        let mut write_buf = BytesMut::new();
+        let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+        let rt_config = make_rt_config();
+
+        let result = try_inline_dispatch(
+            &mut read_buf,
+            &mut write_buf,
+            &dbs,
+            0,
+            0,
+            &aof_pool,
+            &None,
+            0,
+            1,
+            true,  // can_inline_reads
+            false, // can_inline_writes
+            resp3,
+            &rt_config,
+        );
+
+        assert_eq!(result, 1, "resp3={resp3}: the miss must still inline");
+        assert!(read_buf.is_empty(), "resp3={resp3}: buffer not consumed");
+        assert_eq!(
+            &write_buf[..],
+            want,
+            "resp3={resp3}: inline GET miss must answer {:?}, not {:?}",
+            String::from_utf8_lossy(want),
+            String::from_utf8_lossy(&write_buf[..])
+        );
+    }
+}
+
+/// The HIT and the WRONGTYPE reply are byte-identical in both protocols — a
+/// bulk string is `$n` and a simple error is `-...` in RESP2 and RESP3 alike.
+/// Pinned so that threading a protocol flag into this path cannot tempt a
+/// later change to "convert" replies that must not move.
+#[test]
+fn test_inline_get_hit_is_protocol_independent() {
+    for resp3 in [false, true] {
+        let dbs = make_dbs();
+        crate::shard::slice::with_shard_db(0, |db| {
+            db.set(
+                Bytes::from_static(b"foo"),
+                Entry::new_string(Bytes::from_static(b"bar")),
+            );
+        });
+        let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+        let mut write_buf = BytesMut::new();
+        let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+        let rt_config = make_rt_config();
+
+        let result = try_inline_dispatch(
+            &mut read_buf,
+            &mut write_buf,
+            &dbs,
+            0,
+            0,
+            &aof_pool,
+            &None,
+            0,
+            1,
+            true,  // can_inline_reads
+            false, // can_inline_writes
+            resp3,
+            &rt_config,
+        );
+        assert_eq!(result, 1);
+        assert_eq!(
+            &write_buf[..],
+            b"$3\r\nbar\r\n",
+            "resp3={resp3}: a bulk string is spelled the same in both protocols"
+        );
+    }
 }
 
 #[test]
@@ -170,6 +262,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 0, "SET should fall through inline dispatch");
@@ -197,8 +290,9 @@ fn test_inline_set_executes_when_writes_enabled() {
         &None,
         0,
         1,
-        true, // can_inline_reads
-        true, // can_inline_writes
+        true,  // can_inline_reads
+        true,  // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 1, "SET should be inlined");
@@ -239,8 +333,9 @@ fn test_inline_set_with_options_falls_through() {
         &None,
         0,
         1,
-        true, // can_inline_reads
-        true, // can_inline_writes
+        true,  // can_inline_reads
+        true,  // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 0, "SET with options should fall through");
@@ -269,6 +364,7 @@ fn test_inline_fallthrough() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 0);
@@ -307,6 +403,7 @@ fn test_inline_mixed_batch() {
         true,  // can_inline_reads: unrestricted, non-tracking connection
         false, // can_inline_writes
         false, // cluster_enabled
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(total, 1);
@@ -348,6 +445,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         false, // can_inline_reads: restricted ACL or CLIENT TRACKING conn
         false, // can_inline_writes
         false, // cluster_enabled
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(total, 0, "GET must not be inlined when reads are gated off");
@@ -388,6 +486,7 @@ fn test_inline_case_insensitive() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 1);
@@ -417,6 +516,7 @@ fn test_inline_partial() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 0);
@@ -451,6 +551,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(
@@ -494,6 +595,7 @@ fn test_inline_multiple_gets() {
         true,  // can_inline_reads: unrestricted, non-tracking connection
         false, // can_inline_writes
         false, // cluster_enabled
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(total, 2);
@@ -528,9 +630,10 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         &None,
         0,
         1,
-        true, // even with reads inlinable...
-        true, // ...and writes inlinable...
-        true, // ...cluster mode wins: nothing may inline
+        true,  // even with reads inlinable...
+        true,  // ...and writes inlinable...
+        true,  // ...cluster mode wins: nothing may inline
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(
@@ -611,6 +714,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     let elapsed = start.elapsed();
@@ -663,6 +767,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         1,
         true,  // can_inline_reads
         false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
     );
     assert_eq!(result, 1);

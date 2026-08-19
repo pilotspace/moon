@@ -12,8 +12,30 @@ pub const OK: &[u8] = b"+OK\r\n";
 /// +PONG\r\n
 pub const PONG: &[u8] = b"+PONG\r\n";
 
-/// $-1\r\n (null bulk string)
+/// `$-1\r\n` — the RESP2 null bulk string.
+///
+/// Pair with [`NULL_RESP3`] via [`null_bulk`] rather than writing either one
+/// directly: RESP3 spells every null `_`, and a path that hardcodes this
+/// constant answers a RESP3 client in RESP2 (moon#522).
 pub const NULL_BULK: &[u8] = b"$-1\r\n";
+
+/// `_\r\n` — RESP3's single null, the protocol-3 spelling of both
+/// [`NULL_BULK`] and [`NULL_ARRAY`].
+pub const NULL_RESP3: &[u8] = b"_\r\n";
+
+/// The null-bulk reply bytes for a connection's negotiated protocol.
+///
+/// The whole of moon#522: the inline GET fast path frames its own reply bytes
+/// and so never reaches the protocol-aware serializer. At `--shards >= 2` that
+/// made the null spelling depend on which shard owned the KEY — locally-owned
+/// keys were answered inline with `$-1` while remote keys came back through
+/// the serializer as `_`, on the same RESP3 connection.
+///
+/// Zero-cost: two static slices selected by a bool, no allocation.
+#[inline]
+pub const fn null_bulk(resp3: bool) -> &'static [u8] {
+    if resp3 { NULL_RESP3 } else { NULL_BULK }
+}
 
 /// *-1\r\n (null array)
 pub const NULL_ARRAY: &[u8] = b"*-1\r\n";
@@ -92,6 +114,17 @@ mod tests {
     #[test]
     fn test_null_bulk_bytes() {
         assert_eq!(NULL_BULK, b"$-1\r\n");
+    }
+
+    /// moon#522 — the selector must actually SELECT. A constant-returning
+    /// implementation would leave the inline GET path exactly as broken as it
+    /// was while looking like it had been fixed.
+    #[test]
+    fn test_null_bulk_follows_protocol() {
+        assert_eq!(NULL_RESP3, b"_\r\n");
+        assert_eq!(null_bulk(false), b"$-1\r\n");
+        assert_eq!(null_bulk(true), b"_\r\n");
+        assert_ne!(null_bulk(false), null_bulk(true));
     }
 
     #[test]
