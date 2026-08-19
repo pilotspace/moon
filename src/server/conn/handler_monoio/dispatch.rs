@@ -1309,7 +1309,7 @@ pub(super) async fn try_handle_shutdown(
 pub(super) async fn try_handle_swapdb(
     cmd: &[u8],
     cmd_args: &[Frame],
-    conn: &crate::server::conn::core::ConnectionState,
+    conn: &mut crate::server::conn::core::ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
@@ -1326,6 +1326,8 @@ pub(super) async fn try_handle_swapdb(
     // TXN guard: SWAPDB rewrites entire DB contents and has no undo path —
     // reject during an active cross-store TXN so TXN.ABORT remains coherent.
     if conn.in_cross_txn() {
+        // #499: poison the txn so COMMIT cannot report OK.
+        conn.mark_cross_txn_rejected(cmd);
         responses.push(Frame::Error(Bytes::from_static(
             crate::command::transaction::ERR_TXN_CROSS_SHARD,
         )));

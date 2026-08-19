@@ -36,6 +36,41 @@ pub const ERR_MULTI_TXN_CONFLICT: &[u8] = b"ERR cannot use MULTI while in TXN bl
 pub const ERR_TXN_CROSS_SHARD: &[u8] = b"ERR TXN does not support cross-shard writes \
       -- use hash tags {tag} to co-locate keys (e.g. SET {txn}:key value)";
 
+/// #499: the error `TXN.COMMIT` answers when the body contained rejected ops.
+///
+/// Every guard rejection inside a TXN body (cross-shard write, `MOVE`,
+/// `COPY ... DB`, `SWAPDB`, cross-shard Cypher write) poisons the
+/// transaction. Committing the accepted subset would turn a routing mistake
+/// into silent partial application — the caller inspects the COMMIT reply,
+/// not the replies of the individual body commands, exactly as a driver
+/// inspects `EXEC` and not the `QUEUED`s.
+///
+/// Semantics match Redis's `CLIENT_DIRTY_EXEC`: the whole transaction is
+/// rolled back and discarded, and the reply carries the `EXECABORT` code so
+/// drivers classify it as a transaction abort rather than a generic command
+/// error.
+///
+/// Wording note: the message says "rolled back and NOT committed", not
+/// "nothing was applied". Rollback runs the `TXN.ABORT` path, which is
+/// best-effort by construction — `MSET` and multi-key `DEL` bypass undo
+/// capture today (#500), so an absolute claim would be a promise this code
+/// cannot keep. What IS guaranteed: the commit did not happen, and the
+/// transaction is discarded.
+pub fn err_txn_commit_dirty(rejected: u32, first_cmd: Option<&[u8]>) -> Frame {
+    let mut msg = bytes::BytesMut::new();
+    use std::fmt::Write as _;
+    let _ = write!(
+        msg,
+        "EXECABORT TXN.COMMIT discarded because of previous errors: \
+         {rejected} operation(s) rejected inside the transaction"
+    );
+    if let Some(cmd) = first_cmd {
+        let _ = write!(msg, " (first: {})", String::from_utf8_lossy(cmd));
+    }
+    let _ = write!(msg, " -- rolled back and NOT committed");
+    Frame::Error(msg.freeze())
+}
+
 /// TXN.BEGIN - Start a new cross-store transaction.
 ///
 /// Returns: +OK on success, or error if already in transaction.
@@ -224,6 +259,33 @@ mod tests {
     fn test_is_txn_abort() {
         let args = vec![Frame::BulkString(Bytes::from_static(b"ABORT"))];
         assert!(is_txn_abort(b"TXN", &args));
+    }
+
+    /// #499: the commit-time abort error must carry the `EXECABORT` code, the
+    /// rejected-op count, the first offending command, and say plainly that
+    /// nothing was applied.
+    #[test]
+    fn test_err_txn_commit_dirty_shape() {
+        let Frame::Error(msg) = err_txn_commit_dirty(3, Some(b"SET")) else {
+            panic!("err_txn_commit_dirty must return Frame::Error");
+        };
+        let msg = String::from_utf8_lossy(&msg).into_owned();
+        assert!(msg.starts_with("EXECABORT "), "{msg}");
+        assert!(msg.contains("3 operation(s) rejected"), "{msg}");
+        assert!(msg.contains("(first: SET)"), "{msg}");
+        assert!(msg.contains("rolled back and NOT committed"), "{msg}");
+        assert!(!msg.contains('\r') && !msg.contains('\n'), "{msg}");
+    }
+
+    /// A missing command name must not produce a dangling `(first: )`.
+    #[test]
+    fn test_err_txn_commit_dirty_without_cmd_name() {
+        let Frame::Error(msg) = err_txn_commit_dirty(1, None) else {
+            panic!("err_txn_commit_dirty must return Frame::Error");
+        };
+        let msg = String::from_utf8_lossy(&msg).into_owned();
+        assert!(msg.contains("1 operation(s) rejected"), "{msg}");
+        assert!(!msg.contains("first:"), "{msg}");
     }
 
     #[test]

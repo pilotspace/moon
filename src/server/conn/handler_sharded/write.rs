@@ -886,6 +886,8 @@ pub(super) async fn try_handle_graph_command(
                     && cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
                     && crate::command::graph::is_cypher_write_query(cmd_args)
                 {
+                    // #499: poison the txn so COMMIT cannot report OK.
+                    conn.mark_cross_txn_rejected(cmd);
                     responses.push(Frame::Error(bytes::Bytes::from_static(
                         crate::command::transaction::ERR_TXN_CROSS_SHARD,
                     )));

@@ -516,6 +516,21 @@ impl ConnectionState {
         self.active_cross_txn.is_some()
     }
 
+    /// #499: mark the active cross-store transaction dirty because a TXN guard
+    /// rejected `cmd`.
+    ///
+    /// MUST be called at EVERY site that answers `ERR_TXN_CROSS_SHARD` (or any
+    /// future in-TXN rejection). Without it `TXN.COMMIT` would apply the
+    /// accepted subset and still reply `+OK`, converting a routing mistake into
+    /// silent partial application. No-op when no transaction is active, so
+    /// callers need not re-check `in_cross_txn()`.
+    #[inline]
+    pub fn mark_cross_txn_rejected(&mut self, cmd: &[u8]) {
+        if let Some(txn) = self.active_cross_txn.as_mut() {
+            txn.record_rejected_op(cmd);
+        }
+    }
+
     /// D4 (#438): whether this connection may migrate to another shard
     /// RIGHT NOW. `MigratedConnectionState` carries none of the state
     /// checked here (queued MULTI txn, cross-store txn, subscriptions,
