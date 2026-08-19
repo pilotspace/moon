@@ -169,6 +169,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label-gated; both unchanged.
 
 ### Fixed
+- **Blocking pops no longer create the key they miss on** (#523, #539). `BLPOP`, `BRPOP`,
+  `BLMOVE` (source), `BRPOPLPUSH` (source), `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` reached their
+  value through `get_or_create_list` / `get_or_create_sorted_set`, so every miss materialised an
+  empty list/zset before discovering there was nothing to pop — a phantom key that `EXISTS`,
+  `TYPE`, `DBSIZE`, `KEYS` and `SCAN` all reported, that the ordinary "block on a key another
+  client is about to create" idiom then hit with `WRONGTYPE` on the producer's `RPUSH`, and that
+  nothing ever removed (a worker polling rotating ids leaked one empty collection per timed-out
+  poll). An empty list/zset is not a representable Redis value, so those phantoms were also
+  leaking into RDB, AOF rewrite and replication. The four pop helpers now take a new non-creating
+  accessor (`Database::get_mut_if_present::<K>`) — `get_or_create` minus the fabrication step, so
+  expiry drop, cold-tier promotion, compact-encoding upgrade, `WRONGTYPE` classification and the
+  become-empty ⇒ remove-the-key behaviour are all unchanged, but a missing key leaves the
+  keyspace and `used_memory` byte-identical. `BLMPOP` was already correct (it length-checks
+  through the read-only `get_list`) and is untouched. At `--shards >= 2` the phantom appeared only
+  for client-local keys (~1/N of them), which is why it read as a flake.
 - **`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` now accept the Redis 7.0 `NX | XX | GT | LT`
   conditions** (#544) — previously any option token was rejected with a wrong-arity error, which
   breaks typed clients that call them directly (redis-py `expire(k, t, nx=True)`). Semantics match
