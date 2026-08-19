@@ -455,7 +455,7 @@ impl AclTable {
         let Some(user) = self.users.get(username) else {
             return Some(format!("user {} no longer exists", username));
         };
-        // Hot path: unrestricted user skips extract_command_keys + the
+        // Hot path: unrestricted user skips key extraction (keyspec) + the
         // O(patterns*keys) glob match loop. Profile showed ~1.2% of CPU
         // here, most of it in glob_match and Vec allocation for the
         // extracted keys.
@@ -475,7 +475,28 @@ impl AclTable {
         {
             return None;
         }
-        let keys = extract_command_keys(cmd, args);
+        // moon#566: key extraction is derived from the command registry's key
+        // specs and fails CLOSED. The old hand-maintained match returned an
+        // empty vec for anything it did not name — and an empty key list does
+        // not mean "check less precisely", it means the loop below never runs,
+        // so every `~pattern` was silently ignored for that command.
+        let keys = match super::keyspec::command_keys(cmd, args) {
+            // The command provably names no key (PING, CONFIG, SUBSCRIBE...):
+            // there is nothing for key patterns to gate.
+            super::keyspec::CommandKeys::None => return None,
+            super::keyspec::CommandKeys::Keys(keys) => keys,
+            // Known (or suspected) to touch keys, but this argv could not be
+            // enumerated: deny, and say so once per command name so a missing
+            // key spec is visible in the log rather than silently permissive.
+            super::keyspec::CommandKeys::Indeterminate => {
+                super::keyspec::warn_indeterminate(cmd);
+                return Some(format!(
+                    "User {} has no permissions to access one of the keys used as arguments to '{}'",
+                    username,
+                    String::from_utf8_lossy(cmd).to_ascii_lowercase()
+                ));
+            }
+        };
         for key in keys {
             let key_str = std::str::from_utf8(key).unwrap_or("");
             let allowed = user.key_patterns.iter().any(|kp| {
@@ -529,88 +550,6 @@ impl AclTable {
     pub fn user_to_rule_string(&self, username: &str) -> Option<String> {
         let user = self.users.get(username)?;
         Some(super::io::user_to_acl_line(user))
-    }
-}
-
-/// Extract the key argument positions for known multi-key commands.
-fn extract_command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Vec<&'a [u8]> {
-    let cmd_lower = cmd.to_ascii_lowercase();
-    match cmd_lower.as_slice() {
-        // Single key commands: key is args[0]
-        b"get" | b"set" | b"incr" | b"decr" | b"incrby" | b"decrby" | b"incrbyfloat"
-        | b"append" | b"strlen" | b"setnx" | b"setex" | b"psetex" | b"getset" | b"getdel"
-        | b"getex" | b"hget" | b"hset" | b"hdel" | b"hmget" | b"hmset" | b"hgetall" | b"hkeys"
-        | b"hvals" | b"hlen" | b"hexists" | b"hincrby" | b"hincrbyfloat" | b"hscan" | b"lpush"
-        | b"rpush" | b"lpop" | b"rpop" | b"lrange" | b"llen" | b"linsert" | b"lindex" | b"lset"
-        | b"ltrim" | b"lpos" | b"sadd" | b"srem" | b"smembers" | b"sismember" | b"smismember"
-        | b"scard" | b"srandmember" | b"spop" | b"sscan" | b"smove" | b"zadd" | b"zrem"
-        | b"zscore" | b"zrange" | b"zrangebyscore" | b"zrangebylex" | b"zrevrange"
-        | b"zrevrangebyscore" | b"zrevrangebylex" | b"zrank" | b"zrevrank" | b"zcard"
-        | b"zincrby" | b"zcount" | b"zlexcount" | b"zpopmin" | b"zpopmax" | b"bzpopmin"
-        | b"bzpopmax" | b"zscan" | b"zmscore" | b"xadd" | b"xread" | b"xlen" | b"xrange"
-        | b"xrevrange" | b"xtrim" | b"xdel" | b"xinfo" | b"xpending" | b"expire" | b"pexpire"
-        | b"ttl" | b"pttl" | b"persist" | b"type" | b"unlink" | b"object" => {
-            if let Some(frame) = args.first() {
-                extract_key_bytes(frame)
-                    .map(|k| vec![k])
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        }
-        // DEL, EXISTS: all args are keys
-        b"del" | b"exists" => args.iter().filter_map(extract_key_bytes).collect(),
-        // MGET: all args are keys
-        b"mget" => args.iter().filter_map(extract_key_bytes).collect(),
-        // MSET: even-indexed args (0,2,4...) are keys
-        b"mset" | b"msetnx" => args
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 0)
-            .filter_map(|(_, f)| extract_key_bytes(f))
-            .collect(),
-        // RENAME, RENAMENX: first two args
-        b"rename" | b"renamenx" => args.iter().take(2).filter_map(extract_key_bytes).collect(),
-        // BLPOP, BRPOP: all args except last (timeout)
-        b"blpop" | b"brpop" => {
-            if args.len() > 1 {
-                args[..args.len() - 1]
-                    .iter()
-                    .filter_map(extract_key_bytes)
-                    .collect()
-            } else {
-                vec![]
-            }
-        }
-        // LMOVE, BLMOVE, RPOPLPUSH, BRPOPLPUSH: first two args are keys.
-        //
-        // A command MISSING from this table is not merely checked less
-        // precisely — the fallthrough is `vec![]`, and an empty key list makes
-        // the permission loop in `check_key_permission` a no-op, so EVERY key
-        // pattern is ignored for it. `rpoplpush`/`brpoplpush` were absent while
-        // their `lmove`/`blmove` equivalents were present, so a `~cache:*` user
-        // could move an element out of any key in the keyspace into any other
-        // (moon#520).
-        b"lmove" | b"blmove" | b"rpoplpush" | b"brpoplpush" => {
-            args.iter().take(2).filter_map(extract_key_bytes).collect()
-        }
-        // SINTER, SUNION, SDIFF: all args are keys
-        b"sinter" | b"sunion" | b"sdiff" => args.iter().filter_map(extract_key_bytes).collect(),
-        // SINTERSTORE, SUNIONSTORE, SDIFFSTORE: all args (dest + sources)
-        b"sinterstore" | b"sunionstore" | b"sdiffstore" => {
-            args.iter().filter_map(extract_key_bytes).collect()
-        }
-        // ZUNIONSTORE, ZINTERSTORE: all key args
-        b"zunionstore" | b"zinterstore" => args.iter().filter_map(extract_key_bytes).collect(),
-        // No key extraction for admin/connection commands
-        _ => vec![],
-    }
-}
-
-fn extract_key_bytes(frame: &Frame) -> Option<&[u8]> {
-    match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.as_ref()),
-        _ => None,
     }
 }
 
@@ -935,15 +874,17 @@ mod tests {
         );
     }
 
-    /// `extract_command_keys` falls through to `vec![]` for any command it
-    /// does not name, and an empty key list makes the permission loop a no-op —
-    /// so a MISSING entry is not "less precise", it is a BYPASS: every key
-    /// pattern is ignored for that command.
+    /// moon#520 regression guard, carried across the #566 rewrite. The old
+    /// hand-maintained `extract_command_keys` table fell through to `vec![]` for
+    /// any command it did not name, and an empty key list makes the permission
+    /// loop a no-op — so a MISSING entry was not "less precise", it was a BYPASS.
+    /// `RPOPLPUSH`/`BRPOPLPUSH` were absent (`LMOVE`/`BLMOVE`, the exact same
+    /// two-key layout, were present), so a `~cache:*` user could move an element
+    /// out of any key in the keyspace and into any other.
     ///
-    /// `RPOPLPUSH`/`BRPOPLPUSH` were missing (`LMOVE`/`BLMOVE`, the exact same
-    /// two-key layout, were present), so a `~cache:*` user could move an
-    /// element out of any key in the keyspace and into any other (moon#520).
-    /// Both directions are checked because both are writes.
+    /// Key extraction is now registry-derived and fails closed (`keyspec.rs`),
+    /// so every two-key move is covered by construction; this test pins that the
+    /// derived keys still gate both the SOURCE and DESTINATION (both are writes).
     #[test]
     fn test_check_key_permission_two_key_list_moves() {
         let mut table = AclTable::load_or_default(&make_config(None));

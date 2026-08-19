@@ -1,4 +1,5 @@
 pub mod io;
+pub(crate) mod keyspec;
 pub mod log;
 pub mod rules;
 pub mod table;
