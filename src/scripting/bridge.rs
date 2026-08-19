@@ -80,15 +80,12 @@ struct LuaEvictionInner {
     disk_offload_dir: Option<PathBuf>,
     /// Wave A part 2 (task #34): handles for dual-plane (AOF + replication)
     /// emission of a script's write effects. See
-    /// [`LuaEvictionCtx::emit_effect`]. Only read under `runtime-monoio`
-    /// (master-side PSYNC and the shard self-msg relay this rides on are
-    /// monoio-only) — kept unconditional in the struct so every call site
-    /// stays feature-uniform instead of growing a second constructor.
-    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    /// [`LuaEvictionCtx::emit_effect`]. Read on BOTH runtimes since
+    /// moon#517 — the per-plane gate moved into
+    /// `reason_del::record_bytes_conn` (AOF everywhere, replication on
+    /// monoio only).
     num_shards: usize,
-    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
     repl_state: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
-    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
     aof_pool: Option<Arc<AofWriterPool>>,
     /// Task #38: lock-free snapshot of `ReplicationState::is_replica_mirror`,
     /// cloned out once at ctx-construction time — same pattern as
@@ -254,26 +251,30 @@ impl LuaEvictionCtx {
     /// dispatch (see `make_redis_call_fn`) — there is exactly one db per
     /// script execution.
     ///
-    /// No-op for a disabled ctx (unit tests) and under `runtime-tokio`
-    /// (master-side PSYNC and the shard self-msg relay this rides on are
-    /// monoio-only — see `replication::reason_del::record_effect_write`).
+    /// No-op for a disabled ctx (unit tests) only.
+    ///
+    /// moon#517: this used to be `#[cfg(feature = "runtime-monoio")]`-gated
+    /// in full, with a `let _ = (db_index, cmd_and_args)` arm that silently
+    /// DISCARDED the effect on a `runtime-tokio` build — an `EVAL` that
+    /// wrote answered OK and left nothing for AOF replay, so the write was
+    /// gone after a restart while every ordinary write around it survived.
+    /// The gate now lives inside `record_effect_write`, per plane: AOF on
+    /// every runtime, replication on monoio only (master-side PSYNC and the
+    /// `shard::self_msg` relay it rides on do not exist under tokio — no
+    /// ordinary tokio write replicates either, so this is parity, not a
+    /// remaining script-specific gap).
     fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame]) {
-        let Some(_inner) = self.0.as_ref() else {
+        let Some(inner) = self.0.as_ref() else {
             return;
         };
-        #[cfg(feature = "runtime-monoio")]
         crate::replication::reason_del::record_effect_write(
-            &_inner.repl_state,
-            _inner.shard_id,
-            _inner.num_shards,
-            _inner.aof_pool.as_ref(),
+            &inner.repl_state,
+            inner.shard_id,
+            inner.num_shards,
+            inner.aof_pool.as_ref(),
             db_index,
             cmd_and_args,
         );
-        #[cfg(not(feature = "runtime-monoio"))]
-        {
-            let _ = (db_index, cmd_and_args);
-        }
     }
 }
 
@@ -437,6 +438,20 @@ pub fn make_redis_call_fn(
                 if let Err(oom) = eviction_ctx.gate(db, db_idx) {
                     return Ok(oom);
                 }
+                // moon#517: snapshot COW. `spsc_handler::cow_intercept` can
+                // only run where the shard event loop's
+                // `&mut Option<SnapshotState>` is in scope; a script runs on
+                // a connection task (or inside the routed `Execute` arm) and
+                // reaches the keyspace from HERE. Capturing at the
+                // `redis.call` level is also the only level that sees a real
+                // key — `EVAL <script> <numkeys> k`'s own `command[1]` is
+                // the SCRIPT BODY, so wrapping the three `handle_eval` call
+                // sites in `cow_intercept` would have stashed the script
+                // text under a bogus key and still lost every pre-image.
+                // Must run AFTER the eviction gate (which can itself mutate
+                // the db) and BEFORE `execute_command` overwrites the value.
+                // One thread-local `bool` load when no BGSAVE is in flight.
+                crate::persistence::snapshot_cow::capture_command_pre_image(db, db_idx, &frames);
             }
 
             // MONITOR: a script-issued command is fed with the literal `lua`
@@ -675,5 +690,124 @@ mod tests {
     fn is_replica_false_for_disabled_ctx() {
         let ctx = LuaEvictionCtx::disabled();
         assert!(!ctx.is_replica());
+    }
+
+    /// moon#517 gap 2 — a script write that lands while a snapshot is in
+    /// flight must leave the key's epoch-start value behind for the
+    /// snapshot, on every runtime and from all three `handle_eval` call
+    /// sites (local monoio, local tokio, routed).
+    ///
+    /// RED (before the fix): `cow_intercept` is reachable only from the
+    /// shard event loop's own stack, and all three script sites run
+    /// `handle_eval` inside a bare `with_shard(...)`. Nothing captured a
+    /// pre-image, so a `BGSAVE` racing an `EVAL` wrote the POST-write value
+    /// into a segment the WAL then replays on top of — the double-apply
+    /// this whole COW mechanism exists to prevent. GREEN: the bridge takes
+    /// the pre-image at the `redis.call` level (per inner command, where a
+    /// real key exists — `EVAL`'s own `command[1]` is the script body, so
+    /// wrapping the call sites in `cow_intercept` would have captured the
+    /// script text as a key).
+    ///
+    /// Asserted at the queue, not through a full snapshot round-trip: the
+    /// drain-and-serialize half is pinned by
+    /// `persistence::snapshot_cow::tests::
+    /// drain_folds_pending_segments_and_drops_serialized_ones`.
+    #[test]
+    fn script_write_captures_a_cow_pre_image() {
+        use crate::persistence::snapshot_cow;
+
+        let lua = crate::scripting::setup_lua_vm(LuaEvictionCtx::disabled()).unwrap();
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(crate::scripting::ScriptCache::new()));
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"cow517"), Bytes::from_static(b"old"));
+
+        snapshot_cow::arm();
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"redis.call('SET', KEYS[1], 'new')")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"cow517")),
+        ];
+        let run_script = crate::scripting::handle_eval;
+        let result = run_script(&lua, &cache, &args, &mut db, 0, 1, 0, 1);
+        let pending = snapshot_cow::pending_for_test();
+        snapshot_cow::disarm();
+
+        assert!(
+            !matches!(result, Frame::Error(_)),
+            "setup invariant: the script must succeed, got {result:?}"
+        );
+        let captured = pending
+            .iter()
+            .find(|(db_index, key, _)| *db_index == 0 && key.as_ref() == b"cow517")
+            .expect("a script write during a snapshot must capture the key's pre-image");
+        match captured.2.value.as_redis_value() {
+            crate::storage::compact_value::RedisValueRef::String(s) => {
+                assert_eq!(
+                    s as &[u8], b"old",
+                    "the captured pre-image must be the epoch-start value"
+                );
+            }
+            _ => panic!("expected a string pre-image"),
+        }
+    }
+
+    /// moon#517 gap 1 — a script's write effect must reach the AOF plane on
+    /// EVERY supported runtime, not only `runtime-monoio`.
+    ///
+    /// RED (before the fix, `--no-default-features --features
+    /// runtime-tokio,jemalloc`): `emit_effect`'s only body was
+    /// `#[cfg(feature = "runtime-monoio")]`, with a
+    /// `#[cfg(not(...))] { let _ = (db_index, cmd_and_args); }` arm that
+    /// DISCARDED the effect — so `EVAL "redis.call('SET',KEYS[1],'v')" 1 k`
+    /// mutated the keyspace, answered OK, and left nothing behind for AOF
+    /// replay to restore. GREEN: the AOF leg is runtime-agnostic (it is a
+    /// channel send to the writer pool, exactly what the tokio connection
+    /// handler already does for every ordinary write) and now always runs.
+    ///
+    /// The replication leg stays monoio-only ON PURPOSE — see
+    /// `reason_del::record_bytes_conn`: it pushes through
+    /// `shard::self_msg`, which only a monoio shard thread may touch, and
+    /// master-side PSYNC does not exist under tokio at all (no ordinary
+    /// tokio write replicates either). Parity with ordinary writes on the
+    /// same runtime is the bar this pins.
+    #[test]
+    fn emit_effect_reaches_the_aof_plane_on_every_runtime() {
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "noeviction")));
+        let (tx, rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(16);
+        let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+
+        let ctx = LuaEvictionCtx::new(
+            shard_databases,
+            runtime_config,
+            0,
+            None,
+            Rc::new(Cell::new(1)),
+            None,
+            1,    // num_shards
+            None, // repl_state
+            Some(pool),
+        );
+
+        let effect = [
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"lua517")),
+            Frame::BulkString(Bytes::from_static(b"v")),
+        ];
+        ctx.emit_effect(0, &effect);
+
+        let mut saw_effect = false;
+        while let Ok(crate::persistence::aof::AofMessage::Append { bytes, .. }) = rx.try_recv() {
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("SET") && text.contains("lua517") {
+                saw_effect = true;
+            }
+        }
+        assert!(
+            saw_effect,
+            "a script's write effect must be recorded to the AOF plane on this runtime — \
+             without it the write is lost on restart"
+        );
     }
 }

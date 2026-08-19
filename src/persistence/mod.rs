@@ -19,5 +19,6 @@ pub mod recovery;
 pub mod redis_rdb;
 pub mod replay;
 pub mod snapshot;
+pub mod snapshot_cow;
 pub mod vec_undo;
 pub mod wal_v3;
