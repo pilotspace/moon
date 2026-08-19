@@ -421,7 +421,7 @@ where
     {
         // Check immediate availability via the thread-local slice.
         let maybe_frame = crate::shard::slice::with_shard_db(selected_db, |db| {
-            immediate_scan(cmd, args, &keys, db)
+            immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
         });
         if let Some(frame) = maybe_frame {
             return BlockingOutcome::Reply(frame);
@@ -781,7 +781,7 @@ where
     // Use with_shard_db (thread-local ShardSlice) — no RwLock guard needed.
     {
         let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
-            immediate_scan(cmd, args, &keys, db)
+            immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
         });
         if let Some(frame) = immediate_result {
             return BlockingOutcome::Reply(frame);
@@ -1459,8 +1459,22 @@ pub(crate) fn immediate_scan(
     args: &[Frame],
     keys: &[Bytes],
     db: &mut Database,
+    shard_id: usize,
+    num_shards: usize,
 ) -> Option<Frame> {
     for key in keys {
+        // moon#557: `db` is the CLIENT'S OWN shard slice, so this scan may
+        // only speak for the keys this shard owns. A key that hashes elsewhere
+        // lives in another shard's `Database` and is answered where it lives —
+        // the registration the caller is about to send carries it to its owner,
+        // whose `BlockRegister` handler serves it on the spot if data is
+        // already there (`spsc_handler.rs`). Consulting the local slice for it
+        // can only produce a wrong answer from a stale look-alike, and since
+        // moon#556 that includes inventing a `-WRONGTYPE` for a key whose real
+        // owner holds the right type.
+        if num_shards > 1 && key_to_shard(key, num_shards) != shard_id {
+            continue;
+        }
         // moon#556: the type gate runs BEFORE the pop attempt and before any
         // registration, so a wrong-typed key is an error rather than a wait.
         if let Some(err) = blocking_wrongtype_error(cmd, db, key) {

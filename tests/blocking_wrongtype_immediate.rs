@@ -1,5 +1,6 @@
 //! A blocking pop on an EXISTING key of the WRONG TYPE must answer
-//! `-WRONGTYPE` at once, never block. (moon#556)
+//! `-WRONGTYPE` at once, never block (moon#556) — and a populated key must be
+//! served at once no matter which shard owns it (moon#557).
 //!
 //! redis-server 8.x, measured:
 //!
@@ -228,6 +229,62 @@ fn bwt2_wrongtype_across_collection_families() {
             }
             let card = c.send(&["ZCARD", k]);
             (card != ":1\r\n").then(|| format!("the zset lost its member: ZCARD {card:?}"))
+        },
+    );
+}
+
+/// moon#557: a populated key owned by ANOTHER shard is still served at once,
+/// with no second client pushing to wake it.
+///
+/// The pre-registration scan runs against the connection's own shard slice,
+/// so it now skips keys it does not own outright (before, it consulted the
+/// local slice for every key and always missed on the remote ones). What
+/// serves those keys is the owning shard's `BlockRegister` handler, which
+/// checks for available data the moment the registration lands. This pins that
+/// path: at `--shards 4` most placements are remote, the element must come
+/// back in milliseconds — not at the 3s timeout — and exactly one element must
+/// leave the key.
+#[test]
+fn bwt5_a_populated_key_is_served_wherever_it_lives() {
+    let m = spawn_moon(SHARDS);
+    each_trial(
+        m.port,
+        "bwt5:l:",
+        "moon#557 — a populated list must be served immediately whether the \
+         connection's own shard owns it or not",
+        |c, k| {
+            assert_eq!(c.send(&["RPUSH", k, "v1", "v2"]), ":2\r\n");
+            let started = Instant::now();
+            let reply = c.send(&["BLPOP", k, "3"]);
+            let elapsed = started.elapsed();
+            if !reply.contains("v1") {
+                return Some(format!("BLPOP replied {reply:?} after {elapsed:?}"));
+            }
+            if elapsed > Duration::from_millis(500) {
+                return Some(format!(
+                    "BLPOP took {elapsed:?} — it blocked instead of being served"
+                ));
+            }
+            let len = c.send(&["LLEN", k]);
+            (len != ":1\r\n")
+                .then(|| format!("exactly one element must have been consumed, LLEN {len:?}"))
+        },
+    );
+    each_trial(
+        m.port,
+        "bwt5:z:",
+        "moon#557 — a populated zset must be served immediately wherever it lives",
+        |c, k| {
+            assert_eq!(c.send(&["ZADD", k, "1", "m1", "2", "m2"]), ":2\r\n");
+            let started = Instant::now();
+            let reply = c.send(&["BZPOPMIN", k, "3"]);
+            let elapsed = started.elapsed();
+            if !reply.contains("m1") {
+                return Some(format!("BZPOPMIN replied {reply:?} after {elapsed:?}"));
+            }
+            let card = c.send(&["ZCARD", k]);
+            (card != ":1\r\n")
+                .then(|| format!("exactly one member must have been consumed, ZCARD {card:?}"))
         },
     );
 }

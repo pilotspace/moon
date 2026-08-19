@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
 
 ### Fixed
+- **A blocking pop's immediate path consulted the LOCAL shard slice for every key** (#557),
+  including keys owned by another shard. The pre-registration scan runs against the connection's
+  own `ShardSlice`, where a remote key does not live, so at `--shards N` the fast path missed on
+  (N-1)/N of keys and every one of them fell through to registration. Post-#560 that was harmless
+  to the keyspace, but the scan can only ever produce a WRONG answer for a key it does not own —
+  a stale local look-alike would be popped from the wrong shard, and since #556 it could even
+  invent a `-WRONGTYPE` for a key whose real owner holds the right type. The scan now skips keys
+  this shard does not own (`key_to_shard`, the same routing the slotted dispatch uses) and lets
+  the owning shard answer them at `BlockRegister` time, which is how a remote blocking pop has
+  always been served — a populated remote key still comes back in milliseconds, with no second
+  client pushing.
 - **A blocking pop on a key of the WRONG TYPE blocked instead of erroring** (#556). `SET s v` then
   `BLPOP s 0` sat there forever where Redis answers `-WRONGTYPE` immediately: the pop helpers reach
   the store through `get_mut_if_present(..).ok()??`, which collapses `Err(WRONGTYPE)` into `None` —

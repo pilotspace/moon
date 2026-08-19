@@ -1,5 +1,5 @@
 //! Unit tests for the pre-registration scan a blocking pop runs before it
-//! decides to block (`blocking::immediate_scan`) — moon#556.
+//! decides to block (`blocking::immediate_scan`) — moon#556 / moon#557.
 //!
 //! Deliberately NOT in `super::tests`: that module is
 //! `#[cfg(all(test, feature = "runtime-monoio"))]`, so everything in it is
@@ -11,6 +11,7 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::server::conn::blocking::immediate_scan;
+use crate::shard::dispatch::key_to_shard;
 use crate::storage::Database;
 use crate::storage::entry::Entry;
 
@@ -82,7 +83,7 @@ fn immediate_scan_surfaces_wrongtype_instead_of_blocking() {
             Bytes::copy_from_slice(key.as_bytes()),
             Entry::new_string(Bytes::from_static(b"payload")),
         );
-        let reply = immediate_scan(cmd, &argv, &keys(&[key]), &mut db);
+        let reply = immediate_scan(cmd, &argv, &keys(&[key]), &mut db, 0, 1);
         assert_wrongtype(&reply, &name);
         // moon#560's guarantee still holds: the value is untouched.
         assert_eq!(
@@ -105,7 +106,14 @@ fn immediate_scan_surfaces_wrongtype_instead_of_blocking() {
 fn immediate_scan_wrongtype_across_collection_families() {
     let mut db = Database::new();
     db.list_push_back(b"l", Bytes::from_static(b"v"));
-    let reply = immediate_scan(b"BZPOPMIN", &args(&["l", "0"]), &keys(&["l"]), &mut db);
+    let reply = immediate_scan(
+        b"BZPOPMIN",
+        &args(&["l", "0"]),
+        &keys(&["l"]),
+        &mut db,
+        0,
+        1,
+    );
     assert_wrongtype(&reply, "BZPOPMIN on a list");
     assert_eq!(
         db.list_pop_back(b"l"),
@@ -115,7 +123,7 @@ fn immediate_scan_wrongtype_across_collection_families() {
 
     let mut db = Database::new();
     db.zset_restore(b"z", Bytes::from_static(b"m"), 1.0);
-    let reply = immediate_scan(b"BLPOP", &args(&["z", "0"]), &keys(&["z"]), &mut db);
+    let reply = immediate_scan(b"BLPOP", &args(&["z", "0"]), &keys(&["z"]), &mut db, 0, 1);
     assert_wrongtype(&reply, "BLPOP on a zset");
     assert_eq!(
         db.zset_pop_min(b"z").map(|(m, _)| m),
@@ -139,6 +147,8 @@ fn immediate_scan_errors_on_the_first_wrongtype_key_in_order() {
         &args(&["bad", "good", "0"]),
         &keys(&["bad", "good"]),
         &mut db,
+        0,
+        1,
     );
     assert_wrongtype(&reply, "BLPOP bad good");
     assert_eq!(
@@ -155,7 +165,7 @@ fn immediate_scan_still_serves_hits_and_leaves_misses_absent() {
     let mut db = Database::new();
     db.list_push_back(b"q", Bytes::from_static(b"v1"));
     assert_eq!(
-        immediate_scan(b"BLPOP", &args(&["q", "0"]), &keys(&["q"]), &mut db),
+        immediate_scan(b"BLPOP", &args(&["q", "0"]), &keys(&["q"]), &mut db, 0, 1),
         Some(Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"q")),
             Frame::BulkString(Bytes::from_static(b"v1")),
@@ -164,7 +174,14 @@ fn immediate_scan_still_serves_hits_and_leaves_misses_absent() {
 
     let mut db = Database::new();
     assert_eq!(
-        immediate_scan(b"BLPOP", &args(&["ghost", "0"]), &keys(&["ghost"]), &mut db,),
+        immediate_scan(
+            b"BLPOP",
+            &args(&["ghost", "0"]),
+            &keys(&["ghost"]),
+            &mut db,
+            0,
+            1,
+        ),
         None,
         "an absent key must fall through to registration"
     );
@@ -192,7 +209,7 @@ fn immediate_blmove_rejects_a_wrongtype_destination_without_losing_the_element()
             Bytes::from_static(b"dst"),
             Entry::new_string(Bytes::from_static(b"iam-a-string")),
         );
-        let reply = immediate_scan(cmd, &argv, &keys(&["src"]), &mut db);
+        let reply = immediate_scan(cmd, &argv, &keys(&["src"]), &mut db, 0, 1);
         assert_wrongtype(&reply, &name);
         assert_eq!(
             db.list_pop_front(b"src"),
@@ -217,8 +234,106 @@ fn immediate_blmove_with_absent_source_ignores_the_destination_type() {
             &args(&["src", "dst", "LEFT", "LEFT", "0"]),
             &keys(&["src"]),
             &mut db,
+            0,
+            1,
         ),
         None,
         "nothing to move yet — the client blocks, destination untouched"
+    );
+}
+
+/// Pick a key that provably hashes to a shard other than `mine`.
+fn key_owned_elsewhere(mine: usize, shards: usize) -> String {
+    (0..1000)
+        .map(|i| format!("k{i}"))
+        .find(|k| key_to_shard(k.as_bytes(), shards) != mine)
+        .expect("some key hashes off this shard")
+}
+
+/// Pick a key that provably hashes to `mine`.
+fn key_owned_here(mine: usize, shards: usize) -> String {
+    (0..1000)
+        .map(|i| format!("k{i}"))
+        .find(|k| key_to_shard(k.as_bytes(), shards) == mine)
+        .expect("some key hashes onto this shard")
+}
+
+/// moon#557: the scan runs against the CLIENT'S OWN shard slice, so it may
+/// only consider keys this shard owns. A key that hashes elsewhere must be
+/// skipped entirely — answering it from whatever the local slice happens to
+/// hold serves data this shard does not own (and, since moon#556, could invent
+/// a WRONGTYPE from it). The owning shard answers instead, at `BlockRegister`
+/// time, which is how a remote blocking pop has always been served.
+#[test]
+fn immediate_scan_ignores_keys_this_shard_does_not_own() {
+    const SHARDS: usize = 4;
+    let mine = 0usize;
+    let remote = key_owned_elsewhere(mine, SHARDS);
+
+    let mut db = Database::new();
+    db.list_push_back(remote.as_bytes(), Bytes::from_static(b"stale"));
+    assert_eq!(
+        immediate_scan(
+            b"BLPOP",
+            &args(&[&remote, "0"]),
+            &keys(&[&remote]),
+            &mut db,
+            mine,
+            SHARDS,
+        ),
+        None,
+        "a key owned by another shard must fall through to remote registration"
+    );
+    assert_eq!(
+        db.list_pop_front(remote.as_bytes()),
+        Some(Bytes::from_static(b"stale")),
+        "and the local slice must not have been mutated"
+    );
+
+    // Same for the type gate: a local look-alike must not decide WRONGTYPE for
+    // a key whose real owner is another shard.
+    let mut db = Database::new();
+    db.set(
+        Bytes::copy_from_slice(remote.as_bytes()),
+        Entry::new_string(Bytes::from_static(b"v")),
+    );
+    assert_eq!(
+        immediate_scan(
+            b"BLPOP",
+            &args(&[&remote, "0"]),
+            &keys(&[&remote]),
+            &mut db,
+            mine,
+            SHARDS,
+        ),
+        None,
+        "the owning shard decides the type of the keys it owns"
+    );
+}
+
+/// The ownership gate must not touch the keys this shard DOES own, and a
+/// multi-key pop must still scan PAST a remote key to a local one.
+#[test]
+fn immediate_scan_still_serves_keys_this_shard_owns() {
+    const SHARDS: usize = 4;
+    let mine = 0usize;
+    let local = key_owned_here(mine, SHARDS);
+    let remote = key_owned_elsewhere(mine, SHARDS);
+
+    let mut db = Database::new();
+    db.list_push_back(local.as_bytes(), Bytes::from_static(b"v1"));
+    assert_eq!(
+        immediate_scan(
+            b"BLPOP",
+            &args(&[&remote, &local, "0"]),
+            &keys(&[&remote, &local]),
+            &mut db,
+            mine,
+            SHARDS,
+        ),
+        Some(Frame::Array(framevec![
+            Frame::BulkString(Bytes::copy_from_slice(local.as_bytes())),
+            Frame::BulkString(Bytes::from_static(b"v1")),
+        ]))
     );
 }
