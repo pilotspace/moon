@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (entry gone or TTL retargeted) so a backwards wall-clock step can't discard live pairs; the
   per-key budget clock read is batched to every 64 pops; and sweep 2 lowers the hash latch from
   its own reap outcomes instead of a second O(N) rescan.
+- **`volatile-ttl` eviction picks the exact nearest-expiry victim** (#551). The policy now reads
+  the head of the #541 deadline-ordered expiry index — O(log n), always the globally soonest
+  deadline — instead of sampling `maxmemory-samples` random volatile keys and taking the sample's
+  minimum, which could evict a key hours from expiring while the one expiring in seconds
+  survived. `maxmemory-samples` still governs the LRU/LFU/random policies, which remain
+  sampling-based.
 
 ### Added
 - **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired

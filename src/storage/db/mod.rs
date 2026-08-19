@@ -523,6 +523,16 @@ impl Database {
             .cloned()
     }
 
+    /// Earliest `(expires_at_ms, key)` pair in the index regardless of
+    /// whether it is due yet — the exact nearest-deadline victim for
+    /// `volatile-ttl` eviction. O(log n). `None` when no hot key is
+    /// volatile. Cold-spilled keys are not indexed, matching the old
+    /// sampling picker which also only saw hot entries.
+    #[inline]
+    pub fn peek_nearest_expiry(&self) -> Option<(u64, CompactKey)> {
+        self.expiry_index.first().cloned()
+    }
+
     /// Drop one specific index pair. The sweep calls this when a popped
     /// pair is PROVABLY stale (the entry is gone or carries a different
     /// TTL than `ts`): without dropping it, the sweep would peek the same
