@@ -394,6 +394,29 @@ fn rna6_lmpop_zmpop_and_xread_are_null_array() {
         NULL_ARRAY,
         "moon#482 — XREADGROUP with no new entries is *-1",
     );
+
+    // ...but the HISTORY form (an explicit ID, not `>`) is NOT a null at all:
+    // Redis serves the stream before it knows whether the consumer's PEL slice
+    // has anything in it, so an empty PEL is `[["mp5", []]]`. Measured on
+    // redis-server 8.6.1 (moon#526). This is the sibling of the assertion
+    // above and belongs beside it: "which null" and "a null at all" are
+    // decided a few lines apart in the same function.
+    assert_reply(
+        &mut c,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "consumer",
+            "COUNT",
+            "10",
+            "STREAMS",
+            "mp5",
+            "0",
+        ],
+        "*1\r\n*2\r\n$3\r\nmp5\r\n*0\r\n",
+        "moon#526 — XREADGROUP history mode with an empty PEL is [[key, []]], not a null",
+    );
 }
 
 #[test]

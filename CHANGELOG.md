@@ -215,6 +215,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label-gated; both unchanged.
 
 ### Fixed
+- **`XREADGROUP` in history mode answers the stream, not a null** (#526). `XREADGROUP ... STREAMS
+  s 0` asks for the consumer's PENDING entries; Redis serves the stream before it knows whether
+  the PEL slice has anything in it, so an empty PEL replies `*1\r\n*2\r\n$1\r\ns\r\n*0\r\n` —
+  `[["s", []]]`. Moon replied `$-1`, so a client that iterates the returned stream list got a
+  decode error (or a `None` branch) where Redis gives it zero iterations. This is a reply-SHAPE
+  divergence, not a null-type one. The two request modes are now served on Redis's own
+  conditions: history (an explicit ID) always contributes its stream, `>` contributes only when
+  there ARE new entries — a `>` stream with nothing new is dropped from the reply rather than
+  rendered as an empty entry list, which also fixes the mixed `STREAMS a b > 0` case. The reply
+  is the null array only when nothing at all was served, so the `>`-with-no-new-entries answer
+  stays `*-1` (#482).
 - **`LPOP`/`RPOP` validate the optional count BEFORE the key lookup, with Redis's error text**
   (#527). Both commands looked the key up first and returned the miss (`*-1`) without ever
   reaching the count parser, so `LPOP nokey abc` answered "no such list" and the identical

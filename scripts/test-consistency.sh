@@ -849,6 +849,33 @@ countarg_probe absent LPOP %K 2
 countarg_probe absent RPOP %K 2
 countarg_probe absent LPOP %K 0
 
+# ===========================================================================
+# XREADGROUP history mode replies the stream, not a null (moon#526)
+# ===========================================================================
+# `XREADGROUP ... STREAMS s 0` asks for the consumer's PENDING entries. Redis
+# serves the stream before it knows whether the PEL slice is empty, so an empty
+# PEL is `*1 *2 $1 s *0` — the stream with an empty entry list. Moon answered
+# `$-1`, and a client iterating the returned stream list got a decode error
+# where Redis gives it zero iterations.
+#
+# Needs an `XGROUP CREATE` first, which is why this cannot ride on `null_probe`
+# (one command per probe): without the group BOTH servers answer `-NOGROUP` and
+# the comparison passes while testing nothing.
+xrg_probe() {
+    local kind="$1" id="$2"
+    local key="xrghist:${kind}"
+    redis-cli -p "$PORT_REDIS" XGROUP CREATE "$key" g '$' MKSTREAM >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_RUST"  XGROUP CREATE "$key" g '$' MKSTREAM >/dev/null 2>&1 || true
+    assert_eq "xreadgroup ${kind}: STREAMS ${key} ${id}" \
+        "$(null_type_of "$PORT_REDIS" XREADGROUP GROUP g c COUNT 10 STREAMS "$key" "$id")" \
+        "$(null_type_of "$PORT_RUST"  XREADGROUP GROUP g c COUNT 10 STREAMS "$key" "$id")"
+}
+
+# History mode on an empty PEL: the stream array (`*1`), not a null.
+xrg_probe history 0
+# The fence: the `>` form with nothing new stays the null ARRAY (`*-1`, #482).
+xrg_probe newonly '>'
+
 # ---------------------------------------------------------------------------
 # Shard-routing parity (moon#533, moon#534)
 #
