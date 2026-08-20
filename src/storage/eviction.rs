@@ -578,6 +578,7 @@ pub fn evict_to_budget(
                     ctx.manifest,
                     ctx.db_index,
                     deficit,
+                    on_plain_drop,
                 ) > 0
             }
             EvictionSink::AsyncSpill {
@@ -601,6 +602,7 @@ pub fn evict_to_budget(
                                 m,
                                 *db_index,
                                 deficit,
+                                on_plain_drop,
                             ) > 0
                         }
                         // No manifest and no AOF backstop: durable spill is
@@ -617,6 +619,7 @@ pub fn evict_to_budget(
                         shard_dir,
                         next_file_id,
                         *db_index,
+                        on_plain_drop,
                     )
                 }
             }
@@ -767,6 +770,47 @@ fn select_victim(
     }
 }
 
+/// Remaining-TTL floor below which an eviction victim is DROPPED instead of
+/// spilled to the cold tier (moon#553).
+///
+/// ## Why
+///
+/// Spilling costs a datafile write, a manifest commit and a cold-index entry.
+/// Cold TTLs are lazy-only — nothing sweeps the cold tier — so a victim that
+/// expires a moment later occupies that IO and that disk slot until something
+/// happens to read it. `volatile-ttl` makes this pathological by
+/// construction: it selects the NEAREST deadline in the database, i.e. the
+/// victim least worth persisting, and hands it to the spill writer.
+///
+/// ## Why dropping is safe
+///
+/// Eviction is already a destructive operation in Redis: `allkeys-*` and
+/// `volatile-*` DELETE victims. Moon's spill tier is a strict extension that
+/// preserves more than Redis would; declining it for a key with under a
+/// second to live gives up at most `SPILL_TTL_FLOOR_MS` of extra visibility
+/// on a key that is about to become invisible anyway, and never contradicts
+/// Redis semantics. `noeviction` never reaches here (`select_victim` returns
+/// `None`), so no policy that forbids deletion can be affected.
+///
+/// The drop is reported through the same `on_plain_drop` sink a plain-drop
+/// eviction uses, so the dual-plane `DEL` (replica + AOF, task #34) is
+/// emitted — without it a replica would keep a key its master no longer has
+/// in EITHER tier, and no later expiry sweep could ever correct it.
+///
+/// One second is deliberately conservative: long enough to cover the spill
+/// round-trip (queue → batch → pwrite → fsync → manifest commit) plus the
+/// 100ms eviction tick, short enough that no realistic reader loses a key it
+/// could still have used.
+pub const SPILL_TTL_FLOOR_MS: u64 = 1_000;
+
+/// `true` when `entry` is so close to expiry that spilling it would be wasted
+/// IO (moon#553). Reads the TTL already in hand — no clock syscall, no
+/// allocation, no lookup.
+#[inline]
+fn expiring_too_soon_to_spill(entry: &crate::storage::Entry, now_ms: u64) -> bool {
+    entry.has_expiry() && entry.expires_at_ms().saturating_sub(now_ms) < SPILL_TTL_FLOOR_MS
+}
+
 /// Serialize a victim entry's value for spill (W2: the single implementation
 /// — previously copy-pasted at all three spill entry points).
 ///
@@ -862,11 +906,18 @@ fn evict_batch_durable(
     manifest: &mut ShardManifest,
     db_index: usize,
     deficit: usize,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> usize {
     let mut seen: std::collections::HashSet<CompactKey> = std::collections::HashSet::new();
     let mut buffer: Vec<SpillRequest> = Vec::new();
     let mut staged_bytes = 0usize;
     let mut stall = 0usize;
+    // moon#553: victims dropped instead of spilled because they were about to
+    // expire. Counted as reclaimed — a plain drop frees the same RAM a spill
+    // would have, and `evict_to_budget` needs the progress signal or it
+    // answers OOM after a batch made entirely of drops.
+    let mut dropped = 0usize;
+    let now_ms = db.now_ms();
 
     while buffer.len() < NO_AOF_BATCH_CAP && staged_bytes < deficit {
         let key = match select_victim(db, config, policy) {
@@ -888,6 +939,20 @@ fn evict_batch_durable(
             // already gone, so keep sampling for more victims.
             continue;
         };
+        // moon#553: about to expire — drop it now rather than pay a datafile
+        // write plus a manifest commit for a cold entry nothing will reclaim.
+        if expiring_too_soon_to_spill(entry, now_ms) {
+            let before = db.estimated_memory();
+            db.remove(key.as_bytes());
+            crate::admin::metrics_setup::record_expiring_spill_skipped();
+            crate::admin::metrics_setup::record_eviction();
+            on_plain_drop(key.as_bytes());
+            // A drop reclaims RAM immediately, so it counts toward the same
+            // deficit the staged (not-yet-written) victims are sized against.
+            staged_bytes += before.saturating_sub(db.estimated_memory());
+            dropped += 1;
+            continue;
+        }
         // Fail-closed: an unserializable (corrupt) value is retained hot and
         // skipped — its `seen` entry stops the sampler from re-picking it
         // into this batch, and staging continues with other victims.
@@ -916,7 +981,7 @@ fn evict_batch_durable(
     }
 
     if buffer.is_empty() {
-        return 0;
+        return dropped;
     }
 
     // Durable write (pwrite + fsync[+ fsync dir]) for the whole batch, still
@@ -968,7 +1033,7 @@ fn evict_batch_durable(
             reclaimed += 1;
         }
     }
-    reclaimed
+    reclaimed + dropped
 }
 
 /// Evict a single key via the async spill path.
@@ -986,6 +1051,7 @@ fn evict_one_async_spill(
     shard_dir: &Path,
     next_file_id: &mut u64,
     db_index: usize,
+    on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
     // Find victim key using the shared policy dispatch (same as sync path)
     let key = match select_victim(db, config, policy) {
@@ -996,6 +1062,15 @@ fn evict_one_async_spill(
     // Build SpillRequest from the entry BEFORE removing it from DashTable.
     // This is CPU work only -- no I/O on the event loop.
     if let Some(entry) = db.data().get(key.as_bytes()) {
+        // moon#553: about to expire — skip the queue/pwrite/manifest round
+        // trip entirely and reclaim the RAM now.
+        if expiring_too_soon_to_spill(entry, db.now_ms()) {
+            db.remove(key.as_bytes());
+            crate::admin::metrics_setup::record_expiring_spill_skipped();
+            crate::admin::metrics_setup::record_eviction();
+            on_plain_drop(key.as_bytes());
+            return true;
+        }
         // Fail-closed: a value that cannot be faithfully serialized must not
         // be evicted (pre-W2 this spilled an EMPTY body and dropped the key).
         // Bail; the caller surfaces OOM rather than losing data.
@@ -1108,6 +1183,7 @@ pub(crate) fn evict_one_with_spill(
             ctx.manifest,
             ctx.db_index,
             1,
+            on_plain_drop,
         ) > 0;
     }
 
@@ -2455,6 +2531,245 @@ mod tests {
                 .is_none(),
             "no ColdIndex entry may point at an empty/absent spill body"
         );
+    }
+
+    // ── moon#553: about-to-expire victims are dropped, not spilled ───────
+
+    /// Seed one string key carrying `ttl_ms` from now, with the exact shape
+    /// the eviction paths expect (hot entry + indexed TTL).
+    fn db_with_ttl_key(key: &'static [u8], remaining_ms: u64) -> Database {
+        let mut db = Database::new();
+        let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
+        entry.set_expires_at_ms(db.now_ms() + remaining_ms);
+        db.set(Bytes::from_static(key), entry);
+        db
+    }
+
+    /// RED before #553: a victim two seconds from expiry was serialized,
+    /// pwritten, fsynced and manifest-committed into the cold tier, where
+    /// nothing sweeps it. It must be dropped instead — same RAM reclaimed,
+    /// zero IO.
+    #[test]
+    fn sync_spill_drops_a_victim_that_is_about_to_expire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = db_with_ttl_key(b"dying", SPILL_TTL_FLOOR_MS / 2);
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        let config = make_config(1, "allkeys-lru");
+
+        let mut dropped: Vec<Vec<u8>> = Vec::new();
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        let mut sink = |k: &[u8]| dropped.push(k.to_vec());
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::sync_spill(Some(&mut ctx)).report(&mut sink),
+        );
+
+        assert!(result.is_ok(), "the budget must still be reclaimed");
+        assert_eq!(db.len(), 0, "the victim must leave hot RAM either way");
+        assert_eq!(
+            manifest.files().len(),
+            0,
+            "no datafile may be written for a key that expires in \
+             under {SPILL_TTL_FLOOR_MS}ms"
+        );
+        assert!(
+            db.cold_index
+                .as_ref()
+                .is_none_or(|ci| ci.iter().count() == 0),
+            "and no cold-index entry either"
+        );
+        assert_eq!(
+            dropped,
+            vec![b"dying".to_vec()],
+            "the drop MUST be reported, or a replica keeps a key its master \
+             has in neither tier and no expiry sweep can ever correct it"
+        );
+    }
+
+    /// The guard must be narrow: a victim with real time left still spills.
+    #[test]
+    fn sync_spill_still_spills_a_victim_with_a_long_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = db_with_ttl_key(b"living", SPILL_TTL_FLOOR_MS * 60);
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        let config = make_config(1, "allkeys-lru");
+
+        let mut dropped: Vec<Vec<u8>> = Vec::new();
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        let mut sink = |k: &[u8]| dropped.push(k.to_vec());
+        evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::sync_spill(Some(&mut ctx)).report(&mut sink),
+        )
+        .expect("eviction succeeds");
+
+        assert_eq!(db.len(), 0);
+        assert_eq!(
+            manifest.files().len(),
+            1,
+            "a long-lived victim must still reach the cold tier"
+        );
+        assert!(dropped.is_empty(), "a spilled key is not a dropped key");
+    }
+
+    /// A victim with NO TTL is never affected by the guard.
+    #[test]
+    fn sync_spill_still_spills_a_victim_with_no_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        db.set_string(Bytes::from_static(b"forever"), Bytes::from_static(b"v"));
+        let config = make_config(1, "allkeys-lru");
+
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)))
+            .expect("eviction succeeds");
+        assert_eq!(manifest.files().len(), 1);
+    }
+
+    /// The async (AOF-backstopped) path must take the same decision: a
+    /// nearly-expired victim never reaches the `SpillThread` channel.
+    #[test]
+    fn async_spill_drops_a_victim_that_is_about_to_expire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = db_with_ttl_key(b"dying", SPILL_TTL_FLOOR_MS / 2);
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "yes".to_string();
+
+        let (tx, rx) = flume::bounded::<SpillRequest>(8);
+        let mut dropped: Vec<Vec<u8>> = Vec::new();
+        let mut sink = |k: &[u8]| dropped.push(k.to_vec());
+        let result = evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None).report(&mut sink),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0, "RAM is reclaimed");
+        assert_eq!(
+            rx.len(),
+            0,
+            "no SpillRequest may be queued for a key about to expire"
+        );
+        assert_eq!(dropped, vec![b"dying".to_vec()], "the drop is reported");
+        assert!(
+            db.spill_inflight_is_empty(),
+            "and no in-flight record is left behind"
+        );
+    }
+
+    /// The async path's non-guarded victims still queue.
+    #[test]
+    fn async_spill_still_queues_a_victim_with_a_long_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = db_with_ttl_key(b"living", SPILL_TTL_FLOOR_MS * 60);
+        let mut config = make_config(1, "allkeys-lru");
+        config.appendonly = "yes".to_string();
+
+        let (tx, rx) = flume::bounded::<SpillRequest>(8);
+        evict_to_budget(
+            &mut db,
+            &config,
+            EvictionRun::async_spill(&tx, shard_dir, &mut next_file_id, 0, None),
+        )
+        .expect("eviction succeeds");
+
+        assert_eq!(rx.len(), 1, "a long-lived victim must still be queued");
+    }
+
+    /// The exact boundary: `SPILL_TTL_FLOOR_MS` of remaining life spills,
+    /// one millisecond less does not.
+    #[test]
+    fn spill_ttl_floor_boundary_is_exclusive() {
+        let db = db_with_ttl_key(b"k", SPILL_TTL_FLOOR_MS);
+        let now = db.now_ms();
+        let at_floor = db.data().get(&b"k"[..]).expect("seeded").clone();
+        assert!(
+            !expiring_too_soon_to_spill(&at_floor, now),
+            "exactly at the floor still spills"
+        );
+
+        let db = db_with_ttl_key(b"k", SPILL_TTL_FLOOR_MS - 1);
+        let now = db.now_ms();
+        let below = db.data().get(&b"k"[..]).expect("seeded").clone();
+        assert!(
+            expiring_too_soon_to_spill(&below, now),
+            "one millisecond below the floor drops"
+        );
+    }
+
+    /// A budget made entirely of about-to-expire victims must still report
+    /// PROGRESS — `evict_batch_durable` returning 0 because its spill buffer
+    /// stayed empty would make `evict_to_budget` answer a spurious OOM.
+    #[test]
+    fn a_batch_of_only_dropped_victims_still_counts_as_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        for i in 0..32u32 {
+            let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
+            entry.set_expires_at_ms(db.now_ms() + 10);
+            db.set(Bytes::from(format!("k{i}")), entry);
+        }
+        let config = make_config(1, "allkeys-lru");
+
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
+
+        assert!(
+            result.is_ok(),
+            "an all-drops batch must not be mistaken for 'cannot evict'"
+        );
+        assert_eq!(db.len(), 0);
+        assert_eq!(manifest.files().len(), 0, "zero spill IO");
     }
 
     #[test]

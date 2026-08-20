@@ -295,14 +295,43 @@ pub struct Database {
     /// memory (~48B/pair) is metadata outside `used_memory`, like every
     /// other side table here.
     expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
-    /// Conservative "some `HashWithTtl` value may exist" latch (moon#541),
-    /// mirroring `maybe_has_expiring_keys` for hash-FIELD TTLs: raised when
-    /// a field TTL is stored (or a `HashWithTtl` value is written/loaded),
-    /// lowered only by the sweep's self-reset gate when its scan confirms
-    /// none remain. Lets `expire_cycle` skip the O(N) `HashWithTtl` scan
-    /// entirely for workloads that never touch HEXPIRE — the common case.
-    hash_field_ttl_latch: bool,
+    /// Deadline-ordered hash-FIELD expiry index (moon#543), the sibling of
+    /// [`Self::expiry_index`]: one `(min_expiry_ms, key)` pair per hot
+    /// `HashWithTtl` entry whose `ttls` sidecar is non-empty.
+    ///
+    /// It replaces the pre-#543 `hash_field_ttl_latch` bool, which only told
+    /// the sweep *whether* to run an O(N) `HashWithTtl` table scan; the sweep
+    /// then reaped every hash it found, unbudgeted, on the shard event loop.
+    /// Popping due pairs off this index is O(due · log n) and needs no scan.
+    ///
+    /// ## Lower-bound invariant (what makes it self-healing)
+    ///
+    /// For every hot `HashWithTtl` entry with a non-empty `ttls` sidecar
+    /// there EXISTS a pair `(ts, key)` here with `ts <= ttls.values().min()`.
+    /// Pairs may be stale-EARLY (a TTL was raised or the hash was deleted
+    /// without unindexing) — the sweep pops such a pair, finds nothing due,
+    /// and re-arms at the entry's fresh minimum (or drops it). A stale-early
+    /// pair therefore costs one wasted peek, never a missed reap. Only a
+    /// stale-LATE pair could lose a reap, and the single writer that can
+    /// LOWER a hash's minimum (`hash_set_field_ttl`) inserts its new pair
+    /// unconditionally, so none can exist.
+    hash_expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
 }
+
+/// Maximum `HashWithTtl` keys the hash-field sweep reaps in one tick
+/// (moon#543). Bounds the sweep even when the 1ms wall-clock budget has not
+/// yet been consumed, so the cap is deterministic and testable rather than
+/// machine-speed dependent. Expired-but-unreaped fields are already
+/// INVISIBLE to clients (the read path filters `ttls` against the shard
+/// clock), so a deferred reap costs delayed memory reclaim, never a stale
+/// answer.
+pub const HASH_SWEEP_MAX_KEYS_PER_TICK: u32 = 256;
+
+/// Maximum expired fields removed from ONE hash per reap call (moon#543).
+/// A hash with more due fields than this is re-armed at its (still-due)
+/// minimum and picked up again immediately — bounded progress per visit
+/// instead of an unbounded stall inside a single 1M-field hash.
+pub const HASH_SWEEP_MAX_FIELDS_PER_KEY: usize = 256;
 
 /// Bound on [`Database::pending_expired`]. 8192 keys ≈ 200KB of inline
 /// `CompactKey`s at worst — small enough to hold on a replica forever,
@@ -344,7 +373,7 @@ impl Database {
             spill_inflight: std::collections::HashMap::new(),
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
-            hash_field_ttl_latch: false,
+            hash_expiry_index: std::collections::BTreeSet::new(),
         }
     }
 
@@ -374,7 +403,7 @@ impl Database {
             spill_inflight: std::collections::HashMap::new(),
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
-            hash_field_ttl_latch: false,
+            hash_expiry_index: std::collections::BTreeSet::new(),
         }
     }
 
@@ -570,18 +599,94 @@ impl Database {
         self.expiry_index.remove(&(ttl_ms, CompactKey::from(key)));
     }
 
-    /// Conservative hash-field-TTL latch (see field doc). `true` = a
-    /// `HashWithTtl` value MAY exist and the sweep must run its scan.
+    // ── moon#543: deadline-ordered hash-FIELD expiry index ──────────────
+
+    /// `true` iff at least one hash-field deadline is indexed, i.e. the
+    /// hash-field sweep has something it could ever do. Replaces the
+    /// pre-#543 `hash_field_ttl_possible()` latch read; O(1).
     #[inline]
     pub fn hash_field_ttl_possible(&self) -> bool {
-        self.hash_field_ttl_latch
+        !self.hash_expiry_index.is_empty()
     }
 
-    /// Lower the latch. Only `expire_cycle`'s self-reset gate may call
-    /// this, and only after a scan proved zero `HashWithTtl` keys remain.
+    /// Earliest `(min_expiry_ms, key)` hash-field pair that is due at
+    /// `now_ms`, or `None` when nothing is due. O(log n) — the sibling of
+    /// [`Self::peek_due_expiry`], and the head-peek that lets a tick with no
+    /// due hash field skip the cycle entirely (moon#552).
     #[inline]
-    pub fn clear_hash_field_ttl_latch(&mut self) {
-        self.hash_field_ttl_latch = false;
+    pub fn peek_due_hash_expiry(&self, now_ms: u64) -> Option<(u64, CompactKey)> {
+        self.hash_expiry_index
+            .first()
+            .filter(|(ts, _)| *ts <= now_ms)
+            .cloned()
+    }
+
+    /// Number of indexed hash-field deadlines. Exact only up to stale-early
+    /// duplicates (see the field's invariant doc) — tests and diagnostics.
+    #[inline]
+    pub fn hash_expiry_index_len(&self) -> usize {
+        self.hash_expiry_index.len()
+    }
+
+    /// Index `key` from a whole-value write (`set` / `insert_for_load` /
+    /// recovery): reads the TRUE minimum out of the sidecar rather than
+    /// trusting the cached `min_expiry_ms`, because a value arriving over
+    /// RESTORE / replication / cold promotion has not been validated here.
+    /// No-op for every non-`HashWithTtl` value and for an empty sidecar
+    /// (nothing to reap ⇒ nothing to index).
+    pub(crate) fn hash_expiry_index_note_value(&mut self, key: &[u8], entry: &Entry) {
+        if let crate::storage::compact_value::RedisValueRef::HashWithTtl { ttls, .. } =
+            entry.value.as_redis_value()
+            && let Some(min) = ttls.values().copied().min()
+        {
+            self.hash_expiry_index.insert((min, CompactKey::from(key)));
+            // `expire_cycle_direct` gates the WHOLE cycle on this latch, and
+            // a whole-value write carries no WHOLE-KEY TTL to raise it — so
+            // without this a `HashWithTtl` restored by RESTORE, replication
+            // apply or cold promotion was never swept at all unless some
+            // unrelated key happened to hold a TTL. (`hash_set_field_ttl`
+            // raises it directly, which is why HEXPIRE never hit this.)
+            self.maybe_has_expiring_keys = true;
+        }
+    }
+
+    /// Retire the pair the hash-field sweep just consumed and re-arm `key`
+    /// at its FRESH minimum (moon#543).
+    ///
+    /// This is what makes stale-early pairs self-healing: whatever the popped
+    /// `ts` claimed, the replacement is read back out of the live sidecar, so
+    /// a raised TTL moves the pair forward and a deleted / downgraded /
+    /// fully-reaped hash leaves the index entirely.
+    pub(crate) fn rearm_hash_expiry(&mut self, ts: u64, key: &CompactKey) {
+        self.hash_expiry_index.remove(&(ts, key.clone()));
+        let fresh = match self.data.get(key.as_bytes()) {
+            Some(entry) => match entry.value.as_redis_value() {
+                crate::storage::compact_value::RedisValueRef::HashWithTtl { ttls, .. } => {
+                    ttls.values().copied().min()
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(min) = fresh {
+            self.hash_expiry_index.insert((min, key.clone()));
+        }
+    }
+
+    /// Best-effort unindex on hot removal. Guarded by an `is_empty` load so
+    /// the overwhelmingly common (no field TTL anywhere) DEL pays one branch.
+    /// A missed pair is harmless — see the field's invariant doc.
+    #[inline]
+    pub(crate) fn hash_expiry_index_forget(&mut self, key: &[u8], entry: &Entry) {
+        if self.hash_expiry_index.is_empty() {
+            return;
+        }
+        if let crate::storage::compact_value::RedisValueRef::HashWithTtl { ttls, .. } =
+            entry.value.as_redis_value()
+            && let Some(min) = ttls.values().copied().min()
+        {
+            self.hash_expiry_index.remove(&(min, CompactKey::from(key)));
+        }
     }
 
     /// Full-scan consistency oracle for the expiry index (tests + the
@@ -598,13 +703,24 @@ impl Database {
             .filter(|(_, e)| e.has_expiry())
             .map(|(k, e)| (e.expires_at_ms(), k.clone()))
             .collect();
-        let any_hash_ttl = self.data.iter().any(|(_, e)| {
-            matches!(
-                e.value.as_redis_value(),
-                crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
-            )
+        // moon#543: the hash-field index's LOWER-BOUND invariant — every
+        // reapable hash must have SOME pair at or before its true minimum.
+        // Stale-early duplicates are legal (self-healing), so this is a
+        // containment check, not an equality one.
+        let hash_ok = self.data.iter().all(|(k, e)| {
+            let crate::storage::compact_value::RedisValueRef::HashWithTtl { ttls, .. } =
+                e.value.as_redis_value()
+            else {
+                return true;
+            };
+            let Some(min) = ttls.values().copied().min() else {
+                return true; // empty sidecar: nothing to reap, nothing to index
+            };
+            self.hash_expiry_index
+                .iter()
+                .any(|(ts, ik)| ik == k && *ts <= min)
         });
-        scan == self.expiry_index && (!any_hash_ttl || self.hash_field_ttl_latch)
+        scan == self.expiry_index && hash_ok
     }
 
     /// Record a key a lazy read discovered expired (moon#542) so the next
@@ -1252,12 +1368,17 @@ mod tests {
     }
 
     /// The NX/XX/GT/LT gate runs AFTER promotion: HEXPIRE GT on a
-    /// non-volatile field answers -2, but the value has already become
-    /// `HashWithTtl` — the latch must arm at promotion, not at success, or
-    /// a `HashWithTtl` exists with the latch down (breaking the latch's
-    /// conservativeness invariant the oracle checks).
+    /// non-volatile field answers -2 with the value already converted to
+    /// `HashWithTtl` — carrying an EMPTY `ttls` sidecar.
+    ///
+    /// Pre-#543 the bool latch had to arm at promotion (a `HashWithTtl` with
+    /// the latch down broke its conservativeness invariant), which cost every
+    /// later tick an O(N) table scan for a hash that had no deadline at all.
+    /// The deadline index states the invariant precisely instead — index what
+    /// is REAPABLE — so a rejected HEXPIRE indexes nothing, and the very next
+    /// accepted one indexes immediately.
     #[test]
-    fn hash_field_ttl_latch_arms_even_when_condition_fails() {
+    fn a_rejected_hexpire_indexes_nothing_but_an_accepted_one_does() {
         let mut db = Database::new();
         {
             let map = db.get_or_create_hash(b"h").expect("hash");
@@ -1265,13 +1386,204 @@ mod tests {
         }
         let future_ms = db.now_ms() + 60_000;
         // GT on a field with NO current TTL: condition not met.
-        let r = db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Gt);
-        assert_eq!(r, Ok(-2));
+        assert_eq!(
+            db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Gt),
+            Ok(-2)
+        );
         assert!(
-            db.hash_field_ttl_possible(),
-            "promotion happened, so the latch must be up"
+            !db.hash_field_ttl_possible(),
+            "a HashWithTtl with an empty sidecar has nothing to reap, so the \
+             sweep must not be woken for it"
         );
         assert!(db.debug_expiry_index_consistent());
+
+        assert_eq!(
+            db.hash_set_field_ttl(b"h", b"f", future_ms, HashTtlCond::Always),
+            Ok(1)
+        );
+        assert_eq!(
+            db.peek_due_hash_expiry(future_ms),
+            Some((future_ms, CompactKey::from(&b"h"[..]))),
+            "promotion already happened; the accepted TTL must still index"
+        );
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    // ── moon#543: hash-field deadline index — writer coverage ────────────
+    //
+    // "Enumerate state writers, not command names." Exactly ONE writer can
+    // LOWER a hash's field minimum (`hash_set_field_ttl`); every other
+    // mutation can only raise it or remove the hash, and a stale-EARLY pair
+    // is self-healing. These lock that reasoning in.
+
+    fn hash_with_field_ttl(db: &mut Database, key: &[u8], field: &[u8], ttl_ms: u64) {
+        {
+            let map = db.get_or_create_hash(key).expect("hash");
+            map.insert(Bytes::copy_from_slice(field), Bytes::from_static(b"v"));
+        }
+        assert_eq!(
+            db.hash_set_field_ttl(key, field, ttl_ms, HashTtlCond::Always),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn hash_expiry_index_tracks_the_minimum_deadline() {
+        let mut db = Database::new();
+        let base = db.now_ms() + 60_000;
+
+        hash_with_field_ttl(&mut db, b"h", b"late", base + 5_000);
+        assert_eq!(
+            db.peek_due_hash_expiry(base + 6_000),
+            Some((base + 5_000, CompactKey::from(&b"h"[..])))
+        );
+
+        // A LOWER deadline must become reachable at the head.
+        hash_with_field_ttl(&mut db, b"h", b"early", base);
+        assert_eq!(
+            db.peek_due_hash_expiry(base).map(|(ts, _)| ts),
+            Some(base),
+            "the new minimum must be visible to the sweep immediately"
+        );
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// A RAISED deadline leaves a stale-early pair; `rearm_hash_expiry` must
+    /// heal it rather than let the sweep spin on it forever.
+    #[test]
+    fn rearm_heals_a_stale_early_pair() {
+        let mut db = Database::new();
+        let base = db.now_ms() + 60_000;
+        hash_with_field_ttl(&mut db, b"h", b"f", base);
+        // HEXPIRE the same field further out — the (base, h) pair is now early.
+        assert_eq!(
+            db.hash_set_field_ttl(b"h", b"f", base + 10_000, HashTtlCond::Always),
+            Ok(1)
+        );
+        assert_eq!(db.hash_expiry_index_len(), 2, "both pairs are present");
+
+        db.rearm_hash_expiry(base, &CompactKey::from(&b"h"[..]));
+        assert_eq!(
+            db.peek_due_hash_expiry(base + 9_999),
+            None,
+            "the healed index must not report the hash due before its real TTL"
+        );
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// HPERSIST of the last TTL downgrades to plain `Hash`; the sweep must
+    /// stop seeing the key once it re-arms.
+    #[test]
+    fn persisting_the_last_field_ttl_leaves_the_index() {
+        let mut db = Database::new();
+        let ts = db.now_ms() + 1_000;
+        hash_with_field_ttl(&mut db, b"h", b"f", ts);
+        assert!(db.hash_persist_field(b"h", b"f"));
+
+        db.rearm_hash_expiry(ts, &CompactKey::from(&b"h"[..]));
+        assert_eq!(db.hash_expiry_index_len(), 0);
+        assert!(!db.hash_field_ttl_possible());
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// A whole `HashWithTtl` value arriving over RESTORE / replication /
+    /// cold promotion must be indexed from its OWN sidecar, not from the
+    /// cached `min_expiry_ms` an untrusted encoder supplied.
+    #[test]
+    fn a_whole_hashwithttl_value_is_indexed_on_set() {
+        let mut db = Database::new();
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let mut ttls = HashMap::new();
+        ttls.insert(Bytes::from_static(b"f"), 4_000u64);
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                // Deliberately WRONG cached minimum: the index must not trust it.
+                min_expiry_ms: u64::MAX,
+            },
+        );
+        db.set(Bytes::from_static(b"h"), entry);
+
+        assert_eq!(
+            db.peek_due_hash_expiry(4_000),
+            Some((4_000, CompactKey::from(&b"h"[..]))),
+            "the sidecar's real minimum must be indexed"
+        );
+        assert!(
+            db.maybe_has_expiring_keys(),
+            "the whole-cycle latch must arm too — it carries no whole-key TTL \
+             to raise it, so without this the sweep never runs on this db"
+        );
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// End-to-end for the gap above: a `HashWithTtl` that arrived as a whole
+    /// value (RESTORE / replication / cold promotion) with an already-elapsed
+    /// field TTL, in a database holding NO other TTL at all, must still be
+    /// reaped by the active sweep.
+    #[test]
+    fn a_restored_hashwithttl_is_swept_without_any_other_ttl_in_the_db() {
+        let mut db = Database::new();
+        let past = db.now_ms() - 1_000;
+        let mut fields = HashMap::new();
+        fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        let mut ttls = HashMap::new();
+        ttls.insert(Bytes::from_static(b"f"), past);
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms: past,
+            },
+        );
+        db.set(Bytes::from_static(b"h"), entry);
+        assert_eq!(db.len(), 1);
+        assert!(db.expiry_index_is_empty(), "no whole-key TTL anywhere");
+
+        crate::server::expiration::expire_cycle_direct(&mut db, &mut |_| {});
+        assert_eq!(db.len(), 0, "the restored hash's only field had expired");
+    }
+
+    /// `recalculate_memory` heals the index after a bulk load, exactly as it
+    /// does for the whole-key one.
+    #[test]
+    fn recalculate_memory_rebuilds_the_hash_expiry_index() {
+        let mut db = Database::new();
+        let ts = db.now_ms() + 1_000;
+        hash_with_field_ttl(&mut db, b"h", b"f", ts);
+        // Simulate index loss (a load path that bypassed every writer).
+        db.hash_expiry_index.clear();
+        assert!(!db.hash_field_ttl_possible());
+
+        db.recalculate_memory();
+        assert_eq!(db.hash_expiry_index_len(), 1);
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// DEL unindexes, so a churn of short-lived field-TTL hashes cannot
+    /// accumulate pairs that only retire when their far-future deadline
+    /// arrives.
+    #[test]
+    fn removing_a_hash_unindexes_its_field_deadline() {
+        let mut db = Database::new();
+        let far = db.now_ms() + 86_400_000;
+        for i in 0..64u32 {
+            let key = format!("h{i}");
+            hash_with_field_ttl(&mut db, key.as_bytes(), b"f", far);
+        }
+        assert_eq!(db.hash_expiry_index_len(), 64);
+        for i in 0..64u32 {
+            db.remove(format!("h{i}").as_bytes());
+        }
+        assert_eq!(
+            db.hash_expiry_index_len(),
+            0,
+            "a deleted hash must not leave a pair parked until its deadline"
+        );
     }
 
     #[test]

@@ -106,12 +106,6 @@ impl Database {
 
         // 4. Promote to HashWithTtl if needed.
         promote_to_hash_with_ttl(rv);
-        // moon#541: arm the latch the moment the value IS HashWithTtl — the
-        // NX/XX/GT/LT gate below can return early AFTER promotion (e.g. GT
-        // on a non-volatile field), and a HashWithTtl existing with the
-        // latch down breaks the latch's conservativeness invariant (the
-        // debug_expiry_index_consistent oracle checks exactly that).
-        self.hash_field_ttl_latch = true;
         let RedisValue::HashWithTtl {
             ttls,
             min_expiry_ms,
@@ -141,6 +135,16 @@ impl Database {
             *min_expiry_ms = ts_ms;
         }
         self.maybe_has_expiring_keys = true;
+        // moon#543: this is the ONLY writer that can LOWER a hash's field
+        // minimum, so it is the only one that must index. Inserting `ts_ms`
+        // unconditionally (rather than the post-write minimum) keeps the
+        // lower-bound invariant with no extra read: `ts_ms >= min` only when
+        // an EARLIER pair already covers the hash, and `ts_ms < min` is
+        // exactly the case a new pair is needed for. Disjoint field borrow —
+        // `ttls`/`min_expiry_ms` alias `self.data`, this aliases
+        // `self.hash_expiry_index` (same shape as the line above).
+        self.hash_expiry_index
+            .insert((ts_ms, crate::storage::compact_key::CompactKey::from(key)));
         Ok(1)
     }
 

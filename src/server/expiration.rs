@@ -8,6 +8,7 @@ use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
 use crate::storage::Database;
+use crate::storage::db::{HASH_SWEEP_MAX_FIELDS_PER_KEY, HASH_SWEEP_MAX_KEYS_PER_TICK};
 use crate::storage::db_hash_ttl::ReapOutcome;
 use crate::storage::entry::current_time_ms;
 
@@ -83,15 +84,45 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
     // flag is latched true anyway (it had an expiry when it was hidden).
     drain_lazy_expired(db, on_removed);
     // Fast path: if the DB-level flag latches "no expiring keys", skip the
-    // O(N) `keys_with_expiry()` scan entirely. Discovered by flamegraph:
-    // with 100K TTL-less keys, the per-tick scan was consuming ~26% of
-    // event-loop CPU on a SET p=64 workload. The flag is flipped true by
-    // `Database::set` / `set_expiry` / `insert_for_load` and flipped false
-    // only by `expire_cycle` itself when its scan comes back empty.
+    // cycle entirely. Discovered by flamegraph: with 100K TTL-less keys, the
+    // per-tick scan was consuming ~26% of event-loop CPU on a SET p=64
+    // workload. The flag is flipped true by `Database::set` / `set_expiry` /
+    // `insert_for_load` and flipped false only by the maintenance below.
     if !db.maybe_has_expiring_keys() {
         return;
     }
+    // moon#552: the latch above only saves a database with ZERO TTL'd keys.
+    // A TTL-heavy database entered the cycle every 100ms just to re-derive
+    // "nothing due" — allocating a start `Instant`, reading the clock, and
+    // walking both sweeps' entry conditions. Both indexes are deadline-
+    // ordered, so ONE O(log n) head-peek each answers that question
+    // definitively; when neither head is due the tick costs two BTree
+    // `first()` calls and returns.
+    if nothing_due(db) {
+        // The flag maintenance `expire_cycle` would have done: with both
+        // indexes empty there is nothing left to sweep, so lower the latch
+        // and let the branch above claim every subsequent tick.
+        if db.expiry_index_is_empty() && !db.hash_field_ttl_possible() {
+            db.clear_maybe_has_expiring_keys();
+        }
+        return;
+    }
     expire_cycle(db, on_removed);
+}
+
+/// True when [`expire_cycle`] would provably remove nothing (moon#552) — the
+/// head-peek gate, extracted so it can be tested against each thing that can
+/// make a cycle worth running.
+///
+/// O(log n): two deadline-index head reads. Deliberately does NOT consider
+/// the lazy-expired queue — [`drain_lazy_expired`] runs before this gate.
+///
+/// Each sweep is asked against the clock IT reaps with (see `expire_cycle`),
+/// so the gate can never skip work a sweep would have done.
+#[inline]
+fn nothing_due(db: &Database) -> bool {
+    db.peek_due_expiry(current_time_ms()).is_none()
+        && db.peek_due_hash_expiry(db.now_ms()).is_none()
 }
 
 /// Delete-and-emit the lazily-discovered expired keys (moon#542).
@@ -128,13 +159,27 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
 ///    was built to dodge). Work is O(due · log n), capped by the 1ms
 ///    budget; the backlog carries to the next tick.
 ///
-/// 2. **Hash-field sweep** — iterates all `HashWithTtl` keys returned by
-///    `hashes_with_field_expiry()` and calls `reap_expired_fields_one_hash`.
-///    Keys where all fields expired are removed entirely.  Keys where the last
-///    TTL sidecar entry is drained are downgraded back to plain `Hash`.
-///    Gated by the `hash_field_ttl_possible` latch (moon#541): databases
-///    that never stored a field TTL skip the O(N) scan entirely. The scan
-///    itself is still O(N) when the latch is up — tracked as moon#543.
+/// 2. **Hash-field sweep** (moon#543) — the mirror image of sweep 1 over the
+///    hash-field deadline index: pops DUE `(min_expiry_ms, key)` pairs and
+///    reaps that hash's expired fields. Keys where all fields expired are
+///    removed entirely; keys where the last TTL sidecar entry is drained are
+///    downgraded back to plain `Hash`.
+///
+///    Before #543 this sweep collected EVERY `HashWithTtl` key in the
+///    database with a full table scan and reaped all of them, with no time
+///    budget, no sampling and no batch cap — on the shard event loop, every
+///    100ms. It is now bounded three ways: the same 1ms wall-clock budget as
+///    sweep 1, a hard [`HASH_SWEEP_MAX_KEYS_PER_TICK`] cap on hashes visited,
+///    and a [`HASH_SWEEP_MAX_FIELDS_PER_KEY`] cap on fields drained per
+///    visit. A hash left partly reaped is re-armed at its still-due minimum
+///    and resumed on the next visit. Deferring a reap is invisible to
+///    clients — the read path already filters `ttls` against the shard clock,
+///    so an unreaped expired field cannot be returned; only the memory
+///    reclaim is deferred.
+///
+/// The budget is SHARED and spent in order, so a large whole-key backlog can
+/// leave sweep 2 with none. Sweep 2's loop therefore checks the budget AFTER
+/// its first pop: every tick makes at least one hash's worth of progress.
 ///
 /// `maybe_has_expiring_keys` is cleared only when **both** sweeps have
 /// nothing left, so a database with hash-field TTLs but no whole-key TTLs
@@ -179,26 +224,36 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
         }
     }
 
-    // ── Sweep 2: hash-field expiry (latch-gated, moon#541) ───────────────────
-    // The reap outcomes double as the latch's self-reset evidence: a key
-    // stays eligible only while it remains `HashWithTtl` (FieldsRemoved /
-    // NoOp); Downgraded and KeyDeleted leave the kind. When zero eligible
-    // keys remain after the sweep, the latch lowers — no second O(N) scan.
-    if db.hash_field_ttl_possible() {
-        // Collect keys up front to avoid borrow conflicts during mutation.
-        let hash_keys = db.hashes_with_field_expiry();
-        let mut remaining = 0usize;
-        for key in &hash_keys {
-            match db.reap_expired_fields_one_hash(key.as_bytes()) {
-                ReapOutcome::KeyDeleted => {
-                    db.remove(key.as_bytes());
-                }
-                ReapOutcome::Downgraded => {}
-                ReapOutcome::FieldsRemoved | ReapOutcome::NoOp => remaining += 1,
-            }
+    // ── Sweep 2: deadline-ordered hash-field expiry (moon#543) ──────────────
+    //
+    // Termination: each iteration retires the popped pair and re-arms `key`
+    // at the hash's FRESH minimum. Either that minimum is past `now_ms` (the
+    // head moves on) or the reap just removed at least one field (the total
+    // field count strictly decreases) — because `min <= now_ms` means an
+    // expired field existed, so the reap cannot have been a no-op. The two
+    // caps and the budget bound the loop from above regardless.
+    //
+    // Clock: sweep 2 reaps against `db.now_ms()`, NOT sweep 1's
+    // `current_time_ms()`. The hash read path filters `ttls` against
+    // `Database::cached_now_ms`, so reaping against anything ahead of it
+    // could physically drop a field that reads still consider live. In
+    // production both are the same shard clock; the divergence only exists
+    // for `set_cached_now_ms_for_test`.
+    let hash_now_ms = db.now_ms();
+    let mut visited = 0u32;
+    while let Some((ts, key)) = db.peek_due_hash_expiry(hash_now_ms) {
+        if db.reap_expired_fields_one_hash_at(
+            key.as_bytes(),
+            hash_now_ms,
+            HASH_SWEEP_MAX_FIELDS_PER_KEY,
+        ) == ReapOutcome::KeyDeleted
+        {
+            db.remove(key.as_bytes());
         }
-        if remaining == 0 {
-            db.clear_hash_field_ttl_latch();
+        db.rearm_hash_expiry(ts, &key);
+        visited += 1;
+        if visited >= HASH_SWEEP_MAX_KEYS_PER_TICK || start.elapsed() >= budget {
+            break;
         }
     }
 
@@ -273,6 +328,266 @@ mod tests {
 
         // Keys without expiry should remain
         assert_eq!(db.len(), 5 + 3); // alive + noexpiry
+    }
+
+    // ── moon#543 / moon#552: bounded, deadline-indexed sweeps ────────────
+
+    use crate::storage::db::HashTtlCond;
+
+    /// Build `count` hashes, each holding one field whose TTL has elapsed.
+    /// The TTL is set in the future and the DB clock stepped past it
+    /// afterwards, because `hash_set_field_ttl` deletes an already-past field
+    /// inline — the fields must land in the sidecar for the SWEEP to find.
+    fn db_with_due_field_hashes(count: u32) -> Database {
+        let mut db = Database::new();
+        let ttl = db.now_ms() + 1_000;
+        for i in 0..count {
+            let key = format!("h{i}");
+            {
+                let map = db.get_or_create_hash(key.as_bytes()).expect("hash");
+                map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+            }
+            assert_eq!(
+                db.hash_set_field_ttl(key.as_bytes(), b"f", ttl, HashTtlCond::Always),
+                Ok(1)
+            );
+        }
+        // Step the DB clock past the deadline: the fields are now
+        // expired-but-not-reaped, which is exactly the sweep's input.
+        db.set_cached_now_ms_for_test(ttl + 1);
+        db
+    }
+
+    /// moon#543 — THE bound. Sweep 2 used to collect every `HashWithTtl` key
+    /// in the database with a full table scan and reap all of them in one
+    /// tick, on the shard event loop. One cycle must now visit at most
+    /// `HASH_SWEEP_MAX_KEYS_PER_TICK` hashes no matter how many are due.
+    ///
+    /// Deterministic on purpose: the 1ms wall-clock budget alone would make
+    /// this assertion machine-speed dependent (a fast host reaps all 5000
+    /// inside the budget), which is exactly why the hard key cap exists.
+    #[test]
+    fn hash_field_sweep_is_bounded_per_tick() {
+        const DUE: u32 = 5_000;
+        let mut db = db_with_due_field_hashes(DUE);
+        assert_eq!(db.len(), DUE as usize);
+
+        expire_cycle(&mut db, &mut |_| {});
+
+        let reaped = DUE as usize - db.len();
+        assert!(
+            reaped >= 1,
+            "the sweep must always make progress, reaped {reaped}"
+        );
+        assert!(
+            reaped <= HASH_SWEEP_MAX_KEYS_PER_TICK as usize,
+            "sweep 2 is unbudgeted: {reaped} hashes reaped in ONE tick \
+             (cap is {HASH_SWEEP_MAX_KEYS_PER_TICK})"
+        );
+    }
+
+    /// The bound must not become a leak: repeated ticks drain the whole
+    /// backlog, and the index empties with it.
+    #[test]
+    fn hash_field_sweep_drains_backlog_across_ticks() {
+        const DUE: u32 = 1_200;
+        let mut db = db_with_due_field_hashes(DUE);
+
+        let mut ticks = 0;
+        while db.len() > 0 && ticks < 64 {
+            expire_cycle(&mut db, &mut |_| {});
+            ticks += 1;
+        }
+
+        assert_eq!(db.len(), 0, "every all-fields-expired hash must be removed");
+        assert_eq!(
+            db.hash_expiry_index_len(),
+            0,
+            "the hash-field index must empty with the backlog"
+        );
+        assert!(
+            !db.hash_field_ttl_possible(),
+            "with nothing indexed the sweep must be skippable again"
+        );
+        assert!(
+            ticks > 1,
+            "with {DUE} due hashes and a {HASH_SWEEP_MAX_KEYS_PER_TICK} cap \
+             the drain must take more than one tick"
+        );
+    }
+
+    /// A single enormous hash must not stall the loop either: one reap call
+    /// removes at most `max_fields`, and the hash is picked up again.
+    #[test]
+    fn one_reap_call_removes_at_most_max_fields() {
+        let mut db = Database::new();
+        let ttl = db.now_ms() + 1_000;
+        {
+            let map = db.get_or_create_hash(b"big").expect("hash");
+            for i in 0..100u32 {
+                map.insert(Bytes::from(format!("f{i}")), Bytes::from_static(b"v"));
+            }
+        }
+        for i in 0..100u32 {
+            let f = format!("f{i}");
+            assert_eq!(
+                db.hash_set_field_ttl(b"big", f.as_bytes(), ttl, HashTtlCond::Always),
+                Ok(1)
+            );
+        }
+        db.set_cached_now_ms_for_test(ttl + 1);
+
+        let outcome = db.reap_expired_fields_one_hash_at(b"big", db.now_ms(), 4);
+        assert_eq!(outcome, ReapOutcome::FieldsRemoved);
+        let live = db.get_hash(b"big").expect("hash").expect("exists").len();
+        assert_eq!(
+            live, 96,
+            "exactly 4 of the 100 due fields may leave in one capped call"
+        );
+
+        // The whole hash still drains once the sweep resumes it.
+        let mut ticks = 0;
+        while db.len() > 0 && ticks < 64 {
+            expire_cycle(&mut db, &mut |_| {});
+            ticks += 1;
+        }
+        assert_eq!(db.len(), 0);
+    }
+
+    /// The sweep must touch only DUE hashes — the pre-#543 implementation
+    /// called `reap_expired_fields_one_hash` on every `HashWithTtl` key in
+    /// the database, due or not, at O(N) table-scan cost per tick.
+    #[test]
+    fn hash_field_sweep_visits_only_due_hashes() {
+        let mut db = Database::new();
+        let future = db.now_ms() + 3_600_000;
+        for i in 0..500u32 {
+            let key = format!("live{i}");
+            {
+                let map = db.get_or_create_hash(key.as_bytes()).expect("hash");
+                map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+            }
+            assert_eq!(
+                db.hash_set_field_ttl(key.as_bytes(), b"f", future, HashTtlCond::Always),
+                Ok(1)
+            );
+        }
+        {
+            let map = db.get_or_create_hash(b"due").expect("hash");
+            map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        }
+        let soon = db.now_ms() + 1_000;
+        assert_eq!(
+            db.hash_set_field_ttl(b"due", b"f", soon, HashTtlCond::Always),
+            Ok(1)
+        );
+        db.set_cached_now_ms_for_test(soon + 1);
+
+        expire_cycle(&mut db, &mut |_| {});
+
+        assert_eq!(db.len(), 500, "only the due hash may be reaped");
+        assert!(db.data().get(b"due").is_none());
+        assert_eq!(
+            db.hash_expiry_index_len(),
+            500,
+            "the live hashes stay indexed at their own deadlines"
+        );
+    }
+
+    // ── moon#552: skip the cycle when nothing is due ─────────────────────
+
+    /// The head-peek gate must answer "nothing due" for a TTL-HEAVY database
+    /// whose keys simply are not due yet — the case the
+    /// `maybe_has_expiring_keys` latch never covered.
+    #[test]
+    fn nothing_due_gate_covers_a_ttl_heavy_but_idle_database() {
+        let mut db = Database::new();
+        let now = current_time_ms();
+        for i in 0..1_000u32 {
+            db.set(
+                Bytes::from(format!("k{i}")),
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), now + 3_600_000),
+            );
+        }
+        assert!(db.maybe_has_expiring_keys(), "the old latch stays up");
+        assert!(
+            nothing_due(&db),
+            "1000 not-yet-due TTLs must not make the tick do work"
+        );
+
+        // One due key flips it.
+        db.set(
+            Bytes::from_static(b"due"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), now - 1),
+        );
+        assert!(!nothing_due(&db));
+    }
+
+    /// A due HASH FIELD must also defeat the gate — otherwise #552's skip
+    /// would silently disable sweep 2 for every database with no whole-key
+    /// TTLs at all.
+    #[test]
+    fn nothing_due_gate_respects_due_hash_fields() {
+        let mut db = db_with_due_field_hashes(1);
+        assert!(
+            db.expiry_index_is_empty(),
+            "no whole-key TTL exists in this database"
+        );
+        assert!(!nothing_due(&db), "a due hash field is work");
+
+        let mut removed = 0usize;
+        expire_cycle_direct(&mut db, &mut |_| removed += 1);
+        assert_eq!(db.len(), 0, "the skip must not have swallowed the reap");
+        assert!(nothing_due(&db), "and now there is nothing left to do");
+    }
+
+    /// End-to-end: the skip must not lose a key that becomes due later, and
+    /// must not clear the latch while TTL'd keys remain.
+    #[test]
+    fn skipped_tick_still_expires_the_key_once_it_is_due() {
+        let mut db = Database::new();
+        let now = current_time_ms();
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), now + 3_600_000),
+        );
+
+        let mut removed = 0usize;
+        expire_cycle_direct(&mut db, &mut |_| removed += 1);
+        assert_eq!(removed, 0, "not due yet");
+        assert_eq!(db.len(), 1);
+        assert!(
+            db.maybe_has_expiring_keys(),
+            "a live TTL must keep the sweep armed"
+        );
+
+        // Retarget into the past (SET with a new TTL re-indexes the pair).
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), now - 1),
+        );
+        expire_cycle_direct(&mut db, &mut |_| removed += 1);
+        assert_eq!(removed, 1, "the newly-due key must be expired and emitted");
+        assert_eq!(db.len(), 0);
+    }
+
+    /// An empty database drops the latch through the skip path, so every
+    /// later tick takes the one-branch fast path instead of two head-peeks.
+    #[test]
+    fn skip_path_lowers_the_latch_when_both_indexes_are_empty() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"k"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
+        );
+        db.remove(b"k");
+        assert!(db.maybe_has_expiring_keys(), "latch is still up after DEL");
+
+        expire_cycle_direct(&mut db, &mut |_| {});
+        assert!(
+            !db.maybe_has_expiring_keys(),
+            "the skip path must do the flag maintenance the cycle would have"
+        );
     }
 
     // ── moon#541: deadline-ordered expiry index ──────────────────────────

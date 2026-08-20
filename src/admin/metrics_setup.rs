@@ -55,6 +55,7 @@ static KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
 static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
 static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static EXPIRING_SPILL_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 static NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -937,6 +938,22 @@ pub fn record_eviction() {
     counter!("moon_evicted_keys_total").increment(1);
 }
 
+/// Record an eviction victim that was DROPPED rather than spilled to the
+/// cold tier because its remaining TTL was under
+/// [`crate::storage::eviction::SPILL_TTL_FLOOR_MS`] (moon#553).
+///
+/// Also counted by [`record_eviction`] — this counter answers "how much spill
+/// IO did the TTL guard avoid", which is exactly what makes a benchmark of
+/// the guard non-vacuous: a run where it reads 0 never exercised the guard.
+#[inline]
+pub fn record_expiring_spill_skipped() {
+    EXPIRING_SPILL_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_eviction_expiring_drop_total").increment(1);
+}
+
 // ── Persistence metrics ─────────────────────────────────────────────────
 
 /// Record an AOF fsync duration.
@@ -1795,6 +1812,12 @@ pub fn expired_keys() -> u64 {
 /// Keys removed by the maxmemory eviction policy.
 pub fn evicted_keys() -> u64 {
     EVICTED_KEYS.load(Ordering::Relaxed)
+}
+
+/// Eviction victims dropped instead of spilled because they were about to
+/// expire (moon#553). A subset of [`evicted_keys`].
+pub fn expiring_spill_skipped() -> u64 {
+    EXPIRING_SPILL_SKIPPED.load(Ordering::Relaxed)
 }
 
 /// Connections refused (limit reached, or rejected before handshake).
