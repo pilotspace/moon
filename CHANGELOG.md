@@ -246,6 +246,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drawn from 8 distinct vectors (100x tie sets), is red on the old metric at recall 0.0000, and
   asserts the merged segment is FUNCTIONALLY correct (every one of the k hits is an exact duplicate
   at ~0 distance) so a merely-laxer gate cannot pass it.
+- **`COMMAND GETKEYS` answered "the command has no key arguments" for every movablekeys command**
+  (#537). `getkeys()` decided from `meta.first_key <= 0`, which is true of `LMPOP`, `ZMPOP`,
+  `SINTERCARD`, `ZINTERCARD`, `ZDIFF`/`ZINTER`/`ZUNION`, `BLMPOP`/`BZMPOP`, `EVAL`/`EVALSHA`/
+  `FCALL`/`FCALL_RO`, `XREAD`/`XREADGROUP`, `ZUNIONSTORE`/`ZINTERSTORE` and the `SORT`/`GEORADIUS`
+  `STORE` family. In redis's table — which `COMMAND_META` mirrors — that value means "the keys are
+  not at a FIXED argument position", **not** "there are no keys", so Moon replied with an error
+  whose text was itself false. `COMMAND GETKEYS` is precisely how a cluster-aware client routes a
+  command it cannot parse itself, so such a client either refused to route these commands or
+  guessed. `getkeys()` now delegates to the shared walker in `acl::keyspec` — the same one ACL
+  `~pattern` enforcement and client-side cache invalidation consume, so the three answers cannot
+  drift apart again (the drift #537 called "the deeper problem"). All four of redis's error strings
+  are reproduced, in redis's order: the no-keys check runs BEFORE arity, which is observable
+  (`COMMAND GETKEYS SELECT` reports no-keys even though its arity is also wrong), and an argv whose
+  keys cannot be enumerated now says `Invalid arguments specified for command` rather than lying
+  about the command having none. `EVAL`/`EVALSHA`/`FCALL`/`FCALL_RO` carry redis's
+  `no-mandatory-keys` flag, so `EVAL <script> 0` — and an unparsable count — reply with an empty
+  array instead. Verified on the wire against `redis-server 8.6.1`: 87/87 probes byte-identical on
+  both runtimes (monoio and tokio) at 1 and 4 shards. Two deliberate divergences remain, both on
+  argv that cannot execute anyway: a repeated `STORE` reports every destination where redis keeps
+  only the last (a superset, so ACL still checks both), and a container command missing its key
+  (`OBJECT ENCODING`) reports the no-keys error where redis reports its subcommand's arity error.
+- **`CLIENT TRACKING` over-invalidated: the read-only SOURCES of `*STORE` commands were pushed as
+  changed** (#584). The invalidation hook used every key a write command NAMED; redis pushes only
+  what it MODIFIES (`signalModifiedKey`). A client caching `a` was told `a` had changed by
+  `ZUNIONSTORE d 2 a b`, `SINTERSTORE d a b`, `BITOP AND d a b`, `PFMERGE d a b`, `COPY a d`,
+  `ZRANGESTORE d a ...`, `GEOSEARCHSTORE d a ...` or `SORT a STORE d`; worse, a plain `SORT src`
+  (a write-flagged command that writes nothing without `STORE`) invalidated `src` unconditionally.
+  Each spurious push costs the client a dropped cache entry and a refetch. The shared walker now
+  reports a per-position `KeyRole` — the `RO`/`OW` distinction redis carries in its key specs and
+  `first_key`/`last_key`/`step` cannot express — and `invalidate_after_write` uses only the
+  writable positions. ACL is unchanged by construction: it ignores the role, because a `~pattern`
+  gates reads and writes alike. Roles are deliberately over-inclusive where the argv genuinely
+  cannot say: `LMPOP 2 a b LEFT` pops from whichever key is non-empty at execution time and `EVAL`
+  may write any key it was handed, so those stay writable — over-invalidating costs a refetch,
+  under-invalidating leaves a cache stale forever (#582). Verified against `redis-server 8.6.1`
+  with destination CONTROLS on every case (a fix that simply stopped pushing would fail all of
+  them): 25/27 identical on both runtimes at 1 and 4 shards, the two residuals being the known
+  `LMPOP` limit above and `GEORADIUS ... STORE`, which Moon rejects as a syntax error today
+  (a pre-existing gap, unrelated to this change).
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

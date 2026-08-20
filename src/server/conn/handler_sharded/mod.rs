@@ -2449,7 +2449,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let track_keys = if crate::tracking::tracking_active()
                             && metadata::is_write(cmd)
                         {
-                            Some(crate::tracking::invalidation::command_keys(cmd, cmd_args))
+                            Some(crate::tracking::invalidation::written_keys(cmd, cmd_args))
                         } else {
                             None
                         };

@@ -67,12 +67,14 @@ fuzz_target!(|data: &[u8]| {
     match &positions {
         KeyPositions::At(idx) => {
             assert!(!idx.is_empty(), "At is documented as never empty");
-            for &i in idx.iter() {
+            for k in idx.iter() {
+                let i = k.idx;
                 assert!(i < argc, "At position {i} out of bounds for argc {argc}");
             }
         }
         KeyPositions::AtPlusComputed(idx) => {
-            for &i in idx.iter() {
+            for k in idx.iter() {
+                let i = k.idx;
                 assert!(
                     i < argc,
                     "AtPlusComputed position {i} out of bounds for argc {argc}"
@@ -116,6 +118,24 @@ fuzz_target!(|data: &[u8]| {
 
     // --- consumer 2: cache invalidation, which must NOT fail closed ---
     let tracked = invalidation::command_keys(&cmd, &args);
+    // moon#584: only the WRITE positions may be pushed to a tracking client as
+    // changed. This is a strict subset of what the command names, and the
+    // subset relation is the property — a `written_keys` that could name a key
+    // `command_keys` does not is an invalidation of a key the argv never
+    // mentioned.
+    let written = invalidation::written_keys(&cmd, &args);
+    assert!(
+        written.len() <= tracked.len(),
+        "written_keys ({}) must be a subset of command_keys ({})",
+        written.len(),
+        tracked.len()
+    );
+    for w in written.iter() {
+        assert!(
+            tracked.contains(w),
+            "written_keys named a key the command does not"
+        );
+    }
     match &positions {
         KeyPositions::None | KeyPositions::Unknown => {
             assert!(
@@ -134,5 +154,23 @@ fuzz_target!(|data: &[u8]| {
                 idx.len()
             );
         }
+    }
+
+    // --- consumer 3: COMMAND GETKEYS (moon#537) ---
+    //
+    // The walker's own bounds property already covers the extraction; what
+    // this pins is the ANSWER SHAPE, which is what a cluster client routes on.
+    // `command_has_keys` is a STATIC claim, so it must never contradict a
+    // walker that just named positions: "this command has no key arguments" is
+    // the exact lie moon#537 filed.
+    let has_keys = moon::acl::keyspec::command_has_keys(&cmd, &args);
+    if matches!(
+        &positions,
+        KeyPositions::At(_) | KeyPositions::AtPlusComputed(_)
+    ) {
+        assert!(
+            has_keys,
+            "walker named key positions but command_has_keys said no"
+        );
     }
 });

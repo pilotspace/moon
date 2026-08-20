@@ -28,6 +28,14 @@ impl CommandFlags {
     pub const NO_AUTH: Self = Self(1 << 10);
     pub const MAY_REPLICATE: Self = Self(1 << 11);
     pub const SORT_FOR_SCRIPT: Self = Self(1 << 12);
+    /// Redis's `no-mandatory-keys`: the command takes its key COUNT from an
+    /// argument, so naming zero keys is a legitimate outcome rather than a
+    /// malformed invocation.
+    ///
+    /// `COMMAND GETKEYS` is the only consumer: `EVAL <script> 0` (and an
+    /// unparsable count, which redis treats the same way) replies with an
+    /// empty array, where every other command replies with an error.
+    pub const NO_MANDATORY_KEYS: Self = Self(1 << 13);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -424,12 +432,12 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "SUNSUBSCRIBE" => CommandMeta { name: "SUNSUBSCRIBE", arity: -1, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
 
     // ---- Scripting commands ----
-    "EVAL" => CommandMeta { name: "EVAL", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
-    "EVALSHA" => CommandMeta { name: "EVALSHA", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "EVAL" => CommandMeta { name: "EVAL", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "EVALSHA" => CommandMeta { name: "EVALSHA", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "SCRIPT" => CommandMeta { name: "SCRIPT", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "FUNCTION" => CommandMeta { name: "FUNCTION", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
-    "FCALL" => CommandMeta { name: "FCALL", arity: -3, flags: W, first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
-    "FCALL_RO" => CommandMeta { name: "FCALL_RO", arity: -3, flags: R, first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
+    "FCALL" => CommandMeta { name: "FCALL", arity: -3, flags: CommandFlags(CommandFlags::WRITE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
+    "FCALL_RO" => CommandMeta { name: "FCALL_RO", arity: -3, flags: CommandFlags(CommandFlags::READONLY.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
 
     // ---- Transaction commands ----
     "MULTI" => CommandMeta { name: "MULTI", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
