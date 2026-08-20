@@ -1452,11 +1452,16 @@ pub(crate) fn cross_shard_write_rejection(
         }
     };
     let mut owner: Option<usize> = None;
-    for i in idx {
+    // Every position, whatever its `KeyRole` (moon#537 gave the walker
+    // read/write roles). The routed shard executes the WHOLE command against
+    // its own slice, so a remote READ source is just as broken as a remote
+    // write target: `SINTERSTORE dst src` reads an empty `src` and stores a
+    // confidently wrong answer. Co-location is required for both.
+    for k in idx {
         // Borrowed, not cloned: this runs before routing on every command in
         // the family, and a key position holding a non-string is a malformed
         // invocation — let the command reject it in its own words.
-        let key: &[u8] = match args.get(i) {
+        let key: &[u8] = match args.get(k.idx) {
             Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
             _ => return None,
         };
