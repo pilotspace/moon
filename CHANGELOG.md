@@ -373,6 +373,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SCRIPT LOAD` on the server under test, the one command that already fanned out (it now uses a
   hard-coded SHA1 moon cannot influence), and the republish assertion counted log lines where one
   round already emits one per peer.
+- **`volatile-ttl` eviction could spin the shard thread forever on an index-only victim**
+  (#600). `find_victim_volatile_ttl` returned the head of the deadline index verbatim, with no
+  cross-check against the keyspace — the only sampler that does, because it is the only one that
+  reads a *maintained index* instead of iterating occupied DashTable slots. Every caller's sole
+  way to make progress is `db.remove`, so a `(deadline, key)` pair whose hot entry is gone is not
+  a victim, it is a non-terminating loop: `evict_one_with_spill` returned `true` while removing
+  nothing, `before == after`, `current_total` never moved, and the next iteration peeked the very
+  same head pair. The failure mode is silent and total — no `OOM` reply, no log line, no metric:
+  the shard thread spins at 100%, the instance stays over `maxmemory`, and every client on that
+  shard simply stops being served. Reproduced with a unit test that runs `evict_to_budget` on a
+  worker thread behind a 10 s watchdog: before the fix the watchdog fires (the call never
+  returns); after it, the same call completes in 0.1 s having evicted every live victim.
+
+  Two layered guarantees, because "the sampler is now correct" and "the loop cannot hang" are
+  different claims and the second must not depend on the first:
+
+  - **The sampler verifies and self-heals.** `find_victim_volatile_ttl` now walks the index head
+    and reaps any pair that is *provably* stale, using byte-for-byte the predicate the active
+    expiry sweep already uses (`src/server/expiration.rs`): the entry is gone, or it carries a
+    different deadline than the pair claims. Anything else is left untouched — in particular a
+    valid pair that merely is not due yet, which is why no clock is read here at all. Reaping,
+    not skipping, is what `Database::drop_expiry_index_pair` exists for and what its doc comment
+    already warned about: without it the next peek walks the same head again. Termination is
+    structural — each non-returning iteration removes exactly the pair it peeked, so the walk is
+    bounded by the index length — and a further per-tick cap of 64 keeps a large leaked backlog
+    off the 100 ms sweep; the reaping is permanent, so successive ticks converge, and exhausting
+    the cap logs a `warn!` naming the writer-coverage bug rather than failing quietly.
+
+  - **The loop terminates regardless of the sampler.** `evict_to_budget` now judges progress on
+    an OBSERVATION rather than on the sink's claim: `(estimated_memory, pending_spill_bytes,
+    hot key count)` sampled between victims. Sixteen consecutive victims that move none of the
+    three answers `OOM` with a `warn!` instead of looping. A bounded, visible, retryable error
+    is strictly better than a spun shard. The probe is a triple and not a byte count on purpose —
+    async spill (moon#466) moves a value from the hot plane to the pending plane and leaves
+    `estimated_memory` flat, so a bytes-only test would call a working reclaim stalled and
+    convert it into a rejection; the counter also resets on the first real progress, so slow
+    reclaim can never accumulate into a false `OOM`. Verified by mutation: with the sampler fix
+    removed the loop stops spinning and answers `OOM` in 0.14 s, and with both removed it hangs.
+
+  moon#599's accounting distinction is preserved exactly, and neither change touches it: reaping
+  a stale pair is a repair, not an eviction — the key it names is already absent from the
+  keyspace, so `DBSIZE` cannot move and no counter is recorded. Confirmed end to end on a live
+  server in both destinations: with `--disk-offload disable` 2,415 victims were DROPPED
+  (`evicted_keys` 2,415, `spilled_keys` 0, `DBSIZE` 3,585), and with disk offload on the same
+  2,415 were TIERED (`spilled_keys` 2,415, `evicted_keys` 0, `DBSIZE` unchanged at 6,000 and the
+  tiered keys still readable) — `evicted_keys + DBSIZE == keys written` in both. `noeviction` is
+  unaffected: its gate runs before any victim is selected, so it still answers `OOM` immediately
+  and, deliberately, does not even reap the stale pair — it promises not to mutate the keyspace.
+
+  No producer of a stale pair is known today: `self.data.remove` appears exactly once in the
+  codebase (inside `Database::remove_hot`, which un-indexes the entry's own pair), and
+  `debug_expiry_index_consistent` is an oracle over every TTL writer. This is the defence being
+  present on a path where the equivalent path already had one, because the cost of being wrong is
+  an unreachable shard rather than a wrong number.
 - **The two-key write family acknowledged success while destroying the data at `--shards > 1`**
   (#592). Moon routes a command to ONE shard — the owner of the key `extract_primary_key` picks —
   and that shard then executes the whole command against its own slice. `first_key` names the
