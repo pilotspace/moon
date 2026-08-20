@@ -306,9 +306,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly when they are least able to. `maxmemory`, `db-maxmemory`'s byte half, the `--maxmemory`
   CLI flag and therefore `moon.conf` now share one parser reproducing redis's `memtoull()`
   exactly, including its two-scale rule (`1k` = 1000 but `1kb` = 1024, same for `m`/`mb` and
-  `g`/`gb`) and its rejections (`1.5gb`, `4 gb`, `-1`, `+4gb`, unknown units, overflow). This also
+  `g`/`gb`), its rejections (`1.5gb`, `4 gb`, `-1`, `+4gb`, unknown units) and — verified against
+  a live `redis-server` 8.6.1 rather than read off its source — its refusal of *surrounding*
+  whitespace: redis rejects `" 4gb"`, `"4gb "` and even `"1024 "`, so Moon does too. This also
   fixes startup: `moon.conf` synthesises CLI arguments, so the `maxmemory 1gb` line in Moon's own
-  conf-file documentation used to fail the parse.
+  conf-file documentation used to fail the parse (the conf-file parser trims each value itself, so
+  padded conf lines keep working). One deliberate deviation, in the safe direction: redis does not
+  check `strtoull` for `ERANGE`, so it saturates on a bare integer and *wraps* with a suffix —
+  `CONFIG SET maxmemory 17179869184gb` returns `OK` and reads back **0**, silently disarming the
+  memory limit. Moon rejects overflow instead, surfacing the typo.
 - **`used_memory` did not count spilled-but-not-yet-written values** (#466). A victim queued for
   async spill has its whole entry cost credited back to the ledger while a full copy of the value
   is still pinned in RAM — by the queued `SpillRequest` and, since #459, by the in-flight plane

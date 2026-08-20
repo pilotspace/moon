@@ -1542,10 +1542,31 @@ pub fn parse_db_maxmemory_entries(raw: &[String], num_databases: usize) -> Vec<u
 ///   rejected, exactly as redis rejects them (redis's scan stops at the first
 ///   non-digit, so the "suffix" becomes `.5gb` and fails the unit match);
 /// * an **empty** numeric part (`"gb"`, `""`) is rejected;
-/// * no internal or trailing whitespace is accepted (`"4 gb"` is invalid) —
-///   only leading/trailing trim, matching what `CONFIG SET` receives after
-///   protocol parsing;
-/// * overflow is an error rather than a wrap.
+/// * **no whitespace at all**, not even surrounding — `" 4gb"`, `"4gb "` and
+///   even `"1024 "` are rejected. Measured against `redis-server 8.6.1`, which
+///   rejects every one of them: `memtoull` scans from the first character, so
+///   a leading space yields zero digits and a trailing space makes the suffix
+///   `"gb "`, matching no unit. An earlier revision of this function trimmed,
+///   which made moon MORE permissive than redis; the oracle diff caught it.
+///   (`moon.conf` still works: its parser trims the value before synthesising
+///   the CLI argument. `--db-maxmemory <db>:<bytes>` trims at its own call
+///   site, preserving that flag's documented leniency.)
+///
+/// # The one deliberate deviation: overflow
+///
+/// Redis does not check `strtoull`'s `ERANGE`, so it SATURATES on plain
+/// integers and WRAPS when a suffix is applied. Measured on 8.6.1:
+///
+/// ```text
+/// CONFIG SET maxmemory 18446744073709551616  -> OK, reads back 18446744073709551615
+/// CONFIG SET maxmemory 18446744073709551615gb -> OK, reads back 18446744072635809792
+/// CONFIG SET maxmemory 17179869184gb          -> OK, reads back 0   ← UNLIMITED
+/// ```
+///
+/// That last line is why this function returns `Err` instead: replicating it
+/// would let a fat-fingered cap silently disarm the memory limit entirely.
+/// Refusing the value surfaces the typo instead of turning it into an
+/// unbounded server. Deviating in the SAFE direction, and only here.
 ///
 /// Used by `CONFIG SET maxmemory` / `db-maxmemory`, by the `--maxmemory` CLI
 /// flag, and therefore by `moon.conf` (whose parser synthesises the CLI
@@ -1557,7 +1578,8 @@ pub fn parse_db_maxmemory_entries(raw: &[String], num_databases: usize) -> Vec<u
 /// about. Leave those alone: changing `1g` from "invalid" to "1 000 000 000"
 /// there would silently re-scale existing deployments' configs.
 pub fn parse_memory_bytes(s: &str) -> Result<u64, &'static str> {
-    let s = s.trim();
+    // NOT trimmed, deliberately — see the whitespace rule above. redis rejects
+    // surrounding whitespace and so must this.
     let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (digits, suffix) = s.split_at(digits_end);
     if digits.is_empty() {
@@ -1612,8 +1634,11 @@ pub fn parse_one_db_maxmemory_entry(entry: &str) -> Result<(usize, u64), &'stati
         .parse::<usize>()
         .map_err(|_| "non-numeric db index")?;
     // moon#586: the byte half takes the same redis memory-unit suffixes
-    // `maxmemory` does, so `--db-maxmemory 3:512mb` works.
-    let bytes = parse_memory_bytes(bytes_str).map_err(|_| "non-numeric byte count")?;
+    // `maxmemory` does, so `--db-maxmemory 3:512mb` works. Trimmed HERE, not
+    // inside `parse_memory_bytes` (which must reject whitespace for redis
+    // parity): this flag's `<db>:<bytes>` form has always tolerated spaces
+    // around each half, and the index half above still does.
+    let bytes = parse_memory_bytes(bytes_str.trim()).map_err(|_| "non-numeric byte count")?;
     Ok((idx, bytes))
 }
 
@@ -2731,7 +2756,45 @@ mod tests {
         assert_eq!(parse_memory_bytes("512B"), Ok(512));
         assert_eq!(parse_memory_bytes("1048576"), Ok(1_048_576));
         assert_eq!(parse_memory_bytes("0"), Ok(0));
-        assert_eq!(parse_memory_bytes("  4gb  "), Ok(4_294_967_296));
+    }
+
+    /// Whitespace is NOT tolerated, in any position — measured against
+    /// `redis-server 8.6.1`, which rejects every one of these. An earlier
+    /// revision trimmed and was therefore more permissive than redis; the
+    /// oracle diff caught it. `moon.conf` is unaffected (its parser trims the
+    /// value before synthesising the CLI argument).
+    #[test]
+    fn parse_memory_bytes_rejects_surrounding_whitespace_like_redis() {
+        for bad in [
+            " 4gb", "4gb ", "  4gb  ", " 1024", "1024 ", "\t4gb", "4gb\n",
+        ] {
+            assert!(
+                parse_memory_bytes(bad).is_err(),
+                "redis rejects {bad:?}; moon must not be more permissive"
+            );
+        }
+    }
+
+    /// The one deliberate deviation from redis, in the SAFE direction.
+    ///
+    /// redis does not check `strtoull`'s `ERANGE`: it saturates on plain
+    /// integers and WRAPS with a suffix. Measured on 8.6.1,
+    /// `CONFIG SET maxmemory 17179869184gb` returns OK and reads back **0** —
+    /// i.e. a fat-fingered cap silently disarms the memory limit. Moon
+    /// refuses instead, surfacing the typo.
+    #[test]
+    fn parse_memory_bytes_refuses_overflow_rather_than_wrapping_to_unlimited() {
+        // The exact value that makes redis 8.6.1 answer 0 (= unlimited).
+        assert!(parse_memory_bytes("17179869184gb").is_err());
+        // …and the saturating plain-integer cases.
+        assert!(parse_memory_bytes("18446744073709551616").is_err());
+        assert!(parse_memory_bytes("18446744073709551615gb").is_err());
+        // The largest value that genuinely fits is still accepted.
+        assert_eq!(
+            parse_memory_bytes("18446744073709551615"),
+            Ok(u64::MAX),
+            "no false rejection at the boundary"
+        );
     }
 
     #[test]
@@ -2769,6 +2832,18 @@ mod tests {
             ServerConfig::try_parse_from(["moon", "--maxmemory", "1.5gb"]).is_err(),
             "an invalid unit must fail the parse, not be silently ignored"
         );
+    }
+
+    /// moon#586: removing the `trim()` from [`parse_memory_bytes`] (redis
+    /// rejects surrounding whitespace) must NOT make padded conf-file lines
+    /// fail — the conf-file parser already trims each value before it
+    /// synthesises the CLI argument. This pins the whole chain.
+    #[test]
+    fn padded_conf_file_maxmemory_line_still_parses() {
+        let argv = crate::config::conf_file::parse_conf_contents("maxmemory   1gb   \n")
+            .expect("padded conf line must parse");
+        let config = ServerConfig::parse_from(std::iter::once("moon".to_string()).chain(argv));
+        assert_eq!(config.maxmemory, Some(1_073_741_824));
     }
 
     /// moon#586 sweep: `--db-maxmemory <db>:<bytes>` takes the same suffixes.

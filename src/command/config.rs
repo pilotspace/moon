@@ -478,17 +478,14 @@ mod tests {
     /// the operator did not ask for.
     #[test]
     fn config_set_maxmemory_rejects_what_redis_rejects() {
-        // Surrounding whitespace is trimmed, not an error — only whitespace
-        // INSIDE the value (below) is rejected.
-        let mut rt = RuntimeConfig::default();
-        assert_eq!(
-            config_set(&mut rt, &make_args(&[b"maxmemory", b"4gb "])),
-            Frame::SimpleString(Bytes::from_static(b"OK"))
-        );
         for input in [
             &b"1.5gb"[..], // redis scans digits only: '.' ends the number
             b"4 gb",       // internal space
-            b"-1",         // memtoull refuses a leading '-'
+            b" 4gb",       // leading space: redis 8.6.1 rejects (measured)
+            b"4gb ",       // trailing space: likewise
+            b"  4gb  ",
+            b"1024 ", // even a bare integer with trailing space is rejected
+            b"-1",    // memtoull refuses a leading '-'
             b"+4gb",
             b"4tb", // unknown unit
             b"gb",  // no digits

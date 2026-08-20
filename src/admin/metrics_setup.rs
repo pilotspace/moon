@@ -962,6 +962,7 @@ pub fn record_expiring_spill_skipped() {
         return;
     }
     counter!("moon_eviction_expiring_drop_total").increment(1);
+}
 
 /// Record one key MOVED FROM RAM TO DISK by the eviction sweep.
 ///
@@ -1849,6 +1850,7 @@ pub fn evicted_keys() -> u64 {
 /// expire (moon#553). A subset of [`evicted_keys`].
 pub fn expiring_spill_skipped() -> u64 {
     EXPIRING_SPILL_SKIPPED.load(Ordering::Relaxed)
+}
 
 /// Keys MOVED FROM RAM TO DISK by the maxmemory eviction policy.
 ///
