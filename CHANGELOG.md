@@ -207,6 +207,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same database happened to hold a TTL, its expired fields were never actively reaped at all.
   - New `benches/expiry_sweep.rs` measures one tick in all three shapes; the bounded-sweep and
     spill-guard tests were each verified to FAIL against the pre-fix behaviour.
+- **Recovery re-walked and re-warned about dead warm-segment manifest entries on every boot, forever**
+  (#546). A warm vector segment is retired by deleting its directory, but the manifest entry was left
+  `Active` on the stated grounds that recovery "already tolerates" a manifest entry whose directory is
+  missing. It does tolerate it — by logging `manifest references warm segment N but directory missing`
+  and moving on, every single boot, because recovery opened the manifest read-only and never wrote
+  back. Nothing ever retired the entry, so the dead entries could only accumulate: a live instance
+  logged **13,214 of these warnings against 55 real segment directories**, and separately 5,096
+  `failed to read mvcc.mpf for ownership attribution` for the same vanished segments. Recovery is the
+  only component positioned to observe the discrepancy, so it now heals it: entries whose directory is
+  gone are tombstoned via the existing `remove_file` path and committed in a **single** manifest
+  generation (one dual-root swap for the whole batch, not one per entry — a store with thousands of
+  stale entries would otherwise pay thousands of swaps on the boot path). The existing two-axis
+  retention in `gc_tombstones` still governs when entries are physically pruned. Tombstoning is safe in
+  exactly the way deleting the directory already was: the data is gone, so no reader can be served from
+  the entry either way. A commit failure is non-fatal and logged — recovery proceeds identically, since
+  the entries are skipped regardless. Live segments are untouched, which the new test asserts
+  explicitly in both directions (dead entries must be retired AND the live entry must stay `Active`),
+  re-opening the manifest from its path so an in-memory-only retirement cannot pass.
 - **GraphUnion segment merges were rejected forever on any index carrying duplicate vectors, so
   segments accumulated without bound** (#546). `verify_merge_recall` gates every merge on a recall
   measurement that scored an **ID-set overlap**: it took the brute-force top-k ids and intersected
