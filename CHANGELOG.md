@@ -32,6 +32,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
 
 ### Fixed
+- **Inline commands terminated by bare LF were never dispatched, and an interior LF silently merged
+  two commands into one** (#381). Moon's inline parser searched for `\r\n` and, on finding a lone
+  `\r`, kept scanning; Redis's `processInlineBuffer` searches for `\n` and then strips at most one
+  preceding `\r`. Two consequences, both measured against redis-server 8.0.5 over raw sockets:
+  a bare-LF stream (shell loops, `awk` output, anything piped into `redis-cli --pipe`) never
+  terminated a line, so the command was never dispatched and the client simply **hung** — and,
+  worse, `SET k v1\nSET k v2\r\n` skipped the interior `\n` to reach the trailing `\r\n` and
+  produced ONE command with the second command's arguments appended, a silent write loss rather
+  than a rejection. The terminator is now `\n` with an optional preceding `\r`.
+  The token-separator sets were corrected in the same pass, in both directions: `\r` now ends an
+  unquoted token (Redis's `sdssplitargs` breaks on `{space, \n, \r, \t}`, so `RPUSH k a\rb` is two
+  elements there and was one here), while `\x0b`/`\x0c` no longer do — they are `isspace()` but are
+  NOT Redis token separators, so a line that merely *contained* a quote used to split `a\x0bb` while
+  the same line without one did not. Redis reads two different sets here (`isspace()` to skip
+  between tokens and to validate the byte after a closing quote; an explicit 5-byte list to end a
+  token) and Moon now does too; the skip set remains a strict superset of the terminator set, which
+  is the invariant that keeps the #487 livelock fixed. `\0` is deliberately unchanged — redis-server
+  returns nothing at all for an inline line containing a NUL, so there is no oracle to match.
+  The inline fuzz target now drives the pipelined drain loop with a forward-progress assertion and
+  replays every corpus entry a second time with CRLF rewritten to bare LF.
+- **A blank inline line stalled the command queued behind it** (#578). `parse_inline` correctly
+  consumes an empty line and returns `Ok(None)`, but `Ok(None)` also means "need more bytes", and
+  every read loop acts on that second meaning — so `\r\n\r\nPING\r\n` arriving in ONE read left the
+  `PING` unparsed until unrelated later traffic happened to wake the loop, where redis-server
+  answers immediately. This needed no bare LF and predates #381. Fixed in `protocol::parse`, the
+  single funnel the codec and all three connection handlers share, so the fix cannot be
+  CI-invisible in whichever handler was missed; the re-dispatch goes back through the RESP/inline
+  decision, because what follows a blank line is very often a RESP array.
 - **A blocking pop's immediate path consulted the LOCAL shard slice for every key** (#557),
   including keys owned by another shard. The pre-registration scan runs against the connection's
   own `ShardSlice`, where a remote key does not live, so at `--shards N` the fast path missed on
