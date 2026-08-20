@@ -325,6 +325,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   figure would have turned the eviction loop into a runaway that drains the whole database; that
   is why the visibility fix was deferred out of #459, and both halves now ship together under
   test.
+- **A list MOVE to a destination on another shard acked the element and then discarded it**
+  (#570). `BLMOVE`/`BRPOPLPUSH` — and, unreported until now, their non-blocking twins `LMOVE`
+  and `RPOPLPUSH` — are routed by their PRIMARY key, the source, and were then executed whole on
+  that one shard: the pop came off the real source list and the push went into the SOURCE owner's
+  slice under the DESTINATION's name. Every normally-routed read of the destination goes to the
+  destination's OWNER and is blind to that entry, so the client received the moved element as its
+  reply while the element left the keyspace. Measured against the pre-fix binary at `--shards 4`:
+  `BLMOVE` lost 10 of 12 key placements, `RPOPLPUSH` 11 of 12, `LMOVE` 6 of 6 — the survivors are
+  the placements where source and destination happened to be co-located. Silent, acked data loss
+  on a two-key write, the failure mode a durable queue exists to prevent.
+  Moon is shared-nothing across shards: a shard can pop only from keys it owns and push only to
+  keys it owns, and there is no cross-shard commit to split a move across. Such a move is now
+  **refused** with `CROSSSLOT Keys in request don't hash to the same shard; co-locate source and
+  destination with a {hash} tag`, decided from the two key NAMES before anything is popped — so
+  there is no window in which the element exists in neither list, no undo to get wrong under a
+  race or a timeout, and no partial state to recover after a crash. This is the answer Moon
+  already gives for every other operation it cannot perform atomically across shards (a
+  MULTI/EXEC body spanning shards, a script spanning shards, `MSETNX`), and cross-shard `COPY`
+  already degrades to an error naming `{hash}` tags for the types it cannot carry. Splitting the
+  move across a shard hop was rejected as the alternative: it would trade the loss for a
+  non-atomic `LMOVE` — an intermediate state Redis never exposes — plus two independent AOF
+  records with no shared commit point.
+  For the blocking pair the refusal is delivered **immediately**, before a waiter is registered,
+  rather than after the source is served: shard ownership is a static property of the key names,
+  so a client that blocked to its timeout only to learn Moon cannot route its move would have
+  waited for nothing. Three independent guards cover the three execution sites (pre-registration
+  scan, the wake path in `blocking::wakeup`, and pre-routing for the non-blocking pair); each was
+  proven load-bearing by disabling it alone and watching exactly the expected assertions go red.
+  Narrowness is enforced by the same suite: `{hash}`-tagged pairs still move at `--shards 4`,
+  every move still works at `--shards 1` for arbitrary key names, and the rotate form
+  (`LMOVE k k`) is never refused. **Users running `--shards > 1` who move between untagged lists
+  must co-locate the pair with a `{hash}` tag** — previously those moves reported success and
+  destroyed the element.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

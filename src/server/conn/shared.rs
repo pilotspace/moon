@@ -1512,6 +1512,54 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
     }
 }
 
+/// moon#570: the refusal a non-blocking list MOVE is owed when its two keys
+/// are owned by two different shards.
+///
+/// `LMOVE`/`RPOPLPUSH` are routed by their PRIMARY key — the source — and then
+/// executed whole on that one shard, so the push half wrote the element into
+/// the source owner's slice under the destination's name. Every normally
+/// -routed read of the destination goes to the DESTINATION's owner and is
+/// blind to it: measured at `--shards 4`, 11 of 12 key placements returned the
+/// moved element to the client and left it nowhere in the keyspace.
+///
+/// The two blocking twins (`BLMOVE`/`BRPOPLPUSH`) are refused by the same rule
+/// one layer up, in `blocking::immediate_scan`, before they can register a
+/// waiter — see `command::list::cross_shard_move_refusal` for why refusing is
+/// the only answer that cannot lose the element.
+///
+/// Deliberately NOT routed through `coordinate_multi_key` like `COPY`: the
+/// co-located case works correctly today via ordinary primary-key routing,
+/// and moving it onto the coordinator would swap a proven persistence path
+/// for a different one to fix a case that is not broken. This guard changes
+/// nothing except which commands are refused.
+///
+/// Returns `None` for a malformed argv so the command still earns its own
+/// arity error rather than a misleading `CROSSSLOT`.
+pub(crate) fn cross_shard_move_rejection(
+    cmd: &[u8],
+    args: &[Frame],
+    num_shards: usize,
+) -> Option<Frame> {
+    if num_shards <= 1 {
+        return None;
+    }
+    // `LMOVE source destination LEFT|RIGHT LEFT|RIGHT` (arity 5) and
+    // `RPOPLPUSH source destination` (arity 3), minus the command name.
+    let want_args = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+        4
+    } else if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") {
+        2
+    } else {
+        return None;
+    };
+    if args.len() != want_args {
+        return None;
+    }
+    let source = super::util::extract_bytes(args.first()?)?;
+    let destination = super::util::extract_bytes(args.get(1)?)?;
+    crate::command::list::cross_shard_move_refusal(&source, &destination, num_shards)
+}
+
 /// Shard-locality of a queued MULTI/EXEC body.
 ///
 /// `execute_transaction_sharded` runs the whole body on ONE shard's slice with
@@ -2401,6 +2449,47 @@ mod txn_locality_tests {
         let other = other.expect("two keys on different shards must exist across 8 shards");
         let q = [cmd(&["SET", "k0", "1"]), cmd(&["SET", &other, "2"])];
         assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
+
+    /// moon#570: `LMOVE`/`RPOPLPUSH` are refused before routing when their
+    /// two keys are owned by two different shards, and left alone otherwise.
+    #[test]
+    fn cross_shard_move_rejection_fires_only_on_a_real_split() {
+        use super::cross_shard_move_rejection;
+        let bulk = |s: &str| Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()));
+        let n = 4;
+        let base = crate::shard::dispatch::key_to_shard(b"src", n);
+        let far = (0..1000)
+            .map(|i| format!("dst{i}"))
+            .find(|k| crate::shard::dispatch::key_to_shard(k.as_bytes(), n) != base)
+            .expect("a key on another shard must exist");
+
+        let split = [bulk("src"), bulk(&far), bulk("LEFT"), bulk("RIGHT")];
+        assert!(
+            matches!(
+                cross_shard_move_rejection(b"LMOVE", &split, n),
+                Some(Frame::Error(_))
+            ),
+            "a cross-shard LMOVE must be refused before it can write the wrong shard"
+        );
+        assert!(
+            matches!(
+                cross_shard_move_rejection(b"RPOPLPUSH", &split[..2], n),
+                Some(Frame::Error(_))
+            ),
+            "RPOPLPUSH is LMOVE RIGHT LEFT and must answer identically"
+        );
+
+        // Single shard: nothing to refuse.
+        assert!(cross_shard_move_rejection(b"LMOVE", &split, 1).is_none());
+        // Co-located by hash tag: must still run.
+        let tagged = [bulk("{t}:s"), bulk("{t}:d"), bulk("LEFT"), bulk("RIGHT")];
+        assert!(cross_shard_move_rejection(b"LMOVE", &tagged, n).is_none());
+        // Not a move at all.
+        assert!(cross_shard_move_rejection(b"LPUSH", &split, n).is_none());
+        // Malformed argv keeps its own arity error instead of a misleading
+        // CROSSSLOT: a two-arg LMOVE is not an LMOVE.
+        assert!(cross_shard_move_rejection(b"LMOVE", &split[..2], n).is_none());
     }
 
     #[test]

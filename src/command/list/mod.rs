@@ -55,6 +55,70 @@ pub use list_write::rpoplpush;
 pub use list_write::rpush;
 pub use list_write::rpushx;
 
+// ---------------------------------------------------------------------------
+// Cross-shard routing rule for the list MOVE family (moon#570)
+// ---------------------------------------------------------------------------
+
+/// The reply a list MOVE owes its client when its two keys are owned by two
+/// different shards.
+///
+/// Keeps the `CROSSSLOT` prefix every Redis client already recognises as
+/// "co-locate these keys", and names the remedy moon actually supports.
+pub const CROSS_SHARD_MOVE_ERROR: &[u8] =
+    b"CROSSSLOT Keys in request don't hash to the same shard; \
+     co-locate source and destination with a {hash} tag";
+
+/// Is this list MOVE (`LMOVE`/`RPOPLPUSH`/`BLMOVE`/`BRPOPLPUSH`) impossible to
+/// execute without losing the element, and therefore owed a refusal?
+///
+/// moon is shared-nothing across shards: a shard can pop only from keys it
+/// owns and push only to keys it owns. A move whose source and destination
+/// hash to different shards has no shard that can do both halves, and moon has
+/// no cross-shard commit to split it across two. Before this check the pop and
+/// the push both ran on the SOURCE's owner: the element was handed to the
+/// client as the reply and written into that shard's slice under the
+/// destination's name, where every normally-routed read of the destination —
+/// which goes to the DESTINATION's owner — is blind to it. The client was
+/// told the move succeeded and the element was gone (moon#570).
+///
+/// Refusing is the only answer that cannot lose the element:
+///
+/// * it is decided from the two key names alone, before anything is popped, so
+///   there is no window in which the element exists in neither list and no
+///   undo to get wrong under a race, a timeout, or a crash;
+/// * splitting the move across a shard hop would trade the loss for a
+///   non-atomic `LMOVE` — an intermediate state Redis never exposes — plus two
+///   independent AOF records with no shared commit point.
+///
+/// This mirrors what moon already answers for every other operation it cannot
+/// perform atomically across shards: a MULTI/EXEC body spanning shards, a
+/// script spanning shards, and `MSETNX` are all `CROSSSLOT`, and cross-shard
+/// `COPY` degrades to an error naming `{hash}` tags for the types it cannot
+/// carry. `{hash}` tags collapse the pair onto one shard and the move works
+/// exactly as it does at `--shards 1`.
+///
+/// Both keys are hashed with the SAME `key_to_shard` the routing layer uses,
+/// so the answer is independent of which shard happens to ask.
+#[must_use]
+pub fn cross_shard_move_refusal(
+    source: &[u8],
+    destination: &[u8],
+    num_shards: usize,
+) -> Option<Frame> {
+    if num_shards <= 1 {
+        return None;
+    }
+    // The rotate form (`LMOVE k k L R`) is one key: never cross-shard, and
+    // hashing it twice would be wasted work on the hot path.
+    if source == destination {
+        return None;
+    }
+    let src_shard = crate::shard::dispatch::key_to_shard(source, num_shards);
+    let dst_shard = crate::shard::dispatch::key_to_shard(destination, num_shards);
+    (src_shard != dst_shard)
+        .then(|| Frame::Error(bytes::Bytes::from_static(CROSS_SHARD_MOVE_ERROR)))
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -68,6 +132,50 @@ mod tests {
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#570: the routing rule that keeps a cross-shard move from eating
+    /// the element.
+    #[test]
+    fn cross_shard_move_refusal_only_fires_across_a_shard_boundary() {
+        use crate::shard::dispatch::key_to_shard;
+
+        // A single-shard server has no boundary to cross.
+        assert!(cross_shard_move_refusal(b"src", b"dst", 1).is_none());
+
+        // Find a genuinely cross-shard pair and a genuinely co-located one,
+        // rather than trusting two literals to hash where this test wants.
+        let n = 4;
+        let base = key_to_shard(b"src", n);
+        let far = (0..1000)
+            .map(|i| format!("dst{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), n) != base)
+            .expect("a key on another shard must exist");
+        let near = (0..1000)
+            .map(|i| format!("dst{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), n) == base)
+            .expect("a key on the same shard must exist");
+
+        let refused = cross_shard_move_refusal(b"src", far.as_bytes(), n);
+        match refused {
+            Some(Frame::Error(e)) => assert!(
+                e.starts_with(b"CROSSSLOT"),
+                "clients key off the CROSSSLOT prefix, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("cross-shard pair must be refused, got {other:?}"),
+        }
+        assert!(
+            cross_shard_move_refusal(b"src", near.as_bytes(), n).is_none(),
+            "a co-located pair must NOT be refused — {{hash}} tags are the documented remedy"
+        );
+
+        // The rotate form is one key: same shard by construction, and it must
+        // not depend on the hash comparison to notice.
+        assert!(cross_shard_move_refusal(b"k", b"k", 64).is_none());
+
+        // A `{hash}` tag co-locates regardless of the rest of the name.
+        assert!(cross_shard_move_refusal(b"{t}:src", b"{t}:dst", 8).is_none());
     }
 
     fn setup_list(db: &mut Database, key: &[u8], elements: &[&[u8]]) {
