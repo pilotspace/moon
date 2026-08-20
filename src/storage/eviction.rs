@@ -558,6 +558,20 @@ pub fn evict_to_budget(
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
+        // moon#466: bytes already handed to the spill thread are resident RAM
+        // (`estimated_memory` now counts them) that is ALREADY scheduled for
+        // release. Once they cover the overshoot this tick has done its job —
+        // selecting more victims would chase memory that cannot drop until
+        // the completions land, draining the whole database in a runaway
+        // loop. Checked AFTER the `noeviction` gate so a `noeviction` server
+        // still surfaces OOM rather than silently accepting the write.
+        //
+        // One `usize` read plus one comparison per victim: no allocation, no
+        // lock, nothing added to the 100 ms sweep's cost.
+        let pending = db.pending_spill_bytes();
+        if pending > 0 && current_total.saturating_sub(pending) <= budget {
+            return Ok(());
+        }
         let before = db.estimated_memory();
         let deficit = current_total.saturating_sub(budget);
         let progressed = match &mut sink {
@@ -1017,7 +1031,6 @@ fn evict_batch_durable(
             // so the ColdIndex insert MUST come AFTER remove, never before,
             // or `remove` wipes out the very entry being added.
             db.remove(&entry.key);
-            crate::admin::metrics_setup::record_eviction();
             if let Some(ref mut ci) = db.cold_index {
                 ci.insert(
                     entry.key,
@@ -1029,6 +1042,18 @@ fn evict_batch_durable(
                         value_type: entry.value_type,
                     },
                 );
+                // moon#585: TIERED, not evicted. The key is still readable
+                // through the cold index and still counted by `logical_len`,
+                // so `DBSIZE` deliberately does not move — counting it in
+                // `evicted_keys` is what made a live instance report 456,018
+                // evictions against a `DBSIZE` that never budged.
+                crate::admin::metrics_setup::record_key_spilled();
+            } else {
+                // No cold index to receive the key: the spill file is
+                // recovery-only, so as far as the LIVE keyspace is concerned
+                // this key is gone. That is a real eviction, and `DBSIZE`
+                // drops with it.
+                crate::admin::metrics_setup::record_eviction();
             }
             reclaimed += 1;
         }
@@ -1136,6 +1161,12 @@ fn evict_one_async_spill(
                 ttl_ms,
             },
         );
+        // moon#585: TIERED, not evicted — same reasoning as the batch path.
+        // The key is answered from the in-flight plane now and from the cold
+        // index once the completion lands; it never leaves the keyspace.
+        // (Before this, the async path recorded NOTHING while the batch path
+        // recorded an eviction — two spill paths, two different answers.)
+        crate::admin::metrics_setup::record_key_spilled();
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());
@@ -1192,9 +1223,18 @@ pub(crate) fn evict_one_with_spill(
         Some(k) => k,
         None => return false,
     };
-    db.remove(key.as_bytes());
-    crate::admin::metrics_setup::record_eviction();
-    on_plain_drop(key.as_bytes());
+    // moon#585: count the eviction only when a key ACTUALLY left the
+    // keyspace. `select_victim` samples the hot plane, so the miss is rare
+    // (a concurrent lazy-expiry hide, a sampler reading a stale expiry pair)
+    // — but an unconditional `record_eviction()` here would make
+    // `evicted_keys` grow without `DBSIZE` shrinking, which is exactly the
+    // divergence this issue is about. Same gate on `on_plain_drop`: no
+    // dual-plane DEL record for a key this call did not delete.
+    let removed = db.remove(key.as_bytes()).is_some();
+    if removed {
+        crate::admin::metrics_setup::record_eviction();
+        on_plain_drop(key.as_bytes());
+    }
     true
 }
 

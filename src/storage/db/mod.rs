@@ -236,21 +236,32 @@ pub struct Database {
     /// deleted. Reads stay correct throughout; the cost is that the eviction
     /// did not actually reclaim that key's memory.
     ///
-    /// ACCOUNTING (pre-existing, tracked in #466): the payload is resident RAM that
-    /// `used_memory` does not count. `evict_one_async_spill` calls
+    /// ACCOUNTING (moon#466, FIXED): the payload is resident RAM that
+    /// `used_memory` used not to count. `evict_one_async_spill` calls
     /// `db.remove()`, whose `remove_hot` credits back the whole
     /// `entry_overhead`, while the queued `SpillRequest` still holds a full
     /// `Bytes::copy_from_slice` of the value — so for the length of the
-    /// window the eviction loop believes it reclaimed memory it has not.
-    /// That was equally true before this plane existed (the request has
-    /// always owned that copy); what is added here is the key `Bytes` plus
+    /// window the eviction loop believed it had reclaimed memory it had not.
+    /// (That was equally true before this plane existed: the request has
+    /// always owned that copy. What this plane added was the key `Bytes` plus
     /// this struct per in-flight key, and a retention window that now ends
     /// when the event loop APPLIES the completion rather than when the spill
-    /// thread drains the channel. Charging the pending bytes honestly would
-    /// require teaching `evict_to_budget` to stop when pending bytes are
-    /// large, or it would evict in a runaway loop chasing memory that cannot
-    /// drop yet — a design change, deliberately out of scope for #459.
+    /// thread drains the channel.)
+    ///
+    /// The bytes are now charged via [`Self::spill_inflight_bytes`], which
+    /// [`Self::estimated_memory`] includes — paired, as it had to be, with
+    /// the stop rule in [`crate::storage::eviction::evict_to_budget`]: once
+    /// the pending bytes cover the overshoot the tick is done. Without that
+    /// pairing the honest figure would evict in a runaway loop chasing memory
+    /// that cannot drop yet, which is why the fix was deferred out of #459.
+    ///
+    /// A LOST completion therefore now also strands a CHARGE: `used_memory`
+    /// keeps counting those bytes, which is truthful (the RAM really is still
+    /// held) and self-correcting the moment the key is written or deleted.
     spill_inflight: std::collections::HashMap<bytes::Bytes, PendingSpill>,
+    /// Running sum of `key.len() + value_bytes.len()` over [`Self::spill_inflight`]
+    /// (moon#466). See [`Self::pending_spill_bytes`].
+    spill_inflight_bytes: usize,
     /// Ticket dispenser for the version stamped on a NEWLY CREATED entry.
     ///
     /// Versions are per-entry and die with the entry. Before this counter every
@@ -371,6 +382,7 @@ impl Database {
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
+            spill_inflight_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -401,6 +413,7 @@ impl Database {
             cold_shard_dir: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
+            spill_inflight_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -415,7 +428,38 @@ impl Database {
     /// no `.await` between them, so no reader can observe the key absent from
     /// every plane.
     pub fn spill_inflight_mark(&mut self, key: bytes::Bytes, pending: PendingSpill) {
-        self.spill_inflight.insert(key, pending);
+        // moon#466: the payload this record pins is resident RAM that
+        // `remove_hot` has already credited back to `used_memory`. Charge it
+        // here so the ledger stays honest for the length of the window.
+        // O(1) integer arithmetic, no allocation, no clone (`key.len()` is
+        // read before the move).
+        let key_len = key.len();
+        let charge = key_len + pending.value_bytes.len();
+        // A re-eviction of the same key REPLACES its record; credit the old
+        // one or the counter drifts upward forever.
+        if let Some(previous) = self.spill_inflight.insert(key, pending) {
+            let credit = key_len + previous.value_bytes.len();
+            self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
+        }
+        self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_add(charge);
+    }
+
+    /// Drop the in-flight record for `key`, crediting its bytes back
+    /// (moon#466). Returns `true` when a record existed.
+    ///
+    /// The ONE retire point: every path that stops pinning a payload —
+    /// completion applied, DEL, overwriting SET, promoting read — goes
+    /// through here, so the byte counter cannot drift away from the map.
+    #[inline]
+    fn spill_inflight_retire(&mut self, key: &[u8]) -> bool {
+        match self.spill_inflight.remove_entry(key) {
+            Some((stored_key, pending)) => {
+                let credit = stored_key.len() + pending.value_bytes.len();
+                self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
+                true
+            }
+            None => false,
+        }
     }
 
     /// True when `req_id` is still the newest recorded spill request for
@@ -429,7 +473,7 @@ impl Database {
     /// to `req_id`; a newer request's record is left for its own completion.
     pub fn spill_inflight_clear(&mut self, key: &[u8], req_id: u64) {
         if self.spill_inflight.get(key).map(|p| p.req_id) == Some(req_id) {
-            self.spill_inflight.remove(key);
+            self.spill_inflight_retire(key);
         }
     }
 
@@ -445,7 +489,7 @@ impl Database {
         if self.spill_inflight.is_empty() {
             return false;
         }
-        self.spill_inflight.remove(key).is_some()
+        self.spill_inflight_retire(key)
     }
 
     /// Cheap (no disk I/O, no promotion) liveness probe for the in-flight
@@ -513,6 +557,21 @@ impl Database {
     #[inline]
     pub fn spill_inflight_is_empty(&self) -> bool {
         self.spill_inflight.is_empty()
+    }
+
+    /// Bytes of value payload pinned by the in-flight spill plane (moon#466).
+    ///
+    /// This is REAL resident RAM: the queued `SpillRequest` and the in-flight
+    /// record share one refcounted `Bytes` per key, which stays alive until
+    /// the completion is applied. `remove_hot` already credited the whole
+    /// entry back to `used_memory` at mark time, so without this term the
+    /// ledger claims memory that has not been released.
+    ///
+    /// Maintained incrementally by [`Self::spill_inflight_mark`] and the two
+    /// retire paths — O(1), no allocation, no scan.
+    #[inline]
+    pub fn pending_spill_bytes(&self) -> usize {
+        self.spill_inflight_bytes
     }
 
     /// Fast-path predicate for the active-expiry tick. Returns `false` only
@@ -829,16 +888,29 @@ impl Database {
     }
 
     /// Estimated memory usage of all entries in this database.
+    ///
+    /// Includes [`Self::pending_spill_bytes`] (moon#466): a victim queued for
+    /// async spill has had its whole `entry_overhead` credited back by
+    /// `remove_hot` while a full copy of its value is still pinned in RAM by
+    /// the queued `SpillRequest` and the in-flight plane. Counting only
+    /// `used_memory` made the ledger — and every eviction decision built on
+    /// it — believe memory had been released that had not.
+    ///
+    /// The pairing rule this requires lives in
+    /// [`crate::storage::eviction::evict_to_budget`]: once the pending bytes
+    /// cover the overshoot, the tick stops instead of selecting more victims
+    /// to chase memory that cannot drop yet.
     pub fn estimated_memory(&self) -> usize {
-        self.used_memory
+        self.used_memory.saturating_add(self.spill_inflight_bytes)
     }
 
     /// Resident bytes attributed to this database (alias for `estimated_memory`,
     /// kept distinct so observability call sites use the canonical name).
-    /// O(1), zero allocation -- reads the per-shard `used_memory` accumulator.
+    /// O(1), zero allocation -- reads the per-shard `used_memory` accumulator
+    /// plus the pending-spill term (moon#466: those bytes are resident too).
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        self.used_memory
+        self.used_memory.saturating_add(self.spill_inflight_bytes)
     }
 
     /// Charge `delta` bytes of container growth to this database's memory

@@ -451,6 +451,18 @@ impl Database {
         if let Some(ci) = self.cold_index.as_mut() {
             ci.clear_all();
         }
+        // FLUSH is a bulk DEL, and retiring the in-flight record is what
+        // makes a DEL FINAL (#459): the record is the completion's
+        // authorization to insert into `cold_index`, so leaving it here let a
+        // spill that landed after the flush resurrect a flushed key — and
+        // kept it in `DBSIZE`, `KEYS` and `GET` in the meantime, since all
+        // three consult the in-flight plane. The orphan sweep reclaims the
+        // now-unreferenced spill file, exactly as it does for a DEL.
+        //
+        // Also drops the moon#466 pending-byte charge, which `used_memory = 0`
+        // above would otherwise contradict.
+        self.spill_inflight.clear();
+        self.spill_inflight_bytes = 0;
     }
 
     /// The hot-key sketch (sampling hooks, HOTKEYS command, coordinator
