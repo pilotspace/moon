@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Fuzz the shared key-position walker, and stop a bare `.gitignore` entry from hiding new
+  fuzzers** (#576). `acl::keyspec::command_key_positions` parses attacker-controlled argv on behalf
+  of three consumers — ACL key-pattern enforcement, client-side cache invalidation, and command
+  introspection — so one bounds bug is a remote panic in three places at once. PR #571's review had
+  already found exactly that: a `numkeys` `usize` overflow that wrapped `first + nk` in release
+  builds and sliced `&args[1..0]`, reachable by any key-restricted authenticated user. The new
+  `acl_keyspec` target asserts the properties those callers rely on — every reported position
+  indexes `args`; `At` is never empty; and, the security-relevant one, `Unknown` and
+  `AtPlusComputed` must reach ACL as `Indeterminate`, so a `~pattern` user can never be granted a
+  key whose name is computed at runtime (`SORT k BY w_*`). Proven non-vacuous by reverting the
+  `checked_add` guard: the target reproduces the #571 crash from the seed corpus alone, minimizing
+  to the original attack string `LMPOP 18446744073709551615 a LEFT`. Clean over 3.27M executions
+  after restoring it. Two coverage gaps closed alongside: `.gitignore` matched a bare `fuzz`, which
+  ignores only NEW files (already-tracked ones are unaffected), so the 17 existing targets stayed
+  visible while the 18th would have committed clean locally and failed CI as "no such fuzz target";
+  and `term_fst_sidecar` had been present in the tree but listed in neither CI matrix, so it had
+  never actually run.
+
 ### Fixed
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry

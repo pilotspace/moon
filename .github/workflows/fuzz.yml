@@ -39,6 +39,8 @@ jobs:
           - ws_registry_record
           - mq_registry_blob
           - redis_rdb_load
+          - term_fst_sidecar
+          - acl_keyspec
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -103,6 +105,8 @@ jobs:
           - ws_registry_record
           - mq_registry_blob
           - redis_rdb_load
+          - term_fst_sidecar
+          - acl_keyspec
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

@@ -108,3 +108,8 @@ doc = false
 name = "term_fst_sidecar"
 path = "fuzz_targets/term_fst_sidecar.rs"
 doc = false
+
+[[bin]]
+name = "acl_keyspec"
+path = "fuzz_targets/acl_keyspec.rs"
+doc = false
