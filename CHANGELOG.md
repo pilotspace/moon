@@ -40,6 +40,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never actually run.
 
 ### Fixed
+- **The two-key write family acknowledged success while destroying the data at `--shards > 1`**
+  (#592). Moon routes a command to ONE shard — the owner of the key `extract_primary_key` picks —
+  and that shard then executes the whole command against its own slice. `first_key` names the
+  **routing** key, not every key the command writes, so for this family the other key was read from
+  and written to the routing key's table, under the right name but on the wrong shard, where every
+  normally-routed access is blind to it. `RENAME alpha omega` answered `+OK` with `alpha` destroyed
+  and `omega` never created — the value simply gone, with no error, no log line and no metric a
+  client could detect. Measured at `--shards 4` against 12 pairs *constructed* to straddle a shard
+  boundary: **12 of 12 lost the data, for all twelve commands** — `RENAME`, `RENAMENX`, `SMOVE`,
+  `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `ZRANGESTORE`, `ZUNIONSTORE`, `ZINTERSTORE`,
+  `PFMERGE`, `GEOSEARCHSTORE` and `SORT ... STORE`. At `--shards 1` the loss rate is 0. A
+  thirteenth shape had the same defect through Lua: `EVAL "redis.call('RENAME', KEYS[1], ARGV[1])"
+  1 src dst` — routing never sees a key that arrives via `ARGV`, so the script ran on the source's
+  shard and returned `+OK` with the value gone. Such a command is now **refused before anything is
+  read, written or deleted**, from the two key names alone:
+  `CROSSSLOT Keys in request don't hash to the same shard; co-locate every key of the command with
+  a {hash} tag`. Refusing is the only answer that cannot lose data — there is no window in which
+  the value exists in neither place, no undo to get wrong under a race or a timeout, and no partial
+  state to recover after a crash; a shard hop would trade the loss for a non-atomic `RENAME` plus
+  two independent AOF records with no shared commit point. It is also what Moon already answers for
+  every other operation it cannot perform atomically across shards (a MULTI/EXEC body spanning
+  shards, a script spanning shards, `MSETNX`). Guarded on all three dispatch paths that can reach
+  the keyspace at `shards > 1` — `handler_monoio` (the shipped runtime), `handler_sharded` (tokio),
+  and `redis.call` from Lua — each proven independently load-bearing by mutation; `handler_single`
+  has no multi-shard mode. `MULTI ... EXEC` was already safe (`analyze_txn_locality` walks every key
+  of every queued command) and is now covered by a regression test. Commands NOT affected and
+  deliberately untouched: `MGET`/`MSET`/`MSETNX`/`DEL`/`UNLINK`/`EXISTS`/`BITOP`/`COPY`, which
+  `shard::coordinator` already dispatches a leg per owning shard; and `LMOVE`/`RPOPLPUSH`/`BLMOVE`/
+  `BRPOPLPUSH`, the same defect owned by #570.
+
+  > **⚠ Breaking change.** At `--shards > 1`, these commands now return an error where they
+  > previously returned success. Co-locate the keys with a `{hash}` tag — `RENAME {user:42}:staging
+  > {user:42}:live` — and the command works exactly as it does at `--shards 1`. Every affected call
+  > was silently destroying data before, so no working deployment loses behaviour; a `--shards 1`
+  > deployment is unaffected entirely.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

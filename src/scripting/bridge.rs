@@ -427,6 +427,38 @@ pub fn make_redis_call_fn(
                     )));
                 }
             }
+            // moon#592: a two-key write issued from Lua against keys that do
+            // not all belong to ONE shard. A script executes against the
+            // single `Database` slice this thread owns, so the key it did not
+            // route on — `RENAME`'s destination, a `*STORE`'s sources — is
+            // read from and written to THIS shard's table under the right
+            // name, where every normally-routed access is blind to it. The
+            // script returned success and the data was gone.
+            //
+            // `route_script_keys` already refuses a script whose DECLARED keys
+            // straddle shards. This closes the hole it cannot see: a
+            // destination passed through `ARGV` (or built in Lua) is never
+            // part of the routing decision at all, so
+            // `EVAL "redis.call('RENAME', KEYS[1], ARGV[1])" 1 src dst` was
+            // acked while destroying `src` and never creating `dst` —
+            // reproduced at `--shards 4`.
+            //
+            // Refusal, not a hop, for the same reason as the connection-level
+            // guard: it is decided from the key names before anything is
+            // touched, so an aborted script leaves the keyspace untouched.
+            //
+            // NOT the same as "every key a script touches must be local" —
+            // that stronger rule would also catch a single-key write to an
+            // undeclared remote key, and is a separate decision with a much
+            // wider blast radius (tracked as a follow-up).
+            if let Some(err) = crate::server::conn::shared::cross_shard_write_rejection(
+                &cmd_bytes,
+                &frames[1..],
+                crate::command::connection::shard_count(),
+            ) {
+                return Ok(err);
+            }
+
             if cmd_is_write {
                 // Track writes for SCRIPT KILL safety check
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));

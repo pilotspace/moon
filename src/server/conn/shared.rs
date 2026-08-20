@@ -1288,6 +1288,183 @@ pub(crate) async fn route_script_elsewhere(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-shard routing rule for the two-key WRITE family (moon#592)
+// ---------------------------------------------------------------------------
+
+/// The reply a two-key write owes its client when its keys are owned by more
+/// than one shard.
+///
+/// Keeps the `CROSSSLOT` prefix every Redis client already recognises as
+/// "co-locate these keys", and names the remedy moon actually supports.
+pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
+    b"CROSSSLOT Keys in request don't hash to the same shard; \
+      co-locate every key of the command with a {hash} tag";
+
+/// Writes whose argv names a key the command does NOT route on.
+///
+/// `extract_primary_key` answers the command's `first_key` — the ROUTING key.
+/// It is not "the key this command writes", and for this family it is not even
+/// all of them. Reading it as the whole truth is the root of moon#592.
+///
+/// Every name here writes, or reads, at least one key beyond the one routing
+/// picks. Deliberately EXCLUDED, each for a reason that must survive review:
+///
+/// * `MGET`/`MSET`/`MSETNX`/`DEL`/`UNLINK`/`EXISTS`/`BITOP`/`COPY` —
+///   `is_multi_key_command` sends these to `shard::coordinator`, which groups
+///   keys by owner and dispatches a leg to each. They are already correct and
+///   must not start erroring.
+/// * `LMOVE`/`RPOPLPUSH`/`BLMOVE`/`BRPOPLPUSH` — the same defect, owned by
+///   moon#570 / PR #591, which additionally has to guard the two blocking
+///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
+///   pre-routing guard cannot see. Two overlapping guards for one family would
+///   be worse than one complete one.
+/// * `ZDIFFSTORE`, and `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE`/`STOREDIST`
+///   clause — not implemented in moon (unknown command / `ERR syntax error`
+///   respectively), so there is no write to misplace, and claiming
+///   `CROSSSLOT` would send a client chasing hash tags for a command that
+///   will never work. `tests/two_key_write_cross_shard.rs::t2k4` fails the
+///   moment either starts working, which is when they must be added here.
+/// * The read-only multi-key commands (`SINTER`, `SUNION`, `SDIFF`, `ZDIFF`,
+///   `ZINTER`, `ZUNION`, `ZINTERCARD`, `SINTERCARD`, `LCS`, `PFCOUNT`,
+///   `TOUCH`, `LMPOP`, `ZMPOP`) — same routing rule, but the consequence is a
+///   silently wrong ANSWER, never destroyed data. A separate decision with a
+///   different blast radius; see the PR body.
+///
+/// Matched on `(len, first byte)` first so a single-key command falls through
+/// after one integer compare and never reaches the key walk.
+fn writes_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
+    let len = cmd.len();
+    if len == 0 {
+        return false;
+    }
+    match (len, cmd[0] | 0x20) {
+        (6, b'r') => cmd.eq_ignore_ascii_case(b"RENAME"),
+        (8, b'r') => cmd.eq_ignore_ascii_case(b"RENAMENX"),
+        (5, b's') => cmd.eq_ignore_ascii_case(b"SMOVE"),
+        // `SORT src ... STORE dst`. Without a STORE clause the walker reports
+        // one key and the check is a no-op, so no read-only SORT is affected.
+        (4, b's') => cmd.eq_ignore_ascii_case(b"SORT"),
+        (10, b's') => cmd.eq_ignore_ascii_case(b"SDIFFSTORE"),
+        (11, b's') => {
+            cmd.eq_ignore_ascii_case(b"SINTERSTORE") || cmd.eq_ignore_ascii_case(b"SUNIONSTORE")
+        }
+        (11, b'z') => {
+            cmd.eq_ignore_ascii_case(b"ZRANGESTORE")
+                || cmd.eq_ignore_ascii_case(b"ZUNIONSTORE")
+                || cmd.eq_ignore_ascii_case(b"ZINTERSTORE")
+        }
+        (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE"),
+        (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
+        _ => false,
+    }
+}
+
+/// moon#592: the refusal a two-key write is owed when its keys do not all
+/// belong to one shard.
+///
+/// # The defect
+///
+/// moon is shared-nothing across shards. A command is routed to ONE shard —
+/// the owner of `extract_primary_key`'s answer — and that shard executes the
+/// whole command against its own slice. For this family the other key was
+/// therefore read from, and written to, the ROUTING key's slice, under the
+/// right name but in the wrong table. Every normally-routed access of that key
+/// goes to its real owner and is blind to it. The client was told the write
+/// succeeded:
+///
+/// ```text
+/// SET alpha VALUE-1      -> +OK
+/// RENAME alpha omega     -> +OK      (acked)
+/// GET alpha              -> nil      (source destroyed)
+/// GET omega              -> nil      (destination never written)
+/// ```
+///
+/// Measured at `--shards 4` on the pre-fix binary, 12 constructed cross-shard
+/// placements per command: 12/12 lost for all twelve commands in the family.
+///
+/// # Why refuse rather than hop
+///
+/// Refusing is the only answer that cannot lose data: it is decided from the
+/// key NAMES alone, before anything is read, written or deleted, so there is
+/// no window in which the data exists in neither place, no undo to get wrong
+/// under a race or a timeout, and no partial state to recover after a crash. A
+/// shard hop would trade the loss for a non-atomic `RENAME` — an intermediate
+/// state Redis never exposes — plus two independent AOF records with no shared
+/// commit point.
+///
+/// It is also the answer moon already gives everywhere else it cannot act
+/// atomically across shards: a MULTI/EXEC body spanning shards (see
+/// [`analyze_txn_locality`], which has classified exactly these key sets
+/// correctly since prod-hardening #15), a script spanning shards, and
+/// `MSETNX`. `{hash}` tags collapse the keys onto one shard and the command
+/// then works exactly as it does at `--shards 1`.
+///
+/// # Failure design
+///
+/// There is no I/O, no hop, no timeout and no rollback on this path — that is
+/// the point. The decision is a pure function of the argv and the shard count,
+/// so a slow or dead destination shard, a dropped connection mid-command, or a
+/// crash at any instant all leave the keyspace exactly as it was. The only
+/// recovery story a client needs is the one in the error text.
+///
+/// # Contract
+///
+/// Returns `None` — leaving the command to run, and to produce its own error
+/// if it has one — when:
+///
+/// * the server has one shard (nothing to cross);
+/// * the command is not in this family;
+/// * the argv is malformed (bad `numkeys`, a `STORE` with no destination, too
+///   few arguments), so it still earns its own arity/syntax error rather than
+///   a misleading `CROSSSLOT`;
+/// * every key resolves to the same shard — including the degenerate
+///   `RENAME k k` and any `{hash}`-tagged pair.
+#[must_use]
+pub(crate) fn cross_shard_write_rejection(
+    cmd: &[u8],
+    args: &[Frame],
+    num_shards: usize,
+) -> Option<Frame> {
+    if num_shards <= 1 || !writes_a_key_it_did_not_route_on(cmd) {
+        return None;
+    }
+    // The shared key-position walker (moon#582) — the same one ACL and cache
+    // invalidation use, so `SORT ... STORE dst` and `ZUNIONSTORE dst numkeys
+    // ...` are enumerated by the code that already knows those layouts rather
+    // than by a second, drifting copy here.
+    //
+    // `AtPlusComputed` is `SORT ... BY w_*`: the weight keys cannot be named
+    // by anyone, but the ones that CAN be named — source and STORE
+    // destination — are exactly the pair this guard exists for, so they are
+    // still checked. (The unnameable reads are a separate, read-only defect;
+    // see the PR body.)
+    let idx = match crate::acl::keyspec::command_key_positions(cmd, args) {
+        crate::acl::keyspec::KeyPositions::At(idx)
+        | crate::acl::keyspec::KeyPositions::AtPlusComputed(idx) => idx,
+        crate::acl::keyspec::KeyPositions::None | crate::acl::keyspec::KeyPositions::Unknown => {
+            return None;
+        }
+    };
+    let mut owner: Option<usize> = None;
+    for i in idx {
+        // Borrowed, not cloned: this runs before routing on every command in
+        // the family, and a key position holding a non-string is a malformed
+        // invocation — let the command reject it in its own words.
+        let key: &[u8] = match args.get(i) {
+            Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
+            _ => return None,
+        };
+        let shard = crate::shard::dispatch::key_to_shard(key, num_shards);
+        match owner {
+            None => owner = Some(shard),
+            Some(existing) if existing == shard => {}
+            Some(_) => return Some(Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR))),
+        }
+    }
+    None
+}
+
 /// Check if a command is a multi-key command requiring VLL coordination.
 ///
 /// These commands operate on multiple keys that may live on different shards.
@@ -2456,5 +2633,197 @@ mod proto_walk_tests {
     #[test]
     fn a_switch_beyond_the_last_reply_is_inert() {
         assert_eq!(seq(2, &[(9, 3)], 3), vec![2, 2, 2]);
+    }
+}
+
+#[cfg(test)]
+mod cross_shard_write_tests {
+    //! moon#592: the routing rule that stops a two-key write from acking a
+    //! write it put on the wrong shard.
+    //!
+    //! Shard membership is never assumed here — every "far" and "near"
+    //! destination is SEARCHED for with the routing hash the server itself
+    //! uses, so the test cannot pass by accident on a lucky literal.
+
+    use super::{CROSS_SHARD_WRITE_ERROR, cross_shard_write_rejection};
+    use crate::protocol::Frame;
+    use crate::shard::dispatch::key_to_shard;
+    use bytes::Bytes;
+
+    const N: usize = 4;
+
+    fn bulk(s: &str) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    /// A key name that provably hashes to a DIFFERENT shard than `src`.
+    fn far_from(src: &str) -> String {
+        let owner = key_to_shard(src.as_bytes(), N);
+        (0..1000)
+            .map(|i| format!("far{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), N) != owner)
+            .expect("a key on another shard must exist")
+    }
+
+    /// A key name that provably hashes to the SAME shard as `src`, without a
+    /// hash tag — so the co-located case is exercised on its own merits.
+    fn near_to(src: &str) -> String {
+        let owner = key_to_shard(src.as_bytes(), N);
+        (0..1000)
+            .map(|i| format!("near{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), N) == owner)
+            .expect("a key on the same shard must exist")
+    }
+
+    /// Every command the guard claims, in the argv shape a client sends.
+    /// `{s}` is the source, `{d}` the key it is NOT routed on.
+    const FAMILY: &[(&str, &[&str])] = &[
+        ("RENAME", &["{s}", "{d}"]),
+        ("RENAMENX", &["{s}", "{d}"]),
+        ("SMOVE", &["{s}", "{d}", "member"]),
+        ("SINTERSTORE", &["{d}", "{s}"]),
+        ("SUNIONSTORE", &["{d}", "{s}"]),
+        ("SDIFFSTORE", &["{d}", "{s}"]),
+        ("ZRANGESTORE", &["{d}", "{s}", "0", "-1"]),
+        ("ZUNIONSTORE", &["{d}", "1", "{s}"]),
+        ("ZINTERSTORE", &["{d}", "1", "{s}"]),
+        ("PFMERGE", &["{d}", "{s}"]),
+        (
+            "GEOSEARCHSTORE",
+            &[
+                "{d}",
+                "{s}",
+                "FROMLONLAT",
+                "15",
+                "37",
+                "BYRADIUS",
+                "200",
+                "km",
+            ],
+        ),
+        ("SORT", &["{s}", "STORE", "{d}"]),
+    ];
+
+    fn argv(shape: &[&str], src: &str, dst: &str) -> Vec<Frame> {
+        shape
+            .iter()
+            .map(|p| match *p {
+                "{s}" => bulk(src),
+                "{d}" => bulk(dst),
+                other => bulk(other),
+            })
+            .collect()
+    }
+
+    /// Each family member is refused when — and only when — its keys really
+    /// do straddle a shard boundary.
+    ///
+    /// Dropping any one arm of `writes_a_key_it_did_not_route_on` makes
+    /// exactly that command fail the first half; widening the guard to a
+    /// blanket refusal makes every command fail the rest.
+    #[test]
+    fn every_family_member_is_refused_across_a_boundary_and_only_there() {
+        let src = "src";
+        let far = far_from(src);
+        let near = near_to(src);
+        for (cmd, shape) in FAMILY {
+            let split = argv(shape, src, &far);
+            match cross_shard_write_rejection(cmd.as_bytes(), &split, N) {
+                Some(Frame::Error(e)) => assert_eq!(
+                    e.as_ref(),
+                    CROSS_SHARD_WRITE_ERROR,
+                    "{cmd}: clients key off the CROSSSLOT prefix"
+                ),
+                other => panic!(
+                    "{cmd}: a cross-shard invocation must be refused before it can write \
+                     the wrong shard, got {other:?}"
+                ),
+            }
+
+            // Co-located without a tag: the command works today and must keep
+            // working.
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &argv(shape, src, &near), N).is_none(),
+                "{cmd}: a co-located pair must NOT be refused"
+            );
+            // `{hash}` tags are the documented remedy — they must actually
+            // remedy.
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &argv(shape, "{t}:s", "{t}:d"), N)
+                    .is_none(),
+                "{cmd}: a {{hash}}-tagged pair must NOT be refused"
+            );
+            // One shard: no boundary exists to cross.
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &split, 1).is_none(),
+                "{cmd}: a single-shard server has nothing to refuse"
+            );
+        }
+    }
+
+    /// The guard must not steal an error that belongs to the command, and must
+    /// not claim commands it does not own.
+    #[test]
+    fn out_of_family_and_malformed_argvs_keep_their_own_answers() {
+        let src = "src";
+        let far = far_from(src);
+        let two = [bulk(src), bulk(&far)];
+
+        // Owned elsewhere: the coordinator routes a leg per shard for these,
+        // so refusing them would break working commands.
+        for cmd in [
+            "MSET", "MGET", "DEL", "UNLINK", "EXISTS", "COPY", "BITOP", "MSETNX",
+        ] {
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                "{cmd} is coordinated per-shard and must not be refused here"
+            );
+        }
+        // moon#570 / PR #591 owns the list MOVE family, including its two
+        // blocking entry points this pre-routing guard cannot reach.
+        for cmd in ["LMOVE", "RPOPLPUSH", "BLMOVE", "BRPOPLPUSH"] {
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                "{cmd} belongs to moon#570, not here"
+            );
+        }
+        // Read-only twins: same routing rule, different (wrong-answer) defect.
+        for cmd in ["SINTER", "SUNION", "SDIFF", "PFCOUNT", "LCS", "TOUCH"] {
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                "{cmd} is read-only and out of scope for moon#592"
+            );
+        }
+
+        // A SORT with no STORE clause names one key: nothing to straddle.
+        let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];
+        assert!(cross_shard_write_rejection(b"SORT", &sort_ro, N).is_none());
+
+        // Malformed argvs must still earn their own arity/syntax errors rather
+        // than a misleading CROSSSLOT that sends the client chasing hash tags.
+        let cases: &[(&str, Vec<Frame>)] = &[
+            // arity: RENAME needs two keys
+            ("RENAME", vec![bulk(src)]),
+            // numkeys larger than the argv
+            ("ZUNIONSTORE", vec![bulk(&far), bulk("99"), bulk(src)]),
+            // numkeys is not a number
+            ("ZINTERSTORE", vec![bulk(&far), bulk("banana"), bulk(src)]),
+            // STORE with no destination
+            ("SORT", vec![bulk(src), bulk("STORE")]),
+            // a key position holding a non-string
+            ("RENAME", vec![bulk(src), Frame::Integer(7)]),
+        ];
+        for (cmd, args) in cases {
+            assert!(
+                cross_shard_write_rejection(cmd.as_bytes(), args, N).is_none(),
+                "{cmd} {args:?}: a malformed argv must keep its own error"
+            );
+        }
+
+        // The degenerate same-key form is one key, never a boundary.
+        assert!(
+            cross_shard_write_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
+            "RENAME k k names one key"
+        );
     }
 }

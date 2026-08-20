@@ -523,19 +523,31 @@ if should_run "set"; then
     assert_match "SMISMEMBER"          SMISMEMBER s:k1 a z c
     assert_match "SREM"                SREM s:k1 a f
     assert_match "SCARD after SREM"    SCARD s:k1
-    # Set ops
-    rcli SADD s:A 1 2 3 >/dev/null 2>&1; mcli SADD s:A 1 2 3 >/dev/null 2>&1
-    rcli SADD s:B 2 3 4 >/dev/null 2>&1; mcli SADD s:B 2 3 4 >/dev/null 2>&1
-    assert_match_sorted "SINTER"       SINTER s:A s:B
-    assert_match_sorted "SUNION"      SUNION s:A s:B
-    assert_match_sorted "SDIFF"       SDIFF s:A s:B
-    assert_match "SINTERSTORE"         SINTERSTORE s:intres s:A s:B
-    assert_match "SUNIONSTORE"         SUNIONSTORE s:unires s:A s:B
-    assert_match "SDIFFSTORE"          SDIFFSTORE s:difres s:A s:B
+    # Set ops. moon#592: the `{s}` hash tag co-locates every key of a multi-key
+    # set operation on ONE shard, so these rows compare the COMMAND against
+    # Redis at any `--shards N`. Untagged names made them a function of the
+    # shard count instead -- moon refuses a *STORE whose destination is owned
+    # by a different shard than its sources (it executes the whole command on
+    # one slice and used to write the destination into the wrong shard's table,
+    # acked and unreadable), while Redis, having no shards, stores it either
+    # way. The refusal is asserted in scripts/test-consistency.sh.
+    rcli SADD {s}:A 1 2 3 >/dev/null 2>&1; mcli SADD {s}:A 1 2 3 >/dev/null 2>&1
+    rcli SADD {s}:B 2 3 4 >/dev/null 2>&1; mcli SADD {s}:B 2 3 4 >/dev/null 2>&1
+    assert_match_sorted "SINTER"       SINTER {s}:A {s}:B
+    assert_match_sorted "SUNION"      SUNION {s}:A {s}:B
+    assert_match_sorted "SDIFF"       SDIFF {s}:A {s}:B
+    assert_match "SINTERSTORE"         SINTERSTORE {s}:intres {s}:A {s}:B
+    assert_match "SUNIONSTORE"         SUNIONSTORE {s}:unires {s}:A {s}:B
+    assert_match "SDIFFSTORE"          SDIFFSTORE {s}:difres {s}:A {s}:B
+    # SMOVE moves a member between two keys and is routed by the SOURCE, so the
+    # destination is the key it did NOT route on (moon#592).
+    rcli SADD {s}:mvsrc m1 m2 >/dev/null 2>&1; mcli SADD {s}:mvsrc m1 m2 >/dev/null 2>&1
+    assert_match "SMOVE"               SMOVE {s}:mvsrc {s}:mvdst m1
+    assert_match "SISMEMBER after SMOVE" SISMEMBER {s}:mvdst m1
     assert_moon_ok "SPOP"              SPOP s:k1
-    assert_moon_ok "SRANDMEMBER"       SRANDMEMBER s:A
-    assert_moon_ok "SMEMBERS"          SMEMBERS s:A
-    assert_moon_ok "SSCAN"             SSCAN s:A 0
+    assert_moon_ok "SRANDMEMBER"       SRANDMEMBER {s}:A
+    assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
+    assert_moon_ok "SSCAN"             SSCAN {s}:A 0
 fi
 
 # ===========================================================================
@@ -575,12 +587,15 @@ if should_run "sorted_set"; then
     assert_match "ZPOPMIN"             ZPOPMIN z:k1
     assert_match "ZPOPMAX"             ZPOPMAX z:k1
     assert_match "ZLEXCOUNT"           ZLEXCOUNT z:k1 - +
-    # Store ops
-    rcli ZADD z:A 1 a 2 b 3 c >/dev/null 2>&1; mcli ZADD z:A 1 a 2 b 3 c >/dev/null 2>&1
-    rcli ZADD z:B 2 b 3 c 4 d >/dev/null 2>&1; mcli ZADD z:B 2 b 3 c 4 d >/dev/null 2>&1
-    assert_match "ZUNIONSTORE"         ZUNIONSTORE z:union 2 z:A z:B
-    assert_match "ZINTERSTORE"         ZINTERSTORE z:inter 2 z:A z:B
-    assert_moon_ok "ZSCAN"             ZSCAN z:A 0
+    # Store ops. moon#592: `{z}` co-locates destination and sources -- see the
+    # set-ops block above for why the tag is load-bearing at `--shards > 1`.
+    rcli ZADD {z}:A 1 a 2 b 3 c >/dev/null 2>&1; mcli ZADD {z}:A 1 a 2 b 3 c >/dev/null 2>&1
+    rcli ZADD {z}:B 2 b 3 c 4 d >/dev/null 2>&1; mcli ZADD {z}:B 2 b 3 c 4 d >/dev/null 2>&1
+    assert_match "ZUNIONSTORE"         ZUNIONSTORE {z}:union 2 {z}:A {z}:B
+    assert_match "ZINTERSTORE"         ZINTERSTORE {z}:inter 2 {z}:A {z}:B
+    assert_match "ZRANGESTORE"         ZRANGESTORE {z}:rstore {z}:A 0 -1
+    assert_match "ZCARD after ZRANGESTORE" ZCARD {z}:rstore
+    assert_moon_ok "ZSCAN"             ZSCAN {z}:A 0
 fi
 
 # ===========================================================================
@@ -619,19 +634,24 @@ if should_run "key"; then
     assert_match "TYPE zset"           TYPE k:zs
     rcli HSET k:hs f v >/dev/null 2>&1; mcli HSET k:hs f v >/dev/null 2>&1
     assert_match "TYPE hash"           TYPE k:hs
-    rcli SET k:ren oldval >/dev/null 2>&1; mcli SET k:ren oldval >/dev/null 2>&1
-    assert_match "RENAME"              RENAME k:ren k:renamed
-    assert_match "GET after RENAME"    GET k:renamed
-    rcli SET k:rnx1 v1 >/dev/null 2>&1; mcli SET k:rnx1 v1 >/dev/null 2>&1
-    rcli SET k:rnx2 v2 >/dev/null 2>&1; mcli SET k:rnx2 v2 >/dev/null 2>&1
-    assert_match "RENAMENX (blocked)"  RENAMENX k:rnx1 k:rnx2
+    # moon#592: `{k}` co-locates the two names. RENAME is routed by its SOURCE
+    # and used to write the destination into the source owner's table -- acked
+    # `+OK` with the value readable under neither name. The tag keeps this row
+    # comparing the COMMAND against Redis at any `--shards N`; the refusal is
+    # asserted in scripts/test-consistency.sh.
+    rcli SET {k}:ren oldval >/dev/null 2>&1; mcli SET {k}:ren oldval >/dev/null 2>&1
+    assert_match "RENAME"              RENAME {k}:ren {k}:renamed
+    assert_match "GET after RENAME"    GET {k}:renamed
+    rcli SET {k}:rnx1 v1 >/dev/null 2>&1; mcli SET {k}:rnx1 v1 >/dev/null 2>&1
+    rcli SET {k}:rnx2 v2 >/dev/null 2>&1; mcli SET {k}:rnx2 v2 >/dev/null 2>&1
+    assert_match "RENAMENX (blocked)"  RENAMENX {k}:rnx1 {k}:rnx2
     rcli SET k:cpsrc cpval >/dev/null 2>&1; mcli SET k:cpsrc cpval >/dev/null 2>&1
     assert_match "COPY"                COPY k:cpsrc k:cpdst
     assert_match "GET after COPY"      GET k:cpdst
     rcli SET k:cpdst2 old >/dev/null 2>&1; mcli SET k:cpdst2 old >/dev/null 2>&1
     assert_match "COPY no REPLACE"     COPY k:cpsrc k:cpdst2
     assert_match "COPY REPLACE"        COPY k:cpsrc k:cpdst2 REPLACE
-    assert_match "UNLINK"              UNLINK k:renamed
+    assert_match "UNLINK"              UNLINK {k}:renamed
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "SCAN cursor"       SCAN 0
     assert_moon_ok "KEYS pattern"      KEYS "k:*"

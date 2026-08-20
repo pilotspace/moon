@@ -631,8 +631,16 @@ assert_both "SORT numeric" SORT edge:sortl
 assert_both "SORT DESC" SORT edge:sortl DESC
 assert_both "SORT ALPHA" SORT edge:sortl ALPHA
 assert_both "SORT LIMIT" SORT edge:sortl LIMIT 0 2
-assert_both "SORT STORE" SORT edge:sortl STORE edge:sorted
-assert_both "SORT STORE result" LRANGE edge:sorted 0 -1
+# moon#592: `{srt}` co-locates the source with the STORE destination on ONE
+# shard, so this row compares the COMMAND against Redis at any `--shards N`.
+# `SORT` is routed by its source; the destination named after `STORE` is a key
+# routing never saw, and moon used to write it into the source owner's table --
+# acked with a count the client could not read back anywhere. moon now refuses
+# a straddling pair (asserted in the moon-only sweep further down); Redis,
+# having no shards, stores it either way.
+both RPUSH {srt}:list 3 1 2
+assert_both "SORT STORE" SORT {srt}:list STORE {srt}:sorted
+assert_both "SORT STORE result" LRANGE {srt}:sorted 0 -1
 
 # GEOADD / GEOPOS / GEODIST / GEOHASH / GEOSEARCH
 both GEOADD edge:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
@@ -971,6 +979,85 @@ route_probe() {
     assert_eq "shard routing ${label} (shards=${SHARDS}, ${ROUTE_KEYS} keys)" \
         "0 mismatched" "${mismatched} mismatched"
 }
+
+# ---------------------------------------------------------------------------
+# moon#592: no two-key WRITE may ack a write that did not land
+# ---------------------------------------------------------------------------
+#
+# moon-only: Redis has no shards, so a routing refusal has nothing to compare
+# against. moon routes a command to the owner of ONE key -- the one
+# `first_key` names -- and then executes the whole command against that shard's
+# slice, so every OTHER key of the argv was read from and written to the wrong
+# shard's table, under the right name, invisible to every normally-routed
+# access. `RENAME alpha omega` answered `+OK` with the value readable under
+# neither name (12 of 12 constructed cross-shard placements, per command).
+#
+# Two independent checks, so neither can be satisfied vacuously:
+#   * NO placement may lose the data -- this holds whether a pair straddles or
+#     not, and is equally satisfied by a future implementation that routes the
+#     write properly instead of refusing it;
+#   * at least ONE placement must actually be refused, which proves the sweep
+#     reached the cross-shard case at all.
+#
+# The 12-suffix sweep exists because WHICH pair straddles is a property of the
+# hash: one hard-coded pair that happened to co-locate would make this block
+# pass while testing nothing.
+if [[ "$SHARDS" -gt 1 ]]; then
+    # label | seed the source | the two-key write | read the destination back
+    XW_CASES=(
+        "rename|SET %S VALUE-1|RENAME %S %D|EXISTS %D"
+        "renamenx|SET %S VALUE-1|RENAMENX %S %D|EXISTS %D"
+        "smove|SADD %S m1 m2|SMOVE %S %D m1|SCARD %D"
+        "sinterstore|SADD %S m1 m2|SINTERSTORE %D %S|SCARD %D"
+        "sunionstore|SADD %S m1 m2|SUNIONSTORE %D %S|SCARD %D"
+        "sdiffstore|SADD %S m1 m2|SDIFFSTORE %D %S|SCARD %D"
+        "zrangestore|ZADD %S 1 a 2 b|ZRANGESTORE %D %S 0 -1|ZCARD %D"
+        "zunionstore|ZADD %S 1 a 2 b|ZUNIONSTORE %D 1 %S|ZCARD %D"
+        "zinterstore|ZADD %S 1 a 2 b|ZINTERSTORE %D 1 %S|ZCARD %D"
+        "pfmerge|PFADD %S a b c|PFMERGE %D %S|PFCOUNT %D"
+        "geosearchstore|GEOADD %S 15 37 Here|GEOSEARCHSTORE %D %S FROMLONLAT 15 37 BYRADIUS 200 km ASC|ZCARD %D"
+        "sortstore|RPUSH %S 3 1 2|SORT %S STORE %D|LLEN %D"
+    )
+    xw_lost=0
+    xw_refused=0
+    for xw_case in "${XW_CASES[@]}"; do
+        IFS='|' read -r xw_label xw_seed xw_cmd xw_read <<<"$xw_case"
+        for i in $(seq 0 11); do
+            xw_s="xw:${xw_label}:s${i}"
+            xw_d="xw:${xw_label}:d${i}"
+            xw_seed_i="${xw_seed//%S/$xw_s}"
+            xw_cmd_i="${xw_cmd//%S/$xw_s}"; xw_cmd_i="${xw_cmd_i//%D/$xw_d}"
+            xw_read_i="${xw_read//%D/$xw_d}"
+            redis-cli -p "$PORT_RUST" DEL "$xw_s" "$xw_d" &>/dev/null || true
+            # shellcheck disable=SC2086  # deliberate word-split: templates are ours
+            redis-cli -p "$PORT_RUST" $xw_seed_i &>/dev/null || true
+            # shellcheck disable=SC2086
+            xw_reply=$(redis-cli -p "$PORT_RUST" $xw_cmd_i 2>&1)
+            # shellcheck disable=SC2086
+            xw_dst=$(redis-cli -p "$PORT_RUST" $xw_read_i 2>&1)
+            case "$xw_reply" in
+                CROSSSLOT*)
+                    xw_refused=$((xw_refused + 1))
+                    # A refusal must have changed nothing at all.
+                    if [[ -n "$xw_dst" && "$xw_dst" != "0" ]]; then
+                        echo "  FAIL detail: ${xw_label}[$i] refused but destination is $xw_dst"
+                        xw_lost=$((xw_lost + 1))
+                    fi ;;
+                *)
+                    # Acked: the write MUST be readable at the destination
+                    # through a normally-routed read.
+                    if [[ -z "$xw_dst" || "$xw_dst" == "0" ]]; then
+                        echo "  FAIL detail: ${xw_label}[$i] acked '$xw_reply' but destination is empty"
+                        xw_lost=$((xw_lost + 1))
+                    fi ;;
+            esac
+        done
+    done
+    assert_eq "moon#592 no two-key write loses its data (shards=$SHARDS)" "0" "$xw_lost"
+    if [[ "$xw_refused" -eq 0 ]]; then
+        echo "  WARN: moon#592 sweep found no cross-shard pair at shards=$SHARDS (nothing refused)"
+    fi
+fi
 
 route_probe lmpop      "RPUSH %K v1"                 "LMPOP 1 %K LEFT"
 route_probe zmpop      "ZADD %K 1 m"                 "ZMPOP 1 %K MIN"
