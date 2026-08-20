@@ -261,7 +261,7 @@ pub fn recover_shard_v3_pitr(
     // Scan manifest for tier=Warm, status=Active, file_type=VecCodes entries.
     // Each represents a segment that was offloaded to disk before the crash.
     if manifest_path.exists() {
-        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
+        if let Ok(mut manifest) = ShardManifest::open(&manifest_path) {
             let vectors_dir = shard_dir.join("vectors");
             // #435: reclaim `.segment-*.staging` leftovers before scanning.
             // A warm transition that died between its manifest commit and its
@@ -272,6 +272,9 @@ pub fn recover_shard_v3_pitr(
             // in-process guard covers new failures; this covers orphans from a
             // kill -9 or an older build.
             crate::storage::tiered::warm_tier::sweep_orphan_staging(&vectors_dir);
+            // Collected while iterating `manifest.files()` (an immutable borrow)
+            // and applied after the loop ends.
+            let mut stale_warm_ids: Vec<u64> = Vec::new();
             for entry in manifest.files() {
                 if entry.tier == StorageTier::Warm
                     && entry.status == FileStatus::Active
@@ -285,12 +288,55 @@ pub fn recover_shard_v3_pitr(
                             shard_id, entry.file_id, entry.byte_size
                         );
                     } else {
+                        // #546a: RETIRE the entry, do not merely warn about it.
+                        // A segment directory is deleted when the segment is
+                        // superseded (Stack B's GC, or the crash-before-GC
+                        // retirement in `vector::store`), and the manifest entry
+                        // was left Active on the grounds that recovery
+                        // "tolerates" a missing directory. It does — by
+                        // re-walking and re-warning about the same dead entry on
+                        // EVERY boot, forever, since nothing writes the manifest
+                        // back. A live store accumulated 13,214 such warnings
+                        // against 55 real segment directories. Recovery is the
+                        // only component positioned to observe the discrepancy,
+                        // so it is the one that heals it.
+                        //
+                        // Tombstoning here is safe in exactly the way deleting
+                        // the directory already was: the data is gone, so no
+                        // reader can be served from this entry either way. The
+                        // two-axis retention in `gc_tombstones` still governs
+                        // when the entry is physically pruned.
                         tracing::warn!(
-                            "Shard {}: manifest references warm segment {} but directory missing",
+                            "Shard {}: manifest references warm segment {} but directory is \
+                             missing — retiring the stale entry",
                             shard_id,
                             entry.file_id
                         );
+                        stale_warm_ids.push(entry.file_id);
                     }
+                }
+            }
+            // Commit the retirements in ONE manifest generation rather than one
+            // per entry: a store with thousands of stale entries would
+            // otherwise pay thousands of dual-root swaps on the boot path.
+            if !stale_warm_ids.is_empty() {
+                let retired = stale_warm_ids.len();
+                for file_id in &stale_warm_ids {
+                    manifest.remove_file(*file_id);
+                }
+                match manifest.commit() {
+                    Ok(()) => info!(
+                        "Shard {}: retired {} stale warm segment entry(ies) whose directories \
+                         were already deleted",
+                        shard_id, retired
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Shard {}: failed to commit retirement of {} stale warm segment \
+                         entry(ies): {e} — recovery is unaffected (the entries are skipped \
+                         either way), but the next boot will re-walk them",
+                        shard_id,
+                        retired
+                    ),
                 }
             }
             result.warm_segments_loaded = result.warm_segments.len();
@@ -1178,6 +1224,91 @@ mod tests {
         assert_eq!(result.warm_segments.len(), 1);
         assert_eq!(result.warm_segments[0].0, 42);
         assert_eq!(result.warm_segments[0].1, seg_dir);
+    }
+
+    /// Recovery must RETIRE a manifest entry whose segment directory is gone,
+    /// not just warn about it (moon#546a).
+    ///
+    /// A warm segment is retired by deleting its directory; the manifest entry
+    /// was left Active on the grounds that recovery "already tolerates" it. It
+    /// does tolerate it — by re-walking and re-warning about it on EVERY boot,
+    /// forever, because nothing ever writes the manifest back. The live store
+    /// logged 13,214 of these warnings against 55 real segment directories,
+    /// and the entries can only accumulate.
+    ///
+    /// Recovery is the only component that can observe the discrepancy, so it
+    /// is the component that must heal it: tombstone the entry and commit, so
+    /// the next boot does not pay for it again.
+    #[test]
+    fn test_recovery_retires_manifest_entry_for_missing_segment_dir() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        // 7 = present on disk. 40, 41 = directories already deleted.
+        for id in [7u64, 40, 41] {
+            manifest.add_file(FileEntry {
+                file_id: id,
+                file_type: PageType::VecCodes as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Warm,
+                page_size_log2: 16,
+                page_count: 10,
+                byte_size: 655360,
+                created_lsn: 1,
+                db_index: 0,
+                max_key_hash: u64::MAX,
+                last_modified_lsn: 1,
+            });
+        }
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        let seg_dir = shard_dir.join("vectors").join("segment-7");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("codes.mpf"), [0u8; 64]).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        // The live segment still loads.
+        assert_eq!(result.warm_segments_loaded, 1);
+        assert_eq!(result.warm_segments[0].0, 7);
+
+        // The two dead entries must be TOMBSTONED ON DISK, so a second boot
+        // does not re-walk them. Re-open from the path — an in-memory-only
+        // retirement would pass a weaker assertion but fix nothing.
+        let reopened = ShardManifest::open(&manifest_path).expect("reopen manifest");
+        for id in [40u64, 41] {
+            let entry = reopened
+                .files()
+                .iter()
+                .find(|e| e.file_id == id)
+                .unwrap_or_else(|| panic!("entry {id} vanished entirely"));
+            assert_eq!(
+                entry.status,
+                FileStatus::Tombstone,
+                "manifest entry {id} references a missing directory and must be retired, \
+                 not left Active for every future boot to re-walk"
+            );
+        }
+        // The live one must be untouched.
+        let live = reopened
+            .files()
+            .iter()
+            .find(|e| e.file_id == 7)
+            .expect("live entry");
+        assert_eq!(
+            live.status,
+            FileStatus::Active,
+            "live segment must not be retired"
+        );
     }
 
     #[test]

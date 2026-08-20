@@ -207,6 +207,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same database happened to hold a TTL, its expired fields were never actively reaped at all.
   - New `benches/expiry_sweep.rs` measures one tick in all three shapes; the bounded-sweep and
     spill-guard tests were each verified to FAIL against the pre-fix behaviour.
+- **Recovery re-walked and re-warned about dead warm-segment manifest entries on every boot, forever**
+  (#546). A warm vector segment is retired by deleting its directory, but the manifest entry was left
+  `Active` on the stated grounds that recovery "already tolerates" a manifest entry whose directory is
+  missing. It does tolerate it — by logging `manifest references warm segment N but directory missing`
+  and moving on, every single boot, because recovery opened the manifest read-only and never wrote
+  back. Nothing ever retired the entry, so the dead entries could only accumulate: a live instance
+  logged **13,214 of these warnings against 55 real segment directories**, and separately 5,096
+  `failed to read mvcc.mpf for ownership attribution` for the same vanished segments. Recovery is the
+  only component positioned to observe the discrepancy, so it now heals it: entries whose directory is
+  gone are tombstoned via the existing `remove_file` path and committed in a **single** manifest
+  generation (one dual-root swap for the whole batch, not one per entry — a store with thousands of
+  stale entries would otherwise pay thousands of swaps on the boot path). The existing two-axis
+  retention in `gc_tombstones` still governs when entries are physically pruned. Tombstoning is safe in
+  exactly the way deleting the directory already was: the data is gone, so no reader can be served from
+  the entry either way. A commit failure is non-fatal and logged — recovery proceeds identically, since
+  the entries are skipped regardless. Live segments are untouched, which the new test asserts
+  explicitly in both directions (dead entries must be retired AND the live entry must stay `Active`),
+  re-opening the manifest from its path so an in-memory-only retirement cannot pass.
+- **GraphUnion segment merges were rejected forever on any index carrying duplicate vectors, so
+  segments accumulated without bound** (#546). `verify_merge_recall` gates every merge on a recall
+  measurement that scored an **ID-set overlap**: it took the brute-force top-k ids and intersected
+  them with the ids HNSW returned. That measure is undefined when distances TIE. Real corpora tie
+  constantly — repeated text chunks, boilerplate, and hash fields whose vector was never written all
+  produce exact-duplicate embeddings — and when a point has 99 duplicates the ground truth takes an
+  ARBITRARY 10 of the 100 tied candidates while the graph takes a DIFFERENT arbitrary 10. Both
+  answers are exactly correct; the overlap scores them 0.0, the merge aborts, and it aborts again on
+  every retry because the input never changes. The live store recorded **5,596 merge attempts with
+  zero successes**, 1,367 of them at recall exactly 0.0000, with the retry backoff saturated at 480s
+  — every affected index grew its segment count monotonically, which is upstream of both query cost
+  and startup recovery time (recovery rebuilds per segment). Recall is now scored by **distance
+  equivalence**: the k-th ground-truth distance is the acceptance threshold, so any neighbour at
+  least that close counts, whichever of the tied ids it happens to be — which is what recall@k means
+  when distances tie. The gate is not weakened: measured against a deliberately corrupted merge
+  (layer-0 codes decoupled from their graph nodes) on an all-distinct corpus, the old id-overlap
+  metric scores 0.9667 and the new distance metric scores 0.9673 — a 0.0006 difference — so the two
+  are equally sensitive to real breakage and differ only on ties. The new test merges 8 segments
+  drawn from 8 distinct vectors (100x tie sets), is red on the old metric at recall 0.0000, and
+  asserts the merged segment is FUNCTIONALLY correct (every one of the k hits is an exact duplicate
+  at ~0 distance) so a merely-laxer gate cannot pass it.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a
