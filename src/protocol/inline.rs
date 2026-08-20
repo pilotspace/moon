@@ -1,4 +1,4 @@
-use memchr::{memchr, memchr2};
+use memchr::{memchr, memchr2, memchr3};
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -6,30 +6,38 @@ use super::frame::{Frame, FrameVec, ParseError, ProtoFault};
 
 /// Parse an inline command from the buffer.
 ///
-/// Inline commands are plain text lines terminated by `\r\n`, where arguments
-/// are separated by whitespace (spaces or tabs). This is what telnet users
-/// and redis-cli direct input send.
+/// Inline commands are plain text lines terminated by `\n`, optionally preceded
+/// by `\r`, where arguments are separated by whitespace. This is what telnet
+/// users, redis-cli direct input, and shell/awk-generated command streams send —
+/// the last of which commonly emit bare LF (#381).
 ///
 /// Returns `Ok(Some(Frame::Array(...)))` with each argument as a `BulkString`,
-/// `Ok(None)` if the buffer doesn't contain a complete line (no `\r\n` found),
-/// or `Ok(None)` for empty/whitespace-only lines (after advancing past the CRLF).
+/// `Ok(None)` if the buffer doesn't contain a complete line (no `\n` found),
+/// or `Ok(None)` for empty/whitespace-only lines (after advancing past the
+/// terminator).
+///
+/// Note those two `Ok(None)`s differ in whether the buffer moved, and callers
+/// must not conflate them: an empty line consumed bytes and the caller should
+/// ask again, whereas an incomplete line did not and the caller must read more.
+/// [`crate::protocol::parse`] is where that distinction is handled for every
+/// read loop (#578); do not re-derive it per call site.
 ///
 /// `max_inline_size` bounds the length of a single inline line. If the buffer
-/// grows past it without a terminating `\r\n`, the line is rejected with a
-/// protocol error instead of returning `Ok(None)` forever — this is what stops
-/// a client that never sends `\r\n` from growing the read buffer without limit
+/// grows past it without a terminator, the line is rejected with a protocol
+/// error instead of returning `Ok(None)` forever — this is what stops a client
+/// that never sends a line break from growing the read buffer without limit
 /// (mirrors Redis's `PROTO_INLINE_MAX_SIZE`).
 pub fn parse_inline(
     buf: &mut BytesMut,
     max_inline_size: usize,
 ) -> Result<Option<Frame>, ParseError> {
-    // Find the CRLF terminator
-    let crlf_pos = match find_crlf_position(&buf[..]) {
-        Some(pos) => pos,
+    // Find the line terminator: `\n`, with an optional `\r` before it.
+    let (line_len, consumed) = match find_line_terminator(&buf[..]) {
+        Some(t) => t,
         None => {
             // No complete line yet. Reject before the buffer can grow unbounded:
-            // a non-RESP stream with no `\r\n` would otherwise "need more data"
-            // forever. Redis caps this at PROTO_INLINE_MAX_SIZE.
+            // a non-RESP stream with no line break would otherwise "need more
+            // data" forever. Redis caps this at PROTO_INLINE_MAX_SIZE.
             if buf.len() > max_inline_size {
                 return Err(ParseError::Invalid {
                     kind: ProtoFault::InlineTooBig,
@@ -43,7 +51,7 @@ pub fn parse_inline(
 
     // Reject an oversize completed line too (parity with Redis, which rejects
     // any inline request past the cap regardless of termination).
-    if crlf_pos > max_inline_size {
+    if line_len > max_inline_size {
         return Err(ParseError::Invalid {
             kind: ProtoFault::InlineTooBig,
             message: "Protocol error: too big inline request".into(),
@@ -51,8 +59,8 @@ pub fn parse_inline(
         });
     }
 
-    // Extract line content before CRLF
-    let line = &buf[..crlf_pos];
+    // Extract line content before the terminator
+    let line = &buf[..line_len];
 
     // Quoted inline arguments take the careful path. Redis parses inline
     // commands with `sdssplitargs`, which understands quoting and escapes;
@@ -65,26 +73,31 @@ pub fn parse_inline(
     // without spaces in values) keeps the original loop untouched below.
     if memchr2(b'"', b'\'', line).is_some() {
         let args = split_args_quoted(line)?;
-        buf.advance(crlf_pos + 2);
+        buf.advance(consumed);
         if args.is_empty() {
             return Ok(None);
         }
         return Ok(Some(Frame::Array(args)));
     }
 
-    // Split by whitespace (spaces and tabs) using SIMD, filtering empty slices
+    // Split on the separator set using SIMD, filtering empty slices.
+    //
+    // `\r` belongs here and used to be missing: Redis breaks unquoted tokens on
+    // {space, \n, \r, \t}, so `RPUSH k a\rb` is two elements there and was one
+    // in Moon (measured). `\n` cannot appear — it is the terminator — so the
+    // three bytes below are the whole set this path can ever see.
     let mut args = FrameVec::new();
     let mut start = 0;
     while start < line.len() {
-        // Skip whitespace
-        while start < line.len() && (line[start] == b' ' || line[start] == b'\t') {
+        // Skip separators
+        while start < line.len() && is_inline_separator(line[start]) {
             start += 1;
         }
         if start >= line.len() {
             break;
         }
-        // Find next whitespace using SIMD
-        match memchr2(b' ', b'\t', &line[start..]) {
+        // Find next separator using SIMD
+        match memchr3(b' ', b'\t', b'\r', &line[start..]) {
             Some(pos) => {
                 args.push(Frame::BulkString(Bytes::copy_from_slice(
                     &line[start..start + pos],
@@ -98,8 +111,8 @@ pub fn parse_inline(
         }
     }
 
-    // Advance buffer past line + CRLF
-    buf.advance(crlf_pos + 2);
+    // Advance buffer past line + terminator
+    buf.advance(consumed);
 
     // Empty/whitespace-only lines produce no frame
     if args.is_empty() {
@@ -109,15 +122,45 @@ pub fn parse_inline(
     Ok(Some(Frame::Array(args)))
 }
 
-/// The inline whitespace set, defined once so the argument splitter's skip loop
-/// and its token-terminator loop cannot disagree.
+/// The bytes the splitter may SKIP between tokens, and the bytes a closing
+/// quote may be followed by. Exactly C's `isspace()`.
 ///
-/// When they disagreed, a byte that terminated a token but was not skipped left
-/// the splitter unable to advance — see #487. These are exactly the bytes C's
-/// `isspace()` accepts, which is what Redis's `sdssplitargs` uses.
+/// Redis reads two different sets here, and conflating them is a bug in either
+/// direction:
+///   * `sdssplitargs` skips inter-token bytes with `isspace()`, and validates
+///     the byte after a closing quote with `isspace()` — this set.
+///   * it ends an unquoted token on an explicit 5-byte list — see
+///     [`is_inline_separator`], which is strictly narrower.
+///
+/// A previous comment here claimed this set was what `sdssplitargs` uses for
+/// *both* jobs. It is not: `\x0b` and `\x0c` are `isspace()` but are NOT token
+/// separators, so `RPUSH k a\x0bb` is ONE element on redis-server 8.0.5
+/// (measured). Using this wider set as the terminator split it into two.
+///
+/// The skip set must remain a SUPERSET of the terminator set. When it was not,
+/// a byte that ended a token but was not skipped left the splitter unable to
+/// advance: the token loop returned without moving `i`, an empty arg was
+/// pushed, and the outer loop restarted at the same byte — forever, growing
+/// `args` until the process died, remotely and pre-auth (#487).
 #[inline]
 fn is_inline_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// The bytes that END an unquoted inline token.
+///
+/// Redis's `sdssplitargs` token loop tests an explicit list — `' '`, `'\n'`,
+/// `'\r'`, `'\t'`, `'\0'` — not `isspace()`. `\0` is omitted here because the
+/// oracle is ambiguous (redis-server returns nothing at all for an inline line
+/// containing a NUL), so Moon keeps its existing behaviour of treating it as an
+/// ordinary token byte rather than guessing.
+///
+/// A strict subset of [`is_inline_space`], which is what keeps the #487
+/// progress invariant intact: every byte that terminates a token is still
+/// skippable by the outer loop.
+#[inline]
+fn is_inline_separator(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 /// Split an inline command line that contains at least one quote character.
@@ -267,11 +310,13 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
             },
             None => {
                 while i < line.len() {
-                    // Terminator set — read through the same helper the outer
-                    // skip loop uses. Breaking here does NOT advance `i`; the
-                    // outer loop is what must step past this byte, which is
-                    // only true while both sides agree on the set (#487).
-                    if is_inline_space(line[i]) {
+                    // Terminator set — NARROWER than the outer skip set, which
+                    // is what Redis does (`\x0b`/`\x0c` are `isspace()` but do
+                    // not end a token). Breaking here does NOT advance `i`; the
+                    // outer loop must step past this byte, which stays true as
+                    // long as the terminator set remains a subset of the skip
+                    // set (#487).
+                    if is_inline_separator(line[i]) {
                         break;
                     }
                     current.push(line[i]);
@@ -283,27 +328,33 @@ fn split_args_quoted(line: &[u8]) -> Result<FrameVec, ParseError> {
     }
 }
 
-/// SIMD-accelerated CRLF position finder. Returns position of \r.
+/// SIMD-accelerated inline line-terminator finder.
+///
+/// Returns `(line_len, consumed)`: the length of the line content excluding the
+/// terminator, and how far the caller must advance to step past line and
+/// terminator together.
+///
+/// This mirrors Redis's `processInlineBuffer`, which searches for the first
+/// `\n` and then drops ONE optional preceding `\r`. It does **not** require
+/// `\r\n` (#381).
+///
+/// The old version searched for `\r\n` and, on finding a lone `\r`, kept
+/// scanning. Two consequences, both measured against redis-server 8.0.5:
+///   * a bare-LF stream never terminated, so the command was never dispatched
+///     and the client simply hung; and
+///   * worse, `SET k v1\nSET k v2\r\n` skipped the interior `\n` to reach the
+///     trailing `\r\n` and produced ONE command with the second command's
+///     arguments appended — a silent write loss, not just a rejection.
 #[inline]
-fn find_crlf_position(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 2 {
-        return None;
-    }
-    let mut search_from = 0;
-    loop {
-        match memchr(b'\r', &buf[search_from..]) {
-            Some(rel_pos) => {
-                let abs_pos = search_from + rel_pos;
-                if abs_pos + 1 < buf.len() && buf[abs_pos + 1] == b'\n' {
-                    return Some(abs_pos);
-                }
-                search_from = abs_pos + 1;
-                if search_from >= buf.len() {
-                    return None;
-                }
-            }
-            None => return None,
-        }
+fn find_line_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let nl = memchr(b'\n', buf)?;
+    // Only the `\r` immediately before the `\n` is part of the terminator; any
+    // earlier one is line content, and `is_inline_separator` treats it as a
+    // token break exactly as Redis does.
+    if nl > 0 && buf[nl - 1] == b'\r' {
+        Some((nl - 1, nl + 1))
+    } else {
+        Some((nl, nl + 1))
     }
 }
 
@@ -609,6 +660,273 @@ mod tests {
         assert_eq!(args.len(), 2, "got {args:?}");
         assert_eq!(args[0], Frame::BulkString(Bytes::from_static(b"a")));
         assert_eq!(args[1], Frame::BulkString(Bytes::from_static(b"PING")));
+    }
+
+    // === #381: line termination and the separator set ===
+    //
+    // Every expectation below was measured against `redis-server 8.0.5` over a
+    // raw socket, one fresh connection per case, on the moon-dev VM. Where a
+    // token count decides the answer the probe used `RPUSH`, whose integer
+    // reply IS the element count — an `ECHO` probe cannot tell 3 args from 4,
+    // because both are just "wrong number of arguments".
+    //
+    // Redis's `processInlineBuffer` looks for `\n` and then drops ONE optional
+    // preceding `\r`; it never requires `\r\n`. Moon required `\r\n` and
+    // scanned PAST an embedded `\n`, which is why bare-LF hung and why
+    // `ECHO a\nECHO b\r\n` silently merged two commands into one.
+
+    /// Split an inline line and return its arguments, or panic with the frame.
+    fn args_of(input: &[u8]) -> Vec<Bytes> {
+        let mut buf = BytesMut::from(input);
+        match parse_inline(&mut buf, TEST_MAX_INLINE) {
+            Ok(Some(Frame::Array(args))) => args
+                .iter()
+                .map(|a| match a {
+                    Frame::BulkString(b) => b.clone(),
+                    other => panic!("non-bulk arg: {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected an argument array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_inline_bare_lf_terminates_a_line() {
+        // redis: `PING\n` -> +PONG. moon before #381: no reply at all, ever —
+        // the line never terminated so the command was never dispatched.
+        let mut buf = BytesMut::from(&b"PING\n"[..]);
+        let frame = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
+        assert!(buf.is_empty(), "LF must be consumed, left: {:?}", &buf[..]);
+    }
+
+    #[test]
+    fn test_inline_bare_lf_two_commands_in_one_buffer() {
+        // redis: `SET il 1\nGET il\n` -> +OK then $1 1.
+        let mut buf = BytesMut::from(&b"SET il 1\nGET il\n"[..]);
+        let first = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        assert_eq!(
+            first,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"SET")),
+                Frame::BulkString(Bytes::from_static(b"il")),
+                Frame::BulkString(Bytes::from_static(b"1")),
+            ])
+        );
+        let second = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        assert_eq!(
+            second,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"GET")),
+                Frame::BulkString(Bytes::from_static(b"il")),
+            ])
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_inline_lf_must_not_swallow_the_following_command() {
+        // The correctness half of #381, and the reason it is not merely a
+        // rejection bug: scanning past the interior `\n` to reach the trailing
+        // `\r\n` made ONE command out of two, silently appending the second
+        // command's arguments to the first.
+        //
+        // `SET k v1\nSET k v2\r\n` must be two writes, never one malformed
+        // command. redis: two replies.
+        let mut buf = BytesMut::from(&b"SET k v1\nSET k v2\r\n"[..]);
+        let first = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        assert_eq!(
+            first,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"SET")),
+                Frame::BulkString(Bytes::from_static(b"k")),
+                Frame::BulkString(Bytes::from_static(b"v1")),
+            ]),
+            "the interior LF must end the first command"
+        );
+        let second = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        assert_eq!(
+            second,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"SET")),
+                Frame::BulkString(Bytes::from_static(b"k")),
+                Frame::BulkString(Bytes::from_static(b"v2")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_inline_crlf_still_terminates_after_the_lf_change() {
+        // Guard the common path against a regression in the terminator rewrite.
+        let mut buf = BytesMut::from(&b"GET key\r\nPING\r\n"[..]);
+        assert_eq!(
+            parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap(),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"GET")),
+                Frame::BulkString(Bytes::from_static(b"key")),
+            ])
+        );
+        assert_eq!(
+            parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap(),
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
+    }
+
+    #[test]
+    fn test_inline_only_one_cr_is_stripped_before_the_lf() {
+        // redis `PING\r\r\n` -> +PONG: it strips ONE `\r`, leaving `PING\r`,
+        // and then `\r` is a token separator so the trailing one vanishes.
+        // moon kept it and answered `unknown command 'PING\r'`.
+        assert_eq!(args_of(b"PING\r\r\n"), vec![Bytes::from_static(b"PING")]);
+    }
+
+    #[test]
+    fn test_inline_cr_separates_unquoted_tokens() {
+        // Measured with RPUSH: redis pushes 2 elements for `a\rb`, moon pushed
+        // 1. Redis's `sdssplitargs` breaks unquoted tokens on {space, \n, \r,
+        // \t, \0}; moon's fast path broke on {space, \t} only.
+        assert_eq!(
+            args_of(b"RPUSH k a\rb\r\n"),
+            vec![
+                Bytes::from_static(b"RPUSH"),
+                Bytes::from_static(b"k"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inline_vt_and_ff_do_not_separate_tokens_in_either_path() {
+        // The mirror-image divergence. Redis's token loop uses an explicit
+        // 5-byte list, NOT `isspace()` — so VT and FF stay INSIDE a token.
+        // Measured: `RPUSH u a\x0bb` -> 1 element on redis.
+        //
+        // Moon's fast unquoted path already agreed; its quoted path did not,
+        // because `is_inline_space` (an isspace() set) served as the token
+        // terminator too. A line merely CONTAINING a quote therefore split
+        // `a\x0bb` while the same line without one did not.
+        for sep in [0x0bu8, 0x0c] {
+            let mut line = b"RPUSH u a".to_vec();
+            line.push(sep);
+            line.extend_from_slice(b"b\r\n");
+            assert_eq!(
+                args_of(&line),
+                vec![
+                    Bytes::from_static(b"RPUSH"),
+                    Bytes::from_static(b"u"),
+                    Bytes::copy_from_slice(&[b'a', sep, b'b']),
+                ],
+                "unquoted line, separator {sep:#04x}"
+            );
+
+            // Same line, but a quoted token earlier forces the quoted path.
+            let mut qline = b"RPUSH \"q\" a".to_vec();
+            qline.push(sep);
+            qline.extend_from_slice(b"b\r\n");
+            assert_eq!(
+                args_of(&qline),
+                vec![
+                    Bytes::from_static(b"RPUSH"),
+                    Bytes::from_static(b"q"),
+                    Bytes::copy_from_slice(&[b'a', sep, b'b']),
+                ],
+                "quoted line, separator {sep:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_cr_separates_tokens_in_the_quoted_path_too() {
+        // The quoted path already got this right; pin it so the narrowing of
+        // the terminator set does not drop `\r` along with VT and FF.
+        assert_eq!(
+            args_of(b"RPUSH \"q\" a\rb\r\n"),
+            vec![
+                Bytes::from_static(b"RPUSH"),
+                Bytes::from_static(b"q"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inline_closing_quote_then_vt_skips_to_the_next_token() {
+        // Redis uses TWO different sets, and this is where they part company:
+        // the byte after a closing quote is validated with `isspace()` (so VT
+        // is legal there and is skipped), while the token loop's narrower list
+        // decides where a token ENDS. Narrowing the terminator set must not
+        // also narrow the skip set, or `"a"\x0bb` would yield `\x0bb`.
+        assert_eq!(
+            args_of(b"ECHO \"a\"\x0bb\r\n"),
+            vec![
+                Bytes::from_static(b"ECHO"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inline_lf_terminated_line_can_be_unbalanced() {
+        // redis: `ECHO "hi\n` -> -ERR Protocol error: unbalanced quotes.
+        // moon returned Ok(None) and waited forever for a `\r\n` that the
+        // client had no reason to send.
+        let mut buf = BytesMut::from(&b"ECHO \"hi\n"[..]);
+        let err = parse_inline(&mut buf, TEST_MAX_INLINE)
+            .expect_err("an LF-terminated unbalanced quote is still an error");
+        match err {
+            ParseError::Invalid { kind, .. } => assert_eq!(kind, ProtoFault::UnbalancedQuotes),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_inline_lf_inside_quotes_still_terminates_the_line() {
+        // Termination is decided BEFORE quoting: redis finds the `\n` first,
+        // so `ECHO "a\nb"\r\n` is the line `ECHO "a` — unbalanced. moon parsed
+        // the whole thing and handed back a value containing a newline.
+        let mut buf = BytesMut::from(&b"ECHO \"a\nb\"\r\n"[..]);
+        let err = parse_inline(&mut buf, TEST_MAX_INLINE)
+            .expect_err("a quote cannot span an inline line break");
+        match err {
+            ParseError::Invalid { kind, .. } => assert_eq!(kind, ProtoFault::UnbalancedQuotes),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_inline_single_quoted_arg_with_lf_terminator() {
+        // redis: `ECHO 'a b'\n` -> $3 "a b". The quoted path must see the same
+        // terminator rules as the fast path.
+        assert_eq!(
+            args_of(b"ECHO 'a b'\n"),
+            vec![Bytes::from_static(b"ECHO"), Bytes::from_static(b"a b")]
+        );
+    }
+
+    #[test]
+    fn test_inline_size_cap_applies_to_lf_terminated_lines() {
+        // The memory guard must not be bypassable by using LF instead of CRLF.
+        let cap = 8;
+        let mut buf = BytesMut::from(&b"THIS LINE IS WAY TOO LONG\n"[..]);
+        let err = parse_inline(&mut buf, cap).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_inline_lf_line_exactly_at_cap_is_accepted() {
+        // Boundary stays inclusive, and the terminator is not counted.
+        let mut buf = BytesMut::from(&b"PING\n"[..]);
+        let frame = parse_inline(&mut buf, 4).unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
     }
 
     /// The exact libFuzzer `oom-` artifact from the #487 run, through the same

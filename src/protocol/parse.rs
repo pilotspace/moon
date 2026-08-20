@@ -17,16 +17,46 @@ use super::inline;
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-
-    // Dispatch: RESP2/RESP3 prefixed bytes go to RESP parser, everything else is inline
-    match buf[0] {
-        b'+' | b'-' | b':' | b'$' | b'*' // RESP2
-        | b'%' | b'~' | b',' | b'#' | b'_' | b'=' | b'(' | b'>' // RESP3
-        => { /* fall through to RESP parsing below */ }
-        _ => return inline::parse_inline(buf, config.max_inline_size),
+    // Dispatch: RESP2/RESP3 prefixed bytes go to RESP parser, everything else
+    // is inline.
+    //
+    // The loop exists for blank inline lines (#578). `parse_inline` answers
+    // `Ok(None)` both for "that line was empty, I consumed it" and for "I need
+    // more bytes" — and every read loop reads the second meaning and parks. So
+    // `\r\n\r\nECHO hi\r\n` arriving in ONE read left the `ECHO` unparsed until
+    // unrelated later traffic happened to wake the loop; redis-server answers
+    // it immediately. Resolving it here, at the single funnel the codec and all
+    // three connection handlers share, is what keeps the fix from being
+    // CI-invisible in whichever handler got missed.
+    //
+    // Re-dispatching from the top (rather than retrying the inline splitter) is
+    // deliberate: what follows a blank line is very often a RESP array, and
+    // feeding `*1` to the inline path would turn a real command into the
+    // literal token `*1`.
+    //
+    // Termination: each iteration either returns, or consumes at least the one
+    // byte of a line terminator, so the buffer strictly shrinks.
+    loop {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        match buf[0] {
+            b'+' | b'-' | b':' | b'$' | b'*' // RESP2
+            | b'%' | b'~' | b',' | b'#' | b'_' | b'=' | b'(' | b'>' // RESP3
+            => break, // fall through to RESP parsing below
+            _ => {
+                let before = buf.len();
+                match inline::parse_inline(buf, config.max_inline_size)? {
+                    Some(frame) => return Ok(Some(frame)),
+                    // Nothing consumed => genuinely incomplete, so waiting for
+                    // more bytes is correct and looping would spin.
+                    None if buf.len() == before => return Ok(None),
+                    // Bytes consumed but no frame: an empty or whitespace-only
+                    // line. Ask again — there may be a real command behind it.
+                    None => continue,
+                }
+            }
+        }
     }
 
     // Pass 1: Validate structure and compute total byte length (zero allocations)
@@ -1207,6 +1237,95 @@ mod tests {
             result,
             Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
+    }
+
+    // === #578: a blank inline line must not stall the buffered command ===
+    //
+    // `parse_inline` is right to answer `Ok(None)` for a blank line — it has no
+    // frame to give — but `Ok(None)` also means "need more bytes", and the read
+    // loops act on that second meaning: they break and wait for another
+    // `read()`. So a command sitting right behind a blank line in the SAME
+    // buffer went unparsed until unrelated later traffic kicked the loop.
+    //
+    // Measured: `\r\n\r\nECHO hi\r\n` in one send() -> `$2 hi` on redis 8.0.5,
+    // no reply at all on moon. Note this needs no bare LF: it is a pure-CRLF
+    // bug and predates #381.
+    //
+    // The fix belongs in `parse()`, the single funnel every read loop and the
+    // codec share — not in the loops, where the three-dispatch-path trap would
+    // let one of them silently keep the old behaviour.
+
+    #[test]
+    fn test_parse_blank_crlf_line_then_command_same_buffer() {
+        let result = parse_bytes(b"\r\n\r\nECHO hi\r\n").unwrap();
+        assert_eq!(
+            result,
+            Some(Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"ECHO")),
+                Frame::BulkString(Bytes::from_static(b"hi")),
+            ])),
+            "a command behind blank lines must parse without another read()"
+        );
+    }
+
+    #[test]
+    fn test_parse_blank_lf_line_then_command_same_buffer() {
+        let result = parse_bytes(b"\n\nECHO hi\n").unwrap();
+        assert_eq!(
+            result,
+            Some(Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"ECHO")),
+                Frame::BulkString(Bytes::from_static(b"hi")),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parse_whitespace_only_line_then_command() {
+        // Whitespace-only lines take the same "consumed, but no frame" path.
+        let result = parse_bytes(b"   \nECHO hi\n").unwrap();
+        assert_eq!(
+            result,
+            Some(Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"ECHO")),
+                Frame::BulkString(Bytes::from_static(b"hi")),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parse_blank_line_then_resp_frame_redispatches() {
+        // The re-dispatch must go back through the RESP/inline decision, not
+        // just retry the inline splitter: what follows a blank line is very
+        // often a real RESP array, and feeding `*1` to the inline path would
+        // turn a valid command into the literal token "*1".
+        let result = parse_bytes(b"\r\n*1\r\n$4\r\nPING\r\n").unwrap();
+        assert_eq!(
+            result,
+            Some(Frame::Array(framevec![Frame::BulkString(
+                Bytes::from_static(b"PING")
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_parse_only_blank_lines_is_still_need_more_data() {
+        // Nothing to answer with, and every byte consumed: the loop must end
+        // rather than spin on an empty buffer.
+        let mut buf = BytesMut::from(&b"\r\n\r\n"[..]);
+        let config = ParseConfig::default();
+        assert_eq!(parse(&mut buf, &config).unwrap(), None);
+        assert!(buf.is_empty(), "blank lines must be consumed");
+    }
+
+    #[test]
+    fn test_parse_blank_lines_then_partial_command_needs_more_data() {
+        // The blank lines are consumed, the partial line is kept intact so the
+        // caller can append to it.
+        let mut buf = BytesMut::from(&b"\r\n\r\nECHO hi"[..]);
+        let config = ParseConfig::default();
+        assert_eq!(parse(&mut buf, &config).unwrap(), None);
+        assert_eq!(&buf[..], b"ECHO hi");
     }
 
     // === RESP3 parse tests ===
