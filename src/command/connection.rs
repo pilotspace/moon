@@ -241,7 +241,7 @@ pub fn record_shard_count(shards: usize) {
 /// answer and is not one, so an instance that never called
 /// [`record_shard_count`] reports the single-shard truth for an unsharded
 /// embedded harness instead.
-fn shard_count() -> usize {
+pub(crate) fn shard_count() -> usize {
     *SHARD_COUNT.get().unwrap_or(&1)
 }
 

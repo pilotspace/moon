@@ -2375,6 +2375,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // Other DEBUG subcommands fall through.
             }
 
+            // moon#592: a write whose argv names a key on a DIFFERENT shard
+            // than the one routing picked is refused BEFORE routing. Routing
+            // sends it to `first_key`'s owner, which then executes the whole
+            // command against that one slice — so the other key is read from,
+            // and written to, the wrong shard's table: acked, invisible, gone.
+            if let Some(err) = crate::server::conn::shared::cross_shard_write_rejection(
+                cmd,
+                cmd_args,
+                ctx.num_shards,
+            ) {
+                responses.push(err);
+                continue;
+            }
+
             // --- Routing: keyless, local, or remote ---
             let target_shard =
                 extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, ctx.num_shards));
