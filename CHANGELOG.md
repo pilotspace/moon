@@ -126,6 +126,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **A blocking command with an oversized timeout killed the whole server.** `BLPOP k 1e300` built
+  its deadline with `Duration::from_secs_f64`, which **panics** on a value it cannot represent, and
+  moon turns a panic on a shard thread into a process-wide abort — so one unauthenticated line
+  took the server down, every shard and every other client with it:
+
+  ```text
+  $ redis-cli -p 7833 BLPOP nokey 1e300
+  Error: Server closed the connection
+  cannot convert float seconds to Duration: value is either too big or NaN
+  FATAL: thread 'shard-0' panicked; aborting the whole process rather than serving with a
+  dead shard or a dead cluster control plane
+  ```
+
+  Found while adding `XREAD BLOCK` (#595), which routes into the same deadline code — the defect
+  itself predates it on the `BLPOP` float-seconds path. Both parsers now port the tail of Redis's
+  `getTimeoutFromObjectOrReply` exactly, including the ORDER of its checks, which is observable:
+  it converts to milliseconds first and only then judges the sign, so a negative timeout is
+  `-ERR timeout is negative` and not the "not a float" text moon used to send. Measured against
+  redis-server 8.6.1 with one fresh connection per case (a case that BLOCKS leaves its reply in
+  the socket and silently desynchronises every later read on a shared one — the first run of this
+  table was fiction):
+
+  ```text
+                                    before              after / redis 8.6.1
+  BLPOP nokey 1e300                 process abort       -ERR timeout is out of range
+  BLPOP nokey 1e16                  process abort       -ERR timeout is out of range
+  BLPOP nokey 1e15                  parks               parks
+  BLPOP nokey -0.5                  not a float …       -ERR timeout is negative
+  XREAD BLOCK 9223372036854775807   parked forever      -ERR timeout is out of range
+  XREAD BLOCK 9223372036854775      parks               parks
+  ```
+
+  Deadline construction itself is now total as well (`deadline_after` returns `None` instead of
+  panicking), so nothing that slips past a parser can reach the abort. Both sides of the boundary
+  are asserted, in-process and end-to-end: the unit tests pin every error text, and
+  `bsr12_oversized_timeout_errors_and_the_server_survives` `PING`s a live server after each case,
+  because a panicking build passes every in-process assertion right up to the moment it aborts.
+- **`XREAD BLOCK` / `XREADGROUP BLOCK` were a silent no-op: never blocked, never woken** (#595).
+  Both readers parsed `BLOCK`, stepped over its value with an `// ignored` comment, and answered
+  the null array immediately. That is worse than an unimplemented command, because the reply is
+  indistinguishable from a legitimate "nothing new": every consumer loop in the wild — `redis-py`,
+  `go-redis`, `lettuce` — degrades from a parked connection into a **hot spin**, re-issuing at full
+  speed and generating unbounded request volume where Redis would have slept. Measured raw-socket
+  against redis-server 8.6.1, both runtimes, `--shards 1` and `--shards 4`:
+
+  ```text
+  XADD bt 1-1 f v ; XREAD BLOCK 2000 STREAMS bt $
+    redis 8.6.1 :  *-1  after 2.044s     moon (before) :  *-1  after 0.000s
+  parked XREAD BLOCK 5000 STREAMS blk $ , XADD blk 2-1 g w at t=600ms
+    redis 8.6.1 :  the entry, at 0.605s  moon (before) :  *-1  at 0.000s
+  ```
+
+  `crate::blocking::WaitFamily::Stream` and a stream waker already existed; what was missing was
+  everything that would have put a waiter in front of them. Four defects, each independently
+  sufficient to keep the command broken:
+
+  1. **Nothing ever registered.** `is_blocking_command` answers from the command NAME, which is
+     enough for the eight blocking pops but not for `XREAD` — the same name is a plain read without
+     `BLOCK`. Added `is_blocking_command_args`, used at every site that decides whether a command
+     parks. The two `MULTI` queue gates deliberately keep the name-only predicate: inside a
+     transaction a stream read is queued as its ordinary self and executed by the dispatch table at
+     `EXEC`, which already ignores `BLOCK` (measured: `MULTI; XREAD BLOCK 3000 …; EXEC` → `*1 *-1`).
+  2. **The local write path could not wake anything.** The wakeup gate was open-coded at ten
+     dispatch sites; eight said `is_list_producer || ZADD || XADD` while the two **connection
+     handlers** said only `is_list_producer || ZADD`. A reader blocked on a key its own shard owned
+     was therefore unwakeable, while the same `XADD` arriving over SPSC woke it — a
+     routing-dependent hang that reads as a flake. All ten now share `wakeup::is_producer`.
+  3. **The waker was built for a destructive pop.** It stopped at the first served waiter and ran
+     `remove_wait` + `send(None)` on every waiter it popped, servable or not. Both halves are wrong
+     for streams: an `XADD` wakes **every** parked reader (measured — two clients on
+     `XREAD BLOCK 5000 STREAMS k $` both receive the entry), and a reader this `XADD` cannot serve
+     must stay parked. The `send(None)` also fired on the re-check that runs immediately after a
+     remote registration, so a cross-shard `XREAD BLOCK` would have answered null the instant it
+     registered. It now decides each waiter while it is still queued and removes only the ones it
+     can answer.
+  4. **`$` had nowhere correct to be resolved.** The parsing connection may not own the stream, so
+     `$` now travels as `StreamSince::Latest` and is bound by the shard that owns the key, with no
+     `.await` between reading `last_id` and registering — which is the lost-wakeup argument, not a
+     stylistic preference. Redis binds it the same way, and it is observable: block on `$`, `DEL`
+     the stream, re-`XADD` at a LOWER id, and the waiter still times out.
+
+  Errors are answered at once rather than parked: `-WRONGTYPE` for a stream read on a string key,
+  and `XREADGROUP`'s missing-key / missing-group errors — the latter checked on the shard that owns
+  the key, because otherwise `XREADGROUP GROUP nope c BLOCK 800 STREAMS k >` answered `-NOGROUP`
+  when `k` hashed to the client's own shard and parked for the full budget when it did not.
+
+  **The gate is a whitelist, and it covers ONE stream.** Everything it does not positively
+  recognise keeps reaching the dispatch table and answers exactly as it did before this change, so
+  each clause is a narrowing and never a regression:
+
+  * **One stream.** Moon cannot decide a multi-key command on one shard, so a multi-stream read
+    would be deferred to one `BlockRegister` **per key**, on a different thread each — and every
+    owner shard's post-registration re-check MUTATES: `read_group_new` moves entries into the
+    consumer's PEL. The client's coordinator keeps the first reply and drops the rest, stranding
+    the sibling's entries as delivered-and-unacked to a consumer that never received them
+    (`XREADGROUP >` never returns them again; only `XPENDING` / `XAUTOCLAIM` does). Measured on
+    `--shards 4`, 10 key pairs each holding one undelivered entry: **5 lost an entry that way**,
+    against 10/10 correct on redis 8.6.1 and on `--shards 1`. Gating on placement instead would
+    make one command behave two ways depending on a hash, so the gate reads the argument the client
+    wrote. Multi-stream `BLOCK` therefore still answers immediately, as it did before — no worse,
+    and never lossy. Lifting it needs multi-key stream reads decided by a single owner, the shape
+    #602 gave two-key writes; filed as a follow-up.
+  * **Wakeable ids only.** `$`, or an explicit id, for `XREAD`; `>`, and only `>`, for
+    `XREADGROUP` (a history read answers immediately even with `BLOCK` — measured). `+` is
+    excluded because `StreamId::parse` maps it to `StreamId::MAX`, so a waiter parked on it could
+    never be served by any `XADD` and would sit there until its client disconnected — a permanent
+    park where moon used to answer instantly. `>` on a plain `XREAD` is excluded because
+    registering it would bind the waiter at `0-0` and replay the whole stream on the first write.
+  * **Valid arguments only.** A malformed `COUNT` must be an error, not a 300 ms wait ending in the
+    null array. `BLOCK` is validated with Redis's own texts (`-ERR timeout is not an integer or out
+    of range`, `-ERR timeout is negative`) and with Redis's own `string2ll` accept-set, which takes
+    neither a leading `+` nor leading zeros — moon parked the full budget on `BLOCK +300` and
+    `BLOCK 0300`, both of which Redis rejects outright. `BLOCK 0` still blocks forever.
+
+  The waker walks each queue **once**. Deciding waiter-by-waiter through an id-then-lookup loop was
+  quadratic in the number of clients tailing one stream — the canonical fan-out workload — and
+  `XADD` p50 against parked, never-servable readers crossed over Redis at about 2000 tailers:
+
+  ```text
+  waiters                0     500    1000    2000    3000
+  moon (ids-then-lookup) 48.9  314.7  1005.2  3511.9  7601.3 us
+  redis 8.6.1           209.8  878.1   717.9  3032.9  5259.0 us
+  moon (one pass)        46.0  167.8   335.9   685.9   530.2 us
+  ```
+
+  At 3000 tailers a single `XADD` had been holding the shard thread for 7.6 ms p50, which on a
+  thread-per-core runtime stalls every other client on that shard.
+
+  Non-vacuity proven by mutation: each component was reverted in turn and the corresponding tests
+  confirmed to fail (predicate off → 7 of 11; `XADD` dropped from the producer gate → 4;
+  premature-null restored → 4; `$` binding disabled → 3; the whitelist widened → the two gate
+  tests). `handler_single` (the embedded server) is unchanged — it implements no blocking commands
+  at all, `BLPOP` included.
+
+  **Not fixed here, and pre-existing:** a multi-key stream read whose keys span shards is answered
+  by the routing key's shard alone, which cannot see the others. `XREADGROUP` claims the local
+  stream's entries and then under-reports or errors, stranding them in the PEL — measured
+  identically on a binary built from the merge-base and on this branch (**7 of 24 both ways**;
+  redis 8.6.1: 0 of 24). It needs the same single-owner design as the multi-stream `BLOCK` case and
+  is filed with it.
+
+- **`XREAD` emitted an unserved stream with an empty entry list; Redis omits it** (#594). Measured
+  against redis-server 8.6.1 after `XADD pelA 1-1 f v` and `XADD pelB 1-1 f v`:
+
+  ```text
+  XREAD COUNT 10 STREAMS pelA pelB 0 99999
+    redis 8.6.1 : *1 …pelA…
+    moon        : *2 …pelA… *2 $4 pelB *0        <- the extra
+  ```
+
+  A client iterating the reply saw a stream it had to special-case as present-but-empty. Under
+  RESP3 it is sharper still: since #593 the container is a Map keyed by stream name, where
+  membership is the natural "was this stream served?" test, so an entry with an empty list asserts
+  the stream is quiet — a claim the serving shard is not entitled to make. Fixed in
+  both `xread` and `xread_readonly`, so the reply
+  does not depend on which dispatch path served it. The all-unserved miss is unchanged (still the
+  null array, moon#482), and this is **not** the `XREADGROUP` history rule: `XREADGROUP … 0` on an
+  empty PEL genuinely does answer `{name: []}` in Redis (verified), so the omission belongs to
+  plain `XREAD`'s "did anything arrive after this id" question alone. The parity suites never
+  called `XREAD` with a mix of served and unserved streams, which is why it survived them.
+
+  One consequence worth naming: a stream on ANOTHER shard is invisible to the routed shard, which
+  reads it as "does not exist", so a cross-shard multi-stream `XREAD` now omits it instead of
+  reporting `[name, []]`. Both are wrong against Redis, which serves the entries — but the empty
+  list was an active lie (it asserts the stream is quiet), where the omission merely says nothing.
+  The underlying routing gap is pre-existing and filed with the multi-key work above.
+
 - **The two-key write family acknowledged success while destroying the data at `--shards > 1`**
   (#592). Moon routes a command to ONE shard — the owner of the key `extract_primary_key` picks —
   and that shard then executes the whole command against its own slice. `first_key` names the

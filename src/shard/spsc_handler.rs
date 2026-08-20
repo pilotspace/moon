@@ -841,10 +841,7 @@ pub(crate) fn handle_shard_message_shared(
 
                             // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                                    || cmd.eq_ignore_ascii_case(b"ZADD")
-                                    || cmd.eq_ignore_ascii_case(b"XADD");
-                                if needs_wake {
+                                if crate::blocking::wakeup::is_producer(cmd) {
                                     let wake_key = args
                                         .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                         .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -1075,10 +1072,7 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
+                        if crate::blocking::wakeup::is_producer(cmd) {
                             let wake_key = args
                                 .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                 .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -1330,10 +1324,7 @@ pub(crate) fn handle_shard_message_shared(
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
+                        if crate::blocking::wakeup::is_producer(cmd) {
                             let wake_key = args
                                 .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                 .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -1513,10 +1504,7 @@ pub(crate) fn handle_shard_message_shared(
                             }
 
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                                    || cmd.eq_ignore_ascii_case(b"ZADD")
-                                    || cmd.eq_ignore_ascii_case(b"XADD");
-                                if needs_wake {
+                                if crate::blocking::wakeup::is_producer(cmd) {
                                     let wake_key = args
                                         .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                         .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -1707,10 +1695,7 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
+                        if crate::blocking::wakeup::is_producer(cmd) {
                             let wake_key = args
                                 .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                 .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -1963,10 +1948,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
+                        if crate::blocking::wakeup::is_producer(cmd) {
                             let wake_key = args
                                 .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
                                 .and_then(|f| crate::server::connection::extract_bytes(f));
@@ -2074,13 +2056,22 @@ pub(crate) fn handle_shard_message_shared(
             // registered on other shards and may be serving right now, and an
             // error raised here would race a real wake-up whose element has
             // already left the keyspace. Those keep the pre-#556 behaviour.
+            let mut cmd = cmd;
             let type_error = if sole_key {
                 crate::shard::slice::with_shard_db(db_index, |guard| {
                     match cmd.family() {
                         crate::blocking::WaitFamily::List => guard.get_list(&key).err(),
                         crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
-                        // XREAD does its own type handling.
-                        crate::blocking::WaitFamily::Stream => None,
+                        // moon#595: `-WRONGTYPE` for a stream read on the
+                        // wrong type, plus XREADGROUP's missing-key and
+                        // missing-group errors. The client's own scan cannot
+                        // see a key it does not own, so — exactly as moon#556
+                        // argued for the pops — the check has to happen here
+                        // too or the remote case parks on a key that can never
+                        // serve it.
+                        crate::blocking::WaitFamily::Stream => {
+                            crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
+                        }
                     }
                 })
             } else {
@@ -2092,6 +2083,16 @@ pub(crate) fn handle_shard_message_shared(
                 let _ = reply_tx.send(Some(err));
                 return;
             }
+            // moon#595: bind this waiter's `$` against the stream as THIS
+            // shard sees it right now. The client's shard could not do it —
+            // it does not own the key — and doing it here is what closes the
+            // lost-wakeup window: the bind, the registration and the re-check
+            // below are one synchronous stretch of this shard's event loop,
+            // so no `XADD` can land between deciding the cursor and being
+            // reachable by the waker. A no-op for every non-`$` waiter.
+            crate::shard::slice::with_shard_db(db_index, |guard| {
+                cmd.bind_stream_since(guard, &key);
+            });
             let entry = crate::blocking::WaitEntry {
                 wait_id,
                 cmd,

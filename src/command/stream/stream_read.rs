@@ -238,9 +238,29 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
         match db.get_stream(key) {
             Ok(Some(stream)) => {
                 let entries = stream.range(next_id, StreamId::MAX, count);
-                if !entries.is_empty() {
-                    has_entries = true;
+                // moon#594: a stream that yielded nothing is OMITTED, not
+                // reported as present-with-an-empty-list. Measured against
+                // redis-server 8.6.1 — `XREAD COUNT 10 STREAMS a b 0 99999`
+                // with data only in `a` answers `*1`, not `*2 … *0`. A client
+                // iterating the reply otherwise sees a stream it must
+                // special-case as present-but-empty.
+                //
+                // Under RESP3 it matters more: since moon#593 the container
+                // is a Map keyed by stream name (`Resp3Shape::StreamMap`, in
+                // `src/protocol/resp3.rs`), and map membership is the natural
+                // "was this stream served?" test — an entry whose value is an
+                // empty list asserts the stream is quiet, which is a claim
+                // this shard is not entitled to make. Omitting is right under
+                // either container; the Map only sharpens it.
+                //
+                // This is NOT the XREADGROUP history rule — `XREADGROUP … 0`
+                // against an empty PEL really does answer `{name: []}` in
+                // Redis (verified). The omission is specific to plain XREAD's
+                // "did anything arrive after the given id" question.
+                if entries.is_empty() {
+                    continue;
                 }
+                has_entries = true;
                 let entry_frames: Vec<Frame> = entries
                     .into_iter()
                     .map(|(id, fields)| format_entry(id, fields))
@@ -250,13 +270,9 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
                     Frame::Array(entry_frames.into()),
                 ]));
             }
-            Ok(None) => {
-                // Stream doesn't exist, no entries
-                results.push(Frame::Array(framevec![
-                    Frame::BulkString(key.clone()),
-                    Frame::Array(framevec![]),
-                ]));
-            }
+            // Stream doesn't exist: nothing was served, so it is omitted
+            // (moon#594) exactly as an existing-but-quiet stream is.
+            Ok(None) => continue,
             Err(e) => return e,
         }
     }
@@ -760,9 +776,13 @@ pub fn xread_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
         match db.get_stream_if_alive(key, now_ms) {
             Ok(Some(stream)) => {
                 let entries = stream.range(next_id, StreamId::MAX, count);
-                if !entries.is_empty() {
-                    has_entries = true;
+                // moon#594 — see the twin in `xread` for the measured bytes.
+                // The read-only path must answer identically or the reply
+                // shape depends on which dispatch path served the command.
+                if entries.is_empty() {
+                    continue;
                 }
+                has_entries = true;
                 let entry_frames: Vec<Frame> = entries
                     .into_iter()
                     .map(|(id, fields)| format_entry(id, fields))
@@ -772,12 +792,7 @@ pub fn xread_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
                     Frame::Array(entry_frames.into()),
                 ]));
             }
-            Ok(None) => {
-                results.push(Frame::Array(framevec![
-                    Frame::BulkString(key.clone()),
-                    Frame::Array(framevec![]),
-                ]));
-            }
+            Ok(None) => continue,
             Err(e) => return e,
         }
     }

@@ -24,6 +24,25 @@ pub fn is_list_producer(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"RPOPLPUSH")
 }
 
+/// Does `cmd` write data that could satisfy SOME blocked waiter — list, zset
+/// or stream?
+///
+/// The gate in front of every wakeup ladder, and it is a function for the same
+/// reason [`is_list_producer`] is: it was open-coded at ten dispatch sites,
+/// eight of which said `is_list_producer(cmd) || ZADD || XADD` while the two
+/// connection handlers said only `is_list_producer(cmd) || ZADD`. That
+/// difference is half of moon#595 — with the missing `XADD`, a stream reader
+/// blocked on a key its OWN shard owned could never be woken, because the
+/// local write path did not consider stream waiters to exist. It reads as a
+/// routing-dependent hang: the same `XADD` wakes or does not wake depending on
+/// whether the writer's connection happens to live on the key's shard.
+///
+/// Producers that gain a blocking consumer later must be added HERE, once.
+#[inline]
+pub fn is_producer(cmd: &[u8]) -> bool {
+    is_list_producer(cmd) || cmd.eq_ignore_ascii_case(b"ZADD") || cmd.eq_ignore_ascii_case(b"XADD")
+}
+
 /// Index of the argument naming the key a producer WRITES to — the key a
 /// blocked client is waiting on.
 ///
@@ -429,130 +448,230 @@ pub fn try_wake_zset_waiter(
     false
 }
 
-/// Called after XADD successfully adds an entry to a stream key.
-/// Pops the first waiter (FIFO) and checks if the stream has entries > last_seen_id.
-/// For XRead: delivers entries from stream.range(last_seen_id+1.., count).
-/// For XReadGroup with >: delivers via stream.read_group_new().
-/// Returns true if a blocked client was woken.
+/// Called after `XADD` adds an entry to a stream key, and again right after a
+/// remote `BlockRegister` lands, to serve whatever stream readers that key now
+/// has parked on it.
+///
+/// Returns true if at least one blocked client was answered.
+///
+/// # Why this is not shaped like the list and zset wakers
+///
+/// Those wakers CONSUME: a pushed element belongs to exactly one waiter, so
+/// `pop_front_of_family` + answer + `return true` is the whole operation, and
+/// a waiter they cannot serve means the key really is empty.
+///
+/// Stream reads are non-destructive, and both halves of that matter
+/// (both measured against redis-server 8.6.1):
+///
+/// * **one `XADD` wakes EVERY parked `XREAD`.** Two clients on
+///   `XREAD BLOCK 5000 STREAMS k $` each receive the entry from a single
+///   `XADD`. Stopping at the first served waiter would have left the second
+///   parked until its deadline.
+/// * **a waiter this `XADD` cannot serve must stay parked.** The pre-#595
+///   code ran `remove_wait` + `reply_tx.send(None)` for every waiter it
+///   popped, servable or not — so an `XADD` at an id BELOW a `$`-bound
+///   reader's cursor, or an `XREADGROUP` whose entries a sibling consumer
+///   just took, unblocked that reader with a premature null. That same
+///   `send(None)` is what would have fired on the re-check the
+///   `BlockRegister` handler runs immediately after registering, making a
+///   remote `XREAD BLOCK` answer null the instant it was registered.
+///
+/// So this walks the key's stream-family waiters in FIFO order, decides each
+/// one against the store while it is still queued ([`peek_wait`]), and only
+/// removes the ones it can actually answer ([`take_wait`]). Nothing is ever
+/// answered `None` here; a waiter that is not served stays registered and is
+/// released by its own deadline, its client's disconnect, or a later `XADD`.
+///
+/// [`peek_wait`]: BlockingRegistry::peek_wait
+/// [`take_wait`]: BlockingRegistry::take_wait
 pub fn try_wake_stream_waiter(
     registry: &mut BlockingRegistry,
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
 ) -> bool {
+    // Decide first, mutate second. One pass over the queue, with every waiter
+    // still in place, so a decision of "cannot serve" costs nothing and leaves
+    // FIFO order untouched. `wait_id`s come out ascending because they are
+    // handed out monotonically and the queue is FIFO — which is exactly the
+    // precondition `take_waits` needs.
+    let mut decisions: smallvec::SmallVec<[(u64, Option<Frame>); 4]> = smallvec::SmallVec::new();
+    {
+        let Some(queue) = registry.waiters_on(db_index, key) else {
+            return false;
+        };
+        for entry in queue
+            .iter()
+            .filter(|e| e.cmd.family() == crate::blocking::WaitFamily::Stream)
+        {
+            // c10k A2: a client that already went away must not consume the
+            // wake a live sibling needs. There is nothing to undo on this
+            // path — `XREAD` mutates nothing, and `XREADGROUP`'s delivery
+            // leaves the entries in the stream and only records them in the
+            // PEL of a consumer that vanished, which is precisely Redis's
+            // dead-consumer state (recoverable via `XAUTOCLAIM`).
+            if entry.reply_tx.is_disconnected() {
+                decisions.push((entry.wait_id, None));
+            } else if let Some(frame) = serve_stream_waiter(&entry.cmd, db, key) {
+                decisions.push((entry.wait_id, Some(frame)));
+            }
+            // Anything else stays REGISTERED and is released by its own
+            // deadline, its client's disconnect, or a later XADD. It is never
+            // answered `None` here.
+        }
+    }
+    if decisions.is_empty() {
+        return false;
+    }
+
+    let ids: smallvec::SmallVec<[u64; 4]> = decisions.iter().map(|(id, _)| *id).collect();
+    let mut woke = false;
+    // `take_waits` preserves queue order, and `decisions` is in queue order,
+    // so the two line up entry-for-entry.
+    for (entry, (wait_id, frame)) in registry
+        .take_waits(db_index, key, &ids)
+        .into_iter()
+        .zip(decisions)
+    {
+        debug_assert_eq!(entry.wait_id, wait_id);
+        let Some(frame) = frame else {
+            continue; // the disconnected client — removed, nothing to send
+        };
+        if entry.reply_tx.send(Some(frame)).is_ok() {
+            woke = true;
+        }
+        // A failed send is the residual A2 race — the receiver dropped between
+        // the check above and here. Nothing to restore: the entries are still
+        // in the stream.
+    }
+    woke
+}
+
+/// The error a blocking stream read owes its client IMMEDIATELY, decided on
+/// the shard that owns `key` (moon#595).
+///
+/// Registering is the wrong answer to a question the keyspace has already
+/// settled. `-WRONGTYPE` and `XREADGROUP`'s two errors are permanent for as
+/// long as the key is what it is: a group that does not exist cannot start
+/// existing because someone `XADD`s to the stream, so a waiter parked on that
+/// hope would burn its whole budget and then answer the null array.
+///
+/// It runs HERE, in the `BlockRegister` handler, and not only in the client's
+/// own pre-registration scan, because that scan can see only the keys its
+/// shard owns. Without this, `XREADGROUP GROUP nope c BLOCK 800 STREAMS k >`
+/// answered `-NOGROUP` in 0.000 s when `k` hashed to the client's own shard
+/// and parked for the full 800 ms when it did not — the same command, two
+/// answers, decided by a hash.
+///
+/// `None` means "nothing settled; park".
+pub fn stream_register_error(
+    db: &mut Database,
+    key: &Bytes,
+    cmd: &BlockedCommand,
+) -> Option<Frame> {
+    // Wrong type is wrong type for both stream readers.
+    if let Some(err) = db.get_stream(key).err() {
+        return Some(err);
+    }
+    let BlockedCommand::XReadGroup { group, .. } = cmd else {
+        // A plain XREAD on a missing key is not an error — that is exactly the
+        // `$`-on-a-future-stream case, and it must park.
+        return None;
+    };
+    let Ok(Some(stream)) = db.get_stream(key) else {
+        return Some(Frame::Error(Bytes::from_static(
+            b"ERR The XREADGROUP subcommand requires the key to exist.",
+        )));
+    };
+    if !stream.groups.contains_key(group.as_ref()) {
+        return Some(Frame::Error(Bytes::from_static(
+            b"NOGROUP No such consumer group for key name",
+        )));
+    }
+    None
+}
+
+/// The reply a parked stream reader is owed by the current state of `key`, or
+/// `None` if this key cannot serve it yet.
+///
+/// Split out of [`try_wake_stream_waiter`] so the "can I serve this?" question
+/// is answerable against a borrowed [`WaitEntry`], which is what keeps an
+/// unservable waiter in the queue.
+fn serve_stream_waiter(cmd: &BlockedCommand, db: &mut Database, key: &Bytes) -> Option<Frame> {
     use crate::command::stream::format_entry;
     use crate::storage::stream::StreamId;
 
-    // moon#535: pop only waiters THIS waker can serve. The old blind
-    // `pop_front` handed us waiters of every family, and the cleanup below —
-    // `remove_wait` + `send(None)` — runs for every waiter we pop, so an
-    // unservable one was destroyed rather than left for its own waker.
-    //
-    // The loop condition moved from `has_waiters` to the pop itself: a queue
-    // holding only foreign waiters is not empty, so the old condition would
-    // now spin forever.
-    while let Some(waiter) =
-        registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::Stream)
-    {
-        let crate::blocking::WaitEntry {
-            wait_id,
-            cmd,
-            reply_tx,
+    // Each arm builds its own frames: `range` hands back BORROWED field lists
+    // while `read_group_new` hands back owned ones, so there is no common
+    // `entries` type to carry out of the match.
+    let entry_frames: Vec<Frame> = match cmd {
+        BlockedCommand::XRead { streams, count } => {
+            // `find` rather than an index: a multi-key XREAD registers the
+            // same command on several keys and only this key's cursor applies.
+            //
+            // `StreamSince::Latest` here means `$` was never bound to a
+            // number. That is a binding bug, not a client state — and it
+            // resolves to "serve nothing" deliberately: treating it as `0-0`
+            // would replay the stream's whole history to a client that asked
+            // only for what arrives next.
+            let since = streams
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, since)| since.id())?;
+            let start = if since.seq == u64::MAX {
+                StreamId {
+                    ms: since.ms.saturating_add(1),
+                    seq: 0,
+                }
+            } else {
+                StreamId {
+                    ms: since.ms,
+                    seq: since.seq.saturating_add(1),
+                }
+            };
+            let stream = db.get_stream(key).ok()??;
+            let entries = stream.range(start, StreamId::MAX, *count);
+            if entries.is_empty() {
+                return None;
+            }
+            entries
+                .into_iter()
+                .map(|(id, fields)| format_entry(id, fields))
+                .collect()
+        }
+        BlockedCommand::XReadGroup {
+            group,
+            consumer,
+            count,
+            noack,
             ..
-        } = waiter;
-
-        // A2: skip waiters whose client is already gone. Unlike the list and
-        // zset paths there is no undo here, and none is needed: XRead is a
-        // non-destructive range read, and XReadGroup's delivery leaves the
-        // entries in the stream — only the PEL records them as delivered to a
-        // consumer that vanished, which is exactly Redis's dead-consumer
-        // semantics (recoverable via XAUTOCLAIM). The pre-check still matters
-        // so a dead waiter does not consume the wake that a live one needs.
-        if reply_tx.is_disconnected() {
-            registry.remove_wait(wait_id);
-            continue;
-        }
-
-        let result = match &cmd {
-            BlockedCommand::XRead { streams, count } => {
-                // Find this key's last_seen_id in the streams list
-                let last_seen = streams.iter().find(|(k, _)| k == key).map(|(_, id)| *id);
-                if let Some(last_id) = last_seen {
-                    if let Ok(Some(stream)) = db.get_stream(key) {
-                        let start = if last_id.seq == u64::MAX {
-                            StreamId {
-                                ms: last_id.ms.saturating_add(1),
-                                seq: 0,
-                            }
-                        } else {
-                            StreamId {
-                                ms: last_id.ms,
-                                seq: last_id.seq.saturating_add(1),
-                            }
-                        };
-                        let entries = stream.range(start, StreamId::MAX, *count);
-                        if !entries.is_empty() {
-                            let entry_frames: Vec<crate::protocol::Frame> = entries
-                                .iter()
-                                .map(|(id, fields)| format_entry(*id, fields))
-                                .collect();
-                            Some(crate::protocol::Frame::Array(framevec![
-                                crate::protocol::Frame::Array(framevec![
-                                    crate::protocol::Frame::BulkString(key.clone()),
-                                    crate::protocol::Frame::Array(entry_frames.into()),
-                                ])
-                            ]))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+        } => {
+            let stream = db.get_stream_mut(key).ok()??;
+            // Only reaches the store when a live waiter is actually waiting on
+            // it, so the PEL side effect never happens on behalf of a client
+            // that has already gone (checked by the caller).
+            let entries = stream
+                .read_group_new(group, consumer, *count, *noack)
+                .ok()?;
+            if entries.is_empty() {
+                return None;
             }
-            BlockedCommand::XReadGroup {
-                group,
-                consumer,
-                count,
-                noack,
-                ..
-            } => {
-                if let Ok(Some(stream)) = db.get_stream_mut(key) {
-                    match stream.read_group_new(group, consumer, *count, *noack) {
-                        Ok(entries) if !entries.is_empty() => {
-                            let entry_frames: Vec<crate::protocol::Frame> = entries
-                                .iter()
-                                .map(|(id, fields)| format_entry(*id, fields))
-                                .collect();
-                            Some(crate::protocol::Frame::Array(framevec![
-                                crate::protocol::Frame::Array(framevec![
-                                    crate::protocol::Frame::BulkString(key.clone()),
-                                    crate::protocol::Frame::Array(entry_frames.into()),
-                                ])
-                            ]))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            // Unreachable since moon#535 — see try_wake_list_waiter.
-            _ => None,
-        };
-
-        // Clean up all other key registrations for this wait_id
-        registry.remove_wait(wait_id);
-
-        if let Some(frame) = result {
-            let _ = reply_tx.send(Some(frame));
-            return true;
+            entries
+                .iter()
+                .map(|(id, fields)| format_entry(*id, fields))
+                .collect()
         }
-        let _ = reply_tx.send(None);
-    }
-    false
+        // Unreachable since moon#535: `family()` routes only the two stream
+        // commands here, and `family_wait_ids` filtered on it.
+        _ => return None,
+    };
+    // Only the stream that actually had entries appears, which is both what
+    // Redis answers a woken reader and what moon#594 made the non-blocking
+    // XREAD do.
+    Some(Frame::Array(framevec![Frame::Array(framevec![
+        Frame::BulkString(key.clone()),
+        Frame::Array(entry_frames.into()),
+    ])]))
 }
 
 #[cfg(test)]

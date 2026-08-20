@@ -12,6 +12,61 @@ pub enum Direction {
     Right,
 }
 
+/// Where a blocked `XREAD` starts reading from, as the client wrote it.
+///
+/// `$` cannot be turned into a number by the connection that parsed it: with
+/// more than one shard the stream may live on a different thread entirely, and
+/// reading a stale look-alike from the local slice would bind the waiter to
+/// the wrong id. So `$` travels as [`StreamSince::Latest`] and is bound by the
+/// shard that OWNS the key, at registration time.
+///
+/// Binding must happen with **no `.await` between the read of `last_id` and
+/// `BlockingRegistry::register`** — that is the whole lost-wakeup argument for
+/// moon#595. Both binding sites satisfy it by running inside a single
+/// synchronous stretch of their shard's event loop:
+///
+/// * local keys — `handle_blocking_command{,_monoio}` binds inside
+///   `with_shard_db` and registers immediately after;
+/// * remote keys — the `BlockRegister` handler binds, registers, and re-runs
+///   the waker, all in one SPSC message.
+///
+/// Redis binds `$` the same way, which is observable: block on `$`, then
+/// `DEL` the stream and re-`XADD` at a LOWER id, and the waiter still times
+/// out rather than being woken (measured against redis-server 8.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSince {
+    /// An explicit id. Deliver entries strictly greater than this.
+    Id(crate::storage::stream::StreamId),
+    /// The client wrote `$`. Not yet bound to a number.
+    ///
+    /// A waiter that reaches the waker still carrying `Latest` is a binding
+    /// bug, and the waker treats it as "serve nothing" rather than as
+    /// `0-0` — mis-binding must cost a missed wakeup, never a replay of the
+    /// stream's entire history to a client that asked only for new entries.
+    Latest,
+}
+
+impl StreamSince {
+    /// Bind `Latest` to `last_id`; an explicit id is already bound and is
+    /// returned unchanged.
+    #[inline]
+    pub fn bind(self, last_id: crate::storage::stream::StreamId) -> Self {
+        match self {
+            StreamSince::Latest => StreamSince::Id(last_id),
+            bound => bound,
+        }
+    }
+
+    /// The bound id, or `None` while still unbound.
+    #[inline]
+    pub fn id(self) -> Option<crate::storage::stream::StreamId> {
+        match self {
+            StreamSince::Id(id) => Some(id),
+            StreamSince::Latest => None,
+        }
+    }
+}
+
 /// Which blocking command a waiter is executing.
 #[derive(Debug)]
 pub enum BlockedCommand {
@@ -33,14 +88,15 @@ pub enum BlockedCommand {
         count: u32,
     },
     XRead {
-        /// (key, last_seen_id) pairs -- read entries > last_seen_id from each stream.
-        streams: Vec<(Bytes, crate::storage::stream::StreamId)>,
+        /// (key, since) pairs -- read entries strictly after `since` from each
+        /// stream. See [`StreamSince`] for why the id is not always known yet.
+        streams: Vec<(Bytes, StreamSince)>,
         count: Option<usize>,
     },
     XReadGroup {
         group: Bytes,
         consumer: Bytes,
-        streams: Vec<(Bytes, crate::storage::stream::StreamId)>,
+        streams: Vec<(Bytes, StreamSince)>,
         count: Option<usize>,
         noack: bool,
     },
@@ -78,6 +134,42 @@ impl BlockedCommand {
             }
             BlockedCommand::XRead { .. } | BlockedCommand::XReadGroup { .. } => WaitFamily::Stream,
         }
+    }
+
+    /// Bind this command's `$` for `key` against the stream that `db` holds
+    /// under it (moon#595).
+    ///
+    /// Call on the shard that OWNS `key`, immediately before
+    /// [`BlockingRegistry::register`] and with no `.await` in between — see
+    /// [`StreamSince`] for why that ordering is the correctness argument and
+    /// not merely a preference.
+    ///
+    /// Only `key`'s own entry is bound. A multi-key `XREAD` registers one copy
+    /// of this command per key, each on that key's owner, and each copy is
+    /// only ever consulted for the key it was registered under — so binding
+    /// the siblings here would mean reading them off the wrong shard.
+    ///
+    /// A missing stream binds to `0-0`, matching Redis: `$` on a key that does
+    /// not exist yet means "everything from now on".
+    pub fn bind_stream_since(&mut self, db: &mut crate::storage::Database, key: &Bytes) {
+        let BlockedCommand::XRead { streams, .. } = self else {
+            // XREADGROUP reads by group cursor (`>`), never by `$`.
+            return;
+        };
+        let Some(slot) = streams
+            .iter_mut()
+            .find(|(k, since)| k == key && matches!(since, StreamSince::Latest))
+        else {
+            return;
+        };
+        let last_id = match db.get_stream(key) {
+            Ok(Some(stream)) => stream.last_id,
+            // Missing key, or a key of the wrong type — either way there is no
+            // history to skip. A wrong-typed key is answered as `-WRONGTYPE`
+            // before this waiter is ever registered.
+            _ => crate::storage::stream::StreamId::ZERO,
+        };
+        slot.1 = slot.1.bind(last_id);
     }
 }
 
@@ -214,6 +306,95 @@ impl BlockingRegistry {
             self.waiters.remove(&queue_key);
         }
         Some(entry)
+    }
+
+    /// The waiters queued on `(db_index, key)`, in FIFO order, for a caller
+    /// that needs to DECIDE before it removes anything (moon#595).
+    ///
+    /// [`pop_front_of_family`](Self::pop_front_of_family) is the right
+    /// primitive for a DESTRUCTIVE wake: a list push has one element and
+    /// exactly one waiter may have it, so taking the waiter out and answering
+    /// it is the whole operation. `XREAD` is the opposite — the entry stays in
+    /// the stream, so an `XADD` wakes EVERY parked reader (measured: two
+    /// clients on `XREAD BLOCK 5000 STREAMS k $` both receive the entry from
+    /// one `XADD` against redis-server 8.6.1), and a reader this particular
+    /// `XADD` cannot serve must stay parked until its own deadline. Popping
+    /// first and answering `None` on a miss — what the destructive wakers do —
+    /// would unblock those readers with a premature null.
+    pub fn waiters_on(&self, db_index: usize, key: &Bytes) -> Option<&VecDeque<WaitEntry>> {
+        self.waiters.get(&(db_index, key.clone()))
+    }
+
+    /// Remove every waiter on `(db_index, key)` whose id is in `ids`, and hand
+    /// the entries back in queue order.
+    ///
+    /// `ids` MUST be sorted ascending — which is free for the caller, because
+    /// `wait_id`s are handed out monotonically and a queue is FIFO, so reading
+    /// one off in queue order already produces them sorted.
+    ///
+    /// The batching is not micro-optimisation. Removing one at a time meant a
+    /// scan of the queue to find the entry, plus another inside `remove_wait`,
+    /// for each of W waiters — quadratic in the number of clients tailing one
+    /// stream, which is the canonical fan-out workload. Measured `XADD` p50
+    /// against parked, never-servable `XREAD` waiters, before this change:
+    ///
+    /// ```text
+    /// waiters      0     500    1000    2000    3000
+    /// moon      48.9   314.7  1005.2  3511.9  7601.3 us   (24x for 6x waiters)
+    /// redis    209.8   878.1   717.9  3032.9  5259.0 us   (6x  for 6x waiters)
+    /// ```
+    ///
+    /// moon starts 4.3x faster than Redis and crosses over to slower at about
+    /// 2000 tailers; at 3000 a single `XADD` held the shard thread for 7.6 ms,
+    /// which on a thread-per-core runtime stalls every other client on that
+    /// shard. This walks each queue once instead.
+    pub fn take_waits(
+        &mut self,
+        db_index: usize,
+        key: &Bytes,
+        ids: &[u64],
+    ) -> smallvec::SmallVec<[WaitEntry; 4]> {
+        let mut taken = smallvec::SmallVec::new();
+        if ids.is_empty() {
+            return taken;
+        }
+        let queue_key = (db_index, key.clone());
+        if let Some(queue) = self.waiters.get_mut(&queue_key) {
+            let mut kept = VecDeque::with_capacity(queue.len());
+            while let Some(entry) = queue.pop_front() {
+                if ids.binary_search(&entry.wait_id).is_ok() {
+                    taken.push(entry);
+                } else {
+                    kept.push_back(entry);
+                }
+            }
+            if kept.is_empty() {
+                self.waiters.remove(&queue_key);
+            } else {
+                *queue = kept;
+            }
+        }
+        // Sibling registrations and the gauge. `wait_keys` names exactly the
+        // keys each waiter sits on, so this touches only those queues — and a
+        // stream waiter has just the one (see `is_blocking_stream_read`).
+        for id in ids {
+            let Some(keys) = self.wait_keys.remove(id) else {
+                continue;
+            };
+            crate::admin::metrics_setup::record_client_unblocked();
+            for sibling in keys {
+                if sibling == queue_key {
+                    continue;
+                }
+                if let Some(queue) = self.waiters.get_mut(&sibling) {
+                    queue.retain(|e| e.wait_id != *id);
+                    if queue.is_empty() {
+                        self.waiters.remove(&sibling);
+                    }
+                }
+            }
+        }
+        taken
     }
 
     /// Remove all entries with this wait_id from ALL keys they are registered on.

@@ -973,6 +973,105 @@ xrg_probe history 0
 # The fence: the `>` form with nothing new stays the null ARRAY (`*-1`, #482).
 xrg_probe newonly '>'
 
+# ===========================================================================
+# XREAD omits a stream that had nothing (moon#594)
+# ===========================================================================
+# `XREAD ... STREAMS a b 0 <past b's last id>` serves only `a`. Redis answers
+# `*1`; moon answered `*2` and carried `b` as a present-but-empty entry list,
+# so a client iterating the reply saw a stream it had to special-case. Under
+# RESP3 that is a Map key whose value is empty, which is worse — map membership
+# is the natural "this stream was served" test.
+#
+# The header line IS the assertion: the element count is the entire divergence,
+# and `null_type_of` reads exactly that first line.
+#
+# Both streams share a hash tag so they live on the same shard. moon routes a
+# multi-stream XREAD by its FIRST key, so untagged keys would be testing
+# cross-shard routing instead of the omission rule — and would pass vacuously.
+#
+# This is deliberately NOT the XREADGROUP history case above: `XREADGROUP ... 0`
+# on an empty PEL really is `*1 {name: *0}` in Redis. The omission rule belongs
+# to plain XREAD's "did anything arrive after this id" question alone.
+xread_omit_probe() {
+    local kind="$1"; shift
+    local a="{xromit:${kind}}:a" b="{xromit:${kind}}:b" p
+    for p in "$PORT_REDIS" "$PORT_RUST"; do
+        redis-cli -p "$p" DEL "$a" "$b" >/dev/null 2>&1 || true
+        redis-cli -p "$p" XADD "$a" 1-1 f v >/dev/null 2>&1 || true
+        redis-cli -p "$p" XADD "$b" 1-1 f v >/dev/null 2>&1 || true
+    done
+    TOTAL=$((TOTAL + 1))
+    assert_eq "xread omit ${kind}: STREAMS ${a} ${b} $*" \
+        "$(null_type_of "$PORT_REDIS" XREAD COUNT 10 STREAMS "$a" "$b" "$@")" \
+        "$(null_type_of "$PORT_RUST"  XREAD COUNT 10 STREAMS "$a" "$b" "$@")"
+}
+
+# The defect: `a` is served, `b` is not -> `*1`, not `*2`.
+xread_omit_probe served_and_quiet 0 99999
+# The fences, so "always answer *1" cannot pass: both served -> `*2`, and
+# neither served -> the null ARRAY (`*-1`, moon#482), not an empty one.
+xread_omit_probe both_served 0 0
+xread_omit_probe none_served 99999 99999
+
+# ===========================================================================
+# XREAD / XREADGROUP BLOCK really block, and XADD wakes them (moon#595)
+# ===========================================================================
+# `BLOCK` used to be parsed and discarded, so `XREAD BLOCK 700 STREAMS k $`
+# returned in 0.000 s where Redis waits the full budget. The reply BYTES are
+# identical either way (`*-1` is exactly what a legitimate timeout answers), so
+# only the elapsed time can tell the two apart — which is why this probe times
+# rather than compares.
+#
+# Both halves are asserted: a server that never blocks passes "was woken" only
+# vacuously, and a server that blocks but is never woken passes "waited".
+xread_block_ms() {
+    local port="$1"; shift
+    local start end line
+    start=$(date +%s%N)
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "-1"; return 0; }
+    printf '%s\r\n' "$*" >&3
+    IFS= read -r -t 10 line <&3
+    exec 3>&-
+    end=$(date +%s%N)
+    echo $(((end - start) / 1000000))
+}
+
+# `date +%s%N` is a GNU extension; these scripts are documented to run inside
+# moon-dev, but skip rather than fail loudly somewhere without it.
+if [[ "$(date +%s%N)" =~ ^[0-9]+$ ]]; then
+    for port_pair in "redis:${PORT_REDIS}" "moon:${PORT_RUST}"; do
+        who="${port_pair%%:*}"
+        port="${port_pair##*:}"
+        redis-cli -p "$port" DEL xrblk >/dev/null 2>&1 || true
+        redis-cli -p "$port" XADD xrblk 1-1 f v >/dev/null 2>&1 || true
+
+        # (1) nothing new -> waits out the budget.
+        TOTAL=$((TOTAL + 1))
+        elapsed=$(xread_block_ms "$port" XREAD BLOCK 700 STREAMS xrblk '$')
+        if (( elapsed >= 600 && elapsed < 5000 )); then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: ${who} XREAD BLOCK 700 returned after ${elapsed}ms (want ~700)"
+        fi
+
+        # (2) a concurrent XADD wakes it.
+        redis-cli -p "$port" DEL xrwake >/dev/null 2>&1 || true
+        redis-cli -p "$port" XADD xrwake 1-1 f v >/dev/null 2>&1 || true
+        ( sleep 0.4; redis-cli -p "$port" XADD xrwake 2-1 g w >/dev/null 2>&1 ) &
+        waker=$!
+        TOTAL=$((TOTAL + 1))
+        elapsed=$(xread_block_ms "$port" XREAD BLOCK 5000 STREAMS xrwake '$')
+        wait "$waker" 2>/dev/null || true
+        if (( elapsed >= 200 && elapsed < 4000 )); then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: ${who} parked XREAD was not woken by XADD (${elapsed}ms)"
+        fi
+    done
+fi
+
 # ---------------------------------------------------------------------------
 # Shard-routing parity (moon#533, moon#534)
 #

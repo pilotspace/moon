@@ -1730,7 +1730,7 @@ pub(super) async fn try_handle_blocking<
     shutdown: &CancellationToken,
     client_live: &std::sync::Arc<crate::client_registry::ClientLiveState>,
 ) -> BlockingResult {
-    if !crate::server::conn::blocking::is_blocking_command(cmd) {
+    if !crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args) {
         return BlockingResult::NotBlocking;
     }
 
