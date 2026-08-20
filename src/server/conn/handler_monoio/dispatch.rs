@@ -214,9 +214,18 @@ pub(super) async fn try_handle_evalsha(
     if !cmd.eq_ignore_ascii_case(b"EVALSHA") {
         return false;
     }
-    if let Some(routed) =
-        crate::server::conn::shared::route_script_elsewhere(cmd, cmd_args, conn.selected_db, ctx)
-            .await
+    // moon#569: resolve the caller ONCE per script, then let every inner
+    // `redis.call` be authorized against it (locally or on the shard this
+    // script routes to).
+    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user);
+    if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
+        cmd,
+        cmd_args,
+        conn.selected_db,
+        &script_acl,
+        ctx,
+    )
+    .await
     {
         responses.push(routed);
         return true;
@@ -232,6 +241,7 @@ pub(super) async fn try_handle_evalsha(
             ctx.num_shards,
             conn.selected_db,
             db_count,
+            &script_acl,
         )
     });
     responses.push(response);
@@ -253,9 +263,16 @@ pub(super) async fn try_handle_eval(
     if !cmd.eq_ignore_ascii_case(b"EVAL") {
         return false;
     }
-    if let Some(routed) =
-        crate::server::conn::shared::route_script_elsewhere(cmd, cmd_args, conn.selected_db, ctx)
-            .await
+    // moon#569: see `try_handle_evalsha`.
+    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user);
+    if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
+        cmd,
+        cmd_args,
+        conn.selected_db,
+        &script_acl,
+        ctx,
+    )
+    .await
     {
         responses.push(routed);
         return true;
@@ -272,6 +289,7 @@ pub(super) async fn try_handle_eval(
             ctx.num_shards,
             conn.selected_db,
             db_count,
+            &script_acl,
         )
     });
     responses.push(response);
@@ -1496,6 +1514,9 @@ pub(super) fn try_handle_functions(
                 ctx.num_shards,
                 conn.selected_db,
                 db_count,
+                // moon#569: FCALL bodies are ACL-gated per `redis.call`, same
+                // as EVAL.
+                &crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user),
             )
         });
         drop(guard);
@@ -1518,6 +1539,9 @@ pub(super) fn try_handle_functions(
                 ctx.num_shards,
                 conn.selected_db,
                 db_count,
+                // moon#569: FCALL bodies are ACL-gated per `redis.call`, same
+                // as EVAL.
+                &crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user),
             )
         });
         drop(guard);

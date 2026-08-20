@@ -64,6 +64,7 @@ pub fn vm_used_memory(slot: &ShardLuaSlot) -> Option<usize> {
 }
 
 /// Handle the EVAL Redis command: parse args, validate keys, cache script, run.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_eval(
     lua: &Rc<Lua>,
     cache: &Rc<RefCell<ScriptCache>>,
@@ -73,6 +74,7 @@ pub fn handle_eval(
     num_shards: usize,
     selected_db: usize,
     db_count: usize,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
     let (script, _numkeys, keys, argv) = match parse_eval_args(args) {
         Ok(parsed) => parsed,
@@ -89,10 +91,20 @@ pub fn handle_eval(
     // Cache the script (idempotent -- duplicates are no-ops)
     cache.borrow_mut().load(script.clone());
 
-    run_script(lua, script.as_ref(), keys, argv, db, selected_db, db_count)
+    run_script(
+        lua,
+        script.as_ref(),
+        keys,
+        argv,
+        db,
+        selected_db,
+        db_count,
+        acl,
+    )
 }
 
 /// Handle the EVALSHA Redis command: look up cached script by SHA1, then run.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_evalsha(
     lua: &Rc<Lua>,
     cache: &Rc<RefCell<ScriptCache>>,
@@ -102,6 +114,7 @@ pub fn handle_evalsha(
     num_shards: usize,
     selected_db: usize,
     db_count: usize,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -146,7 +159,16 @@ pub fn handle_evalsha(
         }
     }
 
-    run_script(lua, script.as_ref(), keys, argv, db, selected_db, db_count)
+    run_script(
+        lua,
+        script.as_ref(),
+        keys,
+        argv,
+        db,
+        selected_db,
+        db_count,
+        acl,
+    )
 }
 
 /// Handle SCRIPT subcommands (LOAD, EXISTS, FLUSH).
@@ -399,6 +421,7 @@ pub fn parse_eval_args(args: &[Frame]) -> Result<(Bytes, usize, Vec<Bytes>, Vec<
 ///
 /// Sets up the thread-local DB pointer, installs timeout hook, populates
 /// KEYS and ARGV globals (1-indexed), executes the script, and cleans up.
+#[allow(clippy::too_many_arguments)]
 fn run_script(
     lua: &Lua,
     script: &[u8],
@@ -407,9 +430,13 @@ fn run_script(
     db: &mut Database,
     selected_db: usize,
     db_count: usize,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
-    // Set thread-local DB pointer for redis.call/pcall bridge
-    bridge::set_script_db(db, selected_db, db_count);
+    // Set thread-local DB pointer + caller identity for the redis.call/pcall
+    // bridge. `acl` is what every inner command is authorized against
+    // (moon#569) — the script body itself is never trusted to declare what it
+    // will touch.
+    bridge::set_script_db(db, selected_db, db_count, acl);
 
     // Install timeout hook (5-second wall-clock limit)
     let timeout = Duration::from_secs(5);
@@ -447,11 +474,39 @@ fn run_script(
 
     match result {
         Ok(frame) => frame,
-        Err(mlua::Error::RuntimeError(msg)) if msg.contains("ERR Lua script timeout") => {
-            Frame::Error(Bytes::from_static(b"BUSY Lua script timeout exceeded"))
-        }
-        Err(e) => Frame::Error(Bytes::from(format!("ERR Error running script: {e}"))),
+        Err(e) => script_error_to_frame(e),
     }
+}
+
+/// Turn a script-execution failure into the wire error the client sees.
+///
+/// Shared with `FunctionRegistry::call_function` so EVAL and FCALL answer an
+/// ACL denial identically. A `redis.call` denial is raised as an `mlua`
+/// `RuntimeError` carrying [`crate::acl::SCRIPT_ACL_DENIED_PREFIX`]; without
+/// this arm it would reach the client re-wrapped as
+/// `ERR Error running script: runtime error: NOPERM ...`, which no client
+/// matches on. Answering with the bare `-NOPERM ...` keeps script denials
+/// indistinguishable from dispatch-level denials.
+pub(crate) fn script_error_to_frame(e: mlua::Error) -> Frame {
+    let msg = match &e {
+        mlua::Error::RuntimeError(msg) => msg.clone(),
+        other => other.to_string(),
+    };
+    if msg.contains("ERR Lua script timeout") {
+        return Frame::Error(Bytes::from_static(b"BUSY Lua script timeout exceeded"));
+    }
+    if let Some(at) = msg.find(crate::acl::SCRIPT_ACL_DENIED_PREFIX) {
+        // Trim mlua's trailing traceback so the reply is a single line.
+        let tail = &msg[at..];
+        let end = tail.find('\n').unwrap_or(tail.len());
+        return Frame::Error(Bytes::from(tail[..end].trim_end().to_string()));
+    }
+    if msg.contains("Write commands are not allowed") {
+        return Frame::Error(Bytes::from_static(
+            b"ERR Write commands are not allowed from read-only scripts",
+        ));
+    }
+    Frame::Error(Bytes::from(format!("ERR Error running script: {e}")))
 }
 
 #[cfg(test)]
@@ -577,7 +632,16 @@ mod tests {
         let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
-        let result = run_script(&lua, b"return 42", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return 42",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Integer(42)));
     }
 
@@ -594,6 +658,7 @@ mod tests {
             &mut db,
             0,
             1,
+            &crate::acl::ScriptAcl::trusted(),
         );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"mykey")));
     }
@@ -612,6 +677,7 @@ mod tests {
             &mut db,
             0,
             1,
+            &crate::acl::ScriptAcl::trusted(),
         );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"testval")));
     }
@@ -630,6 +696,7 @@ mod tests {
             &mut db,
             0,
             1,
+            &crate::acl::ScriptAcl::trusted(),
         );
         // pcall returns {err = ...} table, which converts to Frame::Error
         assert!(matches!(result, Frame::Error(_)));
@@ -641,23 +708,68 @@ mod tests {
         let mut db = Database::new();
 
         // Return string
-        let result = run_script(&lua, b"return 'hello'", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return 'hello'",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"hello")));
 
         // Return nil
-        let result = run_script(&lua, b"return nil", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return nil",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Null));
 
         // Return boolean false -> Null
-        let result = run_script(&lua, b"return false", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return false",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Null));
 
         // Return boolean true -> Integer(1)
-        let result = run_script(&lua, b"return true", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return true",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Integer(1)));
 
         // Return table
-        let result = run_script(&lua, b"return {1, 2, 3}", vec![], vec![], &mut db, 0, 1);
+        let result = run_script(
+            &lua,
+            b"return {1, 2, 3}",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 3);
@@ -718,6 +830,123 @@ mod tests {
         assert_eq!(cache.borrow().len(), 0);
     }
 
+    // -- moon#569: `redis.call` runs under the CALLER's ACL ----------------
+
+    fn restricted_acl() -> crate::acl::ScriptAcl {
+        let mut t = crate::acl::AclTable::new();
+        t.ensure_default_user(None);
+        t.apply_setuser("app", &["on", ">pw", "~app:*", "+@all"]);
+        crate::acl::ScriptAcl::for_user(&std::sync::Arc::new(std::sync::RwLock::new(t)), "app")
+    }
+
+    /// The bug: a script that DECLARES no key used to reach any key at all,
+    /// because the dispatcher's key check only ever saw `numkeys`.
+    #[test]
+    fn script_acl_blocks_undeclared_out_of_pattern_key() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        let acl = restricted_acl();
+
+        let denied = run_script(
+            &lua,
+            b"return redis.call('GET', 'secret:x')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &acl,
+        );
+        match denied {
+            Frame::Error(e) => assert!(
+                e.starts_with(crate::acl::SCRIPT_ACL_DENIED_PREFIX.as_bytes()),
+                "want a clean NOPERM, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("undeclared out-of-pattern GET was allowed: {other:?}"),
+        }
+
+        // ...and an in-pattern key the script also did not declare is FINE:
+        // the pattern gates, not the declaration.
+        let allowed = run_script(
+            &lua,
+            b"redis.call('SET', 'app:k', 'v') return redis.call('GET', 'app:k')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &acl,
+        );
+        assert!(
+            matches!(&allowed, Frame::BulkString(b) if b.as_ref() == b"v"),
+            "legitimate in-pattern script broke: {allowed:?}"
+        );
+    }
+
+    /// The denial must survive every laundering shape Lua offers, and the
+    /// command must not have executed.
+    #[test]
+    fn script_acl_survives_pcall_and_indirection() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        let acl = restricted_acl();
+        for body in [
+            // computed name
+            &b"return redis.call('GET', 'sec' .. 'ret:x')"[..],
+            // behind a closure
+            b"local f = function() return redis.call('SET','secret:x','v') end return f()",
+            // movable-key layouts
+            b"return redis.call('LMPOP', 1, 'secret:l', 'LEFT')",
+            b"return redis.call('SORT', 'app:l', 'STORE', 'secret:d')",
+            // runtime-computed weight keys: unnameable, so DENY
+            b"return redis.call('SORT', 'app:l', 'BY', 'secret:w_*')",
+        ] {
+            let r = run_script(&lua, body, vec![], vec![], &mut db, 0, 1, &acl);
+            assert!(
+                matches!(&r, Frame::Error(e) if e.starts_with(b"NOPERM")),
+                "not denied: {} -> {r:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // redis.pcall hands the script an error table instead of raising --
+        // the point is that the COMMAND did not run.
+        let r = run_script(
+            &lua,
+            b"local e = redis.pcall('SET','secret:x','v') return redis.call('EXISTS','app:probe')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &acl,
+        );
+        assert!(matches!(r, Frame::Integer(0)), "unexpected: {r:?}");
+    }
+
+    /// A runner that supplies no identity refuses everything rather than
+    /// inheriting `~*`. `set_script_db` takes the identity as a REQUIRED
+    /// argument so this state is only reachable deliberately.
+    #[test]
+    fn script_acl_default_is_deny_not_allow() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        let r = run_script(
+            &lua,
+            b"return redis.call('GET', 'anything')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::deny(),
+        );
+        assert!(
+            matches!(&r, Frame::Error(e) if e.starts_with(b"NOPERM")),
+            "no-identity script was allowed to run: {r:?}"
+        );
+    }
+
     #[test]
     fn test_handle_eval_basic() {
         let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
@@ -729,7 +958,17 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
 
-        let result = handle_eval(&lua, &cache, &args, &mut db, 0, 1, 0, 1);
+        let result = handle_eval(
+            &lua,
+            &cache,
+            &args,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Integer(42)));
     }
 
@@ -746,7 +985,17 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
 
-        let result = handle_evalsha(&lua, &cache, &args, &mut db, 0, 1, 0, 1);
+        let result = handle_evalsha(
+            &lua,
+            &cache,
+            &args,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"NOSCRIPT".as_slice())),
             _ => panic!("Expected NOSCRIPT error"),
@@ -764,7 +1013,17 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"return 99")),
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
-        let _ = handle_eval(&lua, &cache, &eval_args, &mut db, 0, 1, 0, 1);
+        let _ = handle_eval(
+            &lua,
+            &cache,
+            &eval_args,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
 
         // Get the SHA1
         let sha = sha1_smol::Sha1::from(b"return 99").hexdigest();
@@ -774,7 +1033,17 @@ mod tests {
             Frame::BulkString(Bytes::from(sha)),
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
-        let result = handle_evalsha(&lua, &cache, &evalsha_args, &mut db, 0, 1, 0, 1);
+        let result = handle_evalsha(
+            &lua,
+            &cache,
+            &evalsha_args,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Integer(99)));
     }
 }

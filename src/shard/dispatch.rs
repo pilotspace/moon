@@ -599,6 +599,17 @@ pub enum ShardMessage {
     Execute {
         db_index: usize,
         command: std::sync::Arc<Frame>,
+        /// moon#569: the ACL identity a routed EVAL/EVALSHA runs its inner
+        /// `redis.call`s under. The connection that issued the script lives
+        /// on a DIFFERENT thread from the shard that owns its keys, so the
+        /// caller's identity has to travel with the command — otherwise the
+        /// routed copy would execute with nobody's permissions.
+        ///
+        /// One `Arc` clone (8 bytes on the wire). Producers that never carry
+        /// a script pass [`crate::acl::ScriptAcl::deny`]: if a script ever
+        /// does reach a shard through one of them, it is refused rather than
+        /// run unchecked.
+        script_acl: crate::acl::ScriptAcl,
         reply_tx: channel::OneshotSender<Frame>,
     },
     /// Execute a multi-key sub-operation on this shard.

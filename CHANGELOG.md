@@ -20,7 +20,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they run weekly, or when a PR happens to touch `Cargo.toml`. moon#598 touched `Cargo.toml` to
   register a bench, which is the only reason the advisories surfaced at all.
 
-### Security
+- **`redis.call()` inside `EVAL`/`FCALL` bypassed ACL key patterns entirely** (#569). The
+  dispatcher gates `EVAL script numkeys k1 ...` on the keys an invocation DECLARES — but a script
+  need not declare anything, and `redis.call`/`redis.pcall` went straight to
+  `Database::execute_command` with no permission check at all. `numkeys 0` therefore made the outer
+  key check a no-op and everything the script touched was unchecked: a `~app:* +@all` user read and
+  wrote any key in the keyspace with `EVAL "return redis.call('GET','secret:x')" 0`, and could run
+  commands their `-del`/`-flushall` rules denied. Every inner command now runs under the calling
+  user's identity, resolved once per script (`acl::ScriptAcl`) and re-checked per `redis.call`
+  against the same `check_command_permission` + `check_key_permission` the dispatcher uses, with
+  the same fail-closed `acl::keyspec` walker — so movable-key layouts (`LMPOP`, `ZMPOP`,
+  `SINTERCARD`, `ZUNIONSTORE`, `SORT ... STORE`, `GEORADIUS ... STORE`, `COPY`, `SMOVE`, `BITOP`,
+  `XREAD STREAMS`) are covered and an argv the walker cannot enumerate — including `SORT k BY w_*`,
+  whose weight keys are computed at runtime — is DENIED. The check sits at the single choke point
+  every script-issued command passes through, before the SELECT/read-only/replica gates, before
+  the eviction gate and COW pre-image capture and before MONITOR is fed, so a denied command
+  produces no side effect and no laundering shape helps: literal keys, `..` concatenation,
+  `string.format`, `ARGV`, table lookups, loops, closures, `redis.pcall` and nested Lua `pcall` all
+  refuse identically, on EVAL, EVALSHA, FCALL and FCALL_RO. The caller's identity also rides the
+  SPSC message to the shard a script routes to (#508), so the cross-shard copy is not a hole; the
+  fail-closed default (`ScriptAcl::deny`) means a future script runner that forgets to supply an
+  identity refuses every command instead of inheriting `~*`. Denials answer `-NOPERM ACL failure in
+  script: ...` on both surfaces. Unrestricted users pay one enum test plus one `Acquire` load of the
+  ACL version counter per `redis.call` — no lock, no allocation, no key extraction: **+1.9%** per
+  call in an interleaved same-machine A/B against the pre-fix binary (20 000 `redis.call('GET')`
+  per sample, 9 reps, min-of-reps, empty-loop cost subtracted; **dev profile**, so the absolute
+  +86 ns is inflated several-fold and only the ratio transfers). A key-restricted user pays the
+  full check — one uncontended ACL read-lock plus the same key extraction and glob match the
+  dispatcher already runs for every non-script command — measured at +33% per call on the same
+  harness. That version check is what makes the cached verdict safe: an `ACL SETUSER` landing
+  mid-script is honoured by the very next `redis.call` rather than a script outliving its own
+  revocation.
 - **Fuzz the shared key-position walker, and stop a bare `.gitignore` entry from hiding new
   fuzzers** (#576). `acl::keyspec::command_key_positions` parses attacker-controlled argv on behalf
   of three consumers — ACL key-pattern enforcement, client-side cache invalidation, and command
@@ -38,6 +68,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible while the 18th would have committed clean locally and failed CI as "no such fuzz target";
   and `term_fst_sidecar` had been present in the tree but listed in neither CI matrix, so it had
   never actually run.
+
+- **ACL `~pattern` restrictions were silently unenforced for most multi-key commands** (#566).
+  `AclTable::check_key_permission` read a command's keys from `extract_command_keys`, a
+  hand-maintained match on the command name whose fallthrough returned an EMPTY key list — and an
+  empty key list is not "checked less precisely", it makes the permission loop a no-op, so every
+  `~pattern` was ignored outright for any command the list forgot. Measured against a live server,
+  a user restricted to `~app:*` reached arbitrary keys through 21 distinct commands, in both
+  `--shards 1` and `--shards 4`: `COPY`, `ZRANGESTORE` (both positions), `SMOVE`'s DESTINATION (it
+  was listed, but as a single-key command), `LMPOP`/`ZMPOP`/`BLMPOP`/`BZMPOP`, `SINTERCARD`,
+  `ZDIFF`/`ZINTER`/`ZUNION`/`ZINTERCARD`, `SORT ... STORE`, `SORT ... BY <pattern>`,
+  `GEORADIUS ... STORE`, `EVAL`'s declared keys and `MEMORY USAGE`.
+  Key extraction is now **derived from the command registry's key specs**
+  (`COMMAND_META` `first_key`/`last_key`/`step`), so a command that declares its keys is enforced
+  automatically; hand-written arms remain only for layouts a fixed spec cannot express (`numkeys`
+  vectors, positional `STORE` clauses, the `STREAMS` token, subcommand-shaped key positions).
+  Extraction **fails closed**: a command that names keys but whose argv cannot be enumerated — or a
+  command missing from the registry entirely — is DENIED with the standard `NOPERM` error and
+  logged once per command name, so the next command that ships without a key spec fails safe
+  instead of falling open. `SORT`'s `BY`/`GET` patterns read key names computed at runtime and are
+  therefore refused for key-restricted users (`BY nosort` / `GET #` are unaffected). Commands that
+  genuinely name no key (`PING`, `CONFIG`, `SUBSCRIBE`, `KEYS`, the `FT.*`/`GRAPH.*` families, ...)
+  are unaffected, and a registry sweep test now fails if a NEW command declares no keys without
+  being reviewed. Unrestricted and `~*` users still short-circuit before any extraction; the new
+  path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
+
+- **A remote client could hang a shard thread and exhaust memory with a 4-byte inline command
+  (#487).** `split_args_quoted` — the path any inline command containing a quote takes — skipped
+  only `' '` and `'\t'` between arguments, while its token loop *terminated* on the wider
+  `' ' \t \n \r \x0b \x0c`. A byte in the difference (`\n`, `\r`, vertical tab, form feed) sitting at a
+  token boundary therefore made no progress at all: the token loop returned without advancing, an
+  empty argument was appended, and the outer loop restarted at the same offset — forever, with the
+  argument vector growing until the process died. A lone `\r` reaches the line because the CRLF
+  scanner only terminates on the `\r\n` *pair*. Parsing happens before dispatch, so this was
+  reachable pre-authentication: `\r"` followed by CRLF was enough. Both loops now read one
+  `is_inline_space` definition, so they cannot drift apart again — the same six bytes C's
+  `isspace()` accepts, which is what Redis's own `sdssplitargs` skips with. Found by the
+  `resp_parse`, `resp_parse_differential` and `inline_parse` fuzz targets; guarded by an exhaustive
+  test over every short line built from the bytes the splitter branches on (271k cases, ~0.03s),
+  which without the fix allocates until the OS kills the process.
+- **ACL bypass on the inline GET fast path (monoio runtime).** An
+  authenticated but restricted user could read any key with plain `GET`:
+  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
+  map, running neither the ACL command check nor the ACL key-pattern check.
+  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
+  its pattern; no ACL LOG entry was produced. Writes were already gated on
+  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
+  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
+  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
+  suite); `--shards 1` — the config recommended for non-pipelined workloads —
+  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
+  so a restricted connection falls through to generic dispatch where both ACL
+  checks run. The tokio handlers were never affected (they gate correctly at
+  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
+  caught this: every CI test job builds tokio. New suite:
+  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
+  `--shards 1` and `--shards 4`).
 
 ### Fixed
 - **The two-key write family acknowledged success while destroying the data at `--shards > 1`**
@@ -75,6 +161,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   > {user:42}:live` — and the command works exactly as it does at `--shards 1`. Every affected call
   > was silently destroying data before, so no working deployment loses behaviour; a `--shards 1`
   > deployment is unaffected entirely.
+- **Lua numbers passed to `redis.call` produced an argv no command could parse** (#569). Argument
+  conversion reused the RETURN-value converter, so `redis.call('SET', 'k', 5)` handed the dispatcher
+  a `Frame::Integer` — something no wire client can send — and the command answered `wrong number of
+  arguments`. `redis.call('SET', 'app:k'..i, i)` in a loop, and `redis.call('LMPOP', 1, 'k',
+  'LEFT')`, both failed on that. Upstream Redis stringifies Lua numbers for exactly this reason;
+  Moon now does too (float truncation unchanged: `3.7` still becomes `3`). This is also why the
+  #569 ACL gate had to be paired with it — `acl::keyspec` reads keys and `numkeys` out of the argv
+  as bytes, so an integer frame in either slot was un-enumerable and a LEGITIMATE in-pattern
+  `LMPOP` would have failed closed.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a
@@ -98,42 +193,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged — the fail-closed contract, its error text and every existing key-permission test are
   byte-identical.
 
-### Security
-- **ACL `~pattern` restrictions were silently unenforced for most multi-key commands** (#566).
-  `AclTable::check_key_permission` read a command's keys from `extract_command_keys`, a
-  hand-maintained match on the command name whose fallthrough returned an EMPTY key list — and an
-  empty key list is not "checked less precisely", it makes the permission loop a no-op, so every
-  `~pattern` was ignored outright for any command the list forgot. Measured against a live server,
-  a user restricted to `~app:*` reached arbitrary keys through 21 distinct commands, in both
-  `--shards 1` and `--shards 4`: `COPY`, `ZRANGESTORE` (both positions), `SMOVE`'s DESTINATION (it
-  was listed, but as a single-key command), `LMPOP`/`ZMPOP`/`BLMPOP`/`BZMPOP`, `SINTERCARD`,
-  `ZDIFF`/`ZINTER`/`ZUNION`/`ZINTERCARD`, `SORT ... STORE`, `SORT ... BY <pattern>`,
-  `GEORADIUS ... STORE`, `EVAL`'s declared keys and `MEMORY USAGE`.
-  Key extraction is now **derived from the command registry's key specs**
-  (`COMMAND_META` `first_key`/`last_key`/`step`), so a command that declares its keys is enforced
-  automatically; hand-written arms remain only for layouts a fixed spec cannot express (`numkeys`
-  vectors, positional `STORE` clauses, the `STREAMS` token, subcommand-shaped key positions).
-  Extraction **fails closed**: a command that names keys but whose argv cannot be enumerated — or a
-  command missing from the registry entirely — is DENIED with the standard `NOPERM` error and
-  logged once per command name, so the next command that ships without a key spec fails safe
-  instead of falling open. `SORT`'s `BY`/`GET` patterns read key names computed at runtime and are
-  therefore refused for key-restricted users (`BY nosort` / `GET #` are unaffected). Commands that
-  genuinely name no key (`PING`, `CONFIG`, `SUBSCRIBE`, `KEYS`, the `FT.*`/`GRAPH.*` families, ...)
-  are unaffected, and a registry sweep test now fails if a NEW command declares no keys without
-  being reviewed. Unrestricted and `~*` users still short-circuit before any extraction; the new
-  path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
-
-### Added
-- **`INFO Server` now reports `num_shards`** (#497), the resolved shard count rather than the
-  configured one, so `--shards 0` auto-detection reports the number actually in effect. A client
-  that cannot operate against a multi-shard instance — one committing a cross-key transaction per
-  request — previously had no way to refuse at connect time except a two-key co-location canary,
-  which is slow and still a guess. `redis_mode`/`cluster_enabled` do not answer this: a
-  single-process Moon with several shards is `standalone` and still routes keys across threads. The
-  value is never 0; an embedded harness that never records a count reports the single-shard truth,
-  because a zero reads as a valid answer and is not one.
-
-### Fixed
 - **Inline commands terminated by bare LF were never dispatched, and an interior LF silently merged
   two commands into one** (#381). Moon's inline parser searched for `\r\n` and, on finding a lone
   `\r`, kept scanning; Redis's `processInlineBuffer` searches for `\n` and then strips at most one
@@ -318,206 +377,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trap the original investigation fell into, and a guard test now fails if the sample migrates back
   into a runtime-specific arm.
 
-### Changed
-- **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
-  Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
-  index, maintained O(log n) by the storage-layer writers; the 100ms sweep pops exactly the DUE
-  keys off the front — no 20-key random sample (which went blind when due keys were a small
-  fraction of the volatile population, leaving them resident for many ticks), and no O(N)
-  full-map scans (three per tick on any database with even one TTL'd key). Measured on a
-  100K-volatile-key database: 1.36ms → 47ns per tick, and the old cost exceeded the sweep's own
-  1ms budget before it had expired anything. The hash-field-TTL sweep is now latch-gated too, so
-  databases that never touch HEXPIRE skip its scan entirely (the scan itself when the latch is up
-  remains O(N) — #543). `INFO`'s `expires` count reads the index, O(1). Along the way, two
-  writers that bypassed the expiry machinery were rerouted: GETEX's TTL options now go through
-  `set_expiry` (previously a GETEX-only TTL never armed the sweep latch, so the key was invisible
-  to active expiry forever), and EXPIRE-family commands hitting an already-expired key now hide
-  and queue it for the emitting drain (#542 semantics) instead of deleting it silently with no
-  `expired` notification and no dual-plane DEL. Review follow-ups: GETEX `EX`/`EXAT` seconds
-  values that overflow the millisecond conversion now answer the range error instead of
-  wrapping (debug builds panicked); the sweep only drops an index pair that is provably stale
-  (entry gone or TTL retargeted) so a backwards wall-clock step can't discard live pairs; the
-  per-key budget clock read is batched to every 64 pops; and sweep 2 lowers the hash latch from
-  its own reap outcomes instead of a second O(N) rescan.
-- **`volatile-ttl` eviction picks the exact nearest-expiry victim** (#551). The policy now reads
-  the head of the #541 deadline-ordered expiry index — O(log n), always the globally soonest
-  deadline — instead of sampling `maxmemory-samples` random volatile keys and taking the sample's
-  minimum, which could evict a key hours from expiring while the one expiring in seconds
-  survived. `maxmemory-samples` still governs the LRU/LFU/random policies, which remain
-  sampling-based.
-
-### Added
-- **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
-  into the `client-compat` CI job. The raw-RESP differ compares bytes against a real redis-server;
-  it is precise and blind to everything a client library does *around* the reply — the handshake it
-  opens with, the connection it reuses, the Python type it decodes into, the second command it
-  issues on your behalf. A server can answer every byte correctly and still be unusable from
-  redis-py. The suite therefore drives redis-py's own idioms — connection pools, `pipeline()`,
-  `pubsub()`, `scan_iter()`/`hscan_iter()`, `redis.lock.Lock`, `from_url`, RESP2 and RESP3
-  handshakes, `WATCH` optimistic locking — rather than hand-rolled sockets. Stdlib `unittest` and
-  the distro `python3-redis` package, because the runner has no pytest and PEP 668 blocks pip.
-
-  It found three defects on its first run, each pinned inside the suite so that fixing one breaks
-  the run with an actionable message rather than leaving a stale skip: at `--shards >= 2`, an
-  `MGET` in the same pipeline batch as the `SET`s that wrote its keys returns nulls despite those
-  `SET`s acking `+OK` earlier in the batch (a silent read-your-own-writes violation), `EVALSHA` of
-  a **single-key** script is rejected with `CROSSSLOT` (which breaks `redis.lock.Lock.release()`),
-  and `CLIENT INFO` reports a literal `cmd=NULL` for every connection.
-
-  The two multi-shard defects fire for roughly **half** of keys — decided by which shard owns the
-  key relative to the connection's own shard — so each pin runs twenty distinct keys rather than
-  one. A single-trial pin was tried first and made CI flaky, which is how the ~50% rate was found;
-  the amplified form is 0/10 flaky runs on both macOS and Linux, and still fails loudly when the
-  underlying bug is fixed.
-
-- **Nine INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
-  `uptime_in_days`, `aof_last_write_status`, `aof_last_bgrewrite_status`,
-  `rdb_changes_since_last_save`, `sync_full`, `sync_partial_ok` and `sync_partial_err` are now
-  emitted, each from a real source rather than a constant: uptime from a start instant captured
-  before the listener binds, `rdb_changes_since_last_save` from a sharded
-  keyspace-mutation counter reset at save completion, and the three `sync_*` counters recorded at
-  the one point in the PSYNC handshake where full-vs-partial is still distinguishable (`PSYNC ? -1`
-  counts as a full resync the replica ASKED for, not a partial that failed). `tcp_port` reports the
-  configured listener port, not the port the INFO connection arrived on — behind a container port
-  map the two differ, and the field exists so a client can hand a peer a reachable address.
-  The four fields Moon cannot answer truthfully are recorded as waivers with reasons instead of
-  being emitted: `latest_fork_usec` (Moon never calls `fork(2)`; BGSAVE snapshots in-process), the
-  two `client_recent_max_*_buffer` high-water marks (untracked, and tracking them means a counter on
-  every connection read and write), and `used_memory_lua` — which was implemented and then withdrawn
-  when measurement showed the value the shard can publish is ~2 orders of magnitude below the real
-  VM footprint on the shipped monoio runtime (80 bytes against tokio's 26183, same `setup_lua_vm`,
-  ruled out as Cargo feature unification). This keeps the INFO emitter's standing rule intact: a
-  wrong number on a dashboard is worse than an absent one.
-
-### Changed
-- **The `INFO field coverage` CI step is now a hard gate**, no longer `continue-on-error`. The
-  pinned-field harness gained a waiver syntax (`field  # WAIVED: <reason>`) that refuses an
-  unreasoned waiver at load time (exit 2) and reports a waiver on a field Moon has since started
-  emitting as a failure — so the list cannot go stale unnoticed the way the registry sweep's did.
-
-- **`CLUSTER SHARDS`, `CLUSTER MYSHARDID`, `READONLY` and `READWRITE`** — the four verbs a
-  cluster-aware client needs to bootstrap. `CLUSTER SHARDS` reports every shard cluster-wide, one
-  entry per master with its replicas, master first; a shard that has lost every live node reports an
-  empty `slots` array while still listing the dead node as `role: master, health: fail`. The top
-  level is an Array under both protocols and only the shard and node entries change shape — a Map
-  under RESP3, a flat array under RESP2 — which falls out of building them as `Frame::Map` and
-  letting each serializer render it, the same approach the RESP3 pub/sub work used. A node entry
-  carries exactly `id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`, in that
-  order, because under RESP2 a client may read it positionally. `READONLY` lets a replica serve
-  reads for slots its own master owns; a WRITE still answers `MOVED`, the asymmetry a
-  "just return +OK" implementation gets wrong.
-- **`INFO` reports cluster identity honestly.** `redis_mode` and `cluster_enabled` were the hardcoded
-  literals `standalone` and `0`, under a comment promising the cluster subsystem would say otherwise
-  — nothing ever did. An SDK branches on `redis_mode` before it ever calls `CLUSTER SHARDS`, so a
-  server answering SHARDS correctly while reporting `standalone` stayed undiscoverable as a cluster.
-- **`MONITOR` — the command feed.** `redis-cli monitor` now works against Moon, in Redis's exact
-  line format: `+<unix>.<micros> [<db> <addr>] "CMD" "arg" …`, arguments quoted and escaped per
-  byte (`sdscatrepr` semantics — `"` `\`, `\n` `\r` `\t`, `\a` `\b`, and `\xHH` for everything
-  outside printable ASCII, so UTF-8 escapes per byte rather than per character). The line is a
-  SimpleString under **both** RESP2 and RESP3 — measured; Redis does not use a Push frame here,
-  and the reflex to make it one after the RESP3 pub/sub work would have been a new divergence.
-  `AUTH`'s arguments and the credentials in `HELLO … AUTH` render as `(redacted)`, decided before
-  any argument is written rather than filtered afterwards.
-
-  Two behaviours are worth knowing because they are not the obvious implementation. First,
-  administrative commands are hidden at **subcommand** granularity: `CONFIG *`, `SLOWLOG *`,
-  `LATENCY *`, `ACL LIST/SETUSER` and `CLIENT LIST` never reach a monitor, while `INFO`, `DBSIZE`,
-  `LASTSAVE`, `CLIENT GETNAME/ID`, `ACL WHOAMI/CAT` and `CLUSTER INFO/MYID` do. Moon's own
-  `CommandFlags::ADMIN` is container-granular and could not express that split — using it would
-  have hidden six commands Redis shows — and Redis feeds the entire `EVAL` family despite flagging
-  it `skip_monitor`, so neither flag is consulted; the rule is stated explicitly and pinned
-  row-by-row against the measured oracle. `MONITOR` is absent from its own feed as a consequence of
-  that general rule rather than a self-suppression special case. Second, a monitor that stops
-  reading has its **connection dropped**: silently skipping lines would leave an operator unable to
-  tell a quiet server from a lossy feed, and blocking would let one slow TCP reader stall every
-  shard.
-
-  A monitor connection may not touch the keyspace, matching Redis
-  (`-ERR Replica can't interact with the keyspace`). The refusal set is measured, not derived from
-  a flag: `DBSIZE`, `KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL`,
-  `PUBLISH` and `MEMORY USAGE` name no key yet are all refused, while `PING`, `INFO`, `TIME`,
-  `ECHO`, `COMMAND`, `LASTSAVE`, `WAIT`, `SELECT`, `CLIENT`, `ACL`, `SUBSCRIBE` and `RESET` are
-  served. Neither `first_key` nor Moon's `WRITE`/`READONLY` flags reproduce that split — Moon
-  flags `PING` and `INFO` readonly and Redis does not — so the rule is stated explicitly and
-  pinned row by row against the oracle.
-
-  Commands issued by a Lua script are fed too, carrying the literal `lua` in place of a peer
-  address and appearing in execution order after the `EVAL` line — matching Redis. A script command
-  never passes a connection handler, so it needs its own hook; without it an operator watching a
-  script-driven workload would see every `EVAL` and none of its effects.
-
-  `MONITOR` requires the `admin` ACL category, and costs one relaxed atomic load per command when
-  nobody is attached — every other step lives behind that load. While a monitor IS attached the
-  inline fast path stands down, because it answers straight from the read buffer and never sees a
-  peer address; the feed is therefore correct by construction on that path rather than by a hook
-  that must be kept in sync. Fast-path retention when unattached is confirmed by
-  `moon_dispatch_path_total{path="local_inline"}`, not inferred from latency.
-- **Sharded pub/sub: `SSUBSCRIBE`, `SUNSUBSCRIBE`, `SPUBLISH`, and `PUBSUB SHARDCHANNELS` /
-  `SHARDNUMSUB`.** Deliveries carry the `smessage` event name. The sharded namespace is a
-  genuinely separate map from the plain one in both the per-shard registry and the
-  remote-subscriber map, so `SPUBLISH ch` cannot reach a `SUBSCRIBE ch` and vice versa — the two
-  may share a channel *name* while being different destinations, and that separation is
-  structural rather than a filter each call site has to remember. Cross-shard delivery reuses the
-  existing batched fan-out with a sharded marker on each entry, and is proven at `--shards 4`:
-  a local-only registry would have passed every single-shard test while dropping (N-1)/N of
-  deliveries in production. `SPUBLISH` was absent from `COMMAND_META` entirely, while
-  `SSUBSCRIBE` and `SUNSUBSCRIBE` were declared there but answered "unknown command" by the
-  dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
-
-### Changed
-- **CI migration: hosted-only PR gate + local merge bar** — the three self-hosted jobs
-  (`Check`, `Check (monoio)`, `Client compat`) serialized on the single moon-dev runner on every
-  PR (17–24m wall, with manual dispatches queueing behind them). The PR gate is now entirely
-  GitHub-hosted and parallel (Lint, Check on ubuntu-latest with sccache + rust-cache, MSRV,
-  Memory gate, ~5–8m); the monoio and client-compat legs moved to main-push + `workflow_dispatch`,
-  and — before every push — to the new **`scripts/ci-local.sh`** (host lint gates + both full
-  suites in the moon-dev VM; `--full` adds the client-compat harness and the macOS host suite).
-  The script captures exit codes directly (no piped gates), keeps VM builds on VM-local target
-  dirs, pins `MOON_BIN` for the compat harness, and fingerprints the working tree at start/end —
-  a branch switch or edit mid-run marks the run INVALID (exit 3) rather than reporting a false
-  green (both the fail path and the tripwire were attack-tested before landing).
-  `tests/ci_covers_monoio.rs` still guards the monoio job's integrity; its trigger scope is the
-  documented tradeoff. Console Integration was already path-gated and Integration Tests
-  label-gated; both unchanged.
-
-### Added
-- **`ZRANK`/`ZREVRANK ... WITHSCORE`** (#521), the Redis 7.2 option — previously an arity error, so
-  a 7.2-aware client asking for the rank and the score in one round trip got a hard failure. A hit
-  is the two-element array `[rank, score]`; a miss (absent key or absent member) is the null ARRAY
-  `*-1`, not the null bulk the option-less form answers, so `WITHSCORE` changes the null type as
-  well as the hit type — measured against redis-server 8.6.1, and a statically-typed client decodes
-  the two differently. The token is SINGULAR, unlike the `WITHSCORES` that `ZRANGE` takes; the
-  plural is a syntax error here, and only a FOURTH argument is an arity error (Redis distinguishes
-  the two and so does Moon). The score is emitted as a RESP double, so RESP3 gets `,1` while RESP2
-  keeps the identical bulk-string bytes. Both entry points were fixed — `zrank` and
-  `zrank_readonly` each carried their own arity check, and which one answers is decided by shard
-  routing, so fixing one would have left the option working on some keys and failing on others.
-  `ZRANK`/`ZREVRANK` arity in `COMMAND INFO` is now `-3`, matching Redis 7.2+.
-- **`RPOPLPUSH source destination`** (#520) — previously "unknown command" even though `LMOVE` and
-  `BRPOPLPUSH` both worked. It is deprecated in Redis but never removed, and it is the form baked
-  into a decade of client code: `redis-py`, `jedis`, `go-redis` and `node-redis` all expose it as a
-  first-class method, so `r.rpoplpush(...)` failed outright. The name was already in the workspace
-  routing table, in the metrics labels, and was the internal rewrite target of `BRPOPLPUSH` —
-  missing only from the two places a client reaches, the dispatch table and `metadata.rs`
-  (`COMMAND INFO rpoplpush` answered an empty array, so driver feature-detection concluded the
-  command did not exist). Implemented by delegating to `LMOVE`'s body with `RIGHT LEFT` rather than
-  by duplicating the list logic, and registered with LMOVE's two-key spec (arity 3, write,
-  first_key 1, last_key 2, step 1, ACL `@list @slow`). Along the way the blocking-wakeup guard —
-  open-coded at eight dispatch sites — moved behind one shared predicate, which fixed a drift the
-  duplication had hidden: the two connection handlers woke `LMOVE`'s SOURCE key, which no blocked
-  reader waits on, while the SPSC handler correctly woke its DESTINATION. A `BLPOP dst` was
-  therefore woken or left to time out depending on which shard owned the key.
-
-### Removed
-- **The dead `connection::command` stub** (#469). `COMMAND COUNT` replying an empty array (and
-  bare `COMMAND` replying `Integer(0)` — each returning the other's RESP type) was fixed in #471,
-  which routed both dispatch sites to `introspect::command`; verified on the wire, `COMMAND COUNT`
-  now answers `:262` and `COMMAND INFO`/`DOCS WATCH` answer real specs. The superseded stub was
-  left behind unreferenced, together with three unit tests that still asserted its wrong replies —
-  a green test pinned to code nothing could reach. Both are deleted, and the issue's three probes
-  are pinned as one test beside the live handler.
-
-### Fixed
 - **ACL key patterns are now enforced for `RPOPLPUSH` and `BRPOPLPUSH`** (#520). The ACL layer
   extracts a command's key arguments from a name table, and a command missing from that table
   falls through to an empty key list — which makes the permission loop a no-op, so every `~pattern`
@@ -1150,39 +1009,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `INFO server` returned a 3 KB dump where Redis returns `+QUEUED`. The queue decision now sits
   directly below each handler's ACL gate, which fixes the whole class at once.
 
-### Added
-- **Keyspace notifications (`notify-keyspace-events`).** Moon had none: cache-invalidation
-  frameworks and change-data-capture consumers subscribe to `__keyspace@<db>__:<key>` and
-  `__keyevent@<db>__:<event>` and got silence. Both channel families are now published, gated by
-  the full Redis flag model — including the parts that are not what the letters suggest, all
-  measured against redis-server 8.6.1 rather than recalled: `CONFIG SET KEA` reads back as `AKE`,
-  `mn` as `nm`, `Km` as `Km`, and `A` deliberately excludes `m` (keymiss) and `n` (newkey) so it
-  stays safe to enable in production. Events wired: `set`, `incrby` (INCR publishes `incrby`, not
-  `incr`), `rename_from`/`rename_to` (RENAME emits BOTH halves, carrying different keys),
-  `expired`, `keymiss`. Off by default and genuinely zero-cost when off — one relaxed atomic load.
-  Delivery reaches subscribers on **every** shard, not just the one that owns the mutated key: a
-  local-only publish would pass at `--shards 1` and silently drop roughly (N-1)/N of events at
-  `--shards N`.
-- **`ROLE`, `RESET`, and a real `COMMAND` introspection surface.** `COMMAND` and `COMMAND COUNT`
-  each returned the OTHER'S RESP TYPE — bare `COMMAND` replied `:0` (an Integer where an Array
-  belongs) and `COMMAND COUNT` replied `*0` (an Array where an Integer belongs); `COMMAND
-  INFO`/`DOCS`/`LIST`/`GETKEYS` all replied an empty array. A driver that builds its command map at
-  connect time does not read that as "unsupported", it reads it as a protocol violation, and
-  `redis-cli` renders `:0` and `*0` identically as "0" so it never showed up by eye. All six now
-  derive from `COMMAND_META`, so registering a command is what makes it introspectable and there is
-  no second table to drift. `ROLE` and `RESET` were unknown commands: `RESET` was registered in the
-  metadata table with full flags while dispatch rejected it (the same advertise-then-reject class as
-  WATCH/UNWATCH before v0.8.6), and a partial `RESET` existed only inside `handler_sharded`'s
-  subscribe-mode loop, so it worked if you happened to be subscribed on one runtime and nowhere
-  else. `RESET` is wired on every production path and on `handler_single` (the in-process
-  single-shard handler that only tests reach) so the third copy of this surface cannot drift
-  unnoticed the way it just did. `ROLE` is answered from the shared dispatch table instead,
-  reading the process-global replication handle that `INFO` already uses — which is what lets a
-  QUEUED `ROLE` work: `EXEC` replays the queue through `dispatch()`, so a connection-layer
-  intercept would have executed `ROLE` at queue time and dropped it from the `EXEC` array,
-  shifting every later result index for the client. Caught by the client-compat harness.
-
-### Fixed
 - **`HELLO` no longer contradicts `INFO replication` about what the server is.** `hello_acl` built
   its reply with `mode` and `standalone` and `role` and `master` as compile-time literals, so a
   replica told `HELLO` it was a master while telling `INFO` it was a slave — on the same connection.
@@ -1241,40 +1067,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   First full run vs Redis 8.6.1: 152 comparisons, 94 pass, 58 waived, plus 34
   named missing `INFO` fields via `--info-manifest`.
 
-### Security
-- **A remote client could hang a shard thread and exhaust memory with a 4-byte inline command
-  (#487).** `split_args_quoted` — the path any inline command containing a quote takes — skipped
-  only `' '` and `'\t'` between arguments, while its token loop *terminated* on the wider
-  `' ' \t \n \r \x0b \x0c`. A byte in the difference (`\n`, `\r`, vertical tab, form feed) sitting at a
-  token boundary therefore made no progress at all: the token loop returned without advancing, an
-  empty argument was appended, and the outer loop restarted at the same offset — forever, with the
-  argument vector growing until the process died. A lone `\r` reaches the line because the CRLF
-  scanner only terminates on the `\r\n` *pair*. Parsing happens before dispatch, so this was
-  reachable pre-authentication: `\r"` followed by CRLF was enough. Both loops now read one
-  `is_inline_space` definition, so they cannot drift apart again — the same six bytes C's
-  `isspace()` accepts, which is what Redis's own `sdssplitargs` skips with. Found by the
-  `resp_parse`, `resp_parse_differential` and `inline_parse` fuzz targets; guarded by an exhaustive
-  test over every short line built from the bytes the splitter branches on (271k cases, ~0.03s),
-  which without the fix allocates until the OS kills the process.
-- **ACL bypass on the inline GET fast path (monoio runtime).** An
-  authenticated but restricted user could read any key with plain `GET`:
-  `try_inline_dispatch` answered the `*2 $3 GET` shape straight from the shard
-  map, running neither the ACL command check nor the ACL key-pattern check.
-  A `-@all` user read arbitrary keys by name, and a `~app:*` user read outside
-  its pattern; no ACL LOG entry was produced. Writes were already gated on
-  `can_inline_writes` (which folds in `conn.acl_skip_allowed()`) — reads were
-  gated on nothing. Not single-shard-only: at `--shards 4` every key hashing
-  to the connection's own shard leaked (measured 24/160 and 44/160 in the new
-  suite); `--shards 1` — the config recommended for non-pipelined workloads —
-  leaked 160/160. Reads are now gated on the same `acl_skip_allowed()` latch,
-  so a restricted connection falls through to generic dispatch where both ACL
-  checks run. The tokio handlers were never affected (they gate correctly at
-  `handler_single.rs` / `handler_sharded/mod.rs`), which is why no CI job
-  caught this: every CI test job builds tokio. New suite:
-  `tests/acl_inline_read_enforcement.rs` (deny-all and key-pattern users, at
-  `--shards 1` and `--shards 4`).
-
-### Fixed
 - **`WATCH` / `UNWATCH` now actually guard a transaction on the production
   dispatch paths.** Both commands parsed and answered `+OK`, and the tokio and
   embedded handlers re-checked the recorded versions at `EXEC` — but the two
@@ -1440,6 +1232,242 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `moon_dispatch_path_total{path="local_inline"}`: 2000/2000 GETs still
   inlined with and without `--requirepass`, 0/2000 for restricted and
   tracking connections.
+
+### Added
+- **`INFO Server` now reports `num_shards`** (#497), the resolved shard count rather than the
+  configured one, so `--shards 0` auto-detection reports the number actually in effect. A client
+  that cannot operate against a multi-shard instance — one committing a cross-key transaction per
+  request — previously had no way to refuse at connect time except a two-key co-location canary,
+  which is slow and still a guess. `redis_mode`/`cluster_enabled` do not answer this: a
+  single-process Moon with several shards is `standalone` and still routes keys across threads. The
+  value is never 0; an embedded harness that never records a count reports the single-shard truth,
+  because a zero reads as a valid answer and is not one.
+
+- **An acceptance suite driven by unmodified redis-py** (`scripts/client-compat/redis_py/`), wired
+  into the `client-compat` CI job. The raw-RESP differ compares bytes against a real redis-server;
+  it is precise and blind to everything a client library does *around* the reply — the handshake it
+  opens with, the connection it reuses, the Python type it decodes into, the second command it
+  issues on your behalf. A server can answer every byte correctly and still be unusable from
+  redis-py. The suite therefore drives redis-py's own idioms — connection pools, `pipeline()`,
+  `pubsub()`, `scan_iter()`/`hscan_iter()`, `redis.lock.Lock`, `from_url`, RESP2 and RESP3
+  handshakes, `WATCH` optimistic locking — rather than hand-rolled sockets. Stdlib `unittest` and
+  the distro `python3-redis` package, because the runner has no pytest and PEP 668 blocks pip.
+
+  It found three defects on its first run, each pinned inside the suite so that fixing one breaks
+  the run with an actionable message rather than leaving a stale skip: at `--shards >= 2`, an
+  `MGET` in the same pipeline batch as the `SET`s that wrote its keys returns nulls despite those
+  `SET`s acking `+OK` earlier in the batch (a silent read-your-own-writes violation), `EVALSHA` of
+  a **single-key** script is rejected with `CROSSSLOT` (which breaks `redis.lock.Lock.release()`),
+  and `CLIENT INFO` reports a literal `cmd=NULL` for every connection.
+
+  The two multi-shard defects fire for roughly **half** of keys — decided by which shard owns the
+  key relative to the connection's own shard — so each pin runs twenty distinct keys rather than
+  one. A single-trial pin was tried first and made CI flaky, which is how the ~50% rate was found;
+  the amplified form is 0/10 flaky runs on both macOS and Linux, and still fails loudly when the
+  underlying bug is fixed.
+
+- **Nine INFO fields a standard monitoring stack reads.** `tcp_port`, `uptime_in_seconds`,
+  `uptime_in_days`, `aof_last_write_status`, `aof_last_bgrewrite_status`,
+  `rdb_changes_since_last_save`, `sync_full`, `sync_partial_ok` and `sync_partial_err` are now
+  emitted, each from a real source rather than a constant: uptime from a start instant captured
+  before the listener binds, `rdb_changes_since_last_save` from a sharded
+  keyspace-mutation counter reset at save completion, and the three `sync_*` counters recorded at
+  the one point in the PSYNC handshake where full-vs-partial is still distinguishable (`PSYNC ? -1`
+  counts as a full resync the replica ASKED for, not a partial that failed). `tcp_port` reports the
+  configured listener port, not the port the INFO connection arrived on — behind a container port
+  map the two differ, and the field exists so a client can hand a peer a reachable address.
+  The four fields Moon cannot answer truthfully are recorded as waivers with reasons instead of
+  being emitted: `latest_fork_usec` (Moon never calls `fork(2)`; BGSAVE snapshots in-process), the
+  two `client_recent_max_*_buffer` high-water marks (untracked, and tracking them means a counter on
+  every connection read and write), and `used_memory_lua` — which was implemented and then withdrawn
+  when measurement showed the value the shard can publish is ~2 orders of magnitude below the real
+  VM footprint on the shipped monoio runtime (80 bytes against tokio's 26183, same `setup_lua_vm`,
+  ruled out as Cargo feature unification). This keeps the INFO emitter's standing rule intact: a
+  wrong number on a dashboard is worse than an absent one.
+
+- **`ZRANK`/`ZREVRANK ... WITHSCORE`** (#521), the Redis 7.2 option — previously an arity error, so
+  a 7.2-aware client asking for the rank and the score in one round trip got a hard failure. A hit
+  is the two-element array `[rank, score]`; a miss (absent key or absent member) is the null ARRAY
+  `*-1`, not the null bulk the option-less form answers, so `WITHSCORE` changes the null type as
+  well as the hit type — measured against redis-server 8.6.1, and a statically-typed client decodes
+  the two differently. The token is SINGULAR, unlike the `WITHSCORES` that `ZRANGE` takes; the
+  plural is a syntax error here, and only a FOURTH argument is an arity error (Redis distinguishes
+  the two and so does Moon). The score is emitted as a RESP double, so RESP3 gets `,1` while RESP2
+  keeps the identical bulk-string bytes. Both entry points were fixed — `zrank` and
+  `zrank_readonly` each carried their own arity check, and which one answers is decided by shard
+  routing, so fixing one would have left the option working on some keys and failing on others.
+  `ZRANK`/`ZREVRANK` arity in `COMMAND INFO` is now `-3`, matching Redis 7.2+.
+- **`RPOPLPUSH source destination`** (#520) — previously "unknown command" even though `LMOVE` and
+  `BRPOPLPUSH` both worked. It is deprecated in Redis but never removed, and it is the form baked
+  into a decade of client code: `redis-py`, `jedis`, `go-redis` and `node-redis` all expose it as a
+  first-class method, so `r.rpoplpush(...)` failed outright. The name was already in the workspace
+  routing table, in the metrics labels, and was the internal rewrite target of `BRPOPLPUSH` —
+  missing only from the two places a client reaches, the dispatch table and `metadata.rs`
+  (`COMMAND INFO rpoplpush` answered an empty array, so driver feature-detection concluded the
+  command did not exist). Implemented by delegating to `LMOVE`'s body with `RIGHT LEFT` rather than
+  by duplicating the list logic, and registered with LMOVE's two-key spec (arity 3, write,
+  first_key 1, last_key 2, step 1, ACL `@list @slow`). Along the way the blocking-wakeup guard —
+  open-coded at eight dispatch sites — moved behind one shared predicate, which fixed a drift the
+  duplication had hidden: the two connection handlers woke `LMOVE`'s SOURCE key, which no blocked
+  reader waits on, while the SPSC handler correctly woke its DESTINATION. A `BLPOP dst` was
+  therefore woken or left to time out depending on which shard owned the key.
+
+- **Keyspace notifications (`notify-keyspace-events`).** Moon had none: cache-invalidation
+  frameworks and change-data-capture consumers subscribe to `__keyspace@<db>__:<key>` and
+  `__keyevent@<db>__:<event>` and got silence. Both channel families are now published, gated by
+  the full Redis flag model — including the parts that are not what the letters suggest, all
+  measured against redis-server 8.6.1 rather than recalled: `CONFIG SET KEA` reads back as `AKE`,
+  `mn` as `nm`, `Km` as `Km`, and `A` deliberately excludes `m` (keymiss) and `n` (newkey) so it
+  stays safe to enable in production. Events wired: `set`, `incrby` (INCR publishes `incrby`, not
+  `incr`), `rename_from`/`rename_to` (RENAME emits BOTH halves, carrying different keys),
+  `expired`, `keymiss`. Off by default and genuinely zero-cost when off — one relaxed atomic load.
+  Delivery reaches subscribers on **every** shard, not just the one that owns the mutated key: a
+  local-only publish would pass at `--shards 1` and silently drop roughly (N-1)/N of events at
+  `--shards N`.
+- **`ROLE`, `RESET`, and a real `COMMAND` introspection surface.** `COMMAND` and `COMMAND COUNT`
+  each returned the OTHER'S RESP TYPE — bare `COMMAND` replied `:0` (an Integer where an Array
+  belongs) and `COMMAND COUNT` replied `*0` (an Array where an Integer belongs); `COMMAND
+  INFO`/`DOCS`/`LIST`/`GETKEYS` all replied an empty array. A driver that builds its command map at
+  connect time does not read that as "unsupported", it reads it as a protocol violation, and
+  `redis-cli` renders `:0` and `*0` identically as "0" so it never showed up by eye. All six now
+  derive from `COMMAND_META`, so registering a command is what makes it introspectable and there is
+  no second table to drift. `ROLE` and `RESET` were unknown commands: `RESET` was registered in the
+  metadata table with full flags while dispatch rejected it (the same advertise-then-reject class as
+  WATCH/UNWATCH before v0.8.6), and a partial `RESET` existed only inside `handler_sharded`'s
+  subscribe-mode loop, so it worked if you happened to be subscribed on one runtime and nowhere
+  else. `RESET` is wired on every production path and on `handler_single` (the in-process
+  single-shard handler that only tests reach) so the third copy of this surface cannot drift
+  unnoticed the way it just did. `ROLE` is answered from the shared dispatch table instead,
+  reading the process-global replication handle that `INFO` already uses — which is what lets a
+  QUEUED `ROLE` work: `EXEC` replays the queue through `dispatch()`, so a connection-layer
+  intercept would have executed `ROLE` at queue time and dropped it from the `EXEC` array,
+  shifting every later result index for the client. Caught by the client-compat harness.
+
+### Changed
+- **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
+  Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
+  index, maintained O(log n) by the storage-layer writers; the 100ms sweep pops exactly the DUE
+  keys off the front — no 20-key random sample (which went blind when due keys were a small
+  fraction of the volatile population, leaving them resident for many ticks), and no O(N)
+  full-map scans (three per tick on any database with even one TTL'd key). Measured on a
+  100K-volatile-key database: 1.36ms → 47ns per tick, and the old cost exceeded the sweep's own
+  1ms budget before it had expired anything. The hash-field-TTL sweep is now latch-gated too, so
+  databases that never touch HEXPIRE skip its scan entirely (the scan itself when the latch is up
+  remains O(N) — #543). `INFO`'s `expires` count reads the index, O(1). Along the way, two
+  writers that bypassed the expiry machinery were rerouted: GETEX's TTL options now go through
+  `set_expiry` (previously a GETEX-only TTL never armed the sweep latch, so the key was invisible
+  to active expiry forever), and EXPIRE-family commands hitting an already-expired key now hide
+  and queue it for the emitting drain (#542 semantics) instead of deleting it silently with no
+  `expired` notification and no dual-plane DEL. Review follow-ups: GETEX `EX`/`EXAT` seconds
+  values that overflow the millisecond conversion now answer the range error instead of
+  wrapping (debug builds panicked); the sweep only drops an index pair that is provably stale
+  (entry gone or TTL retargeted) so a backwards wall-clock step can't discard live pairs; the
+  per-key budget clock read is batched to every 64 pops; and sweep 2 lowers the hash latch from
+  its own reap outcomes instead of a second O(N) rescan.
+- **`volatile-ttl` eviction picks the exact nearest-expiry victim** (#551). The policy now reads
+  the head of the #541 deadline-ordered expiry index — O(log n), always the globally soonest
+  deadline — instead of sampling `maxmemory-samples` random volatile keys and taking the sample's
+  minimum, which could evict a key hours from expiring while the one expiring in seconds
+  survived. `maxmemory-samples` still governs the LRU/LFU/random policies, which remain
+  sampling-based.
+
+- **The `INFO field coverage` CI step is now a hard gate**, no longer `continue-on-error`. The
+  pinned-field harness gained a waiver syntax (`field  # WAIVED: <reason>`) that refuses an
+  unreasoned waiver at load time (exit 2) and reports a waiver on a field Moon has since started
+  emitting as a failure — so the list cannot go stale unnoticed the way the registry sweep's did.
+
+- **`CLUSTER SHARDS`, `CLUSTER MYSHARDID`, `READONLY` and `READWRITE`** — the four verbs a
+  cluster-aware client needs to bootstrap. `CLUSTER SHARDS` reports every shard cluster-wide, one
+  entry per master with its replicas, master first; a shard that has lost every live node reports an
+  empty `slots` array while still listing the dead node as `role: master, health: fail`. The top
+  level is an Array under both protocols and only the shard and node entries change shape — a Map
+  under RESP3, a flat array under RESP2 — which falls out of building them as `Frame::Map` and
+  letting each serializer render it, the same approach the RESP3 pub/sub work used. A node entry
+  carries exactly `id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`, in that
+  order, because under RESP2 a client may read it positionally. `READONLY` lets a replica serve
+  reads for slots its own master owns; a WRITE still answers `MOVED`, the asymmetry a
+  "just return +OK" implementation gets wrong.
+- **`INFO` reports cluster identity honestly.** `redis_mode` and `cluster_enabled` were the hardcoded
+  literals `standalone` and `0`, under a comment promising the cluster subsystem would say otherwise
+  — nothing ever did. An SDK branches on `redis_mode` before it ever calls `CLUSTER SHARDS`, so a
+  server answering SHARDS correctly while reporting `standalone` stayed undiscoverable as a cluster.
+- **`MONITOR` — the command feed.** `redis-cli monitor` now works against Moon, in Redis's exact
+  line format: `+<unix>.<micros> [<db> <addr>] "CMD" "arg" …`, arguments quoted and escaped per
+  byte (`sdscatrepr` semantics — `"` `\`, `\n` `\r` `\t`, `\a` `\b`, and `\xHH` for everything
+  outside printable ASCII, so UTF-8 escapes per byte rather than per character). The line is a
+  SimpleString under **both** RESP2 and RESP3 — measured; Redis does not use a Push frame here,
+  and the reflex to make it one after the RESP3 pub/sub work would have been a new divergence.
+  `AUTH`'s arguments and the credentials in `HELLO … AUTH` render as `(redacted)`, decided before
+  any argument is written rather than filtered afterwards.
+
+  Two behaviours are worth knowing because they are not the obvious implementation. First,
+  administrative commands are hidden at **subcommand** granularity: `CONFIG *`, `SLOWLOG *`,
+  `LATENCY *`, `ACL LIST/SETUSER` and `CLIENT LIST` never reach a monitor, while `INFO`, `DBSIZE`,
+  `LASTSAVE`, `CLIENT GETNAME/ID`, `ACL WHOAMI/CAT` and `CLUSTER INFO/MYID` do. Moon's own
+  `CommandFlags::ADMIN` is container-granular and could not express that split — using it would
+  have hidden six commands Redis shows — and Redis feeds the entire `EVAL` family despite flagging
+  it `skip_monitor`, so neither flag is consulted; the rule is stated explicitly and pinned
+  row-by-row against the measured oracle. `MONITOR` is absent from its own feed as a consequence of
+  that general rule rather than a self-suppression special case. Second, a monitor that stops
+  reading has its **connection dropped**: silently skipping lines would leave an operator unable to
+  tell a quiet server from a lossy feed, and blocking would let one slow TCP reader stall every
+  shard.
+
+  A monitor connection may not touch the keyspace, matching Redis
+  (`-ERR Replica can't interact with the keyspace`). The refusal set is measured, not derived from
+  a flag: `DBSIZE`, `KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`, `EVAL`,
+  `PUBLISH` and `MEMORY USAGE` name no key yet are all refused, while `PING`, `INFO`, `TIME`,
+  `ECHO`, `COMMAND`, `LASTSAVE`, `WAIT`, `SELECT`, `CLIENT`, `ACL`, `SUBSCRIBE` and `RESET` are
+  served. Neither `first_key` nor Moon's `WRITE`/`READONLY` flags reproduce that split — Moon
+  flags `PING` and `INFO` readonly and Redis does not — so the rule is stated explicitly and
+  pinned row by row against the oracle.
+
+  Commands issued by a Lua script are fed too, carrying the literal `lua` in place of a peer
+  address and appearing in execution order after the `EVAL` line — matching Redis. A script command
+  never passes a connection handler, so it needs its own hook; without it an operator watching a
+  script-driven workload would see every `EVAL` and none of its effects.
+
+  `MONITOR` requires the `admin` ACL category, and costs one relaxed atomic load per command when
+  nobody is attached — every other step lives behind that load. While a monitor IS attached the
+  inline fast path stands down, because it answers straight from the read buffer and never sees a
+  peer address; the feed is therefore correct by construction on that path rather than by a hook
+  that must be kept in sync. Fast-path retention when unattached is confirmed by
+  `moon_dispatch_path_total{path="local_inline"}`, not inferred from latency.
+- **Sharded pub/sub: `SSUBSCRIBE`, `SUNSUBSCRIBE`, `SPUBLISH`, and `PUBSUB SHARDCHANNELS` /
+  `SHARDNUMSUB`.** Deliveries carry the `smessage` event name. The sharded namespace is a
+  genuinely separate map from the plain one in both the per-shard registry and the
+  remote-subscriber map, so `SPUBLISH ch` cannot reach a `SUBSCRIBE ch` and vice versa — the two
+  may share a channel *name* while being different destinations, and that separation is
+  structural rather than a filter each call site has to remember. Cross-shard delivery reuses the
+  existing batched fan-out with a sharded marker on each entry, and is proven at `--shards 4`:
+  a local-only registry would have passed every single-shard test while dropping (N-1)/N of
+  deliveries in production. `SPUBLISH` was absent from `COMMAND_META` entirely, while
+  `SSUBSCRIBE` and `SUNSUBSCRIBE` were declared there but answered "unknown command" by the
+  dispatcher — so `COMMAND COUNT` was advertising verbs Moon could not run.
+
+- **CI migration: hosted-only PR gate + local merge bar** — the three self-hosted jobs
+  (`Check`, `Check (monoio)`, `Client compat`) serialized on the single moon-dev runner on every
+  PR (17–24m wall, with manual dispatches queueing behind them). The PR gate is now entirely
+  GitHub-hosted and parallel (Lint, Check on ubuntu-latest with sccache + rust-cache, MSRV,
+  Memory gate, ~5–8m); the monoio and client-compat legs moved to main-push + `workflow_dispatch`,
+  and — before every push — to the new **`scripts/ci-local.sh`** (host lint gates + both full
+  suites in the moon-dev VM; `--full` adds the client-compat harness and the macOS host suite).
+  The script captures exit codes directly (no piped gates), keeps VM builds on VM-local target
+  dirs, pins `MOON_BIN` for the compat harness, and fingerprints the working tree at start/end —
+  a branch switch or edit mid-run marks the run INVALID (exit 3) rather than reporting a false
+  green (both the fail path and the tripwire were attack-tested before landing).
+  `tests/ci_covers_monoio.rs` still guards the monoio job's integrity; its trigger scope is the
+  documented tradeoff. Console Integration was already path-gated and Integration Tests
+  label-gated; both unchanged.
+
+### Removed
+- **The dead `connection::command` stub** (#469). `COMMAND COUNT` replying an empty array (and
+  bare `COMMAND` replying `Integer(0)` — each returning the other's RESP type) was fixed in #471,
+  which routed both dispatch sites to `introspect::command`; verified on the wire, `COMMAND COUNT`
+  now answers `:262` and `COMMAND INFO`/`DOCS WATCH` answer real specs. The superseded stub was
+  left behind unreferenced, together with three unit tests that still asserted its wrong replies —
+  a green test pinned to code nothing could reach. Both are deleted, and the issue's three probes
+  are pinned as one test beside the live handler.
 
 ## [0.8.5] — 2026-08-08
 

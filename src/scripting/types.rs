@@ -2,6 +2,40 @@ use bytes::Bytes;
 use mlua::prelude::*;
 
 use crate::protocol::{Frame, FrameVec};
+/// Convert one `redis.call`/`redis.pcall` ARGUMENT to a Frame.
+///
+/// Deliberately different from [`lua_value_to_frame`], which converts a
+/// script's RETURN value. An argument is part of a command's argv, and a
+/// wire client can only ever put a bulk string there — upstream Redis
+/// stringifies Lua numbers for exactly this reason
+/// (`luaArgsToRedisArgv`). Moon used to hand `Frame::Integer` straight
+/// through, which meant `redis.call('SET', 'k', 5)` produced an argv no
+/// command parser (and no AOF/replication replay) could read: the value
+/// probes below all failed with `wrong number of arguments` before this.
+///
+/// moon#569 made it security-relevant too: `acl::keyspec` reads keys and
+/// `numkeys` out of the argv as BYTES, so an integer frame in either slot
+/// was un-enumerable and a legitimate `redis.call('LMPOP', 1, 'app:l',
+/// 'LEFT')` failed CLOSED for every key-restricted user.
+///
+/// Float truncation matches what moon already did (`3.7` -> `3`); only the
+/// frame TYPE changes.
+pub fn lua_arg_to_frame(lua: &Lua, value: &LuaValue) -> mlua::Result<Frame> {
+    let n = match value {
+        LuaValue::Integer(n) => *n,
+        LuaValue::Number(f) => *f as i64,
+        // Strings, and the non-numeric types, keep their existing handling.
+        // A nil/boolean/table argument stays whatever `lua_value_to_frame`
+        // makes of it; landing in a key position it is simply un-nameable,
+        // which the ACL walker reports as indeterminate and therefore denies.
+        other => return lua_value_to_frame(lua, other),
+    };
+    let mut buf = itoa::Buffer::new();
+    Ok(Frame::BulkString(Bytes::copy_from_slice(
+        buf.format(n).as_bytes(),
+    )))
+}
+
 /// Convert a Lua value to a Redis Frame (Lua -> RESP2 conversion).
 ///
 /// Redis-compatible conversion table:

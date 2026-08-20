@@ -212,6 +212,7 @@ impl FunctionRegistry {
     }
 
     /// Execute a function by name with the given keys and args.
+    #[allow(clippy::too_many_arguments)]
     pub fn call_function(
         &self,
         func_name: &[u8],
@@ -221,6 +222,7 @@ impl FunctionRegistry {
         selected_db: usize,
         db_count: usize,
         read_only: bool,
+        acl: &crate::acl::ScriptAcl,
     ) -> Frame {
         let (lib, _func_def) = match self.lookup(func_name) {
             Some(pair) => pair,
@@ -230,7 +232,8 @@ impl FunctionRegistry {
         };
 
         // Set up bridge
-        crate::scripting::bridge::set_script_db(db, selected_db, db_count);
+        // moon#569: FCALL runs under the caller's ACL exactly like EVAL.
+        crate::scripting::bridge::set_script_db(db, selected_db, db_count, acl);
         if read_only {
             crate::scripting::bridge::set_script_read_only(true);
         }
@@ -271,17 +274,9 @@ impl FunctionRegistry {
 
         match result {
             Ok(frame) => frame,
-            Err(mlua::Error::RuntimeError(msg)) if msg.contains("ERR Lua script timeout") => {
-                Frame::Error(Bytes::from_static(b"BUSY Lua script timeout exceeded"))
-            }
-            Err(mlua::Error::RuntimeError(msg))
-                if msg.contains("Write commands are not allowed") =>
-            {
-                Frame::Error(Bytes::from_static(
-                    b"ERR Write commands are not allowed from read-only scripts",
-                ))
-            }
-            Err(e) => Frame::Error(Bytes::from(format!("ERR Error running script: {e}"))),
+            // Shared with EVAL/EVALSHA so an ACL denial, a timeout and a
+            // read-only violation read identically on both surfaces.
+            Err(e) => crate::scripting::script_error_to_frame(e),
         }
     }
 
@@ -623,7 +618,16 @@ mod tests {
         reg.load(body, false).unwrap();
 
         let mut db = Database::new();
-        let result = reg.call_function(b"hello", vec![], vec![], &mut db, 0, 1, false);
+        let result = reg.call_function(
+            b"hello",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            false,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::BulkString(ref b) if *b == Bytes::from_static(b"world")));
     }
 
@@ -631,7 +635,16 @@ mod tests {
     fn test_call_function_not_found() {
         let reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let mut db = Database::new();
-        let result = reg.call_function(b"nonexistent", vec![], vec![], &mut db, 0, 1, false);
+        let result = reg.call_function(
+            b"nonexistent",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            false,
+            &crate::acl::ScriptAcl::trusted(),
+        );
         assert!(matches!(result, Frame::Error(_)));
     }
 }

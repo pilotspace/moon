@@ -31,7 +31,7 @@
 //! than executed — see the intercept in [`make_redis_call_fn`] for why
 //! silently allowing it would corrupt state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use mlua::prelude::*;
 
+use crate::acl::ScriptAcl;
 use crate::config::RuntimeConfig;
 use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
@@ -289,20 +290,43 @@ thread_local! {
     static SCRIPT_HAD_WRITE: Cell<bool> = const { Cell::new(false) };
     /// Whether this script is running in read-only mode (FCALL_RO).
     static SCRIPT_READ_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// moon#569: the ACL identity every `redis.call`/`redis.pcall` of the
+    /// CURRENTLY RUNNING script is authorized against.
+    ///
+    /// Same lifetime and the same single-threaded-shard argument as
+    /// `CURRENT_DB`: installed by [`set_script_db`] before the VM runs and
+    /// reset by [`clear_script_db`] on every exit path. It resets to
+    /// [`ScriptAcl::deny`], not to "no identity = allow", so a script that
+    /// somehow reaches a VM outside `set_script_db` refuses every command
+    /// instead of inheriting the previous script's caller.
+    static SCRIPT_ACL: RefCell<ScriptAcl> = RefCell::new(ScriptAcl::deny());
 }
 
-/// Set the thread-local database pointer before script execution.
-pub fn set_script_db(db: &mut crate::storage::Database, db_idx: usize, db_count: usize) {
+/// Set the thread-local database pointer and caller identity before script
+/// execution.
+///
+/// `acl` is a REQUIRED parameter rather than a separate optional setter
+/// precisely so no execution path can forget it: adding a new script runner
+/// forces an explicit authorization decision at compile time (moon#569).
+pub fn set_script_db(
+    db: &mut crate::storage::Database,
+    db_idx: usize,
+    db_count: usize,
+    acl: &ScriptAcl,
+) {
     CURRENT_DB.with(|c| c.set(db as *mut _ as *mut ()));
     CURRENT_DB_IDX.with(|c| c.set(db_idx));
     CURRENT_DB_COUNT.with(|c| c.set(db_count));
     SCRIPT_HAD_WRITE.with(|c| c.set(false));
+    SCRIPT_ACL.with(|c| *c.borrow_mut() = acl.clone());
 }
 
 /// Clear the thread-local database pointer after script execution.
 pub fn clear_script_db() {
     CURRENT_DB.with(|c| c.set(std::ptr::null_mut()));
     SCRIPT_READ_ONLY.with(|c| c.set(false));
+    // Back to fail-closed: nothing may run until the next `set_script_db`.
+    SCRIPT_ACL.with(|c| *c.borrow_mut() = ScriptAcl::deny());
 }
 
 /// Set the read-only flag for the current script execution (FCALL_RO).
@@ -331,9 +355,12 @@ pub fn make_redis_call_fn(
 ) -> mlua::Result<LuaFunction> {
     lua.create_function(move |lua, args: LuaMultiValue| {
         // Convert all Lua arguments to Frames
+        // ARGUMENT conversion, not return-value conversion: Lua numbers
+        // become bulk strings exactly as a wire client would send them
+        // (see `lua_arg_to_frame`).
         let frames: Vec<Frame> = args
             .iter()
-            .map(|v| crate::scripting::types::lua_value_to_frame(lua, v))
+            .map(|v| crate::scripting::types::lua_arg_to_frame(lua, v))
             .collect::<mlua::Result<_>>()?;
 
         if frames.is_empty() {
@@ -365,6 +392,32 @@ pub fn make_redis_call_fn(
             let db = unsafe { &mut *ptr };
             let mut db_idx = CURRENT_DB_IDX.with(|c| c.get());
             let db_count = CURRENT_DB_COUNT.with(|c| c.get());
+
+            // moon#569: authorize the INNER command against the caller's ACL.
+            //
+            // This is the whole fix, and it is placed FIRST — before the
+            // SELECT intercept, before the read-only/replica gates, before
+            // the eviction gate, before the COW pre-image capture and before
+            // MONITOR is fed — so a denied command produces no side effect of
+            // any kind, not even an observable one.
+            //
+            // Why it cannot be laundered: the check runs on the argv that is
+            // about to be executed, at the one place every script-issued
+            // command must pass through. It is therefore blind to HOW the
+            // script produced that argv (literal, `..` concatenation, a
+            // closure, a nested `pcall`, a loop) and to which entry point ran
+            // the script (EVAL / EVALSHA / FCALL / FCALL_RO, local or routed
+            // to another shard). Key extraction is the shared, fail-closed
+            // `acl::keyspec` walker, so movable-key commands (LMPOP, ZMPOP,
+            // SORT ... STORE, COPY, GEORADIUS ... STORE) are covered and
+            // anything it cannot enumerate is DENIED rather than waved
+            // through.
+            if let Some(reason) = SCRIPT_ACL.with_borrow(|acl| acl.check(&cmd_bytes, &frames[1..]))
+            {
+                return Ok(Frame::Error(Bytes::from(crate::acl::script_acl_error(
+                    &reason,
+                ))));
+            }
 
             // Wave A (task #34): `redis.call('SELECT', ...)` used to silently
             // corrupt state — the generic dispatch SELECT handler mutates
@@ -760,7 +813,17 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"cow517")),
         ];
         let run_script = crate::scripting::handle_eval;
-        let result = run_script(&lua, &cache, &args, &mut db, 0, 1, 0, 1);
+        let result = run_script(
+            &lua,
+            &cache,
+            &args,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &ScriptAcl::trusted(),
+        );
         let pending = snapshot_cow::pending_for_test();
         snapshot_cow::disarm();
 

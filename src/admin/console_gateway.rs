@@ -146,6 +146,11 @@ impl ConsoleGateway {
         let msg = ShardMessage::Execute {
             db_index,
             command: frame,
+            // moon#569: the admin console is a separate operator-authenticated
+            // plane with no ACL user behind it — it is already unrestricted by
+            // construction, so its scripts run trusted rather than refused.
+            // This is the ONLY production `trusted()` producer.
+            script_acl: crate::acl::ScriptAcl::trusted(),
             reply_tx,
         };
 

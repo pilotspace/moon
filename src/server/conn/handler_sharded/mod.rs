@@ -1102,10 +1102,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#508: a script whose keys all live on another
                         // shard runs THERE. Same helper as handler_monoio —
                         // one routing policy, not two that can drift.
+                        // moon#569: resolve the caller once, authorize every
+                        // inner `redis.call` against it — locally and on the
+                        // shard this script may route to.
+                        let script_acl = crate::acl::ScriptAcl::for_user(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                        );
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
                             cmd_args,
                             conn.selected_db,
+                            &script_acl,
                             ctx,
                         )
                         .await
@@ -1120,11 +1128,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    &script_acl,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    &script_acl,
                                 )
                             }
                         });
@@ -1285,6 +1295,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::command::functions::handle_fcall(
                                     reg, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    // moon#569: FCALL runs under the caller's ACL.
+                                    &crate::acl::ScriptAcl::for_user(
+                                        &ctx.acl_table, &conn.current_user,
+                                    ),
                                 )
                             });
                             drop(guard);
@@ -1303,6 +1317,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::command::functions::handle_fcall_ro(
                                     reg, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    // moon#569: FCALL runs under the caller's ACL.
+                                    &crate::acl::ScriptAcl::for_user(
+                                        &ctx.acl_table, &conn.current_user,
+                                    ),
                                 )
                             });
                             drop(guard);
