@@ -53,11 +53,11 @@ use crate::protocol::Frame;
 
 /// Borrowed key slices. Four inline slots cover every fixed-arity keyed
 /// command in the registry; only variadic forms (`DEL a b c d e`) spill.
-pub(crate) type KeyVec<'a> = SmallVec<[&'a [u8]; 4]>;
+pub type KeyVec<'a> = SmallVec<[&'a [u8]; 4]>;
 
 /// Outcome of key extraction. See the module docs for the contract.
 #[derive(Debug)]
-pub(crate) enum CommandKeys<'a> {
+pub enum CommandKeys<'a> {
     /// The command provably names no key.
     None,
     /// The keys this invocation touches (never empty).
@@ -84,7 +84,7 @@ const UNREGISTERED_KEYLESS: &[&[u8]] = &[
 ];
 
 /// Zero-based positions in `args` of the keys an invocation touches.
-pub(crate) type KeyIdx = SmallVec<[usize; 4]>;
+pub type KeyIdx = SmallVec<[usize; 4]>;
 
 /// Where the keys of an argv live, without interpreting them.
 ///
@@ -92,7 +92,7 @@ pub(crate) type KeyIdx = SmallVec<[usize; 4]>;
 /// FACTS; each caller applies its own POLICY, because the callers legitimately
 /// disagree — see [`AtPlusComputed`](KeyPositions::AtPlusComputed).
 #[derive(Debug)]
-pub(crate) enum KeyPositions {
+pub enum KeyPositions {
     /// The command provably names no key.
     None,
     /// The positions of the keys this invocation touches (never empty).
@@ -111,7 +111,7 @@ pub(crate) enum KeyPositions {
 
 /// Locate the key arguments of `cmd`/`args`. `args` EXCLUDES the command name,
 /// so registry key-spec index `N` maps to `args[N - 1]`.
-pub(crate) fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
+pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     // Layouts a fixed first/last/step spec cannot express come first: some of
     // them (SORT, OBJECT, ZUNIONSTORE) DO have a spec, but it describes only
     // part of the truth.
@@ -177,7 +177,7 @@ pub(crate) fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions 
 /// cannot be fully enumerated — including an argv that also reaches
 /// runtime-computed key names — is [`CommandKeys::Indeterminate`], so the
 /// caller denies.
-pub(crate) fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a> {
+pub fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a> {
     let idx = match command_key_positions(cmd, args) {
         KeyPositions::None => return CommandKeys::None,
         KeyPositions::At(idx) => idx,

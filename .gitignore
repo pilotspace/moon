@@ -79,7 +79,14 @@ moon_*.log
 ssh
 .qdrant-initialized
 libnull.rlib
-fuzz
+# Ignore fuzzing BUILD OUTPUT, not the fuzzers themselves. A bare `fuzz` silently
+# ignored every newly-added target under fuzz/fuzz_targets/ — already-tracked
+# files are unaffected by .gitignore, so the 17 existing targets stayed visible
+# and the trap only sprang on the 18th (moon#576): the target committed clean
+# locally, then CI failed with "no such fuzz target".
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
 shard-*/
 .serena/
 console/tsconfig.app.tsbuildinfo

@@ -188,7 +188,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Every new command needs at least one unit test and one consistency test entry.
 - Integration tests use real server instances — no mocking.
 - Benchmarks use Criterion with `black_box()` on inputs and outputs.
-- **Fuzzing:** 12 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target. CI runs 15 min/target on PRs and 6h nightly.
+- **Fuzzing:** 18 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target, AND an entry in BOTH matrices in `.github/workflows/fuzz.yml` — a target that exists but is not listed never runs (`term_fst_sidecar` sat unlisted until moon#576). CI runs 15 min/target on PRs and 6h nightly.
 - **Loom:** model tests in `tests/loom_response_slot.rs` for lock-free data structures. Any new atomic state machine MUST have a loom model.
 
 ### Module Structure
@@ -263,7 +263,7 @@ legs run locally via `scripts/ci-local.sh` before every push, and again on Actio
 - Client compat (self-hosted, real redis-server oracle)
 - Check (macOS), Check (Windows), Check (console feature)
 
-**Scheduled:** fuzz nightly 6h (12 targets, nightly compiler, `rust-toolchain.toml` removed for the job), Crash Matrix nightly + weekly soak, CodeQL weekly, supply-chain weekly.
+**Scheduled:** fuzz nightly 6h (18 targets, nightly compiler, `rust-toolchain.toml` removed for the job), Crash Matrix nightly + weekly soak, CodeQL weekly, supply-chain weekly.
 
 ### Local CI (the merge bar)
 
