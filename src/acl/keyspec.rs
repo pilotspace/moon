@@ -83,14 +83,40 @@ const UNREGISTERED_KEYLESS: &[&[u8]] = &[
     b"READWRITE",
 ];
 
-/// Extract the keys `cmd`/`args` touch. `args` EXCLUDES the command name, so
-/// key-spec index `N` maps to `args[N - 1]`.
-pub(crate) fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a> {
+/// Zero-based positions in `args` of the keys an invocation touches.
+pub(crate) type KeyIdx = SmallVec<[usize; 4]>;
+
+/// Where the keys of an argv live, without interpreting them.
+///
+/// This is the single walker every consumer shares (moon#582). It reports
+/// FACTS; each caller applies its own POLICY, because the callers legitimately
+/// disagree — see [`AtPlusComputed`](KeyPositions::AtPlusComputed).
+#[derive(Debug)]
+pub(crate) enum KeyPositions {
+    /// The command provably names no key.
+    None,
+    /// The positions of the keys this invocation touches (never empty).
+    At(KeyIdx),
+    /// The positions we CAN name, plus at least one key whose name is computed
+    /// at runtime and therefore cannot be named at all (`SORT ... BY w_*`).
+    ///
+    /// ACL must treat this as indeterminate: a `~pattern` user could otherwise
+    /// reach arbitrary keys through the pattern. Cache invalidation must NOT —
+    /// redis reports and invalidates the named keys either way, and dropping
+    /// them would leave a tracking client permanently stale.
+    AtPlusComputed(KeyIdx),
+    /// Keys exist (or may exist) but this argv could not be enumerated.
+    Unknown,
+}
+
+/// Locate the key arguments of `cmd`/`args`. `args` EXCLUDES the command name,
+/// so registry key-spec index `N` maps to `args[N - 1]`.
+pub(crate) fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     // Layouts a fixed first/last/step spec cannot express come first: some of
     // them (SORT, OBJECT, ZUNIONSTORE) DO have a spec, but it describes only
     // part of the truth.
-    if let Some(keys) = movable_keys(cmd, args) {
-        return keys;
+    if let Some(pos) = movable_positions(cmd, args) {
+        return pos;
     }
 
     let Some(meta) = metadata::lookup(cmd) else {
@@ -103,13 +129,13 @@ pub(crate) fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a>
                 .iter()
                 .any(|k| cmd.eq_ignore_ascii_case(k))
         {
-            return CommandKeys::None;
+            return KeyPositions::None;
         }
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     };
 
     if meta.first_key <= 0 {
-        return CommandKeys::None;
+        return KeyPositions::None;
     }
 
     let argc = args.len();
@@ -121,26 +147,52 @@ pub(crate) fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a>
         let back = (-meta.last_key) as usize;
         match (argc + 1).checked_sub(back) {
             Some(idx) => idx,
-            None => return CommandKeys::Indeterminate,
+            None => return KeyPositions::Unknown,
         }
     } else {
         meta.last_key as usize
     };
     // A declared key position that the argv does not reach is a malformed
-    // invocation — deny rather than silently check fewer keys.
+    // invocation — report nothing rather than silently naming fewer keys.
     if first > last || last > argc {
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     }
 
     let step = if meta.step > 0 { meta.step as usize } else { 1 };
-    let mut keys = KeyVec::new();
+    let mut idx = KeyIdx::new();
     let mut i = first;
     while i <= last {
-        match key_bytes(&args[i - 1]) {
+        idx.push(i - 1);
+        i += step;
+    }
+    if idx.is_empty() {
+        return KeyPositions::Unknown;
+    }
+    KeyPositions::At(idx)
+}
+
+/// Extract the keys `cmd`/`args` touch, for ACL `~pattern` enforcement.
+///
+/// A thin, fail-closed policy over [`command_key_positions`]: anything that
+/// cannot be fully enumerated — including an argv that also reaches
+/// runtime-computed key names — is [`CommandKeys::Indeterminate`], so the
+/// caller denies.
+pub(crate) fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a> {
+    let idx = match command_key_positions(cmd, args) {
+        KeyPositions::None => return CommandKeys::None,
+        KeyPositions::At(idx) => idx,
+        // Some key of this argv is unnameable, so `~pattern` cannot gate it.
+        KeyPositions::AtPlusComputed(_) | KeyPositions::Unknown => {
+            return CommandKeys::Indeterminate;
+        }
+    };
+    let mut keys = KeyVec::new();
+    for i in idx {
+        // A key position holding a non-string is a malformed invocation.
+        match args.get(i).and_then(key_bytes) {
             Some(k) => keys.push(k),
             None => return CommandKeys::Indeterminate,
         }
-        i += step;
     }
     if keys.is_empty() {
         return CommandKeys::Indeterminate;
@@ -186,7 +238,7 @@ fn key_bytes(frame: &Frame) -> Option<&[u8]> {
 /// Returns `None` when the command is not one of them (the caller then uses
 /// the meta-derived walk). Matched on `(len, first byte)` first so the common
 /// single-key commands fall through after one integer compare.
-fn movable_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<CommandKeys<'a>> {
+fn movable_positions(cmd: &[u8], args: &[Frame]) -> Option<KeyPositions> {
     let len = cmd.len();
     if len == 0 {
         return None;
@@ -195,32 +247,32 @@ fn movable_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<CommandKeys<'a>> {
     let keys = match (len, b0) {
         // ---- numkeys-counted key vectors ----
         // <cmd> numkeys key [key ...] ...
-        (5, b'l') if cmd.eq_ignore_ascii_case(b"LMPOP") => numkeys_keys(args, 0, false),
-        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZMPOP") => numkeys_keys(args, 0, false),
-        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFF") => numkeys_keys(args, 0, false),
+        (5, b'l') if cmd.eq_ignore_ascii_case(b"LMPOP") => numkeys_positions(args, 0, false),
+        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZMPOP") => numkeys_positions(args, 0, false),
+        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFF") => numkeys_positions(args, 0, false),
         (6, b'z') if cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION") => {
-            numkeys_keys(args, 0, false)
+            numkeys_positions(args, 0, false)
         }
-        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZINTERCARD") => numkeys_keys(args, 0, false),
-        (10, b's') if cmd.eq_ignore_ascii_case(b"SINTERCARD") => numkeys_keys(args, 0, false),
+        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZINTERCARD") => numkeys_positions(args, 0, false),
+        (10, b's') if cmd.eq_ignore_ascii_case(b"SINTERCARD") => numkeys_positions(args, 0, false),
         // <cmd> timeout numkeys key [key ...] <dir>
         (6, b'b') if cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP") => {
-            numkeys_keys(args, 1, false)
+            numkeys_positions(args, 1, false)
         }
         // <cmd> script|sha|function numkeys key [key ...] [arg ...]
-        (4, b'e') if cmd.eq_ignore_ascii_case(b"EVAL") => numkeys_keys(args, 1, false),
-        (7, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA") => numkeys_keys(args, 1, false),
-        (5, b'f') if cmd.eq_ignore_ascii_case(b"FCALL") => numkeys_keys(args, 1, false),
-        (8, b'f') if cmd.eq_ignore_ascii_case(b"FCALL_RO") => numkeys_keys(args, 1, false),
+        (4, b'e') if cmd.eq_ignore_ascii_case(b"EVAL") => numkeys_positions(args, 1, false),
+        (7, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA") => numkeys_positions(args, 1, false),
+        (5, b'f') if cmd.eq_ignore_ascii_case(b"FCALL") => numkeys_positions(args, 1, false),
+        (8, b'f') if cmd.eq_ignore_ascii_case(b"FCALL_RO") => numkeys_positions(args, 1, false),
         // <cmd> dest numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
         // The registry spec names only `dest` (first_key == last_key == 1).
         (11, b'z')
             if cmd.eq_ignore_ascii_case(b"ZUNIONSTORE")
                 || cmd.eq_ignore_ascii_case(b"ZINTERSTORE") =>
         {
-            numkeys_keys(args, 1, true)
+            numkeys_positions(args, 1, true)
         }
-        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") => numkeys_keys(args, 1, true),
+        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") => numkeys_positions(args, 1, true),
 
         // ---- positional STORE clauses (source key + optional destination) ----
         (4, b's') if cmd.eq_ignore_ascii_case(b"SORT") => source_plus_store(args, true),
@@ -230,12 +282,10 @@ fn movable_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<CommandKeys<'a>> {
             source_plus_store(args, false)
         }
 
-        // ---- two-key move with no registry entry ----
-        // `RPOPLPUSH src dst` is dispatched by moon#520's work but carries no
-        // COMMAND_META entry, so the meta-derived walk cannot see its keys and
-        // the fail-closed default would refuse it outright for key-restricted
-        // users. Its blocking twin BRPOPLPUSH is in the registry (1..2) and
-        // needs no arm here. Delete this arm once RPOPLPUSH gets a key spec.
+        // ---- two-key move ----
+        // `RPOPLPUSH src dst` also carries a registry spec (1..2), which would
+        // give the identical answer; this arm is kept only so the layout is
+        // stated in one place with its siblings.
         (9, b'r') if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") => two_keys(args),
 
         // ---- keys after the STREAMS token ----
@@ -255,14 +305,14 @@ fn movable_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<CommandKeys<'a>> {
 
 /// `... numkeys key [key ...]` with `numkeys` at `nk_idx`, plus an optional
 /// destination key at `args[0]` (the `Z*STORE` family).
-fn numkeys_keys(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> CommandKeys<'_> {
+fn numkeys_positions(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> KeyPositions {
     let Some(nk) = args
         .get(nk_idx)
         .and_then(key_bytes)
         .and_then(|b| std::str::from_utf8(b).ok())
         .and_then(|s| s.parse::<usize>().ok())
     else {
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     };
     let first = nk_idx + 1;
     // `numkeys` larger than the argv is malformed; the command errors out
@@ -270,46 +320,42 @@ fn numkeys_keys(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> CommandKey
     // reduce enforcement. `checked_add` is load-bearing, not defensive
     // decoration: `nk` is attacker-controlled, so `first + nk` can overflow
     // `usize` — in release (no overflow-checks) it WRAPS, the `<` guard then
-    // sees a tiny sum and the slice below panics `&args[1..0]`. A panic here
-    // is reachable by any key-restricted user = remote DoS inside ACL.
+    // sees a tiny sum and the range below panics. A panic here is reachable by
+    // any key-restricted user = remote DoS inside ACL.
     let Some(end) = first.checked_add(nk).filter(|&e| e <= args.len()) else {
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     };
-    let mut keys = KeyVec::new();
+    let mut idx = KeyIdx::new();
     if dest_at_zero {
-        match args.first().and_then(key_bytes) {
-            Some(dest) => keys.push(dest),
-            None => return CommandKeys::Indeterminate,
+        if args.is_empty() {
+            return KeyPositions::Unknown;
         }
+        idx.push(0);
     }
-    for frame in &args[first..end] {
-        match key_bytes(frame) {
-            Some(k) => keys.push(k),
-            None => return CommandKeys::Indeterminate,
-        }
-    }
-    if keys.is_empty() {
+    idx.extend(first..end);
+    if idx.is_empty() {
         // `EVAL <script> 0` and friends: numkeys parsed cleanly and says the
         // invocation names no key.
-        return CommandKeys::None;
+        return KeyPositions::None;
     }
-    CommandKeys::Keys(keys)
+    KeyPositions::At(idx)
 }
 
 /// `args[0]` plus the key after a positional `STORE`/`STOREDIST` token.
 ///
 /// With `check_by_get`, a `BY`/`GET` pattern containing `*` (SORT's weight and
-/// projection lookups) makes the result [`CommandKeys::Indeterminate`]: those
-/// read keys whose names are computed at runtime from the sorted elements, so
-/// no key spec can name them and a `~pattern` user must not be able to reach
-/// arbitrary keys through them. `BY nosort` / `GET #` carry no `*` and are
-/// therefore unaffected.
-fn source_plus_store(args: &[Frame], check_by_get: bool) -> CommandKeys<'_> {
-    let Some(src) = args.first().and_then(key_bytes) else {
-        return CommandKeys::Indeterminate;
-    };
-    let mut keys = KeyVec::new();
-    keys.push(src);
+/// projection lookups) yields [`KeyPositions::AtPlusComputed`]: those read keys
+/// whose names are computed at runtime from the sorted elements, so no key spec
+/// can name them. ACL must refuse such an argv outright; cache invalidation
+/// must still act on the keys that ARE named, which is what redis does.
+/// `BY nosort` / `GET #` carry no `*` and are therefore unaffected.
+fn source_plus_store(args: &[Frame], check_by_get: bool) -> KeyPositions {
+    if args.is_empty() {
+        return KeyPositions::Unknown;
+    }
+    let mut idx = KeyIdx::new();
+    idx.push(0);
+    let mut computed = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -318,79 +364,72 @@ fn source_plus_store(args: &[Frame], check_by_get: bool) -> CommandKeys<'_> {
             continue;
         };
         if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
-            match args.get(i + 1).and_then(key_bytes) {
-                Some(dest) => keys.push(dest),
-                None => return CommandKeys::Indeterminate,
+            if args.get(i + 1).is_none() {
+                return KeyPositions::Unknown;
             }
+            idx.push(i + 1);
             i += 2;
             continue;
         }
         if check_by_get && (tok.eq_ignore_ascii_case(b"BY") || tok.eq_ignore_ascii_case(b"GET")) {
             let Some(pattern) = args.get(i + 1).and_then(key_bytes) else {
-                return CommandKeys::Indeterminate;
+                return KeyPositions::Unknown;
             };
             if pattern.contains(&b'*') {
-                return CommandKeys::Indeterminate;
+                computed = true;
             }
             i += 2;
             continue;
         }
         i += 1;
     }
-    CommandKeys::Keys(keys)
+    if computed {
+        KeyPositions::AtPlusComputed(idx)
+    } else {
+        KeyPositions::At(idx)
+    }
 }
 
 /// `<cmd> source destination ...` — both are keys, both must be checked.
-fn two_keys(args: &[Frame]) -> CommandKeys<'_> {
-    let (Some(src), Some(dst)) = (
-        args.first().and_then(key_bytes),
-        args.get(1).and_then(key_bytes),
-    ) else {
-        return CommandKeys::Indeterminate;
-    };
-    let mut keys = KeyVec::new();
-    keys.push(src);
-    keys.push(dst);
-    CommandKeys::Keys(keys)
+fn two_keys(args: &[Frame]) -> KeyPositions {
+    if args.len() < 2 {
+        return KeyPositions::Unknown;
+    }
+    let mut idx = KeyIdx::new();
+    idx.push(0);
+    idx.push(1);
+    KeyPositions::At(idx)
 }
 
 /// `XREAD`/`XREADGROUP`: after the `STREAMS` token come N keys then N ids.
-fn stream_keys(args: &[Frame]) -> CommandKeys<'_> {
+fn stream_keys(args: &[Frame]) -> KeyPositions {
     let Some(pos) = args
         .iter()
         .position(|f| key_bytes(f).is_some_and(|t| t.eq_ignore_ascii_case(b"STREAMS")))
     else {
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     };
     let num_keys = (args.len() - pos - 1) / 2;
     if num_keys == 0 {
-        return CommandKeys::Indeterminate;
+        return KeyPositions::Unknown;
     }
-    let mut keys = KeyVec::new();
-    for frame in &args[pos + 1..pos + 1 + num_keys] {
-        match key_bytes(frame) {
-            Some(k) => keys.push(k),
-            None => return CommandKeys::Indeterminate,
-        }
-    }
-    CommandKeys::Keys(keys)
+    let mut idx = KeyIdx::new();
+    idx.extend(pos + 1..pos + 1 + num_keys);
+    KeyPositions::At(idx)
 }
 
 /// `<CMD> <SUBCOMMAND> <key> ...` (OBJECT, XINFO, MEMORY USAGE, XGROUP).
 ///
 /// The keyless subcommands of these (`OBJECT HELP`, `XINFO HELP`,
 /// `MEMORY DOCTOR|STATS|PURGE`) carry no second argument.
-fn subcommand_key(args: &[Frame]) -> CommandKeys<'_> {
+fn subcommand_key(args: &[Frame]) -> KeyPositions {
     match args.get(1) {
-        None => CommandKeys::None,
-        Some(frame) => match key_bytes(frame) {
-            Some(k) => {
-                let mut keys = KeyVec::new();
-                keys.push(k);
-                CommandKeys::Keys(keys)
-            }
-            None => CommandKeys::Indeterminate,
-        },
+        None => KeyPositions::None,
+        Some(_) => {
+            let mut idx = KeyIdx::new();
+            idx.push(1);
+            KeyPositions::At(idx)
+        }
     }
 }
 
@@ -673,7 +712,7 @@ mod tests {
                     && !name.starts_with("GRAPH.")
                     // movable-key commands: their registry spec says 0 but
                     // this module extracts their keys explicitly.
-                    && movable_keys(name.as_bytes(), &[]).is_none()
+                    && movable_positions(name.as_bytes(), &[]).is_none()
             })
             .collect();
         unreviewed.sort_unstable();
