@@ -768,7 +768,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // command and the unconsumed tail to the next batch
                     // iteration; phase 2 resolves the pending replies first.
                     if (!remote_groups.is_empty() || !publish_batches.is_empty())
-                        && (crate::server::conn::blocking::is_blocking_command(cmd)
+                        && (crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args)
                             || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
                             || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"))
                     {
@@ -1467,7 +1467,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
 
                     // --- BLOCKING COMMANDS ---
-                    if crate::server::conn::blocking::is_blocking_command(cmd) {
+                    if crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args) {
                         // Earlier frames in this batch may hold barrier-pending
                         // local-leg writes — confirm (or fail-loud) them before
                         // this early flush; the replacement of `responses` below
@@ -2089,9 +2089,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
                                 if !matches!(response, Frame::Error(_)) {
-                                    let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                                        || cmd.eq_ignore_ascii_case(b"ZADD");
-                                    if needs_wake {
+                                    // moon#595: shared gate — see the twin in
+                                    // handler_monoio. Omitting XADD here made a
+                                    // locally-owned stream key unwakeable.
+                                    if crate::blocking::wakeup::is_producer(cmd) {
                                         // Destination for LMOVE/RPOPLPUSH, args[0] otherwise —
                                         // see the matching comment in handler_monoio (moon#520).
                                         let idx = crate::blocking::wakeup::producer_wake_key_index(cmd);
@@ -2099,8 +2100,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             let mut reg = ctx.blocking_registry.borrow_mut();
                                             if crate::blocking::wakeup::is_list_producer(cmd) {
                                                 crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, conn.selected_db, &key);
-                                            } else {
+                                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                                 crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, conn.selected_db, &key);
+                                            } else {
+                                                crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, db, conn.selected_db, &key);
                                             }
                                         }
                                     }

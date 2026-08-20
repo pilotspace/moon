@@ -309,6 +309,25 @@ pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"BZMPOP")
 }
 
+/// Does this command need the blocking machinery, ARGUMENTS INCLUDED?
+///
+/// [`is_blocking_command`] answers from the name alone, which is enough for
+/// the eight blocking pops — `BLPOP` is always `BLPOP`. `XREAD` is not: the
+/// same name is a plain read without `BLOCK`, and even with `BLOCK` an
+/// `XREADGROUP` history read still answers immediately
+/// ([`is_blocking_stream_read`] owns that rule).
+///
+/// Use this at every site that decides whether a command PARKS. The two
+/// `MULTI` queue gates deliberately keep the name-only predicate: inside a
+/// transaction a stream read must be queued as its ordinary self and executed
+/// by the dispatch table at `EXEC`, which already ignores `BLOCK` — measured,
+/// `MULTI; XREAD BLOCK 3000 STREAMS ghost $; EXEC` answers `*1 *-1` at once.
+/// Routing it through `queued_blocking_frame` would rewrite a command that
+/// needs no rewriting.
+pub(crate) fn is_blocking_command_args(cmd: &[u8], args: &[Frame]) -> bool {
+    is_blocking_command(cmd) || is_blocking_stream_read(cmd, args)
+}
+
 /// The frame a blocking command is QUEUED as inside `MULTI`.
 ///
 /// Two outcomes, and which one applies is the whole of moon#524:
@@ -368,6 +387,25 @@ pub(crate) fn queued_blocking_frame(cmd: &[u8], args: &[Frame]) -> Frame {
         for arg in args.iter().skip(1) {
             new_args.push(arg.clone());
         }
+    } else {
+        // No rewrite matched. Before moon#595 that could not happen — the
+        // callers were gated on `is_blocking_command`, whose eight names are
+        // exactly the ones enumerated above. `is_blocking_command_args` widened
+        // the gate to `XREAD`/`XREADGROUP`, which need no rewrite, so falling
+        // off the end here would have queued `Frame::Array([])` — an empty
+        // command that `EXEC` cannot dispatch. The MULTI gates deliberately
+        // kept the name-only predicate so this arm stays unreachable, but a
+        // silent empty frame is not the failure mode to leave armed for the
+        // next person who reorders these checks.
+        debug_assert!(
+            false,
+            "queued_blocking_frame has no rewrite for {}",
+            String::from_utf8_lossy(cmd)
+        );
+        let mut original = Vec::with_capacity(args.len() + 1);
+        original.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
+        original.extend(args.iter().cloned());
+        return Frame::Array(original.into());
     }
     Frame::Array(new_args.into())
 }
@@ -429,11 +467,7 @@ where
         // Borrow released at with_shard_db boundary — safe before await.
     }
 
-    let deadline = if timeout_secs > 0.0 {
-        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
-    } else {
-        None // 0 = block forever
-    };
+    let deadline = deadline_after(timeout_secs);
 
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
@@ -465,7 +499,7 @@ where
             // Local registration
             let entry = crate::blocking::WaitEntry {
                 wait_id,
-                cmd: blocked_cmd_factory(),
+                cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, &keys[0]),
                 reply_tx,
                 deadline,
             };
@@ -592,7 +626,7 @@ where
                 // Local registration
                 let entry = crate::blocking::WaitEntry {
                     wait_id,
-                    cmd: blocked_cmd_factory(),
+                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
                     reply_tx: tx,
                     deadline,
                 };
@@ -788,11 +822,7 @@ where
         }
     }
 
-    let deadline = if timeout_secs > 0.0 {
-        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
-    } else {
-        None // 0 = block forever
-    };
+    let deadline = deadline_after(timeout_secs);
 
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
@@ -833,7 +863,7 @@ where
         } else {
             let entry = crate::blocking::WaitEntry {
                 wait_id,
-                cmd: blocked_cmd_factory(),
+                cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, &keys[0]),
                 reply_tx,
                 deadline,
             };
@@ -935,7 +965,7 @@ where
                 // Local registration
                 let entry = crate::blocking::WaitEntry {
                     wait_id,
-                    cmd: blocked_cmd_factory(),
+                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
                     reply_tx: tx,
                     deadline,
                 };
@@ -1075,6 +1105,13 @@ where
 /// For BLMPOP, timeout is the first argument.
 /// Returns seconds as f64. 0 = block forever.
 pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, Frame> {
+    // Stream reads carry `BLOCK <ms>` somewhere in their option block rather
+    // than a float of seconds in a fixed position (moon#595).
+    if let Some(shape) = stream_read_shape(cmd, args) {
+        if let Some(idx) = shape.block_value {
+            return parse_block_millis(&args[idx]);
+        }
+    }
     if args.is_empty() {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for blocking command",
@@ -1107,12 +1144,533 @@ pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, 
             b"ERR timeout is not a float or out of range",
         ))
     })?;
-    if !timeout.is_finite() || timeout < 0.0 {
+    if !timeout.is_finite() {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR timeout is not a float or out of range",
         )));
     }
+    // Redis converts to milliseconds FIRST and only then judges the sign and
+    // the range, which is why `-0.5` answers "negative" while `1e300` answers
+    // "out of range" -- see `check_timeout_millis`.
+    let millis = timeout * 1000.0;
+    if millis > i64::MAX as f64 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR timeout is out of range",
+        )));
+    }
+    check_timeout_millis(millis as i64)?;
     Ok(timeout)
+}
+
+/// Reject a blocking timeout that cannot become a deadline.
+///
+/// A direct port of the tail of Redis's `getTimeoutFromObjectOrReply`, because
+/// the order of its two checks is observable and moon got both wrong. Measured
+/// against redis-server 8.6.1 with one fresh connection per case (a case that
+/// BLOCKS leaves its reply in the socket and silently desynchronises every
+/// later read on a shared one):
+///
+/// ```text
+/// BLPOP nokey -0.5                 -> -ERR timeout is negative
+/// BLPOP nokey 1e15                 -> waits            (1e18 ms, fits)
+/// BLPOP nokey 1e16                 -> -ERR timeout is out of range
+/// XREAD BLOCK 9223372036854775     -> waits
+/// XREAD BLOCK 9223372036854775807  -> -ERR timeout is out of range
+/// ```
+///
+/// This is not only a parity fix. Moon ACCEPTED every one of those values and
+/// then built the deadline with `Duration::from_secs_f64`, which **panics** on
+/// anything it cannot represent -- and a panic on a shard thread aborts the
+/// whole process:
+///
+/// ```text
+/// $ redis-cli -p 7833 BLPOP nokey 1e300
+/// Error: Server closed the connection
+/// cannot convert float seconds to Duration: value is either too big or NaN
+/// FATAL: thread 'shard-0' panicked; aborting the whole process rather than
+/// serving with a dead shard or a dead cluster control plane
+/// ```
+///
+/// So an unauthenticated one-liner could kill the server. It predates moon#595
+/// on the `BLPOP` float path, but the new `XREAD BLOCK` route reaches the same
+/// code, so it is bounded here rather than left for a follow-up.
+/// [`deadline_after`] is the second line of defence: it never panics, whatever
+/// slips past this parser.
+fn check_timeout_millis(millis: i64) -> Result<(), Frame> {
+    if millis < 0 {
+        return Err(Frame::Error(Bytes::from_static(b"ERR timeout is negative")));
+    }
+    // Redis stores an absolute `mstime()` deadline and refuses a timeout that
+    // would overflow it. Moon keeps a monotonic `Instant`, so it does not need
+    // the epoch term for correctness -- but the boundary is observable, and
+    // `i64::MAX` milliseconds is exactly what an adversarial client sends.
+    if millis > i64::MAX - unix_millis_now() {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR timeout is out of range",
+        )));
+    }
+    Ok(())
+}
+
+/// Wall clock in milliseconds, saturating instead of panicking.
+///
+/// Only ever called while parsing a command that is about to park for
+/// milliseconds or more, so this is not a hot path; a pre-1970 clock yields 0,
+/// which merely makes the range check marginally stricter.
+fn unix_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+// ---------------------------------------------------------------------------
+// moon#595: XREAD / XREADGROUP BLOCK
+//
+// `BLOCK` used to be parsed and thrown away — both stream readers stepped over
+// the token and its value with a `// ignored` comment — so a client asking to
+// tail a stream got an instant empty answer and turned into a busy-poll loop.
+// Worse than an unimplemented command, because a valid "nothing new" is
+// indistinguishable from a working BLOCK.
+//
+// These helpers give the existing blocking machinery the three things it
+// needed for streams and did not have: a predicate that recognises a stream
+// read that WANTS to block, a timeout parser that speaks milliseconds instead
+// of seconds, and a `BlockedCommand` factory. Everything downstream — the
+// registry, the deadline heap, the cross-shard `BlockRegister`, the peer-EOF
+// watch, the shutdown arm — is reused unchanged.
+// ---------------------------------------------------------------------------
+
+/// The argument layout of an `XREAD` / `XREADGROUP`, resolved once so the
+/// predicate, the timeout parser and the `BlockedCommand` factory cannot
+/// disagree about where anything is.
+///
+/// `None` from [`stream_read_shape`] means "not a stream read, or malformed" —
+/// both fall through to the ordinary dispatch table, which already answers the
+/// arity and syntax errors Redis does. Nothing here invents an error.
+pub(crate) struct StreamReadShape {
+    /// Index of the value after `BLOCK`, when the client wrote one.
+    pub block_value: Option<usize>,
+    /// Index of the value after `COUNT`, when the client wrote one.
+    pub count_value: Option<usize>,
+    /// `NOACK` was present (`XREADGROUP` only).
+    pub noack: bool,
+    /// `(group, consumer)` argument indexes (`XREADGROUP` only).
+    pub group: Option<(usize, usize)>,
+    /// Index of the first key — the argument right after `STREAMS`.
+    pub keys_at: usize,
+    /// Number of `(key, id)` pairs; ids start at `keys_at + num_streams`.
+    pub num_streams: usize,
+}
+
+impl StreamReadShape {
+    /// The id argument written for stream `i`.
+    fn id(&self, args: &[Frame], i: usize) -> Option<Bytes> {
+        extract_bytes(&args[self.keys_at + self.num_streams + i])
+    }
+
+    /// The key argument written for stream `i`.
+    fn key(&self, args: &[Frame], i: usize) -> Option<Bytes> {
+        extract_bytes(&args[self.keys_at + i])
+    }
+}
+
+/// The `BlockedCommand` for a LOCAL registration on `key`, with any `$` bound
+/// against this shard's own view of the stream (moon#595).
+///
+/// The bind and the `register` that consumes its result must not be separated
+/// by an `.await` — that is the lost-wakeup argument, see [`StreamSince`]. All
+/// four call sites satisfy it by construction: each runs straight from here
+/// into [`BlockingRegistry::register`] with no suspension point between, and a
+/// shard thread cannot run an `XADD` for its own keys while one of its tasks
+/// is mid-statement.
+///
+/// A no-op for every command that is not an `XREAD` written with `$`.
+///
+/// [`StreamSince`]: crate::blocking::StreamSince
+/// [`BlockingRegistry::register`]: crate::blocking::BlockingRegistry::register
+fn local_blocked_cmd(
+    factory: &dyn Fn() -> crate::blocking::BlockedCommand,
+    selected_db: usize,
+    key: &Bytes,
+) -> crate::blocking::BlockedCommand {
+    let mut cmd = factory();
+    crate::shard::slice::with_shard_db(selected_db, |db| cmd.bind_stream_since(db, key));
+    cmd
+}
+
+/// Parse the argument layout of `XREAD` / `XREADGROUP`.
+///
+/// Mirrors the option loop the two readers already run, so a form they accept
+/// is a form this recognises. Deliberately permissive about option VALUES —
+/// validating them is the readers' job, and duplicating it here would create a
+/// second place for the error text to drift.
+pub(crate) fn stream_read_shape(cmd: &[u8], args: &[Frame]) -> Option<StreamReadShape> {
+    let is_group = cmd.eq_ignore_ascii_case(b"XREADGROUP");
+    if !is_group && !cmd.eq_ignore_ascii_case(b"XREAD") {
+        return None;
+    }
+
+    let mut shape = StreamReadShape {
+        block_value: None,
+        count_value: None,
+        noack: false,
+        group: None,
+        keys_at: 0,
+        num_streams: 0,
+    };
+
+    let mut idx = 0;
+    if is_group {
+        // XREADGROUP GROUP <group> <consumer> ...
+        if args.len() < 3 || !extract_bytes(&args[0])?.eq_ignore_ascii_case(b"GROUP") {
+            return None;
+        }
+        shape.group = Some((1, 2));
+        idx = 3;
+    }
+
+    loop {
+        let tok = extract_bytes(args.get(idx)?)?;
+        if tok.eq_ignore_ascii_case(b"STREAMS") {
+            idx += 1;
+            break;
+        } else if tok.eq_ignore_ascii_case(b"COUNT") {
+            shape.count_value = Some(idx + 1);
+            idx += 2;
+        } else if tok.eq_ignore_ascii_case(b"BLOCK") {
+            // `BLOCK` as the LAST argument is an arity error, not a block
+            // request: Redis answers `-ERR wrong number of arguments for
+            // 'xread' command`, which is what the dispatch table already says.
+            if idx + 1 >= args.len() {
+                return None;
+            }
+            shape.block_value = Some(idx + 1);
+            idx += 2;
+        } else if is_group && tok.eq_ignore_ascii_case(b"NOACK") {
+            shape.noack = true;
+            idx += 1;
+        } else {
+            return None;
+        }
+    }
+
+    let remaining = args.len().checked_sub(idx)?;
+    if remaining == 0 || !remaining.is_multiple_of(2) {
+        return None;
+    }
+    shape.keys_at = idx;
+    shape.num_streams = remaining / 2;
+    Some(shape)
+}
+
+/// Is this an `XREAD` / `XREADGROUP` that must go through the blocking
+/// machinery rather than be answered straight from the dispatch table?
+///
+/// A whitelist, not a blacklist. Anything this does not positively recognise
+/// keeps reaching the dispatch table and behaves exactly as it did before
+/// moon#595 — which is what makes every clause below a *narrowing* and never a
+/// regression.
+///
+/// 1. `BLOCK` is present with a value.
+/// 2. Exactly one stream — see the section below.
+/// 3. `COUNT`, if written, is a number. Otherwise `XREAD COUNT abc BLOCK 300
+///    …` would park for 300 ms and then answer the null array, where Redis
+///    says `-ERR value is not an integer or out of range` at once. A bad
+///    argument must never become a wait.
+/// 4. The id is one this waiter could actually be woken at:
+///    * `XREADGROUP` — `>`, and only `>`. A history read answers immediately
+///      even when `BLOCK` was written; measured against redis-server 8.6.1,
+///      `XREADGROUP GROUP g c BLOCK 2000 STREAMS ga gb > 0` returns in 0.000 s
+///      carrying only `gb`.
+///    * `XREAD` — `$`, or an explicit id, which always begins with a digit.
+///      `+` and `-` are excluded deliberately: `StreamId::parse` maps `+` to
+///      `StreamId::MAX`, so a waiter parked on it could never be served by any
+///      `XADD` and would sit there until its client disconnected. Redis 7.4+
+///      answers `+` with the stream's last entry, immediately; excluding it
+///      keeps moon's pre-#595 answer instead of inventing a permanent park.
+///      `>` is excluded for the same class of reason — on `XREAD` it is a
+///      syntax error, and registering it would have bound the waiter at `0-0`
+///      and replayed the entire stream on the first `XADD`.
+///
+/// # Why only one stream
+///
+/// Redis accepts `XREAD BLOCK 0 STREAMS a b $ $`, and so does moon — but not
+/// through the blocking machinery. A multi-stream read still reaches the
+/// dispatch table and answers immediately, exactly as it did before #595.
+///
+/// The reason is not tidiness, it is data loss. Moon cannot decide a multi-key
+/// command on one shard: `stream_read_immediate` declines as soon as any key is
+/// remote, so the command is deferred to one `BlockRegister` **per key**, on a
+/// different thread each. Every owner shard then runs its own post-registration
+/// re-check — and for `XREADGROUP` that re-check MUTATES: `read_group_new`
+/// moves entries into the consumer's PEL. The client's coordinator takes the
+/// first reply and drops the rest, so every sibling shard's entries are left
+/// marked delivered-and-unacked to a consumer that never received them.
+/// `XREADGROUP >` will never return them again; only `XPENDING` / `XAUTOCLAIM`
+/// gets them back. Measured, 10 key pairs each holding one undelivered entry,
+/// `XREADGROUP GROUP g cc BLOCK 800 STREAMS a b > >`:
+///
+/// ```text
+/// redis 8.6.1      both streams served   10/10
+/// moon --shards 1  both streams served   10/10
+/// moon --shards 4  ONE stream served      5/10   <- the sibling's entry sits
+///                                                   in the PEL, undelivered
+/// ```
+///
+/// Gating on placement instead (block when the keys happen to share a shard)
+/// would make one command behave two ways depending on a hash — the very
+/// defect `stream_register_error` exists to stamp out. So the gate reads the
+/// argument the client wrote, and answers the same on every deployment.
+///
+/// Lifting it needs multi-key stream reads decided by a single owner, the
+/// shape moon#602 gave two-key writes. That is a design change, not a clause
+/// here; until then a multi-stream `BLOCK` is no worse than it was, and never
+/// lossy.
+pub(crate) fn is_blocking_stream_read(cmd: &[u8], args: &[Frame]) -> bool {
+    let Some(shape) = stream_read_shape(cmd, args) else {
+        return false;
+    };
+    if shape.block_value.is_none() || shape.num_streams != 1 {
+        return false;
+    }
+    if let Some(i) = shape.count_value
+        && parse_stream_count(args, i).is_none()
+    {
+        return false;
+    }
+    let Some(id) = shape.id(args, 0) else {
+        return false;
+    };
+    if shape.group.is_some() {
+        return id.as_ref() == b">";
+    }
+    id.as_ref() == b"$"
+        || (id.first().is_some_and(u8::is_ascii_digit)
+            && crate::storage::stream::StreamId::parse(&id, 0).is_ok())
+}
+
+/// The `COUNT` value at `idx`, or `None` if the client did not write a number.
+///
+/// One parse shared by the predicate and the `BlockedCommand` factory, so a
+/// `COUNT` the predicate accepted cannot be silently dropped downstream — the
+/// factory used to swallow a bad one with `.ok()`, which is how a malformed
+/// `COUNT` turned into a full-budget park.
+fn parse_stream_count(args: &[Frame], idx: usize) -> Option<usize> {
+    let bytes = extract_bytes(args.get(idx)?)?;
+    std::str::from_utf8(&bytes).ok()?.parse::<usize>().ok()
+}
+
+/// `BLOCK <ms>`, validated with Redis's own error texts.
+///
+/// Measured against redis-server 8.6.1:
+///
+/// ```text
+/// XREAD BLOCK abc … -> -ERR timeout is not an integer or out of range
+/// XREAD BLOCK 1.5 … -> -ERR timeout is not an integer or out of range
+/// XREAD BLOCK -1  … -> -ERR timeout is negative
+/// ```
+///
+/// Moon answered `*-1` to all three before #595, because the value was never
+/// looked at. Note this is an INTEGER of milliseconds — unrelated to the
+/// float-seconds timeout every other blocking command takes, which is why
+/// `parse_blocking_timeout` cannot simply be pointed at a different argument.
+fn parse_block_millis(arg: &Frame) -> Result<f64, Frame> {
+    let bytes = extract_bytes(arg).ok_or_else(|| {
+        Frame::Error(Bytes::from_static(
+            b"ERR timeout is not an integer or out of range",
+        ))
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        Frame::Error(Bytes::from_static(
+            b"ERR timeout is not an integer or out of range",
+        ))
+    })?;
+    let millis: i64 = redis_str2ll(text).ok_or_else(|| {
+        Frame::Error(Bytes::from_static(
+            b"ERR timeout is not an integer or out of range",
+        ))
+    })?;
+    check_timeout_millis(millis)?;
+    // 0 means block forever; the callers turn 0.0 into `deadline: None`.
+    Ok(millis as f64 / 1000.0)
+}
+
+/// Redis's `string2ll` accept-set, which is narrower than `str::parse::<i64>`.
+///
+/// `parse` takes a leading `+` and leading zeros; `string2ll` takes neither,
+/// so moon parked for the full budget on two forms Redis rejects outright:
+///
+/// ```text
+/// XREAD BLOCK +300 …   redis: -ERR timeout is not an integer or out of range
+/// XREAD BLOCK 0300 …   redis: -ERR timeout is not an integer or out of range
+/// ```
+///
+/// The grammar is exactly: an optional `-`, then either a lone `0` or a digit
+/// string that does not start with `0`.
+fn redis_str2ll(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Keys and `BlockedCommand` factory for a blocking stream read.
+///
+/// The keys are ALL the streams named after `STREAMS`, so the waiter is
+/// registered on each and an `XADD` to any of them wakes it — matching Redis,
+/// which answers a woken multi-stream reader with only the stream that got
+/// data (measured).
+///
+/// `$` becomes [`StreamSince::Latest`] rather than a number: this runs on the
+/// CLIENT's shard, which may not own the stream. See [`StreamSince`] for the
+/// binding contract that closes the lost-wakeup window.
+///
+/// [`StreamSince`]: crate::blocking::StreamSince
+fn parse_stream_read_args(
+    cmd: &[u8],
+    args: &[Frame],
+) -> Result<(Vec<Bytes>, Box<dyn Fn() -> crate::blocking::BlockedCommand>), Frame> {
+    use crate::blocking::{BlockedCommand, StreamSince};
+
+    let syntax = || Frame::Error(Bytes::from_static(b"ERR syntax error"));
+    let shape = stream_read_shape(cmd, args).ok_or_else(syntax)?;
+
+    // `is_blocking_stream_read` already refused a COUNT that is not a number,
+    // so this cannot silently drop one the predicate accepted.
+    let count = shape.count_value.and_then(|i| parse_stream_count(args, i));
+
+    let mut keys: Vec<Bytes> = Vec::with_capacity(shape.num_streams);
+    let mut streams: Vec<(Bytes, StreamSince)> = Vec::with_capacity(shape.num_streams);
+    for i in 0..shape.num_streams {
+        let key = shape.key(args, i).ok_or_else(syntax)?;
+        let id = shape.id(args, i).ok_or_else(syntax)?;
+        let since = if id.as_ref() == b"$" {
+            StreamSince::Latest
+        } else if id.as_ref() == b">" {
+            // XREADGROUP's cursor lives in the group, not in the waiter, so
+            // the value here is never read for a `>` waiter. Only XREADGROUP
+            // reaches this arm: `is_blocking_stream_read` refuses `>` on a
+            // plain XREAD, where it would otherwise have meant "replay from
+            // 0-0" on the first XADD.
+            StreamSince::Id(crate::storage::stream::StreamId::ZERO)
+        } else {
+            StreamSince::Id(
+                crate::storage::stream::StreamId::parse(&id, 0)
+                    .map_err(|e| Frame::Error(Bytes::from(e)))?,
+            )
+        };
+        keys.push(key.clone());
+        streams.push((key, since));
+    }
+
+    if let Some((gi, ci)) = shape.group {
+        let group = shape_arg(args, gi).ok_or_else(syntax)?;
+        let consumer = shape_arg(args, ci).ok_or_else(syntax)?;
+        let noack = shape.noack;
+        return Ok((
+            keys,
+            Box::new(move || BlockedCommand::XReadGroup {
+                group: group.clone(),
+                consumer: consumer.clone(),
+                streams: streams.clone(),
+                count,
+                noack,
+            }),
+        ));
+    }
+    Ok((
+        keys,
+        Box::new(move || BlockedCommand::XRead {
+            streams: streams.clone(),
+            count,
+        }),
+    ))
+}
+
+/// One owned argument by index.
+fn shape_arg(args: &[Frame], idx: usize) -> Option<Bytes> {
+    extract_bytes(args.get(idx)?)
+}
+
+/// The immediate answer a blocking stream read is owed before it parks, or
+/// `None` when it must register and wait.
+///
+/// Stream reads are decided as ONE command across all their keys, not key by
+/// key like a blocking pop: `XREAD … STREAMS a b 0 0` with data only in `b` is
+/// served, and the reply names only `b`. So this runs instead of the per-key
+/// `try_immediate_pop` ladder, not alongside it.
+///
+/// Two ways to end up blocking:
+///
+/// * the read genuinely found nothing — `Frame::NullArray`, which is exactly
+///   and only what "no stream had new entries" means for both readers;
+/// * a key lives on another shard, so this slice cannot speak for it
+///   (moon#557). The registration about to be sent carries the command to each
+///   key's owner, whose `BlockRegister` handler binds `$` and re-runs the
+///   waker on the spot — so an already-satisfiable read is answered there
+///   rather than being lost.
+///
+/// Everything else the readers produce — served entries, `-WRONGTYPE`,
+/// `-NOGROUP`, a bad id — is the client's final reply and is returned as-is.
+/// That is what keeps `XREAD BLOCK 1500 STREAMS <string-key> $` an immediate
+/// `-WRONGTYPE` (measured against redis-server 8.6.1) instead of a 1.5 s park.
+fn stream_read_immediate(
+    cmd: &[u8],
+    args: &[Frame],
+    keys: &[Bytes],
+    db: &mut Database,
+    shard_id: usize,
+    num_shards: usize,
+) -> Option<Frame> {
+    if num_shards > 1 && keys.iter().any(|k| key_to_shard(k, num_shards) != shard_id) {
+        return None;
+    }
+    let frame = if cmd.eq_ignore_ascii_case(b"XREADGROUP") {
+        crate::command::stream::xreadgroup(db, args)
+    } else {
+        crate::command::stream::xread(db, args)
+    };
+    match frame {
+        Frame::NullArray => None,
+        served => Some(served),
+    }
+}
+
+/// The absolute deadline for a `timeout_secs` wait, or `None` for "block
+/// forever" (`0`).
+///
+/// **Never panics**, which is the entire reason it exists. Both call sites used
+/// to be `Instant::now() + Duration::from_secs_f64(timeout_secs)`, and BOTH of
+/// those operations abort the process on an out-of-range value:
+/// `Duration::from_secs_f64` panics outside its representable range, and
+/// `Instant + Duration` panics on overflow. `parse_blocking_timeout` accepted
+/// any finite non-negative float, so `BLPOP k 1e300` — one command, no
+/// authentication needed beyond whatever the connection already has — killed
+/// the shard thread and, via moon's abort-on-shard-panic policy, the whole
+/// server. Reproduced on the shipped runtime while adding moon#595:
+///
+/// ```text
+/// BLPOP nokey 1e300
+///   redis 8.6.1 : -ERR timeout is out of range
+///   moon        : FATAL: thread 'shard-0' panicked; aborting the whole process
+/// ```
+///
+/// The range is now rejected up front by the parsers with Redis's own text, so
+/// nothing should reach here out of range. This is the second line of defence:
+/// a saturating conversion plus `checked_add`, so a future parser change cannot
+/// silently re-open a remote abort. An unrepresentable deadline degrades to
+/// "block forever", which the peer-EOF watch, the shutdown arm and
+/// `CLIENT UNBLOCK` all still terminate.
+fn deadline_after(timeout_secs: f64) -> Option<std::time::Instant> {
+    if timeout_secs <= 0.0 || !timeout_secs.is_finite() {
+        return None; // 0 = block forever
+    }
+    let duration = std::time::Duration::try_from_secs_f64(timeout_secs).ok()?;
+    std::time::Instant::now().checked_add(duration)
 }
 
 /// Parse keys and build a BlockedCommand factory from blocking command args.
@@ -1120,6 +1678,9 @@ pub(crate) fn parse_blocking_args(
     cmd: &[u8],
     args: &[Frame],
 ) -> Result<(Vec<Bytes>, Box<dyn Fn() -> crate::blocking::BlockedCommand>), Frame> {
+    if is_blocking_stream_read(cmd, args) {
+        return parse_stream_read_args(cmd, args);
+    }
     if cmd.eq_ignore_ascii_case(b"BLPOP") {
         // BLPOP key [key ...] timeout
         if args.len() < 2 {
@@ -1410,6 +1971,10 @@ pub(crate) fn blocking_pop_family(cmd: &[u8]) -> Option<crate::blocking::WaitFam
         || cmd.eq_ignore_ascii_case(b"BZMPOP")
     {
         Some(WaitFamily::ZSet)
+    } else if cmd.eq_ignore_ascii_case(b"XREAD") || cmd.eq_ignore_ascii_case(b"XREADGROUP") {
+        // moon#595. Stream reads do not "pop", but they do have a required key
+        // type, and that is the whole question this answers.
+        Some(WaitFamily::Stream)
     } else {
         None
     }
@@ -1437,8 +2002,11 @@ pub(crate) fn blocking_wrongtype_error(
     match blocking_pop_family(cmd)? {
         crate::blocking::WaitFamily::List => db.get_list(key).err(),
         crate::blocking::WaitFamily::ZSet => db.get_sorted_set(key).err(),
-        // Stream blocking (XREAD) does not come through this path.
-        crate::blocking::WaitFamily::Stream => None,
+        // moon#595: it does now. `XREAD BLOCK 1500 STREAMS <string-key> $` is
+        // an immediate `-WRONGTYPE` in Redis (measured), not a 1.5 s park —
+        // and a park would be the worse failure, because the key can never
+        // become a stream while it holds a string.
+        crate::blocking::WaitFamily::Stream => db.get_stream(key).err(),
     }
 }
 
@@ -1478,6 +2046,14 @@ pub(crate) fn immediate_scan(
         crate::command::list::cross_shard_move_refusal(&src, &dst, num_shards)
     }) {
         return Some(err);
+    }
+    // moon#595: a stream read is answered by running the reader itself, not by
+    // the per-key ladder below — its reply names the streams that had data
+    // rather than the one key that served, and `XREADGROUP` needs the group
+    // machinery. Blocking stream reads carry exactly one key
+    // (`is_blocking_stream_read`), so this is still a single-key decision.
+    if blocking_pop_family(cmd) == Some(crate::blocking::WaitFamily::Stream) {
+        return stream_read_immediate(cmd, args, keys, db, shard_id, num_shards);
     }
     for key in keys {
         // moon#557: `db` is the CLIENT'S OWN shard slice, so this scan may
@@ -2264,4 +2840,113 @@ pub(crate) fn try_inline_dispatch_loop(
         total += n;
     }
     total
+}
+
+#[cfg(test)]
+mod timeout_range_tests {
+    use super::*;
+
+    fn arg(s: &str) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    fn blpop(timeout: &str) -> Result<f64, Frame> {
+        parse_blocking_timeout(b"BLPOP", &[arg("nokey"), arg(timeout)])
+    }
+
+    fn xread_block(timeout: &str) -> Result<f64, Frame> {
+        parse_blocking_timeout(
+            b"XREAD",
+            &[
+                arg("BLOCK"),
+                arg(timeout),
+                arg("STREAMS"),
+                arg("k"),
+                arg("$"),
+            ],
+        )
+    }
+
+    fn err_text(r: Result<f64, Frame>) -> String {
+        match r {
+            Err(Frame::Error(e)) => String::from_utf8_lossy(&e).into_owned(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// The values that used to ABORT THE PROCESS.
+    ///
+    /// `Duration::from_secs_f64` panics on anything it cannot represent, and a
+    /// panic on a shard thread takes the whole server down -- so before the fix
+    /// `BLPOP nokey 1e300` was an unauthenticated remote kill. Each of these is
+    /// now an error, and each error text is the one redis-server 8.6.1 sends
+    /// (measured, one fresh connection per case).
+    #[test]
+    fn oversized_timeouts_are_rejected_not_fatal() {
+        for t in ["1e300", "1e200", "1e100", "1e30", "1e17", "1e16"] {
+            assert_eq!(err_text(blpop(t)), "ERR timeout is out of range", "{t}");
+        }
+        // i64::MAX milliseconds: accepted by the integer parser, then refused
+        // because it cannot become a deadline.
+        assert_eq!(
+            err_text(xread_block("9223372036854775807")),
+            "ERR timeout is out of range"
+        );
+    }
+
+    /// The boundary is at the millisecond conversion, not at a round number --
+    /// so the fix must not have become a blanket "big timeouts are illegal".
+    #[test]
+    fn large_but_representable_timeouts_still_park() {
+        assert_eq!(blpop("1e15"), Ok(1e15));
+        assert_eq!(blpop("99999999999"), Ok(99999999999.0));
+        assert_eq!(
+            xread_block("9223372036854775"),
+            Ok(9223372036854775.0 / 1000.0)
+        );
+        // 0 keeps its "block forever" meaning: it must not trip the range check.
+        assert_eq!(blpop("0"), Ok(0.0));
+        assert_eq!(xread_block("0"), Ok(0.0));
+    }
+
+    /// Redis converts to milliseconds BEFORE it judges the sign, which is why a
+    /// negative timeout is "negative" and not "not a float". Moon answered "not
+    /// a float or out of range" for `-0.5`.
+    #[test]
+    fn negative_and_nonfinite_use_redis_texts() {
+        assert_eq!(err_text(blpop("-0.5")), "ERR timeout is negative");
+        assert_eq!(err_text(blpop("-1")), "ERR timeout is negative");
+        assert_eq!(err_text(xread_block("-1")), "ERR timeout is negative");
+        for t in ["inf", "-inf", "nan"] {
+            assert_eq!(
+                err_text(blpop(t)),
+                "ERR timeout is not a float or out of range",
+                "{t}"
+            );
+        }
+        // The millisecond parser is an INTEGER parser and says so.
+        for t in ["abc", "1.5", "inf"] {
+            assert_eq!(
+                err_text(xread_block(t)),
+                "ERR timeout is not an integer or out of range",
+                "{t}"
+            );
+        }
+    }
+
+    /// The second line of defence: whatever reaches it, it returns rather than
+    /// panicking. `deadline_after` is what actually stood between the old
+    /// parser and the abort.
+    #[test]
+    fn deadline_after_never_panics() {
+        assert!(deadline_after(0.0).is_none(), "0 means block forever");
+        assert!(deadline_after(-1.0).is_none());
+        assert!(deadline_after(f64::NAN).is_none());
+        assert!(deadline_after(f64::INFINITY).is_none());
+        assert!(
+            deadline_after(1e300).is_none(),
+            "this is the one that aborted"
+        );
+        assert!(deadline_after(0.05).is_some());
+    }
 }

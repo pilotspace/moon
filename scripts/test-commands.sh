@@ -756,6 +756,73 @@ if should_run "stream"; then
     assert_moon_ok "XREADGROUP"        XREADGROUP GROUP grp1 consumer1 COUNT 1 STREAMS stream:k1 '>'
     assert_moon_ok "XACK"              XACK stream:k1 grp1 0-0
     assert_moon_ok "XPENDING summary"  XPENDING stream:k1 grp1 - + 10
+
+    # moon#594: a stream that yielded nothing is OMITTED from the reply, where
+    # moon used to carry it as a present-but-empty entry list. Both streams
+    # share a hash tag so ONE XREAD sees them whatever the shard count — moon
+    # routes a multi-stream read by its first key.
+    mcli DEL "{xr594}:a" "{xr594}:b" >/dev/null 2>&1 || true
+    mcli XADD "{xr594}:a" 1-1 f v >/dev/null 2>&1 || true
+    mcli XADD "{xr594}:b" 1-1 f v >/dev/null 2>&1 || true
+    TOTAL=$((TOTAL + 1))
+    xr594_out=$(mcli XREAD COUNT 10 STREAMS "{xr594}:a" "{xr594}:b" 0 99999 2>/dev/null)
+    # `a` is served from 0; `b` is read from an id past its last, so it has
+    # nothing. Asserting on BOTH halves — `a` present AND `b` absent — so a
+    # server that dropped every stream could not pass.
+    if grep -q "{xr594}:a" <<<"$xr594_out" && ! grep -q "{xr594}:b" <<<"$xr594_out"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: XREAD must omit the unserved stream {xr594}:b"
+        echo "    GOT: $(echo "$xr594_out" | tr '\n' ' ')"
+    fi
+    # The fence: a read that serves NOTHING is still the null array (moon#482),
+    # not an empty one — without it, "always omit" would pass.
+    assert_moon "XREAD all-unserved is the null array" "" \
+        XREAD STREAMS "{xr594}:a" "{xr594}:b" 99999 99999
+
+    # moon#595: BLOCK is honoured rather than parsed and discarded. The reply
+    # BYTES of a timeout cannot tell the two apart (`*-1` is exactly what a
+    # legitimate timeout answers), so this asserts on the argument VALIDATION,
+    # which only a server that actually reads the value can produce. The timing
+    # halves live in tests/blocking_stream_read.rs and test-consistency.sh.
+    assert_moon "XREAD BLOCK rejects a non-integer" \
+        "ERR timeout is not an integer or out of range" \
+        XREAD BLOCK abc STREAMS stream:k1 '$'
+    assert_moon "XREAD BLOCK rejects a negative timeout" \
+        "ERR timeout is negative" \
+        XREAD BLOCK -1 STREAMS stream:k1 '$'
+    # A blocking read whose data is ALREADY there answers at once, unchanged.
+    assert_moon_ok "XREAD BLOCK served immediately" \
+        XREAD BLOCK 3000 STREAMS stream:k1 0
+
+    # An oversized timeout used to ABORT THE WHOLE PROCESS: the deadline was
+    # built with Duration::from_secs_f64, which panics on a value it cannot
+    # represent, and a panic on a shard thread takes the server down. So the
+    # PING below is not decoration — on a broken build the two rows above it
+    # cannot even report, because the server is gone. Texts and the accept /
+    # reject boundary are redis-server 8.6.1's own.
+    assert_moon "XREAD BLOCK rejects an unrepresentable timeout" \
+        "ERR timeout is out of range" \
+        XREAD BLOCK 9223372036854775807 STREAMS stream:k1 '$'
+    assert_moon "BLPOP rejects an unrepresentable timeout" \
+        "ERR timeout is out of range" \
+        BLPOP stream:absent 1e300
+    assert_moon "BLPOP negative timeout says negative" \
+        "ERR timeout is negative" \
+        BLPOP stream:absent -0.5
+    assert_moon "server survives an oversized blocking timeout" "PONG" PING
+
+    # Redis parses BLOCK with `string2ll`, which takes neither a leading `+`
+    # nor leading zeros. `str::parse::<i64>` takes both, so moon accepted these
+    # and PARKED for 300ms on arguments Redis rejects outright. Texts measured
+    # against redis-server 8.6.1.
+    assert_moon "XREAD BLOCK rejects a leading plus" \
+        "ERR timeout is not an integer or out of range" \
+        XREAD BLOCK +300 STREAMS stream:k1 '$'
+    assert_moon "XREAD BLOCK rejects leading zeros" \
+        "ERR timeout is not an integer or out of range" \
+        XREAD BLOCK 0300 STREAMS stream:k1 '$'
 fi
 
 # ===========================================================================

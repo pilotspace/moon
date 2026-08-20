@@ -1625,7 +1625,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // and the epilogue flushes them first. The two `is_empty()`
             // loads keep the common local-only batch at zero name compares.
             if (!remote_groups.is_empty() || !publish_batches.is_empty())
-                && (crate::server::conn::blocking::is_blocking_command(cmd)
+                && (crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args)
                     || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
                     || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
                     || cmd.eq_ignore_ascii_case(b"PSYNC"))
@@ -2770,9 +2770,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                         // Blocking wakeup: re-borrow db by index (NLL)
                         if !is_error {
-                            let needs_wake = crate::blocking::wakeup::is_list_producer(cmd)
-                                || cmd.eq_ignore_ascii_case(b"ZADD");
-                            if needs_wake {
+                            // moon#595: shared with the SPSC sites. This gate
+                            // used to omit XADD, so a stream reader blocked on
+                            // a key THIS shard owns was never woken by a local
+                            // write — while the same XADD arriving over SPSC
+                            // woke it. Routing-dependent, so it read as a flake.
+                            if crate::blocking::wakeup::is_producer(cmd) {
                                 // The wake key is the DESTINATION for
                                 // LMOVE/RPOPLPUSH and args[0] otherwise. This
                                 // site used to hardcode `first()`, so a client
@@ -2789,8 +2792,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         crate::blocking::wakeup::try_wake_list_waiter(
                                             &mut reg, wake_db, new_sel_db, &key,
                                         );
-                                    } else {
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                         crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, wake_db, new_sel_db, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
                                             &mut reg, wake_db, new_sel_db, &key,
                                         );
                                     }
