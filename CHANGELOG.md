@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
+  permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
+  `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a
+  FIXED position", not "there are no keys". The tracking hook's key extractor read it as the latter
+  and returned an empty key list, which disabled BOTH halves of the protocol: a movablekeys **read**
+  (`SINTERCARD`, `ZINTERCARD`, `ZDIFF`/`ZINTER`/`ZUNION`, `XREAD`) never registered the client, so
+  it cached a value it would never be told about; and a movablekeys **write** (`LMPOP`, `ZMPOP`,
+  `BLMPOP`, `BZMPOP`, `XREADGROUP`) never pushed an `invalidate`. `SORT src ... STORE dst` was a
+  third shape: `first_key = 1` names the SOURCE, so Moon invalidated a key it had not written and
+  missed the one it had — likewise `GEORADIUS`/`GEORADIUSBYMEMBER ... STORE`/`STOREDIST`. Because
+  client-side caching is a correctness contract (the client may serve its cached copy until told
+  otherwise), a missed invalidation is unbounded stale data with no signal to the client, rather
+  than a slow path. Measured against `redis-server 8.0.5`, which invalidates in all of these cases;
+  now verified on the wire at `--shards 1` and `--shards 4`, each case run beside a fixed-position
+  control so a silent harness cannot pass for a fix. Key extraction here is now **shared with**
+  `acl::keyspec`, which already understood every one of these layouts (`numkeys` vectors, the
+  `STREAMS` token, positional `STORE` clauses, subcommand-shaped positions). The shared walker
+  reports key POSITIONS and each consumer applies its own policy, because the consumers
+  legitimately disagree: `SORT ... BY <pattern>` reads runtime-computed key names, which ACL must
+  refuse outright while invalidation must still act on the keys that ARE named. ACL behaviour is
+  unchanged — the fail-closed contract, its error text and every existing key-permission test are
+  byte-identical.
+
 ### Security
 - **ACL `~pattern` restrictions were silently unenforced for most multi-key commands** (#566).
   `AclTable::check_key_permission` read a command's keys from `extract_command_keys`, a
