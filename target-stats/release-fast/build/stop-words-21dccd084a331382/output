@@ -1,4 +1,0 @@
-cargo:rerun-if-changed=build.rs
-cargo:rerun-if-changed=src/nltk
-cargo:rerun-if-changed=src/constructed
-cargo:rerun-if-changed=src/iso/stopwords-iso.json

@@ -1,2 +1,0 @@
-cargo:rerun-if-env-changed=CUDA_HOME
-cargo:rerun-if-env-changed=CUDA_PATH
