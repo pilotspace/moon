@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being reviewed. Unrestricted and `~*` users still short-circuit before any extraction; the new
   path borrows key slices into a `SmallVec` and no longer heap-allocates per command.
 
+### Added
+- **`INFO Server` now reports `num_shards`** (#497), the resolved shard count rather than the
+  configured one, so `--shards 0` auto-detection reports the number actually in effect. A client
+  that cannot operate against a multi-shard instance — one committing a cross-key transaction per
+  request — previously had no way to refuse at connect time except a two-key co-location canary,
+  which is slow and still a guess. `redis_mode`/`cluster_enabled` do not answer this: a
+  single-process Moon with several shards is `standalone` and still routes keys across threads. The
+  value is never 0; an embedded harness that never records a count reports the single-shard truth,
+  because a zero reads as a valid answer and is not one.
+
 ### Fixed
 - **Inline commands terminated by bare LF were never dispatched, and an interior LF silently merged
   two commands into one** (#381). Moon's inline parser searched for `\r\n` and, on finding a lone
@@ -60,6 +70,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single funnel the codec and all three connection handlers share, so the fix cannot be
   CI-invisible in whichever handler was missed; the re-dispatch goes back through the RESP/inline
   decision, because what follows a blank line is very often a RESP array.
+- **Arity errors named the command in upper case, and spelled container subcommands with a space**
+  (#491). Redis formats this message with the command table's `->fullname`, which is stored lower
+  case, so `echo`, `ECHO` and `EcHo` all produce `'echo'` — Moon normalised UP instead, and any
+  client that string-matches error text saw a mismatch. Measured against redis-server 8.0.5, the
+  container form differs too: `'client|setname'`, `'acl|getuser'`, `'memory|usage'`,
+  `'xgroup|create'`, `'object|encoding'` — a pipe, not a space. Underscores are not separators and
+  stay put (`sort_ro`, `bitfield_ro`). Normalisation now happens inside `err_wrong_args`, which 703
+  call sites already share, plus 33 static literals and two `HGETDEL`/`HPERSIST` sites rerouted
+  through it.
+  Scoped to commands with a real redis-server oracle. Moon-native families (`WS`, `MQ`, `GRAPH.*`,
+  `TEMPORAL.*`, `FT.*`, `TXN`) keep their current names — there is nothing to be compatible with,
+  and the redis-server used as the oracle has no search module to answer for `FT.*`.
+  The sibling rule is deliberately NOT swept: `unknown command '<x>'` echoes back what the client
+  sent, case intact, because there is no registered name to normalise to. A guard test pins that,
+  since a blanket lower-casing would have broken it.
+- **`MEMORY USAGE key SAMPLES 0` was rejected by a dead second parser** (#519). `key_extra::memory_usage`
+  had no callers at all — the live path is `server_admin.rs` — but it was stricter than Redis
+  (`SAMPLES 0` means "sample every nested value" and is valid) and sat next to `copy`/`sort`, which
+  ARE wired up. A plausible-looking duplicate is how the next person wiring a new dispatch path
+  silently narrows accepted syntax, so it is deleted rather than corrected. The live behaviour stays
+  pinned by `memory_usage_samples_zero_is_accepted`.
 - **A blocking pop's immediate path consulted the LOCAL shard slice for every key** (#557),
   including keys owned by another shard. The pre-registration scan runs against the connection's
   own `ShardSlice`, where a remote key does not live, so at `--shards N` the fast path missed on

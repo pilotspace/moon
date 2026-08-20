@@ -33,7 +33,7 @@ pub fn handle_acl(
         Some(s) => s.to_ascii_uppercase(),
         None => {
             return Frame::Error(Bytes::from_static(
-                b"ERR wrong number of arguments for 'ACL' command",
+                b"ERR wrong number of arguments for 'acl' command",
             ));
         }
     };
@@ -66,7 +66,7 @@ pub fn handle_acl(
                 Some(u) => u.to_string(),
                 None => {
                     return Frame::Error(Bytes::from_static(
-                        b"ERR wrong number of arguments for 'ACL|GETUSER' command",
+                        b"ERR wrong number of arguments for 'acl|getuser' command",
                     ));
                 }
             };
@@ -152,7 +152,7 @@ pub fn handle_acl(
                 Some(u) => u.to_string(),
                 None => {
                     return Frame::Error(Bytes::from_static(
-                        b"ERR wrong number of arguments for 'ACL|SETUSER' command",
+                        b"ERR wrong number of arguments for 'acl|setuser' command",
                     ));
                 }
             };
@@ -167,7 +167,7 @@ pub fn handle_acl(
         "DELUSER" => {
             if args.is_empty() {
                 return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'ACL|DELUSER' command",
+                    b"ERR wrong number of arguments for 'acl|deluser' command",
                 ));
             }
             let mut count = 0i64;

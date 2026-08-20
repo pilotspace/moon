@@ -100,7 +100,7 @@ pub fn copy_core(
 pub fn parse_move_args(args: &[Frame], db_count: usize) -> Result<(Bytes, usize), Frame> {
     if args.len() != 2 {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'MOVE' command",
+            b"ERR wrong number of arguments for 'move' command",
         )));
     }
     let key = match extract_bytes(&args[0]) {

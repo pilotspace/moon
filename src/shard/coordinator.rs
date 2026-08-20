@@ -579,12 +579,12 @@ async fn coordinate_bitop(
     }
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'BITOP' command",
+            b"ERR wrong number of arguments for 'bitop' command",
         ));
     }
     let (Some(op), Some(dest)) = (extract_key(&args[0]), extract_key(&args[1])) else {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'BITOP' command",
+            b"ERR wrong number of arguments for 'bitop' command",
         ));
     };
     // Redis validation order: NOT arity errors before any key is touched.
@@ -599,7 +599,7 @@ async fn coordinate_bitop(
             Some(k) => src_keys.push(k),
             None => {
                 return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'BITOP' command",
+                    b"ERR wrong number of arguments for 'bitop' command",
                 ));
             }
         }
@@ -789,12 +789,12 @@ async fn coordinate_copy(
     }
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'COPY' command",
+            b"ERR wrong number of arguments for 'copy' command",
         ));
     }
     let (Some(src), Some(dst)) = (extract_key(&args[0]), extract_key(&args[1])) else {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'COPY' command",
+            b"ERR wrong number of arguments for 'copy' command",
         ));
     };
     let mut replace = false;
@@ -1482,7 +1482,7 @@ async fn coordinate_msetnx(
 ) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'MSETNX' command",
+            b"ERR wrong number of arguments for 'msetnx' command",
         ));
     }
 
@@ -1491,7 +1491,7 @@ async fn coordinate_msetnx(
         Some(k) => k,
         None => {
             return Frame::Error(Bytes::from_static(
-                b"ERR wrong number of arguments for 'MSETNX' command",
+                b"ERR wrong number of arguments for 'msetnx' command",
             ));
         }
     };
@@ -1501,7 +1501,7 @@ async fn coordinate_msetnx(
             Some(k) => k,
             None => {
                 return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'MSETNX' command",
+                    b"ERR wrong number of arguments for 'msetnx' command",
                 ));
             }
         };

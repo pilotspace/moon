@@ -531,19 +531,13 @@ pub(super) fn parse_key_and_fields<'a>(
 ) -> Result<KeyAndFields<'a>, Frame> {
     // Minimum: key + FIELDS + numfields + ≥1 field = 4 elements.
     if args.len() < 4 {
-        return Err(Frame::Error(Bytes::from(format!(
-            "ERR wrong number of arguments for '{}' command",
-            cmd
-        ))));
+        return Err(crate::command::helpers::err_wrong_args(cmd));
     }
 
     let key = match extract_bytes(&args[0]) {
         Some(k) => k.as_ref(),
         None => {
-            return Err(Frame::Error(Bytes::from(format!(
-                "ERR wrong number of arguments for '{}' command",
-                cmd
-            ))));
+            return Err(crate::command::helpers::err_wrong_args(cmd));
         }
     };
 
@@ -630,7 +624,7 @@ fn parse_hexpire_args<'a>(
     //   args[0] key  args[1] when  args[2] FIELDS  args[3] numfields  args[4+] fields
     if args.len() < 5 {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'HEXPIRE' command",
+            b"ERR wrong number of arguments for 'hexpire' command",
         )));
     }
 
@@ -727,7 +721,7 @@ fn parse_hexpire_args<'a>(
     let numfields_pos = fkw_pos + 1;
     if numfields_pos >= args.len() {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'HEXPIRE' command",
+            b"ERR wrong number of arguments for 'hexpire' command",
         )));
     }
     let numfields: usize = match extract_bytes(&args[numfields_pos]) {
@@ -908,7 +902,7 @@ fn parse_hgetex_args<'a>(args: &'a [Frame]) -> Result<HgetexParsed<'a>, Frame> {
     // Minimum: key + FIELDS + numfields + ≥1 field = 4 elements.
     if args.is_empty() {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'HGETEX' command",
+            b"ERR wrong number of arguments for 'hgetex' command",
         )));
     }
 
@@ -916,7 +910,7 @@ fn parse_hgetex_args<'a>(args: &'a [Frame]) -> Result<HgetexParsed<'a>, Frame> {
         Some(k) => k.as_ref(),
         None => {
             return Err(Frame::Error(Bytes::from_static(
-                b"ERR wrong number of arguments for 'HGETEX' command",
+                b"ERR wrong number of arguments for 'hgetex' command",
             )));
         }
     };
@@ -1022,7 +1016,7 @@ fn parse_hgetex_args<'a>(args: &'a [Frame]) -> Result<HgetexParsed<'a>, Frame> {
     let numfields_pos = fkw_pos + 1;
     if numfields_pos >= args.len() {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'HGETEX' command",
+            b"ERR wrong number of arguments for 'hgetex' command",
         )));
     }
     let numfields: usize = match extract_bytes(&args[numfields_pos]) {
