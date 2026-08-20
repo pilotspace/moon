@@ -46,7 +46,7 @@ pub fn ping(args: &[Frame]) -> Frame {
             _ => Frame::BulkString(Bytes::from(format!("{:?}", args[0]))),
         },
         _ => Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'PING' command",
+            b"ERR wrong number of arguments for 'ping' command",
         )),
     }
 }
@@ -58,14 +58,14 @@ pub fn ping(args: &[Frame]) -> Frame {
 pub fn echo(args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'ECHO' command",
+            b"ERR wrong number of arguments for 'echo' command",
         ));
     }
     match &args[0] {
         Frame::BulkString(s) => Frame::BulkString(s.clone()),
         Frame::SimpleString(s) => Frame::BulkString(s.clone()),
         _ => Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'ECHO' command",
+            b"ERR wrong number of arguments for 'echo' command",
         )),
     }
 }
@@ -76,7 +76,7 @@ pub fn echo(args: &[Frame]) -> Frame {
 pub fn select(args: &[Frame], selected_db: &mut usize, db_count: usize) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'SELECT' command",
+            b"ERR wrong number of arguments for 'select' command",
         ));
     }
     let index_str = match &args[0] {
@@ -218,6 +218,33 @@ fn server_uptime_secs() -> u64 {
         .as_secs()
 }
 
+/// Configured shard count, captured once at startup by [`record_shard_count`].
+static SHARD_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Record how many shards this instance runs (`--shards`), for `INFO Server`.
+///
+/// A process global rather than a field on [`InstanceFacts`] on purpose: that
+/// struct derives `Default` so callers without handler context (Lua's
+/// `redis.call`, unit tests) still get a well-formed INFO, and a defaulted
+/// `num_shards: 0` would be a *wrong* answer rather than a missing one — see
+/// [`shard_count`].
+pub fn record_shard_count(shards: usize) {
+    let _ = SHARD_COUNT.set(shards.max(1));
+}
+
+/// The configured shard count, defaulting to 1.
+///
+/// Never returns 0. `num_shards` exists so a client can branch on `> 1` (or
+/// divide by it) to decide whether it can operate against this instance at all
+/// — Lunaris commits one cross-key transaction per ingest and must refuse a
+/// multi-shard server at connect time (#497). A zero would read as a valid
+/// answer and is not one, so an instance that never called
+/// [`record_shard_count`] reports the single-shard truth for an unsharded
+/// embedded harness instead.
+fn shard_count() -> usize {
+    *SHARD_COUNT.get().unwrap_or(&1)
+}
+
 /// Build the full INFO payload with every section present.
 ///
 /// Callers must pass this through [`crate::command::info_sections::finalize`],
@@ -252,6 +279,15 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         sections.push_str("cluster_enabled:0\r\n");
     }
     let _ = write!(sections, "process_id:{}\r\n", std::process::id());
+    // How many shard threads this instance runs. A client that cannot operate
+    // multi-shard — one that commits a cross-key transaction per request, say —
+    // otherwise has no way to refuse at connect time except a two-key
+    // co-location canary, which is slow and still a guess (#497).
+    //
+    // `redis_mode`/`cluster_enabled` above do not answer this: a single-process
+    // Moon with several shards is `standalone` and still routes keys across
+    // threads.
+    let _ = write!(sections, "num_shards:{}\r\n", shard_count());
     // The port this instance LISTENS on, not the port this connection arrived
     // on. Behind a container port map or a proxy they differ, and a client
     // handing a peer the arrival port would send it somewhere unreachable.
@@ -785,7 +821,7 @@ pub fn info_readonly(db: &Database, args: &[Frame]) -> Frame {
 pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'AUTH' command",
+            b"ERR wrong number of arguments for 'auth' command",
         ));
     }
 
@@ -892,7 +928,7 @@ pub fn auth_acl(
         }
         _ => (
             Frame::Error(Bytes::from_static(
-                b"ERR wrong number of arguments for 'AUTH' command",
+                b"ERR wrong number of arguments for 'auth' command",
             )),
             None,
         ),
@@ -1087,7 +1123,7 @@ pub fn replicaof(args: &[Frame]) -> (Frame, Option<ReplicaofAction>) {
     if args.len() != 2 {
         return (
             Frame::Error(Bytes::from_static(
-                b"ERR wrong number of arguments for 'REPLICAOF' command",
+                b"ERR wrong number of arguments for 'replicaof' command",
             )),
             None,
         );
@@ -1137,7 +1173,7 @@ pub fn replicaof(args: &[Frame]) -> (Frame, Option<ReplicaofAction>) {
 pub fn replconf(args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'REPLCONF' command",
+            b"ERR wrong number of arguments for 'replconf' command",
         ));
     }
     // REPLCONF takes key/value pairs. Walk them; reject if any unknown.

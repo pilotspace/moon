@@ -551,6 +551,13 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // Publish the RESOLVED count for `INFO Server`'s `num_shards` (#497), not
+    // `config.shards` — those differ whenever `--shards 0` auto-detects, and a
+    // client refusing multi-shard servers must see the number actually in
+    // effect. Recorded before the listener binds, so no client can observe a
+    // default in place of the real value.
+    moon::command::connection::record_shard_count(num_shards);
+
     // O5: record the non-shard core set BEFORE any auxiliary thread spawns
     // (AOF writers, the vector pools below, and — indirectly — the
     // manifest-sync/spill/wal-sync threads each shard spawns internally).

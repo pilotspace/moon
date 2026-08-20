@@ -17,7 +17,7 @@ pub struct TrackingConfig {
 pub fn parse_tracking_args(args: &[Frame]) -> Result<TrackingConfig, Frame> {
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'CLIENT TRACKING' command",
+            b"ERR wrong number of arguments for 'client|tracking' command",
         )));
     }
     let on_off = match &args[1] {

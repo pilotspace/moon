@@ -101,54 +101,6 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
-/// MEMORY USAGE key [SAMPLES count]
-///
-/// Returns the number of bytes a key and its value require to be stored.
-pub fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("MEMORY");
-    }
-    let key = match extract_key(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("MEMORY"),
-    };
-
-    // Parse optional SAMPLES count; reject unknown trailing args
-    let mut i = 1;
-    let mut _samples: usize = 5; // default sample count (like Redis)
-    while i < args.len() {
-        let arg = match extract_key(&args[i]) {
-            Some(a) => a,
-            None => return err_wrong_args("MEMORY"),
-        };
-        if arg.eq_ignore_ascii_case(b"SAMPLES") {
-            i += 1;
-            let count_arg = match args.get(i).and_then(|f| extract_key(f)) {
-                Some(c) => c,
-                None => return err_wrong_args("MEMORY"),
-            };
-            match std::str::from_utf8(count_arg)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                Some(c) if c > 0 => _samples = c,
-                _ => return err_wrong_args("MEMORY"),
-            }
-        } else {
-            return err_wrong_args("MEMORY");
-        }
-        i += 1;
-    }
-
-    match db.get(key) {
-        Some(entry) => {
-            let mem = key.len() + entry.value.estimate_memory() + 128; // same as entry_overhead
-            Frame::Integer(mem as i64)
-        }
-        None => Frame::Null,
-    }
-}
-
 /// MEMORY DOCTOR — report memory health issues.
 pub fn memory_doctor() -> Frame {
     // Basic health report

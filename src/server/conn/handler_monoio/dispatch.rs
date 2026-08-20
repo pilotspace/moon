@@ -934,7 +934,7 @@ pub(super) fn try_handle_client_early(
             if sub_bytes.eq_ignore_ascii_case(b"SETNAME") {
                 if cmd_args.len() != 2 {
                     responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
+                        b"ERR wrong number of arguments for 'client|setname' command",
                     )));
                 } else {
                     conn.client_name = extract_bytes(&cmd_args[1]);
@@ -1123,7 +1123,7 @@ pub(super) fn try_handle_client_admin(
             if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
                 if cmd_args.len() < 2 {
                     responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                        b"ERR wrong number of arguments for 'client|pause' command",
                     )));
                 } else {
                     let timeout_bytes = match &cmd_args[1] {

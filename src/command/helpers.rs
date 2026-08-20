@@ -3,11 +3,38 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 
 /// Return ERR wrong number of arguments for a given command.
+///
+/// The name is normalised to the form Redis registers commands under, because
+/// that is what Redis interpolates here (`commandCheckArity` formats with the
+/// command table's `->fullname`) and clients string-match the result (#491):
+///
+///   * **lower case** — Redis normalises down regardless of what the client
+///     sent, so `echo`, `ECHO` and `EcHo` all produce `'echo'`;
+///   * **`parent|sub`** for a container command — `MEMORY USAGE` is
+///     `'memory|usage'`, not `'memory usage'`. Callers pass the human form with
+///     a space, so the space is translated here rather than at 700 call sites.
+///
+/// Measured against redis-server 8.0.5: `memory|usage`, `xgroup|create`,
+/// `xinfo|consumers`, `object|encoding`, `client|setname`, `acl|getuser`.
+/// Underscores are NOT separators and stay put (`sort_ro`, `bitfield_ro`).
+///
+/// This is only the ARITY message. Redis does *not* normalise the name in
+/// `unknown command '<x>'`, which echoes back what the client actually sent —
+/// see the guard test in `tests/wire_parity_naming_and_shards.rs`.
 pub fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
+    const PREFIX: &str = "ERR wrong number of arguments for '";
+    const SUFFIX: &str = "' command";
+    let mut msg = String::with_capacity(PREFIX.len() + cmd.len() + SUFFIX.len());
+    msg.push_str(PREFIX);
+    for c in cmd.chars() {
+        msg.push(if c == ' ' {
+            '|'
+        } else {
+            c.to_ascii_lowercase()
+        });
+    }
+    msg.push_str(SUFFIX);
+    Frame::Error(Bytes::from(msg))
 }
 
 /// Extract &Bytes from a BulkString or SimpleString frame.
