@@ -100,8 +100,38 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
 - **`moon_commands_processed_total`** -- total commands processed (rate = ops/sec)
 - **`moon_keyspace_hits_total`** -- successful key lookups
 - **`moon_keyspace_misses_total`** -- failed key lookups (cache miss rate)
-- **`moon_evicted_keys_total`** -- keys evicted due to maxmemory
+- **`moon_evicted_keys_total`** (INFO: `evicted_keys`) -- keys **removed from
+  the keyspace** under maxmemory pressure. Moves in lockstep with `DBSIZE`.
+- **`moon_spilled_keys_total`** (INFO: `spilled_keys`) -- keys **moved from RAM
+  to disk** under maxmemory pressure, with `--disk-offload enable`.
 - **`moon_expired_keys_total`** -- keys removed by expiration
+
+### `evicted_keys` vs `spilled_keys` (moon#585)
+
+These count different fates and must not be added together or substituted for
+one another:
+
+| | Key still readable? | In `DBSIZE`? | RAM freed? |
+|---|---|---|---|
+| `evicted_keys` | no -- it is gone | no, `DBSIZE` drops | yes |
+| `spilled_keys` | yes, from the cold tier | **yes, `DBSIZE` does not move** | yes |
+
+On a `--disk-offload enable` instance (the default), memory pressure normally
+shows up entirely in `spilled_keys` while `evicted_keys` stays at 0 -- nothing
+left the keyspace, so there is nothing for `DBSIZE` to stop counting. That is
+healthy tiering, not a stuck counter. `evicted_keys` climbing is the signal
+that data is being **destroyed** to stay under the cap: either disk-offload is
+off, or it is on without a durability backstop (`--appendonly yes` or
+`--save`), which makes the spill tier inert.
+
+Alert on `rate(moon_evicted_keys_total[5m])` for data loss and on
+`rate(moon_spilled_keys_total[5m])` for "the working set no longer fits in
+RAM" -- a high spill rate with a flat eviction rate means reads are
+increasingly served from disk.
+
+Before moon#585 the tiering path incremented `evicted_keys`, so a live
+instance reported 456,018 "evictions" against a `DBSIZE` that never moved. If
+you see that shape in an older build, it is a counter bug, not a `DBSIZE` bug.
 
 ### `used_memory` vs RSS under disk-offload
 

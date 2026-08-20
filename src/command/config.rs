@@ -143,8 +143,16 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
         let value_str = String::from_utf8_lossy(&value_bytes);
 
         match param_name.as_str() {
-            "maxmemory" => match value_str.parse::<usize>() {
-                Ok(v) => {
+            // moon#586: `maxmemory 4gb` is the spelling every runbook, Helm
+            // chart and tuning guide uses; rejecting it forced an operator
+            // applying a cap under memory pressure to convert by hand.
+            // `parse_memory_bytes` implements redis's exact rules, two-scale
+            // suffixes (`1k` = 1000, `1kb` = 1024) included.
+            "maxmemory" => match crate::config::parse_memory_bytes(&value_str)
+                .ok()
+                .and_then(|b| usize::try_from(b).ok())
+            {
+                Some(v) => {
                     runtime_config.maxmemory = v;
                     // Keep the inline write path's lock-free pre-gate in sync.
                     crate::storage::eviction::publish_maxmemory_hints(&*runtime_config);
@@ -153,7 +161,7 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     // the eviction gate on both paths.
                     crate::storage::eviction::publish_maxmemory(v as u64);
                 }
-                Err(_) => {
+                None => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'maxmemory'",
                         value_str
@@ -424,6 +432,95 @@ mod tests {
             .iter()
             .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
             .collect()
+    }
+
+    /// moon#586 (RED before the fix): `CONFIG SET maxmemory 4gb` — the
+    /// spelling redis documents and every runbook uses — was rejected with
+    /// `ERR Invalid argument`, forcing an operator applying a cap under
+    /// memory pressure to convert to bytes by hand.
+    ///
+    /// Locks redis's TWO-SCALE rule, which is the half a naive parser gets
+    /// wrong: `1k` is 1000 but `1kb` is 1024.
+    #[test]
+    fn config_set_maxmemory_accepts_redis_memory_units() {
+        for (input, expected) in [
+            (&b"0"[..], 0usize),
+            (b"4gb", 4 * 1024 * 1024 * 1024),
+            (b"4GB", 4 * 1024 * 1024 * 1024),
+            (b"100mb", 104_857_600),
+            (b"1k", 1_000),
+            (b"1kb", 1_024),
+            (b"1m", 1_000_000),
+            (b"1mb", 1_048_576),
+            (b"1g", 1_000_000_000),
+            (b"512b", 512),
+            (b"1048576", 1_048_576),
+        ] {
+            let mut rt = RuntimeConfig::default();
+            let args = make_args(&[b"maxmemory", input]);
+            assert_eq!(
+                config_set(&mut rt, &args),
+                Frame::SimpleString(Bytes::from_static(b"OK")),
+                "CONFIG SET maxmemory {} must be accepted",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(
+                rt.maxmemory,
+                expected,
+                "CONFIG SET maxmemory {}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// The other half of parity: what redis REJECTS, moon must reject too —
+    /// a parser that silently accepted `1.5gb` or `4 gb` would apply a cap
+    /// the operator did not ask for.
+    #[test]
+    fn config_set_maxmemory_rejects_what_redis_rejects() {
+        // Surrounding whitespace is trimmed, not an error — only whitespace
+        // INSIDE the value (below) is rejected.
+        let mut rt = RuntimeConfig::default();
+        assert_eq!(
+            config_set(&mut rt, &make_args(&[b"maxmemory", b"4gb "])),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        for input in [
+            &b"1.5gb"[..], // redis scans digits only: '.' ends the number
+            b"4 gb",       // internal space
+            b"-1",         // memtoull refuses a leading '-'
+            b"+4gb",
+            b"4tb", // unknown unit
+            b"gb",  // no digits
+            b"",
+            b"abc",
+            b"18446744073709551616gb", // overflow
+        ] {
+            let mut rt = RuntimeConfig::default();
+            let args = make_args(&[b"maxmemory", input]);
+            assert!(
+                matches!(config_set(&mut rt, &args), Frame::Error(_)),
+                "CONFIG SET maxmemory '{}' must be rejected",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(rt.maxmemory, 0, "a rejected value must not be applied");
+        }
+    }
+
+    /// moon#586 sweep: the per-db quota's byte half takes the same suffixes,
+    /// so `CONFIG SET db-maxmemory 1:512mb` agrees with `maxmemory 512mb`.
+    #[test]
+    fn config_set_db_maxmemory_accepts_memory_units() {
+        let mut rt = RuntimeConfig {
+            db_maxmemory: vec![0; 16],
+            ..Default::default()
+        };
+        let args = make_args(&[b"db-maxmemory", b"1:512mb"]);
+        assert_eq!(
+            config_set(&mut rt, &args),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(rt.db_maxmemory[1], 512 * 1024 * 1024);
     }
 
     #[test]

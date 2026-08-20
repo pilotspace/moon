@@ -186,7 +186,10 @@ pub struct ServerConfig {
     /// Resolved once at startup by [`ServerConfig::apply_memory_guardrail`];
     /// downstream code reads the resolved `usize` from `RuntimeConfig`
     /// (`0 = unlimited`).
-    #[arg(long)]
+    ///
+    /// Accepts redis memory-unit suffixes (`4gb`, `100mb`, `512k`) as well as
+    /// a raw byte count — see [`parse_memory_bytes`] (moon#586).
+    #[arg(long, value_parser = parse_maxmemory_arg)]
     pub maxmemory: Option<usize>,
 
     /// Eviction policy when maxmemory is reached
@@ -1520,6 +1523,81 @@ pub fn parse_db_maxmemory_entries(raw: &[String], num_databases: usize) -> Vec<u
     out
 }
 
+/// Parse a Redis memory-size string into bytes (moon#586).
+///
+/// Reproduces `redis`'s `memtoull()` exactly, including its **two-scale
+/// rule** — the part a naive parser gets wrong:
+///
+/// | suffix | multiplier | | suffix | multiplier |
+/// |--------|------------|-|--------|------------|
+/// | (none) | 1          | | `b`    | 1          |
+/// | `k`    | 1 000      | | `kb`   | 1 024      |
+/// | `m`    | 1 000 000  | | `mb`   | 1 048 576  |
+/// | `g`    | 1 000⁠³     | | `gb`   | 1 073 741 824 |
+///
+/// Suffixes are case-insensitive (`4GB` == `4gb`). Rules inherited verbatim
+/// from redis, each one a case a hand-rolled parser typically gets wrong:
+///
+/// * the numeric part is **digits only** — `1.5gb`, `+4gb` and `-1` are all
+///   rejected, exactly as redis rejects them (redis's scan stops at the first
+///   non-digit, so the "suffix" becomes `.5gb` and fails the unit match);
+/// * an **empty** numeric part (`"gb"`, `""`) is rejected;
+/// * no internal or trailing whitespace is accepted (`"4 gb"` is invalid) —
+///   only leading/trailing trim, matching what `CONFIG SET` receives after
+///   protocol parsing;
+/// * overflow is an error rather than a wrap.
+///
+/// Used by `CONFIG SET maxmemory` / `db-maxmemory`, by the `--maxmemory` CLI
+/// flag, and therefore by `moon.conf` (whose parser synthesises the CLI
+/// flag) — the three must agree, which is why there is one function.
+///
+/// Distinct from [`ServerConfig::parse_size`], which is moon's own
+/// `kb`/`mb`/`gb`-only format for internal size knobs (`--max-wal-size`,
+/// `--pagecache-size`) and has no `k`/`m`/`g` decimal forms to be wrong
+/// about. Leave those alone: changing `1g` from "invalid" to "1 000 000 000"
+/// there would silently re-scale existing deployments' configs.
+pub fn parse_memory_bytes(s: &str) -> Result<u64, &'static str> {
+    let s = s.trim();
+    let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, suffix) = s.split_at(digits_end);
+    if digits.is_empty() {
+        return Err("expected a byte count, optionally suffixed with k/kb/m/mb/g/gb");
+    }
+    let mul: u64 = if suffix.is_empty() || suffix.eq_ignore_ascii_case("b") {
+        1
+    } else if suffix.eq_ignore_ascii_case("k") {
+        1_000
+    } else if suffix.eq_ignore_ascii_case("kb") {
+        1_024
+    } else if suffix.eq_ignore_ascii_case("m") {
+        1_000_000
+    } else if suffix.eq_ignore_ascii_case("mb") {
+        1_024 * 1_024
+    } else if suffix.eq_ignore_ascii_case("g") {
+        1_000_000_000
+    } else if suffix.eq_ignore_ascii_case("gb") {
+        1_024 * 1_024 * 1_024
+    } else {
+        return Err("unknown memory unit (expected k/kb/m/mb/g/gb)");
+    };
+    digits
+        .parse::<u64>()
+        .map_err(|_| "byte count out of range")?
+        .checked_mul(mul)
+        .ok_or("byte count out of range")
+}
+
+/// `clap` value parser for `--maxmemory`, so the CLI and `moon.conf` accept
+/// the same `4gb` spelling `CONFIG SET` does (moon#586).
+///
+/// `moon.conf` is parsed by synthesising CLI arguments, so before this the
+/// `maxmemory 1gb` line in this crate's own conf-file documentation failed at
+/// startup with a clap "invalid digit found in string".
+fn parse_maxmemory_arg(s: &str) -> Result<usize, String> {
+    let bytes = parse_memory_bytes(s).map_err(|reason| format!("{reason} (got '{s}')"))?;
+    usize::try_from(bytes).map_err(|_| format!("'{s}' does not fit in a usize"))
+}
+
 /// Parse a single `<db>:<bytes>` token, shared by [`parse_db_maxmemory_entries`]
 /// (batch, startup CLI) and `CONFIG SET db-maxmemory <db>:<bytes>` (single,
 /// runtime). Returns `Err(reason)` — never panics — on malformed input; the
@@ -1533,10 +1611,9 @@ pub fn parse_one_db_maxmemory_entry(entry: &str) -> Result<(usize, u64), &'stati
         .trim()
         .parse::<usize>()
         .map_err(|_| "non-numeric db index")?;
-    let bytes = bytes_str
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| "non-numeric byte count")?;
+    // moon#586: the byte half takes the same redis memory-unit suffixes
+    // `maxmemory` does, so `--db-maxmemory 3:512mb` works.
+    let bytes = parse_memory_bytes(bytes_str).map_err(|_| "non-numeric byte count")?;
     Ok((idx, bytes))
 }
 
@@ -2634,6 +2711,75 @@ mod tests {
         let config =
             ServerConfig::parse_from(["moon", "--appendonly", "no", "--disk-offload", "disable"]);
         assert!(!config.disk_offload_spill_inert());
+    }
+
+    /// moon#586: redis's two-scale rule. `1k` is 1000, `1kb` is 1024 — a
+    /// parser that treats them alike is off by 2.4% on every value an
+    /// operator writes.
+    #[test]
+    fn parse_memory_bytes_honors_redis_two_scale_rule() {
+        assert_eq!(parse_memory_bytes("1k"), Ok(1_000));
+        assert_eq!(parse_memory_bytes("1kb"), Ok(1_024));
+        assert_eq!(parse_memory_bytes("1m"), Ok(1_000_000));
+        assert_eq!(parse_memory_bytes("1mb"), Ok(1_048_576));
+        assert_eq!(parse_memory_bytes("1g"), Ok(1_000_000_000));
+        assert_eq!(parse_memory_bytes("1gb"), Ok(1_073_741_824));
+        assert_eq!(parse_memory_bytes("4gb"), Ok(4_294_967_296));
+        assert_eq!(parse_memory_bytes("100mb"), Ok(104_857_600));
+        // Case-insensitive, `b` == bytes, bare integer == bytes.
+        assert_eq!(parse_memory_bytes("4GB"), Ok(4_294_967_296));
+        assert_eq!(parse_memory_bytes("512B"), Ok(512));
+        assert_eq!(parse_memory_bytes("1048576"), Ok(1_048_576));
+        assert_eq!(parse_memory_bytes("0"), Ok(0));
+        assert_eq!(parse_memory_bytes("  4gb  "), Ok(4_294_967_296));
+    }
+
+    #[test]
+    fn parse_memory_bytes_rejects_what_redis_rejects() {
+        for bad in [
+            "1.5gb",
+            "4 gb",
+            "-1",
+            "+4gb",
+            "4tb",
+            "gb",
+            "",
+            "abc",
+            "4gbx",
+            "18446744073709551616",
+            "18446744073709551615gb",
+        ] {
+            assert!(
+                parse_memory_bytes(bad).is_err(),
+                "'{bad}' must be rejected (redis rejects it)"
+            );
+        }
+    }
+
+    /// moon#586: `moon.conf` synthesises CLI arguments, so a conf file
+    /// carrying the `maxmemory 1gb` line this crate's own conf-file module
+    /// documents used to fail at startup with a clap "invalid digit" error.
+    #[test]
+    fn maxmemory_cli_flag_accepts_memory_units() {
+        let config = ServerConfig::parse_from(["moon", "--maxmemory", "1gb"]);
+        assert_eq!(config.maxmemory, Some(1_073_741_824));
+        let config = ServerConfig::parse_from(["moon", "--maxmemory", "0"]);
+        assert_eq!(config.maxmemory, Some(0));
+        assert!(
+            ServerConfig::try_parse_from(["moon", "--maxmemory", "1.5gb"]).is_err(),
+            "an invalid unit must fail the parse, not be silently ignored"
+        );
+    }
+
+    /// moon#586 sweep: `--db-maxmemory <db>:<bytes>` takes the same suffixes.
+    #[test]
+    fn db_maxmemory_entry_accepts_memory_units() {
+        assert_eq!(
+            parse_one_db_maxmemory_entry("2:256mb"),
+            Ok((2, 268_435_456))
+        );
+        assert_eq!(parse_one_db_maxmemory_entry("0:1024"), Ok((0, 1024)));
+        assert!(parse_one_db_maxmemory_entry("0:1.5gb").is_err());
     }
 
     #[test]

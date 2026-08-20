@@ -632,6 +632,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          keyspace_misses:{}\r\n\
          expired_keys:{}\r\n\
          evicted_keys:{}\r\n\
+         spilled_keys:{}\r\n\
          rejected_connections:{}\r\n\
          total_net_input_bytes:{}\r\n\
          total_net_output_bytes:{}\r\n\
@@ -645,6 +646,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::keyspace_misses(),
         crate::admin::metrics_setup::expired_keys(),
         crate::admin::metrics_setup::evicted_keys(),
+        // moon#585: keys the disk-offload tier moved out of RAM. NOT
+        // evictions — they are still in `DBSIZE` and still readable. This is
+        // the counter to watch for memory-pressure activity on an instance
+        // with `--disk-offload enable`; `evicted_keys` stays 0 there because
+        // nothing left the keyspace.
+        crate::admin::metrics_setup::spilled_keys(),
         crate::admin::metrics_setup::rejected_connections(),
         crate::admin::metrics_setup::total_net_input_bytes(),
         crate::admin::metrics_setup::total_net_output_bytes(),

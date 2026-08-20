@@ -285,6 +285,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them): 25/27 identical on both runtimes at 1 and 4 shards, the two residuals being the known
   `LMPOP` limit above and `GEORADIUS ... STORE`, which Moon rejects as a syntax error today
   (a pre-existing gap, unrelated to this change).
+- **`evicted_keys` counted keys that had NOT left the keyspace, so it contradicted `DBSIZE`**
+  (#585). On a live instance `evicted_keys` climbed by 456,018 while `DBSIZE` never moved. The
+  two numbers were counting different things: with `--disk-offload enable` (the default) the
+  durable batch spiller *tiers* a victim — it frees the hot copy, registers the key in the cold
+  index, and the key stays readable and stays in `DBSIZE` (#355) — yet it recorded that as an
+  eviction. The one metric an operator instinctively checks therefore stayed flat while the
+  counter that is supposed to explain it ran away, which reads exactly like "DBSIZE never
+  decrements". `evicted_keys` now counts only keys REMOVED FROM THE KEYSPACE, so it and `DBSIZE`
+  move together; tiered keys are reported in a new `INFO stats` field, **`spilled_keys`**
+  (Prometheus `moon_spilled_keys_total`), which is the counter to watch for memory-pressure
+  activity on a disk-offload instance. Two further inconsistencies closed on the way: the *async*
+  spill path recorded nothing at all (two spill paths, two different answers), and the plain-drop
+  path incremented `evicted_keys` even when its sampled victim turned out not to be there to
+  remove. Invariant now locked by test — `DBSIZE` falls by exactly the `evicted_keys` delta, and
+  does not move for a `spilled_keys` delta.
+- **`CONFIG SET maxmemory 4gb` was rejected** (#586). Memory-unit suffixes are the spelling redis
+  documents and every runbook, Helm chart and tuning guide uses; an operator applying a cap under
+  memory pressure got `ERR Invalid argument` and had to convert to bytes by hand — which is
+  exactly when they are least able to. `maxmemory`, `db-maxmemory`'s byte half, the `--maxmemory`
+  CLI flag and therefore `moon.conf` now share one parser reproducing redis's `memtoull()`
+  exactly, including its two-scale rule (`1k` = 1000 but `1kb` = 1024, same for `m`/`mb` and
+  `g`/`gb`) and its rejections (`1.5gb`, `4 gb`, `-1`, `+4gb`, unknown units, overflow). This also
+  fixes startup: `moon.conf` synthesises CLI arguments, so the `maxmemory 1gb` line in Moon's own
+  conf-file documentation used to fail the parse.
+- **`used_memory` did not count spilled-but-not-yet-written values** (#466). A victim queued for
+  async spill has its whole entry cost credited back to the ledger while a full copy of the value
+  is still pinned in RAM — by the queued `SpillRequest` and, since #459, by the in-flight plane
+  until the completion is applied. `used_memory` now carries that term (`pending_spill_bytes`,
+  maintained O(1) at mark and at every retire), paired with the rule that makes it safe: once the
+  pending bytes cover the overshoot, `evict_to_budget` treats the tick as done rather than
+  selecting more victims to chase memory that cannot drop yet. Without the pairing the honest
+  figure would have turned the eviction loop into a runaway that drains the whole database; that
+  is why the visibility fix was deferred out of #459, and both halves now ship together under
+  test.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

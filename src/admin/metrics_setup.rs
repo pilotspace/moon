@@ -56,6 +56,8 @@ static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
 static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
 static EXPIRING_SPILL_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+static SPILLED_KEYS: AtomicU64 = AtomicU64::new(0);
 static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 static NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -928,7 +930,15 @@ pub fn record_keyspace_miss() {
 
 // ── Eviction metrics ────────────────────────────────────────────────────
 
-/// Record an eviction event.
+/// Record one key REMOVED FROM THE KEYSPACE to free memory.
+///
+/// Redis parity, and the moon#585 invariant: `evicted_keys` counts exactly
+/// the keys `DBSIZE` stops counting. A key the tiering plane moved from RAM
+/// to disk has NOT left the keyspace (moon#355 — it is still readable, still
+/// in `DBSIZE`) and must be recorded with [`record_key_spilled`] instead. The
+/// two must never be conflated: before moon#585 the durable batch spiller
+/// counted every tiered key here, so a live instance reported 456,018
+/// "evicted" keys while `DBSIZE` never moved.
 #[inline]
 pub fn record_eviction() {
     EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
@@ -952,6 +962,24 @@ pub fn record_expiring_spill_skipped() {
         return;
     }
     counter!("moon_eviction_expiring_drop_total").increment(1);
+
+/// Record one key MOVED FROM RAM TO DISK by the eviction sweep.
+///
+/// The tiering counterpart of [`record_eviction`]: memory was reclaimed but
+/// the key is still in the keyspace, so `DBSIZE` deliberately does not move.
+/// Operators watching a `--disk-offload enable` instance read this counter
+/// (not `evicted_keys`) to see memory-pressure activity.
+///
+/// One relaxed `fetch_add` plus one relaxed load — the same shape as
+/// [`record_eviction`], which already sits on the 100 ms eviction sweep. No
+/// allocation, no lock.
+#[inline]
+pub fn record_key_spilled() {
+    SPILLED_KEYS.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_spilled_keys_total").increment(1);
 }
 
 // ── Persistence metrics ─────────────────────────────────────────────────
@@ -1809,7 +1837,10 @@ pub fn expired_keys() -> u64 {
     EXPIRED_KEYS.load(Ordering::Relaxed)
 }
 
-/// Keys removed by the maxmemory eviction policy.
+/// Keys REMOVED FROM THE KEYSPACE by the maxmemory eviction policy.
+///
+/// Pairs with `DBSIZE`: this counter and the key count move together (see
+/// [`record_eviction`]). Tiered keys are in [`spilled_keys`] instead.
 pub fn evicted_keys() -> u64 {
     EVICTED_KEYS.load(Ordering::Relaxed)
 }
@@ -1818,6 +1849,13 @@ pub fn evicted_keys() -> u64 {
 /// expire (moon#553). A subset of [`evicted_keys`].
 pub fn expiring_spill_skipped() -> u64 {
     EXPIRING_SPILL_SKIPPED.load(Ordering::Relaxed)
+
+/// Keys MOVED FROM RAM TO DISK by the maxmemory eviction policy.
+///
+/// These keys are still in `DBSIZE` and still readable — see
+/// [`record_key_spilled`].
+pub fn spilled_keys() -> u64 {
+    SPILLED_KEYS.load(Ordering::Relaxed)
 }
 
 /// Connections refused (limit reached, or rejected before handshake).
