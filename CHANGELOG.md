@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **A blocking command with an oversized timeout killed the whole server.** `BLPOP k 1e300` built
+  its deadline with `Duration::from_secs_f64`, which **panics** on a value it cannot represent, and
+  moon turns a panic on a shard thread into a process-wide abort — so one unauthenticated line
+  took the server down, every shard and every other client with it:
+
+  ```text
+  $ redis-cli -p 7833 BLPOP nokey 1e300
+  Error: Server closed the connection
+  cannot convert float seconds to Duration: value is either too big or NaN
+  FATAL: thread 'shard-0' panicked; aborting the whole process rather than serving with a
+  dead shard or a dead cluster control plane
+  ```
+
+  Found while adding `XREAD BLOCK` (#595), which routes into the same deadline code — the defect
+  itself predates it on the `BLPOP` float-seconds path. Both parsers now port the tail of Redis's
+  `getTimeoutFromObjectOrReply` exactly, including the ORDER of its checks, which is observable:
+  it converts to milliseconds first and only then judges the sign, so a negative timeout is
+  `-ERR timeout is negative` and not the "not a float" text moon used to send. Measured against
+  redis-server 8.6.1 with one fresh connection per case (a case that BLOCKS leaves its reply in
+  the socket and silently desynchronises every later read on a shared one — the first run of this
+  table was fiction):
+
+  ```text
+                                    before              after / redis 8.6.1
+  BLPOP nokey 1e300                 process abort       -ERR timeout is out of range
+  BLPOP nokey 1e16                  process abort       -ERR timeout is out of range
+  BLPOP nokey 1e15                  parks               parks
+  BLPOP nokey -0.5                  not a float …       -ERR timeout is negative
+  XREAD BLOCK 9223372036854775807   parked forever      -ERR timeout is out of range
+  XREAD BLOCK 9223372036854775      parks               parks
+  ```
+
+  Deadline construction itself is now total as well (`deadline_after` returns `None` instead of
+  panicking), so nothing that slips past a parser can reach the abort. Both sides of the boundary
+  are asserted, in-process and end-to-end: the unit tests pin every error text, and
+  `bsr12_oversized_timeout_errors_and_the_server_survives` `PING`s a live server after each case,
+  because a panicking build passes every in-process assertion right up to the moment it aborts.
+
 - **`h2` DoS advisory RUSTSEC-2026-0258 and `event-listener` unsoundness RUSTSEC-2026-0221**
   were both live on `main`. `h2` 0.4.14 accepted and queued **empty DATA frames without limit** —
   a remote memory-exhaustion vector in a networked server. `event-listener` 5.4.1 allowed `!Send`
@@ -126,43 +164,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
-- **A blocking command with an oversized timeout killed the whole server.** `BLPOP k 1e300` built
-  its deadline with `Duration::from_secs_f64`, which **panics** on a value it cannot represent, and
-  moon turns a panic on a shard thread into a process-wide abort — so one unauthenticated line
-  took the server down, every shard and every other client with it:
-
-  ```text
-  $ redis-cli -p 7833 BLPOP nokey 1e300
-  Error: Server closed the connection
-  cannot convert float seconds to Duration: value is either too big or NaN
-  FATAL: thread 'shard-0' panicked; aborting the whole process rather than serving with a
-  dead shard or a dead cluster control plane
-  ```
-
-  Found while adding `XREAD BLOCK` (#595), which routes into the same deadline code — the defect
-  itself predates it on the `BLPOP` float-seconds path. Both parsers now port the tail of Redis's
-  `getTimeoutFromObjectOrReply` exactly, including the ORDER of its checks, which is observable:
-  it converts to milliseconds first and only then judges the sign, so a negative timeout is
-  `-ERR timeout is negative` and not the "not a float" text moon used to send. Measured against
-  redis-server 8.6.1 with one fresh connection per case (a case that BLOCKS leaves its reply in
-  the socket and silently desynchronises every later read on a shared one — the first run of this
-  table was fiction):
-
-  ```text
-                                    before              after / redis 8.6.1
-  BLPOP nokey 1e300                 process abort       -ERR timeout is out of range
-  BLPOP nokey 1e16                  process abort       -ERR timeout is out of range
-  BLPOP nokey 1e15                  parks               parks
-  BLPOP nokey -0.5                  not a float …       -ERR timeout is negative
-  XREAD BLOCK 9223372036854775807   parked forever      -ERR timeout is out of range
-  XREAD BLOCK 9223372036854775      parks               parks
-  ```
-
-  Deadline construction itself is now total as well (`deadline_after` returns `None` instead of
-  panicking), so nothing that slips past a parser can reach the abort. Both sides of the boundary
-  are asserted, in-process and end-to-end: the unit tests pin every error text, and
-  `bsr12_oversized_timeout_errors_and_the_server_survives` `PING`s a live server after each case,
-  because a panicking build passes every in-process assertion right up to the moment it aborts.
 - **`XREAD BLOCK` / `XREADGROUP BLOCK` were a silent no-op: never blocked, never woken** (#595).
   Both readers parsed `BLOCK`, stepped over its value with an `// ignored` comment, and answered
   the null array immediately. That is worse than an unimplemented command, because the reply is
