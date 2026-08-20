@@ -199,7 +199,32 @@ pub fn try_wake_list_waiter(
                 //
                 // `destination == key` is the rotate form: same key, same
                 // type, nothing to check.
-                let dest_err = if destination == key {
+                // moon#570: this shard owns `key` (the source) — it is the
+                // shard the waiter registered on. It cannot push to a
+                // destination another shard owns; doing so wrote the element
+                // into THIS shard's slice under the destination's name, where
+                // a normally-routed read of the destination never looks. The
+                // client got the element in its reply and the keyspace lost
+                // it.
+                //
+                // Unreachable in practice: `immediate_scan` refuses the same
+                // pair before the waiter is ever registered, so no `BLMove`
+                // with a remote destination should reach this arm. It is
+                // checked again here because this is the LAST place that can
+                // still decline to consume the element — every other defence
+                // sits upstream of the pop, and a silent regression upstream
+                // would be acked data loss, the failure mode this whole path
+                // exists to prevent. Comparing the two key hashes (rather
+                // than this shard's id) makes the answer independent of which
+                // shard runs it.
+                let cross_shard_err = crate::command::list::cross_shard_move_refusal(
+                    key,
+                    destination,
+                    crate::command::connection::shard_count(),
+                );
+                let dest_err = if cross_shard_err.is_some() {
+                    cross_shard_err
+                } else if destination == key {
                     None
                 } else {
                     db.get_list(destination).err()

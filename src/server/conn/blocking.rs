@@ -1462,6 +1462,23 @@ pub(crate) fn immediate_scan(
     shard_id: usize,
     num_shards: usize,
 ) -> Option<Frame> {
+    // moon#570: a BLMOVE/BRPOPLPUSH whose DESTINATION is owned by another
+    // shard is refused HERE — before the pop below, before any registration,
+    // and independently of whether the source has data. The decision is a
+    // property of the two key NAMES, so answering it up front is what keeps
+    // the element safe: there is no popped-but-unplaced window to undo.
+    //
+    // Deciding it early also matters for the blocking case. Redis consults a
+    // BLMOVE's destination only when the move is about to happen (moon#556),
+    // but that rule is about the destination's *type* — data that only exists
+    // once the source is served. Shard ownership is static, so a client that
+    // blocked for its timeout and only then learned moon cannot route its
+    // move would have waited for nothing.
+    if let Some(err) = move_endpoints(cmd, args).and_then(|(src, dst)| {
+        crate::command::list::cross_shard_move_refusal(&src, &dst, num_shards)
+    }) {
+        return Some(err);
+    }
     for key in keys {
         // moon#557: `db` is the CLIENT'S OWN shard slice, so this scan may
         // only speak for the keys this shard owns. A key that hashes elsewhere
@@ -1485,6 +1502,23 @@ pub(crate) fn immediate_scan(
         }
     }
     None
+}
+
+/// The (source, destination) pair of a list MOVE, or `None` for anything else.
+///
+/// `BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout` and
+/// `BRPOPLPUSH source destination timeout` disagree on everything after the
+/// second argument and agree on the two that matter. Arity is already
+/// validated by `parse_blocking_args` before any caller reaches here; the
+/// `get`s are belt-and-braces so a future caller cannot turn a short argv into
+/// a panic.
+fn move_endpoints(cmd: &[u8], args: &[Frame]) -> Option<(Bytes, Bytes)> {
+    if !cmd.eq_ignore_ascii_case(b"BLMOVE") && !cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        return None;
+    }
+    let source = extract_bytes(args.first()?)?;
+    let destination = extract_bytes(args.get(1)?)?;
+    Some((source, destination))
 }
 
 /// moon#556: the `-WRONGTYPE` a `BLMOVE`/`BRPOPLPUSH` owes its client because

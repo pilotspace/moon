@@ -1747,6 +1747,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // moon#570: a list MOVE whose destination is owned by another
+                    // shard is refused BEFORE routing. Routing sends it to the
+                    // SOURCE's owner, which then executes both halves locally and
+                    // writes the destination into the wrong shard's slice — acked,
+                    // invisible, gone.
+                    if let Some(err) = crate::server::conn::shared::cross_shard_move_rejection(
+                        cmd,
+                        cmd_args,
+                        ctx.num_shards,
+                    ) {
+                        responses.push(err);
+                        continue;
+                    }
+
                     // --- Routing: keyless, local, or remote ---
                     let target_shard = extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, ctx.num_shards));
                     let is_local = match target_shard {
