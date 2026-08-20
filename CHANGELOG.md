@@ -21,6 +21,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register a bench, which is the only reason the advisories surfaced at all.
 
 ### Security
+- **`redis.call()` inside `EVAL`/`FCALL` bypassed ACL key patterns entirely** (#569). The
+  dispatcher gates `EVAL script numkeys k1 ...` on the keys an invocation DECLARES — but a script
+  need not declare anything, and `redis.call`/`redis.pcall` went straight to
+  `Database::execute_command` with no permission check at all. `numkeys 0` therefore made the outer
+  key check a no-op and everything the script touched was unchecked: a `~app:* +@all` user read and
+  wrote any key in the keyspace with `EVAL "return redis.call('GET','secret:x')" 0`, and could run
+  commands their `-del`/`-flushall` rules denied. Every inner command now runs under the calling
+  user's identity, resolved once per script (`acl::ScriptAcl`) and re-checked per `redis.call`
+  against the same `check_command_permission` + `check_key_permission` the dispatcher uses, with
+  the same fail-closed `acl::keyspec` walker — so movable-key layouts (`LMPOP`, `ZMPOP`,
+  `SINTERCARD`, `ZUNIONSTORE`, `SORT ... STORE`, `GEORADIUS ... STORE`, `COPY`, `SMOVE`, `BITOP`,
+  `XREAD STREAMS`) are covered and an argv the walker cannot enumerate — including `SORT k BY w_*`,
+  whose weight keys are computed at runtime — is DENIED. The check sits at the single choke point
+  every script-issued command passes through, before the SELECT/read-only/replica gates, before
+  the eviction gate and COW pre-image capture and before MONITOR is fed, so a denied command
+  produces no side effect and no laundering shape helps: literal keys, `..` concatenation,
+  `string.format`, `ARGV`, table lookups, loops, closures, `redis.pcall` and nested Lua `pcall` all
+  refuse identically, on EVAL, EVALSHA, FCALL and FCALL_RO. The caller's identity also rides the
+  SPSC message to the shard a script routes to (#508), so the cross-shard copy is not a hole; the
+  fail-closed default (`ScriptAcl::deny`) means a future script runner that forgets to supply an
+  identity refuses every command instead of inheriting `~*`. Denials answer `-NOPERM ACL failure in
+  script: ...` on both surfaces. Unrestricted users pay one enum test plus one `Acquire` load of the
+  ACL version counter per `redis.call` — no lock, no allocation, no key extraction: **+1.9%** per
+  call in an interleaved same-machine A/B against the pre-fix binary (20 000 `redis.call('GET')`
+  per sample, 9 reps, min-of-reps, empty-loop cost subtracted; **dev profile**, so the absolute
+  +86 ns is inflated several-fold and only the ratio transfers). A key-restricted user pays the
+  full check — one uncontended ACL read-lock plus the same key extraction and glob match the
+  dispatcher already runs for every non-script command — measured at +33% per call on the same
+  harness. That version check is what makes the cached verdict safe: an `ACL SETUSER` landing
+  mid-script is honoured by the very next `redis.call` rather than a script outliving its own
+  revocation.
 - **Fuzz the shared key-position walker, and stop a bare `.gitignore` entry from hiding new
   fuzzers** (#576). `acl::keyspec::command_key_positions` parses attacker-controlled argv on behalf
   of three consumers — ACL key-pattern enforcement, client-side cache invalidation, and command
@@ -75,6 +106,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   > {user:42}:live` — and the command works exactly as it does at `--shards 1`. Every affected call
   > was silently destroying data before, so no working deployment loses behaviour; a `--shards 1`
   > deployment is unaffected entirely.
+- **Lua numbers passed to `redis.call` produced an argv no command could parse** (#569). Argument
+  conversion reused the RETURN-value converter, so `redis.call('SET', 'k', 5)` handed the dispatcher
+  a `Frame::Integer` — something no wire client can send — and the command answered `wrong number of
+  arguments`. `redis.call('SET', 'app:k'..i, i)` in a loop, and `redis.call('LMPOP', 1, 'k',
+  'LEFT')`, both failed on that. Upstream Redis stringifies Lua numbers for exactly this reason;
+  Moon now does too (float truncation unchanged: `3.7` still becomes `3`). This is also why the
+  #569 ACL gate had to be paired with it — `acl::keyspec` reads keys and `numkeys` out of the argv
+  as bytes, so an integer frame in either slot was un-enumerable and a LEGITIMATE in-pattern
+  `LMPOP` would have failed closed.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

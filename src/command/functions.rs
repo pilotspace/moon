@@ -206,6 +206,7 @@ fn handle_function_delete(registry: &mut FunctionRegistry, args: &[Frame]) -> Fr
 }
 
 /// Handle FCALL: look up function by name, parse numkeys, dispatch.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_fcall(
     registry: &FunctionRegistry,
     args: &[Frame],
@@ -214,6 +215,7 @@ pub fn handle_fcall(
     num_shards: usize,
     selected_db: usize,
     db_count: usize,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
     handle_fcall_inner(
         registry,
@@ -224,10 +226,12 @@ pub fn handle_fcall(
         selected_db,
         db_count,
         false,
+        acl,
     )
 }
 
 /// Handle FCALL_RO: same as FCALL but sets read-only mode.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_fcall_ro(
     registry: &FunctionRegistry,
     args: &[Frame],
@@ -236,6 +240,7 @@ pub fn handle_fcall_ro(
     num_shards: usize,
     selected_db: usize,
     db_count: usize,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
     handle_fcall_inner(
         registry,
@@ -246,10 +251,12 @@ pub fn handle_fcall_ro(
         selected_db,
         db_count,
         true,
+        acl,
     )
 }
 
 /// Inner FCALL implementation shared by FCALL and FCALL_RO.
+#[allow(clippy::too_many_arguments)]
 fn handle_fcall_inner(
     registry: &FunctionRegistry,
     args: &[Frame],
@@ -259,6 +266,7 @@ fn handle_fcall_inner(
     selected_db: usize,
     db_count: usize,
     read_only: bool,
+    acl: &crate::acl::ScriptAcl,
 ) -> Frame {
     // FCALL funcname numkeys [key ...] [arg ...]
     if args.len() < 2 {
@@ -331,5 +339,14 @@ fn handle_fcall_inner(
         }
     }
 
-    registry.call_function(func_name, keys, argv, db, selected_db, db_count, read_only)
+    registry.call_function(
+        func_name,
+        keys,
+        argv,
+        db,
+        selected_db,
+        db_count,
+        read_only,
+        acl,
+    )
 }

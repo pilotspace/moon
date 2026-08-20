@@ -1708,11 +1708,13 @@ async fn coordinate_multi_del_or_exists(
 /// The reply is passed through untouched, including errors — a `NOSCRIPT` from
 /// the target shard is a real answer about the target's script cache, and
 /// rewriting it here would hide a cache fan-out gap.
+#[allow(clippy::too_many_arguments)]
 pub async fn coordinate_script(
     command: std::sync::Arc<Frame>,
     target: usize,
     my_shard: usize,
     db_index: usize,
+    script_acl: crate::acl::ScriptAcl,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
@@ -1720,6 +1722,9 @@ pub async fn coordinate_script(
     let msg = ShardMessage::Execute {
         db_index,
         command,
+        // moon#569: the caller's identity rides along, so the target shard
+        // authorizes every `redis.call` exactly as the origin shard would.
+        script_acl,
         reply_tx,
     };
     // Both failure outcomes mean the script was NEVER executed, so each can be
@@ -1809,6 +1814,9 @@ pub async fn coordinate_keys(
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
@@ -1898,6 +1906,9 @@ pub async fn coordinate_scan(
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
@@ -1983,6 +1994,9 @@ pub async fn coordinate_dbsize(
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
@@ -2090,6 +2104,9 @@ pub async fn coordinate_hotkeys(
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;

@@ -455,6 +455,7 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::Execute {
             db_index,
             command,
+            script_acl,
             reply_tx,
         } => {
             let response = {
@@ -505,6 +506,7 @@ pub(crate) fn handle_shard_message_shared(
                                 rt.num_shards(),
                                 db_idx,
                                 db_count,
+                                &script_acl,
                             )
                         } else {
                             crate::scripting::handle_evalsha(
@@ -516,6 +518,7 @@ pub(crate) fn handle_shard_message_shared(
                                 rt.num_shards(),
                                 db_idx,
                                 db_count,
+                                &script_acl,
                             )
                         }
                     });

@@ -1250,6 +1250,10 @@ pub(crate) async fn route_script_elsewhere(
     cmd: &[u8],
     cmd_args: &[Frame],
     db_index: usize,
+    // moon#569: the caller's ACL identity travels with the routed script so
+    // the target shard authorizes each `redis.call` exactly as the origin
+    // shard would have.
+    script_acl: &crate::acl::ScriptAcl,
     ctx: &crate::server::conn::core::ConnectionContext,
 ) -> Option<Frame> {
     if ctx.num_shards <= 1 {
@@ -1279,6 +1283,7 @@ pub(crate) async fn route_script_elsewhere(
                     target,
                     ctx.shard_id,
                     db_index,
+                    script_acl.clone(),
                     &ctx.dispatch_tx,
                     &ctx.spsc_notifiers,
                 )
