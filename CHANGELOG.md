@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **`h2` DoS advisory RUSTSEC-2026-0258 and `event-listener` unsoundness RUSTSEC-2026-0221**
+  were both live on `main`. `h2` 0.4.14 accepted and queued **empty DATA frames without limit** —
+  a remote memory-exhaustion vector in a networked server. `event-listener` 5.4.1 allowed `!Send`
+  tags to cross thread boundaries via `StackSlot`, which is uncomfortably adjacent to this
+  codebase's core concurrency assumption: monoio tasks are `!Send` and moon's cross-shard reply
+  path is built entirely on the premise that they never cross threads. Bumped to `h2` 0.4.18 and
+  `event-listener` 5.4.2 (lockfile only — no source, API, or MSRV change; `cargo check` and
+  `cargo audit` both clean, 401 crates scanned).
+
+  These went unnoticed because `cargo audit` / `cargo deny` do NOT run on ordinary pull requests —
+  they run weekly, or when a PR happens to touch `Cargo.toml`. moon#598 touched `Cargo.toml` to
+  register a bench, which is the only reason the advisories surfaced at all.
+
+### Security
 - **Fuzz the shared key-position walker, and stop a bare `.gitignore` entry from hiding new
   fuzzers** (#576). `acl::keyspec::command_key_positions` parses attacker-controlled argv on behalf
   of three consumers — ACL key-pattern enforcement, client-side cache invalidation, and command
