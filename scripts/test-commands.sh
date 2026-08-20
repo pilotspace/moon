@@ -463,8 +463,14 @@ if should_run "list"; then
     assert_match "LRANGE after INSERT" LRANGE lst:k3 0 -1
     rcli RPUSH lst:k4 a >/dev/null 2>&1; mcli RPUSH lst:k4 a >/dev/null 2>&1
     assert_match "LPOS"                LPOS lst:k4 a
-    rcli RPUSH lst:src x y z >/dev/null 2>&1; mcli RPUSH lst:src x y z >/dev/null 2>&1
-    assert_match "LMOVE"               LMOVE lst:src lst:dst LEFT RIGHT
+    # moon#570: `{lst}` co-locates source and destination on one shard, so this
+    # row compares the COMMAND against Redis at any `--shards N`. Untagged names
+    # made it a function of the shard count -- moon refuses a move whose two
+    # keys are owned by different shards (it cannot do both halves atomically
+    # and used to lose the element instead); Redis, having no shards, moves it
+    # either way. The refusal is asserted in scripts/test-consistency.sh.
+    rcli RPUSH {lst}:src x y z >/dev/null 2>&1; mcli RPUSH {lst}:src x y z >/dev/null 2>&1
+    assert_match "LMOVE"               LMOVE {lst}:src {lst}:dst LEFT RIGHT
     # RPOPLPUSH === LMOVE ... RIGHT LEFT (moon#520). Probe the reply, the
     # source's remainder AND the destination: a no-op that answered the popped
     # element without moving it would pass a reply-only assertion.
@@ -1010,8 +1016,9 @@ if should_run "blocking"; then
     rcli ZADD blk:z2 1 a 2 b >/dev/null 2>&1; mcli ZADD blk:z2 1 a 2 b >/dev/null 2>&1
     assert_match "BZPOPMAX (ready)"    BZPOPMAX blk:z2 1
 
-    rcli RPUSH blk:src x y z >/dev/null 2>&1; mcli RPUSH blk:src x y z >/dev/null 2>&1
-    assert_match "BLMOVE (ready)"      BLMOVE blk:src blk:dst LEFT RIGHT 1
+    # moon#570: `{blk}` co-locates the pair -- see the LMOVE row above.
+    rcli RPUSH {blk}:src x y z >/dev/null 2>&1; mcli RPUSH {blk}:src x y z >/dev/null 2>&1
+    assert_match "BLMOVE (ready)"      BLMOVE {blk}:src {blk}:dst LEFT RIGHT 1
 fi
 
 # ===========================================================================

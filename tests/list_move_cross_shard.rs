@@ -157,6 +157,19 @@ fn conserved(c: &mut Conn, reply: &str, src: &str, dst: &str, elem: &str) -> Opt
     ))
 }
 
+/// How many clients the server currently has PARKED on a blocking command.
+///
+/// Read from `INFO clients`, which is the server's own account rather than the
+/// test's guess. `lmx2` uses it as the handshake that proves a waiter reached
+/// the registry before the producer runs — see the comment at its call site
+/// for why a `sleep` cannot do that job.
+fn blocked_clients(c: &mut Conn) -> u32 {
+    c.send(&["INFO", "clients"])
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("blocked_clients:")?.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Run `body` once per key placement on a FRESH connection and report every
 /// trial that came out wrong.
 ///
@@ -262,18 +275,57 @@ fn lmx2_blocking_move_wake_path_never_loses_the_element() {
                     .expect("read timeout");
                 waiter.write_all(&common::encode(&refs)).expect("write");
 
-                // Give the waiter time to reach the registry before producing,
-                // so the element really goes through the wake path rather than
-                // being found by the producer-side immediate scan.
-                std::thread::sleep(Duration::from_millis(150));
+                // Do not sleep a fixed interval and hope — a delay too short
+                // for a loaded runner lets the producer win the race, the move
+                // is served by the producer-side immediate scan instead, and
+                // the wake path this test exists for is never entered. The
+                // test would still pass, silently covering nothing.
+                //
+                // Instead wait for the server's own account of what it did
+                // with the command. It has exactly two terminal answers and
+                // both are observable:
+                //
+                //   * it PARKED the client — `blocked_clients` rises, and the
+                //     element can now only be delivered by the wake path;
+                //   * it ANSWERED already — a complete reply frame is readable
+                //     on the waiter socket (the refusal path never blocks).
+                //
+                // Anything else within the deadline is a hang, and is reported
+                // as one rather than passing.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                waiter
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .expect("poll timeout");
+                let ready_by = Instant::now() + Duration::from_secs(10);
+                let mut decided = false;
+                while Instant::now() < ready_by {
+                    match waiter.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        // A read timeout is the EXPECTED state while parked.
+                        Err(_) => {}
+                    }
+                    if common::framed_len(&buf, 1).is_some() || blocked_clients(c) >= 1 {
+                        decided = true;
+                        break;
+                    }
+                }
+                if !decided {
+                    return Some(format!(
+                        "{label}: server neither parked nor answered the waiter within 10s"
+                    ));
+                }
+
                 assert_eq!(
                     c.send(&["RPUSH", &src, "elem"]),
                     ":1\r\n",
                     "producer RPUSH must succeed"
                 );
 
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
+                waiter
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .expect("read timeout");
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while Instant::now() < deadline {
                     if common::framed_len(&buf, 1).is_some() {
@@ -282,7 +334,7 @@ fn lmx2_blocking_move_wake_path_never_loses_the_element() {
                     match waiter.read(&mut chunk) {
                         Ok(0) => break,
                         Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
+                        Err(_) => {}
                     }
                 }
                 let reply = String::from_utf8_lossy(&buf).into_owned();

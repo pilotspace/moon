@@ -410,20 +410,64 @@ assert_both "LINDEX large value" LINDEX l:test -1
 # reply AND both keys afterwards — a stub that returned the tail without moving
 # it would satisfy a reply-only check. Same-key rotation is the reliable-queue
 # idiom and takes the src == dst branch, so it gets its own row.
-both RPUSH l:rl a b c
-assert_both "RPOPLPUSH reply" RPOPLPUSH l:rl l:rl-d
-assert_both "RPOPLPUSH source" LRANGE l:rl 0 -1
-assert_both "RPOPLPUSH dest" LRANGE l:rl-d 0 -1
-assert_both "RPOPLPUSH equals LMOVE RIGHT LEFT" LMOVE l:rl l:rl-d RIGHT LEFT
-assert_both "RPOPLPUSH after LMOVE dest" LRANGE l:rl-d 0 -1
-assert_both "RPOPLPUSH absent source" RPOPLPUSH l:rl-absent l:rl-d
-assert_both "RPOPLPUSH wrong arity" RPOPLPUSH l:rl
+# moon#570: the source/destination pair carries a `{rl}` hash tag so it is
+# co-located on ONE shard at any `--shards N`. moon refuses a list move whose
+# two keys are owned by different shards (`CROSSSLOT`, because it cannot do
+# both halves atomically and used to lose the element instead); Redis, having
+# no shards, moves it either way. Untagged names made these rows a function of
+# the shard count rather than of the command -- `l:rl`/`l:rl-d` happen to
+# co-locate at 4 shards and split at 12. A tag keeps them comparing the COMMAND
+# against Redis at every shard count; the refusal itself is asserted separately
+# below, where it belongs (moon-only -- Redis has nothing to compare it to).
+both RPUSH l:{rl} a b c
+assert_both "RPOPLPUSH reply" RPOPLPUSH l:{rl} l:{rl}-d
+assert_both "RPOPLPUSH source" LRANGE l:{rl} 0 -1
+assert_both "RPOPLPUSH dest" LRANGE l:{rl}-d 0 -1
+assert_both "RPOPLPUSH equals LMOVE RIGHT LEFT" LMOVE l:{rl} l:{rl}-d RIGHT LEFT
+assert_both "RPOPLPUSH after LMOVE dest" LRANGE l:{rl}-d 0 -1
+assert_both "RPOPLPUSH absent source" RPOPLPUSH l:{rl}-absent l:{rl}-d
+assert_both "RPOPLPUSH wrong arity" RPOPLPUSH l:{rl}
 both RPUSH l:rot a b c
 assert_both "RPOPLPUSH rotate in place" RPOPLPUSH l:rot l:rot
 assert_both "RPOPLPUSH rotate result" LRANGE l:rot 0 -1
-both SET l:rl-str notalist
-assert_both "RPOPLPUSH WRONGTYPE source" RPOPLPUSH l:rl-str l:rl-d
-assert_both "RPOPLPUSH WRONGTYPE dest" RPOPLPUSH l:rl l:rl-str
+both SET l:{rl}-str notalist
+assert_both "RPOPLPUSH WRONGTYPE source" RPOPLPUSH l:{rl}-str l:{rl}-d
+assert_both "RPOPLPUSH WRONGTYPE dest" RPOPLPUSH l:{rl} l:{rl}-str
+
+# moon#570, moon-only (Redis has no shards, so there is nothing to compare a
+# routing refusal against). At --shards > 1 a list move whose two keys land on
+# different shards must be REFUSED with the element still in the source. Before
+# the fix the client was handed the element and it was written to the wrong
+# shard's table -- acked, unreadable, gone (10 of 12 key placements measured at
+# --shards 4).
+#
+# Sweeps 12 key pairs rather than asserting on one: which pair is cross-shard
+# is a property of the hash, and a single hard-coded pair that happens to
+# co-locate would make this row pass while testing nothing. Two independent
+# checks, so neither can be satisfied vacuously:
+#   * NO pair may lose the element (holds for every placement, cross or not);
+#   * at least ONE pair must actually be refused (proves the sweep reached the
+#     cross-shard case at all).
+if [[ "$SHARDS" -gt 1 ]]; then
+    xs_lost=0
+    xs_refused=0
+    for i in $(seq 0 11); do
+        redis-cli -p "$PORT_RUST" DEL "l:xs$i" "l:xd$i" &>/dev/null || true
+        redis-cli -p "$PORT_RUST" RPUSH "l:xs$i" survivor &>/dev/null || true
+        xs_reply=$(redis-cli -p "$PORT_RUST" LMOVE "l:xs$i" "l:xd$i" LEFT RIGHT 2>&1)
+        xs_src=$(redis-cli -p "$PORT_RUST" LRANGE "l:xs$i" 0 -1 2>&1)
+        xs_dst=$(redis-cli -p "$PORT_RUST" LRANGE "l:xd$i" 0 -1 2>&1)
+        case "$xs_reply" in
+            CROSSSLOT*) xs_refused=$((xs_refused + 1))
+                        [[ "$xs_src" == "survivor" && -z "$xs_dst" ]] || xs_lost=$((xs_lost + 1)) ;;
+            *)          [[ "$xs_dst" == "survivor" && -z "$xs_src" ]] || xs_lost=$((xs_lost + 1)) ;;
+        esac
+    done
+    assert_eq "moon#570 no list move loses its element (shards=$SHARDS)" "0" "$xs_lost"
+    if [[ "$xs_refused" -eq 0 ]]; then
+        echo "  WARN: moon#570 sweep found no cross-shard pair at shards=$SHARDS (nothing refused)"
+    fi
+fi
 # `COMMAND INFO rpoplpush` is deliberately NOT compared here: the two servers
 # legitimately disagree on the tips/key-specs sub-arrays, so an equality check
 # would fail for a reason unrelated to whether the command exists. Its
