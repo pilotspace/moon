@@ -1693,7 +1693,23 @@ fn verify_merge_recall(
             .map(|i| (l2_fn(query, &all_decoded[i as usize]), i))
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let gt_ids: std::collections::HashSet<u32> = dists.iter().take(k).map(|d| d.1).collect();
+        // Score by DISTANCE, not by id (moon#546). Duplicate vectors are
+        // ubiquitous in real corpora, and when a point has many exact
+        // duplicates the ground truth takes an ARBITRARY k of the tied
+        // candidates while HNSW takes a DIFFERENT arbitrary k — both answers
+        // are exactly correct, but an id-set overlap scores them 0.0 and the
+        // gate rejects a perfect merge forever. The k-th ground-truth distance
+        // is the acceptance threshold: any neighbour at least that close is a
+        // correct answer, whichever of the tied ids it happens to be.
+        let gt_len = dists.len().min(k);
+        let gt_kth = match dists.get(gt_len.wrapping_sub(1)) {
+            Some(d) => d.0,
+            None => continue, // no comparable neighbours; nothing to measure
+        };
+        // Relative + absolute slack absorbs float non-determinism between the
+        // brute-force and graph distance paths (zero distances need the
+        // absolute term; the relative term carries large-magnitude ones).
+        let tol = gt_kth.abs() * 1e-4 + 1e-6;
 
         // HNSW search on the merged graph using f32 decoded centroids.
         // f32_bfs_flat has BFS-ordered vectors, `eff_dim` elements each.
@@ -1714,8 +1730,11 @@ fn verify_merge_recall(
             .take(k)
             .collect();
 
-        let overlap = gt_ids.intersection(&hnsw_ids).count();
-        total_recall += overlap as f32 / k.min(gt_ids.len()).max(1) as f32;
+        let hits = hnsw_ids
+            .iter()
+            .filter(|&&b| l2_fn(query, &all_decoded[b as usize]) <= gt_kth + tol)
+            .count();
+        total_recall += hits as f32 / gt_len.max(1) as f32;
         sample_count += 1;
     }
 
@@ -1895,6 +1914,91 @@ mod tests {
         let frozen = seg.freeze();
         let imm = compact(&frozen, collection, seed, None).expect("SQ8 compact failed");
         (imm, db)
+    }
+
+    /// GraphUnion must survive a corpus carrying DUPLICATE vectors (moon#546).
+    ///
+    /// Real corpora duplicate embeddings constantly — repeated text chunks,
+    /// boilerplate, and hash fields whose vector never got written. When a
+    /// point has 99 exact duplicates, the brute-force ground truth picks an
+    /// ARBITRARY 10 of the 100 tied candidates and HNSW picks a DIFFERENT
+    /// arbitrary 10; both answers are exactly correct, yet an ID-set overlap
+    /// scores them 0.0. `verify_merge_recall` scored exactly that overlap, so
+    /// every merge on a duplicate-heavy index was rejected forever and its
+    /// segments accumulated without bound (the live store logged 5,596 merge
+    /// attempts, zero successes, 1,367 of them at recall exactly 0.0000).
+    ///
+    /// This is a proper red on ID-overlap scoring: the merge below is
+    /// FUNCTIONALLY perfect (asserted by self-match distance) but the gate
+    /// measures 0.0000 and aborts. Recall must be scored by DISTANCE
+    /// equivalence, which is what recall@k means when distances tie.
+    #[test]
+    fn test_graph_union_merge_survives_duplicate_vectors() {
+        distance::init();
+        let dim = 96usize;
+        let per = 100usize;
+        let nsrc = 8usize;
+        let distinct = 8usize; // 800 entries drawn from 8 vectors => 100x tie sets
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::Sq8,
+            42,
+        ));
+
+        let mut pool: Vec<Vec<f32>> = Vec::with_capacity(distinct);
+        for d in 0..distinct {
+            let mut v = lcg_f32(dim, (d * 7 + 13) as u32);
+            normalize(&mut v);
+            pool.push(v);
+        }
+
+        let mut segs = Vec::new();
+        for sidx in 0..nsrc {
+            let seg = MutableSegment::new(dim as u32, collection.clone());
+            for i in 0..per {
+                let gid = sidx * per + i;
+                seg.append(gid as u64, &pool[gid % distinct], gid as u64 + 1);
+            }
+            let frozen = seg.freeze();
+            segs.push(Arc::new(
+                compact(&frozen, &collection, 12345 + sidx as u64, None).expect("compact failed"),
+            ));
+        }
+
+        // 0.90 is the manual force_compact gate — the strictest one shipped.
+        let merged = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.90, None)
+            .expect("GraphUnion merge rejected a duplicate-heavy corpus");
+        assert_eq!(
+            merged.live_count(),
+            (nsrc * per) as u32,
+            "merged live_count"
+        );
+
+        // Non-vacuity: the gate passing is only meaningful if the merged
+        // segment actually answers correctly. Every pool vector must self-match
+        // at ~0 distance, and all k results must be its duplicates (also ~0).
+        let padded = collection.padded_dimension;
+        for (d, q) in pool.iter().enumerate() {
+            let mut sc =
+                crate::vector::hnsw::search::SearchScratch::new(merged.graph().num_nodes(), padded);
+            let got = merged.search(q, 10, 128, &mut sc);
+            assert_eq!(
+                got.len(),
+                10,
+                "merged search returned {} for pool[{d}]",
+                got.len()
+            );
+            for (rank, r) in got.iter().enumerate() {
+                assert!(
+                    r.distance < 0.01,
+                    "pool[{d}] rank {rank}: distance {} (expected ~0 — every hit \
+                     must be one of its 99 exact duplicates)",
+                    r.distance
+                );
+            }
+        }
     }
 
     /// MERGE path for SQ8: merge two SQ8 immutable segments via GraphUnion and
