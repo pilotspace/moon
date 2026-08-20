@@ -1186,7 +1186,11 @@ pub(super) fn try_handle_client_admin(
             if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
                 || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
             {
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                // ON|OFF is mandatory (moon#580) — shared with the other two
+                // dispatch paths so the three cannot drift.
+                responses.push(crate::command::client::no_evict_or_no_touch(
+                    &sub_bytes, cmd_args,
+                ));
                 return true;
             }
             // Unknown CLIENT subcommand

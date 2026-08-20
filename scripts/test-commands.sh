@@ -709,6 +709,13 @@ if should_run "key"; then
     assert_match "GEORADIUS_RO"             GEORADIUS_RO k:geo 15 37 200 km ASC
     assert_match "GEORADIUSBYMEMBER"        GEORADIUSBYMEMBER k:geo Palermo 200 km ASC
     assert_match "GEORADIUSBYMEMBER_RO"     GEORADIUSBYMEMBER_RO k:geo Palermo 200 km ASC
+    # moon#568: WITHCOORD coordinates carry the same full precision as GEOPOS.
+    # `%.4f` rounding was invisible to every row above, none of which asks for
+    # coordinates at all.
+    assert_match "GEOSEARCH WITHCOORD"      GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHCOORD
+    assert_match "GEOSEARCH WITHCOORD+DIST+HASH" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHCOORD WITHDIST WITHHASH
+    assert_match "GEORADIUS WITHCOORD"      GEORADIUS k:geo 15 37 200 km ASC WITHCOORD
+    assert_match "GEORADIUSBYMEMBER WITHCOORD" GEORADIUSBYMEMBER k:geo Palermo 200 km ASC WITHCOORD
     # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
     rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
     assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999

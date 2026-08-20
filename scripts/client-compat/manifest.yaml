@@ -452,28 +452,17 @@ entries:
     protocols: [resp2]
     contexts: [standalone, pipeline]
 
-  # The RESP3 container gap the #526 probe surfaces: Redis 7+ types a non-empty
-  # XREADGROUP reply as a Map keyed by stream name; Moon emits the RESP2 Array in
-  # every protocol (no Frame::Map is built anywhere in src/command/stream/). This
-  # is systemic across the whole XREAD/XREADGROUP family, not specific to history
-  # mode — waived here, owned by resp3-type-fidelity, so it ratchets: --strict
-  # fails the moment Moon starts answering a Map.
+  # The RESP3 container gap the #526 probe surfaced: Redis 7+ types a non-empty
+  # XREADGROUP reply as a Map keyed by stream name, and Moon used to emit the
+  # RESP2 Array in every protocol. FIXED in moon#577 (Resp3Shape::StreamMap) —
+  # the waiver is removed, so the probe now compares exact bytes against the
+  # oracle and a regression fails the harness rather than being tolerated.
   - name: parity_xreadgroup_history_resp3_reply_is_map
     setup: ["DEL cl:xrg3", "XGROUP CREATE cl:xrg3 g $ MKSTREAM"]
     command: "XREADGROUP GROUP g c COUNT 10 STREAMS cl:xrg3 0"
     policy: exact
     protocols: [resp3]
     contexts: [standalone, pipeline]
-    expect_diff:
-      reason: >-
-        RESP3 container gap, NOT a #526 regression: Redis 7+ wraps a non-empty
-        XREADGROUP reply in a Map (stream-name => entries), Moon emits the RESP2
-        Array in every protocol — no Frame::Map is constructed anywhere in
-        src/command/stream/. Systemic across the XREAD/XREADGROUP family
-        (the null-array miss case parity_xreadgroup_new_only_miss_is_null_array
-        is unaffected — a null array is identical in both protocols). Owner:
-        resp3-type-fidelity, tracked as a SPEC delta — stream-reply RESP3
-        container typing, distinct from the #526 null→stream-name fix.
 
   # The fence: the `>` form with nothing new stays the null array.
   - name: parity_xreadgroup_new_only_miss_is_null_array

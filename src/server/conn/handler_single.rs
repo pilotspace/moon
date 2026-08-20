@@ -791,6 +791,20 @@ pub async fn handle_connection(
                                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                         continue;
                                     }
+                                    if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
+                                        || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
+                                    {
+                                        // The other two dispatch paths already
+                                        // accepted these; this path answered
+                                        // "unknown subcommand" instead — a
+                                        // third divergence found while fixing
+                                        // moon#580. All three now share one
+                                        // parser, ON|OFF mandatory.
+                                        responses.push(crate::command::client::no_evict_or_no_touch(
+                                            &sub_bytes, cmd_args,
+                                        ));
+                                        continue;
+                                    }
                                     // Unknown CLIENT subcommand
                                     responses.push(Frame::Error(Bytes::from(format!(
                                         "ERR unknown subcommand '{}'",

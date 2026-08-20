@@ -169,6 +169,57 @@ fn arity_errors_use_the_registered_command_name() {
     }
 }
 
+// === #580: CLIENT NO-EVICT / NO-TOUCH must not accept a missing argument ===
+
+/// (argv, expected raw reply) — measured against redis-server 8.6.1 over a raw
+/// socket on 2026-08-20. `client|no-evict` and `client|no-touch` are registered
+/// with arity **3**, so BOTH a missing and an extra argument are arity errors;
+/// only a present-but-unrecognised value is a syntax error.
+const NO_EVICT_CASES: &[(&[&str], &str)] = &[
+    (
+        &["CLIENT", "NO-EVICT"],
+        "-ERR wrong number of arguments for 'client|no-evict' command\r\n",
+    ),
+    (
+        &["CLIENT", "NO-EVICT", "ON", "EXTRA"],
+        "-ERR wrong number of arguments for 'client|no-evict' command\r\n",
+    ),
+    (&["CLIENT", "NO-EVICT", "MAYBE"], "-ERR syntax error\r\n"),
+    (&["CLIENT", "NO-EVICT", "ON"], "+OK\r\n"),
+    (&["CLIENT", "NO-EVICT", "OFF"], "+OK\r\n"),
+    // Case-insensitive, as the wire allows.
+    (&["client", "no-evict", "on"], "+OK\r\n"),
+    (
+        &["CLIENT", "NO-TOUCH"],
+        "-ERR wrong number of arguments for 'client|no-touch' command\r\n",
+    ),
+    (
+        &["CLIENT", "NO-TOUCH", "ON", "EXTRA"],
+        "-ERR wrong number of arguments for 'client|no-touch' command\r\n",
+    ),
+    (&["CLIENT", "NO-TOUCH", "BOGUS"], "-ERR syntax error\r\n"),
+    (&["CLIENT", "NO-TOUCH", "ON"], "+OK\r\n"),
+    (&["CLIENT", "NO-TOUCH", "OFF"], "+OK\r\n"),
+];
+
+#[test]
+fn client_no_evict_and_no_touch_require_their_on_off_argument() {
+    // Moon used to answer `+OK` to EVERY one of these, including the malformed
+    // forms — telling a client the setting had been applied when nothing was
+    // ever parsed (#580). Driven at shards=1 and shards=4 because the CLIENT
+    // subcommand table is duplicated across dispatch paths.
+    for shards in ["1", "4"] {
+        let moon = spawn_moon(shards);
+        for (argv, want) in NO_EVICT_CASES {
+            let reply = cmd(moon.port, argv);
+            assert_eq!(
+                reply, *want,
+                "argv {argv:?} at shards={shards}\n  got: {reply:?}"
+            );
+        }
+    }
+}
+
 // === guards: the OTHER naming rule must not be swept up ===
 
 #[test]
