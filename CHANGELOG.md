@@ -358,6 +358,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`LMOVE k k`) is never refused. **Users running `--shards > 1` who move between untagged lists
   must co-locate the pair with a `{hash}` tag** — previously those moves reported success and
   destroyed the element.
+- **`XREAD`/`XREADGROUP` answered a RESP2 Array to RESP3 clients instead of a Map** (#577).
+  Redis 7+ types a non-empty stream read as a RESP3 **Map** keyed by stream name
+  (`%N <name> => <entries>`); Moon built `Frame::Array` unconditionally, in every protocol, so a
+  client that dispatches on the reply CONTAINER was handed the wrong type. Now classified as
+  `Resp3Shape::StreamMap` in `src/protocol/resp3.rs`, which means the conversion happens at the
+  single choke point every dispatch path already shares — including the cross-shard path, where the
+  1-byte shape tag rides along on the batch. Only the container re-types: entry ids and their
+  field/value pairs stay BulkStrings, the empty-PEL history stays `%1{name: *0}`, and the miss stays
+  a null array (`_` on RESP3, `*-1` on RESP2) in both protocols. **RESP2 output is unchanged.**
+  The client-compat probe `parity_xreadgroup_history_resp3_reply_is_map` is un-waived in
+  `scripts/client-compat/manifest.yaml` and now compares exact bytes.
+- **`GEOSEARCH`/`GEORADIUS ... WITHCOORD` coordinates were BulkStrings and rounded to 4 decimals**
+  (#568). Two independent defects in one reply. Redis emits the coordinate pair through
+  `addReplyHumanLongDouble`, so on RESP3 it is a pair of **Doubles** — now classified as
+  `Resp3Shape::GeoCoords` for `GEOSEARCH`, `GEORADIUS(_RO)` and `GEORADIUSBYMEMBER(_RO)` whenever
+  `WITHCOORD` is present, converting the trailing coordinate element (Redis emits the extras in a
+  fixed dist/hash/coord order, so coords are always last). Separately, the coordinates were
+  formatted `{:.4}` — about 11 m of resolution — where Redis sends the full shortest
+  round-tripping decimal; they now use the same `fmt_geo_coord` that `GEOPOS` already used.
+  **That half is protocol-independent, so RESP2 `WITHCOORD` bytes change too** — from
+  `$7\r\n13.3614` to `$18\r\n13.361389338970184`, matching `redis-server 8.6.1` exactly.
+  `WITHDIST` is deliberately untouched: Redis builds it with `addReplyDoubleDistance`, a `%.4f`
+  BulkString in both protocols.
+- **`CLIENT NO-EVICT` and `CLIENT NO-TOUCH` accepted a missing argument and answered `+OK`**
+  (#580). Redis registers both subcommands with arity 3 (exact), so `CLIENT NO-EVICT` with no
+  `ON`/`OFF` is `-ERR wrong number of arguments for 'client|no-evict' command` — and so is a fourth
+  argument, while a present-but-unrecognised value is `-ERR syntax error`. Moon answered `+OK` to
+  every one of those, telling a client the setting had been applied when nothing was ever parsed.
+  All three dispatch paths now share one parser (`command::client::no_evict_or_no_touch`); this
+  also fixes a third divergence found while fixing it — the single-shard tokio path
+  (`handler_single`) did not implement either subcommand at all and answered
+  `-ERR unknown subcommand`.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

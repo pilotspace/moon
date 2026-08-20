@@ -1212,3 +1212,609 @@ fn r3f17_keyed_pop_shape_is_identical_across_shards() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// r3f19 — XREAD / XREADGROUP are a MAP keyed by stream name (moon#577)
+//
+// Oracle (redis-server 8.6.1, raw socket, measured 2026-08-20):
+//   RESP3  XREAD COUNT 10 STREAMS st 0
+//     %1\r\n$2\r\nst\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n
+//   RESP2  same command
+//     *1\r\n*2\r\n$2\r\nst\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n
+//   RESP3  XREAD ... STREAMS st 99999   ->  _\r\n   (the miss is unaffected)
+//
+// Both XREADGROUP modes (`>` = new entries, `0` = PEL history) take the same
+// container, so the test drives all three commands, not just the one the
+// client-compat probe caught.
+// ---------------------------------------------------------------------------
+
+/// `%1[$:*1[*2[$|*2[$]]]]` — one stream name mapped to its entry list, each
+/// entry a `[id, [field, value]]` pair. Only the CONTAINER re-types on RESP3;
+/// the ids and field/value pairs stay BulkStrings in both protocols.
+const STREAM_MAP: &str = "%1[$:*1[*2[$|*2[$]]]]";
+/// The RESP2 form: the same payload wrapped in `[name, entries]` arrays.
+const STREAM_ARRAY: &str = "*1[*2[$|*1[*2[$|*2[$]]]]]";
+
+fn stream_setup(key: &str, group: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["DEL".into(), key.into()],
+        vec![
+            "XADD".into(),
+            key.into(),
+            "1-1".into(),
+            "f".into(),
+            "v".into(),
+        ],
+        vec![
+            "XGROUP".into(),
+            "CREATE".into(),
+            key.into(),
+            group.into(),
+            "0".into(),
+        ],
+    ]
+}
+
+#[test]
+fn r3f19_xread_family_is_a_map_on_resp3() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    // XREADGROUP's PEL-history mode needs a prior `>` delivery, otherwise the
+    // PEL is empty and the reply is `%1{name: *0}` — a real Redis answer, but
+    // a DIFFERENT one, pinned separately below.
+    let deliver: Vec<String> = [
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c",
+        "COUNT",
+        "10",
+        "STREAMS",
+        "r3f19:st",
+        ">",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+
+    let base = stream_setup("r3f19:st", "g");
+    let mut with_delivery = base.clone();
+    with_delivery.push(deliver);
+
+    for (owned, cmd, what) in [
+        (
+            &base,
+            &["XREAD", "COUNT", "10", "STREAMS", "r3f19:st", "0"][..],
+            "XREAD",
+        ),
+        (
+            &base,
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "10",
+                "STREAMS",
+                "r3f19:st",
+                ">",
+            ][..],
+            "XREADGROUP > (new entries)",
+        ),
+        (
+            &with_delivery,
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "10",
+                "STREAMS",
+                "r3f19:st",
+                "0",
+            ][..],
+            "XREADGROUP 0 (PEL history)",
+        ),
+    ] {
+        let borrowed = as_setup(owned);
+        let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+
+        let got = standalone(port, 3, &setup, cmd);
+        assert_shape(
+            &got,
+            STREAM_MAP,
+            &format!("{what} on RESP3 is a Map keyed by stream name"),
+        );
+        // The key really is the stream NAME, not a positional index: a Map
+        // whose key happened to be the entry list would have the same shape.
+        match &got {
+            V::Map(kv) => assert_eq!(
+                kv[0].0.as_text(),
+                "r3f19:st",
+                "{what}: the map key must be the stream name"
+            ),
+            other => panic!("{what} did not answer a Map: {other:?}"),
+        }
+
+        // RESP2 keeps the array-of-pairs form.
+        let got2 = standalone(port, 2, &setup, cmd);
+        assert_shape(
+            &got2,
+            STREAM_ARRAY,
+            &format!("{what} on RESP2 must stay an Array of [name, entries]"),
+        );
+    }
+}
+
+#[test]
+fn r3f19_xread_map_keys_every_served_stream() {
+    // Oracle (redis-server 8.6.1, RESP3, measured 2026-08-20):
+    //   XREADGROUP .. 0 with an EMPTY PEL   -> %1\r\n$3\r\npel\r\n*0\r\n
+    //   XREAD over two populated streams    -> %2  (both names)
+    //   XREAD over one hit + one miss       -> %1  (only the served stream)
+    // The empty-PEL case is the one that separates "wraps whatever it got in a
+    // Map" from "keys the reply by stream name": its VALUE is an empty array.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let mut c = Conn::new(port, 3);
+    for s in as_setup(&stream_setup("r3f19:pel", "g")) {
+        c.setup(&s);
+    }
+    let empty_pel = c.cmd(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c",
+        "COUNT",
+        "10",
+        "STREAMS",
+        "r3f19:pel",
+        "0",
+    ]);
+    assert_shape(
+        &empty_pel,
+        "%1[$:*0[]]",
+        "an empty PEL history is still a Map whose single value is an empty Array",
+    );
+    match &empty_pel {
+        V::Map(kv) => assert_eq!(kv[0].0.as_text(), "r3f19:pel"),
+        other => panic!("empty PEL history is not a Map: {other:?}"),
+    }
+
+    // Two streams -> two map entries, in the order the client asked for them.
+    for k in ["r3f19:a", "r3f19:b"] {
+        c.setup(&["DEL", k]);
+        c.setup(&["XADD", k, "1-1", "f", "v"]);
+    }
+    let both = c.cmd(&[
+        "XREAD", "COUNT", "10", "STREAMS", "r3f19:a", "r3f19:b", "0", "0",
+    ]);
+    match &both {
+        V::Map(kv) => {
+            let names: Vec<String> = kv.iter().map(|(k, _)| k.as_text()).collect();
+            assert_eq!(names, vec!["r3f19:a", "r3f19:b"], "got {both:?}");
+        }
+        other => panic!("a two-stream XREAD must be a 2-entry Map, got {other:?}"),
+    }
+
+    // One hit, one miss.
+    //
+    // KNOWN DIVERGENCE, deliberately NOT asserted here: Redis omits an
+    // unserved stream entirely (`%1`, only `r3f19:a`), Moon emits it with an
+    // empty entry list (`%2`, `r3f19:b` -> `*0`). Measured on 2026-08-20:
+    //   redis 8.6.1 RESP2  *1\r\n*2\r\n$4\r\npelA\r\n..
+    //   moon        RESP2  *2\r\n..\r\n*2\r\n$4\r\npelB\r\n*0\r\n
+    // It is present on RESP2 too, so it is NOT caused by the Map conversion
+    // and is out of scope for moon#577 (which owns the CONTAINER type, not
+    // which streams appear in it). Tracked separately; what moon#577 owns —
+    // that the reply is a Map keyed by stream name — is asserted.
+    let one = c.cmd(&[
+        "XREAD", "COUNT", "10", "STREAMS", "r3f19:a", "r3f19:b", "0", "99999",
+    ]);
+    match &one {
+        V::Map(kv) => {
+            let names: Vec<String> = kv.iter().map(|(k, _)| k.as_text()).collect();
+            assert!(
+                names.contains(&"r3f19:a".to_string()),
+                "the served stream must be a map KEY, got {one:?}"
+            );
+        }
+        other => panic!("a partially-served XREAD must still be a Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn r3f19_xread_miss_stays_null_in_both_protocols() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let owned = stream_setup("r3f19:miss", "g");
+    let borrowed = as_setup(&owned);
+    let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+
+    // A null array is `_` on RESP3 and `*-1` on RESP2; the reader renders both
+    // as V::Null, so the assertion is that the Map conversion did NOT swallow
+    // the miss into an empty `%0`.
+    for proto in [2u8, 3u8] {
+        let got = standalone(
+            port,
+            proto,
+            &setup,
+            &["XREAD", "COUNT", "10", "STREAMS", "r3f19:miss", "99999"],
+        );
+        assert_eq!(
+            got.tag(),
+            '_',
+            "XREAD's miss is a null on RESP{proto}, never an empty Map. Got {got:?}"
+        );
+    }
+}
+
+#[test]
+fn r3f19_xread_map_survives_multi_pipeline_and_shards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 4);
+    let _g = ServerGuard(child);
+
+    // Hash tags spread the stream across shards, so at least one probe is
+    // answered over the cross-shard batch where the shape rides as a tag.
+    for tag in ["t0", "t1", "t2", "t3", "t7"] {
+        let key = format!("{{{tag}}}r3f19");
+        let owned = stream_setup(&key, "g");
+        let borrowed = as_setup(&owned);
+        let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+        let cmd = ["XREAD", "COUNT", "10", "STREAMS", key.as_str(), "0"];
+
+        for (ctx, got) in [
+            ("standalone", standalone(port, 3, &setup, &cmd)),
+            ("MULTI/EXEC", in_multi(port, 3, &setup, &cmd)),
+            ("pipeline", in_pipeline(port, 3, &setup, &cmd)),
+        ] {
+            assert_shape(
+                &got,
+                STREAM_MAP,
+                &format!("XREAD on {{{tag}}} in {ctx} must answer the Redis shape"),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r3f20 — GEOSEARCH/GEORADIUS WITHCOORD coordinates (moon#568)
+//
+// Oracle (redis-server 8.6.1, raw socket, measured 2026-08-20), after
+// `GEOADD geo 13.361389 38.115556 Palermo`:
+//   RESP3 GEOSEARCH geo FROMLONLAT 15 37 BYRADIUS 300 km ASC WITHCOORD
+//     *1\r\n*2\r\n$7\r\nPalermo\r\n*2\r\n,13.361389338970184\r\n,38.1155563954963\r\n
+//   RESP2 same
+//     *1\r\n*2\r\n$7\r\nPalermo\r\n*2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n
+//   RESP3 ... WITHCOORD WITHDIST WITHHASH
+//     *1\r\n*4\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n:3479099956230698\r\n*2\r\n,..\r\n,..\r\n
+//   RESP3 ... WITHDIST                (no coords: nothing re-types)
+//     *1\r\n*2\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n
+//
+// TWO defects in one reply, and they are independent:
+//   * the coordinates are BulkStrings where Redis sends Doubles (RESP3 only);
+//   * they are rounded to 4 decimals where Redis sends the full shortest
+//     round-tripping decimal — visible on RESP2 as well, so the RESP2 bytes
+//     for this family DO change (a fix, not a regression: they are wrong now).
+// WITHDIST stays a `%.4f` BulkString in both protocols — Redis builds it with
+// addReplyDoubleDistance, not addReplyHumanLongDouble — so it is pinned too.
+// ---------------------------------------------------------------------------
+
+const GEO_LON: &str = "13.361389338970184";
+const GEO_LAT: &str = "38.1155563954963";
+
+fn geo_setup(key: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["DEL".into(), key.into()],
+        vec![
+            "GEOADD".into(),
+            key.into(),
+            "13.361389".into(),
+            "38.115556".into(),
+            "Palermo".into(),
+        ],
+    ]
+}
+
+/// The `[lon, lat]` pair of the first result of a WITHCOORD reply whose entry
+/// layout is `[member, .., coords]` — Redis always emits coords LAST.
+#[track_caller]
+fn first_coords(got: &V, what: &str) -> (V, V) {
+    let entry = got
+        .items()
+        .first()
+        .unwrap_or_else(|| panic!("{what}: no results at all in {got:?}"));
+    let coords = entry
+        .items()
+        .last()
+        .unwrap_or_else(|| panic!("{what}: entry has no elements in {got:?}"));
+    let xs = coords.items();
+    assert_eq!(
+        xs.len(),
+        2,
+        "{what}: the coordinate element must be a 2-element array. Got {coords:?}"
+    );
+    (xs[0].clone(), xs[1].clone())
+}
+
+#[test]
+fn r3f20_withcoord_is_doubles_on_resp3() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let owned = geo_setup("r3f20:geo");
+    let borrowed = as_setup(&owned);
+    let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+
+    for (cmd, want, what) in [
+        (
+            &[
+                "GEOSEARCH",
+                "r3f20:geo",
+                "FROMLONLAT",
+                "15",
+                "37",
+                "BYRADIUS",
+                "300",
+                "km",
+                "ASC",
+                "WITHCOORD",
+            ][..],
+            "*1[*2[$|*2[,]]]",
+            "GEOSEARCH WITHCOORD",
+        ),
+        (
+            &[
+                "GEOSEARCH",
+                "r3f20:geo",
+                "FROMLONLAT",
+                "15",
+                "37",
+                "BYRADIUS",
+                "300",
+                "km",
+                "ASC",
+                "WITHCOORD",
+                "WITHDIST",
+                "WITHHASH",
+            ][..],
+            "*1[*4[$|:|*2[,]]]",
+            "GEOSEARCH WITHCOORD WITHDIST WITHHASH",
+        ),
+        (
+            &[
+                "GEORADIUS",
+                "r3f20:geo",
+                "15",
+                "37",
+                "300",
+                "km",
+                "WITHCOORD",
+            ][..],
+            "*1[*2[$|*2[,]]]",
+            "GEORADIUS WITHCOORD",
+        ),
+        (
+            &[
+                "GEORADIUS_RO",
+                "r3f20:geo",
+                "15",
+                "37",
+                "300",
+                "km",
+                "WITHCOORD",
+            ][..],
+            "*1[*2[$|*2[,]]]",
+            "GEORADIUS_RO WITHCOORD",
+        ),
+        (
+            &[
+                "GEORADIUSBYMEMBER",
+                "r3f20:geo",
+                "Palermo",
+                "300",
+                "km",
+                "WITHCOORD",
+            ][..],
+            "*1[*2[$|*2[,]]]",
+            "GEORADIUSBYMEMBER WITHCOORD",
+        ),
+    ] {
+        let got = standalone(port, 3, &setup, cmd);
+        assert_shape(&got, want, what);
+
+        let (lon, lat) = first_coords(&got, what);
+        assert_eq!(
+            (lon.tag(), lat.tag()),
+            (',', ','),
+            "{what}: Redis sends coordinates as Doubles. Got {lon:?} / {lat:?}"
+        );
+        // ..and at full precision. GEOPOS already answers these exact digits;
+        // WITHCOORD rounding to 4 decimals is the OTHER half of moon#568.
+        assert_eq!(
+            (lon.as_text(), lat.as_text()),
+            (GEO_LON.to_string(), GEO_LAT.to_string()),
+            "{what}: coordinates must carry full precision, not `%.4f`"
+        );
+    }
+}
+
+#[test]
+fn r3f20_withcoord_precision_matches_geopos_on_resp2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let owned = geo_setup("r3f20:geo2");
+    let borrowed = as_setup(&owned);
+    let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+
+    let search = standalone(
+        port,
+        2,
+        &setup,
+        &[
+            "GEOSEARCH",
+            "r3f20:geo2",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "300",
+            "km",
+            "ASC",
+            "WITHCOORD",
+        ],
+    );
+    assert_shape(
+        &search,
+        "*1[*2[$|*2[$]]]",
+        "on RESP2 WITHCOORD coordinates stay BulkStrings",
+    );
+    let (lon, lat) = first_coords(&search, "GEOSEARCH WITHCOORD (RESP2)");
+
+    // GEOPOS is the in-tree reference for coordinate formatting (moon#568
+    // states it is already correct); the two commands decode the same score
+    // and must therefore print the same digits.
+    let pos = standalone(port, 2, &setup, &["GEOPOS", "r3f20:geo2", "Palermo"]);
+    let pos_xy = pos.items().first().expect("GEOPOS result").items().to_vec();
+    assert_eq!(
+        (lon.as_text(), lat.as_text()),
+        (pos_xy[0].as_text(), pos_xy[1].as_text()),
+        "WITHCOORD and GEOPOS decode the same score — they must print identically"
+    );
+    assert_eq!(
+        (lon.as_text(), lat.as_text()),
+        (GEO_LON.to_string(), GEO_LAT.to_string()),
+        "and both must match redis-server 8.6.1"
+    );
+}
+
+#[test]
+fn r3f20_geo_without_withcoord_is_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 1);
+    let _g = ServerGuard(child);
+
+    let owned = geo_setup("r3f20:geo3");
+    let borrowed = as_setup(&owned);
+    let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+
+    // WITHDIST alone: `%.4f` BulkString in BOTH protocols (addReplyDoubleDistance).
+    let dist = standalone(
+        port,
+        3,
+        &setup,
+        &[
+            "GEOSEARCH",
+            "r3f20:geo3",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "300",
+            "km",
+            "ASC",
+            "WITHDIST",
+        ],
+    );
+    assert_shape(
+        &dist,
+        "*1[*2[$]]",
+        "WITHDIST is a BulkString on RESP3 too — only coordinates re-type",
+    );
+    assert_eq!(
+        dist.items()[0].items()[1].as_text(),
+        "190.4424",
+        "WITHDIST keeps Redis's 4-decimal distance formatting"
+    );
+
+    // No options at all: a flat array of member names, nothing to convert.
+    let plain = standalone(
+        port,
+        3,
+        &setup,
+        &[
+            "GEOSEARCH",
+            "r3f20:geo3",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "300",
+            "km",
+            "ASC",
+        ],
+    );
+    assert_shape(
+        &plain,
+        "*1[$]",
+        "a bare GEOSEARCH is a flat array of members",
+    );
+
+    // A member literally NAMED `WITHCOORD` must not trick the classifier into
+    // re-typing a reply that has no coordinate element.
+    let mut c = Conn::new(port, 3);
+    c.setup(&["DEL", "r3f20:trap"]);
+    c.setup(&[
+        "GEOADD",
+        "r3f20:trap",
+        "13.361389",
+        "38.115556",
+        "WITHCOORD",
+    ]);
+    let trap = c.cmd(&["GEORADIUSBYMEMBER", "r3f20:trap", "WITHCOORD", "300", "km"]);
+    assert_shape(
+        &trap,
+        "*1[$]",
+        "a member named WITHCOORD is not the WITHCOORD option",
+    );
+}
+
+#[test]
+fn r3f20_withcoord_shape_survives_multi_pipeline_and_shards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path(), 4);
+    let _g = ServerGuard(child);
+
+    for tag in ["t0", "t1", "t2", "t3", "t7"] {
+        let key = format!("{{{tag}}}r3f20");
+        let owned = geo_setup(&key);
+        let borrowed = as_setup(&owned);
+        let setup: Vec<&[&str]> = borrowed.iter().map(|r| r.as_slice()).collect();
+        let cmd = [
+            "GEOSEARCH",
+            key.as_str(),
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "300",
+            "km",
+            "ASC",
+            "WITHCOORD",
+        ];
+
+        for (ctx, got) in [
+            ("standalone", standalone(port, 3, &setup, &cmd)),
+            ("MULTI/EXEC", in_multi(port, 3, &setup, &cmd)),
+            ("pipeline", in_pipeline(port, 3, &setup, &cmd)),
+        ] {
+            assert_shape(
+                &got,
+                "*1[*2[$|*2[,]]]",
+                &format!("GEOSEARCH WITHCOORD on {{{tag}}} in {ctx}"),
+            );
+        }
+    }
+}

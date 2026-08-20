@@ -63,6 +63,14 @@ pub enum Resp3Shape {
     ValuePairs,
     /// `[[x, y], ...]` -> `[[double, double], ...]`, preserving Null. GEOPOS.
     CoordPairs,
+    /// `[[name, entries], ...]` -> `%{name: entries}`. XREAD/XREADGROUP.
+    ///
+    /// Only the OUTER container re-types: the entry ids and their field/value
+    /// pairs stay BulkStrings in both protocols (moon#577).
+    StreamMap,
+    /// `[[member, .., [x, y]], ...]` -> the same with Double coordinates.
+    /// The GEOSEARCH/GEORADIUS family with WITHCOORD (moon#568).
+    GeoCoords,
     /// Bulk -> VerbatimString. CLIENT INFO.
     Verbatim,
 }
@@ -127,6 +135,12 @@ pub fn resp3_shape_of(cmd_upper: &[u8], args: &[Frame]) -> Resp3Shape {
         b"ZSCORE" | b"ZINCRBY" => Resp3Shape::Double,
         b"ZMSCORE" => Resp3Shape::DoubleArray,
         b"GEOPOS" => Resp3Shape::CoordPairs,
+        // XREAD/XREADGROUP are keyed by STREAM NAME on RESP3 (moon#577). The
+        // shape is unconditional: every mode of both commands answers the same
+        // `[[name, entries], ...]` container, and the miss — a null array,
+        // identical in both protocols — is returned by `apply_shape` before any
+        // converter sees it.
+        b"XREAD" | b"XREADGROUP" => Resp3Shape::StreamMap,
 
         // ---- container commands: only ONE subcommand converts --------------
         // `CONFIG GET` is a Map; CONFIG SET/RESETSTAT/REWRITE are not.
@@ -148,6 +162,26 @@ pub fn resp3_shape_of(cmd_upper: &[u8], args: &[Frame]) -> Resp3Shape {
             Resp3Shape::ScoredPairs
         }
         b"HRANDFIELD" if has_token(args, b"WITHVALUES") => Resp3Shape::ValuePairs,
+
+        // The GEO radius family with WITHCOORD: Redis emits the coordinate
+        // pair through `addReplyHumanLongDouble`, i.e. Doubles on RESP3
+        // (moon#568). WITHDIST is NOT in this rule — it goes through
+        // `addReplyDoubleDistance`, a `%.4f` BulkString in both protocols.
+        //
+        // `has_token` can fire on a MEMBER literally named WITHCOORD
+        // (`GEORADIUSBYMEMBER key WITHCOORD 300 km`). That costs nothing: with
+        // no real WITHCOORD option the reply is a flat array of member names,
+        // and `geo_coords` only rewrites an entry whose LAST element is a
+        // 2-element array, so such a reply passes through untouched.
+        b"GEOSEARCH"
+        | b"GEORADIUS"
+        | b"GEORADIUS_RO"
+        | b"GEORADIUSBYMEMBER"
+        | b"GEORADIUSBYMEMBER_RO"
+            if has_token(args, b"WITHCOORD") =>
+        {
+            Resp3Shape::GeoCoords
+        }
 
         // ZPOPMIN/ZPOPMAX: `<count>` present -> wrapped pairs; absent -> ONE
         // flat [member, score] pair. Redis really does change the nesting on
@@ -236,6 +270,8 @@ pub fn apply_shape(shape: Resp3Shape, response: Frame, proto: u8) -> Frame {
         Resp3Shape::CoordPairs => {
             map_elements(response, |inner| map_elements(inner, bulk_to_double))
         }
+        Resp3Shape::StreamMap => stream_map(response),
+        Resp3Shape::GeoCoords => map_elements(response, geo_coords),
         Resp3Shape::Verbatim => bulk_to_verbatim(response),
     }
 }
@@ -351,6 +387,69 @@ fn keyed_scored_flat(frame: Frame) -> Frame {
                 return Frame::Array(FrameVec::new());
             };
             Frame::Array(FrameVec::from_vec(vec![k, m, bulk_to_double(s)]))
+        }
+        other => other,
+    }
+}
+
+/// `[[name, entries], ...]` -> `%{name: entries}` (XREAD/XREADGROUP, moon#577).
+///
+/// Only converts when EVERY element is a 2-element array — the exact container
+/// the stream readers build. Anything else is passed through whole rather than
+/// half-rewritten, keeping `apply_shape`'s promise that a reply it does not
+/// recognise is never mangled.
+///
+/// An empty outer array converts to `%0`: emptiness must not change a reply's
+/// TYPE (the rule `array_to_map` states for HGETALL). Moon's readers answer the
+/// miss with a null array, not an empty one, so this arm is defensive.
+fn stream_map(frame: Frame) -> Frame {
+    match frame {
+        Frame::Array(items)
+            if items
+                .iter()
+                .all(|it| matches!(it, Frame::Array(pair) if pair.len() == 2)) =>
+        {
+            let mut pairs = Vec::with_capacity(items.len());
+            for item in items {
+                let Frame::Array(pair) = item else {
+                    // Unreachable: the guard above checked every element.
+                    // Structural rather than an unwrap, per the never-panics rule.
+                    return Frame::Array(FrameVec::new());
+                };
+                let mut it = pair.into_iter();
+                let (Some(name), Some(entries)) = (it.next(), it.next()) else {
+                    return Frame::Array(FrameVec::new());
+                };
+                pairs.push((name, entries));
+            }
+            Frame::Map(pairs)
+        }
+        other => other,
+    }
+}
+
+/// One GEO result entry `[member, ..., [x, y]]` -> the same with Double
+/// coordinates (moon#568).
+///
+/// Redis's reply builder emits the optional extras in a FIXED order — dist,
+/// hash, then coords — regardless of the order the client wrote the options,
+/// so the coordinate pair is always the LAST element when WITHCOORD is on.
+/// Only a trailing 2-element array is rewritten, which is why a reply that
+/// carries no coordinates at all (a flat member name, or `[member, dist]`)
+/// falls through unchanged.
+fn geo_coords(frame: Frame) -> Frame {
+    match frame {
+        Frame::Array(items) if matches!(items.last(), Some(Frame::Array(xy)) if xy.len() == 2) => {
+            let last = items.len() - 1;
+            let mut out: Vec<Frame> = Vec::with_capacity(items.len());
+            for (i, item) in items.into_iter().enumerate() {
+                out.push(if i == last {
+                    map_elements(item, bulk_to_double)
+                } else {
+                    item
+                });
+            }
+            Frame::Array(FrameVec::from_vec(out))
         }
         other => other,
     }
@@ -792,5 +891,168 @@ mod tests {
                 data: Bytes::from_static(b"id=1 addr=x"),
             }
         );
+    }
+
+    // ---- moon#577: XREAD/XREADGROUP are a Map keyed by stream name --------
+
+    /// The reply container the stream readers build: `[[name, entries], ...]`.
+    fn stream_reply() -> Frame {
+        Frame::Array(framevec![Frame::Array(framevec![
+            bulk("st"),
+            Frame::Array(framevec![Frame::Array(framevec![
+                bulk("1-1"),
+                Frame::Array(framevec![bulk("f"), bulk("v")]),
+            ])]),
+        ])])
+    }
+
+    #[test]
+    fn xread_family_classifies_as_a_stream_map() {
+        for cmd in [&b"XREAD"[..], b"XREADGROUP"] {
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["COUNT", "10", "STREAMS", "st", "0"])),
+                Resp3Shape::StreamMap,
+                "{} must carry the StreamMap shape",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // Neighbours in the same command family must NOT be swept up: XRANGE
+        // and XINFO GROUPS keep their arrays.
+        assert_eq!(
+            resp3_shape_of(b"XRANGE", &args(&["st", "-", "+"])),
+            Resp3Shape::None
+        );
+        assert_eq!(
+            resp3_shape_of(b"XINFO", &args(&["GROUPS", "st"])),
+            Resp3Shape::None
+        );
+    }
+
+    #[test]
+    fn stream_map_rekeys_only_the_outer_container() {
+        let Frame::Map(pairs) = apply_shape(Resp3Shape::StreamMap, stream_reply(), 3) else {
+            panic!("XREAD must convert to a Map on RESP3");
+        };
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, bulk("st"), "the map key is the stream NAME");
+        // The entries below are untouched: only the container re-types.
+        assert_eq!(
+            pairs[0].1,
+            Frame::Array(framevec![Frame::Array(framevec![
+                bulk("1-1"),
+                Frame::Array(framevec![bulk("f"), bulk("v")]),
+            ])])
+        );
+    }
+
+    #[test]
+    fn stream_map_leaves_resp2_and_the_miss_alone() {
+        assert_eq!(
+            apply_shape(Resp3Shape::StreamMap, stream_reply(), 2),
+            stream_reply(),
+            "RESP2 keeps the array-of-pairs form"
+        );
+        assert_eq!(
+            apply_shape(Resp3Shape::StreamMap, Frame::NullArray, 3),
+            Frame::NullArray,
+            "XREAD's miss is a null array in both protocols"
+        );
+    }
+
+    #[test]
+    fn stream_map_passes_through_anything_that_is_not_pairs() {
+        // A reply whose elements are not all 2-element arrays is returned
+        // WHOLE — never half-converted, never truncated.
+        let odd = Frame::Array(framevec![Frame::Array(framevec![bulk("st")])]);
+        assert_eq!(apply_shape(Resp3Shape::StreamMap, odd.clone(), 3), odd);
+        let flat = Frame::Array(framevec![bulk("st")]);
+        assert_eq!(apply_shape(Resp3Shape::StreamMap, flat.clone(), 3), flat);
+    }
+
+    // ---- moon#568: GEO WITHCOORD coordinates are Doubles ------------------
+
+    #[test]
+    fn geo_family_classifies_only_with_withcoord() {
+        for cmd in [
+            &b"GEOSEARCH"[..],
+            b"GEORADIUS",
+            b"GEORADIUS_RO",
+            b"GEORADIUSBYMEMBER",
+            b"GEORADIUSBYMEMBER_RO",
+        ] {
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["k", "1", "2", "3", "m", "WITHCOORD"])),
+                Resp3Shape::GeoCoords,
+                "{} WITHCOORD must carry the GeoCoords shape",
+                String::from_utf8_lossy(cmd)
+            );
+            assert_eq!(
+                resp3_shape_of(cmd, &args(&["k", "1", "2", "3", "m", "WITHDIST"])),
+                Resp3Shape::None,
+                "{} WITHDIST alone re-types nothing",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // GEOSEARCHSTORE replies with an Integer and must never be classified.
+        assert_eq!(
+            resp3_shape_of(b"GEOSEARCHSTORE", &args(&["d", "s", "WITHCOORD"])),
+            Resp3Shape::None
+        );
+    }
+
+    #[test]
+    fn geo_coords_converts_the_trailing_pair_in_every_option_layout() {
+        // WITHCOORD only: [member, [lon, lat]]
+        let one = Frame::Array(framevec![Frame::Array(framevec![
+            bulk("Palermo"),
+            Frame::Array(framevec![bulk("13.36"), bulk("38.11")]),
+        ])]);
+        assert_eq!(
+            apply_shape(Resp3Shape::GeoCoords, one, 3),
+            Frame::Array(framevec![Frame::Array(framevec![
+                bulk("Palermo"),
+                Frame::Array(framevec![Frame::Double(13.36), Frame::Double(38.11)]),
+            ])])
+        );
+
+        // All three: [member, dist, hash, [lon, lat]] — Redis's fixed order.
+        // The distance stays a BulkString and the hash stays an Integer.
+        let all = Frame::Array(framevec![Frame::Array(framevec![
+            bulk("Palermo"),
+            bulk("190.4424"),
+            Frame::Integer(3_479_099_956_230_698),
+            Frame::Array(framevec![bulk("13.36"), bulk("38.11")]),
+        ])]);
+        assert_eq!(
+            apply_shape(Resp3Shape::GeoCoords, all, 3),
+            Frame::Array(framevec![Frame::Array(framevec![
+                bulk("Palermo"),
+                bulk("190.4424"),
+                Frame::Integer(3_479_099_956_230_698),
+                Frame::Array(framevec![Frame::Double(13.36), Frame::Double(38.11)]),
+            ])])
+        );
+    }
+
+    #[test]
+    fn geo_coords_leaves_coordless_replies_alone() {
+        // The member-named-WITHCOORD trap: the classifier fires on the token,
+        // the converter must still not touch a reply that has no coordinates.
+        let flat = Frame::Array(framevec![bulk("WITHCOORD")]);
+        assert_eq!(apply_shape(Resp3Shape::GeoCoords, flat.clone(), 3), flat);
+
+        // WITHDIST-shaped entry: the last element is a Bulk, not a pair.
+        let dist = Frame::Array(framevec![Frame::Array(framevec![
+            bulk("Palermo"),
+            bulk("190.4424"),
+        ])]);
+        assert_eq!(apply_shape(Resp3Shape::GeoCoords, dist.clone(), 3), dist);
+
+        // RESP2 is untouched.
+        let one = Frame::Array(framevec![Frame::Array(framevec![
+            bulk("Palermo"),
+            Frame::Array(framevec![bulk("13.36"), bulk("38.11")]),
+        ])]);
+        assert_eq!(apply_shape(Resp3Shape::GeoCoords, one.clone(), 2), one);
     }
 }

@@ -124,12 +124,130 @@ pub fn parse_tracking_args(args: &[Frame]) -> Result<TrackingConfig, Frame> {
     })
 }
 
+/// `CLIENT NO-EVICT ON|OFF` and `CLIENT NO-TOUCH ON|OFF` (moon#580).
+///
+/// Redis 7+ registers both subcommands in its command table with arity **3**
+/// (exact), so the `ON|OFF` argument is mandatory and a fourth argument is an
+/// arity error too — only a present-but-unrecognised value reaches the
+/// subcommand body and becomes a syntax error. Measured against redis-server
+/// 8.6.1:
+///
+/// ```text
+/// CLIENT NO-EVICT           -> -ERR wrong number of arguments for 'client|no-evict' command
+/// CLIENT NO-EVICT ON EXTRA  -> -ERR wrong number of arguments for 'client|no-evict' command
+/// CLIENT NO-EVICT MAYBE     -> -ERR syntax error
+/// CLIENT NO-EVICT ON|OFF    -> +OK
+/// ```
+///
+/// Moon used to answer `+OK` to every one of those, telling a client the
+/// setting had been applied when nothing was ever parsed.
+///
+/// `sub` is the raw subcommand token (any case); `args` starts AT that token,
+/// so `args[0]` is the subcommand and `args[1]` is its `ON|OFF` argument —
+/// the same slice the three dispatch paths already hold. Allocation-free: both
+/// error texts are static, so this is safe on the dispatch hot path.
+///
+/// Moon does not yet act on either flag (it has no per-client eviction bucket
+/// and no LRU-touch suppression); this makes the PARSE faithful, so a client
+/// is no longer told a setting took effect when the request was malformed.
+#[must_use]
+pub fn no_evict_or_no_touch(sub: &[u8], args: &[Frame]) -> Frame {
+    let arity_err: &'static [u8] = if sub.eq_ignore_ascii_case(b"NO-TOUCH") {
+        b"ERR wrong number of arguments for 'client|no-touch' command"
+    } else {
+        b"ERR wrong number of arguments for 'client|no-evict' command"
+    };
+    if args.len() != 2 {
+        return Frame::Error(Bytes::from_static(arity_err));
+    }
+    match &args[1] {
+        Frame::BulkString(v) | Frame::SimpleString(v)
+            if v.eq_ignore_ascii_case(b"ON") || v.eq_ignore_ascii_case(b"OFF") =>
+        {
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+        _ => Frame::Error(Bytes::from_static(b"ERR syntax error")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::from(s.to_vec()))
+    }
+
+    // ---- CLIENT NO-EVICT / NO-TOUCH arity (moon#580) ----------------------
+
+    fn err_text(f: &Frame) -> String {
+        match f {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            Frame::SimpleString(s) => format!("+{}", String::from_utf8_lossy(s)),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_evict_without_its_argument_is_an_arity_error() {
+        assert_eq!(
+            err_text(&no_evict_or_no_touch(b"NO-EVICT", &[bs(b"NO-EVICT")])),
+            "ERR wrong number of arguments for 'client|no-evict' command"
+        );
+        assert_eq!(
+            err_text(&no_evict_or_no_touch(b"NO-TOUCH", &[bs(b"NO-TOUCH")])),
+            "ERR wrong number of arguments for 'client|no-touch' command"
+        );
+    }
+
+    #[test]
+    fn no_evict_with_an_extra_argument_is_also_an_arity_error() {
+        // Redis's arity 3 is EXACT, not a minimum.
+        assert_eq!(
+            err_text(&no_evict_or_no_touch(
+                b"NO-EVICT",
+                &[bs(b"NO-EVICT"), bs(b"ON"), bs(b"EXTRA")]
+            )),
+            "ERR wrong number of arguments for 'client|no-evict' command"
+        );
+    }
+
+    #[test]
+    fn no_evict_with_a_bad_value_is_a_syntax_error_not_an_arity_error() {
+        // The two error classes are distinct in Redis and must stay distinct
+        // here: arity is checked by the command table, the value by the body.
+        assert_eq!(
+            err_text(&no_evict_or_no_touch(
+                b"NO-EVICT",
+                &[bs(b"NO-EVICT"), bs(b"MAYBE")]
+            )),
+            "ERR syntax error"
+        );
+    }
+
+    #[test]
+    fn no_evict_on_and_off_are_accepted_in_any_case() {
+        for v in [&b"ON"[..], b"off", b"On", b"OFF"] {
+            assert_eq!(
+                no_evict_or_no_touch(b"no-evict", &[bs(b"no-evict"), bs(v)]),
+                Frame::SimpleString(Bytes::from_static(b"OK")),
+                "CLIENT NO-EVICT {} must be accepted",
+                String::from_utf8_lossy(v)
+            );
+        }
+    }
+
+    #[test]
+    fn no_evict_with_a_non_string_argument_is_a_syntax_error() {
+        // A client can put any RESP type in the slot; the parser must answer,
+        // never panic.
+        assert_eq!(
+            err_text(&no_evict_or_no_touch(
+                b"NO-EVICT",
+                &[bs(b"NO-EVICT"), Frame::Integer(1)]
+            )),
+            "ERR syntax error"
+        );
     }
 
     #[test]

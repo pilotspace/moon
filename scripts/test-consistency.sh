@@ -694,6 +694,11 @@ assert_both "GEODIST m" GEODIST edge:geo Palermo Catania
 assert_both "GEODIST km" GEODIST edge:geo Palermo Catania km
 assert_both "GEOHASH" GEOHASH edge:geo Palermo
 assert_both "GEOADD count" GEOADD edge:geo 2.349014 48.864716 Paris
+# moon#568: WITHCOORD prints the full shortest-round-tripping decimal, exactly
+# as GEOPOS does — it used to be truncated to 4 places on BOTH protocols.
+assert_both "GEOSEARCH WITHCOORD" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHCOORD
+assert_both "GEORADIUS WITHCOORD" GEORADIUS edge:geo 15 37 200 km ASC WITHCOORD
+assert_both "GEORADIUSBYMEMBER WITHCOORD+DIST" GEORADIUSBYMEMBER edge:geo Palermo 200 km ASC WITHCOORD WITHDIST
 
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"

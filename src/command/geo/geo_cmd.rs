@@ -742,10 +742,16 @@ fn geosearch_core(
                     entry.push(Frame::Integer(*score as i64));
                 }
                 if withcoord {
+                    // Full shortest-round-tripping decimal, exactly as GEOPOS
+                    // prints it — Redis builds both through the same
+                    // `addReplyHumanLongDouble` path. `{:.4}` here truncated
+                    // WITHCOORD to ~11m of resolution on BOTH protocols
+                    // (moon#568). WITHDIST above keeps `{:.4}`: that one really
+                    // is `addReplyDoubleDistance` in Redis.
                     entry.push(Frame::Array(
                         vec![
-                            Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
-                            Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
+                            Frame::BulkString(Bytes::from(fmt_geo_coord(*lon))),
+                            Frame::BulkString(Bytes::from(fmt_geo_coord(*lat))),
                         ]
                         .into(),
                     ));
