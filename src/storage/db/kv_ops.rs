@@ -332,15 +332,11 @@ impl Database {
         let new_cost = entry_overhead(&key, &entry);
         let has_expiry = entry.has_expiry();
         let new_ttl = entry.expires_at_ms();
-        // moon#541: a HashWithTtl value arriving whole (RESTORE, cold
-        // promotion, replication apply) must arm the hash-field-TTL latch —
-        // one discriminant match on the write path, no allocation.
-        if matches!(
-            entry.value.as_redis_value(),
-            crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
-        ) {
-            self.hash_field_ttl_latch = true;
-        }
+        // moon#543: a HashWithTtl value arriving whole (RESTORE, cold
+        // promotion, replication apply) must be indexed for the hash-field
+        // sweep — one discriminant match on the write path, no allocation
+        // for every other value kind.
+        self.hash_expiry_index_note_value(&key, &entry);
         let mut old_cost: usize = 0;
         let mut old_ttl: u64 = 0;
 
@@ -447,7 +443,7 @@ impl Database {
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
         self.expiry_index.clear();
-        self.hash_field_ttl_latch = false;
+        self.hash_expiry_index.clear();
         self.hot_keys.clear();
         // D1: FLUSH must clear the cold tier too, or flushed keys stay
         // readable via cold read-through. Files are queued for unlink and
@@ -481,12 +477,7 @@ impl Database {
             self.maybe_has_expiring_keys = true;
             self.expiry_index_insert(entry.expires_at_ms(), &key);
         }
-        if matches!(
-            entry.value.as_redis_value(),
-            crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
-        ) {
-            self.hash_field_ttl_latch = true;
-        }
+        self.hash_expiry_index_note_value(&key, &entry);
         entry.set_version(self.next_birth_version());
         self.data.insert(CompactKey::from(key), entry);
     }
@@ -499,27 +490,27 @@ impl Database {
         // rebuild it from scratch so any load path that bypassed
         // `insert_for_load` still ends consistent.
         let mut index = std::collections::BTreeSet::new();
-        let mut any_hash_ttl = false;
+        let mut hash_index = std::collections::BTreeSet::new();
         for (key, entry) in self.data.iter() {
             total += entry_overhead(key.as_bytes(), entry);
             if entry.has_expiry() {
                 any_expiring = true;
                 index.insert((entry.expires_at_ms(), key.clone()));
             }
-            if matches!(
-                entry.value.as_redis_value(),
-                crate::storage::compact_value::RedisValueRef::HashWithTtl { .. }
-            ) {
-                any_hash_ttl = true;
+            // moon#543: the same healing property for the hash-field index —
+            // a load path that bypassed `insert_for_load` still ends indexed.
+            if let crate::storage::compact_value::RedisValueRef::HashWithTtl { ttls, .. } =
+                entry.value.as_redis_value()
+                && let Some(min) = ttls.values().copied().min()
+            {
+                hash_index.insert((min, key.clone()));
             }
         }
         self.used_memory = total;
         self.maybe_has_expiring_keys = any_expiring;
         self.expiry_index = index;
-        // Authoritative, like the index rebuild above: the scan just proved
-        // exactly whether any HashWithTtl exists, so a restore WITHOUT them
-        // also clears a previously raised latch.
-        self.hash_field_ttl_latch = any_hash_ttl;
+        // Authoritative, like the whole-key index rebuild above.
+        self.hash_expiry_index = hash_index;
     }
 
     /// Pre-size the internal hash table for an expected key count.
@@ -545,7 +536,7 @@ impl Database {
             // matching `clear` (no-ops on the documented empty-db call, but
             // the misuse case must not leave stale pairs behind).
             self.expiry_index.clear();
-            self.hash_field_ttl_latch = false;
+            self.hash_expiry_index.clear();
         }
     }
 
@@ -608,6 +599,9 @@ impl Database {
             if entry.has_expiry() {
                 self.expiry_index_remove(entry.expires_at_ms(), key);
             }
+            // moon#543: same for the hash-field index (best-effort; one
+            // `is_empty` load when no field TTL exists anywhere).
+            self.hash_expiry_index_forget(key, &entry);
             Some(entry)
         } else {
             None

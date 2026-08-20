@@ -170,6 +170,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #569 ACL gate had to be paired with it — `acl::keyspec` reads keys and `numkeys` out of the argv
   as bytes, so an integer frame in either slot was un-enumerable and a LEGITIMATE in-pattern
   `LMPOP` would have failed closed.
+- **The hash-field TTL sweep was unbudgeted, expiry ticks ran with nothing due, and eviction
+  spilled keys about to expire** (#543, #552, #553) — three CPU/IO wastes on the 100ms shard-loop
+  timer, the latency-critical path.
+  - **#543 — sweep 2 is now deadline-indexed and bounded.** The hash-field reap collected EVERY
+    `HashWithTtl` key in the database with a full table scan and reaped all of them, with no time
+    budget, no sampling and no batch cap, every tick. It now pops due `(min_expiry_ms, key)` pairs
+    off a `hash_expiry_index` — the sibling of #541's whole-key index — and is bounded three ways:
+    the same 1ms wall-clock budget as sweep 1, 256 hashes visited per tick, and 256 fields drained
+    per visit. A partly-reaped hash is re-armed at its still-due minimum and resumed. The index
+    holds a LOWER BOUND on each hash's minimum, which makes it self-healing: only
+    `hash_set_field_ttl` can lower a minimum (so only it must index), while a raised TTL or a
+    deleted hash leaves a stale-EARLY pair that the sweep pops, finds nothing due for, and re-arms
+    or drops. Deferring a reap is invisible to clients — the read path already filters `ttls`
+    against the shard clock, so only the memory reclaim is deferred. The reap now also takes its
+    clock from the caller: sweeping against a clock ahead of `Database::cached_now_ms` (which the
+    hash read path filters with) could physically drop a field reads still considered live.
+  - **#552 — a tick with nothing due costs two head-peeks.** The `maybe_has_expiring_keys` latch
+    only ever saved a database with ZERO TTL'd keys; a TTL-heavy one entered the cycle every 100ms
+    just to re-derive "nothing due". Both indexes are deadline-ordered, so one `O(log n)` head-peek
+    each answers that definitively, and the gate asks each sweep against the clock IT reaps with.
+  - **#553 — eviction stops spilling keys that are about to expire.** A victim under
+    `SPILL_TTL_FLOOR_MS` (1s) from expiry cost a datafile write, an fsync, a manifest commit and a
+    cold-index entry for a value reclaimed moments later — and cold TTLs are lazy-only, so nothing
+    sweeps it afterwards. `volatile-ttl` made this pathological by construction: it selects the
+    NEAREST deadline in the database, i.e. the victim least worth persisting. Such victims are now
+    plain-dropped instead (same RAM reclaimed, zero IO) on both the sync-batch and async-spill
+    paths, reported through the same `on_plain_drop` sink a plain eviction uses so the dual-plane
+    `DEL` still reaches replicas and the AOF, and counted as progress so an all-drops batch is not
+    mistaken for "cannot evict". Eviction already DELETES victims under every non-`noeviction`
+    policy in redis, so this gives up at most one second of extra visibility on a key that is about
+    to become invisible anyway; `noeviction` never reaches the path. New metric
+    `moon_eviction_expiring_drop_total` counts the spills avoided.
+  - Found and fixed alongside: a `HashWithTtl` arriving as a WHOLE value (RESTORE, replication
+    apply, cold promotion) never raised `maybe_has_expiring_keys`, so unless some unrelated key in
+    the same database happened to hold a TTL, its expired fields were never actively reaped at all.
+  - New `benches/expiry_sweep.rs` measures one tick in all three shapes; the bounded-sweep and
+    spill-guard tests were each verified to FAIL against the pre-fix behaviour.
 - **`CLIENT TRACKING` never invalidated for movablekeys commands, so client-side caches went
   permanently stale** (#582). Commands whose keys are not at a fixed argument position carry
   `first_key: 0` in `COMMAND_META`, mirroring redis's own table — that means "the keys are not at a

@@ -269,6 +269,10 @@ name = "pubsub_hotpath"
 harness = false
 
 [[bench]]
+name = "expiry_sweep"
+harness = false
+
+[[bench]]
 name = "graph_bench"
 harness = false
 required-features = ["graph"]

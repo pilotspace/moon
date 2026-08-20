@@ -43,8 +43,27 @@ impl Database {
     /// `SmallVec` avoids heap allocation for the common case of ≤8 expired
     /// fields per tick.
     pub fn reap_expired_fields_one_hash(&mut self, key: &[u8]) -> ReapOutcome {
-        let now_ms = self.now_ms();
+        self.reap_expired_fields_one_hash_at(key, self.now_ms(), usize::MAX)
+    }
 
+    /// [`Self::reap_expired_fields_one_hash`] with the clock and the per-call
+    /// field budget supplied by the caller (moon#543).
+    ///
+    /// `now_ms` is explicit because the active sweep MUST reap against the
+    /// same instant its index head-peek used. With two clocks the sweep could
+    /// pop a pair it believes is due, have the reap answer `NoOp` against a
+    /// staler `self.now_ms()`, re-arm the same still-due pair, and spin on it
+    /// for the whole tick budget.
+    ///
+    /// `max_fields` caps how many expired fields leave in one call so a
+    /// single enormous hash cannot stall the shard event loop; the caller
+    /// re-arms the (still-due) pair and resumes.
+    pub fn reap_expired_fields_one_hash_at(
+        &mut self,
+        key: &[u8],
+        now_ms: u64,
+        max_fields: usize,
+    ) -> ReapOutcome {
         // --- Pass 1: immutable scan to collect expired field names ----------
         // We clone the field names so we can drop the immutable borrow before
         // the mutable pass.
@@ -54,6 +73,7 @@ impl Database {
                     .iter()
                     .filter(|(_, t)| **t <= now_ms)
                     .map(|(f, _)| f.clone())
+                    .take(max_fields)
                     .collect(),
                 _ => return ReapOutcome::NoOp,
             },
