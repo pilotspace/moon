@@ -405,14 +405,18 @@ pub(crate) async fn handle_connection_sharded_inner<
     }
     let _registry_guard = RegistryGuard(client_id);
 
-    // Functions API registry — LAZY per connection (P-1 footprint): built on
-    // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
-    // >99% of connections that never touch the Functions API pay zero
-    // registry + eviction-ctx cost. Kept as a local because Rc<RefCell<>> is
-    // !Send. The eviction ctx (Gap B — FCALL-internal `redis.call` writes run
-    // the same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    // Functions API registry — LAZY per SHARD (P-1 footprint): built on first
+    // FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so a shard that
+    // never sees the Functions API pays zero registry + eviction-ctx cost.
+    // The eviction ctx (Gap B — FCALL-internal `redis.call` writes run the
+    // same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    //
+    // moon#514: per SHARD, not per connection. This used to be a local
+    // `Rc::new(RefCell::new(None))`, which scoped the whole Functions API to
+    // one TCP connection — `FUNCTION LOAD` on one connection left
+    // `FUNCTION LIST` empty on the next.
     let func_registry: std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
+        crate::scripting::shard_function_registry();
 
     // Per-connection arena for batch processing temporaries.
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
@@ -1102,6 +1106,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#508: a script whose keys all live on another
                         // shard runs THERE. Same helper as handler_monoio —
                         // one routing policy, not two that can drift.
+                        // moon#515: fan an EVAL'd body out on first sight so
+                        // a later EVALSHA is answerable from every shard.
+                        // Before routing, so the load and the execution reach
+                        // the target over the same ring in that order.
+                        if cmd.eq_ignore_ascii_case(b"EVAL") {
+                            crate::server::conn::shared::eval_script_fanout(
+                                ctx, &shutdown, cmd_args,
+                            )
+                            .await;
+                        }
                         // moon#569: resolve the caller once, authorize every
                         // inner `redis.call` against it — locally and on the
                         // shard this script may route to.
@@ -1273,17 +1287,71 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if !conn.in_multi {
                         if cmd.eq_ignore_ascii_case(b"FUNCTION") {
                             crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
-                            let mut guard = func_registry.borrow_mut();
-                            #[allow(clippy::unwrap_used)]
-                            // ensure_function_registry guarantees Some
-                            let response = crate::command::functions::handle_function(
-                                guard.as_mut().unwrap(), cmd_args,
+                            // Borrow SCOPED to this block, so it is released
+                            // before the fan-out await: the registry RefCell is
+                            // shared with this shard thread's SPSC drain loop,
+                            // which applies INBOUND fan-outs. A trailing
+                            // `drop(guard)` satisfies the borrow checker but
+                            // still trips `await_holding_refcell_ref`.
+                            let mut response = {
+                                let mut guard = func_registry.borrow_mut();
+                                #[allow(clippy::unwrap_used)]
+                                // ensure_function_registry guarantees Some
+                                crate::command::functions::handle_function(
+                                    guard.as_mut().unwrap(), cmd_args,
+                                )
+                            };
+                            // moon#514: FUNCTION is a server-wide verb; replay
+                            // LOAD/DELETE/FLUSH on every other shard.
+                            // A replay that did not reach every shard
+                            // REPLACES the local reply: the client asked for a
+                            // server-wide mutation, and `+OK` over a registry
+                            // that answers differently per shard is the defect
+                            // this fix removes, not a shape to keep on the
+                            // failure path.
+                            if let Some(op) = crate::server::conn::shared::function_fanout_op(
+                                cmd_args, &response,
+                            ) {
+                                if let Some(partial) =
+                                    crate::server::conn::shared::function_registry_fanout(
+                                        ctx, &shutdown, op,
+                                    )
+                                    .await
+                                {
+                                    response = partial;
+                                }
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+                        let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
+                        if is_fcall || cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                            // moon#569: FCALL bodies are ACL-gated per
+                            // `redis.call`, same as EVAL. Resolved BEFORE
+                            // routing so the same identity applies whether the
+                            // call runs here or on the shard owning the key —
+                            // routing must never change what a caller may do.
+                            let script_acl = crate::acl::ScriptAcl::for_user(
+                                &ctx.acl_table,
+                                &conn.current_user,
                             );
-                            drop(guard);
-                            responses.push(response);
-                            continue;
-                        }
-                        if cmd.eq_ignore_ascii_case(b"FCALL") {
+                            // moon#514 defect 1 (== moon#508): route to the
+                            // shard owning the key instead of refusing
+                            // CROSSSLOT because the key is not local. Same
+                            // helper as handler_monoio — one routing policy.
+                            if let Some(routed) =
+                                crate::server::conn::shared::route_script_elsewhere(
+                                    cmd,
+                                    cmd_args,
+                                    conn.selected_db,
+                                    &script_acl,
+                                    ctx,
+                                )
+                                .await
+                            {
+                                responses.push(routed);
+                                continue;
+                            }
                             crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
                             let db_count = ctx.shard_databases.db_count();
                             let guard = func_registry.borrow();
@@ -1292,36 +1360,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
                             let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                crate::command::functions::handle_fcall(
-                                    reg, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    // moon#569: FCALL runs under the caller's ACL.
-                                    &crate::acl::ScriptAcl::for_user(
-                                        &ctx.acl_table, &conn.current_user,
-                                    ),
-                                )
-                            });
-                            drop(guard);
-                            responses.push(response);
-                            continue;
-                        }
-                        if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
-                            crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
-                            let db_count = ctx.shard_databases.db_count();
-                            let guard = func_registry.borrow();
-                            #[allow(clippy::unwrap_used)]
-                            // ensure_function_registry guarantees Some
-                            let reg = guard.as_ref().unwrap();
-                            // Unconditional slice path: ShardSlice is always initialized.
-                            let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                crate::command::functions::handle_fcall_ro(
-                                    reg, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    // moon#569: FCALL runs under the caller's ACL.
-                                    &crate::acl::ScriptAcl::for_user(
-                                        &ctx.acl_table, &conn.current_user,
-                                    ),
-                                )
+                                // moon#569: FCALL runs under the caller's
+                                // ACL. Built once and shared by both arms —
+                                // main split FCALL and FCALL_RO into two
+                                // blocks to add it; moon#514 needs them
+                                // unified because BOTH route through
+                                // `route_script_elsewhere` first.
+                                if is_fcall {
+                                    crate::command::functions::handle_fcall(
+                                        reg, cmd_args, db,
+                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        &script_acl,
+                                    )
+                                } else {
+                                    crate::command::functions::handle_fcall_ro(
+                                        reg, cmd_args, db,
+                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        &script_acl,
+                                    )
+                                }
                             });
                             drop(guard);
                             responses.push(response);

@@ -526,6 +526,101 @@ pub(crate) fn handle_shard_message_shared(
                     return;
                 }
 
+                // FCALL/FCALL_RO routed here because THIS shard owns the
+                // key (moon#514, same rule as EVAL above). `cmd_dispatch`
+                // has no Functions arm either — the connection layer
+                // intercepts them — so without this a routed FCALL comes
+                // back as an unknown command.
+                let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
+                if is_fcall || cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                    let Some(rt) = lua_rt else {
+                        let _ = reply_tx.send(crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(
+                                b"ERR scripting is unavailable on this shard",
+                            ),
+                        ));
+                        return;
+                    };
+                    let slot = crate::scripting::shard_function_registry();
+                    // Build on first use exactly as a local connection would;
+                    // a fan-out may not have arrived yet on a shard that has
+                    // never seen the Functions API.
+                    //
+                    // `try_borrow*` rather than `borrow*`: this runs ON the
+                    // shard thread, where a panic aborts the whole process,
+                    // and the same `RefCell` is reachable from the connection
+                    // handlers on this thread. A borrow conflict is not
+                    // supposed to be possible (no `.await` is taken while it
+                    // is held), but refusing one command beats killing the
+                    // shard if that ever stops being true.
+                    {
+                        let Ok(mut guard) = slot.try_borrow_mut() else {
+                            let _ = reply_tx.send(crate::protocol::Frame::Error(
+                                bytes::Bytes::from_static(
+                                    b"ERR function registry busy on this shard",
+                                ),
+                            ));
+                            return;
+                        };
+                        if guard.is_none() {
+                            *guard = Some(crate::scripting::FunctionRegistry::new(
+                                rt.eviction_ctx().clone(),
+                            ));
+                        }
+                    }
+                    let Ok(guard) = slot.try_borrow() else {
+                        let _ = reply_tx.send(crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(b"ERR function registry busy on this shard"),
+                        ));
+                        return;
+                    };
+                    let Some(reg) = guard.as_ref() else {
+                        let _ = reply_tx.send(crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(
+                                b"ERR function registry unavailable on this shard",
+                            ),
+                        ));
+                        return;
+                    };
+                    let frame = crate::shard::slice::with_shard(|s| {
+                        let db_count = s.databases.len();
+                        let db = &mut s.databases[db_idx];
+                        // moon#569 + moon#514: the ACL that travels with
+                        // `ShardMessage::Execute` is the ORIGIN connection's, so a
+                        // routed FCALL authorizes each inner `redis.call` exactly as
+                        // it would have on the shard the client is attached to.
+                        // Using this shard's own identity instead would let routing —
+                        // an implementation detail the client cannot see — decide
+                        // permissions.
+                        if is_fcall {
+                            crate::command::functions::handle_fcall(
+                                reg,
+                                args,
+                                db,
+                                shard_id,
+                                rt.num_shards(),
+                                db_idx,
+                                db_count,
+                                &script_acl,
+                            )
+                        } else {
+                            crate::command::functions::handle_fcall_ro(
+                                reg,
+                                args,
+                                db,
+                                shard_id,
+                                rt.num_shards(),
+                                db_idx,
+                                db_count,
+                                &script_acl,
+                            )
+                        }
+                    });
+                    drop(guard);
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
+
                 // FT.* commands route to VectorStore, not the KV Database.
                 // Intercept before cmd_dispatch so the console gateway's
                 // ShardMessage::Execute path reaches the vector handlers.
@@ -2020,11 +2115,45 @@ pub(crate) fn handle_shard_message_shared(
             }
             slot.add(batch_total);
         }
-        ShardMessage::ScriptLoad { sha1, script } => {
+        ShardMessage::ScriptLoad { sha1, script, ack } => {
             // Fan-out: cache this script on this shard so EVALSHA works locally
             let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
             if computed == sha1 {
                 script_cache.borrow_mut().load(script);
+            }
+            // Answered even on a digest mismatch — as a FAILURE. The sender
+            // is waiting to answer its client and must not hang, but it also
+            // must not be told a cache it never wrote is in step. A mismatch
+            // is impossible from the fan-out path (the digest is computed from
+            // the same bytes) and would mean memory corruption.
+            if let Some(ack) = ack {
+                let _ = ack.send(computed == sha1);
+            }
+        }
+        ShardMessage::FunctionRegistry { op, ack } => {
+            // moon#514: replay a FUNCTION LOAD/DELETE/FLUSH that another
+            // shard's connection accepted, so this shard's registry agrees.
+            // Without a Lua runtime there is no eviction ctx to build the
+            // registry with, and silently skipping would leave this shard
+            // answering `ERR Function not found` forever — say so.
+            let Some(rt) = lua_rt else {
+                tracing::warn!(
+                    "shard {shard_id}: FUNCTION fan-out dropped (no Lua runtime on this shard); \
+                     its function registry is divergent until the next load"
+                );
+                crate::admin::metrics_setup::record_xshard_fanout_drop("function_op");
+                // Answered as a FAILURE rather than left to time out: the
+                // sender must not hang, and must not report success for a
+                // registry this shard never touched.
+                if let Some(ack) = ack {
+                    let _ = ack.send(false);
+                }
+                return;
+            };
+            let slot = crate::scripting::shard_function_registry();
+            let applied = crate::scripting::apply_registry_op(&slot, rt.eviction_ctx(), op);
+            if let Some(ack) = ack {
+                let _ = ack.send(applied);
             }
         }
         ShardMessage::SnapshotBegin {

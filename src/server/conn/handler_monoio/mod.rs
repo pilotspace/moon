@@ -422,8 +422,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // registry + eviction-ctx cost. Kept as a local because Rc<RefCell<>> is
     // !Send. The eviction ctx (Gap B — FCALL-internal `redis.call` writes run
     // the same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    // moon#514: PER-SHARD, not per-connection. The old `Rc::new(RefCell::new(
+    // None))` here scoped the whole Functions API to one TCP connection —
+    // `FUNCTION LOAD` on one connection left `FUNCTION LIST` empty on the
+    // next, and every other connection's `FCALL` answered `ERR Function not
+    // found`. This handle is the shard thread's single registry, which the
+    // SPSC drain loop also reaches to apply fan-outs and run routed FCALLs.
     let func_registry: Rc<RefCell<Option<crate::scripting::FunctionRegistry>>> =
-        Rc::new(RefCell::new(None));
+        crate::scripting::shard_function_registry();
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
@@ -1878,7 +1884,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if cmd_len == 4
-                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses).await
+                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &shutdown, &mut responses)
+                    .await
             {
                 continue;
             }
@@ -2114,8 +2121,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &conn,
                 ctx,
                 &func_registry,
+                &shutdown,
                 &mut responses,
-            ) {
+            )
+            .await
+            {
                 continue;
             }
 

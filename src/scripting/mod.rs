@@ -5,7 +5,9 @@ pub mod sandbox;
 pub mod types;
 
 pub use cache::ScriptCache;
-pub use functions::FunctionRegistry;
+pub use functions::{
+    FunctionRegistry, FunctionRegistryOp, apply_registry_op, shard_function_registry,
+};
 
 use bytes::Bytes;
 use mlua::prelude::*;
@@ -268,6 +270,18 @@ impl ShardLuaRuntime {
 
     pub fn num_shards(&self) -> usize {
         self.num_shards
+    }
+
+    /// The shard's OOM/eviction gate, as needed to build this shard's
+    /// [`FunctionRegistry`] on the SPSC drain path (moon#514).
+    ///
+    /// The drain loop has no `ConnectionContext` to call
+    /// `build_lua_eviction_ctx()` on, and a fan-out'd `FUNCTION LOAD` — or an
+    /// `FCALL` routed here because this shard owns the key — must be able to
+    /// materialise the registry with the same write gate a local connection
+    /// would have given it.
+    pub fn eviction_ctx(&self) -> &bridge::LuaEvictionCtx {
+        &self.eviction_ctx
     }
 
     /// The shard's VM, built on first use.

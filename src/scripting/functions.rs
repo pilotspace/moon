@@ -252,19 +252,34 @@ impl FunctionRegistry {
             for (i, key) in keys.iter().enumerate() {
                 keys_table.set(i as i64 + 1, lib.lua.create_string(key.as_ref())?)?;
             }
-            lib.lua.globals().set("KEYS", keys_table)?;
+            lib.lua.globals().set("KEYS", keys_table.clone())?;
 
             let argv_table = lib.lua.create_table()?;
             for (i, arg) in argv.iter().enumerate() {
                 argv_table.set(i as i64 + 1, lib.lua.create_string(arg.as_ref())?)?;
             }
-            lib.lua.globals().set("ARGV", argv_table)?;
+            lib.lua.globals().set("ARGV", argv_table.clone())?;
 
-            // Call the registered function
+            // Call the registered function.
+            //
+            // The `(keys, args)` PARAMETERS are the documented Redis Functions
+            // calling convention — `redis.register_function('f', function(keys,
+            // args) ... end)` is the form in every Redis example and every
+            // client library's docs. moon used to call with `()` and publish
+            // the values only as the `KEYS`/`ARGV` globals (the EVAL
+            // convention), so the idiomatic callback received `nil` and every
+            // such function died with "attempt to index a nil value (local
+            // 'keys')". Surfaced by moon#514: until FCALL was routed to the
+            // key's shard, this error was masked by the CROSSSLOT /
+            // `ERR Function not found` that came first.
+            //
+            // The globals are still set, so bodies written against the
+            // EVAL-style `KEYS[1]` keep working; a Lua function ignores extra
+            // arguments, so a zero-parameter callback is unaffected either way.
             let func_name_str = lib.lua.create_string(func_name)?;
             let func_tbl: mlua::Table = lib.lua.globals().get("__moon_functions")?;
             let registered: mlua::Function = func_tbl.get(func_name_str)?;
-            let val: LuaValue = registered.call(())?;
+            let val: LuaValue = registered.call((keys_table, argv_table))?;
             crate::scripting::types::lua_value_to_frame(&lib.lua, &val)
         })();
 
@@ -438,6 +453,113 @@ impl FunctionRegistry {
             functions,
             lua,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-SHARD registry (moon#514)
+// ---------------------------------------------------------------------------
+
+/// A registry mutation that must reach every shard, not just the one whose
+/// connection issued it (moon#514).
+///
+/// `FUNCTION LOAD`/`DELETE`/`FLUSH` are server-wide verbs in Redis. In moon
+/// each shard thread owns its own [`FunctionRegistry`], so all three have to
+/// be replayed on the other shards or `FCALL` answers `ERR Function not
+/// found` on whichever shard the key happened to land on.
+///
+/// `Load` deliberately carries the SOURCE, not a parsed library: a
+/// [`Library`] owns an `Rc<Lua>` and is `!Send`, and each shard needs its own
+/// VM anyway. Replay is a re-`load` on the receiving thread.
+#[derive(Debug, Clone)]
+pub enum FunctionRegistryOp {
+    /// Replay a `FUNCTION LOAD` of this library body.
+    Load { source: Bytes },
+    /// Replay a `FUNCTION DELETE` of this library name.
+    Delete { library: Bytes },
+    /// Replay a `FUNCTION FLUSH`.
+    Flush,
+}
+
+thread_local! {
+    /// The one [`FunctionRegistry`] shared by every connection on this shard
+    /// thread, plus the shard's own SPSC drain loop.
+    ///
+    /// Before moon#514 this slot was a `Rc::new(RefCell::new(None))` LOCAL to
+    /// each connection handler, so the Functions API was scoped to a single
+    /// TCP connection: `FUNCTION LOAD` on one connection left `FUNCTION LIST`
+    /// empty on the next, and `FCALL` from any other connection answered
+    /// `ERR Function not found` — measured at `--shards 4`, but true at
+    /// `--shards 1` too. Hoisting it to a thread-local makes it per-shard,
+    /// which is the scope the fan-out then replicates across shards.
+    ///
+    /// A thread-local (rather than a field threaded through
+    /// `ConnectionContext`) is deliberate and matches `shard::slice` and
+    /// `bridge::CURRENT_DB`: the shard's SPSC drain loop must reach the SAME
+    /// registry to apply a fan-out or run a routed `FCALL`, and it does not
+    /// own a `ConnectionContext`.
+    static SHARD_FUNCTION_REGISTRY: Rc<RefCell<Option<FunctionRegistry>>> =
+        Rc::new(RefCell::new(None));
+}
+
+/// Handle to this shard thread's shared [`FunctionRegistry`] slot.
+///
+/// Still `Option`: the registry is built lazily on first Functions-API use
+/// (P-1 footprint — the >99% of shards that never see `FCALL` pay nothing),
+/// via [`ensure_shard_function_registry`].
+#[must_use]
+pub fn shard_function_registry() -> Rc<RefCell<Option<FunctionRegistry>>> {
+    SHARD_FUNCTION_REGISTRY.with(Rc::clone)
+}
+
+/// Build this shard's registry if it does not exist yet, then apply `op`.
+///
+/// Used by the SPSC drain loop when a fan-out arrives on a shard where no
+/// connection has touched the Functions API: the library must land anyway, or
+/// the first `FCALL` routed here would answer `ERR Function not found` for a
+/// library the server accepted.
+///
+/// Returns whether the op was actually applied. The caller (the SPSC drain)
+/// forwards that verdict to the origin shard, which is still holding its
+/// client's reply: a body that loads on the origin and fails here — a function
+/// name that collides with a library only this shard holds, say — must surface
+/// as an error, not as `+OK` plus a divergence nobody is looking for.
+#[must_use]
+pub fn apply_registry_op(
+    slot: &RefCell<Option<FunctionRegistry>>,
+    eviction_ctx: &crate::scripting::bridge::LuaEvictionCtx,
+    op: FunctionRegistryOp,
+) -> bool {
+    let Ok(mut guard) = slot.try_borrow_mut() else {
+        // Re-entrancy would mean a fan-out arriving while THIS thread is
+        // inside a registry mutation, which the single-threaded shard model
+        // makes impossible. Refuse rather than panic on the shard thread.
+        tracing::warn!("function registry fan-out arrived re-entrantly; dropped");
+        crate::admin::metrics_setup::record_xshard_fanout_drop("function_op");
+        return false;
+    };
+    let reg = guard.get_or_insert_with(|| FunctionRegistry::new(eviction_ctx.clone()));
+    match op {
+        // `replace: true` unconditionally: the origin shard already accepted
+        // this load, so this shard must end up agreeing with it. Without
+        // REPLACE a shard that somehow still holds an older copy (a fan-out
+        // that gave up, then a re-load) would reject the repair forever.
+        FunctionRegistryOp::Load { source } => {
+            if let Err(e) = reg.load(&source, true) {
+                tracing::warn!("function library fan-out failed to load on this shard: {e:?}");
+                crate::admin::metrics_setup::record_xshard_fanout_drop("function_op");
+                return false;
+            }
+            true
+        }
+        FunctionRegistryOp::Delete { library } => {
+            reg.delete(&library);
+            true
+        }
+        FunctionRegistryOp::Flush => {
+            reg.flush();
+            true
+        }
     }
 }
 

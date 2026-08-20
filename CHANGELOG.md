@@ -294,6 +294,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list was an active lie (it asserts the stream is quiet), where the omission merely says nothing.
   The underlying routing gap is pre-existing and filed with the multi-key work above.
 
+- **Scripting state never left the shard that created it, so `EVALSHA` and `FCALL` failed
+  depending on where the key landed** (#515, #514). Moon keeps the `EVAL` script cache and the
+  Functions library registry per shard. `SCRIPT LOAD` fanned out; nothing else did — so the state a
+  command needs was, like moon#592's second key, simply not where the routing key sent the command.
+  To an application author that is indistinguishable from corruption. Measured at `--shards 4` on
+  fresh connections, before the fix:
+
+  * **`EVAL` did not publish its body** (#515). Redis caches an `EVAL`'d script server-wide, which
+    makes "`EVAL` once, then `EVALSHA` by sha" a supported and very common idiom — it is what
+    `redis-py`'s `Script` wrapper does. One bare `EVAL` followed by `EVALSHA` of that sha on twelve
+    other keys: **ok=2, NOSCRIPT=10**. The same body via `SCRIPT LOAD` first: 12/12.
+
+  * **`FCALL` was three defects stacked**, each hiding the next (#514). One `FUNCTION LOAD` then
+    eight single-key `FCALL`s: **5/8 CROSSSLOT, 3/8 `ERR Function not found`, 0/8 succeeded**, and
+    `FUNCTION LIST` on a fresh connection returned `*0`.
+    1. `FCALL` still used `validate_keys_same_shard`, which demands every key hash to the
+       *connection's* shard — the exact defect #508 fixed for `EVAL`. A single key cannot cross a
+       slot; it just lives elsewhere.
+    2. The `FunctionRegistry` was built **per connection**, so a loaded library was invisible to the
+       very next connection, and `FUNCTION LOAD` had no fan-out either. This half reproduced at
+       `--shards 1` too.
+    3. Callbacks were invoked with **no arguments**, so the documented `function(keys, args)`
+       signature received `nil` and any idiomatic library died with
+       `attempt to index a nil value (local 'keys')`. Only visible once (1) and (2) stopped erroring
+       first.
+
+  The fix. `EVAL` publishes its body to every other shard once per distinct script, and
+  `FUNCTION LOAD`/`DELETE`/`FLUSH` replay on every other shard (`DELETE`/`FLUSH` for the same reason
+  as `LOAD` in reverse: a delete that reaches one shard leaves the library callable elsewhere, which
+  is a worse lie than not deleting it). The registry is now per **shard** — a thread-local shared by
+  every connection on that shard and by the shard's SPSC drain loop. `FCALL`/`FCALL_RO` route to the
+  shard owning their key through the same helper `EVAL` uses, so there is one routing policy rather
+  than two that can drift. `call_function` passes `(keys, args)`; the `KEYS`/`ARGV` globals are still
+  set, so `EVAL`-style bodies keep working. A genuinely cross-shard key set is still refused
+  `CROSSSLOT` before anything is touched — a function runs against one shard's database and cannot
+  reach another's, so deleting that check instead of routing around it would have converted #514
+  straight into #592.
+
+  **The replay is acknowledged, and a partial replay is reported, not swallowed.** Pushing to a ring
+  only enqueues; the target applies it in its own drain loop. Returning `+OK` at push time makes
+  `FUNCTION LOAD` a lie for as long as that queue takes to drain — a client that loads and
+  immediately calls can have its `FCALL` reach a shard that has not installed the library yet. So
+  each replay carries an ack that reports whether the shard **applied** the op (delivery is not
+  application: a shard can receive a library and still reject it), and the whole ack loop runs under
+  a single 2s budget rather than a fresh 30s per shard. When some shard did not apply it, a
+  `FUNCTION` mutation answers `MOONERR partialfanout FUNCTION <verb> applied on N of M shards` — its
+  ops are idempotent under retry (`DELETE`/`FLUSH` outright, `LOAD` when re-sent with `REPLACE`), so
+  the truth plus a retry beats `+OK` over a registry that answers differently per shard. A partial
+  `EVAL` publish does **not** fail the `EVAL`: the script still runs, only a later `EVALSHA` routed
+  to the shard that missed it is affected, and `NOSCRIPT` is exactly what client libraries already
+  handle by re-sending the full `EVAL` — which republishes, because the cache tracks "published"
+  separately from "cached". Every failure is also loud (`warn!` +
+  `moon_xshard_fanout_drop_total{kind}`).
+
+  A **repair leg** was designed first and rejected under adversarial review: a later routed call that
+  hit `NOSCRIPT` / `ERR Function not found` would re-push the state from a shard that had it. Both
+  errors are also what a shard says when it has ALREADY applied a `FUNCTION DELETE` the origin has
+  not seen yet, so the repair could not tell "you never got it" from "you already dropped it" and
+  would resurrect deleted libraries — spreading the divergence, since a diverged shard keeps
+  re-seeding whichever shard owns the next key. The same mechanism un-did `SCRIPT FLUSH`, which is
+  local-only. Divergence is now prevented at publish time and reported, never patched up after.
+
+  Known limitations, stated rather than implied. Registry mutations have **no total order**: two
+  `FUNCTION` mutations issued concurrently from connections on different shards can apply in
+  different orders on different shards, and nothing reconciles them — issue them one at a time until
+  an ordering authority exists. `SCRIPT FLUSH` still does not fan out (pre-existing, genuinely
+  unchanged here). And a client that interpolates values into script bodies now replicates every
+  distinct body to all N shards instead of one, so that anti-pattern costs N× the cache it used to.
+
+  Covered in `handler_monoio` (the shipped runtime), `handler_sharded` (tokio) and the shard-side
+  SPSC drain; `handler_single` is excluded deliberately — it only runs at `--shards 1`, where there
+  is no other shard to publish to. Each half is proven load-bearing by mutation: deleting the `EVAL`
+  publish, reverting the registry to per-connection, deleting the `FCALL` routing, restoring the
+  zero-argument callback, swallowing a partial fan-out, and claiming the publish regardless of the
+  outcome each fail a distinct subset of `tests/script_function_fanout.rs`; restored, it passes
+  13/13. Two vacuous tests were found and fixed that way — the first draft took the sha from
+  `SCRIPT LOAD` on the server under test, the one command that already fanned out (it now uses a
+  hard-coded SHA1 moon cannot influence), and the republish assertion counted log lines where one
+  round already emits one per peer.
 - **The two-key write family acknowledged success while destroying the data at `--shards > 1`**
   (#592). Moon routes a command to ONE shard — the owner of the key `extract_primary_key` picks —
   and that shard then executes the whole command against its own slice. `first_key` names the
