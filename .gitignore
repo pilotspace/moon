@@ -119,6 +119,13 @@ target-fast/
 # CARGO_TARGET_DIR used for the local release-fast build+test loop
 /target-rf/
 /target-tokio/
+/target-vec/
+/target-clippy/
+# Any CARGO_TARGET_DIR: build artifacts must never be tracked. `target-stats/`
+# was committed by accident in #431 — 6,624 artifact files, ~1 GB, written by
+# every clone and every `git worktree add`. A full disk from exactly that cost
+# two agent runs and an OrbStack VM.
+target-*/
 
 # replication test-run artifact (written to CWD by save_replication_state)
 replication.state
