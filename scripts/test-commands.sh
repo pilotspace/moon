@@ -769,6 +769,26 @@ if should_run "connection"; then
     assert_moon_contains "COMMAND LIST includes reset" "reset" COMMAND LIST
     assert_moon_contains "COMMAND GETKEYS extracts the key" "k1" COMMAND GETKEYS MSET k1 v1 k2 v2
     assert_moon_contains "COMMAND GETKEYS rejects keyless" "no key arguments" COMMAND GETKEYS PING
+    # moon#537: `first_key: 0` mirrors redis and means "the keys are not at a
+    # FIXED argument position", NOT "there are no keys". Reading it as the
+    # latter made GETKEYS answer "the command has no key arguments" to the
+    # whole movablekeys family — the exact question a cluster-aware client
+    # asks GETKEYS in order to route. One assertion per key LAYOUT.
+    assert_moon_contains "GETKEYS LMPOP names its key" "mk1" COMMAND GETKEYS LMPOP 2 mk1 mk2 LEFT
+    assert_moon_contains "GETKEYS ZMPOP names its key" "mk1" COMMAND GETKEYS ZMPOP 1 mk1 MIN
+    assert_moon_contains "GETKEYS SINTERCARD names its key" "mk1" COMMAND GETKEYS SINTERCARD 2 mk1 mk2
+    assert_moon_contains "GETKEYS ZDIFF names its key" "mk1" COMMAND GETKEYS ZDIFF 2 mk1 mk2
+    assert_moon_contains "GETKEYS EVAL names its declared key" "mk1" COMMAND GETKEYS EVAL "return 1" 1 mk1
+    assert_moon_contains "GETKEYS XREADGROUP names its stream" "ms1" COMMAND GETKEYS XREADGROUP GROUP g c STREAMS ms1 '>'
+    assert_moon_contains "GETKEYS XREAD names its stream" "ms1" COMMAND GETKEYS XREAD COUNT 1 STREAMS ms1 0
+    assert_moon_contains "GETKEYS ZUNIONSTORE names its dest" "mkd" COMMAND GETKEYS ZUNIONSTORE mkd 2 mk1 mk2
+    assert_moon_contains "GETKEYS SORT..STORE names its dest" "mkd" COMMAND GETKEYS SORT mk1 ALPHA STORE mkd
+    assert_moon_contains "GETKEYS OBJECT names its key" "mk1" COMMAND GETKEYS OBJECT ENCODING mk1
+    # The other three error strings redis uses, so "has no key arguments" can
+    # never again stand in for all of them.
+    assert_moon_contains "GETKEYS unknown command" "Invalid command specified" COMMAND GETKEYS NOSUCHCMD k
+    assert_moon_contains "GETKEYS wrong arity" "Invalid number of arguments" COMMAND GETKEYS LMPOP 0 LEFT
+    assert_moon_contains "GETKEYS unextractable argv" "Invalid arguments specified" COMMAND GETKEYS LMPOP abc k LEFT
     assert_moon_contains "COMMAND COUNT arity" "wrong number of arguments" COMMAND COUNT extra
     assert_match "ROLE"                ROLE
     assert_moon_contains "ROLE reports master" "master" ROLE

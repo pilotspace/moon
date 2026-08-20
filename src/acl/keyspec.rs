@@ -83,8 +83,49 @@ const UNREGISTERED_KEYLESS: &[&[u8]] = &[
     b"READWRITE",
 ];
 
+/// What an invocation does to the key at a reported position.
+///
+/// Redis carries this per key in its command table (`RO`/`RW`/`OW`, plus
+/// `access`/`update`/`insert`/`delete`); moon collapses it to the one
+/// distinction its consumers act on — "may this position be MODIFIED?".
+///
+/// `first_key`/`last_key`/`step` cannot express it at all, which is why
+/// `ZUNIONSTORE dst 2 a b` looked to moon like three equally-written keys
+/// (moon#584). Only [`Write`](KeyRole::Write) positions may be pushed to a
+/// tracking client as invalidated; ACL ignores the role entirely, because a
+/// `~pattern` gates reads and writes alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRole {
+    /// The command only READS this position (a `*STORE` source, `COPY`'s
+    /// source, `SORT`'s input).
+    Read,
+    /// The command may MODIFY this position.
+    ///
+    /// Deliberately over-inclusive where a static spec cannot do better:
+    /// `LMPOP 2 a b LEFT` writes only the first NON-EMPTY key, which is not
+    /// knowable from the argv, so both are `Write`. Over-invalidating costs a
+    /// client one refetch; under-invalidating leaves it stale forever.
+    Write,
+}
+
+/// One key argument: where it is, and what the command does to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyAt {
+    /// Zero-based index into `args` (the argv WITHOUT the command name).
+    pub idx: usize,
+    /// Whether this invocation may modify the key at `idx`.
+    pub role: KeyRole,
+}
+
+impl KeyAt {
+    #[inline]
+    const fn new(idx: usize, role: KeyRole) -> Self {
+        Self { idx, role }
+    }
+}
+
 /// Zero-based positions in `args` of the keys an invocation touches.
-pub type KeyIdx = SmallVec<[usize; 4]>;
+pub type KeyIdx = SmallVec<[KeyAt; 4]>;
 
 /// Where the keys of an argv live, without interpreting them.
 ///
@@ -115,8 +156,8 @@ pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     // Layouts a fixed first/last/step spec cannot express come first: some of
     // them (SORT, OBJECT, ZUNIONSTORE) DO have a spec, but it describes only
     // part of the truth.
-    if let Some(pos) = movable_positions(cmd, args) {
-        return pos;
+    if let Some(shape) = movable_shape(cmd) {
+        return shape.positions(args);
     }
 
     let Some(meta) = metadata::lookup(cmd) else {
@@ -159,16 +200,106 @@ pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     }
 
     let step = if meta.step > 0 { meta.step as usize } else { 1 };
+    // Every position of a same-role command takes the command's own verdict:
+    // a write command writes all of them, a read command reads all of them.
+    // The exceptions carry a `DEST` shape instead (see `dest_position`).
+    let bulk = if meta.flags.contains(metadata::CommandFlags::WRITE) {
+        KeyRole::Write
+    } else {
+        KeyRole::Read
+    };
     let mut idx = KeyIdx::new();
     let mut i = first;
     while i <= last {
-        idx.push(i - 1);
+        idx.push(KeyAt::new(i - 1, bulk));
         i += step;
     }
     if idx.is_empty() {
         return KeyPositions::Unknown;
     }
+    // A single-key invocation has nothing to split, so the overwhelmingly
+    // common case never reaches the name match at all.
+    if let Some(dest) = if idx.len() > 1 {
+        dest_position(cmd)
+    } else {
+        None
+    } {
+        // `SINTERSTORE dst a b`: only `dst` is written, the rest are read.
+        // Demote everything, then promote the one destination slot.
+        for k in idx.iter_mut() {
+            k.role = KeyRole::Read;
+        }
+        let slot = match dest {
+            Dest::First => 0,
+            Dest::Last => idx.len() - 1,
+        };
+        idx[slot].role = KeyRole::Write;
+    }
     KeyPositions::At(idx)
+}
+
+/// Which key position of a fixed-spec command is the WRITE destination, for
+/// the commands whose positions do not all share one role.
+///
+/// `first_key`/`last_key`/`step` cannot say this — redis carries it per key as
+/// `OW`/`RO` flags, which is how it knows `ZUNIONSTORE`'s sources are only
+/// read (moon#584). Everything absent from here is same-role, taking its
+/// verdict from the command's own `WRITE` flag, which is correct for `DEL a b`,
+/// `MSET k v k v`, `RENAME a b` and `SMOVE src dst` alike (those really do
+/// write every position).
+///
+/// Membership is deliberately conservative: a command wrongly listed here
+/// would MISS an invalidation, which is the direction that leaves a client
+/// cache stale forever (moon#582). A command wrongly absent merely
+/// over-invalidates, costing one refetch.
+#[derive(Clone, Copy)]
+enum Dest {
+    /// `<cmd> dst src [src ...]`
+    First,
+    /// `<cmd> src dst`
+    Last,
+}
+
+fn dest_position(cmd: &[u8]) -> Option<Dest> {
+    let b0 = cmd.first().map(|b| b | 0x20)?;
+    let d = match (cmd.len(), b0) {
+        // dst first, read-only sources after it
+        (11, b's') if cmd.eq_ignore_ascii_case(b"SINTERSTORE") => Dest::First,
+        (11, b's') if cmd.eq_ignore_ascii_case(b"SUNIONSTORE") => Dest::First,
+        (10, b's') if cmd.eq_ignore_ascii_case(b"SDIFFSTORE") => Dest::First,
+        (7, b'p') if cmd.eq_ignore_ascii_case(b"PFMERGE") => Dest::First,
+        // `BITOP <op> dst src ...` — the op is not a key, so `first_key` is 2
+        // and the destination is still the FIRST reported position.
+        (5, b'b') if cmd.eq_ignore_ascii_case(b"BITOP") => Dest::First,
+        (11, b'z') if cmd.eq_ignore_ascii_case(b"ZRANGESTORE") => Dest::First,
+        (14, b'g') if cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE") => Dest::First,
+        // `COPY src dst` — the odd one out: destination LAST.
+        (4, b'c') if cmd.eq_ignore_ascii_case(b"COPY") => Dest::Last,
+        _ => return None,
+    };
+    Some(d)
+}
+
+/// Does `cmd` name key arguments AT ALL, independent of what this particular
+/// argv managed to parse?
+///
+/// This is redis's `doesCommandHaveKeys`, and `COMMAND GETKEYS` answers
+/// "The command has no key arguments" from it BEFORE checking arity — which is
+/// why `COMMAND GETKEYS SELECT` reports no-keys rather than wrong-arity
+/// (verified against redis 8.6.1). A movablekeys command has keys even when
+/// this argv's `numkeys` is unparsable, so `EVAL <script> <garbage>` must not
+/// be answered "has no key arguments"; that is the lie moon#537 was about.
+///
+/// `args` matters only for the CONTAINER commands, whose key-ness belongs to
+/// the SUBCOMMAND: `MEMORY USAGE k` has a key, `MEMORY STATS` does not.
+pub fn command_has_keys(cmd: &[u8], args: &[Frame]) -> bool {
+    match movable_shape(cmd) {
+        Some(Movable::Container { role }) => {
+            matches!(subcommand_key(args, role), KeyPositions::At(_))
+        }
+        Some(_) => true,
+        None => metadata::lookup(cmd).is_some_and(|m| m.first_key > 0),
+    }
 }
 
 /// Extract the keys `cmd`/`args` touch, for ACL `~pattern` enforcement.
@@ -187,7 +318,10 @@ pub fn command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> CommandKeys<'a> {
         }
     };
     let mut keys = KeyVec::new();
-    for i in idx {
+    // The ROLE is deliberately ignored: a `~pattern` gates reads and writes
+    // alike, so ACL checks every named position regardless of what the command
+    // does to it. (Cache invalidation is the consumer that filters on role.)
+    for KeyAt { idx: i, .. } in idx {
         // A key position holding a non-string is a malformed invocation.
         match args.get(i).and_then(key_bytes) {
             Some(k) => keys.push(k),
@@ -233,79 +367,163 @@ fn key_bytes(frame: &Frame) -> Option<&[u8]> {
     }
 }
 
-/// Key layouts that `first_key`/`last_key`/`step` cannot express.
+/// A key layout that `first_key`/`last_key`/`step` cannot express, together
+/// with the per-position roles the fixed spec cannot carry either.
 ///
-/// Returns `None` when the command is not one of them (the caller then uses
-/// the meta-derived walk). Matched on `(len, first byte)` first so the common
-/// single-key commands fall through after one integer compare.
-fn movable_positions(cmd: &[u8], args: &[Frame]) -> Option<KeyPositions> {
+/// Keeping the SHAPE separate from the walk lets two questions share one
+/// table: "where are this argv's keys" ([`Movable::positions`]) and "does this
+/// command name keys at all" ([`command_has_keys`]). Answering the second from
+/// a second list is exactly how moon#537 shipped — `COMMAND GETKEYS` decided
+/// from `first_key <= 0` and told every movablekeys client the command had no
+/// keys.
+#[derive(Clone, Copy)]
+enum Movable {
+    /// `... numkeys key [key ...] ...`, count at `nk`, with an optional write
+    /// destination at `args[0]` (the `Z*STORE` family).
+    NumKeys {
+        nk: usize,
+        dest_at_zero: bool,
+        vec_role: KeyRole,
+    },
+    /// `key ... [STORE dest]`: one source key plus a positional destination.
+    /// `by_get` additionally scans `SORT`'s `BY`/`GET` patterns.
+    SourceStore { by_get: bool },
+    /// `<cmd> src dst` — both written.
+    TwoKeys,
+    /// N keys after the `STREAMS` token, then N ids.
+    Streams { role: KeyRole },
+    /// `<CMD> <SUBCOMMAND> <key>` — only SOME subcommands take a key.
+    Container { role: KeyRole },
+}
+
+/// Classify `cmd`'s key layout, or `None` when the meta-derived walk applies.
+///
+/// Matched on `(len, first byte)` first so the common single-key commands fall
+/// through after one integer compare.
+fn movable_shape(cmd: &[u8]) -> Option<Movable> {
+    use KeyRole::{Read, Write};
     let len = cmd.len();
     if len == 0 {
         return None;
     }
-    let b0 = cmd[0] | 0x20;
-    let keys = match (len, b0) {
-        // ---- numkeys-counted key vectors ----
-        // <cmd> numkeys key [key ...] ...
-        (5, b'l') if cmd.eq_ignore_ascii_case(b"LMPOP") => numkeys_positions(args, 0, false),
-        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZMPOP") => numkeys_positions(args, 0, false),
-        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFF") => numkeys_positions(args, 0, false),
-        (6, b'z') if cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION") => {
-            numkeys_positions(args, 0, false)
+    // `<cmd> numkeys key [key ...]`, count at args[0].
+    const fn vec0(vec_role: KeyRole) -> Movable {
+        Movable::NumKeys {
+            nk: 0,
+            dest_at_zero: false,
+            vec_role,
         }
-        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZINTERCARD") => numkeys_positions(args, 0, false),
-        (10, b's') if cmd.eq_ignore_ascii_case(b"SINTERCARD") => numkeys_positions(args, 0, false),
+    }
+    // `<cmd> <arg> numkeys key [key ...]`, count at args[1].
+    const fn vec1(vec_role: KeyRole) -> Movable {
+        Movable::NumKeys {
+            nk: 1,
+            dest_at_zero: false,
+            vec_role,
+        }
+    }
+    let b0 = cmd[0] | 0x20;
+    let shape = match (len, b0) {
+        // ---- numkeys-counted key vectors ----
+        // The MPOP family pops from the first NON-EMPTY key, which no static
+        // spec can identify, so every candidate counts as written.
+        (5, b'l') if cmd.eq_ignore_ascii_case(b"LMPOP") => vec0(Write),
+        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZMPOP") => vec0(Write),
+        // Set/zset combinators only read their inputs.
+        (5, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFF") => vec0(Read),
+        (6, b'z') if cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION") => {
+            vec0(Read)
+        }
+        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZINTERCARD") => vec0(Read),
+        (10, b's') if cmd.eq_ignore_ascii_case(b"SINTERCARD") => vec0(Read),
         // <cmd> timeout numkeys key [key ...] <dir>
         (6, b'b') if cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP") => {
-            numkeys_positions(args, 1, false)
+            vec1(Write)
         }
         // <cmd> script|sha|function numkeys key [key ...] [arg ...]
-        (4, b'e') if cmd.eq_ignore_ascii_case(b"EVAL") => numkeys_positions(args, 1, false),
-        (7, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA") => numkeys_positions(args, 1, false),
-        (5, b'f') if cmd.eq_ignore_ascii_case(b"FCALL") => numkeys_positions(args, 1, false),
-        (8, b'f') if cmd.eq_ignore_ascii_case(b"FCALL_RO") => numkeys_positions(args, 1, false),
+        // A script may write any key it was handed; only the `_RO` forms
+        // cannot.
+        (4, b'e') if cmd.eq_ignore_ascii_case(b"EVAL") => vec1(Write),
+        (7, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA") => vec1(Write),
+        (5, b'f') if cmd.eq_ignore_ascii_case(b"FCALL") => vec1(Write),
+        (8, b'f') if cmd.eq_ignore_ascii_case(b"FCALL_RO") => vec1(Read),
         // <cmd> dest numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
-        // The registry spec names only `dest` (first_key == last_key == 1).
+        // The registry spec names only `dest` (first_key == last_key == 1);
+        // the numkeys vector after it is READ, not written (moon#584).
         (11, b'z')
             if cmd.eq_ignore_ascii_case(b"ZUNIONSTORE")
                 || cmd.eq_ignore_ascii_case(b"ZINTERSTORE") =>
         {
-            numkeys_positions(args, 1, true)
+            Movable::NumKeys {
+                nk: 1,
+                dest_at_zero: true,
+                vec_role: Read,
+            }
         }
-        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") => numkeys_positions(args, 1, true),
+        (10, b'z') if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") => Movable::NumKeys {
+            nk: 1,
+            dest_at_zero: true,
+            vec_role: Read,
+        },
 
         // ---- positional STORE clauses (source key + optional destination) ----
-        (4, b's') if cmd.eq_ignore_ascii_case(b"SORT") => source_plus_store(args, true),
-        (7, b's') if cmd.eq_ignore_ascii_case(b"SORT_RO") => source_plus_store(args, true),
-        (9, b'g') if cmd.eq_ignore_ascii_case(b"GEORADIUS") => source_plus_store(args, false),
+        (4, b's') if cmd.eq_ignore_ascii_case(b"SORT") => Movable::SourceStore { by_get: true },
+        (7, b's') if cmd.eq_ignore_ascii_case(b"SORT_RO") => Movable::SourceStore { by_get: true },
+        (9, b'g') if cmd.eq_ignore_ascii_case(b"GEORADIUS") => {
+            Movable::SourceStore { by_get: false }
+        }
         (17, b'g') if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER") => {
-            source_plus_store(args, false)
+            Movable::SourceStore { by_get: false }
         }
 
         // ---- two-key move ----
         // `RPOPLPUSH src dst` also carries a registry spec (1..2), which would
         // give the identical answer; this arm is kept only so the layout is
         // stated in one place with its siblings.
-        (9, b'r') if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") => two_keys(args),
+        (9, b'r') if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") => Movable::TwoKeys,
 
         // ---- keys after the STREAMS token ----
-        (5, b'x') if cmd.eq_ignore_ascii_case(b"XREAD") => stream_keys(args),
-        (10, b'x') if cmd.eq_ignore_ascii_case(b"XREADGROUP") => stream_keys(args),
+        // XREADGROUP advances the group's last-delivered id, so its streams
+        // are written; plain XREAD only reads.
+        (5, b'x') if cmd.eq_ignore_ascii_case(b"XREAD") => Movable::Streams { role: Read },
+        (10, b'x') if cmd.eq_ignore_ascii_case(b"XREADGROUP") => Movable::Streams { role: Write },
 
         // ---- subcommand first, key second ----
-        (6, b'o') if cmd.eq_ignore_ascii_case(b"OBJECT") => subcommand_key(args),
-        (5, b'x') if cmd.eq_ignore_ascii_case(b"XINFO") => subcommand_key(args),
-        (6, b'm') if cmd.eq_ignore_ascii_case(b"MEMORY") => subcommand_key(args),
-        (6, b'x') if cmd.eq_ignore_ascii_case(b"XGROUP") => subcommand_key(args),
+        (6, b'o') if cmd.eq_ignore_ascii_case(b"OBJECT") => Movable::Container { role: Read },
+        (5, b'x') if cmd.eq_ignore_ascii_case(b"XINFO") => Movable::Container { role: Read },
+        (6, b'm') if cmd.eq_ignore_ascii_case(b"MEMORY") => Movable::Container { role: Read },
+        (6, b'x') if cmd.eq_ignore_ascii_case(b"XGROUP") => Movable::Container { role: Write },
 
         _ => return None,
     };
-    Some(keys)
+    Some(shape)
+}
+
+impl Movable {
+    /// Walk `args` for this shape.
+    fn positions(self, args: &[Frame]) -> KeyPositions {
+        match self {
+            Movable::NumKeys {
+                nk,
+                dest_at_zero,
+                vec_role,
+            } => numkeys_positions(args, nk, dest_at_zero, vec_role),
+            Movable::SourceStore { by_get } => source_plus_store(args, by_get),
+            Movable::TwoKeys => two_keys(args),
+            Movable::Streams { role } => stream_keys(args, role),
+            Movable::Container { role } => subcommand_key(args, role),
+        }
+    }
 }
 
 /// `... numkeys key [key ...]` with `numkeys` at `nk_idx`, plus an optional
-/// destination key at `args[0]` (the `Z*STORE` family).
-fn numkeys_positions(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> KeyPositions {
+/// WRITE destination key at `args[0]` (the `Z*STORE` family).
+fn numkeys_positions(
+    args: &[Frame],
+    nk_idx: usize,
+    dest_at_zero: bool,
+    vec_role: KeyRole,
+) -> KeyPositions {
     let Some(nk) = args
         .get(nk_idx)
         .and_then(key_bytes)
@@ -330,9 +548,9 @@ fn numkeys_positions(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> KeyPo
         if args.is_empty() {
             return KeyPositions::Unknown;
         }
-        idx.push(0);
+        idx.push(KeyAt::new(0, KeyRole::Write));
     }
-    idx.extend(first..end);
+    idx.extend((first..end).map(|i| KeyAt::new(i, vec_role)));
     if idx.is_empty() {
         // `EVAL <script> 0` and friends: numkeys parsed cleanly and says the
         // invocation names no key.
@@ -341,7 +559,8 @@ fn numkeys_positions(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> KeyPo
     KeyPositions::At(idx)
 }
 
-/// `args[0]` plus the key after a positional `STORE`/`STOREDIST` token.
+/// The READ source at `args[0]` plus the WRITE key after a positional
+/// `STORE`/`STOREDIST` token.
 ///
 /// With `check_by_get`, a `BY`/`GET` pattern containing `*` (SORT's weight and
 /// projection lookups) yields [`KeyPositions::AtPlusComputed`]: those read keys
@@ -349,12 +568,17 @@ fn numkeys_positions(args: &[Frame], nk_idx: usize, dest_at_zero: bool) -> KeyPo
 /// can name them. ACL must refuse such an argv outright; cache invalidation
 /// must still act on the keys that ARE named, which is what redis does.
 /// `BY nosort` / `GET #` carry no `*` and are therefore unaffected.
+///
+/// A DANGLING clause (`SORT k STORE`, `SORT k BY`) takes the same route: the
+/// keys we can name are complete and redis reports exactly them, but the
+/// unfinished clause is one more thing this walker could not account for, so
+/// ACL keeps denying the argv as it did when this returned `Unknown`.
 fn source_plus_store(args: &[Frame], check_by_get: bool) -> KeyPositions {
     if args.is_empty() {
         return KeyPositions::Unknown;
     }
     let mut idx = KeyIdx::new();
-    idx.push(0);
+    idx.push(KeyAt::new(0, KeyRole::Read));
     let mut computed = false;
 
     let mut i = 1;
@@ -365,15 +589,17 @@ fn source_plus_store(args: &[Frame], check_by_get: bool) -> KeyPositions {
         };
         if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
             if args.get(i + 1).is_none() {
-                return KeyPositions::Unknown;
+                computed = true;
+                break;
             }
-            idx.push(i + 1);
+            idx.push(KeyAt::new(i + 1, KeyRole::Write));
             i += 2;
             continue;
         }
         if check_by_get && (tok.eq_ignore_ascii_case(b"BY") || tok.eq_ignore_ascii_case(b"GET")) {
             let Some(pattern) = args.get(i + 1).and_then(key_bytes) else {
-                return KeyPositions::Unknown;
+                computed = true;
+                break;
             };
             if pattern.contains(&b'*') {
                 computed = true;
@@ -390,19 +616,19 @@ fn source_plus_store(args: &[Frame], check_by_get: bool) -> KeyPositions {
     }
 }
 
-/// `<cmd> source destination ...` — both are keys, both must be checked.
+/// `<cmd> source destination ...` — both are written, both must be checked.
 fn two_keys(args: &[Frame]) -> KeyPositions {
     if args.len() < 2 {
         return KeyPositions::Unknown;
     }
     let mut idx = KeyIdx::new();
-    idx.push(0);
-    idx.push(1);
+    idx.push(KeyAt::new(0, KeyRole::Write));
+    idx.push(KeyAt::new(1, KeyRole::Write));
     KeyPositions::At(idx)
 }
 
 /// `XREAD`/`XREADGROUP`: after the `STREAMS` token come N keys then N ids.
-fn stream_keys(args: &[Frame]) -> KeyPositions {
+fn stream_keys(args: &[Frame], role: KeyRole) -> KeyPositions {
     let Some(pos) = args
         .iter()
         .position(|f| key_bytes(f).is_some_and(|t| t.eq_ignore_ascii_case(b"STREAMS")))
@@ -414,7 +640,7 @@ fn stream_keys(args: &[Frame]) -> KeyPositions {
         return KeyPositions::Unknown;
     }
     let mut idx = KeyIdx::new();
-    idx.extend(pos + 1..pos + 1 + num_keys);
+    idx.extend((pos + 1..pos + 1 + num_keys).map(|i| KeyAt::new(i, role)));
     KeyPositions::At(idx)
 }
 
@@ -422,12 +648,12 @@ fn stream_keys(args: &[Frame]) -> KeyPositions {
 ///
 /// The keyless subcommands of these (`OBJECT HELP`, `XINFO HELP`,
 /// `MEMORY DOCTOR|STATS|PURGE`) carry no second argument.
-fn subcommand_key(args: &[Frame]) -> KeyPositions {
+fn subcommand_key(args: &[Frame], role: KeyRole) -> KeyPositions {
     match args.get(1) {
         None => KeyPositions::None,
         Some(_) => {
             let mut idx = KeyIdx::new();
-            idx.push(1);
+            idx.push(KeyAt::new(1, role));
             KeyPositions::At(idx)
         }
     }
@@ -597,6 +823,195 @@ mod tests {
         assert!(is_none(b"MEMORY", &["STATS"]));
     }
 
+    /// Roles, reported as `(key, is-written)` pairs so a case reads like the
+    /// command's own semantics.
+    fn roles_of(cmd: &[u8], parts: &[&str]) -> Vec<(String, bool)> {
+        let args = argv(parts);
+        let idx = match command_key_positions(cmd, &args) {
+            KeyPositions::At(idx) | KeyPositions::AtPlusComputed(idx) => idx,
+            other => panic!(
+                "{} expected positions, got {other:?}",
+                String::from_utf8_lossy(cmd)
+            ),
+        };
+        idx.iter()
+            .map(|k| {
+                (
+                    String::from_utf8_lossy(key_bytes(&args[k.idx]).unwrap_or_default())
+                        .into_owned(),
+                    k.role == KeyRole::Write,
+                )
+            })
+            .collect()
+    }
+
+    /// moon#584. A key position's ROLE is the fact `first_key`/`last_key`/
+    /// `step` cannot carry, and without it moon told a tracking client that a
+    /// `*STORE` command had changed the keys it merely read.
+    ///
+    /// Each case pins EVERY position's role, so a fix that flips the whole
+    /// command one way cannot pass.
+    #[test]
+    fn key_roles_separate_destinations_from_sources() {
+        // numkeys vector after a destination
+        assert_eq!(
+            roles_of(b"ZUNIONSTORE", &["d", "2", "a", "b"]),
+            [("d".into(), true), ("a".into(), false), ("b".into(), false)]
+        );
+        // positional STORE
+        assert_eq!(
+            roles_of(b"SORT", &["src", "STORE", "dst"]),
+            [("src".into(), false), ("dst".into(), true)]
+        );
+        assert_eq!(
+            roles_of(b"GEORADIUS", &["s", "1", "2", "3", "m", "STOREDIST", "d"]),
+            [("s".into(), false), ("d".into(), true)]
+        );
+        // fixed spec, destination FIRST
+        assert_eq!(
+            roles_of(b"SINTERSTORE", &["d", "a", "b"]),
+            [("d".into(), true), ("a".into(), false), ("b".into(), false)]
+        );
+        assert_eq!(
+            roles_of(b"BITOP", &["AND", "d", "a", "b"]),
+            [("d".into(), true), ("a".into(), false), ("b".into(), false)]
+        );
+        // fixed spec, destination LAST
+        assert_eq!(
+            roles_of(b"COPY", &["src", "dst"]),
+            [("src".into(), false), ("dst".into(), true)]
+        );
+        // same-role commands take the command's own verdict
+        assert_eq!(
+            roles_of(b"MSET", &["a", "1", "b", "2"]),
+            [("a".into(), true), ("b".into(), true)]
+        );
+        assert_eq!(
+            roles_of(b"MGET", &["a", "b"]),
+            [("a".into(), false), ("b".into(), false)]
+        );
+        assert_eq!(
+            roles_of(b"SMOVE", &["s", "d", "m"]),
+            [("s".into(), true), ("d".into(), true)]
+        );
+        // read-only combinators vs the write-flagged MPOP family
+        assert_eq!(
+            roles_of(b"ZDIFF", &["2", "a", "b"]),
+            [("a".into(), false), ("b".into(), false)]
+        );
+        assert_eq!(
+            roles_of(b"LMPOP", &["2", "a", "b", "LEFT"]),
+            [("a".into(), true), ("b".into(), true)]
+        );
+        assert_eq!(
+            roles_of(b"FCALL_RO", &["f", "1", "k"]),
+            [("k".into(), false)]
+        );
+        assert_eq!(roles_of(b"FCALL", &["f", "1", "k"]), [("k".into(), true)]);
+        // XREAD reads its streams; XREADGROUP advances the group's cursor
+        assert_eq!(
+            roles_of(b"XREAD", &["STREAMS", "s", "0"]),
+            [("s".into(), false)]
+        );
+        assert_eq!(
+            roles_of(b"XREADGROUP", &["GROUP", "g", "c", "STREAMS", "s", ">"]),
+            [("s".into(), true)]
+        );
+        assert_eq!(
+            roles_of(b"OBJECT", &["ENCODING", "k"]),
+            [("k".into(), false)]
+        );
+        assert_eq!(
+            roles_of(b"XGROUP", &["CREATE", "k", "g", "$"]),
+            [("k".into(), true)]
+        );
+    }
+
+    /// Every command that claims a split-role layout must actually HAVE a
+    /// fixed key spec to split, and must name at least two keys in practice —
+    /// otherwise `dest_position` is silently decorating a command whose
+    /// positions it never reaches.
+    #[test]
+    fn split_role_commands_have_a_fixed_spec_to_split() {
+        for cmd in [
+            b"SINTERSTORE".as_ref(),
+            b"SUNIONSTORE".as_ref(),
+            b"SDIFFSTORE".as_ref(),
+            b"PFMERGE".as_ref(),
+            b"BITOP".as_ref(),
+            b"ZRANGESTORE".as_ref(),
+            b"GEOSEARCHSTORE".as_ref(),
+            b"COPY".as_ref(),
+        ] {
+            let name = String::from_utf8_lossy(cmd);
+            assert!(
+                dest_position(cmd).is_some(),
+                "{name} must be recognised by dest_position"
+            );
+            assert!(
+                movable_shape(cmd).is_none(),
+                "{name} is meta-derived; a movable arm would bypass dest_position"
+            );
+            let meta = metadata::lookup(cmd)
+                .unwrap_or_else(|| panic!("{name} needs a COMMAND_META entry to split"));
+            assert!(
+                meta.first_key > 0,
+                "{name} has no fixed key spec for dest_position to split"
+            );
+            assert!(
+                meta.flags.contains(metadata::CommandFlags::WRITE),
+                "{name} must be a write command for the split to mean anything"
+            );
+        }
+    }
+
+    /// `command_has_keys` is the STATIC claim `COMMAND GETKEYS` answers
+    /// before it even looks at the argv (moon#537). It must never contradict
+    /// the walker: a command whose positions we can name has keys, full stop.
+    #[test]
+    fn command_has_keys_agrees_with_the_walker() {
+        let cases: &[(&[u8], &[&str])] = &[
+            (b"GET", &["k"]),
+            (b"MSET", &["a", "1"]),
+            (b"LMPOP", &["1", "k", "LEFT"]),
+            (b"EVAL", &["s", "1", "k"]),
+            (b"XREAD", &["STREAMS", "s", "0"]),
+            (b"SORT", &["k", "STORE", "d"]),
+            (b"OBJECT", &["ENCODING", "k"]),
+            (b"ZUNIONSTORE", &["d", "1", "a"]),
+        ];
+        for (cmd, parts) in cases {
+            let args = argv(parts);
+            assert!(
+                command_has_keys(cmd, &args),
+                "{} names keys",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // A movablekeys command has keys even when THIS argv is unparsable —
+        // the exact confusion moon#537 filed. `EVAL <script> <garbage>` must
+        // not be answered "the command has no key arguments".
+        assert!(command_has_keys(b"EVAL", &argv(&["s", "garbage", "k"])));
+        assert!(command_has_keys(b"LMPOP", &argv(&["garbage", "k"])));
+        assert!(command_has_keys(b"XREAD", &argv(&["COUNT", "1"])));
+        // Genuinely keyless, and containers whose subcommand takes no key.
+        for (cmd, parts) in [
+            (b"PING".as_ref(), &[][..]),
+            (b"SELECT".as_ref(), &["0"][..]),
+            (b"FLUSHALL".as_ref(), &[][..]),
+            (b"NOSUCHCMD".as_ref(), &["k"][..]),
+            (b"MEMORY".as_ref(), &["STATS"][..]),
+            (b"OBJECT".as_ref(), &["HELP"][..]),
+            (b"XINFO".as_ref(), &["HELP"][..]),
+        ] {
+            assert!(
+                !command_has_keys(cmd, &argv(parts)),
+                "{} names no key",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
     #[test]
     fn keyless_and_unknown_commands() {
         for cmd in [
@@ -712,7 +1127,7 @@ mod tests {
                     && !name.starts_with("GRAPH.")
                     // movable-key commands: their registry spec says 0 but
                     // this module extracts their keys explicitly.
-                    && movable_positions(name.as_bytes(), &[]).is_none()
+                    && movable_shape(name.as_bytes()).is_none()
             })
             .collect();
         unreviewed.sort_unstable();

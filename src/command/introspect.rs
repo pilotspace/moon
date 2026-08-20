@@ -37,6 +37,7 @@ const FLAG_NAMES: &[(CommandFlags, &str)] = &[
     (CommandFlags::NO_AUTH, "no-auth"),
     (CommandFlags::MAY_REPLICATE, "may_replicate"),
     (CommandFlags::SORT_FOR_SCRIPT, "sort_for_script"),
+    (CommandFlags::NO_MANDATORY_KEYS, "no_mandatory_keys"),
 ];
 
 /// ACL category name as Redis spells it (`@`-prefixed on the wire).
@@ -110,22 +111,57 @@ fn err(msg: &'static str) -> Frame {
     Frame::Error(Bytes::from_static(msg.as_bytes()))
 }
 
-/// Extract the key arguments of `argv` using the registry's key spec.
+/// Extract the key arguments of `argv`, where `argv[0]` is the command name.
 ///
-/// `argv[0]` is the command name. Returns an error Frame rather than an empty
-/// array when the command has no keys — "no keys" and "I did not understand
-/// you" must not look identical to a cluster-aware client deciding where to
-/// route a command.
-fn getkeys(argv: &[Bytes]) -> Frame {
-    let Some(name) = argv.first() else {
+/// # moon#537
+///
+/// This used to answer from `meta.first_key <= 0`, which is true of every
+/// **movablekeys** command (`LMPOP`, `ZMPOP`, `SINTERCARD`, `XREADGROUP`,
+/// `EVAL`, `ZDIFF`, `SORT ... STORE`, ...). In redis's table — which moon
+/// mirrors — that means "the keys are not at a FIXED argument position", NOT
+/// "there are no keys", so moon told every one of those callers
+/// `ERR The command has no key arguments`. `COMMAND GETKEYS` is precisely how
+/// a cluster-aware client routes a command it cannot parse itself, so the
+/// answer was both wrong and self-evidently a lie.
+///
+/// It now delegates to the SHARED key walker ([`crate::acl::keyspec`]) — the
+/// same one ACL key patterns and client-side cache invalidation consume — so
+/// the three answers cannot drift apart again.
+///
+/// # Reply shapes
+///
+/// Verified against `redis-server 8.6.1`; the four error strings and their
+/// ORDER are redis's, and the order is observable: `COMMAND GETKEYS SELECT`
+/// reports no-keys rather than wrong-arity even though its arity is also
+/// wrong.
+///
+/// 1. unknown command → `Invalid command specified`
+/// 2. the command names no keys AT ALL → `The command has no key arguments`
+/// 3. wrong arity → `Invalid number of arguments specified for command`
+/// 4. this argv names no key → `Invalid arguments specified for command`,
+///    except for `no-mandatory-keys` commands (`EVAL` and friends), whose
+///    key COUNT is an argument and which reply with an empty array.
+fn getkeys(argv: &[Frame]) -> Frame {
+    let Some(name) = argv.first().and_then(extract) else {
         return err("ERR Unknown subcommand or wrong number of arguments for 'GETKEYS'");
     };
     // `lookup` uppercases internally — no need to allocate an upper copy.
-    let Some(meta) = crate::command::metadata::lookup(name) else {
+    let Some(meta) = crate::command::metadata::lookup(&name) else {
         return err("ERR Invalid command specified");
     };
 
-    // Arity: positive = exact, negative = minimum. argv includes the name.
+    // The walker's contract: `args` EXCLUDES the command name.
+    let args = &argv[1..];
+
+    // (2) A STATIC property of the command, checked before arity — see the
+    // `SELECT` case above. Container commands (`MEMORY USAGE` vs
+    // `MEMORY STATS`) resolve through the subcommand, which is why the argv
+    // is passed.
+    if !crate::acl::keyspec::command_has_keys(&name, args) {
+        return err("ERR The command has no key arguments");
+    }
+
+    // (3) Arity: positive = exact, negative = minimum. argv includes the name.
     let n = argv.len() as i16;
     let arity_ok = if meta.arity >= 0 {
         n == meta.arity
@@ -136,31 +172,41 @@ fn getkeys(argv: &[Bytes]) -> Frame {
         return err("ERR Invalid number of arguments specified for command");
     }
 
-    if meta.first_key <= 0 {
-        return err("ERR The command has no key arguments");
-    }
-
-    let last = if meta.last_key < 0 {
-        // -1 means "through the last argument"; -2 means "through the
-        // second-to-last", and so on.
-        (n + meta.last_key) as usize
+    let unextractable = if meta
+        .flags
+        .contains(crate::command::metadata::CommandFlags::NO_MANDATORY_KEYS)
+    {
+        // `EVAL <script> 0` names no key, and redis answers an empty array
+        // rather than an error — it also does so for a count this argv cannot
+        // satisfy, so both walker verdicts land here.
+        Frame::Array(crate::protocol::FrameVec::new())
     } else {
-        meta.last_key as usize
-    };
-    let step = if meta.step <= 0 {
-        1
-    } else {
-        meta.step as usize
+        err("ERR Invalid arguments specified for command")
     };
 
-    let mut keys = crate::protocol::FrameVec::new();
-    let mut i = meta.first_key as usize;
-    while i <= last && i < argv.len() {
-        keys.push(Frame::BulkString(argv[i].clone()));
-        i += step;
+    let idx = match crate::acl::keyspec::command_key_positions(&name, args) {
+        // `AtPlusComputed` is `SORT k BY w_*` (and a dangling `STORE`): some
+        // key name is computed at runtime and cannot be reported, but redis
+        // reports the ones that ARE named and so must moon. ACL takes the
+        // opposite view of the same value and denies the argv — the walker
+        // reports facts, each consumer applies its own policy.
+        crate::acl::keyspec::KeyPositions::At(idx)
+        | crate::acl::keyspec::KeyPositions::AtPlusComputed(idx) => idx,
+        crate::acl::keyspec::KeyPositions::None | crate::acl::keyspec::KeyPositions::Unknown => {
+            return unextractable;
+        }
+    };
+
+    let mut keys = crate::protocol::FrameVec::with_capacity(idx.len());
+    for k in idx {
+        match args.get(k.idx).and_then(extract) {
+            Some(b) => keys.push(Frame::BulkString(b)),
+            // A key position holding a non-string is a malformed invocation.
+            None => return unextractable,
+        }
     }
     if keys.is_empty() {
-        return err("ERR The command has no key arguments");
+        return unextractable;
     }
     Frame::Array(keys)
 }
@@ -275,8 +321,9 @@ pub fn command(args: &[Frame]) -> Frame {
         if args.len() < 2 {
             return err("ERR Unknown subcommand or wrong number of arguments for 'GETKEYS'");
         }
-        let argv: Vec<Bytes> = args[1..].iter().filter_map(extract).collect();
-        return getkeys(&argv);
+        // Pass the FRAMES through: filtering to `Bytes` here would silently
+        // drop a non-string argument and shift every key position after it.
+        return getkeys(&args[1..]);
     }
 
     Frame::Error(Bytes::from(format!(
@@ -411,5 +458,353 @@ mod tests {
             panic!("must be an error");
         };
         assert!(String::from_utf8_lossy(&e).contains("Invalid number of arguments"));
+    }
+
+    // ── moon#537: COMMAND GETKEYS for movablekeys commands ────────────────
+
+    /// Run `COMMAND GETKEYS <parts...>` and render the reply as either the key
+    /// list or the error text, so a test case can be written the way the wire
+    /// shows it.
+    fn getkeys_of(parts: &[&str]) -> Result<Vec<String>, String> {
+        let mut argv = vec![bulk("GETKEYS")];
+        argv.extend(parts.iter().map(|p| bulk(p)));
+        match command(&argv) {
+            Frame::Array(keys) => Ok(keys
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("key must be a bulk string, got {other:?}"),
+                })
+                .collect()),
+            Frame::Error(e) => Err(String::from_utf8_lossy(&e).into_owned()),
+            other => panic!("GETKEYS must reply an array or an error, got {other:?}"),
+        }
+    }
+
+    /// moon#537. Every command here carries `first_key: 0` in `COMMAND_META`,
+    /// mirroring redis's own table, where it means "the keys are not at a
+    /// FIXED argument position" — NOT "there are no keys". `getkeys()` read it
+    /// as the latter and answered `ERR The command has no key arguments` to
+    /// the entire movablekeys family. `COMMAND GETKEYS` is how a cluster-aware
+    /// client routes a command it cannot parse itself, so it either refused to
+    /// route or guessed; and the error text was itself false.
+    ///
+    /// Expectations are the measured replies of `redis-server 8.6.1`.
+    #[test]
+    fn issue_537_movablekeys_commands_report_their_keys() {
+        // The exact table from the issue.
+        assert_eq!(
+            getkeys_of(&["LMPOP", "1", "k", "LEFT"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["ZMPOP", "1", "k", "MIN"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(getkeys_of(&["SINTERCARD", "1", "k"]), Ok(vec!["k".into()]));
+        assert_eq!(
+            getkeys_of(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]),
+            Ok(vec!["s".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["EVAL", "return 1", "1", "k"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(getkeys_of(&["ZDIFF", "1", "k"]), Ok(vec!["k".into()]));
+        // The control from the issue: fixed-position commands still work.
+        assert_eq!(
+            getkeys_of(&["MSET", "a", "1", "b", "2"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+    }
+
+    /// The rest of the movablekeys family, one case per SHAPE the walker
+    /// knows, so a fix that covers only the six names in the issue cannot pass.
+    #[test]
+    fn getkeys_covers_every_movable_shape() {
+        // numkeys vectors, count at argv[1] and argv[2]
+        assert_eq!(
+            getkeys_of(&["ZINTERCARD", "2", "a", "b", "LIMIT", "1"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["ZUNION", "2", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["ZINTER", "2", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["BLMPOP", "0", "2", "a", "b", "LEFT"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["BZMPOP", "0", "2", "a", "b", "MIN"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        // scripting
+        assert_eq!(
+            getkeys_of(&["EVALSHA", "sha", "1", "k"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["FCALL", "f", "2", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["FCALL_RO", "f", "1", "k"]),
+            Ok(vec!["k".into()])
+        );
+        // destination + numkeys vector: the destination comes FIRST
+        assert_eq!(
+            getkeys_of(&["ZUNIONSTORE", "d", "2", "a", "b"]),
+            Ok(vec!["d".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["ZINTERSTORE", "d", "2", "a", "b"]),
+            Ok(vec!["d".into(), "a".into(), "b".into()])
+        );
+        // positional STORE clauses
+        assert_eq!(getkeys_of(&["SORT", "k"]), Ok(vec!["k".into()]));
+        assert_eq!(
+            getkeys_of(&["SORT", "k", "ALPHA", "STORE", "dst"]),
+            Ok(vec!["k".into(), "dst".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["GEORADIUS", "src", "1", "2", "3", "m", "STORE", "d"]),
+            Ok(vec!["src".into(), "d".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["GEORADIUSBYMEMBER", "src", "m", "3", "m", "STOREDIST", "d"]),
+            Ok(vec!["src".into(), "d".into()])
+        );
+        // the STREAMS token: N keys then N ids
+        assert_eq!(
+            getkeys_of(&["XREAD", "COUNT", "1", "STREAMS", "a", "b", "0", "0"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        // subcommand-shaped
+        assert_eq!(
+            getkeys_of(&["OBJECT", "ENCODING", "k"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(getkeys_of(&["MEMORY", "USAGE", "k"]), Ok(vec!["k".into()]));
+        assert_eq!(getkeys_of(&["XINFO", "STREAM", "k"]), Ok(vec!["k".into()]));
+        assert_eq!(
+            getkeys_of(&["XGROUP", "CREATE", "k", "g", "$"]),
+            Ok(vec!["k".into()])
+        );
+        // two-key move
+        assert_eq!(
+            getkeys_of(&["RPOPLPUSH", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        // a `BY`/`GET` pattern names keys nobody can enumerate; redis still
+        // reports the ones it CAN, and so must moon. (ACL deliberately denies
+        // the same argv — the walker reports facts, consumers apply policy.)
+        assert_eq!(
+            getkeys_of(&["SORT", "k", "BY", "w_*"]),
+            Ok(vec!["k".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["SORT_RO", "k", "BY", "w_*"]),
+            Ok(vec!["k".into()])
+        );
+    }
+
+    /// The four error strings and — critically — their ORDER, all measured
+    /// against redis 8.6.1. The order is observable: `SELECT`'s arity is wrong
+    /// AND it has no keys, and redis reports the no-keys answer, so an
+    /// implementation that checks arity first is distinguishable.
+    #[test]
+    fn getkeys_error_strings_and_their_order_match_redis() {
+        assert_eq!(
+            getkeys_of(&["NOSUCHCMD", "k"]),
+            Err("ERR Invalid command specified".into())
+        );
+        for argv in [
+            &["PING"][..],
+            &["PING", "x"][..],
+            &["SELECT"][..], // arity ALSO wrong: no-keys must win
+            &["SELECT", "0"][..],
+            &["FLUSHALL"][..],
+            &["KEYS", "*"][..],
+            &["MULTI"][..],
+            &["SUBSCRIBE", "ch"][..],
+            // container commands whose SUBCOMMAND takes no key
+            &["OBJECT", "HELP"][..],
+            &["MEMORY", "STATS"][..],
+            &["XINFO", "HELP"][..],
+        ] {
+            assert_eq!(
+                getkeys_of(argv),
+                Err("ERR The command has no key arguments".into()),
+                "{argv:?}"
+            );
+        }
+        for argv in [
+            &["GET"][..],                                         // arity 2, given 1
+            &["SET", "k"][..],                                    // arity -3, given 2
+            &["LMPOP", "0", "LEFT"][..],                          // arity -4, given 3
+            &["SINTERCARD", "0"][..],                             // arity -3, given 2
+            &["XREAD", "COUNT", "1"][..],                         // arity -4, given 3
+            &["XREADGROUP", "GROUP", "g", "c", "COUNT", "1"][..], // arity -7
+        ] {
+            assert_eq!(
+                getkeys_of(argv),
+                Err("ERR Invalid number of arguments specified for command".into()),
+                "{argv:?}"
+            );
+        }
+        // Right arity, but THIS argv names no key we can enumerate.
+        for argv in [
+            &["LMPOP", "3", "k1", "LEFT"][..],   // numkeys exceeds the argv
+            &["LMPOP", "abc", "k1", "LEFT"][..], // numkeys unparsable
+            &["LMPOP", "-1", "k", "LEFT"][..],
+            &["ZMPOP", "abc", "k", "MIN"][..],
+            &["ZDIFF", "9", "a"][..],
+            &["SINTERCARD", "2", "a"][..],
+            &["ZUNIONSTORE", "d", "abc", "a"][..],
+            &["XREAD", "COUNT", "1", "2", "3"][..], // no STREAMS token
+        ] {
+            assert_eq!(
+                getkeys_of(argv),
+                Err("ERR Invalid arguments specified for command".into()),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// `no-mandatory-keys`: the scripting family takes its key COUNT from an
+    /// argument, so naming zero keys is a legitimate outcome and redis replies
+    /// with an EMPTY ARRAY rather than an error — including for a count the
+    /// argv cannot satisfy. Every other movablekeys command errors instead,
+    /// which is the distinction the flag exists to draw.
+    #[test]
+    fn getkeys_no_mandatory_keys_family_replies_an_empty_array() {
+        for argv in [
+            &["EVAL", "return 1", "0"][..],
+            &["EVAL", "return 1", "0", "extra"][..],
+            &["EVAL", "return 1", "5", "k"][..], // count the argv cannot satisfy
+            &["EVAL", "return 1", "abc", "k"][..], // unparsable count
+            &["EVAL", "s", "-1", "k"][..],
+            &["EVALSHA", "sha", "abc", "k"][..],
+            &["FCALL", "f", "abc", "k"][..],
+            &["FCALL_RO", "f", "0"][..],
+        ] {
+            assert_eq!(getkeys_of(argv), Ok(vec![]), "{argv:?}");
+        }
+        // The contrast: LMPOP is NOT no-mandatory-keys, so the same shape of
+        // bad count is an error (issue text pins this pair explicitly).
+        assert!(getkeys_of(&["LMPOP", "abc", "k", "LEFT"]).is_err());
+    }
+
+    /// Fixed-position multi-key commands keep working — the meta-derived walk
+    /// still answers them, including `BITOP`'s `first_key: 2` and the
+    /// destination-first `*STORE` family whose SOURCES this change reclassified
+    /// as read-only (moon#584). `COMMAND GETKEYS` reports every key regardless
+    /// of role, exactly as redis does.
+    #[test]
+    fn getkeys_reports_read_only_sources_too() {
+        assert_eq!(
+            getkeys_of(&["SINTERSTORE", "d", "a", "b"]),
+            Ok(vec!["d".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["BITOP", "AND", "d", "a", "b"]),
+            Ok(vec!["d".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["PFMERGE", "d", "a", "b"]),
+            Ok(vec!["d".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["COPY", "s", "d"]),
+            Ok(vec!["s".into(), "d".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["ZRANGESTORE", "d", "s", "0", "-1"]),
+            Ok(vec!["d".into(), "s".into()])
+        );
+        assert_eq!(
+            getkeys_of(&[
+                "GEOSEARCHSTORE",
+                "d",
+                "s",
+                "FROMMEMBER",
+                "m",
+                "BYRADIUS",
+                "1",
+                "m",
+                "ASC"
+            ]),
+            Ok(vec!["d".into(), "s".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["RENAME", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            getkeys_of(&["EXISTS", "a", "b"]),
+            Ok(vec!["a".into(), "b".into()])
+        );
+    }
+
+    /// Known, deliberate divergences from redis 8.6.1 on MALFORMED argv, kept
+    /// here so a future reader can tell "we decided this" from "we missed it".
+    ///
+    /// All three are cases where moon is stricter or more inclusive than
+    /// redis, on argv that cannot execute successfully anyway.
+    #[test]
+    fn getkeys_documented_divergences_on_malformed_argv() {
+        // (1) A dangling STORE: redis ignores the token and answers `k`. moon
+        //     answers `k` too — but ACL keeps DENYING the same argv, which is
+        //     why the walker routes it through `AtPlusComputed` rather than
+        //     simply dropping the clause.
+        assert_eq!(getkeys_of(&["SORT", "k", "STORE"]), Ok(vec!["k".into()]));
+        assert_eq!(getkeys_of(&["SORT", "k", "BY"]), Ok(vec!["k".into()]));
+        assert_eq!(
+            getkeys_of(&["GEORADIUS", "src", "1", "2", "3", "m", "STORE"]),
+            Ok(vec!["src".into()])
+        );
+
+        // (2) Repeated STORE: redis keeps only the LAST destination (`k`,`e`);
+        //     moon reports both. Reporting a superset is the safe direction —
+        //     ACL checks both, and the command is a syntax error regardless.
+        assert_eq!(
+            getkeys_of(&["SORT", "k", "STORE", "d", "STORE", "e"]),
+            Ok(vec!["k".into(), "d".into(), "e".into()])
+        );
+
+        // (3) Container arity: redis resolves `OBJECT ENCODING` to the
+        //     subcommand and reports its arity error; moon has no per-
+        //     subcommand arity, so it answers the no-keys error instead. Both
+        //     are errors; only the text differs.
+        assert_eq!(
+            getkeys_of(&["OBJECT", "ENCODING"]),
+            Err("ERR The command has no key arguments".into())
+        );
+    }
+
+    /// A key position holding a non-string cannot be reported as a key, and
+    /// must not shift the positions after it either — the reason `getkeys`
+    /// walks FRAMES rather than a pre-filtered `Vec<Bytes>`.
+    #[test]
+    fn getkeys_survives_a_non_string_in_a_key_position() {
+        let r = command(&[
+            bulk("GETKEYS"),
+            bulk("MSET"),
+            Frame::Integer(7),
+            bulk("v1"),
+            bulk("k2"),
+            bulk("v2"),
+        ]);
+        // Integer is not a key name; the argv is malformed, so it must be an
+        // error rather than a silently shifted key list naming "v1".
+        let Frame::Error(e) = r else {
+            panic!("a non-string key position must not produce a key list");
+        };
+        assert!(String::from_utf8_lossy(&e).contains("Invalid arguments"));
     }
 }

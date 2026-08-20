@@ -35,10 +35,10 @@ pub fn flush_invalidation_push() -> Frame {
 /// [`crate::tracking::tracking_active`], so with no tracking clients the
 /// write path pays one relaxed atomic load.
 ///
-/// Invalidates EVERY key of the command per its registry key spec
-/// (`DEL a b`, `MSET k1 v1 k2 v2`), pushing one `invalidate` frame per key
-/// to each tracker. Senders are cross-thread (flume) — this works from any
-/// shard thread against the process-global table.
+/// Invalidates every key the command may MODIFY ([`written_keys`]), pushing
+/// one `invalidate` frame per key to each tracker. Senders are cross-thread
+/// (flume) — this works from any shard thread against the process-global
+/// table.
 pub fn invalidate_after_write(
     table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
     cmd: &[u8],
@@ -51,7 +51,7 @@ pub fn invalidate_after_write(
     if !crate::command::metadata::is_write(cmd) {
         return;
     }
-    let keys = command_keys(cmd, cmd_args);
+    let keys = written_keys(cmd, cmd_args);
     invalidate_keys(table, &keys, writer_client_id);
 }
 
@@ -149,6 +149,39 @@ pub fn track_read_keys(
 /// the wrong key would evict a still-valid cache entry, and (on the read side)
 /// registering the wrong key would be a silent miss anyway.
 pub fn command_keys(cmd: &[u8], cmd_args: &[Frame]) -> SmallVec<[Bytes; 4]> {
+    collect_keys(cmd, cmd_args, None)
+}
+
+/// The keys `cmd` may MODIFY — the subset of [`command_keys`] that an
+/// invalidation push is allowed to name.
+///
+/// moon#584: `invalidate_after_write` used every key the command NAMED, but
+/// redis invalidates only what it MODIFIES (`signalModifiedKey`). A tracking
+/// client caching `a` was told it changed by `ZUNIONSTORE d 2 a b`, which only
+/// read `a`; `SORT src STORE dst` invalidated `src`; a plain `SORT src` (a
+/// write-flagged command that writes nothing without `STORE`) invalidated
+/// `src` too. Each spurious push costs the client a dropped cache entry and a
+/// refetch.
+///
+/// The role comes from the shared walker's [`KeyRole`], so the answer cannot
+/// drift from the key positions themselves. It is deliberately over-inclusive
+/// where the argv genuinely cannot say: `LMPOP 2 a b LEFT` pops from whichever
+/// key is non-empty at execution time, and `EVAL` hands its script keys it may
+/// or may not write, so all of those stay `Write`. Closing that last gap needs
+/// an invalidation hook at the storage-mutation point, not a better key spec.
+///
+/// [`KeyRole`]: crate::acl::keyspec::KeyRole
+pub fn written_keys(cmd: &[u8], cmd_args: &[Frame]) -> SmallVec<[Bytes; 4]> {
+    collect_keys(cmd, cmd_args, Some(crate::acl::keyspec::KeyRole::Write))
+}
+
+/// Shared body: collect the walker's key positions, optionally filtered to one
+/// role.
+fn collect_keys(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    only: Option<crate::acl::keyspec::KeyRole>,
+) -> SmallVec<[Bytes; 4]> {
     use crate::acl::keyspec::{KeyPositions, command_key_positions};
 
     let mut keys: SmallVec<[Bytes; 4]> = SmallVec::new();
@@ -162,11 +195,14 @@ pub fn command_keys(cmd: &[u8], cmd_args: &[Frame]) -> SmallVec<[Bytes; 4]> {
         KeyPositions::None | KeyPositions::Unknown => return keys,
     };
     keys.reserve(idx.len());
-    for i in idx {
+    for k in idx {
+        if only.is_some_and(|want| k.role != want) {
+            continue;
+        }
         // Cheap: `extract_bytes` clones the `Bytes` handle (refcount), it does
         // not copy the key. A non-string in a key position cannot be a key.
         if let Some(b) = cmd_args
-            .get(i)
+            .get(k.idx)
             .and_then(crate::server::conn::util::extract_bytes)
         {
             keys.push(b);
@@ -315,6 +351,169 @@ mod tests {
         let huge = usize::MAX.to_string();
         assert!(keys_of(b"LMPOP", &[&huge, "a", "LEFT"]).is_empty());
         assert!(keys_of(b"EVAL", &["s", &huge, "a"]).is_empty());
+    }
+
+    fn written_of(cmd: &[u8], parts: &[&str]) -> Vec<String> {
+        let args: Vec<Frame> = parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect();
+        written_keys(cmd, &args)
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect()
+    }
+
+    /// moon#584. `invalidate_after_write` pushed every key the command NAMED;
+    /// redis pushes only what it MODIFIES. A tracking client caching `a` was
+    /// told `a` changed by `ZUNIONSTORE d 2 a b`, which only read it.
+    ///
+    /// Each case asserts the FULL key list on both sides: `command_keys` must
+    /// keep naming every key (routing and read-tracking depend on it) while
+    /// `written_keys` names only the destination. Asserting one without the
+    /// other would pass for a fix that simply dropped the sources everywhere.
+    #[test]
+    fn issue_584_store_sources_are_read_not_written() {
+        // The two rows measured in the issue.
+        assert_eq!(
+            keys_of(b"ZUNIONSTORE", &["d", "2", "a", "b"]),
+            ["d", "a", "b"]
+        );
+        assert_eq!(written_of(b"ZUNIONSTORE", &["d", "2", "a", "b"]), ["d"]);
+        assert_eq!(
+            keys_of(b"SORT", &["src", "ALPHA", "STORE", "dst"]),
+            ["src", "dst"]
+        );
+        assert_eq!(
+            written_of(b"SORT", &["src", "ALPHA", "STORE", "dst"]),
+            ["dst"]
+        );
+
+        // The rest of the same shape.
+        assert_eq!(written_of(b"ZINTERSTORE", &["d", "2", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"ZDIFFSTORE", &["d", "2", "a", "b"]), ["d"]);
+        assert_eq!(
+            written_of(b"GEORADIUS", &["src", "1", "2", "3", "m", "STORE", "dst"]),
+            ["dst"]
+        );
+        assert_eq!(
+            written_of(
+                b"GEORADIUSBYMEMBER",
+                &["src", "m", "3", "m", "STOREDIST", "dst"]
+            ),
+            ["dst"]
+        );
+        // Fixed-spec destination-first commands have exactly the same defect.
+        assert_eq!(written_of(b"SINTERSTORE", &["d", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"SUNIONSTORE", &["d", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"SDIFFSTORE", &["d", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"PFMERGE", &["d", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"BITOP", &["AND", "d", "a", "b"]), ["d"]);
+        assert_eq!(written_of(b"ZRANGESTORE", &["d", "s", "0", "-1"]), ["d"]);
+        assert_eq!(written_of(b"GEOSEARCHSTORE", &["d", "s", "x"]), ["d"]);
+        // ... and `COPY`, whose destination is LAST, not first.
+        assert_eq!(keys_of(b"COPY", &["src", "dst"]), ["src", "dst"]);
+        assert_eq!(written_of(b"COPY", &["src", "dst"]), ["dst"]);
+    }
+
+    /// `SORT` is a WRITE-flagged command that writes NOTHING without a `STORE`
+    /// clause, so a plain `SORT src` must push no invalidation at all — redis
+    /// does not. This is the case a "drop the first key" fix would get wrong.
+    #[test]
+    fn issue_584_sort_without_store_invalidates_nothing() {
+        assert_eq!(keys_of(b"SORT", &["src", "ALPHA"]), ["src"]);
+        assert!(written_of(b"SORT", &["src", "ALPHA"]).is_empty());
+        assert!(written_of(b"SORT", &["src", "BY", "w_*"]).is_empty());
+        assert!(
+            written_of(b"GEORADIUS", &["src", "1", "2", "3", "m"]).is_empty(),
+            "GEORADIUS without STORE writes nothing"
+        );
+        // A `BY` pattern does not change which keys are NAMED, and the named
+        // source is still only read.
+        assert_eq!(
+            written_of(b"SORT", &["src", "BY", "w_*", "STORE", "dst"]),
+            ["dst"]
+        );
+    }
+
+    /// The direction that must NOT change: a command that really does write
+    /// every key it names keeps invalidating every one of them. Under-
+    /// invalidating is moon#582 — a client cache stale forever — so this is
+    /// the guard that the role split did not overshoot.
+    #[test]
+    fn commands_that_write_every_key_still_invalidate_every_key() {
+        assert_eq!(written_of(b"MSET", &["a", "1", "b", "2"]), ["a", "b"]);
+        assert_eq!(written_of(b"DEL", &["a", "b", "c"]), ["a", "b", "c"]);
+        assert_eq!(written_of(b"SET", &["k", "v"]), ["k"]);
+        assert_eq!(written_of(b"RENAME", &["a", "b"]), ["a", "b"]);
+        assert_eq!(written_of(b"RENAMENX", &["a", "b"]), ["a", "b"]);
+        assert_eq!(written_of(b"SMOVE", &["s", "d", "m"]), ["s", "d"]);
+        assert_eq!(
+            written_of(b"LMOVE", &["s", "d", "LEFT", "RIGHT"]),
+            ["s", "d"]
+        );
+        assert_eq!(written_of(b"RPOPLPUSH", &["s", "d"]), ["s", "d"]);
+        assert_eq!(written_of(b"XGROUP", &["CREATE", "k", "g", "$"]), ["k"]);
+        assert_eq!(
+            written_of(b"XREADGROUP", &["GROUP", "g", "c", "STREAMS", "s", ">"]),
+            ["s"],
+            "XREADGROUP advances the group's last-delivered id"
+        );
+        // The MPOP family: which key is popped depends on which is non-empty
+        // at execution time, so a static spec MUST keep all of them writable.
+        // Over-invalidating costs a refetch; under-invalidating goes stale.
+        assert_eq!(written_of(b"LMPOP", &["2", "a", "b", "LEFT"]), ["a", "b"]);
+        assert_eq!(written_of(b"ZMPOP", &["2", "a", "b", "MIN"]), ["a", "b"]);
+        assert_eq!(
+            written_of(b"BLMPOP", &["0", "2", "a", "b", "LEFT"]),
+            ["a", "b"]
+        );
+    }
+
+    /// Read-only commands never reach `invalidate_after_write` (it gates on
+    /// `is_write` first), but their keys must still be READ-role so that a
+    /// future caller cannot mistake them for modifications.
+    #[test]
+    fn read_only_commands_write_nothing() {
+        assert_eq!(keys_of(b"SINTERCARD", &["2", "a", "b"]), ["a", "b"]);
+        assert!(written_of(b"SINTERCARD", &["2", "a", "b"]).is_empty());
+        assert!(written_of(b"ZDIFF", &["2", "a", "b"]).is_empty());
+        assert!(written_of(b"ZUNION", &["2", "a", "b"]).is_empty());
+        assert!(written_of(b"ZINTER", &["2", "a", "b"]).is_empty());
+        assert!(written_of(b"ZINTERCARD", &["2", "a", "b"]).is_empty());
+        assert!(written_of(b"MGET", &["a", "b"]).is_empty());
+        assert!(written_of(b"SORT_RO", &["k"]).is_empty());
+        assert!(written_of(b"FCALL_RO", &["f", "1", "k"]).is_empty());
+        assert!(
+            written_of(b"XREAD", &["COUNT", "1", "STREAMS", "a", "0"]).is_empty(),
+            "plain XREAD does not modify the stream"
+        );
+        assert!(written_of(b"OBJECT", &["ENCODING", "k"]).is_empty());
+        assert!(written_of(b"MEMORY", &["USAGE", "k"]).is_empty());
+    }
+
+    /// `written_keys` is a SUBSET of `command_keys` by construction; pinning
+    /// it means a future role change can never invent a key the argv does not
+    /// name (which would invalidate a key nobody asked about).
+    #[test]
+    fn written_keys_never_names_a_key_the_command_does_not() {
+        for (cmd, argv) in [
+            (b"ZUNIONSTORE".as_ref(), &["d", "2", "a", "b"][..]),
+            (b"SORT".as_ref(), &["s", "STORE", "d"][..]),
+            (b"COPY".as_ref(), &["s", "d"][..]),
+            (b"BITOP".as_ref(), &["AND", "d", "a"][..]),
+            (b"LMPOP".as_ref(), &["2", "a", "b", "LEFT"][..]),
+            (b"DEL".as_ref(), &["a", "b"][..]),
+        ] {
+            let all = keys_of(cmd, argv);
+            for k in written_of(cmd, argv) {
+                assert!(
+                    all.contains(&k),
+                    "{} invalidated {k:?}, which it does not name",
+                    String::from_utf8_lossy(cmd)
+                );
+            }
+        }
     }
 
     #[test]

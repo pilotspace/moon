@@ -1131,6 +1131,145 @@ assert_eq "COMMAND COUNT equals COMMAND LIST length" \
 
 assert_both "COMMAND GETKEYS extracts keys" COMMAND GETKEYS MSET ik1 v1 ik2 v2
 assert_both "COMMAND GETKEYS rejects a keyless command" COMMAND GETKEYS PING
+
+# moon#537: every command below carries `first_key: 0`, which mirrors redis and
+# means "the keys are not at a FIXED argument position" — NOT "there are no
+# keys". moon read it as the latter and answered `ERR The command has no key
+# arguments` to the whole movablekeys family, which is exactly what a
+# cluster-aware client calls GETKEYS to resolve. One case per key LAYOUT the
+# shared walker knows, so a fix that covers only one shape cannot pass.
+assert_both "GETKEYS LMPOP (numkeys vector)"        COMMAND GETKEYS LMPOP 2 ik1 ik2 LEFT
+assert_both "GETKEYS ZMPOP (numkeys vector)"        COMMAND GETKEYS ZMPOP 1 ik1 MIN
+assert_both "GETKEYS BLMPOP (numkeys after arg)"    COMMAND GETKEYS BLMPOP 0 2 ik1 ik2 LEFT
+assert_both "GETKEYS SINTERCARD"                    COMMAND GETKEYS SINTERCARD 2 ik1 ik2
+assert_both "GETKEYS ZDIFF"                         COMMAND GETKEYS ZDIFF 2 ik1 ik2
+assert_both "GETKEYS ZINTERCARD"                    COMMAND GETKEYS ZINTERCARD 2 ik1 ik2
+assert_both "GETKEYS ZUNIONSTORE (dest + vector)"   COMMAND GETKEYS ZUNIONSTORE ikd 2 ik1 ik2
+assert_both "GETKEYS EVAL (script numkeys)"         COMMAND GETKEYS EVAL "return 1" 1 ik1
+assert_both "GETKEYS EVALSHA"                       COMMAND GETKEYS EVALSHA sha 1 ik1
+assert_both "GETKEYS FCALL"                         COMMAND GETKEYS FCALL fn 2 ik1 ik2
+assert_both "GETKEYS XREAD (STREAMS token)"         COMMAND GETKEYS XREAD COUNT 1 STREAMS ik1 ik2 0 0
+assert_both "GETKEYS XREADGROUP (STREAMS token)"    COMMAND GETKEYS XREADGROUP GROUP g c STREAMS ik1 '>'
+assert_both "GETKEYS SORT (source only)"            COMMAND GETKEYS SORT ik1
+assert_both "GETKEYS SORT ... STORE (source+dest)"  COMMAND GETKEYS SORT ik1 ALPHA STORE ikd
+assert_both "GETKEYS SORT ... BY pattern"           COMMAND GETKEYS SORT ik1 BY 'w_*'
+assert_both "GETKEYS GEORADIUS ... STORE"           COMMAND GETKEYS GEORADIUS ik1 1 2 3 m STORE ikd
+assert_both "GETKEYS OBJECT (subcommand-shaped)"    COMMAND GETKEYS OBJECT ENCODING ik1
+assert_both "GETKEYS MEMORY USAGE"                  COMMAND GETKEYS MEMORY USAGE ik1
+assert_both "GETKEYS XGROUP CREATE"                 COMMAND GETKEYS XGROUP CREATE ik1 g '$'
+assert_both "GETKEYS RPOPLPUSH (two keys)"          COMMAND GETKEYS RPOPLPUSH ik1 ik2
+# ... and the four error strings, whose ORDER is observable: SELECT's arity is
+# ALSO wrong, and redis still reports the no-keys answer first.
+assert_both "GETKEYS unknown command"               COMMAND GETKEYS NOSUCHCMD ik1
+assert_both "GETKEYS keyless beats wrong arity"     COMMAND GETKEYS SELECT
+assert_both "GETKEYS container keyless subcommand"  COMMAND GETKEYS MEMORY STATS
+assert_both "GETKEYS wrong arity"                   COMMAND GETKEYS LMPOP 0 LEFT
+assert_both "GETKEYS unextractable argv"            COMMAND GETKEYS LMPOP abc ik1 LEFT
+assert_both "GETKEYS numkeys exceeds argv"          COMMAND GETKEYS LMPOP 3 ik1 LEFT
+# `no-mandatory-keys`: EVAL's key COUNT is an argument, so zero keys (and even
+# a count the argv cannot satisfy) is an empty ARRAY, not an error. LMPOP with
+# the same shape of bad count IS an error — that contrast is the whole point.
+assert_both "GETKEYS EVAL numkeys 0 is an empty array" COMMAND GETKEYS EVAL "return 1" 0
+assert_both "GETKEYS EVAL bad numkeys is empty too"    COMMAND GETKEYS EVAL "return 1" 9 ik1
+
+# ---------------------------------------------------------------------------
+# moon#584 -- CLIENT TRACKING must invalidate what a command MODIFIES, not
+# every key it NAMES.
+#
+# Moon pushed an invalidation for the read-only SOURCES of `*STORE` commands,
+# so a client caching `a` was told `a` had changed by `ZUNIONSTORE d 2 a b`.
+# Extra invalidations are safe but wasteful (a dropped cache entry and a
+# refetch); the DANGEROUS direction is a missing one, which is why every case
+# below is paired with its destination CONTROL. A fix that simply stopped
+# pushing would pass the source rows and fail every control.
+#
+# Needs a held-open RESP3 connection to observe the out-of-band push, same
+# /dev/tcp technique as the WATCH/RESET tests above.
+# ---------------------------------------------------------------------------
+tracking_push_for() {
+    local port="$1" watched="$2" read_cmd="$3"; shift 3
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\nCLIENT TRACKING ON\r\n%s\r\n' "$read_cmd" >&3
+    # Drain the HELLO map, the +OK and the read's own reply so the only thing
+    # left on the socket is whatever the write pushes.
+    local line=""
+    while IFS= read -r -t 1 line <&3; do :; done
+    redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+    local seen="" got="NONE"
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'}|"
+    done
+    exec 3>&-
+    case "$seen" in
+        *invalidate*"${watched}"*) got="PUSH:${watched}" ;;
+        *invalidate*)              got="PUSH:other" ;;
+    esac
+    echo "$got"
+}
+
+assert_tracking() {
+    local desc="$1" watched="$2" read_cmd="$3"; shift 3
+    assert_eq "$desc" \
+        "$(tracking_push_for "$PORT_REDIS" "$watched" "$read_cmd" "$@")" \
+        "$(tracking_push_for "$PORT_RUST"  "$watched" "$read_cmd" "$@")"
+}
+
+both ZADD tz:a 1 m
+both ZADD tz:b 1 m
+assert_tracking "tracking: ZUNIONSTORE SOURCE not invalidated" \
+    "tz:a" "ZRANGE tz:a 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+assert_tracking "tracking: ZUNIONSTORE DEST invalidated [control]" \
+    "tz:d" "ZRANGE tz:d 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+assert_tracking "tracking: ZINTERSTORE SOURCE not invalidated" \
+    "tz:a" "ZRANGE tz:a 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+assert_tracking "tracking: ZINTERSTORE DEST invalidated [control]" \
+    "tz:i" "ZRANGE tz:i 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+
+both RPUSH tl:s b a
+assert_tracking "tracking: SORT..STORE SOURCE not invalidated" \
+    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA STORE tl:d
+assert_tracking "tracking: SORT..STORE DEST invalidated [control]" \
+    "tl:d" "LRANGE tl:d 0 -1" SORT tl:s ALPHA STORE tl:d
+# SORT is a WRITE-flagged command that writes NOTHING without STORE.
+assert_tracking "tracking: SORT without STORE invalidates nothing" \
+    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA
+
+both SADD ts:a x
+both SADD ts:b x
+assert_tracking "tracking: SINTERSTORE SOURCE not invalidated" \
+    "ts:a" "SMEMBERS ts:a" SINTERSTORE ts:d ts:a ts:b
+assert_tracking "tracking: SINTERSTORE DEST invalidated [control]" \
+    "ts:d" "SMEMBERS ts:d" SINTERSTORE ts:d ts:a ts:b
+
+both SET tb:a x
+both SET tb:b y
+assert_tracking "tracking: BITOP SOURCE not invalidated" \
+    "tb:a" "GET tb:a" BITOP AND tb:d tb:a tb:b
+assert_tracking "tracking: BITOP DEST invalidated [control]" \
+    "tb:d" "GET tb:d" BITOP AND tb:d tb:a tb:b
+
+both SET tc:a v
+assert_tracking "tracking: COPY SOURCE not invalidated" \
+    "tc:a" "GET tc:a" COPY tc:a tc:d
+assert_tracking "tracking: COPY DEST invalidated [control]" \
+    "tc:d" "GET tc:d" COPY tc:a tc:d REPLACE
+
+assert_tracking "tracking: ZRANGESTORE SOURCE not invalidated" \
+    "tz:a" "ZRANGE tz:a 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
+    "tz:r" "ZRANGE tz:r 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+
+# Same-role commands must be untouched: every key they name IS written.
+assert_tracking "tracking: SET invalidates its key [control]" \
+    "tp:k" "GET tp:k" SET tp:k v
+both SET tp:d v
+assert_tracking "tracking: DEL invalidates its key [control]" \
+    "tp:d" "GET tp:d" DEL tp:d
+assert_tracking "tracking: MSET invalidates every key [control]" \
+    "tp:m2" "GET tp:m2" MSET tp:m1 1 tp:m2 2
+both SET tp:rs v
+assert_tracking "tracking: RENAME invalidates its source [control]" \
+    "tp:rs" "GET tp:rs" RENAME tp:rs tp:rd
 assert_both "COMMAND COUNT arity" COMMAND COUNT extra
 assert_both "COMMAND INFO unknown name" COMMAND INFO definitely-not-a-command
 
