@@ -412,6 +412,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reclaim can never accumulate into a false `OOM`. Verified by mutation: with the sampler fix
     removed the loop stops spinning and answers `OOM` in 0.14 s, and with both removed it hangs.
 
+    The backstop carries its OWN tests rather than only that combined mutation. Disabling it
+    while leaving the sampler correct left the entire eviction suite green — no sampler can
+    reach the backstop today, which is exactly why a defence built for the NEXT index-only
+    victim would have rotted unnoticed before that victim arrived. The stall decision is
+    therefore a pure function over two probes and a counter, and three tests pin the three
+    properties the constant claims: it fires on the 16th consecutive no-op and not the 15th,
+    each of the three fields counts as progress on its own (a bytes-only test would reject a
+    working async spill), and progress RESETS the count, so intermittent-but-real reclaim never
+    accumulates into a rejection. Both mutations — backstop never fires, and progress judged on
+    bytes alone — are caught.
+
   moon#599's accounting distinction is preserved exactly, and neither change touches it: reaping
   a stale pair is a repair, not an eviction — the key it names is already absent from the
   keyspace, so `DBSIZE` cannot move and no counter is recorded. Confirmed end to end on a live

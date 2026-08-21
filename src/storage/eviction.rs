@@ -654,22 +654,17 @@ pub fn evict_to_budget(
         // original spin: a victim `db.remove` could not find). Terminate on
         // the observation, never on the claim.
         let after_probe = EvictionProgress::probe(db);
-        if after_probe == before_probe {
-            stalled += 1;
-            if stalled >= EVICTION_STALL_LIMIT {
-                warn!(
-                    policy = %config.maxmemory_policy,
-                    budget,
-                    current_total,
-                    stalled,
-                    "eviction made no observable progress for \
-                     EVICTION_STALL_LIMIT consecutive victims; answering OOM \
-                     rather than spinning the shard thread"
-                );
-                return Err(oom_error());
-            }
-        } else {
-            stalled = 0;
+        if EvictionProgress::note_iteration(before_probe, after_probe, &mut stalled) {
+            warn!(
+                policy = %config.maxmemory_policy,
+                budget,
+                current_total,
+                stalled,
+                "eviction made no observable progress for \
+                 EVICTION_STALL_LIMIT consecutive victims; answering OOM \
+                 rather than spinning the shard thread"
+            );
+            return Err(oom_error());
         }
         let after = after_probe.memory;
         current_total = current_total.saturating_sub(before.saturating_sub(after));
@@ -726,6 +721,30 @@ struct EvictionProgress {
 }
 
 impl EvictionProgress {
+    /// Fold one iteration's observation into the consecutive-stall counter,
+    /// answering "must this run give up?" (moon#600).
+    ///
+    /// Split out of `evict_to_budget` so the backstop is reachable from a
+    /// test WITHOUT a stalling sink. It is defence in depth for a sampler
+    /// that does not exist yet — no sampler can reach it today, which is
+    /// exactly why it would otherwise rot unnoticed and fail to catch the
+    /// next index-only victim.
+    ///
+    /// Pins all three properties the constant's doc comment claims: it fires
+    /// only on the `EVICTION_STALL_LIMIT`-th CONSECUTIVE no-op, ANY of the
+    /// three fields moving counts as progress, and progress resets the count
+    /// so a slow-but-working reclaim can never accumulate into a rejection.
+    #[inline]
+    fn note_iteration(before: Self, after: Self, stalled: &mut usize) -> bool {
+        if after == before {
+            *stalled += 1;
+            *stalled >= EVICTION_STALL_LIMIT
+        } else {
+            *stalled = 0;
+            false
+        }
+    }
+
     #[inline]
     fn probe(db: &Database) -> Self {
         Self {
@@ -3177,6 +3196,101 @@ mod tests {
             result.is_err(),
             "override must clamp to maxmemory (1 byte) and OOM under noeviction"
         );
+    }
+
+    // ── moon#600: the stall backstop, independent of any sampler ──────────
+    //
+    // The PR that added this made TWO claims: the sampler is now correct, and
+    // the loop terminates REGARDLESS of the sampler. Reverting the sampler
+    // proves the first (four tests below go red). Nothing proved the second:
+    // with the backstop disabled and the sampler intact, the whole eviction
+    // suite still passed, because no sampler can reach the backstop today.
+    // That is precisely why it needs its own test — a defence for a bug that
+    // does not exist yet is worthless if it rots unnoticed before that bug
+    // arrives.
+
+    /// A probe with all three fields distinct from `base`'s, so each field
+    /// can be moved one at a time.
+    fn probe_at(memory: usize, pending_spill: usize, hot_keys: usize) -> EvictionProgress {
+        EvictionProgress {
+            memory,
+            pending_spill,
+            hot_keys,
+        }
+    }
+
+    /// Fires on the LIMIT-th consecutive no-op, and not one iteration sooner.
+    /// An off-by-one either way is a real defect: too eager converts a slow
+    /// reclaim into a spurious `OOM`, too lax leaves the shard spinning
+    /// longer than the constant promises.
+    #[test]
+    fn eviction_stall_backstop_fires_exactly_on_the_limit() {
+        let p = probe_at(100, 0, 10);
+        let mut stalled = 0usize;
+        for i in 1..EVICTION_STALL_LIMIT {
+            assert!(
+                !EvictionProgress::note_iteration(p, p, &mut stalled),
+                "no-op #{i} must not trip the backstop before                  EVICTION_STALL_LIMIT ({EVICTION_STALL_LIMIT})"
+            );
+        }
+        assert!(
+            EvictionProgress::note_iteration(p, p, &mut stalled),
+            "the {EVICTION_STALL_LIMIT}th consecutive no-op must answer OOM              rather than spin the shard thread"
+        );
+    }
+
+    /// ANY of the three fields moving is progress. A bytes-only test would
+    /// call async spill (moon#466) stalled — it moves a value from the hot
+    /// plane to the pending plane and leaves `estimated_memory` flat — and
+    /// convert a working reclaim into a rejection.
+    #[test]
+    fn eviction_stall_backstop_counts_each_field_as_progress() {
+        let base = probe_at(100, 50, 10);
+        for (label, moved) in [
+            ("memory", probe_at(99, 50, 10)),
+            ("pending_spill", probe_at(100, 51, 10)),
+            ("hot_keys", probe_at(100, 50, 9)),
+        ] {
+            let mut stalled = EVICTION_STALL_LIMIT - 1;
+            assert!(
+                !EvictionProgress::note_iteration(base, moved, &mut stalled),
+                "{label} moving is progress; the backstop must not fire"
+            );
+            assert_eq!(
+                stalled, 0,
+                "{label} moving must RESET the counter, not merely spare this                  iteration — otherwise slow reclaim accumulates into a false OOM"
+            );
+        }
+    }
+
+    /// The counter is CONSECUTIVE. A reclaim that frees nothing on most
+    /// iterations but genuinely progresses now and then must never be
+    /// rejected, however long it runs.
+    #[test]
+    fn eviction_stall_backstop_never_fires_on_intermittent_progress() {
+        let rounds = EVICTION_STALL_LIMIT * 4;
+        let mut stalled = 0usize;
+        // One real victim per round, so the starting count must outlast them.
+        let mut hot = rounds + 1;
+        for round in 0..rounds {
+            // LIMIT-1 no-ops, then one real victim, forever.
+            for _ in 0..(EVICTION_STALL_LIMIT - 1) {
+                let p = probe_at(100, 0, hot);
+                assert!(
+                    !EvictionProgress::note_iteration(p, p, &mut stalled),
+                    "round {round}: intermittent progress must never OOM"
+                );
+            }
+            let before = probe_at(100, 0, hot);
+            hot -= 1;
+            let after = probe_at(100, 0, hot);
+            assert!(!EvictionProgress::note_iteration(
+                before,
+                after,
+                &mut stalled
+            ));
+            assert_eq!(stalled, 0, "round {round}: real progress must reset");
+        }
     }
 
     // ── moon#600: index-only volatile-ttl victims ─────────────────────────
