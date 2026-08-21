@@ -30,6 +30,8 @@
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -50,13 +52,6 @@ fn find_moon_binary() -> PathBuf {
         }
     }
     PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn unique_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
 }
 
 fn unique_dir(suffix: &str) -> PathBuf {
@@ -463,7 +458,7 @@ fn ft_info_int(c: &mut Client, idx: &str, field: &str) -> i64 {
 #[test]
 #[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s1");
     let idx = "idleidx";
 
@@ -593,7 +588,7 @@ fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
 #[test]
 #[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hdel_during_cold_does_not_resurrect() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s2");
     let idx = "colddelidx";
 
@@ -669,7 +664,7 @@ fn hdel_during_cold_does_not_resurrect() {
 #[test]
 #[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hdel_during_warm_does_not_resurrect() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s3");
     let idx = "warmdelidx";
 
@@ -752,7 +747,7 @@ fn cold_unload_reduces_process_rss() {
     const BIG_DIM: usize = 768;
     const N: u32 = 15000;
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("rss");
     let idx = "rssidx";
 

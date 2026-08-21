@@ -143,17 +143,10 @@ fn wait_ready(addr: &str) {
     panic!("server at {addr} never became ready");
 }
 
-fn unique_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
-
 /// Interleave db0/db2 writes from two connections, kill -9, restart, assert
 /// every key recovered into the db it was written to.
 fn run_case(shards: usize) {
-    let port = unique_port();
+    let port = common::reserve_port();
     let addr = format!("127.0.0.1:{port}");
     let dir = tempfile::tempdir().expect("tempdir");
     let dir_path = dir.path().to_str().expect("utf8 dir").to_string();
@@ -228,7 +221,7 @@ fn aof_multidb_kill9_recovers_per_shard() {
 /// writes recover into db2. Fix: txn entries carry the db each command
 /// actually executed in; queued SELECT is never persisted.
 fn run_txn_case(shards: usize) {
-    let port = unique_port();
+    let port = common::reserve_port();
     let addr = format!("127.0.0.1:{port}");
     let dir = tempfile::tempdir().expect("tempdir");
     let dir_path = dir.path().to_str().expect("utf8 dir").to_string();

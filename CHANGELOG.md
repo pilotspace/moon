@@ -185,6 +185,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ids are now sorted before the lookup and each entry is paired with its decision **by
   `wait_id`**, never by position. Only reachable at `--shards >= 2`; the list and zset wakers
   consume one waiter at a time and were never affected.
+- **Eleven more test binaries drew ports from an unverified `:0` probe** (#489). Each carried its
+  own copy of the same `unique_port()` — bind `127.0.0.1:0`, read the kernel's port, drop the
+  listener, hand it out — with no record of what it had already handed out and no floor on the value.
+  Two draws in one binary can return the same number, and moon's `SO_REUSEPORT` listeners bind an
+  already-taken port **without an error**, so the collision produces no bind failure and no log: the
+  kernel simply splits (Linux) or redirects (macOS) one test's connections into another test's
+  server. All eleven now call `common::reserve_port`, whose process-wide dedup set makes an
+  in-process repeat impossible and which floors draws at 20000.
+
+  `crash_matrix_per_shard_bgrewriteaof.rs` carried a comment asserting that "two independent kernel
+  allocations never return the same port" — they can, which is the whole reason the shared helper
+  keeps a dedup set. Corrected in place.
+
+  Files: `crash_recovery_wal_recycle_legacy`, `crash_matrix_per_shard_bgrewriteaof`,
+  `cold_shadow_overwrite_resurrection`, `crash_recovery_orphan_sweep_readiness`,
+  `vector_idle_unload`, `crash_recovery_vector_durability`, `crash_recovery_graph_durability`,
+  `crash_recovery_disk_offload_no_aof`, `aof_multidb_kill9`,
+  `crash_recovery_cold_del_resurrection`, `wal_group_commit`.
 
 - **Crash-matrix tests could silently run two servers on one port** (#489).
   `tests/crash_matrix_per_shard_aof.rs` took a port from a local `unique_port()` — bind `:0`, read

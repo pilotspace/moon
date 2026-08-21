@@ -73,14 +73,6 @@ const SETTLE_AFTER_FILLER: u64 = 8;
 /// v2, updating the manifest and defeating the whole point of this test.
 const SETTLE_AFTER_OVERWRITE: u64 = 3;
 
-fn unique_port() -> u16 {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
-}
-
 fn unique_dir(suffix: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -313,7 +305,7 @@ fn count_heap_files(dir: &std::path::Path) -> usize {
 #[test]
 #[ignore] // requires ./target/release/moon + redis-cli; run with -- --ignored
 fn overwritten_cold_key_returns_new_value_after_crash() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("overwrite");
     std::fs::create_dir_all(&dir).expect("create test dir");
 

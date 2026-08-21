@@ -32,14 +32,6 @@ mod common;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-fn unique_port() -> u16 {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
-}
-
 fn unique_dir(suffix: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -210,7 +202,7 @@ fn compacted_base_exists(dir: &std::path::Path) -> bool {
 fn bgrewriteaof_straddle_crash_recovers_exact() {
     const N: i64 = 500;
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("straddle");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
@@ -291,15 +283,16 @@ fn bgrewriteaof_base_plus_incr_recovers_exact() {
     const PRE: i64 = 300;
     const POST: i64 = 200;
 
-    // Plain unique_port(), NOT unique_port()+1: macOS allocates ephemeral
-    // ports sequentially, so when this test runs in parallel with the
-    // straddle test, `+1` lands exactly on the port the straddle test's own
-    // unique_port() call returns next. Both moons then bind the SAME port via
-    // SO_REUSEPORT (no bind error) and the kernel splits each test's
-    // redis-cli connections between the two servers — INCRs land on the
-    // wrong server and the rewrite asserts fire ("rewrite did not compact").
-    // Two independent kernel allocations never return the same port.
-    let port = unique_port();
+    // Never offset this draw. macOS allocates ephemeral ports sequentially, so
+    // `port + 1` lands exactly on what the straddle test's own draw returns
+    // next; both moons then bind the SAME port via SO_REUSEPORT (which does NOT
+    // fail), the kernel splits each test's redis-cli connections between the
+    // two servers, INCRs land on the wrong one and the rewrite assertion fires
+    // ("rewrite did not compact"). The old note here claimed "two independent
+    // kernel allocations never return the same port" — they can, which is why
+    // the draw now goes through `common::reserve_port` and its process-wide
+    // dedup set rather than a bare `:0` bind.
+    let port = common::reserve_port();
     let dir = unique_dir("compose");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
