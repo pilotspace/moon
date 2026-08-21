@@ -2988,6 +2988,14 @@ pub(crate) fn handle_shard_message_shared(
             // broadcasts to the other shards (see `TxnExecReply::exec_flushes`
             // for why the fan-out cannot happen here).
             let mut exec_flushes: Vec<(usize, crate::protocol::Frame, usize)> = Vec::new();
+            // moon#606: keys this body wrote that a blocked client may be on.
+            // This is the arm that matters most for the defect — `TxnLocality`
+            // routes a body to the shard that OWNS its keys, which at
+            // num_shards > 1 is usually not the connection's own shard, so a
+            // transaction wakes waiters here far more often than on the
+            // originator.
+            let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
+                Vec::new();
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -2998,8 +3006,17 @@ pub(crate) fn handle_shard_message_shared(
                     cached_clock,
                     &mut exec_publishes,
                     &mut exec_flushes,
+                    &mut exec_wakes,
                     &watched,
                 );
+            // The waiters are registered HERE, on the owning shard's registry
+            // — the same one the live cross-shard write path wakes.
+            for (wake_db, wake_key, family) in exec_wakes.drain(..) {
+                let mut reg = blocking_registry.borrow_mut();
+                crate::shard::slice::with_shard_db(wake_db, |db| {
+                    crate::blocking::wakeup::wake_family(&mut reg, db, wake_db, &wake_key, family);
+                });
+            }
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
             // construction only happens at num_shards > 1) -- graph

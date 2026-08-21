@@ -385,6 +385,10 @@ pub(crate) fn execute_transaction_sharded(
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
+    // moon#606: keys this body wrote that a blocked client may be waiting on.
+    // Raised by the CALLER after the body, never here — see the collection
+    // site below for why.
+    exec_wakes: &mut Vec<(usize, Bytes, crate::blocking::WaitFamily)>,
     // WATCH/CAS (task `watch-cas-transactions`): the versions this connection
     // recorded at WATCH time. Empty for the overwhelming majority of
     // transactions, which is why the check below early-outs on `is_empty`
@@ -567,6 +571,30 @@ pub(crate) fn execute_transaction_sharded(
             if !matches!(&response, Frame::Error(_)) {
                 aof_entries.push((entry_db, bytes));
             }
+        }
+
+        // moon#606: a producer queued inside MULTI must wake whoever is
+        // blocked on the key it wrote. This executor reaches none of the live
+        // wake hooks, so a `MULTI ; LPUSH k v ; EXEC` used to leave a `BLPOP k`
+        // asleep until its own timeout.
+        //
+        // Recorded for the caller rather than raised here, for two reasons.
+        // It matches Redis, which defers to the ready-keys pass that runs
+        // after the command — and EXEC is one command, so every waiter sees
+        // the whole transaction applied, never a half-built body. And this
+        // function has no registry access anyway (same reason `exec_publishes`
+        // and the graph records are returned rather than acted on).
+        //
+        // The caller's own registry is the right one: `TxnLocality` rejects a
+        // cross-shard body outright, so the shard executing this owns every
+        // key in it.
+        if !matches!(&response, Frame::Error(_))
+            && let Some(family) = crate::blocking::wakeup::producer_family(cmd)
+            && let Some(key) = cmd_args
+                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
+                .and_then(super::util::extract_bytes)
+        {
+            exec_wakes.push((entry_db, key, family));
         }
 
         // Auto-index: if HSET succeeded, check for vector index match

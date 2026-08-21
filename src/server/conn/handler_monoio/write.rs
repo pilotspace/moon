@@ -891,6 +891,9 @@ pub(super) async fn try_handle_multi_exec(
             }
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only this shard.
             let mut exec_flushes: Vec<(usize, Frame, usize)> = Vec::new();
+            // moon#606: keys the body wrote that a blocked client may be on.
+            let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
+                Vec::new();
             let (mut result, aof_entries, graph_records) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
@@ -900,8 +903,27 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
                 &mut exec_flushes,
+                &mut exec_wakes,
                 &watched,
             );
+            // moon#606: raise the wakes the body recorded. A producer queued
+            // inside MULTI reaches none of the live write path's hooks, so
+            // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
+            // on `k` asleep until its own timeout.
+            //
+            // Positioned exactly where the live path's hooks sit relative to
+            // the AOF barrier, and raised whether or not that barrier later
+            // fails: the elements are in the keyspace either way (an EXEC that
+            // cannot be persisted is reported as an error, not rolled back), so
+            // a waiter left asleep would answer null for a key that
+            // demonstrably has data.
+            for (wake_db, wake_key, family) in exec_wakes.drain(..) {
+                let mut reg = ctx.blocking_registry.borrow_mut();
+                crate::shard::slice::with_shard_db(wake_db, |db| {
+                    crate::blocking::wakeup::wake_family(&mut reg, db, wake_db, &wake_key, family);
+                });
+            }
+
             // v0.7 REPLICATION (adversarial-review P0-1): the txn body must
             // reach replicas like any other successful local write. This was
             // the ONE local write path that skipped the replication plane —

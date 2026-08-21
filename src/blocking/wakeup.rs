@@ -448,6 +448,43 @@ pub fn try_wake_zset_waiter(
     false
 }
 
+/// Which waker a producer command's write should raise, or `None` when the
+/// command is not a producer at all.
+///
+/// Pairs with [`producer_wake_key_index`]: together they are everything a
+/// write site needs to raise the right wake, so a new execution path can hook
+/// in without re-deriving the command-to-waker mapping and getting it subtly
+/// wrong. `EXEC` was such a path — it ran producers through its own executor
+/// and reached none of the existing hooks, so a `MULTI ; LPUSH k v ; EXEC`
+/// left a client blocked on `k` asleep until its own timeout (moon#606).
+pub fn producer_family(cmd: &[u8]) -> Option<crate::blocking::WaitFamily> {
+    if !is_producer(cmd) {
+        return None;
+    }
+    Some(if is_list_producer(cmd) {
+        crate::blocking::WaitFamily::List
+    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+        crate::blocking::WaitFamily::ZSet
+    } else {
+        crate::blocking::WaitFamily::Stream
+    })
+}
+
+/// Raise `family`'s waker for `key`. Returns true if a client was answered.
+pub fn wake_family(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    key: &Bytes,
+    family: crate::blocking::WaitFamily,
+) -> bool {
+    match family {
+        crate::blocking::WaitFamily::List => try_wake_list_waiter(registry, db, db_index, key),
+        crate::blocking::WaitFamily::ZSet => try_wake_zset_waiter(registry, db, db_index, key),
+        crate::blocking::WaitFamily::Stream => try_wake_stream_waiter(registry, db, db_index, key),
+    }
+}
+
 /// Called after `XADD` adds an entry to a stream key, and again right after a
 /// remote `BlockRegister` lands, to serve whatever stream readers that key now
 /// has parked on it.
