@@ -283,7 +283,8 @@ entries:
         all pre-existing data/typing gaps rather than introspection bugs:
         (1) acl_categories is thin — Redis reports @read @string @fast for GET,
         Moon's registry carries only @string;
-        (2) key_specs is empty — Redis emits one spec for GET, Moon emits *0;
+        (2) key_specs is empty — Redis emits one spec for GET, Moon emits an
+        empty container (RESP3 ~0 since moon#631, downgraded to *0 on RESP2);
         A client dispatching on the reply shape is served; one reading
         acl_categories to build a permission model is not.
         The former item (3) -- flags, acl_categories, tips, key_specs and

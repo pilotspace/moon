@@ -38,6 +38,12 @@ enum Node {
     Null,
     /// `*`, `~`, `>` — sigil kept so Array and Set stay distinguishable.
     Agg(char, Vec<Node>),
+    /// A NEGATIVE aggregate length (`*-1`), which RESP2 uses as its null.
+    /// Deliberately NOT folded into an empty `Agg`: several assertions below
+    /// turn on a field being an EMPTY array (`selectors`, `passwords`), and a
+    /// regression that answered the null array instead would satisfy an
+    /// `items().is_empty()` check while being a different wire value.
+    NullAgg(char),
     /// `%` — pairs, so key order is preserved.
     Map(Vec<(Node, Node)>),
 }
@@ -45,7 +51,7 @@ enum Node {
 impl Node {
     fn sigil(&self) -> char {
         match self {
-            Node::Line(c, _) | Node::Blob(c, _) | Node::Agg(c, _) => *c,
+            Node::Line(c, _) | Node::Blob(c, _) | Node::Agg(c, _) | Node::NullAgg(c) => *c,
             Node::Null => '_',
             Node::Map(_) => '%',
         }
@@ -74,6 +80,9 @@ impl Node {
     fn items(&self) -> &[Node] {
         match self {
             Node::Agg(_, v) => v,
+            // Loud on purpose — see `NullAgg`. An empty slice here would let a
+            // null-array regression pass an emptiness assertion.
+            Node::NullAgg(c) => panic!("expected an aggregate, got the null aggregate {c}-1"),
             other => panic!("expected an aggregate, got {other:?}"),
         }
     }
@@ -105,6 +114,7 @@ impl Node {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Node::NullAgg(c) => format!("{c}-1"),
             other => other.sigil().to_string(),
         }
     }
@@ -161,11 +171,24 @@ impl Conn {
         }
     }
 
+    /// Read exactly `n` payload bytes and the CRLF that must follow them.
+    ///
+    /// The terminator is VERIFIED, not skipped: a server that under- or
+    /// over-declared a bulk length would otherwise leave this reader silently
+    /// mis-framed and every later assertion would be read off the wrong bytes.
     fn exact(&mut self, n: usize) -> String {
         while self.buf.len() < self.pos + n + 2 {
             self.fill();
         }
         let s = String::from_utf8_lossy(&self.buf[self.pos..self.pos + n]).into_owned();
+        let term = &self.buf[self.pos + n..self.pos + n + 2];
+        assert_eq!(
+            term,
+            b"\r\n",
+            "bulk payload of {n} bytes was not CRLF-terminated (got {:?}); \
+             the declared length disagrees with the wire",
+            String::from_utf8_lossy(term)
+        );
         self.pos += n + 2;
         s
     }
@@ -189,7 +212,7 @@ impl Conn {
             '*' | '~' | '>' => {
                 let n: i64 = body.parse().expect("aggregate length");
                 if n < 0 {
-                    return Node::Agg(sigil, Vec::new());
+                    return Node::NullAgg(sigil);
                 }
                 Node::Agg(sigil, (0..n).map(|_| self.read_node()).collect())
             }
@@ -319,7 +342,19 @@ fn cs1_acl_getuser_is_a_map_with_redis_field_set() {
     assert_eq!(r.get("commands").sigil(), '$');
     assert_eq!(r.get("keys").sigil(), '$', "keys is ONE string, not a list");
     assert_eq!(r.get("channels").sigil(), '$');
-    assert_eq!(r.get("selectors").sigil(), '*');
+    // `sketch()`, not `sigil()`: both an empty array and the RESP2 null array
+    // report '*', and Moon must send the EMPTY one. `*-1` would mean "this
+    // user has no selector support" to a client that distinguishes them.
+    assert_eq!(
+        r.get("selectors").sketch(),
+        "*[]",
+        "selectors is an EMPTY Array, never the null array"
+    );
+    assert_eq!(
+        r.get("passwords").sketch(),
+        "*[]",
+        "default user has no passwords"
+    );
 }
 
 /// RESP2 keeps the flat array — same names, same order, same value types.
@@ -349,6 +384,9 @@ fn cs2_acl_getuser_resp2_is_the_same_field_set_flat() {
     assert_eq!(value_of(2), '$', "commands");
     assert_eq!(value_of(3), '$', "keys is ONE string here too");
     assert_eq!(value_of(4), '$', "channels");
+    // Same empty-vs-null distinction as cs1, on the downgraded wire.
+    assert_eq!(items[11].sketch(), "*[]", "selectors is an EMPTY Array");
+    assert_eq!(items[3].sketch(), "*[]", "passwords is an EMPTY Array");
 }
 
 // ---------------------------------------------------------------------------

@@ -4720,7 +4720,10 @@ async fn test_acl_setuser_and_getuser() {
         .unwrap();
     assert_eq!(r, "OK");
 
-    // ACL GETUSER alice -- returns array with username, flags, etc.
+    // ACL GETUSER alice -- Redis 8.6.1 answers six fields, in this order, and
+    // deliberately does NOT echo the username back (the caller just supplied
+    // it). Moon emitted a seventh `username` field until moon#631; asserting
+    // its ABSENCE is what keeps that from creeping back.
     let r: redis::Value = redis::cmd("ACL")
         .arg("GETUSER")
         .arg("alice")
@@ -4728,11 +4731,36 @@ async fn test_acl_setuser_and_getuser() {
         .await
         .unwrap();
 
-    // Flatten to string for inspection
+    // RESP2 here (redis-rs defaults to it), so the reply is the flat
+    // downgrade of the RESP3 Map: field, value, field, value, ...
+    let redis::Value::Array(ref flat) = r else {
+        panic!("GETUSER should answer an array on RESP2, got: {r:?}");
+    };
+    let names: Vec<String> = flat
+        .iter()
+        .step_by(2)
+        .map(|v| match v {
+            redis::Value::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("field name should be a bulk string, got: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "flags",
+            "passwords",
+            "commands",
+            "keys",
+            "channels",
+            "selectors"
+        ],
+        "GETUSER field set must match Redis 8.6.1, got: {r:?}"
+    );
+
     let s = format!("{:?}", r);
     assert!(
-        s.contains("alice"),
-        "GETUSER should contain username alice, got: {}",
+        !s.contains("username"),
+        "GETUSER must not echo a `username` field -- Redis has none: {}",
         s
     );
     assert!(
