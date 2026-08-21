@@ -1876,6 +1876,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shifting every later result index for the client. Caught by the client-compat harness.
 
 ### Changed
+- **`compaction.rs` and `metrics_setup.rs` split into directory modules** (#479). Both files were
+  over the 1500-line ceiling `CLAUDE.md` sets (2408 and 2038 lines); each is now a directory module
+  whose largest file is 800 lines. `src/vector/segment/compaction/` splits along the pipeline's real
+  seams — `graph_build` (cell assignment, parallel sub-graph build, cross-cell stitching, builder
+  selection), `compact_path` (frozen -> immutable), `merge` (the GraphUnion consolidation), and
+  `recall` (both verification gates, including the moon#546/#588 distance-scoring rationale).
+  `src/admin/metrics_setup/` splits by metric family — `init`, `command_metrics`, `recorders`,
+  `memory`, `globals`, `publishers`. Pure code movement: every moved body is byte-identical to its
+  pre-split text (verified by diffing the extracted ranges against `HEAD`), the public symbol set is
+  unchanged (8 and 98 items, diffed before/after), and the lib test set is unchanged at 4878 tests
+  with identical names — the count check is what caught the one real hazard, a `metrics_setup` test
+  that reaches into `CachedMetricsHandles` private state and would otherwise have silently stopped
+  compiling. `pub(super)` on the handful of newly cross-file internals reproduces exactly the
+  visibility they had inside the single file; no item became reachable from outside its old scope.
+
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
   Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
   index, maintained O(log n) by the storage-layer writers; the 100ms sweep pops exactly the DUE

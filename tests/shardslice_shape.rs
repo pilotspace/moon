@@ -340,15 +340,34 @@ fn test_ssm4b_observer_lockfree() {
     ];
 
     // Paths to check: (relative path, human label)
-    // metrics_setup is under src/admin/
-    let files = [
-        ("src/admin/metrics_setup.rs", "src/admin/metrics_setup.rs"),
-        ("src/command/server_admin.rs", "src/command/server_admin.rs"),
-        (
-            "src/shard/persistence_tick.rs",
-            "src/shard/persistence_tick.rs",
-        ),
-    ];
+    //
+    // `metrics_setup` is a DIRECTORY module (moon#479 split it out of a single
+    // 1,850-line file), so every file under it is checked — not just `mod.rs`.
+    // Pinning one file by name would let the next split silently move an
+    // offending call into a sibling and retire this guard without anyone
+    // noticing, which is exactly how a shape pin rots.
+    let mut files: Vec<(String, String)> = rs_files_under("src/admin/metrics_setup")
+        .into_iter()
+        .map(|abs| {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let rel = abs
+                .strip_prefix(base)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .into_owned();
+            (rel.clone(), rel)
+        })
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "ssm4b: found no sources under src/admin/metrics_setup/ — the observer          guard would pass vacuously; did the module move again?"
+    );
+    for p in [
+        "src/command/server_admin.rs",
+        "src/shard/persistence_tick.rs",
+    ] {
+        files.push((p.to_owned(), p.to_owned()));
+    }
 
     let mut all_violations: Vec<String> = Vec::new();
 
