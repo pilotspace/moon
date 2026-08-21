@@ -164,6 +164,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+
+- **Eighteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
+  `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`,
+  `GETRANGE`, `SUBSTR`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO`, `LCS`, `SORT_RO` and
+  `MGET` all read through `Database::get_if_alive`, which probes the HOT plane and stops.
+  `PFCOUNT` had the same bug through a loader of its own (`load_hll_readonly`), reporting
+  cardinality 0 for a spilled HyperLogLog that `EXISTS` answers 1 for.
+
+  A source-grep shape pin (`tests/cold_read_through_shape.rs`) now DENIES `get_if_alive(` inside
+  `src/command/`, with a reasoned allowlist for the three genuinely hot-only readers (`KEYS`,
+  `SCAN`, `RANDOMKEY` are plane-partitioned and enumerate the cold plane separately; `GET` does its
+  own cold read after the hot miss). A second test fails if an allowlist entry outlives the call
+  site it excuses. Both were mutation-verified: planting a hot-only read in a non-allowlisted
+  handler fails naming the file and line, and a stale allowlist entry fails naming the file. A key that
+  eviction spilled to the cold tier is absent from `data`, so every one of them returned the
+  missing-key answer for a key that is present and readable. Measured on one instance, one shard,
+  `--maxmemory 4mb --maxmemory-policy volatile-ttl --disk-offload enable`, 6,000 × 1KB values
+  (`spilled_keys` 2,599) against a HOT control key with an identical value and TTL: `STRLEN` 1000
+  vs **0**, `TYPE` string vs **none**, `TTL` 3598 vs **-2**, `BITCOUNT` 4000 vs **0**, `MGET` the
+  value vs **nil** — while `EXISTS` answered 1 and `GET` served the value in full on the same key.
+
+  `0` and `-2` are the worst possible shape: both are exactly what a MISSING key returns, so
+  nothing distinguishes "tiered" from "absent". `EXISTS` said 1 while `TTL` said -2 in the same
+  breath, and `MGET` contradicted `GET` on the same key. Which keys are affected is decided by
+  the eviction sweep, so no caller can predict or avoid it.
+
+  `get_readonly` was the ONLY one of twenty-six call sites with a cold fallback, hand-written
+  locally; `Database::get` (the `&mut` path) promotes via `promote_cold_if_present`, so the same
+  command was right or wrong depending on which dispatch path served it. The fix therefore
+  belongs to the accessor, not the call sites: a new `get_if_alive_any_plane` returns an
+  `EntryView` from whichever plane holds the key, and `Deref`s to `Entry` so each handler is a
+  one-word rename rather than a rewrite. Per-call-site fallback is precisely how this drifted —
+  GET got fixed, the other twenty-five did not, and nothing failed.
+
+  The first cut of the fix traded one wrong answer for another: taking the value through
+  `get_cold_value` alone drops the deadline, so `TTL` answered **-1** ("no expiry") for a key
+  written with `EX`. The in-flight spill plane (#459) is now consulted first because it is the
+  only accessor that returns a whole `Entry`, TTL included. That regression was caught by
+  measurement against a hot control — it is invisible to review, and the first A/B probe missed
+  it too, because probing `GET` PROMOTES the key and every later row then measures a hot key.
+  Re-run with one distinct tiered key per command, all nine wrong answers match the hot control
+  and the two that were already correct are unchanged.
+
+  A first pass converted only the commands that first probe happened to cover, which left the
+  `TTL` fix in place while its own siblings `EXPIRETIME`/`PEXPIRETIME` still answered `-2`, plus
+  `BITFIELD_RO` 0, `LCS` 0 and `MEMORY USAGE` an error. Sweeping the accessor's remaining call
+  sites rather than the command list closed those. `KEYS` and `SCAN` were checked and are NOT
+  affected — both list all 6,000 keys — so they are deliberately left alone rather than converted
+  on suspicion.
+
+  Two of the remaining differences turned out to be the PROBE, not the server: comparing absolute
+  `EXPIRETIME` across two keys written at different moments, and comparing `MEMORY USAGE` between
+  keys whose NAMES differ in length. A hot-vs-hot control settles both — two resident keys differ
+  by exactly the 1-byte name-length delta, and judged against its own TTL a tiered key's
+  `EXPIRETIME - now` equals its `TTL` exactly, matching the hot control.
+
 - **`XREAD BLOCK` / `XREADGROUP BLOCK` were a silent no-op: never blocked, never woken** (#595).
   Both readers parsed `BLOCK`, stepped over its value with an `// ignored` comment, and answered
   the null array immediately. That is worse than an unimplemented command, because the reply is

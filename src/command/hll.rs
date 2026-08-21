@@ -40,8 +40,12 @@ fn load_hll(db: &mut Database, key: &[u8]) -> Result<Option<Hll>, Frame> {
 }
 
 /// Load an existing HLL from the database (read-only access).
+///
+/// Reads through every plane (moon#610): an HLL that has been spilled to the
+/// cold tier is still a live key, and answering `PFCOUNT` 0 for it reports an
+/// empty cardinality for a set that has members.
 fn load_hll_readonly(db: &Database, key: &[u8], now_ms: u64) -> Result<Option<Hll>, Frame> {
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => {
             let raw = match entry.value.as_bytes() {
                 Some(b) => b,

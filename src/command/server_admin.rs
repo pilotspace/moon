@@ -247,8 +247,8 @@ fn debug_object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("DEBUG OBJECT"),
     };
-    match db.get_if_alive(key.as_ref(), now_ms) {
-        Some(entry) => debug_object_reply(entry),
+    match db.get_if_alive_any_plane(key.as_ref(), now_ms) {
+        Some(entry) => debug_object_reply(entry.entry()),
         None => Frame::Error(Bytes::from_static(b"ERR no such key")),
     }
 }
@@ -777,8 +777,8 @@ fn memory_usage_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Ok(k) => k,
         Err(e) => return e,
     };
-    match db.get_if_alive(key.as_ref(), now_ms) {
-        Some(entry) => memory_usage_reply(key.as_ref(), entry),
+    match db.get_if_alive_any_plane(key.as_ref(), now_ms) {
+        Some(entry) => memory_usage_reply(key.as_ref(), entry.entry()),
         None => Frame::Null,
     }
 }
