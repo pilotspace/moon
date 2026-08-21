@@ -595,7 +595,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 // Trailing bool marks a SHARDED publish. One batch map, split at flush:
@@ -2557,12 +2557,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         };
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
-                        let cmd_bytes = if let Frame::Array(ref args) = dispatch_frame {
-                            extract_bytes(&args[0]).unwrap_or_default()
-                        } else {
-                            Bytes::new()
-                        };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys, resp3_shape));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, conn.selected_db, track_keys, resp3_shape));
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
                 }
@@ -2597,15 +2592,16 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
+                    // moon#460: no command name — see the twin in handler_monoio.
+                    type RemoteMeta = (usize, Option<Bytes>, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
                     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, _, db, _, _)| *db).unwrap_or(conn.selected_db);
+                        let batch_db = entries.first().map(|(_, _, _, db, _, _)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk, shape)| ((idx, aof, cmd, tk, shape), arc_frame)).unzip();
+                            entries.into_iter().map(|(idx, arc_frame, aof, _db, tk, shape)| ((idx, aof, tk, shape), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
@@ -2646,7 +2642,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (resp_idx, _, _, _, _) in &meta {
+                                for (resp_idx, _, _, _) in &meta {
                                     responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                         b"ERR cross-shard dispatch backpressure",
                                     ));
@@ -2698,7 +2694,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx.shard_id
                             );
                             crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                            for (resp_idx, _, _, _, _) in &meta {
+                            for (resp_idx, _, _, _) in &meta {
                                 responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                     b"ERR cross-shard reply timeout",
                                 ));
@@ -2713,7 +2709,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // we can overwrite write responses on fsync failure below.
                         // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
                             // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                             // inside the SPSC arm (PipelineBatchSlotted / PipelineBatch),
                             // BEFORE the response slot is filled. Appending here (after

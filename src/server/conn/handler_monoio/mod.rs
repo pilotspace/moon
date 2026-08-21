@@ -481,10 +481,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // converted at all — and skipping it would re-create the exact
     // "shape changes by context" defect. It is `Copy` and one byte, so it costs
     // no allocation on the shard hot path (task `resp3-type-fidelity` §3).
+    // moon#460: no command name here. The cross-shard reply loop used to need
+    // it to pick the RESP3 conversion; since the shape is classified at ENQUEUE
+    // into a 1-byte `Copy` tag (`Resp3Shape`), the loop reads only the tag. The
+    // field survived as `_cmd_name` and cost a `Bytes` clone per cross-shard
+    // command on the shard hot path.
     type RemoteMeta = (
         usize,
         Option<Bytes>,
-        Bytes,
         Option<crate::tracking::invalidation::TrackedWriteKeys>,
         crate::protocol::resp3::Resp3Shape,
     );
@@ -494,7 +498,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
             usize,
             std::sync::Arc<Frame>,
             Option<Bytes>,
-            Bytes,
             Option<crate::tracking::invalidation::TrackedWriteKeys>,
             crate::protocol::resp3::Resp3Shape,
         )>,
@@ -3214,11 +3217,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 } else {
                     None
                 };
-                let cmd_bytes = if let Frame::Array(ref args) = dispatch_frame {
-                    extract_bytes(&args[0]).unwrap_or_default()
-                } else {
-                    Bytes::new()
-                };
                 // CLIENT TRACKING: capture the write's key set at enqueue time
                 // (gated); invalidation fires when the remote reply confirms.
                 let track_keys = if crate::tracking::tracking_active() && metadata::is_write(cmd) {
@@ -3239,7 +3237,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     );
                 }
                 // Classify HERE: this is the last point at which the command's
-                // args exist. The reply loop below only ever sees `cmd_name`.
+                // args exist. The reply loop below sees only this tag (moon#460).
                 let resp3_shape = if conn.protocol_version >= 3 {
                     resp3_shape_for(cmd, cmd_args)
                 } else {
@@ -3249,7 +3247,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     resp_idx,
                     std::sync::Arc::new(dispatch_frame),
                     aof_bytes,
-                    cmd_bytes,
                     track_keys,
                     resp3_shape,
                 ));
@@ -3400,9 +3397,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let slot_arc = response_pool.slot_arc(target);
                 let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) = entries
                     .into_iter()
-                    .map(|(idx, arc_frame, aof, cmd, tk, shape)| {
-                        ((idx, aof, cmd, tk, shape), arc_frame)
-                    })
+                    .map(|(idx, arc_frame, aof, tk, shape)| ((idx, aof, tk, shape), arc_frame))
                     .unzip();
 
                 let msg = ShardMessage::PipelineBatchSlotted {
@@ -3459,7 +3454,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             target,
                             outcome
                         );
-                        for (resp_idx, _, _, _, _) in &meta {
+                        for (resp_idx, _, _, _) in &meta {
                             responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                 b"ERR cross-shard dispatch backpressure",
                             ));
@@ -3532,7 +3527,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ctx.shard_id
                     );
                     crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                    for (resp_idx, _, _, _, _) in &meta {
+                    for (resp_idx, _, _, _) in &meta {
                         responses[*resp_idx] =
                             Frame::Error(Bytes::from_static(b"ERR cross-shard reply timeout"));
                     }
@@ -3544,7 +3539,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
                 let mut write_resp_idxs: Vec<usize> = Vec::new();
-                for ((resp_idx, aof_bytes, _cmd_name, track_keys, resp3_shape), resp) in
+                for ((resp_idx, aof_bytes, track_keys, resp3_shape), resp) in
                     meta.into_iter().zip(shard_responses)
                 {
                     // C4-FOLD-FIX: AOF append for cross-shard writes is now done
