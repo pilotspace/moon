@@ -165,6 +165,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`INFO`, `CLIENT LIST`, `LOLWUT` and `MEMORY DOCTOR` sent a BulkString where RESP3 clients are
+  told to expect a VerbatimString** (#462). Swept every reply type against redis-server 8.6.1 on the
+  wire, at `--shards 1` and `--shards 4`, RESP2 and RESP3:
+
+  ```text
+                         redis 8.6.1        moon (before)      moon (after)
+    INFO [section...]    = (verbatim)       $ (bulk)           =
+    CLIENT LIST [TYPE]   =                  $                  =
+    LOLWUT [VERSION n]   =                  $                  =
+    MEMORY DOCTOR        =                  $                  =
+    MEMORY MALLOC-STATS  $                  (unimplemented)    (unimplemented)
+    CLIENT INFO          =                  =                  =
+  ```
+
+  RESP2 is untouched — all four stay BulkStrings there, which is what every existing driver reads.
+  `MEMORY MALLOC-STATS` is in the table because it looks like exactly the same kind of
+  human-readable blob and is NOT verbatim on 8.6.1; the policy is transcribed from the oracle, never
+  inferred from what a reply obviously ought to be.
+
+- **Command intercepts can no longer forget the RESP2→RESP3 conversion, because they can no longer
+  perform it** (#462). Two of the four above were not a missing table entry — they were the
+  structural hole the issue names. A `try_handle_*` intercept answers the command itself and
+  short-circuits the dispatch exit where the reply-shape policy runs, so each intercept had to
+  remember to apply the policy by hand, and nothing made forgetting visible. `CONFIG GET` reached
+  the wire as a flat Array where Redis sends a Map from the day RESP3 landed; `CLIENT INFO` was
+  patched by hand and `CLIENT LIST`, one `if` below it in the same function, was not.
+
+  Intercepts now receive an `InterceptReplies` sink (`src/server/conn/intercept.rs`) instead of a
+  `&mut Vec<Frame>`, and its `push` applies the policy unconditionally. The hand-written conversions
+  at `CONFIG` and `CLIENT INFO` are deleted — they are the sink's job now, which the mutation test
+  below proves. 41 intercepts across both shipped handlers were converted by changing the parameter
+  type and letting the compiler name every call site. Three paths keep a plain vector, each with the
+  reason written at its signature: the AUTH gate (runs before the command name is even extracted),
+  the blocking pops (encode straight into the write buffer after the batch has flushed), and the
+  cross-shard batch (reply arrives later; shape rides in `RemoteMeta` as a one-byte tag).
+
+  Cost on RESP2 is nil — the conversion returns before classifying when `proto < 3`. Proven
+  load-bearing by mutation: with `InterceptReplies::push` stripped of its conversion, `INFO`,
+  `CLIENT LIST`, `CLIENT INFO` and `CONFIG GET` all revert to the wrong wire type while `LOLWUT`,
+  `MEMORY DOCTOR` and `HGETALL` — which reach the dispatch exit — stay correct.
+
 - **A fired MQ trigger reached only subscribers that happened to land on the queue's home shard**
   (#474). `fire_pending_mq_triggers` delivered its callback notification with a single
   `publish_shared` into the shard's OWN pub/sub registry. Triggers do fire on the queue's home shard

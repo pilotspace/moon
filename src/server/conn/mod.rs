@@ -12,6 +12,7 @@ pub mod handler_monoio;
 pub mod handler_sharded;
 #[cfg(feature = "runtime-tokio")]
 pub mod handler_single;
+pub mod intercept;
 pub mod monitor_mode;
 pub mod park_policy;
 pub mod shared;

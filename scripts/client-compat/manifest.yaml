@@ -290,6 +290,38 @@ entries:
         acl_categories to build a permission model is not.
         Owner: (1)+(2) sdk-wire-form-fixes, (3) resp3-type-fidelity.
 
+  # ── Verbatim replies (moon#462) ───────────────────────────────────────
+  # Redis answers these four through `addReplyVerbatim`: `=` on RESP3, `$` on
+  # RESP2. Moon sent `$` in both until moon#462. `type_only` because the
+  # CONTENT is supposed to differ — Moon's INFO reports its own fields and its
+  # LOLWUT is not Redis's ASCII art — while the TYPE is what a client
+  # dispatches on. Live assertions, never waivers: they are the regression
+  # guard for a class that took a wire-level sweep to see at all.
+  #
+  # `standalone, pipeline` only. Inside MULTI, `CLIENT` and `INFO` are
+  # intercept-only families in Moon and execute immediately instead of
+  # queueing — a transaction-queueing divergence already owned by
+  # multi-exec-queue-semantics, which this entry must not re-litigate.
+  - name: verbatim_info
+    command: "INFO server"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
+  - name: verbatim_client_list
+    command: "CLIENT LIST"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
+  - name: verbatim_lolwut
+    command: "LOLWUT"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
+  - name: verbatim_memory_doctor
+    command: "MEMORY DOCTOR"
+    policy: type_only
+    contexts: [standalone, pipeline]
+
   - name: identity_command_getkeys
     command: "COMMAND GETKEYS MSET k1 v1 k2 v2"
     policy: exact

@@ -1596,6 +1596,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             };
 
+            // Every intercept below answers through `shaped!()`, never through
+            // `responses` directly: an intercept short-circuits the dispatch exit
+            // where the RESP2->RESP3 shape policy is applied, so the sink applies it
+            // on push instead of each intercept having to remember. See
+            // `crate::server::conn::intercept` (moon#462).
+            //
+            // Read once per command rather than per push: `HELLO 3` changes it
+            // mid-batch, and a reply must be shaped for the protocol the command
+            // ARRIVED under, which is what the encoder's protocol-switch record
+            // assumes too.
+            let intercept_proto = conn.protocol_version;
+            macro_rules! shaped {
+                () => {
+                    &mut crate::server::conn::intercept::InterceptReplies::new(
+                        &mut responses,
+                        cmd,
+                        cmd_args,
+                        intercept_proto,
+                    )
+                };
+            }
             // --- QUIT ---
             if cmd.eq_ignore_ascii_case(b"QUIT") {
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
@@ -1699,7 +1720,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     ctx,
                     &peer_addr,
                     &mut auth_delay_ms,
-                    &mut responses,
+                    shaped!(),
                 )
             {
                 continue;
@@ -1713,7 +1734,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     client_id,
                     &peer_addr,
                     &mut auth_delay_ms,
-                    &mut responses,
+                    shaped!(),
                     &mut codec,
                 )
             {
@@ -1759,8 +1780,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // (Redis marks both NO_AUTH).
             //
             // If you add a privileged intercept, add it BELOW this line.
-            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
-            {
+            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, shaped!()) {
                 continue;
             }
 
@@ -1878,58 +1898,42 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
             crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
 
-            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, shaped!()) {
                 continue;
             }
             if cmd_len == 7
-                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses).await
+                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, shaped!()).await
             {
                 continue;
             }
             if cmd_len == 4
-                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &shutdown, &mut responses)
-                    .await
+                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &shutdown, shaped!()).await
             {
                 continue;
             }
             if cmd_len == 6
-                && dispatch::try_handle_script(cmd, cmd_args, ctx, &shutdown, &mut responses).await
+                && dispatch::try_handle_script(cmd, cmd_args, ctx, &shutdown, shaped!()).await
             {
                 continue;
             }
-            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, shaped!()) {
                 continue;
             }
             if cmd_len == 3
-                && dispatch::try_handle_acl(
-                    cmd,
-                    cmd_args,
-                    &mut conn,
-                    ctx,
-                    &peer_addr,
-                    &mut responses,
-                )
+                && dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, shaped!())
             {
                 continue;
             }
-            if cmd_len == 6
-                && dispatch::try_handle_config(
-                    cmd,
-                    cmd_args,
-                    ctx,
-                    conn.protocol_version,
-                    &mut responses,
-                )
-            {
+            if cmd_len == 6 && dispatch::try_handle_config(cmd, cmd_args, ctx, shaped!()) {
                 continue;
             }
             // REPLICAOF (9) or SLAVEOF (7)
             if (cmd_len == 9 || cmd_len == 7)
-                && dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses)
+                && dispatch::try_handle_replicaof(cmd, cmd_args, ctx, shaped!())
             {
                 continue;
             }
-            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, shaped!()) {
                 // Likely a replica mid-handshake (PSYNC next): permanently
                 // exclude from task-parking — the resumed-parked path does
                 // not support the PSYNC hijack.
@@ -1941,7 +1945,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // caller can drive the resync handshake.
             if cmd_len == 5 {
                 if let Some((repl_id, offset)) =
-                    dispatch::try_handle_psync(cmd, cmd_args, ctx, &mut responses)
+                    dispatch::try_handle_psync(cmd, cmd_args, ctx, shaped!())
                 {
                     // Earlier frames in this batch may hold barrier-pending
                     // local-leg writes — confirm them before this early flush.
@@ -1985,32 +1989,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     continue;
                 }
             }
-            if cmd_len == 4
-                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses).await
+            if cmd_len == 4 && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await
             {
                 continue;
             }
             // WAIT blocks on replica ACKs (R1) — must run at the connection
             // layer; generic dispatch is synchronous and used to answer :0.
-            if cmd_len == 4 && dispatch::try_handle_wait(cmd, cmd_args, ctx, &mut responses).await {
+            if cmd_len == 4 && dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await {
                 continue;
             }
-            if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
+            if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, shaped!()) {
                 continue;
             }
             // MA12: Disk full enforcement
-            if dispatch::try_enforce_disk_full(cmd, &mut responses) {
+            if dispatch::try_enforce_disk_full(cmd, shaped!()) {
                 continue;
             }
             // CLIENT early (ID, SETNAME, GETNAME, TRACKING) -- admin subcmds fall through to ACL gate
             if cmd_len == 6
-                && dispatch::try_handle_client_early(
-                    cmd,
-                    cmd_args,
-                    client_id,
-                    &mut conn,
-                    &mut responses,
-                )
+                && dispatch::try_handle_client_early(cmd, cmd_args, client_id, &mut conn, shaped!())
             {
                 continue;
             }
@@ -2073,12 +2070,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             // --- Persistence + ACL gate + CLIENT admin + Functions ---
-            if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
+            if dispatch::try_handle_persistence(cmd, ctx, shaped!()) {
                 continue;
             }
             // --- SHUTDOWN [NOSAVE|SAVE] ---
-            match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, &mut responses).await
-            {
+            match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, shaped!()).await {
                 dispatch::ShutdownOutcome::NotShutdown => {}
                 dispatch::ShutdownOutcome::Rejected => {
                     continue;
@@ -2092,10 +2088,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // of every privileged intercept. Its old comment claimed exactly
             // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-            if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+            if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!()).await {
                 continue;
             }
-            if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
+            if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, shaped!()) {
                 continue;
             }
             // CLIENT TRACKING mutates server-side invalidation state — post-ACL
@@ -2107,7 +2103,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     client_id,
                     &mut conn,
                     ctx,
-                    &mut responses,
+                    shaped!(),
                 )
             {
                 continue;
@@ -2115,7 +2111,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // CDC.READ (8) — stateless WAL reader, no shard state involved.
             // Post-ACL (H-3): it reads arbitrary WAL directories off disk, so
             // it must be deniable (-@dangerous / allow-list users).
-            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
+            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!()) {
                 continue;
             }
             if dispatch::try_handle_functions(
@@ -2125,7 +2121,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx,
                 &func_registry,
                 &shutdown,
-                &mut responses,
+                shaped!(),
             )
             .await
             {
@@ -2277,7 +2273,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 cmd_args,
                 &conn,
                 ctx,
-                &mut responses,
+                shaped!(),
                 &mut local_leg_write_idxs,
             )
             .await

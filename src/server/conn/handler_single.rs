@@ -995,7 +995,21 @@ pub async fn handle_connection(
                         }
                         // CONFIG
                         if cmd.eq_ignore_ascii_case(b"CONFIG") {
-                            responses.push(handle_config(cmd_args, &runtime_config, &config));
+                            // Intercepts short-circuit the dispatch exit where
+                            // the RESP3 shape policy runs, so this one applies
+                            // it — `CONFIG GET` is a Map, not the flat Array it
+                            // is built as. This handler drives only the
+                            // embedded / non-sharded server, so it has no
+                            // `InterceptReplies` chain to route through the way
+                            // the two shipped handlers now do; the conversion
+                            // is by hand and the reason is moon#462.
+                            let reply = handle_config(cmd_args, &runtime_config, &config);
+                            responses.push(apply_resp3_conversion(
+                                cmd,
+                                cmd_args,
+                                reply,
+                                framed.codec().protocol_version(),
+                            ));
                             continue;
                         }
 
@@ -1114,7 +1128,14 @@ pub async fn handle_connection(
                                     &pubsub_facts,
                                 );
                                 drop(guard);
-                                responses.push(resp_frame);
+                                // Verbatim on RESP3 — see the CONFIG intercept
+                                // above for why the conversion is by hand here.
+                                responses.push(apply_resp3_conversion(
+                                    cmd,
+                                    cmd_args,
+                                    resp_frame,
+                                    framed.codec().protocol_version(),
+                                ));
                                 continue;
                             }
                             // Fall through to normal dispatch if no repl_state

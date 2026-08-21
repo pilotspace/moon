@@ -71,7 +71,8 @@ pub enum Resp3Shape {
     /// `[[member, .., [x, y]], ...]` -> the same with Double coordinates.
     /// The GEOSEARCH/GEORADIUS family with WITHCOORD (moon#568).
     GeoCoords,
-    /// Bulk -> VerbatimString. CLIENT INFO.
+    /// Bulk -> VerbatimString. INFO, LOLWUT, CLIENT INFO, CLIENT LIST,
+    /// MEMORY DOCTOR.
     Verbatim,
 }
 
@@ -142,12 +143,26 @@ pub fn resp3_shape_of(cmd_upper: &[u8], args: &[Frame]) -> Resp3Shape {
         // converter sees it.
         b"XREAD" | b"XREADGROUP" => Resp3Shape::StreamMap,
 
+        // `INFO` and `LOLWUT` are Verbatim in every argument form: Redis
+        // replies through `addReplyVerbatim` regardless of the section list or
+        // `VERSION` selector, so these are unconditional rather than
+        // arg-dependent. Both were `$` on Moon until moon#462.
+        b"INFO" | b"LOLWUT" => Resp3Shape::Verbatim,
+
         // ---- container commands: only ONE subcommand converts --------------
         // `CONFIG GET` is a Map; CONFIG SET/RESETSTAT/REWRITE are not.
         b"CONFIG" if arg_is(args, 0, b"GET") => Resp3Shape::Map,
-        // `CLIENT INFO` is a Verbatim string; every other CLIENT subcommand
-        // keeps its own type (CLIENT LIST is Bulk, CLIENT ID is Integer).
-        b"CLIENT" if arg_is(args, 0, b"INFO") => Resp3Shape::Verbatim,
+        // `CLIENT INFO` and `CLIENT LIST` are Verbatim strings; every other
+        // CLIENT subcommand keeps its own type (CLIENT ID is Integer, CLIENT
+        // GETNAME is Bulk-or-Null). `LIST` was documented here as "Bulk" on the
+        // strength of reading Moon rather than the oracle — redis-8.6.1 sends
+        // `=` for it, in every TYPE/ID filter form (moon#462).
+        b"CLIENT" if arg_is(args, 0, b"INFO") || arg_is(args, 0, b"LIST") => Resp3Shape::Verbatim,
+        // `MEMORY DOCTOR` is Verbatim. `MEMORY MALLOC-STATS` is NOT — it looks
+        // like the same kind of human-readable blob but Redis sends it through
+        // `addReplyBulkCString`, verified on 8.6.1. `MEMORY STATS` is a Map
+        // built by its own handler and `MEMORY USAGE` an Integer.
+        b"MEMORY" if arg_is(args, 0, b"DOCTOR") => Resp3Shape::Verbatim,
         // `XINFO STREAM` is a Map; XINFO GROUPS/CONSUMERS are arrays of maps
         // and are converted by their own handler, not here.
         b"XINFO" if arg_is(args, 0, b"STREAM") => Resp3Shape::Map,
@@ -635,7 +650,24 @@ mod tests {
         );
         assert_eq!(
             resp3_shape_of(b"CLIENT", &args(&["LIST"])),
+            Resp3Shape::Verbatim
+        );
+        assert_eq!(resp3_shape_of(b"CLIENT", &args(&["ID"])), Resp3Shape::None);
+        assert_eq!(
+            resp3_shape_of(b"MEMORY", &args(&["DOCTOR"])),
+            Resp3Shape::Verbatim
+        );
+        // Looks like the same kind of human-readable blob and is NOT verbatim
+        // on redis-8.6.1 — the reason this policy is transcribed from a live
+        // sweep instead of inferred from what a reply "obviously" is.
+        assert_eq!(
+            resp3_shape_of(b"MEMORY", &args(&["MALLOC-STATS"])),
             Resp3Shape::None
+        );
+        assert_eq!(
+            resp3_shape_of(b"MEMORY", &args(&["STATS"])),
+            Resp3Shape::None,
+            "MEMORY STATS is built as a Map by its own handler, not converted here"
         );
         assert_eq!(
             resp3_shape_of(b"XINFO", &args(&["STREAM", "s"])),
@@ -644,6 +676,26 @@ mod tests {
         assert_eq!(
             resp3_shape_of(b"XINFO", &args(&["GROUPS", "s"])),
             Resp3Shape::None
+        );
+    }
+
+    #[test]
+    fn info_and_lolwut_are_verbatim_in_every_argument_form() {
+        // Redis replies through `addReplyVerbatim` regardless of the section
+        // list or VERSION selector, so a classifier keyed on argument count
+        // would be wrong. Verified against redis-server 8.6.1.
+        for a in [
+            vec![],
+            args(&["server"]),
+            args(&["server", "clients"]),
+            args(&["all"]),
+        ] {
+            assert_eq!(resp3_shape_of(b"INFO", &a), Resp3Shape::Verbatim, "{a:?}");
+        }
+        assert_eq!(resp3_shape_of(b"LOLWUT", &[]), Resp3Shape::Verbatim);
+        assert_eq!(
+            resp3_shape_of(b"LOLWUT", &args(&["VERSION", "5"])),
+            Resp3Shape::Verbatim
         );
     }
 
