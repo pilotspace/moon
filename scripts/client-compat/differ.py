@@ -17,6 +17,7 @@ Contract: see `.add/tasks/client-compat-harness/TASK.md` §3 (FROZEN @ v1).
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -722,6 +723,14 @@ class Runner:
             raise HarnessError("ERR_NO_MOON",
                                f"moon binary not executable: {cfg.moon_bin!r}")
 
+        # 2b. Provenance, ALWAYS printed (moon#461). The harness's whole value
+        # is being the trustworthy oracle-backed verifier, so "which binary did
+        # this actually test" must never be something a reader has to infer.
+        # Printed before the spawn so it survives a later crash.
+        prov = binary_provenance(cfg.moon_bin)
+        print(prov.describe(), file=sys.stderr)
+        enforce_binary_freshness(prov, cfg.strict)
+
         try:
             rport, mport = _free_port(), _free_port()
             rdir = tempfile.mkdtemp(prefix="cc-redis-")
@@ -789,13 +798,117 @@ class Runner:
 # ===========================================================================
 
 
-def _default_moon_bin() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def default_moon_bin(root: str = "") -> str:
+    """Resolve the default moon binary: the NEWEST of the known build layouts.
+
+    First-found order picked `target/release/moon` by construction, which is
+    exactly the binary this repo quarantines — everyday work builds
+    `release-fast`, so the default was reliably the stale one (moon#461).
+    """
+    if not root:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    found = []
     for candidate in ("target/release/moon", "target-fast/release-fast/moon"):
         p = os.path.join(root, candidate)
         if os.access(p, os.X_OK):
-            return p
+            found.append((os.stat(p).st_mtime, p))
+    if found:
+        return max(found)[1]
     return os.environ.get("MOON_BIN", "")
+
+
+# Backwards-compatible alias for the private name this used to have.
+_default_moon_bin = default_moon_bin
+
+
+@dataclass
+class BinaryProvenance:
+    """What binary is actually under test, and is it the code under test.
+
+    A differential harness that runs the wrong binary does not fail — it
+    reports a confident, false compatibility picture. Measured 2026-08-10 on a
+    tree where the fix was already green: a two-day-old `target/release/moon`
+    gave PASS=94 FAIL=32, including a divergence from a function deleted hours
+    earlier. Same tree, `MOON_BIN` pinned: PASS=128 FAIL=0 (moon#461).
+    """
+
+    path: str
+    mtime: float
+    size: int
+    newest_source_mtime: float
+    newest_source_path: str
+
+    @property
+    def stale(self) -> bool:
+        """True when a source file is newer than the binary.
+
+        `newest_source_mtime == 0` means the source tree could not be scanned
+        (a binary tested from outside a checkout, which is legitimate); that is
+        NOT stale, because unknown must not masquerade as a verdict.
+        """
+        return self.newest_source_mtime > 0 and self.newest_source_mtime > self.mtime
+
+    def describe(self) -> str:
+        stamp = datetime.datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d %H:%M:%S")
+        line = f"moon binary: {self.path}  built {stamp}  {self.size} bytes"
+        if self.stale:
+            newest = datetime.datetime.fromtimestamp(
+                self.newest_source_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            line += (f"\n  !! STALE: {self.newest_source_path} was modified {newest}, "
+                     f"AFTER this binary was built")
+        return line
+
+
+def _newest_source(root: str) -> tuple:
+    """(mtime, path) of the newest `.rs` file under `root/src`, or (0.0, "")."""
+    src = os.path.join(root, "src")
+    newest, newest_path = 0.0, ""
+    for dirpath, _dirnames, filenames in os.walk(src):
+        for name in filenames:
+            if not name.endswith(".rs"):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                m = os.stat(full).st_mtime
+            except OSError:
+                continue
+            if m > newest:
+                newest, newest_path = m, full
+    return newest, newest_path
+
+
+def binary_provenance(path: str, root: str = "") -> BinaryProvenance:
+    """Describe `path` and compare it against the newest source in `root`."""
+    if not root:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    st = os.stat(path)
+    newest, newest_path = _newest_source(root)
+    return BinaryProvenance(path=os.path.abspath(path), mtime=st.st_mtime,
+                            size=st.st_size, newest_source_mtime=newest,
+                            newest_source_path=newest_path)
+
+
+def enforce_binary_freshness(prov: BinaryProvenance, strict: bool) -> None:
+    """Warn on a stale binary; refuse under `--strict`.
+
+    Same philosophy as ERR_NO_ORACLE: a differential harness with no oracle
+    proves nothing, and a green skip would be a lie. A differential harness
+    testing the wrong binary is the same lie with extra steps.
+
+    Non-strict warns rather than blocks, because an intentionally older binary
+    is a legitimate run — a bisect, or a deliberately pinned `MOON_BIN`.
+    """
+    if not prov.stale:
+        return
+    if strict:
+        raise HarnessError(
+            "ERR_STALE_BINARY",
+            f"{prov.path} is older than {prov.newest_source_path}; "
+            f"the binary under test is not the code under test")
+    # `describe()` has already printed the STALE detail; repeating it here just
+    # buries the actionable half.
+    print("WARNING: results below describe a binary that is not this checkout's "
+          "code. Rebuild, or pass --strict to make this a refusal.", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:

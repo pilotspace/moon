@@ -20,8 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from differ import (  # noqa: E402
     HarnessError,
+    binary_provenance,
     compare,
+    default_moon_bin,
     encode_command,
+    enforce_binary_freshness,
     load_manifest,
     parse_resp,
 )
@@ -305,3 +308,89 @@ class TestInjectionIsTestOnly(unittest.TestCase):
         entries = load_manifest(os.path.join(here, "manifest.yaml"))
         offenders = [e.name for e in entries if e.inject_moon_reply is not None]
         self.assertEqual(offenders, [], f"shipped manifest fabricates replies: {offenders}")
+
+
+class TestBinaryProvenance(unittest.TestCase):
+    """moon#461: a harness that tests the wrong binary is worse than one that
+    refuses to run — it produces a confident, false compatibility picture.
+
+    Measured 2026-08-10 on a tree where the fix was already green: a two-day-old
+    `target/release/moon` reported PASS=94 FAIL=32, including a divergence from
+    a function deleted hours earlier. Same tree, MOON_BIN pinned: PASS=128 FAIL=0.
+    """
+
+    def _tree(self, bin_age_offset, src_age_offset):
+        """Build a fake checkout: <root>/src/lib.rs and <root>/target/release/moon.
+
+        Ages are seconds relative to a fixed base, so the test never races the
+        clock the way a `touch`-then-compare would.
+        """
+        root = tempfile.mkdtemp(prefix="prov-")
+        src = os.path.join(root, "src")
+        os.makedirs(src)
+        srcfile = os.path.join(src, "lib.rs")
+        with open(srcfile, "w") as f:
+            f.write("fn main() {}\n")
+        bindir = os.path.join(root, "target", "release")
+        os.makedirs(bindir)
+        binpath = os.path.join(bindir, "moon")
+        with open(binpath, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binpath, 0o755)
+        base = 1_700_000_000
+        os.utime(binpath, (base + bin_age_offset, base + bin_age_offset))
+        os.utime(srcfile, (base + src_age_offset, base + src_age_offset))
+        return root, binpath
+
+    def test_binary_older_than_sources_is_reported_stale(self):
+        root, binpath = self._tree(bin_age_offset=0, src_age_offset=3600)
+        prov = binary_provenance(binpath, root)
+        self.assertTrue(prov.stale,
+                        "a binary older than the newest src/ file must be stale")
+        self.assertGreater(prov.newest_source_mtime, prov.mtime)
+
+    def test_binary_newer_than_sources_is_not_stale(self):
+        root, binpath = self._tree(bin_age_offset=3600, src_age_offset=0)
+        prov = binary_provenance(binpath, root)
+        self.assertFalse(prov.stale,
+                         "a binary built after the last source edit is current")
+
+    def test_strict_refuses_a_stale_binary_with_the_contracted_code(self):
+        root, binpath = self._tree(bin_age_offset=0, src_age_offset=3600)
+        prov = binary_provenance(binpath, root)
+        with self.assertRaises(HarnessError) as cm:
+            enforce_binary_freshness(prov, strict=True)
+        self.assertEqual(cm.exception.code, "ERR_STALE_BINARY")
+
+    def test_non_strict_warns_but_does_not_refuse(self):
+        """Warn, do not block: the default run must stay usable on a tree whose
+        binary is intentionally older (a bisect, a pinned MOON_BIN)."""
+        root, binpath = self._tree(bin_age_offset=0, src_age_offset=3600)
+        prov = binary_provenance(binpath, root)
+        enforce_binary_freshness(prov, strict=False)  # must not raise
+
+    def test_provenance_renders_the_path_and_a_timestamp(self):
+        """The header line is the whole point — it makes the mistake
+        self-diagnosing instead of requiring someone to suspect it."""
+        root, binpath = self._tree(bin_age_offset=3600, src_age_offset=0)
+        line = binary_provenance(binpath, root).describe()
+        self.assertIn(binpath, line)
+        self.assertRegex(line, r"\d{4}-\d{2}-\d{2}")
+
+    def test_default_bin_prefers_the_newer_of_the_two_build_layouts(self):
+        """`target/release/moon` is explicitly quarantined in this repo while
+        everyday work builds `release-fast`. First-found order therefore picks
+        the stale one by construction (moon#461 item 3)."""
+        root = tempfile.mkdtemp(prefix="prov2-")
+        base = 1_700_000_000
+        made = {}
+        for rel, age in (("target/release/moon", 0),
+                         ("target-fast/release-fast/moon", 3600)):
+            p = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+            os.utime(p, (base + age, base + age))
+            made[rel] = p
+        self.assertEqual(default_moon_bin(root), made["target-fast/release-fast/moon"])
