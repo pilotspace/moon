@@ -201,7 +201,11 @@ fn rk3_empty_db_still_answers_null() {
     assert_eq!(dbsize(&mut c), 0);
     for draw in 0..5 {
         let r = c.send(&["RANDOMKEY"]);
-        assert_eq!(bulk(&r), None, "draw {draw}: empty db must answer Null, got {r:?}");
+        assert_eq!(
+            bulk(&r),
+            None,
+            "draw {draw}: empty db must answer Null, got {r:?}"
+        );
     }
 }
 

@@ -2059,18 +2059,17 @@ pub async fn coordinate_randomkey(
         (db.logical_len() as u64, db.random_key())
     }));
 
-    let mut pending: Vec<(channel::OneshotReceiver<Frame>, channel::OneshotReceiver<Frame>)> =
-        Vec::with_capacity(num_shards.saturating_sub(1));
+    let mut pending: Vec<(
+        channel::OneshotReceiver<Frame>,
+        channel::OneshotReceiver<Frame>,
+    )> = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
         if target == my_shard {
             continue;
         }
         let (size_tx, size_rx) = channel::oneshot();
         let (key_tx, key_rx) = channel::oneshot();
-        for (cmd, reply_tx) in [
-            (&b"DBSIZE"[..], size_tx),
-            (&b"RANDOMKEY"[..], key_tx),
-        ] {
+        for (cmd, reply_tx) in [(&b"DBSIZE"[..], size_tx), (&b"RANDOMKEY"[..], key_tx)] {
             let msg = ShardMessage::Execute {
                 db_index,
                 command: std::sync::Arc::new(Frame::Array(framevec![Frame::BulkString(
