@@ -227,6 +227,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vector_idle_unload`, `crash_recovery_vector_durability`, `crash_recovery_graph_durability`,
   `crash_recovery_disk_offload_no_aof`, `aof_multidb_kill9`,
   `crash_recovery_cold_del_resurrection`, `wal_group_commit`.
+- **A write inside `MULTI`/`EXEC` never woke a client blocked on the key it wrote** (#606). Measured
+  against redis-server 8.6.1 — one client on `BLPOP k 5`, another running `MULTI ; LPUSH k v ; EXEC`:
+
+  ```text
+  redis 8.6.1 :  woken at 0.514s   <- the push woke it
+  moon        :  5.013s            <- its own timeout, not the push
+  ```
+
+  The EXEC executor runs body commands through its own path and reached none of the live write
+  path's wake hooks, so the consumer was never wrong-answered — only late by its entire timeout,
+  which turns a queue into a poller and reads as a flake. All three families were affected
+  (`BLPOP`/`BLMOVE`, `BZPOPMIN`, `XREAD BLOCK`), 8 of 8 trials each.
+
+  The executor now records each producer's key and hands it to the caller, which raises the wake
+  after the body — the same deferral Redis uses, so a waiter sees the whole transaction applied
+  rather than a half-built body. All three EXEC callers are wired, including the forwarded
+  (cross-shard) arm in `spsc_handler`, which is where a transaction lands most often at
+  `--shards >= 2` because `TxnLocality` routes a body to the shard that owns its keys.
 
 - **Crash-matrix tests could silently run two servers on one port** (#489).
   `tests/crash_matrix_per_shard_aof.rs` took a port from a local `unique_port()` — bind `:0`, read
