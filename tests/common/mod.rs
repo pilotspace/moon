@@ -31,21 +31,79 @@ use std::process::Child;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-/// Reserve a port that no other call in THIS process has handed out.
+/// Reserve a port no other call in this process — **or any other test process
+/// on this machine** — has handed out.
 ///
 /// Binds `:0`, records the kernel-chosen port in a process-wide dedup set,
-/// and retries until it gets a never-before-returned one. The listener is
-/// still dropped before returning (the server must be able to bind), so
-/// this alone does not stop *external* steals — pair it with
-/// [`spawn_listening`].
+/// then claims it across processes with [`claim_across_processes`]. The
+/// listener is dropped before returning, because the server must be able to
+/// bind it; pair this with [`spawn_listening`], which verifies the child
+/// actually accepts.
 pub fn reserve_port() -> u16 {
     loop {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 probe");
         let port = probe.local_addr().expect("probe local_addr").port();
         drop(probe);
-        if port >= 20000 && HANDED_OUT.lock().unwrap().insert(port) {
+        if port >= 20000 && HANDED_OUT.lock().unwrap().insert(port) && claim_across_processes(port)
+        {
             return port;
         }
+    }
+}
+
+/// Locks held for every port this process has claimed, kept alive for the
+/// whole run.
+///
+/// Dropping one would release the port back to a sibling binary while our
+/// server is still on it, which is the collision this exists to prevent — so
+/// they are deliberately never removed.
+static PORT_LOCKS: LazyLock<Mutex<Vec<moon::persistence::dir_lock::DirLock>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Claim `port` against every other moon test process on this machine.
+///
+/// [`HANDED_OUT`] closes collisions inside ONE test binary. Cargo runs test
+/// binaries **concurrently**, so that is only half the problem, and the other
+/// half cannot be closed by any reserve-then-bind scheme: the probe listener
+/// must be dropped before the server can bind, because a held plain
+/// `TcpListener` is exactly what stops a `SO_REUSEPORT` bind.
+///
+/// The consequence is not a loud failure. moon's client listeners use
+/// `SO_REUSEPORT`, so a second server on a taken port binds **successfully** —
+/// both processes stay alive and the kernel splits or hijacks the connections,
+/// with no bind error, no log line and no panic. That is moon#489, and
+/// moon#365's `ConnectionReset` in `crash_matrix_cross_plane` has the same
+/// signature in a suite that already uses this helper.
+///
+/// A filesystem lock closes it, because it does not need to hold the port
+/// itself. `dir_lock::acquire` takes an exclusive, non-blocking `flock` and the
+/// kernel releases it when the holder dies — **including `SIGKILL`**, which the
+/// crash-matrix suites do on purpose. A test binary that is killed mid-run
+/// therefore frees its ports without a cleanup step to forget.
+///
+/// The lock DIRECTORIES persist after the lock is released — they are empty
+/// and bounded by the number of distinct ports ever used, and `$TMPDIR` is the
+/// OS's to reap, so nothing here removes them. Removing a directory another
+/// process is mid-`acquire` on is how you turn a flake guard into a flake.
+///
+/// Returns false when another process holds the port, so the caller tries the
+/// next one. Any other failure (an unwritable `TMPDIR`, or Windows, where
+/// `dir_lock` is a documented no-op) returns TRUE: this is a flake guard, and
+/// one that refuses to hand out ports is worse than the flake.
+fn claim_across_processes(port: u16) -> bool {
+    let dir = std::env::temp_dir()
+        .join("moon-test-ports")
+        .join(port.to_string());
+    if std::fs::create_dir_all(&dir).is_err() {
+        return true;
+    }
+    match moon::persistence::dir_lock::acquire(&dir) {
+        Ok(lock) => {
+            PORT_LOCKS.lock().unwrap().push(lock);
+            true
+        }
+        Err(moon::persistence::dir_lock::DirLockError::Held { .. }) => false,
+        Err(_) => true,
     }
 }
 
@@ -124,7 +182,15 @@ pub fn reserve_cluster_port() -> u16 {
         };
         drop(bus_probe);
         drop(client_probe);
-        return candidate;
+        // Both numbers, or neither: a pair whose bus is claimed by another
+        // process is unusable even when its client port is free, and the node
+        // would die on the bus bind. The client claim is deliberately not
+        // released on that path — this process keeps it and moves on, which
+        // costs one port out of 2700 and avoids a release/re-claim race.
+        if claim_across_processes(candidate) && claim_across_processes(bus) {
+            return candidate;
+        }
+        continue;
     }
     panic!(
         "reserve_cluster_port: no free port pair in [{CLUSTER_PORT_LOW}, \

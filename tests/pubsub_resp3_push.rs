@@ -786,7 +786,11 @@ fn ps21_disconnect_clears_sharded_subscriptions() {
         let mut c = Conn::open(m.port);
         let r = c.send(&["SSUBSCRIBE", "sch"]);
         assert!(
-            r.windows(9).any(|w| w == b"ssubscribe"[..9].as_ref()),
+            // Both sides spelled `&[u8]`. `[u8]::as_ref()` is ambiguous once
+            // the `moon` crate is linked into this binary (it brings a second
+            // `AsRef<_> for [u8]` impl into scope), which `tests/common`
+            // now does for its cross-process port lock.
+            r.windows(9).any(|w| w == &b"ssubscribe"[..9]),
             "subscribed before dropping; got {:?}",
             s(&r)
         );
