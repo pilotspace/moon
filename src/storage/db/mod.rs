@@ -1864,6 +1864,41 @@ mod tests {
 
     // ── moon#610: read-only access must see the cold tier ────────────────
 
+    /// `PFCOUNT` reads its HLL through a *separate* loader from the string
+    /// commands, so converting `STRLEN`/`TYPE`/`TTL` left it behind: a spilled
+    /// HyperLogLog reported cardinality 0 while `EXISTS` answered 1. Measured
+    /// against a live server (2026-08-21, 4,977 spilled keys, identical spill
+    /// sets on both binaries): hot control `PFCOUNT` 5, tiered 0.
+    #[test]
+    fn pfcount_reads_a_tiered_hyperloglog_through_every_plane() {
+        use crate::protocol::Frame;
+        use crate::storage::hll::Hll;
+
+        let mut hll = Hll::new_sparse();
+        for element in [b"a".as_slice(), b"b", b"c", b"d", b"e"] {
+            hll.add(element);
+        }
+        let expected = hll.count() as i64;
+        assert!(
+            expected > 0,
+            "the fixture HLL must have members to be a test"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_spilled_value(tmp.path(), b"hk", TestRedisValue::String(hll.into_bytes()));
+
+        let reply = crate::command::hll::pfcount_readonly(
+            &db,
+            &[Frame::BulkString(Bytes::from_static(b"hk"))],
+            0,
+        );
+        assert_eq!(
+            reply,
+            Frame::Integer(expected),
+            "a spilled HLL must report its real cardinality, not 0"
+        );
+    }
+
     /// `get_if_alive` is hot-plane-only, so a tiered key is indistinguishable
     /// from a missing one. This is the property every read-only command
     /// inherited: `STRLEN` 0, `TYPE` none, `TTL` -2 for a key `EXISTS`

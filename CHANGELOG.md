@@ -165,10 +165,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Fifteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
+- **Eighteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
   `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`,
   `GETRANGE`, `SUBSTR`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO`, `LCS`, `SORT_RO` and
-  `MGET` all read through `Database::get_if_alive`, which probes the HOT plane and stops. A key that
+  `MGET` all read through `Database::get_if_alive`, which probes the HOT plane and stops.
+  `PFCOUNT` had the same bug through a loader of its own (`load_hll_readonly`), reporting
+  cardinality 0 for a spilled HyperLogLog that `EXISTS` answers 1 for. A key that
   eviction spilled to the cold tier is absent from `data`, so every one of them returned the
   missing-key answer for a key that is present and readable. Measured on one instance, one shard,
   `--maxmemory 4mb --maxmemory-policy volatile-ttl --disk-offload enable`, 6,000 × 1KB values
