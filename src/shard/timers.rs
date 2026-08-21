@@ -278,11 +278,25 @@ pub const WARM_CHECK_INTERVAL_MS: u64 = 10_000;
 /// Triggers fire on the workspace home shard only (hash tag ensures
 /// all workspace keys route to one shard, so the TriggerRegistry on
 /// that shard is authoritative).
+///
+/// That is true of the KEY and says nothing about the SUBSCRIBER. A consumer
+/// that subscribes to `mq:trigger:<queue>` lands on whichever shard accepted
+/// its connection, and moon keeps one pub/sub registry per shard — so the
+/// notification goes out through the same cross-shard fan-out `PUBLISH` uses,
+/// not a bare local publish. Publishing locally only meant a consumer was
+/// woken just when it happened to connect to the queue's home shard: right at
+/// `--shards 1`, roughly a 1-in-N chance at `--shards N`, and silent either
+/// way because the subscriber count is only `debug!`ged (moon#474).
 pub(crate) fn fire_pending_mq_triggers(
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
     now_ms: u64,
     pubsub_registry: &Arc<parking_lot::RwLock<crate::pubsub::PubSubRegistry>>,
+    remote_subscriber_map: &Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >,
+    dispatch_tx: &std::cell::RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+    notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
 ) {
     // Collect keys of triggers ready to fire via with_shard (no lock needed on slice path).
     let ready_keys: Vec<bytes::Bytes> = crate::shard::slice::with_shard(|s| {
@@ -317,18 +331,27 @@ pub(crate) fn fire_pending_mq_triggers(
     });
     let _ = shard_databases; // shared handle no longer needed on this path
 
-    // Publish each trigger notification via pub/sub (outside with_shard — no
-    // re-entry). publish_shared fans out without holding the registry lock
-    // across the loop (P1).
-    for (channel, message) in &notifications {
-        let _subscriber_count = crate::pubsub::publish_shared(pubsub_registry, channel, message);
-        tracing::debug!(
-            "Shard {}: MQ trigger fired on channel {:?} -> {} subscriber(s)",
-            shard_id,
-            String::from_utf8_lossy(channel),
-            _subscriber_count,
-        );
+    // Publish outside with_shard — no re-entry. The fan-out serves local
+    // subscribers directly and hands every OTHER shard holding a subscriber
+    // for the channel one batched `NotifyPublish`, which is the only
+    // cross-thread wake that reaches a subscriber's connection task.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (channel, _) in &notifications {
+            tracing::debug!(
+                "Shard {}: MQ trigger fired on channel {:?}",
+                shard_id,
+                String::from_utf8_lossy(channel),
+            );
+        }
     }
+    crate::notify_fanout::publish_from_shard(
+        shard_id,
+        pubsub_registry,
+        remote_subscriber_map,
+        dispatch_tx,
+        notifiers,
+        notifications,
+    );
 }
 
 /// Default interval for cold-tier orphan sweep (5 minutes).

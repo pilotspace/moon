@@ -32,7 +32,7 @@ pub fn flush_outbox<P>(
     shard_id: usize,
     local_registry: &parking_lot::RwLock<crate::pubsub::PubSubRegistry>,
     remote_map: &parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
-    mut push_to: P,
+    push_to: P,
 ) where
     P: FnMut(usize, Vec<(Bytes, Bytes)>),
 {
@@ -46,21 +46,53 @@ pub fn flush_outbox<P>(
         return;
     }
 
-    // Group by target shard so a burst of events costs one message per shard
-    // rather than one per event.
+    publish_fanout(
+        shard_id,
+        local_registry,
+        remote_map,
+        pending.iter().flat_map(|n| notify::channels_for(n, flags)),
+        push_to,
+    );
+}
+
+/// Publish `pairs` to local subscribers AND to every other shard holding a
+/// subscriber for the channel.
+///
+/// This is the whole cross-shard publish rule in one place: a subscriber's
+/// connection lives on the shard that accepted it, which has nothing to do
+/// with the shard the publisher runs on, so publishing into the local registry
+/// alone reaches only the subscribers that happened to land there. At
+/// `--shards N` that silently loses about `(N-1)/N` of deliveries and is
+/// perfectly correct at `--shards 1`, which is why it survives review.
+///
+/// Both callers that produce events off a connection use it: keyspace
+/// notifications via [`flush_outbox`], and MQ triggers via
+/// [`publish_from_shard`] (moon#474 — the trigger timer published locally
+/// only, so a queue consumer was woken only when it happened to connect to the
+/// queue's home shard).
+///
+/// Deliveries are grouped by target shard, so a burst costs one message per
+/// shard rather than one per event.
+pub fn publish_fanout<P>(
+    shard_id: usize,
+    local_registry: &parking_lot::RwLock<crate::pubsub::PubSubRegistry>,
+    remote_map: &parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    pairs: impl IntoIterator<Item = (Bytes, Bytes)>,
+    mut push_to: P,
+) where
+    P: FnMut(usize, Vec<(Bytes, Bytes)>),
+{
     let mut remote: Vec<(usize, Vec<(Bytes, Bytes)>)> = Vec::new();
-    for n in &pending {
-        for (channel, payload) in notify::channels_for(n, flags) {
-            crate::pubsub::publish_shared(local_registry, &channel, &payload);
-            let targets = remote_map.read().target_shards(&channel);
-            for t in targets {
-                if t == shard_id {
-                    continue;
-                }
-                match remote.iter_mut().find(|(id, _)| *id == t) {
-                    Some((_, batch)) => batch.push((channel.clone(), payload.clone())),
-                    None => remote.push((t, vec![(channel.clone(), payload.clone())])),
-                }
+    for (channel, payload) in pairs {
+        crate::pubsub::publish_shared(local_registry, &channel, &payload);
+        let targets = remote_map.read().target_shards(&channel);
+        for t in targets {
+            if t == shard_id {
+                continue;
+            }
+            match remote.iter_mut().find(|(id, _)| *id == t) {
+                Some((_, batch)) => batch.push((channel.clone(), payload.clone())),
+                None => remote.push((t, vec![(channel.clone(), payload.clone())])),
             }
         }
     }
@@ -128,6 +160,45 @@ pub fn flush_from_shard(
             notifiers[target].notify_one();
         }
     });
+}
+
+/// Fan out arbitrary `(channel, payload)` pairs from a shard event loop.
+///
+/// The counterpart to [`flush_from_shard`] for producers that are not keyspace
+/// notifications — today the MQ trigger timer. It carries the same mesh
+/// plumbing (SPSC ring + notifier), because that is the only cross-thread wake
+/// that actually reaches a subscriber's connection task: under monoio a
+/// `Waker` fired from another OS thread does not.
+///
+/// Remote deliveries ride `ShardMessage::NotifyPublish`, whose receiver simply
+/// publishes each pair into its own registry. Reusing it is deliberate — a
+/// second fan-out mechanism is a second thing to forget to call.
+pub fn publish_from_shard(
+    shard_id: usize,
+    local_registry: &parking_lot::RwLock<crate::pubsub::PubSubRegistry>,
+    remote_map: &parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    dispatch_tx: &std::cell::RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+    notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
+    pairs: impl IntoIterator<Item = (Bytes, Bytes)>,
+) {
+    use ringbuf::traits::Producer;
+    publish_fanout(
+        shard_id,
+        local_registry,
+        remote_map,
+        pairs,
+        |target, batch| {
+            let msg = crate::shard::dispatch::ShardMessage::NotifyPublish(Box::new(batch));
+            let idx = crate::shard::mesh::ChannelMesh::target_index(shard_id, target);
+            let pushed = {
+                let mut producers = dispatch_tx.borrow_mut();
+                producers[idx].try_push(msg).is_ok()
+            };
+            if pushed {
+                notifiers[target].notify_one();
+            }
+        },
+    );
 }
 
 /// Class of the event a command produced, for call sites that need to name it
