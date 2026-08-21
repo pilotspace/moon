@@ -188,6 +188,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves such a read; moon cannot, and answering from a subset is the worse of the two failures.
   Co-locate the streams with a `{hash}` tag, or run `--shards 1`, and they are served in full as
   before. Single-stream reads are unaffected: one key cannot disagree with itself.
+- **Test port reservations are now exclusive across processes** (#489). `reserve_port` deduped within
+  one test binary, but cargo runs test binaries concurrently and the probe listener must be dropped
+  before the server can bind it — a held plain `TcpListener` is exactly what stops a `SO_REUSEPORT`
+  bind — so two binaries could hand out the same port. moon's client listeners use `SO_REUSEPORT`, so
+  the second server then binds **successfully**: both processes stay alive and the kernel splits or
+  hijacks the connections, with no bind error, no log line and no panic. Every reservation now also
+  takes an exclusive `flock` under `$TMPDIR/moon-test-ports/<port>/` via
+  `persistence::dir_lock::acquire`, which the kernel releases when the holder dies — including
+  `SIGKILL`, which the crash-matrix suites do deliberately, so a killed binary frees its ports with no
+  cleanup step to forget. Cluster reservations claim the bus sibling too. Unix only; `dir_lock` is a
+  documented no-op on Windows, where the in-process set still applies.
 
 - **A blocked `XREAD` could be answered with another client's entries, or never answered at all**
   (#620). `wait_id` is `(shard_id << 48) | counter`, minted by the registry of the shard the
