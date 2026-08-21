@@ -40,33 +40,26 @@ use std::time::Duration;
 
 const KEY_COUNT: usize = 200;
 
-/// Serializes the server-spawning tests in this binary. Run in parallel they
-/// intermittently SPLIT-BRAIN: `unique_port()` hands out OS-sequential
-/// ephemeral ports and the other tests offset by +1/+2, so two concurrently
-/// starting tests can land on the SAME port — and moon's per-shard
-/// SO_REUSEPORT listeners bind it without an error, silently splitting one
-/// test's redis-cli traffic across another test's server (observed as "200
-/// missing" total-loss false alarms). A shared lock costs ~seconds and kills
-/// the whole class.
+/// Serializes the server-spawning tests in this binary so four concurrent
+/// two-shard servers do not contend for CPU and disk on a loaded box.
+///
+/// It is NOT what makes the ports safe (moon#489). It used to be asked to be:
+/// these tests took a port from a local `unique_port()` and offset it by
+/// +1/+2/+3, so two of them could land on the SAME port — and moon's per-shard
+/// SO_REUSEPORT listeners bind an already-taken port WITHOUT an error,
+/// silently splitting one test's redis-cli traffic into another test's server
+/// (seen as "200 missing" total-loss false alarms). A lock inside one binary
+/// could never close that, because cargo runs test BINARIES in parallel too.
+///
+/// `common::spawn_listening` closes it properly: `reserve_port` dedups
+/// process-wide and floors at 20000, and a child that loses the bind race is
+/// respawned on a FRESH port instead of being polled as a corpse.
 static SERVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serialize_server_test() -> std::sync::MutexGuard<'static, ()> {
     SERVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn unique_port() -> u16 {
-    // Ask the OS to assign an available ephemeral port by binding to 0.
-    // The socket is immediately dropped after reading the port — there is a
-    // brief TOCTOU window, but it is far safer than the previous pid-modulo
-    // scheme which collides when multiple cargo test processes run in parallel
-    // (e.g., CI --test-threads > 1 across feature flag matrix jobs).
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
 }
 
 fn unique_dir(suffix: &str) -> std::path::PathBuf {
@@ -305,13 +298,11 @@ fn sigkill(child: &mut Child) {
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
     let _serial = serialize_server_test();
-    let port = unique_port();
     let dir = unique_dir("crash01");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let mut child = start_moon(port, &dir);
-    wait_for_port(port);
+    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir));
 
     // Write KEY_COUNT keys. Use hash tags to deterministically spread
     // across both shards (half on each) — confirms per-shard files are
@@ -389,13 +380,11 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
     let _serial = serialize_server_test();
     // Offset port so this test never collides with the everysec test
     // when both run on the same dev host.
-    let port = unique_port().saturating_add(1);
     let dir = unique_dir("crash01-always");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let mut child = start_moon_with_fsync(port, &dir, "always");
-    wait_for_port(port);
+    let (mut child, port) = common::spawn_listening(|p| start_moon_with_fsync(p, &dir, "always"));
 
     let mut expected: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(KEY_COUNT);
@@ -473,13 +462,11 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
     let _serial = serialize_server_test();
     const N: usize = 20;
 
-    let port = unique_port().saturating_add(2);
     let dir = unique_dir("pipeline-dbl");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let mut child = start_moon(port, &dir);
-    wait_for_port(port);
+    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir));
 
     // Pipeline N RPUSHes to list{a} (→ shard 1) and N to list{b} (→ shard 0)
     // in two separate pipelined bursts.  Each list should end up with exactly
@@ -565,13 +552,11 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn crash_133_swapdb_multishard_durability_after_sigkill() {
     let _serial = serialize_server_test();
-    let port = unique_port().saturating_add(3);
     let dir = unique_dir("swapdb-133");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let mut child = start_moon_with_fsync(port, &dir, "always");
-    wait_for_port(port);
+    let (mut child, port) = common::spawn_listening(|p| start_moon_with_fsync(p, &dir, "always"));
 
     // `{a}` and `{b}` hash-tag to different shards (CRC16 mod 2) — writing
     // both in db0 and db1 guarantees the pre-swap content spans both

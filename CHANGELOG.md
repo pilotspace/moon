@@ -165,6 +165,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Crash-matrix tests could silently run two servers on one port** (#489).
+  `tests/crash_matrix_per_shard_aof.rs` took a port from a local `unique_port()` — bind `:0`, read
+  the port, drop the listener — and then offset it by `+1`/`+2`/`+3` for its other three tests.
+  Two tests could therefore land on the SAME port, and moon's per-shard `SO_REUSEPORT` listeners
+  bind an already-taken port **without an error**, so one test's `redis-cli` traffic silently
+  entered another test's server. The symptom was a "200 missing" total-loss false alarm in a
+  crash-recovery assertion — a failure that reads as a durability bug.
+
+  The file's `SERVER_TEST_LOCK` could never close this: it serializes tests within one binary, and
+  cargo runs test binaries in parallel. Converted to `common::spawn_listening`, which pairs
+  `reserve_port` (process-wide dedup, floored at 20000) with a wait-until-it-actually-accepts loop
+  that respawns on a **fresh** port when a child loses the bind race. The lock is kept, for
+  resource contention rather than correctness, and its doc comment now says so.
+
+  Restarts inside a test keep the original port deliberately — that is the point of a crash-recovery
+  test, and by then the port's previous owner is dead.
+
 - **Eighteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
   `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`,
   `GETRANGE`, `SUBSTR`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO`, `LCS`, `SORT_RO` and
