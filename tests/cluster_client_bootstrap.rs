@@ -19,37 +19,11 @@ mod common;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── harness ────────────────────────────────────────────────────────────────
-
-/// Reserve ports whose cluster-bus sibling (`port + 10000`) is also free — the
-/// bus binds that unconditionally in cluster mode. Same approach as
-/// `cluster_formation.rs`: the ephemeral range would overflow past 65535.
-fn reserve_cluster_ports(n: usize) -> Vec<u16> {
-    static NEXT_RANGE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let range = NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let start = 22000 + (std::process::id() as u16 % 900) * 5 + range * 300;
-    let mut held: Vec<TcpListener> = Vec::new();
-    let mut ports = Vec::new();
-    for candidate in (start..40000).step_by(3) {
-        let Ok(l) = TcpListener::bind(("127.0.0.1", candidate)) else {
-            continue;
-        };
-        let Ok(bus) = TcpListener::bind(("127.0.0.1", candidate + 10000)) else {
-            continue;
-        };
-        held.push(l);
-        held.push(bus);
-        ports.push(candidate);
-        if ports.len() == n {
-            return ports;
-        }
-    }
-    panic!("could not reserve {n} ports with free +10000 siblings");
-}
 
 /// Kills the whole fleet on drop, so a failed assertion never leaks servers.
 /// A leaked moon whose `--dir` is then removed spins CPU indefinitely.
@@ -329,13 +303,14 @@ fn info_field(c: &mut Conn, cmd: &[&str], key: &str) -> Option<String> {
 /// and hide which assertion actually broke.
 fn form_cluster(n: usize) -> Cluster {
     let dirs: Vec<tempfile::TempDir> = (0..n).map(|_| tempfile::tempdir().unwrap()).collect();
-    let ports = reserve_cluster_ports(n);
-    let fleet = Fleet(
-        dirs.iter()
-            .zip(&ports)
-            .map(|(d, &p)| Some(spawn_node(d.path(), p, &[])))
-            .collect(),
-    );
+    let (children, ports): (Vec<Option<Child>>, Vec<u16>) = dirs
+        .iter()
+        .map(|d| {
+            let (c, p) = common::spawn_listening_cluster(|p| spawn_node(d.path(), p, &[]));
+            (Some(c), p)
+        })
+        .unzip();
+    let fleet = Fleet(children);
 
     let mut conns: Vec<Conn> = ports.iter().map(|&p| Conn::ready(p)).collect();
     let ids: Vec<String> = conns
@@ -518,8 +493,8 @@ fn cb4_lone_node_with_no_slots_still_serves_locally() {
     // before the fix and must stay green after: narrowing the fallback must not
     // break a single node that has never been told about any slots.
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_cluster_ports(1)[0];
-    let _fleet = Fleet(vec![Some(spawn_node(dir.path(), port, &[]))]);
+    let (port_child, port) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _fleet = Fleet(vec![Some(port_child)]);
     let mut c = Conn::ready(port);
     assert_eq!(c.cmd(&["SET", "k", "v"]), Val::Str("OK".into()));
     assert_eq!(c.cmd(&["GET", "k"]), Val::Str("v".into()));
@@ -694,8 +669,8 @@ fn cb8_a_master_and_its_replica_share_one_shard_entry() {
 
     // A fourth node, replicating node 0.
     let dir = tempfile::tempdir().unwrap();
-    let rport = reserve_cluster_ports(1)[0];
-    let _replica = Fleet(vec![Some(spawn_node(dir.path(), rport, &[]))]);
+    let (rport_child, rport) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _replica = Fleet(vec![Some(rport_child)]);
     let mut rc = Conn::ready(rport);
     let mut c0 = cl.conn(0);
     assert_eq!(
@@ -837,8 +812,8 @@ fn cb10_myshardid_is_stable_and_identical_within_a_shard() {
 #[test]
 fn cb11_readonly_and_readwrite_are_accepted_on_a_cluster_instance() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_cluster_ports(1)[0];
-    let _fleet = Fleet(vec![Some(spawn_node(dir.path(), port, &[]))]);
+    let (port_child, port) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _fleet = Fleet(vec![Some(port_child)]);
     let mut c = Conn::ready(port);
     assert_eq!(c.cmd(&["READONLY"]), Val::Str("OK".into()));
     assert_eq!(c.cmd(&["READWRITE"]), Val::Str("OK".into()));
@@ -861,8 +836,8 @@ fn cb12_readonly_serves_replica_reads_but_never_replica_writes() {
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
 
     let dir = tempfile::tempdir().unwrap();
-    let rport = reserve_cluster_ports(1)[0];
-    let _replica = Fleet(vec![Some(spawn_node(dir.path(), rport, &[]))]);
+    let (rport_child, rport) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _replica = Fleet(vec![Some(rport_child)]);
     let mut rc = Conn::ready(rport);
     let mut c0 = cl.conn(0);
     assert_eq!(
@@ -938,8 +913,8 @@ fn cb12b_readonly_routing_holds_on_both_runtimes() {
     assert!(await_slot_convergence(&cl, Duration::from_secs(30)));
 
     let dir = tempfile::tempdir().unwrap();
-    let rport = reserve_cluster_ports(1)[0];
-    let _replica = Fleet(vec![Some(spawn_node(dir.path(), rport, &[]))]);
+    let (rport_child, rport) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _replica = Fleet(vec![Some(rport_child)]);
     let mut rc = Conn::ready(rport);
     let mut c0 = cl.conn(0);
     assert_eq!(
@@ -1115,8 +1090,8 @@ fn cb16_a_degraded_cluster_refuses_keyspace_traffic_even_for_local_slots() {
 #[test]
 fn cb17_info_reports_cluster_mode_honestly() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_cluster_ports(1)[0];
-    let _fleet = Fleet(vec![Some(spawn_node(dir.path(), port, &[]))]);
+    let (port_child, port) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _fleet = Fleet(vec![Some(port_child)]);
     let mut c = Conn::ready(port);
     assert_eq!(
         info_field(&mut c, &["INFO"], "redis_mode").as_deref(),
@@ -1135,8 +1110,8 @@ fn cb18_cluster_info_does_not_emit_cluster_enabled() {
     // Measured: redis-server reports cluster_enabled in INFO, never in
     // CLUSTER INFO. Moon has it in exactly the wrong one of the two.
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_cluster_ports(1)[0];
-    let _fleet = Fleet(vec![Some(spawn_node(dir.path(), port, &[]))]);
+    let (port_child, port) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _fleet = Fleet(vec![Some(port_child)]);
     let mut c = Conn::ready(port);
     let body = c.cmd(&["CLUSTER", "INFO"]).as_str().to_string();
     assert!(
@@ -1150,8 +1125,8 @@ fn cb18_cluster_info_does_not_emit_cluster_enabled() {
 #[test]
 fn cb19_argument_rejections_are_verbatim() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_cluster_ports(1)[0];
-    let _fleet = Fleet(vec![Some(spawn_node(dir.path(), port, &[]))]);
+    let (port_child, port) = common::spawn_listening_cluster(|p| spawn_node(dir.path(), p, &[]));
+    let _fleet = Fleet(vec![Some(port_child)]);
     let mut c = Conn::ready(port);
 
     match c.cmd(&["CLUSTER", "SHARDS", "extra"]) {

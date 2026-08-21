@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 /// this alone does not stop *external* steals — pair it with
 /// [`spawn_listening`].
 pub fn reserve_port() -> u16 {
-    static HANDED_OUT: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     loop {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 probe");
         let port = probe.local_addr().expect("probe local_addr").port();
@@ -48,6 +47,91 @@ pub fn reserve_port() -> u16 {
             return port;
         }
     }
+}
+
+/// Every port number this process has handed out, of EITHER kind.
+///
+/// Shared between [`reserve_port`] and [`reserve_cluster_port`] on purpose: a
+/// cluster node occupies two numbers (`p` and its bus sibling `p + 10000`), and
+/// a plain server that later drew `p + 10000` from the ephemeral range would
+/// collide with a bus nobody had recorded. One set, both kinds.
+static HANDED_OUT: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Client ports for cluster nodes are drawn from `[20000, 22700)`, so their bus
+/// siblings land in `[30000, 32700)`. Three properties, all deliberate: the two
+/// spaces never overlap each other; both sit BELOW Linux's default ephemeral
+/// floor of 32768 and macOS's 49152, so neither can be stolen by an OS-assigned
+/// port from [`reserve_port`] or from any other process; and `+ 10000` cannot
+/// overflow `u16`.
+const CLUSTER_PORT_LOW: u16 = 20000;
+const CLUSTER_PORT_HIGH: u16 = 22700;
+/// How far apart consecutive reservations start scanning. Purely a spreading
+/// device: the dedup set is what makes overlap impossible, so a scan that runs
+/// past its own stride into the next one is safe — every port another
+/// reservation took is already claimed and gets skipped.
+const CLUSTER_STRIDE: u16 = 50;
+
+/// Reserve a cluster-node port whose bus sibling (`port + 10000`) is also free.
+///
+/// Cluster mode binds `port + 10000` for the bus unconditionally, so an
+/// OS-assigned ephemeral port is unusable: those start at 49152 on macOS and
+/// 32768 on Linux, where `+ 10000` overflows past 65535. This scans an explicit
+/// low window instead.
+///
+/// Both numbers are recorded in [`HANDED_OUT`] before the bind probe, so no two
+/// reservations in this process — of either kind — can ever pick the same port.
+/// That closes the dominant half of moon#505: the suites that flaked run their
+/// tests in parallel THREADS of one binary, and the per-suite helpers this
+/// replaces scanned `start..40000` unbounded, so a test whose own window was
+/// busy walked straight into its neighbour's window by design.
+///
+/// The scan is bounded to that range and panics when it is exhausted, rather
+/// than the old helpers' `start..40000` wander. Cross-PROCESS collisions cannot
+/// be closed by any reservation scheme — the probe listener must be dropped
+/// before the server can bind — so pair this with [`spawn_listening_cluster`],
+/// which detects the loser.
+pub fn reserve_cluster_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let span = CLUSTER_PORT_HIGH - CLUSTER_PORT_LOW;
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Spread the starting point by pid so concurrent test BINARIES do not all
+    // begin at the bottom of the range and race each other down it.
+    let offset = (std::process::id() as u16)
+        .wrapping_mul(CLUSTER_STRIDE)
+        .wrapping_add(seq.wrapping_mul(CLUSTER_STRIDE))
+        % span;
+
+    for i in 0..span {
+        let candidate = CLUSTER_PORT_LOW + (offset + i) % span;
+        let bus = candidate + 10000;
+        {
+            // Claim both numbers, or skip. A candidate that fails the bind
+            // probe below stays claimed deliberately: it is occupied by
+            // something outside this process, and no later reservation here
+            // should waste a probe on it.
+            let mut handed = HANDED_OUT.lock().unwrap();
+            if handed.contains(&candidate) || handed.contains(&bus) {
+                continue;
+            }
+            handed.insert(candidate);
+            handed.insert(bus);
+        }
+        let Ok(client_probe) = std::net::TcpListener::bind(("127.0.0.1", candidate)) else {
+            continue;
+        };
+        let Ok(bus_probe) = std::net::TcpListener::bind(("127.0.0.1", bus)) else {
+            continue;
+        };
+        drop(bus_probe);
+        drop(client_probe);
+        return candidate;
+    }
+    panic!(
+        "reserve_cluster_port: no free port pair in [{CLUSTER_PORT_LOW}, \
+         {CLUSTER_PORT_HIGH}) — either this process leaked servers or the \
+         machine is saturated below {}",
+        CLUSTER_PORT_HIGH + 10000
+    );
 }
 
 /// How long `spawn_listening` waits for one spawn attempt to accept.
@@ -68,10 +152,52 @@ const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
 /// three consecutive dead children (something is wrong beyond a port race:
 /// read the server's stderr log) or if a live child never accepts within
 /// [`ACCEPT_DEADLINE`].
-pub fn spawn_listening(mut spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
+pub fn spawn_listening(spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
+    spawn_listening_inner(reserve_port, spawn, Duration::ZERO)
+}
+
+/// How long a cluster node must stay alive AFTER its client port accepts
+/// before it is trusted.
+///
+/// moon's client listeners use `SO_REUSEPORT`, so a second node on an
+/// already-taken client port binds SUCCESSFULLY and the kernel splits incoming
+/// connections between the two — the collision leaves no bind error, no log and
+/// no panic, only a client that intermittently reaches the wrong node and gets
+/// reset (moon#505). The one observable it does leave is the cluster BUS: that
+/// binds plainly, and `main.rs` exits(1) on `EADDRINUSE` by design ("a cluster
+/// node without its bus is invisible to every peer"). The loser therefore dies
+/// on its own, shortly after start-up — this window is how long we watch for
+/// that before handing the node to the test.
+///
+/// The window is load-bearing, not decorative: because the WINNER is already
+/// accepting on the shared port, `TcpStream::connect` succeeds instantly and
+/// the plain accept-wait above would hand back a child that is in the middle of
+/// dying. Measured on macOS against a release build, the loser lives **79 ms**
+/// from spawn to exit, so 300 ms carries a wide margin for a debug build on a
+/// loaded box.
+///
+/// It is still a bounded heuristic, not a proof: the bus binds on the
+/// `cluster-ctl` thread concurrently with the listener coming up, so nothing
+/// orders "client port accepts" against "bus bind has been attempted". The
+/// in-process guarantee comes from [`reserve_cluster_port`]'s dedup set; this
+/// only narrows the cross-process residue.
+const CLUSTER_BUS_SETTLE: Duration = Duration::from_millis(300);
+
+/// [`spawn_listening`] for CLUSTER nodes: ports come from
+/// [`reserve_cluster_port`] so the bus sibling is free too, and readiness
+/// additionally requires the child to survive [`CLUSTER_BUS_SETTLE`].
+pub fn spawn_listening_cluster(spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
+    spawn_listening_inner(reserve_cluster_port, spawn, CLUSTER_BUS_SETTLE)
+}
+
+fn spawn_listening_inner(
+    mut reserve: impl FnMut() -> u16,
+    mut spawn: impl FnMut(u16) -> Child,
+    settle: Duration,
+) -> (Child, u16) {
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
-        let port = reserve_port();
+        let port = reserve();
         let mut child = spawn(port);
         let start = Instant::now();
         loop {
@@ -81,7 +207,19 @@ pub fn spawn_listening(mut spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
             )
             .is_ok()
             {
-                return (child, port);
+                match settled(&mut child, settle) {
+                    Ok(()) => return (child, port),
+                    Err(status) => {
+                        eprintln!(
+                            "spawn_listening: child exited {status} within {settle:?} of \
+                             accepting on port {port} (attempt {attempt}/{ATTEMPTS}) — its \
+                             cluster bus almost certainly lost port {} to another node; \
+                             respawning",
+                            port.wrapping_add(10000)
+                        );
+                        break;
+                    }
+                }
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -109,6 +247,24 @@ pub fn spawn_listening(mut spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
         "spawn_listening: {ATTEMPTS} consecutive children exited before accepting — \
          not a port race; read the server stderr log in the test's --dir"
     );
+}
+
+/// Watch `child` for `settle`; `Err(status)` if it exits inside the window.
+fn settled(child: &mut Child, settle: Duration) -> Result<(), std::process::ExitStatus> {
+    let until = Instant::now() + settle;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(status),
+            Ok(None) => {}
+            // A child we cannot poll is not a port race — let the caller have
+            // it and fail on a real assertion instead of guessing here.
+            Err(_) => return Ok(()),
+        }
+        if Instant::now() >= until {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 // ---------------------------------------------------------------------------

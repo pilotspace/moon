@@ -18,40 +18,6 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Reserve a port whose cluster-bus sibling (port + 10000) is also free —
-/// the bus binds `port + 10000` unconditionally in cluster mode.
-fn reserve_cluster_ports(n: usize) -> Vec<u16> {
-    // OS-assigned ports land in the ephemeral range (49152+ on macOS), where
-    // `port + 10000` overflows past 65535 — probe a low range explicitly.
-    // All reservations (client port AND its +10000 bus sibling) stay bound
-    // until every node's pair is chosen, so picks can't collide with each
-    // other. Spread starts by pid so parallel test processes don't fight
-    // over the same slots.
-    // Tests in this file run in parallel threads of ONE process: give each
-    // reservation call its own sub-range so a later test can't race the
-    // window between a fleet's reservation-drop and its servers' binds.
-    static NEXT_RANGE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let range = NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let start = 21000 + (std::process::id() as u16 % 1500) * 7 + range * 4000;
-    let mut held: Vec<TcpListener> = Vec::new();
-    let mut ports = Vec::new();
-    for candidate in (start..40000).step_by(3) {
-        let Ok(l) = TcpListener::bind(("127.0.0.1", candidate)) else {
-            continue;
-        };
-        let Ok(bus) = TcpListener::bind(("127.0.0.1", candidate + 10000)) else {
-            continue;
-        };
-        held.push(l);
-        held.push(bus);
-        ports.push(candidate);
-        if ports.len() == n {
-            return ports;
-        }
-    }
-    panic!("could not reserve {n} ports with free +10000 siblings");
-}
-
 /// Kills the whole fleet on drop so a failed assertion never leaks servers
 /// (leaked-moon gotcha: orphans spin CPU and poison later benches).
 struct Fleet(Vec<Child>);
@@ -161,14 +127,11 @@ fn form_three_node_cluster(
     dirs: &[tempfile::TempDir],
     extra: &[&str],
 ) -> (Fleet, Vec<TcpStream>, Vec<u16>, Vec<String>) {
-    let ports = reserve_cluster_ports(3);
-
-    let fleet = Fleet(
-        dirs.iter()
-            .zip(&ports)
-            .map(|(d, &p)| spawn_cluster_node(d.path(), p, extra))
-            .collect(),
-    );
+    let (children, ports): (Vec<Child>, Vec<u16>) = dirs
+        .iter()
+        .map(|d| common::spawn_listening_cluster(|p| spawn_cluster_node(d.path(), p, extra)))
+        .unzip();
+    let fleet = Fleet(children);
 
     let mut conns: Vec<TcpStream> = ports.iter().map(|&p| connect_retry(p)).collect();
     for c in &mut conns {
@@ -261,7 +224,7 @@ fn three_node_cluster_forms_via_meet_and_gossip() {
 /// loudly at startup — not serve clients while invisible to every peer.
 #[test]
 fn occupied_bus_port_aborts_startup() {
-    let port = reserve_cluster_ports(1)[0];
+    let port = common::reserve_cluster_port();
     let _bus_blocker = TcpListener::bind(("127.0.0.1", port + 10000)).expect("occupy bus port");
     let dir = tempfile::tempdir().expect("tempdir");
     let mut child = spawn_cluster_node(dir.path(), port, &[]);
