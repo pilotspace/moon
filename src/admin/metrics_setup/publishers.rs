@@ -12,9 +12,11 @@ use crate::admin::metrics_setup::{
     METRICS_INITIALIZED, get_allocator_overhead_bytes, get_global_repl_state_arc,
     get_global_shard_databases, get_rss_bytes, update_rss_bytes,
 };
-// Only the console-gated SSE snapshot reads the raw connection gauge.
+// Only the console-gated SSE snapshot reads the raw connection gauge and the
+// exact total-commands sum. Both imports must stay cfg'd: unconditionally
+// importing them makes the default (no-console) build fail `unused_imports`.
 #[cfg(feature = "console")]
-use crate::admin::metrics_setup::CONNECTED_CLIENTS;
+use crate::admin::metrics_setup::{CONNECTED_CLIENTS, total_commands_sum};
 
 // ── SSE metrics publisher (console feature) ────────────────────────────
 
