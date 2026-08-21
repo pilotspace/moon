@@ -221,41 +221,17 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("HSCAN"),
     };
 
-    // Parse optional MATCH and COUNT
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(v) = extract_bytes(&args[i]) {
-                    if let Some(c) = std::str::from_utf8(v)
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                    {
-                        if c > 0 {
-                            count = c;
-                        }
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options` for why
+    // eight hand-copied ones is how `NOVALUES` came to be silently dropped.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Hash,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
 
     // Collect live (field, value) pairs; HashRef::entries() filters expired fields.
     let now_ms = db.now_ms();
@@ -294,7 +270,12 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         }
 
         results.push(Frame::BulkString(field.clone()));
-        results.push(Frame::BulkString(value.clone()));
+        // NOVALUES: field names only. A client that passes it parses the reply
+        // as a flat list of names, so emitting the value here hands it a name
+        // that does not exist (moon#630).
+        if !opts.novalues {
+            results.push(Frame::BulkString(value.clone()));
+        }
     }
 
     let next_cursor = if pos >= total {
@@ -498,39 +479,17 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         },
         None => return err_wrong_args("HSCAN"),
     };
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(v) = extract_bytes(&args[i]) {
-                    if let Some(c) = std::str::from_utf8(v)
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                    {
-                        if c > 0 {
-                            count = c;
-                        }
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options` for why
+    // eight hand-copied ones is how `NOVALUES` came to be silently dropped.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Hash,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
     let entries = match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
             let mut e = href.entries();
@@ -559,7 +518,12 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             }
         }
         results.push(Frame::BulkString(field.clone()));
-        results.push(Frame::BulkString(value.clone()));
+        // NOVALUES: field names only. A client that passes it parses the reply
+        // as a flat list of names, so emitting the value here hands it a name
+        // that does not exist (moon#630).
+        if !opts.novalues {
+            results.push(Frame::BulkString(value.clone()));
+        }
     }
     let next_cursor = if pos >= total {
         Bytes::from_static(b"0")

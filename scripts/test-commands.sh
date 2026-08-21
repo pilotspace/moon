@@ -508,6 +508,10 @@ if should_run "hash"; then
     assert_match "HSETNX (new)"        HSETNX hsh:k1 f6 v6
     assert_match "HSETNX (exists)"     HSETNX hsh:k1 f6 v6b
     assert_moon_ok "HSCAN"             HSCAN hsh:k1 0
+    # moon#630: NOVALUES was accepted and dropped, so the reply carried the
+    # field/value interleave a client reads as field names. `assert_match`
+    # compares against real Redis, which is what catches a silent drop.
+    assert_match "HSCAN NOVALUES"      HSCAN hsh:k1 0 NOVALUES
     assert_match "HINCRBY"             HINCRBY hsh:k1 counter 10
     assert_match "HINCRBY (again)"     HINCRBY hsh:k1 counter 5
     assert_match "HINCRBYFLOAT"        HINCRBYFLOAT hsh:k1 fcounter 1.5

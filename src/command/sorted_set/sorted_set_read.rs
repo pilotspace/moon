@@ -191,45 +191,19 @@ pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Parse optional MATCH and COUNT
-    let mut pattern: Option<&[u8]> = None;
-    let mut scan_count: usize = 10;
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            if i + 1 < args.len() {
-                pattern = extract_bytes(&args[i + 1]).map(|b| b.as_ref());
-                i += 2;
-            } else {
-                return err_wrong_args("ZSCAN");
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            if i + 1 < args.len() {
-                let count_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZSCAN"),
-                };
-                scan_count = match std::str::from_utf8(count_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
-                    Some(c) => c,
-                    None => return err("ERR value is not an integer or out of range"),
-                };
-                i += 2;
-            } else {
-                return err_wrong_args("ZSCAN");
-            }
-        } else {
-            i += 1;
-        }
-    }
+    // One parser for the whole family — see `command::scan_options`. ZSCAN's
+    // own copy was the strictest of the eight (it alone refused a non-numeric
+    // COUNT) and still answered `wrong number of arguments` where Redis
+    // answers `syntax error` for a dangling MATCH.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::SortedSet,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let pattern = opts.pattern;
+    let scan_count = opts.count;
 
     match db.get_sorted_set(key) {
         Ok(Some((members, _scores))) => {
@@ -1261,45 +1235,19 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(c) => c,
         None => return err("ERR invalid cursor"),
     };
-    let mut pattern: Option<&[u8]> = None;
-    let mut scan_count: usize = 10;
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            if i + 1 < args.len() {
-                pattern = extract_bytes(&args[i + 1]).map(|b| b.as_ref());
-                i += 2;
-            } else {
-                return err_wrong_args("ZSCAN");
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            if i + 1 < args.len() {
-                let count_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZSCAN"),
-                };
-                scan_count = match std::str::from_utf8(count_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
-                    Some(c) => c,
-                    None => return err("ERR value is not an integer or out of range"),
-                };
-                i += 2;
-            } else {
-                return err_wrong_args("ZSCAN");
-            }
-        } else {
-            i += 1;
-        }
-    }
+    // One parser for the whole family — see `command::scan_options`. ZSCAN's
+    // own copy was the strictest of the eight (it alone refused a non-numeric
+    // COUNT) and still answered `wrong number of arguments` where Redis
+    // answers `syntax error` for a dangling MATCH.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::SortedSet,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let pattern = opts.pattern;
+    let scan_count = opts.count;
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             let mut all_members: Vec<(Bytes, f64)> = match zref.members_map() {
