@@ -1011,6 +1011,34 @@ if should_run "scripting"; then
     rcli SET lua:k1 luaval >/dev/null 2>&1; mcli SET lua:k1 luaval >/dev/null 2>&1
     assert_match "EVAL redis.call"     EVAL "return redis.call('GET', KEYS[1])" 1 lua:k1
     assert_match "EVAL table"          EVAL "return {1,2,3}" 0
+
+    # moon#515: Redis caches an EVAL'd body server-wide, so EVAL-then-EVALSHA
+    # is a supported idiom. moon cached it only on the executing shard, so at
+    # --shards >= 2 the EVALSHA answered NOSCRIPT for every key that routed
+    # elsewhere. Each `mcli` is a fresh connection, so the loop samples shards.
+    # The sha comes from REDIS, not from `SCRIPT LOAD` on moon -- SCRIPT LOAD
+    # already fanned out, and using it here would hide the defect.
+    FANOUT_BODY="return redis.call('set',KEYS[1],'v')"
+    FANOUT_SHA=$(rcli SCRIPT LOAD "$FANOUT_BODY" 2>/dev/null)
+    mcli EVAL "$FANOUT_BODY" 1 lua:fanoutseed >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do
+        assert_match "EVALSHA after bare EVAL (key $i)" EVALSHA "$FANOUT_SHA" 1 "lua:fanout$i"
+    done
+
+    # moon#514: FUNCTION LOAD must reach every shard and FCALL must route to
+    # the shard owning its key. Unfixed at --shards 4: 5/8 CROSSSLOT, 3/8
+    # "Function not found", 0/8 succeeded.
+    FN_LIB=$'#!lua name=cmdlib\nredis.register_function(\'cmdset\', function(keys, args) return redis.call(\'set\', keys[1], args[1]) end)\n'
+    rcli FUNCTION FLUSH >/dev/null 2>&1; mcli FUNCTION FLUSH >/dev/null 2>&1
+    assert_match "FUNCTION LOAD"       FUNCTION LOAD "$FN_LIB"
+    for i in 1 2 3 4 5 6 7 8; do
+        assert_match "FCALL single key (key $i)" FCALL cmdset 1 "fn:k$i" "v$i"
+        assert_match "FCALL value landed (key $i)" GET "fn:k$i"
+    done
+    assert_match "FUNCTION DELETE"     FUNCTION DELETE cmdlib
+    for i in 1 2 3 4; do
+        assert_match "FCALL after DELETE (key $i)" FCALL cmdset 1 "fn:d$i" x
+    done
 fi
 
 # ===========================================================================

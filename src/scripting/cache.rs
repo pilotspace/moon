@@ -4,12 +4,26 @@ use std::collections::HashMap;
 /// Per-shard script cache: maps hex SHA1 -> script source bytes.
 pub struct ScriptCache {
     scripts: HashMap<String, Bytes>,
+    /// Digests this shard has successfully published to every other shard
+    /// (moon#515). Tracked SEPARATELY from `scripts` because the two answer
+    /// different questions: `scripts` says "can I run this sha", `fanned_out`
+    /// says "does the rest of the server know about it".
+    ///
+    /// Folding the two together — gating the fan-out on the cache insert —
+    /// looks tempting and is wrong: a fan-out that fails leaves the body
+    /// cached locally, so every later `EVAL` of that body sees a hit and
+    /// SKIPS the retry. The divergence would then be permanent for a
+    /// self-inflicted reason. Keeping the flag separate makes the next `EVAL`
+    /// of the same body republish, which is the whole recovery story now that
+    /// there is no repair leg.
+    fanned_out: std::collections::HashSet<String>,
 }
 
 impl ScriptCache {
     pub fn new() -> Self {
         ScriptCache {
             scripts: HashMap::new(),
+            fanned_out: std::collections::HashSet::new(),
         }
     }
 
@@ -18,6 +32,34 @@ impl ScriptCache {
         let sha = sha1_smol::Sha1::from(&script[..]).hexdigest();
         self.scripts.entry(sha.clone()).or_insert(script);
         sha
+    }
+
+    /// Cache a script and report whether this shard still OWES the other
+    /// shards a copy of it (moon#515).
+    ///
+    /// `EVAL` must publish its body to the other shards, or a later `EVALSHA`
+    /// on a connection that landed elsewhere answers `NOSCRIPT` for a sha the
+    /// server has already run. Fanning out on EVERY `EVAL` would put N-1 SPSC
+    /// pushes and a cross-shard round trip on the scripting hot path, so the
+    /// duty is claimed once per distinct body and cleared by
+    /// [`Self::mark_fanned_out`] only when the publish actually completed.
+    ///
+    /// Costs one sha1 pass over the body. `handle_eval` computes the digest
+    /// again in [`Self::load`], so an `EVAL` at `--shards > 1` pays two —
+    /// unifying them means threading the digest through three dispatch paths
+    /// and is left as a follow-up rather than folded into a correctness fix.
+    #[must_use]
+    pub fn claim_fanout_duty(&mut self, script: Bytes) -> (String, bool) {
+        let sha = sha1_smol::Sha1::from(&script[..]).hexdigest();
+        self.scripts.entry(sha.clone()).or_insert(script);
+        let owed = !self.fanned_out.contains(&sha);
+        (sha, owed)
+    }
+
+    /// Record that `sha1` reached every other shard, so later `EVAL`s of the
+    /// same body skip the fan-out. Called ONLY on a complete publish.
+    pub fn mark_fanned_out(&mut self, sha1: &str) {
+        self.fanned_out.insert(sha1.to_owned());
     }
 
     pub fn get(&self, sha1_hex: &str) -> Option<&Bytes> {
@@ -30,6 +72,9 @@ impl ScriptCache {
 
     pub fn flush(&mut self) {
         self.scripts.clear();
+        // A flushed shard owes the world nothing, and the next `EVAL` of any
+        // body must republish it (this shard may have been the only holder).
+        self.fanned_out.clear();
     }
 
     pub fn len(&self) -> usize {

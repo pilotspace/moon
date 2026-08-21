@@ -212,9 +212,12 @@ pub(crate) enum ReplyFailure {
 
 /// Await `reply_rx` for at most `timeout`, reporting WHICH failure occurred.
 ///
-/// Split out from [`recv_reply_bounded_reason`] purely so tests can drive both
-/// arms without waiting out the real 30s [`XSHARD_REPLY_TIMEOUT`].
-async fn recv_reply_within<T: Send + 'static>(
+/// Split out from [`recv_reply_bounded_reason`] so tests can drive both arms
+/// without waiting out the real 30s [`XSHARD_REPLY_TIMEOUT`], and so callers
+/// that await SEVERAL receivers under ONE overall budget (the scripting
+/// fan-out) can pass the remaining slice of it rather than restarting the full
+/// timeout per receiver.
+pub(crate) async fn recv_reply_within<T: Send + 'static>(
     reply_rx: channel::OneshotReceiver<T>,
     timeout: std::time::Duration,
 ) -> Result<T, ReplyFailure> {

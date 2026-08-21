@@ -1699,6 +1699,81 @@ fi
 start_moon_with_shards "$SHARDS" || true
 
 # ===========================================================================
+# SCRIPTING/FUNCTIONS state fan-out -- cross-shard consistency (moon#515/#514)
+# ===========================================================================
+#
+# Scripting state (the EVAL script cache, the Functions library registry) lives
+# PER SHARD. If it is not replicated to every shard, whether a command works
+# depends on which shard the client's key routes to -- indistinguishable from
+# corruption to an application author.
+#
+# Each `redis-cli` invocation is a NEW connection and therefore samples a new
+# shard placement, which is exactly what these defects needed to reproduce:
+#   moon#515 -- one bare EVAL then EVALSHA on 12 keys: ok=2, NOSCRIPT=10 at 4 shards.
+#   moon#514 -- one FUNCTION LOAD then 8 FCALLs: 5 CROSSSLOT, 3 not-found, 0 ok.
+# Both are 12/12 and 8/8 once the state fans out.
+echo ""
+echo "=== SCRIPTING/FUNCTIONS FAN-OUT (moon#515 / moon#514) ==="
+
+stop_moon
+
+SCRIPT_BODY="return redis.call('set',KEYS[1],'v')"
+FN_LIB=$'#!lua name=consistlib\nredis.register_function(\'cset\', function(keys, args) return redis.call(\'set\', keys[1], args[1]) end)\n'
+
+for NSHARDS in 1 4 12; do
+    log "  -- scripting fan-out shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # --- moon#515: a bare EVAL must publish its body to every shard ---------
+    # The sha comes from Redis, NOT from `SCRIPT LOAD` on moon: SCRIPT LOAD
+    # already fanned out, so using it here would make this check pass against
+    # the broken build.
+    SHA=$(redis-cli -p "$PORT_REDIS" SCRIPT LOAD "$SCRIPT_BODY" 2>/dev/null)
+    redis-cli -p "$PORT_RUST" EVAL "$SCRIPT_BODY" 1 fanoutseed >/dev/null 2>&1
+    EVALSHA_OK=0
+    for i in $(seq 1 12); do
+        OUT=$(redis-cli -p "$PORT_RUST" EVALSHA "$SHA" 1 "fanoutk$i" 2>&1)
+        [[ "$OUT" == "OK" ]] && EVALSHA_OK=$((EVALSHA_OK + 1))
+    done
+    assert_eq "moon#515 shards=$NSHARDS: EVALSHA after a bare EVAL" "12" "$EVALSHA_OK"
+
+    # --- moon#514: FUNCTION LOAD must reach every shard, FCALL must route ---
+    redis-cli -p "$PORT_RUST" FUNCTION FLUSH >/dev/null 2>&1
+    LOADED=$(redis-cli -p "$PORT_RUST" FUNCTION LOAD "$FN_LIB" 2>&1)
+    assert_eq "moon#514 shards=$NSHARDS: FUNCTION LOAD accepted" "consistlib" "$LOADED"
+
+    FCALL_OK=0
+    for i in $(seq 1 12); do
+        OUT=$(redis-cli -p "$PORT_RUST" FCALL cset 1 "fnk$i" "fv$i" 2>&1)
+        # Read back through the NORMAL path so a write that landed on the
+        # wrong shard cannot fake success.
+        BACK=$(redis-cli -p "$PORT_RUST" GET "fnk$i" 2>&1)
+        [[ "$OUT" == "OK" && "$BACK" == "fv$i" ]] && FCALL_OK=$((FCALL_OK + 1))
+    done
+    assert_eq "moon#514 shards=$NSHARDS: single-key FCALL runs on the key's shard" "12" "$FCALL_OK"
+
+    # The library must be listable from a fresh connection on any shard.
+    LIST_SEEN=0
+    for i in $(seq 1 12); do
+        redis-cli -p "$PORT_RUST" FUNCTION LIST 2>&1 | grep -q consistlib && LIST_SEEN=$((LIST_SEEN + 1))
+    done
+    assert_eq "moon#514 shards=$NSHARDS: FUNCTION LIST sees the library everywhere" "12" "$LIST_SEEN"
+
+    # ...and FUNCTION DELETE must un-list it everywhere, or the delete lied.
+    redis-cli -p "$PORT_RUST" FUNCTION DELETE consistlib >/dev/null 2>&1
+    GONE=0
+    for i in $(seq 1 12); do
+        OUT=$(redis-cli -p "$PORT_RUST" FCALL cset 1 "delk$i" x 2>&1)
+        [[ "$OUT" == *"Function not found"* ]] && GONE=$((GONE + 1))
+    done
+    assert_eq "moon#514 shards=$NSHARDS: FUNCTION DELETE reaches every shard" "12" "$GONE"
+done
+
+# Restart moon with the originally-requested shard count so later sections work.
+start_moon_with_shards "$SHARDS" || true
+
+# ===========================================================================
 # TEMPORAL COMMANDS -- cross-shard consistency (moon-only)
 # ===========================================================================
 

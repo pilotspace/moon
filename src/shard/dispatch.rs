@@ -715,7 +715,36 @@ pub enum ShardMessage {
     },
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
-    ScriptLoad { sha1: String, script: bytes::Bytes },
+    ///
+    /// `ack` (moon#515) reports whether the script is now in THIS shard's
+    /// cache, and is sent after the attempt either way. The sender waits on
+    /// it, so `SCRIPT LOAD` / the first `EVAL` of a body cannot return `+OK`
+    /// while a shard that has not drained the message yet would still answer
+    /// `NOSCRIPT`.
+    ///
+    /// It carries `bool`, not `()`, because delivery is not application: a
+    /// shard can receive the message and still fail to install it, and an ack
+    /// that cannot say so turns every such failure into a silent divergence
+    /// the client was told did not happen. `None` where no one is waiting.
+    ScriptLoad {
+        sha1: String,
+        script: bytes::Bytes,
+        ack: Option<channel::OneshotSender<bool>>,
+    },
+    /// Fan-out of a `FUNCTION LOAD`/`DELETE`/`FLUSH` to every other shard, so
+    /// a library loaded through one connection is callable from all of them
+    /// (moon#514). The Functions-API counterpart of [`Self::ScriptLoad`];
+    /// received by every other shard's SPSC drain loop.
+    ///
+    /// `ack` reports whether the op was APPLIED to this shard's registry, for
+    /// the same reason as [`Self::ScriptLoad`]: `FUNCTION LOAD` must not
+    /// answer the client before an `FCALL` routed to any shard can find the
+    /// library, and must not answer `+OK` at all if some shard rejected the
+    /// body it accepted.
+    FunctionRegistry {
+        op: crate::scripting::FunctionRegistryOp,
+        ack: Option<channel::OneshotSender<bool>>,
+    },
     /// Migrate a connection's file descriptor to this shard.
     /// The source shard has deregistered the FD and extracted connection state.
     /// This shard must reconstruct the TCP stream and spawn a new handler.
