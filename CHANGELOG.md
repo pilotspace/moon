@@ -203,6 +203,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   It now draws from the thread RNG, like `HRANDFIELD`, `SRANDMEMBER` and `ZRANDMEMBER` already did.
 
+- **`scripts/test-consistency.sh` died 40% in and reported success.** `TOTAL` was incremented by
+  the null-type probes but never initialised, so `set -u` aborted the run at the first
+  `TOTAL=$((TOTAL + 1))` — and the `EXIT` trap's own last command then set the exit status, so the
+  script exited **0** while never reaching the #592 two-key sweep, script routing, `SWAPDB`, the
+  `FT.*` block, `RESET` or any restart loop. Every run since the moon#594 probes landed was
+  reporting on roughly the first half of the suite. Both halves are fixed, and the run now
+  completes: 390 checks at `--shards 4`, 388 at `--shards 1`.
+
+  Un-hiding the tail surfaced 8 pre-existing failures at `--shards 4` and 2 at `--shards 1`, all
+  present on the merge-base binary too (same-script A/B). They are tracked separately: the
+  `ROLE`/`master_repl_offset` divergence under #536, `COMMAND LIST` omitting container
+  subcommands, and the cross-shard `BLMOVE` and movablekeys-tracking cases under the #592 family.
+  None is introduced here.
+
 - **`INFO`, `CLIENT LIST`, `LOLWUT` and `MEMORY DOCTOR` sent a BulkString where RESP3 clients are
   told to expect a VerbatimString** (#462). Swept every reply type against redis-server 8.6.1 on the
   wire, at `--shards 1` and `--shards 4`, RESP2 and RESP3:
