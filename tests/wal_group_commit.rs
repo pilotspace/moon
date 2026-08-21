@@ -392,14 +392,6 @@ mod integration {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
-    fn unique_port() -> u16 {
-        use std::net::TcpListener;
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-        let p = l.local_addr().expect("local addr").port();
-        drop(l);
-        p
-    }
-
     fn unique_dir(suffix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -517,7 +509,7 @@ mod integration {
         const WRITERS: usize = 16;
         const PER_WRITER: usize = 60;
 
-        let port = unique_port();
+        let port = super::common::reserve_port();
         let dir = unique_dir(tag);
         std::fs::create_dir_all(&dir).expect("create test dir");
 
@@ -586,7 +578,7 @@ mod integration {
     #[test]
     #[ignore]
     fn lone_writer_fsyncs_immediately() {
-        let port = unique_port();
+        let port = super::common::reserve_port();
         let dir = unique_dir("lone");
         std::fs::create_dir_all(&dir).expect("create test dir");
 
@@ -621,7 +613,7 @@ mod integration {
         const WRITERS: usize = 12;
         const PER_WRITER: usize = 80;
 
-        let port = unique_port();
+        let port = super::common::reserve_port();
         let dir = unique_dir("rewrite");
         std::fs::create_dir_all(&dir).expect("create test dir");
 

@@ -56,14 +56,6 @@ fn find_moon_binary() -> PathBuf {
     common::find_moon_binary()
 }
 
-fn unique_port() -> u16 {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
-
 fn unique_dir(suffix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -516,7 +508,7 @@ fn write_marker_and_sync(c: &mut Client, dir: &Path, marker: &str) {
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn g1_mutable_tier_survives_kill9_with_stable_handles() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("g1");
     let guard = start_moon_alive(port, &dir);
     let mut c = Client::connect(port);
@@ -630,7 +622,7 @@ fn g2_frozen_tier_rebuilt_from_wal_replay() {
     const NODES: u64 = 300;
     const EDGES: usize = 64_100;
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("g2");
     let guard = start_moon_alive(port, &dir);
     let mut c = Client::connect(port);
@@ -731,7 +723,7 @@ fn g2_frozen_tier_rebuilt_from_wal_replay() {
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn g3_double_crash_recovery_is_idempotent() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("g3");
     let guard = start_moon_alive(port, &dir);
     let mut c = Client::connect(port);
@@ -963,7 +955,7 @@ fn assert_graph_recovered(c: &mut Client, n_ids: &BTreeSet<i64>, c_ids: &BTreeSe
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn g4_default_v3_mode_survives_kill9() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("g4");
     let guard = start_moon_alive_v3(port, &dir);
     let mut c = Client::connect(port);
@@ -981,7 +973,7 @@ fn g4_default_v3_mode_survives_kill9() {
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn g5_default_v3_mode_survives_kill9_after_checkpoint() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("g5");
     let guard = start_moon_alive_v3(port, &dir);
     let mut c = Client::connect(port);

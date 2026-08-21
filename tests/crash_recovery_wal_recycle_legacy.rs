@@ -70,14 +70,6 @@ fn find_moon_binary() -> PathBuf {
     common::find_moon_binary()
 }
 
-fn unique_port() -> u16 {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
-
 fn unique_dir(suffix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -425,7 +417,7 @@ const G: &[u8] = b"walrecycleg";
 #[test]
 #[ignore] // Requires built release binary; run explicitly.
 fn t43_legacy_mode_pass_c_must_not_lose_ws_and_graph_history() {
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("t43");
     let guard = start_moon_alive(port, &dir);
     let mut c = Client::connect(port);

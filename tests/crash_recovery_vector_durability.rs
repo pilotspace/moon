@@ -37,6 +37,8 @@
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::collections::HashSet;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -72,14 +74,6 @@ fn find_moon_binary() -> PathBuf {
     // Windows (the old target/{release,debug}/moon probing found nothing on
     // Windows and could pick a stale release binary).
     PathBuf::from(env!("CARGO_BIN_EXE_moon"))
-}
-
-fn unique_port() -> u16 {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
 }
 
 fn unique_dir(suffix: &str) -> PathBuf {
@@ -925,7 +919,7 @@ fn s1_unchanged_keys_fast_path_survives_crash() {
     const N: usize = 2000;
     const IDX: &str = "s1";
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s1");
     let vdir = vector_persist_dir(&dir);
     let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
@@ -1016,7 +1010,7 @@ fn s2_updates_and_deletes_reconcile_across_crash() {
     /// from its original position (distinguishable in KNN).
     const UPDATE_SEED_OFFSET: u32 = 500_000;
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s2");
     let vdir = vector_persist_dir(&dir);
     let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
@@ -1121,7 +1115,7 @@ fn s3_orphan_files_swept_on_boot() {
     const N: usize = 400;
     const IDX: &str = "s3";
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s3");
     let vdir = vector_persist_dir(&dir);
     let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
@@ -1277,7 +1271,7 @@ fn s4_collection_id_pin_survives_post_recovery_merge() {
     const N_CLUSTERS: usize = 20;
     const PER_CLUSTER: usize = 25; // 500 pre-crash + 500 post-recovery = 1000 total
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s4");
     let vdir = vector_persist_dir(&dir);
     let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
@@ -1419,7 +1413,7 @@ fn s5_no_persist_dir_regression_guard() {
     const N: usize = 50;
     const IDX: &str = "s5";
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s5");
 
     let guard = spawn_moon_no_persist(port, &dir);
@@ -1531,7 +1525,7 @@ fn s6_crash_during_snapshot_window_reindexes_uncovered_keys() {
     const N: usize = 2000;
     const IDX: &str = "s6";
 
-    let port = unique_port();
+    let port = common::reserve_port();
     let dir = unique_dir("s6");
     let vdir = vector_persist_dir(&dir);
     let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
