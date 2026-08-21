@@ -170,7 +170,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GETRANGE`, `SUBSTR`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO`, `LCS`, `SORT_RO` and
   `MGET` all read through `Database::get_if_alive`, which probes the HOT plane and stops.
   `PFCOUNT` had the same bug through a loader of its own (`load_hll_readonly`), reporting
-  cardinality 0 for a spilled HyperLogLog that `EXISTS` answers 1 for. A key that
+  cardinality 0 for a spilled HyperLogLog that `EXISTS` answers 1 for.
+
+  A source-grep shape pin (`tests/cold_read_through_shape.rs`) now DENIES `get_if_alive(` inside
+  `src/command/`, with a reasoned allowlist for the three genuinely hot-only readers (`KEYS`,
+  `SCAN`, `RANDOMKEY` are plane-partitioned and enumerate the cold plane separately; `GET` does its
+  own cold read after the hot miss). A second test fails if an allowlist entry outlives the call
+  site it excuses. Both were mutation-verified: planting a hot-only read in a non-allowlisted
+  handler fails naming the file and line, and a stale allowlist entry fails naming the file. A key that
   eviction spilled to the cold tier is absent from `data`, so every one of them returned the
   missing-key answer for a key that is present and readable. Measured on one instance, one shard,
   `--maxmemory 4mb --maxmemory-policy volatile-ttl --disk-offload enable`, 6,000 × 1KB values
