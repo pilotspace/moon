@@ -1890,6 +1890,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that reaches into `CachedMetricsHandles` private state and would otherwise have silently stopped
   compiling. `pub(super)` on the handful of newly cross-file internals reproduces exactly the
   visibility they had inside the single file; no item became reachable from outside its old scope.
+- **Retiring a document from a text index walked the whole field vocabulary, and left the
+  emptied terms behind** (T2). `TextIndex::remove_field` asked every term the field had EVER seen
+  "were you carrying this document?", and the answer was no for almost all of them — so the cost of
+  one removal was the size of the corpus's entire term history, not the size of the document. Worse,
+  a term whose last carrier left kept its now-empty bitmap forever, so the vocabulary only grew:
+  every later removal and every search miss paid for documents that had been deleted long ago. The
+  same unbounded-growth shape as the manifest entries in moon#546 — a cost with no reader.
+
+  Each field now keeps a forward map (`doc_id -> the terms it contributed`) beside the inverted one,
+  sharing the same `Arc<str>` allocation per term, so the forward side costs one pointer per
+  (document, term) pair and never a second copy of the text. Removal touches only the terms the
+  document actually held, and retires any term it was the last to carry.
+
+  Measured on one field, ten distinct terms per document, timing the removal of every document
+  (`cargo test --release --lib bench_removal_cost -- --ignored --nocapture`, same machine, same
+  build, the only change being `remove_field` reverted to the old sweep):
+
+  ```text
+  docs   vocabulary   before      after     speedup
+  250    2,500        2.40 ms     0.20 ms   11.8x
+  500    5,000        7.67 ms     0.37 ms   20.7x
+  1,000  10,000      21.85 ms     0.80 ms   27.2x
+  2,000  20,000      68.05 ms     1.87 ms   36.4x
+  ```
+
+  Eight times the documents cost 28.4x more before and 9.2x after: the speedup grows with the
+  corpus because what was removed is a quadratic, not a constant factor.
+
+  Not changed here: `PayloadIndex::remove_field`'s tag and numeric sweeps have the same shape, but
+  their per-field value sets are typically bounded (categories, prices) where a text vocabulary is
+  not, so they are a smaller problem and a separate change.
 
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
   Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
