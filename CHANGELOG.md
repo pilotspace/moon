@@ -1922,6 +1922,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their per-field value sets are typically bounded (categories, prices) where a text vocabulary is
   not, so they are a smaller problem and a separate change.
 
+- **Dependency bumps, batched into one verified lockfile change** (dependabot #603, #532, #530,
+  #528, #529). Five separate PRs all rewriting `Cargo.lock` invalidate one another the moment any
+  one of them lands, so they were resolved into a single branch, verified once, and gated once
+  rather than serialised through five matrices. Contents: `base64` 0.22.1 → 0.23.1 (the only
+  manifest change), `num-bigint` 0.4.6 → 0.5.1, `redis` 1.5.0 → 1.6.0, `ureq` 3.3.0 → 3.4.0,
+  `aws-lc-rs` 1.17.3 → 1.18.0 (`aws-lc-sys` 0.43 → 0.44), `io-uring` 0.7.13 → 0.7.14,
+  `roaring` 0.11.4 → 0.11.5, `futures-util` 0.3.32 → 0.3.34, plus `bytemuck`, `cudarc`,
+  `http-body-util`, `thiserror`, `uuid` patch bumps and `mozilla-actions/sccache-action`
+  0.0.10 → 0.0.11.
+
+  Three of these are not routine and were checked deliberately rather than on a green default
+  build. `base64` is `optional = true` and reachable ONLY through the `console` feature — a
+  build the PR gate does not run — so its green per-PR CI proved nothing about it; verified
+  under `--features console`, including the `admin::auth` signature path that decodes with it.
+  `num-bigint` 0.4 → 0.5 is a breaking change under semver. `io-uring` backs the SHIPPED monoio
+  runtime, which is likewise dispatch-only. Verified locally on native macOS arm64 across the
+  default, `console`, and `runtime-tokio,jemalloc` feature sets, with the full lib suite green
+  (4,877 passed), then through the complete dispatch matrix.
+
 - **Active expiry runs on a deadline-ordered index instead of probabilistic sampling** (#541).
   Every hot entry with a TTL now has an `(expires_at_ms, key)` pair in a per-database ordered
   index, maintained O(log n) by the storage-layer writers; the 100ms sweep pops exactly the DUE
