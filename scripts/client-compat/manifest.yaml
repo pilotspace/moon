@@ -284,11 +284,70 @@ entries:
         (1) acl_categories is thin — Redis reports @read @string @fast for GET,
         Moon's registry carries only @string;
         (2) key_specs is empty — Redis emits one spec for GET, Moon emits *0;
-        (3) under RESP3 Redis types flags and acl_categories as Sets (~) and
-        key_specs entries as Maps (%), while Moon emits Arrays (*).
         A client dispatching on the reply shape is served; one reading
         acl_categories to build a permission model is not.
-        Owner: (1)+(2) sdk-wire-form-fixes, (3) resp3-type-fidelity.
+        The former item (3) -- flags, acl_categories, tips, key_specs and
+        subcommands typed as Arrays where RESP3 Redis sends Sets -- is FIXED in
+        moon#631 and pinned live by resp3_container_shapes::cs7/cs8. Redis also
+        types each key_specs ELEMENT as a Map; Moon's key_specs is empty, so
+        that is item (2), not a separate typing gap.
+        Owner: (1)+(2) sdk-wire-form-fixes.
+
+  # ── RESP3 container shapes (moon#631) ─────────────────────────────────
+  # Redis types these three as Maps (and ACL GETUSER's `flags` as a Set) under
+  # RESP3; Moon built flat Arrays. Unlike moon#462 no shared conversion could
+  # fix them — each is built by its own handler and the structures are nested,
+  # not flat-to-map — so the handlers now emit the right Frame and the
+  # serializer downgrades it for RESP2.
+  #
+  # `type_only` is NOT a blanket pass here: it still compares `_shape_sig`,
+  # i.e. the structure BELOW the top level. XINFO GROUPS matches Redis 8.6.1
+  # element-for-element, so it stays a live assertion. The other two still
+  # diverge on FIELD SET (content), not on reply type, so each carries a
+  # reasoned waiver naming exactly what is missing — and `--strict` turns each
+  # waiver into a ratchet that fails the moment the gap is closed.
+  # The reply TYPE itself is pinned live by tests/resp3_container_shapes.rs
+  # (cs1..cs8), which asserts the sigils directly off the wire.
+  - name: shapes_acl_getuser
+    command: "ACL GETUSER default"
+    policy: type_only
+    # `multi` is excluded on purpose: ACL is a further member of the
+    # transaction-queueing bypass class already waived on config_get_in_multi
+    # (moon answers the reply inline instead of +QUEUED, so EXEC returns *0).
+    # Measured 2026-08-22, same class, not a reply-shape defect.
+    # Owner: multi-exec-queue-semantics.
+    contexts: [standalone, pipeline]
+    expect_diff:
+      reason: >-
+        NARROWED by moon#631: the reply TYPE is now correct — both servers
+        answer a Map whose `flags` is a Set and whose `passwords`/`selectors`
+        are Arrays. What remains is a FIELD-SET gap: Redis 8.6.1's `flags` Set
+        carries 3 members (on, nopass, sanitize-payload); Moon's carries 2.
+        `sanitize-payload` is absent because Moon implements no RESTORE payload
+        sanitization at all, so advertising the flag would be a lie. Moon's
+        `selectors` is likewise always empty — ACL selectors are unimplemented.
+        Owner: acl-selectors-and-payload-sanitization.
+
+  - name: shapes_xinfo_groups
+    setup: ["DEL shp:st", "XADD shp:st 1-1 f v", "XGROUP CREATE shp:st shp:g 0"]
+    command: "XINFO GROUPS shp:st"
+    policy: type_only
+
+  - name: shapes_command_docs
+    command: "COMMAND DOCS GET"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        NARROWED by moon#631: the reply TYPE is now correct — both servers
+        answer a Map of command-name -> doc Map (RESP3) and the serializer
+        downgrades both levels to flat arrays on RESP2. What remains is a
+        FIELD-SET gap inside the per-command doc: Moon emits 2 fields
+        (summary, since), Redis 8.6.1 emits 5 (adds group, complexity,
+        arguments). Moon's registry stores no argument specification and no
+        complexity string, so the fields are omitted rather than invented —
+        the same content gap already waived on
+        identity_command_info_known_and_unknown.
+        Owner: sdk-wire-form-fixes.
 
   # ── Verbatim replies (moon#462) ───────────────────────────────────────
   # Redis answers these four through `addReplyVerbatim`: `=` on RESP3, `$` on

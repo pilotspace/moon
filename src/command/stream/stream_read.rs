@@ -432,6 +432,62 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 /// XINFO STREAM key | XINFO GROUPS key | XINFO CONSUMERS key group
+
+/// One `XINFO GROUPS` element, in redis 8.6.1's shape and field set.
+///
+/// A **Map**, not the flat array Moon used to build: `XINFO GROUPS` is an array
+/// OF maps under RESP3 (moon#631), and the serializer downgrades each Map to
+/// `[k, v, …]` for RESP2 clients, so one construction serves both protocols.
+///
+/// `entries-read` is Null. Redis tracks a per-group counter of entries the
+/// group has read since it was created; Moon does not, and Redis itself sends
+/// Null whenever it cannot determine the value, so Null is a value clients
+/// already handle — inventing a number here would be worse than admitting the
+/// gap.
+///
+/// `lag` IS computed, by counting the entries after the group's cursor.
+/// That is O(entries after `last_delivered_id`) rather than Redis's O(1)
+/// counter arithmetic; `XINFO GROUPS` is an introspection command and never on
+/// a hot path, and a real number beats a Null for the one field an operator
+/// actually reads this reply for.
+fn group_info_frame(
+    stream: &crate::storage::stream::Stream,
+    name: &Bytes,
+    group: &crate::storage::stream::ConsumerGroup,
+) -> Frame {
+    use std::ops::Bound;
+    let lag = stream
+        .entries
+        .range((Bound::Excluded(group.last_delivered_id), Bound::Unbounded))
+        .count() as i64;
+    Frame::Map(vec![
+        (
+            Frame::BulkString(Bytes::from_static(b"name")),
+            Frame::BulkString(name.clone()),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"consumers")),
+            Frame::Integer(group.consumers.len() as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"pending")),
+            Frame::Integer(group.pel.len() as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"last-delivered-id")),
+            Frame::BulkString(group.last_delivered_id.to_bytes()),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"entries-read")),
+            Frame::Null,
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"lag")),
+            Frame::Integer(lag),
+        ),
+    ])
+}
+
 pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("XINFO");
@@ -489,18 +545,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
         let groups: Vec<Frame> = stream
             .groups
             .iter()
-            .map(|(name, group)| {
-                Frame::Array(framevec![
-                    Frame::BulkString(Bytes::from_static(b"name")),
-                    Frame::BulkString(name.clone()),
-                    Frame::BulkString(Bytes::from_static(b"consumers")),
-                    Frame::Integer(group.consumers.len() as i64),
-                    Frame::BulkString(Bytes::from_static(b"pending")),
-                    Frame::Integer(group.pel.len() as i64),
-                    Frame::BulkString(Bytes::from_static(b"last-delivered-id")),
-                    Frame::BulkString(group.last_delivered_id.to_bytes()),
-                ])
-            })
+            .map(|(name, group)| group_info_frame(stream, name, group))
             .collect();
         Frame::Array(groups.into())
     } else if subcmd.eq_ignore_ascii_case(b"CONSUMERS") {
@@ -866,18 +911,7 @@ pub fn xinfo_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
         let groups: Vec<Frame> = stream
             .groups
             .iter()
-            .map(|(name, group)| {
-                Frame::Array(framevec![
-                    Frame::BulkString(Bytes::from_static(b"name")),
-                    Frame::BulkString(name.clone()),
-                    Frame::BulkString(Bytes::from_static(b"consumers")),
-                    Frame::Integer(group.consumers.len() as i64),
-                    Frame::BulkString(Bytes::from_static(b"pending")),
-                    Frame::Integer(group.pel.len() as i64),
-                    Frame::BulkString(Bytes::from_static(b"last-delivered-id")),
-                    Frame::BulkString(group.last_delivered_id.to_bytes()),
-                ])
-            })
+            .map(|(name, group)| group_info_frame(&stream, name, group))
             .collect();
         Frame::Array(groups.into())
     } else if subcmd.eq_ignore_ascii_case(b"CONSUMERS") {
