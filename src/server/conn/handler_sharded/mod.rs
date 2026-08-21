@@ -1673,7 +1673,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
-                    // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
+                    // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY ---
                     if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, shaped!()).await {
                         continue;
                     }

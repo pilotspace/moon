@@ -920,7 +920,15 @@ impl Database {
     /// across the passes: `&self` is held throughout and each shard's
     /// database is single-threaded, so neither plane can mutate between
     /// the count and the walk.
+    ///
+    /// The position comes from the thread RNG, NOT the clock. It used to be
+    /// `current_time_ms() % total`, which made every call inside the same
+    /// millisecond return the SAME key — a client polling RANDOMKEY in a loop
+    /// (the normal way to sample a keyspace) got one name repeated for as long
+    /// as the loop ran, and only ~1 distinct key per millisecond of wall time
+    /// however many times it asked (moon#629).
     pub fn random_key(&self) -> Option<Bytes> {
+        use rand::RngExt;
         let now_ms = self.cached_now_ms;
         let hot_live = self
             .data
@@ -932,7 +940,7 @@ impl Database {
         if total == 0 {
             return None;
         }
-        let idx = (current_time_ms() as usize) % total;
+        let idx = rand::rng().random_range(0..total);
         if idx < hot_live {
             self.data
                 .iter()

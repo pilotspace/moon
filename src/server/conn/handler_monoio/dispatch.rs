@@ -1599,7 +1599,8 @@ pub(super) async fn try_handle_functions(
     false
 }
 
-/// Handle cross-shard aggregation commands: KEYS, SCAN, DBSIZE, and multi-key commands.
+/// Handle cross-shard aggregation commands: KEYS, SCAN, DBSIZE, RANDOMKEY,
+/// HOTKEYS, and multi-key commands.
 /// Returns `true` if consumed.
 pub(super) async fn try_handle_cross_shard_commands(
     cmd: &[u8],
@@ -1663,6 +1664,23 @@ pub(super) async fn try_handle_cross_shard_commands(
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;
+        responses.push(response);
+        return true;
+    }
+    if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
+        let mut response = crate::shard::coordinator::coordinate_randomkey(
+            ctx.shard_id,
+            ctx.num_shards,
+            conn.selected_db,
+            &ctx.shard_databases,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
+            &(), // monoio: coordinator uses oneshot, not response_pool
+        )
+        .await;
+        if let Some(ws_id) = conn.workspace_id.as_ref() {
+            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+        }
         responses.push(response);
         return true;
     }

@@ -2267,7 +2267,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE + multi-key ---
+            // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY + multi-key ---
             if dispatch::try_handle_cross_shard_commands(
                 cmd,
                 cmd_args,

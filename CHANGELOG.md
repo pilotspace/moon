@@ -165,6 +165,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`RANDOMKEY` answered Null while `DBSIZE` reported keys, and never sampled more than one shard**
+  (#629). It was missing from the cross-shard coordinator, so it read the shard the connection
+  happened to sit on. With one key in the db that is deterministic — on `--shards 4`, three
+  connections in four never see it:
+
+  ```text
+  HELLO 3 · FLUSHALL · SET k v
+  DBSIZE     -> :1
+  EXISTS k   -> :1
+  KEYS *     -> *1 ["k"]
+  RANDOMKEY  -> _        <- 20 of 20 draws, one connection
+  ```
+
+  `KEYS`, `SCAN` and `DBSIZE` all scatter-gather, so they disagreed with `RANDOMKEY` at the same
+  instant and the whole thing read as data loss. Fresh `redis-cli` invocations HID it: each opens
+  its own connection and SO_REUSEPORT spreads those over the shards, so only a client that keeps
+  one connection — every real client — saw the run of empty replies.
+
+  `RANDOMKEY` now fans out, asking each shard for both its key count and one candidate of its own,
+  and draws a shard with probability proportional to its count. Weighting by count rather than
+  picking a shard uniformly is the difference between sampling the KEYSPACE and sampling the
+  SHARDS, and `{hash tag}` co-location makes unequal shards the normal case. Null is still the
+  answer when — and only when — no shard holds a key.
+
+- **`RANDOMKEY` returned the same key for every call inside the same millisecond** (#629). The
+  draw indexed with `current_time_ms() % total`, not a random number, so a client polling it in a
+  loop — the normal way to sample a keyspace — got roughly one distinct name per millisecond of
+  wall time however fast it asked. Measured on `--shards 1`, where no coordinator is involved, so
+  this is the clock defect alone:
+
+  ```text
+  64 keys, 300 draws on one connection      distinct keys
+  before                     (17 ms)        10 of 64
+  after                      (18 ms)        62 of 64
+  ```
+
+  It now draws from the thread RNG, like `HRANDFIELD`, `SRANDMEMBER` and `ZRANDMEMBER` already did.
+
+- **`scripts/test-consistency.sh` died 40% in and reported success.** `TOTAL` was incremented by
+  the null-type probes but never initialised, so `set -u` aborted the run at the first
+  `TOTAL=$((TOTAL + 1))` — and the `EXIT` trap's own last command then set the exit status, so the
+  script exited **0** while never reaching the #592 two-key sweep, script routing, `SWAPDB`, the
+  `FT.*` block, `RESET` or any restart loop. Every run since the moon#594 probes landed was
+  reporting on roughly the first half of the suite. Both halves are fixed, and the run now
+  completes: 390 checks at `--shards 4`, 388 at `--shards 1`.
+
+  Un-hiding the tail surfaced 8 pre-existing failures at `--shards 4` and 2 at `--shards 1`, all
+  present on the merge-base binary too (same-script A/B). They are tracked separately: the
+  `ROLE`/`master_repl_offset` divergence under #536, `COMMAND LIST` omitting container
+  subcommands, and the cross-shard `BLMOVE` and movablekeys-tracking cases under the #592 family.
+  None is introduced here.
+
 - **`INFO`, `CLIENT LIST`, `LOLWUT` and `MEMORY DOCTOR` sent a BulkString where RESP3 clients are
   told to expect a VerbatimString** (#462). Swept every reply type against redis-server 8.6.1 on the
   wire, at `--shards 1` and `--shards 4`, RESP2 and RESP3:

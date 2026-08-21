@@ -22,6 +22,15 @@ SKIP_BUILD=false
 RUST_BINARY="${MOON_BIN:-./target/release/moon}"
 PASS=0
 FAIL=0
+# `TOTAL` is incremented by the null-type / xread probes. It was never
+# initialised, and `set -u` turns the first `TOTAL=$((TOTAL + 1))` into a fatal
+# error -- so from the moon#594 probes landing until moon#629, every run of this
+# script DIED at that line and the entire tail (the #592 two-key sweep, script
+# routing, SWAPDB, FT.*, RESET, the restart loops) never executed. It exited 0
+# while doing it, because the EXIT trap's own last command set the status, which
+# is why nothing noticed. Both halves are fixed: initialise the counter, and
+# make `cleanup` re-exit with the status it was called with.
+TOTAL=0
 RUST_PID=""
 REDIS_PID=""
 
@@ -38,11 +47,15 @@ done
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 cleanup() {
+    local rc=$?
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
     pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
     [[ -n "${MOON_DATA_DIR:-}" ]] && rm -rf "$MOON_DATA_DIR"
+    # Without this the trap's own last command decides the script's exit
+    # status, so an abort mid-run reports success.
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -1206,6 +1219,47 @@ if [[ "$SHARDS" -gt 1 ]]; then
         echo "  WARN: moon#592 sweep found no cross-shard pair at shards=$SHARDS (nothing refused)"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# moon#629: RANDOMKEY must sample the keyspace, not repeat one name
+# ---------------------------------------------------------------------------
+#
+# moon-only: Redis has one keyspace and a real RNG, so there is nothing to
+# compare against. Two defects made RANDOMKEY return the same few names for as
+# long as a client asked: it was absent from the cross-shard coordinator (so it
+# saw only the serving shard's keys), and its index was `current_time_ms() %
+# total` (so every call inside one millisecond drew the same position).
+#
+# Every draw MUST share one connection -- `redis-cli` reading commands from
+# stdin does exactly that. A fresh `redis-cli` per draw is what hid this
+# originally: each opens its own connection, SO_REUSEPORT spreads those across
+# the shards, and the spread alone produces a healthy-looking mix of names
+# while every individual reply is still shard-local. Measured on this exact
+# probe, 60 draws over 40 keys on one connection:
+#
+#   shards=4   before 4 distinct    after 32
+#   shards=1   before 5 distinct    after 27
+#
+# 20 is the bound: one shard of four owns ~10 of the 40, and a fair draw
+# reaches ~31 (coupon collector), so neither hash imbalance nor an unlucky
+# sample can move the verdict.
+#
+# db 9 so the sweep neither sees nor disturbs the keys the rest of this script
+# is asserting on.
+redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
+for rk_i in $(seq 0 39); do
+    redis-cli -p "$PORT_RUST" -n 9 SET "rk:$rk_i" v &>/dev/null || true
+done
+rk_size=$(redis-cli -p "$PORT_RUST" -n 9 DBSIZE 2>&1 | grep -oE '[0-9]+') || true
+rk_distinct=$(for _ in $(seq 1 60); do echo RANDOMKEY; done \
+    | redis-cli -p "$PORT_RUST" -n 9 2>/dev/null | sort -u | grep -c 'rk:') || true
+assert_eq "moon#629 DBSIZE sees every seeded key (shards=$SHARDS)" "40" "$rk_size"
+if [[ "$rk_distinct" -ge 20 ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: moon#629 RANDOMKEY samples the keyspace (shards=$SHARDS, $rk_distinct distinct)"
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: moon#629 RANDOMKEY reached only $rk_distinct distinct keys in 60 draws (shards=$SHARDS)"
+fi
+redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
 
 route_probe lmpop      "RPUSH %K v1"                 "LMPOP 1 %K LEFT"
 route_probe zmpop      "ZADD %K 1 m"                 "ZMPOP 1 %K MIN"
