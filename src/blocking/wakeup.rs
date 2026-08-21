@@ -9,12 +9,11 @@ use crate::storage::Database;
 /// Does `cmd` PUSH onto a list, and so possibly satisfy a blocked
 /// `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` waiter?
 ///
-/// This decision is open-coded at eight dispatch sites (two connection
-/// handlers and six arms of the SPSC handler), which is why it is a function
-/// and not a literal at each one: a producer that one site wakes on and
-/// another does not is a routing-dependent hang — the waiter returns instantly
-/// or blocks to its timeout depending on which shard owns the key, which reads
-/// as a flake rather than as a bug. `RPOPLPUSH` is `LMOVE ... RIGHT LEFT` and
+/// Every dispatch site reaches this through [`wake_producer`], never by
+/// open-coding the test: a producer that one site wakes on and another does
+/// not is a routing-dependent hang — the waiter returns instantly or blocks to
+/// its timeout depending on which shard owns the key, which reads as a flake
+/// rather than as a bug. It was open-coded at eight sites until moon#623. `RPOPLPUSH` is `LMOVE ... RIGHT LEFT` and
 /// so must answer identically here (moon#520).
 #[inline]
 pub fn is_list_producer(cmd: &[u8]) -> bool {
@@ -483,6 +482,45 @@ pub fn wake_family(
         crate::blocking::WaitFamily::ZSet => try_wake_zset_waiter(registry, db, db_index, key),
         crate::blocking::WaitFamily::Stream => try_wake_stream_waiter(registry, db, db_index, key),
     }
+}
+
+/// The one producer→waiter hook: given a command that just executed
+/// successfully, wake whoever was blocked on the key it wrote.
+///
+/// Call this instead of open-coding the trio `is_producer`, then
+/// `producer_wake_key_index`, then a three-way family match. Every dispatch
+/// path used to carry its own copy — eight of them — and a path that reached
+/// none of them looked perfectly healthy in review and in CI. That is how
+/// `XADD` on a locally
+/// owned stream (moon#595) and every write inside `MULTI`/`EXEC` (moon#606)
+/// each shipped a lost wakeup. Keeping the mapping in one function means a
+/// future producer command is taught here once (moon#623).
+///
+/// The caller keeps its own success gate (`is_write && !error`, or just
+/// `!error`) — it differs per path and is not part of the mapping.
+///
+/// Borrows `registry` only after the command is known to be a producer with a
+/// key, so the common non-producer write pays no `RefCell` borrow.
+///
+/// Returns true if a blocked client was answered.
+pub fn wake_producer(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    db: &mut Database,
+    db_index: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) -> bool {
+    let Some(family) = producer_family(cmd) else {
+        return false;
+    };
+    let Some(key) = args
+        .get(producer_wake_key_index(cmd))
+        .and_then(crate::server::connection::extract_bytes)
+    else {
+        return false;
+    };
+    let mut reg = registry.borrow_mut();
+    wake_family(&mut reg, db, db_index, &key, family)
 }
 
 /// Called after `XADD` adds an entry to a stream key, and again right after a
@@ -1073,5 +1111,149 @@ mod cross_shard_wait_id_tests {
             ids_in(live.try_recv().expect("live reader was not woken")),
             vec!["7-1".to_string()],
         );
+    }
+}
+
+/// The mapping [`wake_producer`] owns: which commands wake, which argument
+/// names the key, which family's queue gets raised.
+///
+/// Until moon#623 this trio was open-coded at eight dispatch sites, so a site
+/// could disagree with its siblings and the disagreement showed up only as a
+/// routing-dependent hang. These pin the single copy.
+#[cfg(test)]
+mod wake_producer_tests {
+    use super::*;
+    use crate::blocking::WaitEntry;
+    use crate::storage::Database;
+    use std::cell::RefCell;
+
+    fn args(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    fn park_blpop(
+        reg: &mut BlockingRegistry,
+        key: &Bytes,
+    ) -> crate::runtime::channel::OneshotReceiver<Option<Frame>> {
+        let (tx, rx) = crate::runtime::channel::oneshot();
+        reg.register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id: 1,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx,
+                deadline: None,
+            },
+        );
+        rx
+    }
+
+    fn served(rx: &crate::runtime::channel::OneshotReceiver<Option<Frame>>) -> Option<Frame> {
+        rx.try_recv().ok().flatten()
+    }
+
+    #[test]
+    fn lpush_wakes_the_reader_blocked_on_the_key_it_pushed() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let key = Bytes::from_static(b"wp:list");
+        let rx = park_blpop(&mut reg.borrow_mut(), &key);
+
+        let argv = args(&["wp:list", "v"]);
+        assert_eq!(
+            crate::command::list::lpush(&mut db, &argv),
+            Frame::Integer(1)
+        );
+        assert!(
+            wake_producer(&reg, &mut db, 0, b"LPUSH", &argv),
+            "LPUSH must wake the BLPOP parked on its key"
+        );
+        assert!(served(&rx).is_some(), "the parked reader got no reply");
+    }
+
+    /// `LMOVE src dst ...` makes `dst` non-empty, so `dst` is the key that can
+    /// satisfy a waiter — not `args[0]` (moon#520). A site that reads the
+    /// source instead wakes nobody and leaves the real waiter parked.
+    #[test]
+    fn lmove_wakes_on_its_destination_not_its_source() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let src = Bytes::from_static(b"wp:src");
+        let dst = Bytes::from_static(b"wp:dst");
+
+        assert_eq!(
+            crate::command::list::lpush(&mut db, &args(&["wp:src", "v"])),
+            Frame::Integer(1)
+        );
+        let on_src = park_blpop(&mut reg.borrow_mut(), &src);
+        let on_dst = park_blpop(&mut reg.borrow_mut(), &dst);
+
+        let argv = args(&["wp:src", "wp:dst", "LEFT", "LEFT"]);
+        let moved = crate::command::list::lmove(&mut db, &argv);
+        assert!(matches!(moved, Frame::BulkString(_)), "LMOVE: {moved:?}");
+
+        assert!(
+            wake_producer(&reg, &mut db, 0, b"LMOVE", &argv),
+            "LMOVE must wake the waiter on its DESTINATION"
+        );
+        assert!(served(&on_dst).is_some(), "destination waiter left parked");
+        assert!(
+            served(&on_src).is_none(),
+            "the source key is now empty — its waiter must stay parked"
+        );
+    }
+
+    #[test]
+    fn a_non_producer_wakes_nobody_and_leaves_the_waiter_parked() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let key = Bytes::from_static(b"wp:list");
+        let rx = park_blpop(&mut reg.borrow_mut(), &key);
+
+        let argv = args(&["wp:list", "v"]);
+        assert!(
+            !wake_producer(&reg, &mut db, 0, b"GET", &argv),
+            "GET is not a producer"
+        );
+        assert!(served(&rx).is_none(), "a non-producer answered a waiter");
+    }
+
+    #[test]
+    fn xadd_wakes_a_stream_reader() {
+        use crate::blocking::StreamSince;
+        use crate::storage::stream::StreamId;
+
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let key = Bytes::from_static(b"wp:stream");
+        let (tx, rx) = crate::runtime::channel::oneshot();
+        reg.borrow_mut().register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id: 1,
+                cmd: BlockedCommand::XRead {
+                    streams: vec![(key.clone(), StreamSince::Id(StreamId { ms: 0, seq: 0 }))],
+                    count: None,
+                },
+                reply_tx: tx,
+                deadline: None,
+            },
+        );
+
+        let argv = args(&["wp:stream", "1-1", "f", "v"]);
+        assert!(matches!(
+            crate::command::stream::xadd(&mut db, &argv),
+            Frame::BulkString(_)
+        ));
+        assert!(
+            wake_producer(&reg, &mut db, 0, b"XADD", &argv),
+            "XADD must wake the XREAD parked on its key"
+        );
+        assert!(served(&rx).is_some(), "stream reader left parked");
     }
 }

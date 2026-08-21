@@ -2788,34 +2788,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // a key THIS shard owns was never woken by a local
                             // write — while the same XADD arriving over SPSC
                             // woke it. Routing-dependent, so it read as a flake.
-                            if crate::blocking::wakeup::is_producer(cmd) {
-                                // The wake key is the DESTINATION for
-                                // LMOVE/RPOPLPUSH and args[0] otherwise. This
-                                // site used to hardcode `first()`, so a client
-                                // blocked on an LMOVE destination was never
-                                // woken here even though the SPSC path woke it
-                                // — same command, opposite outcome depending on
-                                // which shard owned the key (moon#520).
-                                let idx = crate::blocking::wakeup::producer_wake_key_index(cmd);
-                                if let Some(key) = cmd_args.get(idx).and_then(|f| extract_bytes(f))
-                                {
-                                    let mut reg = ctx.blocking_registry.borrow_mut();
-                                    let wake_db = &mut s.databases[new_sel_db];
-                                    if crate::blocking::wakeup::is_list_producer(cmd) {
-                                        crate::blocking::wakeup::try_wake_list_waiter(
-                                            &mut reg, wake_db, new_sel_db, &key,
-                                        );
-                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(
-                                            &mut reg, wake_db, new_sel_db, &key,
-                                        );
-                                    } else {
-                                        crate::blocking::wakeup::try_wake_stream_waiter(
-                                            &mut reg, wake_db, new_sel_db, &key,
-                                        );
-                                    }
-                                }
-                            }
+                            crate::blocking::wakeup::wake_producer(
+                                &ctx.blocking_registry,
+                                &mut s.databases[new_sel_db],
+                                new_sel_db,
+                                cmd,
+                                cmd_args,
+                            );
                         }
 
                         Ok((result, new_sel_db, hset_inserts))
