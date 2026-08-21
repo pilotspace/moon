@@ -328,9 +328,15 @@ impl BlockingRegistry {
     /// Remove every waiter on `(db_index, key)` whose id is in `ids`, and hand
     /// the entries back in queue order.
     ///
-    /// `ids` MUST be sorted ascending — which is free for the caller, because
-    /// `wait_id`s are handed out monotonically and a queue is FIFO, so reading
-    /// one off in queue order already produces them sorted.
+    /// `ids` MUST be sorted ascending: each one is located with a binary
+    /// search, and an unsorted slice makes that search MISS ids that are
+    /// present, silently leaving those waiters queued (moon#620).
+    ///
+    /// Queue order will not do. A `wait_id` is `(shard_id << 48) | counter`,
+    /// minted by the registry of the shard the waiter's CONNECTION lives on,
+    /// while the queue belongs to the shard that owns the KEY — so ids reach
+    /// one queue from several counters and arrive in no particular order.
+    /// Sort a copy at the call site.
     ///
     /// The batching is not micro-optimisation. Removing one at a time meant a
     /// scan of the queue to find the entry, plus another inside `remove_wait`,

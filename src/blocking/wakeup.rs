@@ -492,9 +492,14 @@ pub fn try_wake_stream_waiter(
 ) -> bool {
     // Decide first, mutate second. One pass over the queue, with every waiter
     // still in place, so a decision of "cannot serve" costs nothing and leaves
-    // FIFO order untouched. `wait_id`s come out ascending because they are
-    // handed out monotonically and the queue is FIFO — which is exactly the
-    // precondition `take_waits` needs.
+    // FIFO order untouched.
+    //
+    // Queue order is NOT `wait_id` order (moon#620). An id is
+    // `(shard_id << 48) | counter`, minted by the registry of the shard the
+    // waiter's CONNECTION lives on, while the queue belongs to the shard that
+    // owns the KEY — so a reader on shard 3 that parks before a reader on
+    // shard 1 puts the larger id first. Everything downstream of here treats
+    // the two orders as independent.
     let mut decisions: smallvec::SmallVec<[(u64, Option<Frame>); 4]> = smallvec::SmallVec::new();
     {
         let Some(queue) = registry.waiters_on(db_index, key) else {
@@ -524,17 +529,25 @@ pub fn try_wake_stream_waiter(
         return false;
     }
 
-    let ids: smallvec::SmallVec<[u64; 4]> = decisions.iter().map(|(id, _)| *id).collect();
+    // `take_waits` looks each id up with a binary search, so it must be handed
+    // a SORTED slice — queue order will not do (see above). An unsorted slice
+    // makes the search miss ids that are present, which silently leaves those
+    // waiters parked until their own deadline: the lost wakeup moon#620 was
+    // filed for.
+    let mut ids: smallvec::SmallVec<[u64; 4]> = decisions.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+
     let mut woke = false;
-    // `take_waits` preserves queue order, and `decisions` is in queue order,
-    // so the two line up entry-for-entry.
-    for (entry, (wait_id, frame)) in registry
-        .take_waits(db_index, key, &ids)
-        .into_iter()
-        .zip(decisions)
-    {
-        debug_assert_eq!(entry.wait_id, wait_id);
-        let Some(frame) = frame else {
+    // Pair each returned entry with its decision BY `wait_id`, never by
+    // position: `take_waits` hands entries back in queue order while `ids` is
+    // sorted, and a positional pairing would hand one reader the entries
+    // computed for another's cursor.
+    for entry in registry.take_waits(db_index, key, &ids) {
+        let Some(slot) = decisions.iter_mut().find(|(id, _)| *id == entry.wait_id) else {
+            debug_assert!(false, "take_waits returned an entry we did not ask for");
+            continue;
+        };
+        let Some(frame) = slot.1.take() else {
             continue; // the disconnected client — removed, nothing to send
         };
         if entry.reply_tx.send(Some(frame)).is_ok() {
@@ -881,6 +894,147 @@ mod dead_waiter_tests {
             db.zset_pop_min(&key),
             Some((Bytes::from_static(b"m1"), 1.5)),
             "member must survive a dead waiter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cross_shard_wait_id_tests {
+    use super::*;
+    use crate::blocking::{StreamSince, WaitEntry};
+    use crate::storage::Database;
+    use crate::storage::stream::StreamId;
+
+    /// A `wait_id` as minted by the client's OWN shard: `shard_id << 48`.
+    fn id_from_shard(shard: u64) -> u64 {
+        shard << 48
+    }
+
+    fn xadd(db: &mut Database, key: &str, id: &str) {
+        let args: Vec<Frame> = [key, id, "f", "v"]
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect();
+        let reply = crate::command::stream::xadd(db, &args);
+        assert!(
+            matches!(reply, Frame::BulkString(_)),
+            "seed XADD {id} failed: {reply:?}"
+        );
+    }
+
+    /// Register a stream reader with an EXPLICIT wait_id, bypassing
+    /// `next_wait_id`. That is not a shortcut: the id a waiter carries is
+    /// minted by the registry of the shard its CONNECTION lives on, while the
+    /// queue it lands in belongs to the shard that owns the KEY.
+    fn park(
+        reg: &mut BlockingRegistry,
+        key: &Bytes,
+        wait_id: u64,
+        since: StreamId,
+    ) -> crate::runtime::channel::OneshotReceiver<Option<Frame>> {
+        let (tx, rx) = crate::runtime::channel::oneshot();
+        reg.register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id,
+                cmd: BlockedCommand::XRead {
+                    streams: vec![(key.clone(), StreamSince::Id(since))],
+                    count: None,
+                },
+                reply_tx: tx,
+                deadline: None,
+            },
+        );
+        rx
+    }
+
+    fn ids_in(reply: Option<Frame>) -> Vec<String> {
+        let Some(Frame::Array(streams)) = reply else {
+            panic!("expected a woken reply, got {reply:?}");
+        };
+        let Some(Frame::Array(pair)) = streams.first().cloned() else {
+            panic!("expected one stream pair");
+        };
+        let Some(Frame::Array(entries)) = pair.get(1).cloned() else {
+            panic!("expected an entries array");
+        };
+        entries
+            .iter()
+            .map(|e| match e {
+                Frame::Array(fields) => match fields.first() {
+                    Some(Frame::BulkString(id)) => String::from_utf8_lossy(id).into_owned(),
+                    other => panic!("expected an entry id, got {other:?}"),
+                },
+                other => panic!("expected an entry, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// moon#620: one `XADD` must wake BOTH parked readers, and each must get
+    /// the entries ITS OWN cursor asked for — even when the two readers'
+    /// `wait_id`s reach the owning shard's queue in descending order.
+    ///
+    /// `wait_id` is `(shard_id << 48) | counter`, minted by the registry of the
+    /// shard the CONNECTION is pinned to, while the waiter is queued on the
+    /// shard that owns the KEY. So a reader on shard 3 that parks before a
+    /// reader on shard 1 puts a LARGER id ahead of a smaller one — queue order
+    /// is not id order, and any code that assumes it is silently mispairs
+    /// replies or drops a wakeup entirely.
+    #[test]
+    fn descending_wait_ids_wake_both_readers_with_their_own_entries() {
+        let mut reg = BlockingRegistry::new(2);
+        let mut db = Database::new();
+        let key = Bytes::from_static(b"s");
+
+        xadd(&mut db, "s", "1-1");
+        xadd(&mut db, "s", "5-1");
+
+        // Reader on shard 3 parks first (bigger id), reader on shard 1 second.
+        // Distinct cursors, so a mispaired reply is visible in the CONTENT and
+        // not only in a debug assertion.
+        let early = park(&mut reg, &key, id_from_shard(3), StreamId { ms: 1, seq: 1 });
+        let late = park(&mut reg, &key, id_from_shard(1), StreamId { ms: 5, seq: 1 });
+
+        xadd(&mut db, "s", "7-1");
+        let woke = try_wake_stream_waiter(&mut reg, &mut db, 0, &key);
+
+        assert!(woke, "the XADD must wake the parked readers");
+        assert_eq!(
+            ids_in(early.try_recv().expect("shard-3 reader was not woken")),
+            vec!["5-1".to_string(), "7-1".to_string()],
+            "the reader bound at 1-1 must receive both later entries"
+        );
+        assert_eq!(
+            ids_in(late.try_recv().expect("shard-1 reader was not woken")),
+            vec!["7-1".to_string()],
+            "the reader bound at 5-1 must receive only the new entry"
+        );
+    }
+
+    /// The dead-waiter path (A2) crosses the same pairing. A departed reader
+    /// whose id sorts AFTER a live sibling's contributes a `None` decision; if
+    /// decisions were matched by position, that `None` would land on the live
+    /// reader and swallow its wakeup.
+    #[test]
+    fn a_dead_reader_with_a_higher_wait_id_does_not_swallow_a_live_siblings_wakeup() {
+        let mut reg = BlockingRegistry::new(2);
+        let mut db = Database::new();
+        let key = Bytes::from_static(b"s");
+
+        xadd(&mut db, "s", "1-1");
+
+        let dead = park(&mut reg, &key, id_from_shard(3), StreamId { ms: 1, seq: 1 });
+        drop(dead); // client vanished (RST / CLIENT KILL / timeout cleanup)
+        let live = park(&mut reg, &key, id_from_shard(1), StreamId { ms: 1, seq: 1 });
+
+        xadd(&mut db, "s", "7-1");
+        let woke = try_wake_stream_waiter(&mut reg, &mut db, 0, &key);
+
+        assert!(woke, "the live reader must still be served");
+        assert_eq!(
+            ids_in(live.try_recv().expect("live reader was not woken")),
+            vec!["7-1".to_string()],
         );
     }
 }
