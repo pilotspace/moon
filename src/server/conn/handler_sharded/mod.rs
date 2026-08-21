@@ -734,6 +734,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     };
 
+
+                    // Every intercept below answers through `shaped!()`, never through
+                    // `responses` directly: an intercept short-circuits the dispatch exit
+                    // where the RESP2->RESP3 shape policy is applied, so the sink applies it
+                    // on push instead of each intercept having to remember. See
+                    // `crate::server::conn::intercept` (moon#462).
+                    //
+                    // Read once per command rather than per push: `HELLO 3` changes it
+                    // mid-batch, and a reply must be shaped for the protocol the command
+                    // ARRIVED under, which is what the encoder's protocol-switch record
+                    // assumes too.
+                    let intercept_proto = conn.protocol_version;
+                    macro_rules! shaped {
+                        () => {
+                            &mut crate::server::conn::intercept::InterceptReplies::new(
+                                &mut responses,
+                                cmd,
+                                cmd_args,
+                                intercept_proto,
+                            )
+                        };
+                    }
                     // --- QUIT ---
                     if cmd.eq_ignore_ascii_case(b"QUIT") {
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
@@ -1387,58 +1409,58 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CONFIG ---
-                    if dispatch::try_handle_config(cmd, cmd_args, ctx, conn.protocol_version, &mut responses) {
+                    if dispatch::try_handle_config(cmd, cmd_args, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- SLOWLOG ---
-                    if dispatch::try_handle_slowlog(cmd, cmd_args, &mut responses) {
+                    if dispatch::try_handle_slowlog(cmd, cmd_args, shaped!()) {
                         continue;
                     }
 
                     // --- REPLICAOF / SLAVEOF ---
-                    if dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses) {
+                    if dispatch::try_handle_replicaof(cmd, cmd_args, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- REPLCONF ---
-                    if dispatch::try_handle_replconf(cmd, cmd_args, &mut responses) {
+                    if dispatch::try_handle_replconf(cmd, cmd_args, shaped!()) {
                         continue;
                     }
 
                     // --- PSYNC (unsupported on tokio; clear error, R3/2A) ---
-                    if dispatch::try_handle_psync_unsupported(cmd, &mut responses) {
+                    if dispatch::try_handle_psync_unsupported(cmd, shaped!()) {
                         continue;
                     }
 
                     // --- CDC.READ ---
-                    if dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
+                    if dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!()) {
                         continue;
                     }
 
                     // --- INFO ---
-                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses).await {
+                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await {
                         continue;
                     }
 
                     // --- WAIT (R1): blocks on replica ACKs; must run at the
                     // connection layer (generic dispatch is synchronous) ---
-                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, &mut responses).await {
+                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await {
                         continue;
                     }
 
                     // --- READONLY enforcement ---
-                    if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, &mut responses) {
+                    if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- MA12: Disk full enforcement ---
-                    if dispatch::try_enforce_disk_full(cmd, &mut responses) {
+                    if dispatch::try_enforce_disk_full(cmd, shaped!()) {
                         continue;
                     }
 
                     // --- CLIENT subcommands ---
-                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, &mut conn, ctx, &mut responses) {
+                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, &mut conn, ctx, shaped!()) {
                         continue;
                     }
 
@@ -1633,26 +1655,26 @@ pub(crate) async fn handle_connection_sharded_inner<
 
 
                     // --- BGSAVE / SAVE / LASTSAVE / BGREWRITEAOF ---
-                    if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
+                    if dispatch::try_handle_persistence(cmd, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- SHUTDOWN [NOSAVE|SAVE] ---
-                    match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, &mut responses).await {
+                    match dispatch::try_handle_shutdown(cmd, cmd_args, ctx, &shutdown, shaped!()).await {
                         dispatch::ShutdownOutcome::NotShutdown => {}
                         dispatch::ShutdownOutcome::Rejected => { continue; }
                         dispatch::ShutdownOutcome::Exiting => { should_quit = true; break; }
                     }
 
                     // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-                    if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, &mut responses)
+                    if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!())
                         .await
                     {
                         continue;
                     }
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
-                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, &mut responses).await {
+                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, shaped!()).await {
                         continue;
                     }
 

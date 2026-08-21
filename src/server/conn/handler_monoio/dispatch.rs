@@ -43,6 +43,10 @@ pub(super) fn check_auth_gate(
     ctx: &ConnectionContext,
     peer_addr: &str,
     client_id: u64,
+    // NOT an `InterceptReplies`: this gate runs BEFORE the command name is
+    // extracted, so there is nothing to classify a shape from. It answers only
+    // `AUTH` and `HELLO`, neither of which carries a shape — see
+    // `conn::intercept`.
     responses: &mut Vec<Frame>,
     auth_delay_ms: &mut u64,
     codec: &mut crate::server::codec::RespCodec,
@@ -148,7 +152,7 @@ pub(super) fn try_handle_cluster(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLUSTER") {
         return false;
@@ -209,7 +213,7 @@ pub(super) async fn try_handle_evalsha(
     cmd_args: &[Frame],
     conn: &ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"EVALSHA") {
         return false;
@@ -259,7 +263,7 @@ pub(super) async fn try_handle_eval(
     conn: &ConnectionState,
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"EVAL") {
         return false;
@@ -312,7 +316,7 @@ pub(super) async fn try_handle_script(
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
         return false;
@@ -335,7 +339,7 @@ pub(super) fn try_handle_cluster_routing(
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !crate::cluster::cluster_enabled() {
         return false;
@@ -406,7 +410,7 @@ pub(super) fn try_handle_auth(
     ctx: &ConnectionContext,
     peer_addr: &str,
     auth_delay_ms: &mut u64,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"AUTH") {
         return false;
@@ -434,7 +438,7 @@ pub(super) fn try_handle_hello(
     client_id: u64,
     peer_addr: &str,
     auth_delay_ms: &mut u64,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     codec: &mut crate::server::codec::RespCodec,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"HELLO") {
@@ -489,7 +493,7 @@ pub(super) fn try_handle_acl(
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     peer_addr: &str,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"ACL") {
         return false;
@@ -513,20 +517,16 @@ pub(super) fn try_handle_config(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    proto: u8,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CONFIG") {
         return false;
     }
-    // This intercept short-circuits the generic dispatch exit, so it must
-    // apply the RESP3 conversion itself — otherwise `CONFIG GET` reaches the
-    // wire as a flat Array where Redis sends a Map. That omission is exactly
-    // why CONFIG was the one command the old converter could never fix.
-    let reply = handle_config(cmd_args, &ctx.runtime_config, &ctx.config);
-    responses.push(crate::server::conn::util::apply_resp3_conversion(
-        cmd, cmd_args, reply, proto,
-    ));
+    // `CONFIG GET` reaches the wire as a Map, not the flat Array it is built
+    // as — applied by `responses`, which is an `InterceptReplies`. The
+    // hand-written conversion that used to sit here is what every future
+    // intercept would have had to copy (moon#462).
+    responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
     true
 }
 
@@ -536,7 +536,7 @@ pub(super) fn try_handle_replicaof(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"REPLICAOF") && !cmd.eq_ignore_ascii_case(b"SLAVEOF") {
         return false;
@@ -611,7 +611,7 @@ pub(super) fn try_handle_replconf(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"REPLCONF") {
         return false;
@@ -633,7 +633,7 @@ pub(super) fn try_handle_replconf(
 pub(super) fn try_handle_cdc_read(
     cmd: &[u8],
     cmd_args: &[Frame],
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CDC.READ") {
         return false;
@@ -654,7 +654,7 @@ pub(super) fn try_handle_psync(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> Option<(String, i64)> {
     if !cmd.eq_ignore_ascii_case(b"PSYNC") {
         return None;
@@ -744,7 +744,7 @@ pub(super) async fn try_handle_info(
     cmd_args: &[Frame],
     conn: &ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"INFO") {
         return false;
@@ -780,6 +780,10 @@ pub(super) async fn try_handle_info(
     let resp_frame = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
         conn_cmd::info_with_facts(db, cmd_args, &keyspace, real_repl.as_deref(), &pubsub_facts)
     });
+    // Leaves as a VerbatimString on RESP3 — Redis answers `INFO` through
+    // `addReplyVerbatim` in every section form. Applied by `responses`; this
+    // intercept carried no conversion at all until moon#462, which is the bug
+    // the sink exists to make unwritable.
     responses.push(resp_frame);
     true
 }
@@ -792,7 +796,7 @@ pub(super) async fn try_handle_wait(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"WAIT") {
         return false;
@@ -848,7 +852,7 @@ pub(super) fn try_enforce_readonly(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     let Some(ref mirror) = ctx.is_replica_mirror else {
         return false;
@@ -910,7 +914,10 @@ pub(super) fn try_enforce_readonly(
 /// Hot path: three `Atomic::load(Relaxed)` — no allocation, no lock.
 /// Read-only commands pass through unaffected. Background compaction is exempt.
 #[inline]
-pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
+pub(super) fn try_enforce_disk_full(
+    cmd: &[u8],
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
+) -> bool {
     if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
         // dir-lost first: it also sets `is_write_paused`, and "diskfull"
         // would send the operator hunting free space instead of the missing
@@ -944,7 +951,7 @@ pub(super) fn try_handle_client_early(
     cmd_args: &[Frame],
     client_id: u64,
     conn: &mut ConnectionState,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {
         return false;
@@ -1001,7 +1008,7 @@ pub(super) fn try_handle_client_tracking(
     client_id: u64,
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {
         return false;
@@ -1063,7 +1070,7 @@ pub(super) fn try_handle_client_admin(
     cmd_args: &[Frame],
     client_id: u64,
     conn: &ConnectionState,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {
         return false;
@@ -1113,13 +1120,12 @@ pub(super) fn try_handle_client_admin(
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
-                // RESP3 sends CLIENT INFO as a Verbatim string. This intercept
-                // never reaches the generic dispatch exit, so it converts here.
-                responses.push(crate::protocol::resp3::apply_shape(
-                    crate::protocol::resp3::Resp3Shape::Verbatim,
-                    Frame::BulkString(Bytes::from(info)),
-                    conn.protocol_version,
-                ));
+                // No conversion call here any more: `responses` is an
+                // `InterceptReplies`, which applies the RESP3 policy on push.
+                // The hand-written `Resp3Shape::Verbatim` this replaces was the
+                // patch that fixed CLIENT INFO and left CLIENT LIST — one line
+                // away, same function — wrong (moon#462).
+                responses.push(Frame::BulkString(Bytes::from(info)));
                 return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"KILL") {
@@ -1219,7 +1225,7 @@ pub(super) fn try_handle_client_admin(
 pub(super) fn try_handle_persistence(
     cmd: &[u8],
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if cmd.eq_ignore_ascii_case(b"BGSAVE") {
         responses.push(crate::command::persistence::bgsave_start_sharded(
@@ -1272,7 +1278,7 @@ pub(super) async fn try_handle_shutdown(
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
     shutdown: &CancellationToken,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> ShutdownOutcome {
     if !cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
         return ShutdownOutcome::NotShutdown;
@@ -1339,7 +1345,7 @@ pub(super) async fn try_handle_swapdb(
     cmd_args: &[Frame],
     conn: &mut crate::server::conn::core::ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"SWAPDB") {
         return false;
@@ -1437,7 +1443,7 @@ pub(super) fn try_enforce_acl(
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     peer_addr: &str,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if conn.acl_skip_allowed() {
         return false;
@@ -1496,7 +1502,7 @@ pub(super) async fn try_handle_functions(
     ctx: &ConnectionContext,
     func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
     shutdown: &crate::runtime::cancel::CancellationToken,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if conn.in_multi {
         return false;
@@ -1600,7 +1606,7 @@ pub(super) async fn try_handle_cross_shard_commands(
     cmd_args: &[Frame],
     conn: &ConnectionState,
     ctx: &ConnectionContext,
-    responses: &mut Vec<Frame>,
+    responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // v3-5 group commit: response indexes of local-leg writes pending the
     // batch-end fsync_barrier(ctx.shard_id) (appendfsync=always only).
     local_leg_write_idxs: &mut Vec<usize>,
@@ -1759,6 +1765,11 @@ pub(super) async fn try_handle_blocking<
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
+    // NOT an `InterceptReplies`: this intercept flushes the batch, then
+    // encodes its own reply straight into `write_buf` and CLEARS the vector,
+    // because the reply arrives long after the batch was written. It applies
+    // the RESP3 policy itself, below — see `conn::intercept` for the two paths
+    // that are allowed to.
     responses: &mut Vec<Frame>,
     local_leg_write_idxs: &mut Vec<usize>,
     codec: &mut crate::server::codec::RespCodec,
