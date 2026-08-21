@@ -1953,6 +1953,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shifting every later result index for the client. Caught by the client-compat harness.
 
 ### Changed
+
+- **Cross-shard dispatch no longer clones the command name for every command** (#460). `RemoteMeta`
+  carried a `Bytes` holding the command name on both handlers. The cross-shard reply loop needed it
+  before RESP3 type fidelity landed, to choose the conversion; since then the shape is classified at
+  ENQUEUE into a 1-byte `Copy` tag (`Resp3Shape`) and the reply loop reads only the tag. The field
+  survived as `_cmd_name`, still paying `extract_bytes(&args[0]).unwrap_or_default()` — an atomic
+  refcount increment, and a later decrement — once per cross-shard command on the shard hot path.
+
+  Removed from both `handler_monoio` and `handler_sharded`, along with the corresponding slot in the
+  per-batch metadata tuple, which shrinks by `size_of::<Bytes>()` = **32 bytes** per command
+  (measured in-crate; the issue estimated 16).
+
+  **No throughput claim is made here.** Per-command refcount traffic on the cross-shard path is a
+  structural improvement visible in the diff; a benchmark able to resolve it from noise would have to
+  come from the Linux VM per CLAUDE.md, and was not run. The change's real justification is that the
+  value was dead.
+
 - **`compaction.rs` and `metrics_setup.rs` split into directory modules** (#479). Both files were
   over the 1500-line ceiling `CLAUDE.md` sets (2408 and 2038 lines); each is now a directory module
   whose largest file is 800 lines. `src/vector/segment/compaction/` splits along the pipeline's real
