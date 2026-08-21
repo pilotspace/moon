@@ -554,6 +554,9 @@ pub fn evict_to_budget(
     };
 
     let mut current_total = run.total_memory.unwrap_or_else(|| db.estimated_memory());
+    // moon#600: consecutive iterations that claimed progress but changed
+    // NOTHING observable. See `EVICTION_STALL_LIMIT`.
+    let mut stalled = 0usize;
     while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
@@ -572,7 +575,13 @@ pub fn evict_to_budget(
         if pending > 0 && current_total.saturating_sub(pending) <= budget {
             return Ok(());
         }
-        let before = db.estimated_memory();
+        // moon#600: the liveness probe. `progressed` is a claim by the sink;
+        // this triple is the OBSERVATION. Three O(1) field reads, no
+        // allocation, no lock — see `EVICTION_STALL_LIMIT` for why all three
+        // are needed. `memory` is the same figure the byte accounting below
+        // uses, so this replaces that read rather than adding one.
+        let before_probe = EvictionProgress::probe(db);
+        let before = before_probe.memory;
         let deficit = current_total.saturating_sub(budget);
         let progressed = match &mut sink {
             EvictionSink::Plain | EvictionSink::SyncSpill(None) => {
@@ -641,11 +650,109 @@ pub fn evict_to_budget(
         if !progressed {
             return Err(oom_error());
         }
-        let after = db.estimated_memory();
+        // moon#600: a sink may return `true` having done nothing at all (the
+        // original spin: a victim `db.remove` could not find). Terminate on
+        // the observation, never on the claim.
+        let after_probe = EvictionProgress::probe(db);
+        if EvictionProgress::note_iteration(before_probe, after_probe, &mut stalled) {
+            warn!(
+                policy = %config.maxmemory_policy,
+                budget,
+                current_total,
+                stalled,
+                "eviction made no observable progress for \
+                 EVICTION_STALL_LIMIT consecutive victims; answering OOM \
+                 rather than spinning the shard thread"
+            );
+            return Err(oom_error());
+        }
+        let after = after_probe.memory;
         current_total = current_total.saturating_sub(before.saturating_sub(after));
     }
 
     Ok(())
+}
+
+/// Consecutive eviction iterations allowed to claim progress while changing
+/// nothing observable, before [`evict_to_budget`] gives up with `OOM`
+/// (moon#600).
+///
+/// ## Why a backstop exists at all
+///
+/// `evict_to_budget`'s loop condition is `current_total > budget`, and
+/// `current_total` only moves when `estimated_memory()` moves. A sink that
+/// returns `true` without touching the database therefore loops forever —
+/// the shard thread spins, the instance stays over budget, and no client
+/// ever sees an error. That is strictly worse than an `OOM` reply: an `OOM`
+/// is a bounded, visible, retryable failure; a spin is an outage.
+///
+/// moon#600's index-only victim was one way to reach it. This bound is
+/// deliberately sampler-agnostic so the NEXT one cannot hang a shard either.
+///
+/// ## Why the probe is a triple and not just bytes
+///
+/// A "did memory drop?" test alone would misfire on a legitimately slow
+/// reclaim. Two real paths free ~0 bytes per victim yet are making progress:
+///
+/// * async spill (moon#466) moves a value from the hot plane to the pending
+///   plane — `estimated_memory()` counts both, so bytes are flat while
+///   `pending_spill_bytes()` rises and the hot key count falls;
+/// * an eviction of a tiny value can be dwarfed by rounding in the estimate,
+///   but the hot key count still falls.
+///
+/// Progress is therefore "any of the three moved". Only an iteration that
+/// moved NONE of them counts as stalled, and the counter resets on the first
+/// real one, so a slow-but-working reclaim can never be converted into a
+/// rejection. 16 consecutive no-ops is far outside anything a working sink
+/// produces.
+const EVICTION_STALL_LIMIT: usize = 16;
+
+/// Observable state of an eviction run, sampled between victims (moon#600).
+///
+/// Deliberately NOT a measure of "enough progress" — only of "any progress".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EvictionProgress {
+    /// Accounted bytes, including bytes already handed to the spill thread.
+    memory: usize,
+    /// Bytes queued for spill: rises when the async sink accepts a victim.
+    pending_spill: usize,
+    /// Hot keys: falls whenever a key leaves the hot plane, however tiny.
+    hot_keys: usize,
+}
+
+impl EvictionProgress {
+    /// Fold one iteration's observation into the consecutive-stall counter,
+    /// answering "must this run give up?" (moon#600).
+    ///
+    /// Split out of `evict_to_budget` so the backstop is reachable from a
+    /// test WITHOUT a stalling sink. It is defence in depth for a sampler
+    /// that does not exist yet — no sampler can reach it today, which is
+    /// exactly why it would otherwise rot unnoticed and fail to catch the
+    /// next index-only victim.
+    ///
+    /// Pins all three properties the constant's doc comment claims: it fires
+    /// only on the `EVICTION_STALL_LIMIT`-th CONSECUTIVE no-op, ANY of the
+    /// three fields moving counts as progress, and progress resets the count
+    /// so a slow-but-working reclaim can never accumulate into a rejection.
+    #[inline]
+    fn note_iteration(before: Self, after: Self, stalled: &mut usize) -> bool {
+        if after == before {
+            *stalled += 1;
+            *stalled >= EVICTION_STALL_LIMIT
+        } else {
+            *stalled = 0;
+            false
+        }
+    }
+
+    #[inline]
+    fn probe(db: &Database) -> Self {
+        Self {
+            memory: db.estimated_memory(),
+            pending_spill: db.pending_spill_bytes(),
+            hot_keys: db.data().len(),
+        }
+    }
 }
 
 /// Compute a shard's elastic memory budget from a snapshot of every shard's
@@ -763,8 +870,15 @@ const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
 /// implementation of the policy dispatch — previously copy-pasted in
 /// `evict_batch_durable`, `evict_one_async_spill`, and
 /// `evict_one_with_spill`).
+///
+/// **Postcondition (moon#600): a returned key is present in the hot plane.**
+/// Every caller's only way to make progress is `db.remove`, so a victim that
+/// is not in `data` is not a victim — it is an infinite loop. The sampling
+/// pickers satisfy this by construction (`sample_random_keys` iterates
+/// occupied DashTable slots); `volatile-ttl` reads a maintained index and
+/// must therefore verify, which is why this takes `&mut Database`.
 fn select_victim(
-    db: &Database,
+    db: &mut Database,
     config: &RuntimeConfig,
     policy: &EvictionPolicy,
 ) -> Option<CompactKey> {
@@ -1318,12 +1432,69 @@ fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> 
     sample_random_keys(db, 1, volatile_only).into_iter().next()
 }
 
+/// Bounded number of provably-stale expiry pairs [`find_victim_volatile_ttl`]
+/// will reap in ONE call before giving up on this tick (moon#600).
+///
+/// This is a LATENCY bound, not a correctness one. Termination is already
+/// guaranteed without it — every non-returning iteration removes the pair it
+/// just peeked, so the loop is bounded by `expiry_index_len()` — but this
+/// path runs on the shard event loop inside the 100 ms sweep, and a large
+/// leaked backlog must not be walked in a single tick. Reaping is permanent,
+/// so successive calls converge: 64 pairs retired per call, never re-seen.
+const VOLATILE_TTL_STALE_REAP_LIMIT: usize = 64;
+
 /// Find the victim with the globally nearest expiry — exact, via the
 /// deadline-ordered expiry index (#541), O(log n). Replaces the old
 /// random-sampling approximation (#551), which could miss the soonest
 /// key entirely when it was buried among many far-future volatiles.
-fn find_victim_volatile_ttl(db: &Database) -> Option<CompactKey> {
-    db.peek_nearest_expiry().map(|(_, key)| key)
+///
+/// ## Why this verifies (moon#600)
+///
+/// This is the only sampler that reads a *maintained index* rather than
+/// `data` itself, so it is the only one that can name a key the caller
+/// cannot remove. `evict_to_budget`'s sole progress mechanism is
+/// `db.remove`; handing it a pair whose hot entry is gone means
+/// `before == after` forever and the shard thread spins — an unreachable
+/// instance rather than an `OOM` reply.
+///
+/// The staleness predicate is byte-for-byte the one `expire_cycle` already
+/// uses (`src/server/expiration.rs`): a pair is PROVABLY stale when the
+/// entry is gone **or** carries a different deadline than the pair claims.
+/// Anything else is left alone — in particular a pair that merely looks
+/// "not due yet" is valid and must survive, which is why no clock is read
+/// here at all. Reaping (rather than skipping) matches
+/// [`Database::drop_expiry_index_pair`]'s stated contract: without it the
+/// next peek walks the same head again.
+///
+/// Reaping is a repair, never an eviction: the key it names is already
+/// absent from the keyspace, so `DBSIZE` cannot move and neither
+/// `evicted_keys` nor `spilled_keys` is touched (moon#585/#599 accounting
+/// is unaffected by construction — this function records nothing).
+fn find_victim_volatile_ttl(db: &mut Database) -> Option<CompactKey> {
+    let mut reaped = 0usize;
+    while reaped < VOLATILE_TTL_STALE_REAP_LIMIT {
+        let (ts, key) = db.peek_nearest_expiry()?;
+        if db
+            .data()
+            .get(key.as_bytes())
+            .is_some_and(|e| e.expires_at_ms() == ts)
+        {
+            return Some(key);
+        }
+        // Provably stale. `drop_expiry_index_pair` removes exactly the pair
+        // just peeked, so `expiry_index_len()` strictly decreases: this loop
+        // cannot repeat a pair and cannot run longer than the index is long.
+        db.drop_expiry_index_pair(ts, &key);
+        reaped += 1;
+    }
+    warn!(
+        reaped = VOLATILE_TTL_STALE_REAP_LIMIT,
+        remaining = db.expiry_index_len(),
+        "volatile-ttl: expiry index disagrees with the keyspace; retired the \
+         per-tick cap of stale pairs and yielded no victim this tick (a TTL \
+         writer is leaking index pairs — see debug_expiry_index_consistent)"
+    );
+    None
 }
 
 #[cfg(test)]
@@ -3024,6 +3195,341 @@ mod tests {
         assert!(
             result.is_err(),
             "override must clamp to maxmemory (1 byte) and OOM under noeviction"
+        );
+    }
+
+    // ── moon#600: the stall backstop, independent of any sampler ──────────
+    //
+    // The PR that added this made TWO claims: the sampler is now correct, and
+    // the loop terminates REGARDLESS of the sampler. Reverting the sampler
+    // proves the first (four tests below go red). Nothing proved the second:
+    // with the backstop disabled and the sampler intact, the whole eviction
+    // suite still passed, because no sampler can reach the backstop today.
+    // That is precisely why it needs its own test — a defence for a bug that
+    // does not exist yet is worthless if it rots unnoticed before that bug
+    // arrives.
+
+    /// A probe with all three fields distinct from `base`'s, so each field
+    /// can be moved one at a time.
+    fn probe_at(memory: usize, pending_spill: usize, hot_keys: usize) -> EvictionProgress {
+        EvictionProgress {
+            memory,
+            pending_spill,
+            hot_keys,
+        }
+    }
+
+    /// Fires on the LIMIT-th consecutive no-op, and not one iteration sooner.
+    /// An off-by-one either way is a real defect: too eager converts a slow
+    /// reclaim into a spurious `OOM`, too lax leaves the shard spinning
+    /// longer than the constant promises.
+    #[test]
+    fn eviction_stall_backstop_fires_exactly_on_the_limit() {
+        let p = probe_at(100, 0, 10);
+        let mut stalled = 0usize;
+        for i in 1..EVICTION_STALL_LIMIT {
+            assert!(
+                !EvictionProgress::note_iteration(p, p, &mut stalled),
+                "no-op #{i} must not trip the backstop before                  EVICTION_STALL_LIMIT ({EVICTION_STALL_LIMIT})"
+            );
+        }
+        assert!(
+            EvictionProgress::note_iteration(p, p, &mut stalled),
+            "the {EVICTION_STALL_LIMIT}th consecutive no-op must answer OOM              rather than spin the shard thread"
+        );
+    }
+
+    /// ANY of the three fields moving is progress. A bytes-only test would
+    /// call async spill (moon#466) stalled — it moves a value from the hot
+    /// plane to the pending plane and leaves `estimated_memory` flat — and
+    /// convert a working reclaim into a rejection.
+    #[test]
+    fn eviction_stall_backstop_counts_each_field_as_progress() {
+        let base = probe_at(100, 50, 10);
+        for (label, moved) in [
+            ("memory", probe_at(99, 50, 10)),
+            ("pending_spill", probe_at(100, 51, 10)),
+            ("hot_keys", probe_at(100, 50, 9)),
+        ] {
+            let mut stalled = EVICTION_STALL_LIMIT - 1;
+            assert!(
+                !EvictionProgress::note_iteration(base, moved, &mut stalled),
+                "{label} moving is progress; the backstop must not fire"
+            );
+            assert_eq!(
+                stalled, 0,
+                "{label} moving must RESET the counter, not merely spare this                  iteration — otherwise slow reclaim accumulates into a false OOM"
+            );
+        }
+    }
+
+    /// The counter is CONSECUTIVE. A reclaim that frees nothing on most
+    /// iterations but genuinely progresses now and then must never be
+    /// rejected, however long it runs.
+    #[test]
+    fn eviction_stall_backstop_never_fires_on_intermittent_progress() {
+        let rounds = EVICTION_STALL_LIMIT * 4;
+        let mut stalled = 0usize;
+        // One real victim per round, so the starting count must outlast them.
+        let mut hot = rounds + 1;
+        for round in 0..rounds {
+            // LIMIT-1 no-ops, then one real victim, forever.
+            for _ in 0..(EVICTION_STALL_LIMIT - 1) {
+                let p = probe_at(100, 0, hot);
+                assert!(
+                    !EvictionProgress::note_iteration(p, p, &mut stalled),
+                    "round {round}: intermittent progress must never OOM"
+                );
+            }
+            let before = probe_at(100, 0, hot);
+            hot -= 1;
+            let after = probe_at(100, 0, hot);
+            assert!(!EvictionProgress::note_iteration(
+                before,
+                after,
+                &mut stalled
+            ));
+            assert_eq!(stalled, 0, "round {round}: real progress must reset");
+        }
+    }
+
+    // ── moon#600: index-only volatile-ttl victims ─────────────────────────
+
+    /// Build the "index-only victim" state: an `expiry_index` pair whose hot
+    /// entry is absent from `data`. `volatile-ttl` is the only sampler that
+    /// reads a maintained index instead of `data` itself, so it is the only
+    /// one that can hand `evict_to_budget` a key it cannot remove.
+    ///
+    /// The ghost pair is given the SMALLEST possible deadline (`1`) so it is
+    /// the index head — exactly what `peek_nearest_expiry` returns — and
+    /// therefore the victim `select_victim` keeps re-picking.
+    fn db_with_index_only_victim(live_keys: usize) -> Database {
+        let mut db = Database::new();
+        let far_ms = current_time_ms() + 3_600_000;
+        for i in 0..live_keys {
+            db.set(
+                Bytes::from(format!("live_{i:03}")),
+                Entry::new_string_with_expiry(
+                    Bytes::from_static(b"a_reasonably_sized_value_payload"),
+                    far_ms + i as u64,
+                ),
+            );
+        }
+        // The ghost: indexed, never present in `data`.
+        db.expiry_index_insert(1, b"ghost");
+        assert!(
+            db.data().get(&b"ghost"[..]).is_none(),
+            "ghost must exist ONLY in the expiry index"
+        );
+        db
+    }
+
+    /// moon#600 (sampler): the volatile-ttl sampler must not return a key
+    /// that is not in the hot plane. A pair whose entry is gone is provably
+    /// stale — the same predicate `expire_cycle` uses — so it is reaped and
+    /// the walk continues to a real victim.
+    #[test]
+    fn volatile_ttl_sampler_reaps_index_only_pair() {
+        let mut db = db_with_index_only_victim(4);
+        let victim =
+            find_victim_volatile_ttl(&mut db).expect("a live volatile key exists behind the ghost");
+        assert_ne!(
+            victim.as_bytes(),
+            b"ghost",
+            "sampler must never return a key absent from the hot plane"
+        );
+        assert!(
+            db.data().get(victim.as_bytes()).is_some(),
+            "the returned victim must be removable"
+        );
+        assert_eq!(
+            db.expiry_index_len(),
+            4,
+            "the stale pair must be REAPED, not merely skipped, or every \
+             later peek pays for it again"
+        );
+        assert!(
+            db.debug_expiry_index_consistent(),
+            "reaping must move the index toward consistency"
+        );
+    }
+
+    /// moon#600 (sampler, degenerate): a database whose expiry index holds
+    /// NOTHING but ghosts must answer `None` — not a phantom victim — and
+    /// must leave the index empty rather than re-walking the same pairs.
+    #[test]
+    fn volatile_ttl_sampler_all_ghosts_yields_none() {
+        let mut db = Database::new();
+        for i in 0..8u64 {
+            db.expiry_index_insert(i + 1, format!("ghost_{i}").as_bytes());
+        }
+        assert!(
+            find_victim_volatile_ttl(&mut db).is_none(),
+            "no hot volatile key exists: the sampler must give up, not \
+             invent a victim"
+        );
+        assert_eq!(db.expiry_index_len(), 0, "every ghost reaped exactly once");
+    }
+
+    /// moon#600 (liveness, the defect): `evict_to_budget` under
+    /// `volatile-ttl` must TERMINATE when the index head is a ghost.
+    ///
+    /// Before the fix this loop never exits: `evict_one_with_spill` returns
+    /// `true` (progress claimed) while `db.remove` removed nothing, so
+    /// `before == after`, `current_total` is unchanged, and the next
+    /// iteration peeks the very same head pair. The watchdog turns that
+    /// spin into a FAILURE instead of a hung test binary.
+    #[test]
+    fn evict_to_budget_volatile_ttl_index_only_victim_terminates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut db = db_with_index_only_victim(8);
+            let config = make_config(1, "volatile-ttl");
+            let mut dropped: Vec<Vec<u8>> = Vec::new();
+            let mut sink = |k: &[u8]| dropped.push(k.to_vec());
+            let result = evict_to_budget(&mut db, &config, EvictionRun::plain().report(&mut sink));
+            let _ = tx.send((
+                result.is_ok(),
+                db.len(),
+                db.expiry_index_len(),
+                dropped.len(),
+            ));
+        });
+        let (ok, len, index_len, reported) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("evict_to_budget must terminate: an index-only victim spun the shard thread");
+        assert!(
+            ok,
+            "8 live volatile keys are evictable: must not answer OOM"
+        );
+        assert_eq!(len, 0, "budget of 1 byte: every live key must go");
+        assert_eq!(index_len, 0, "ghost reaped, live pairs unindexed by remove");
+        assert_eq!(
+            reported, 8,
+            "only the 8 REAL removals are reported downstream"
+        );
+    }
+
+    /// moon#600 (backstop, non-vacuity): the loop's stall probe must watch
+    /// all THREE signals, not just bytes.
+    ///
+    /// A bytes-only probe would judge the async-spill path (moon#466)
+    /// stalled — it moves a value from the hot plane to the pending plane,
+    /// which `estimated_memory()` counts on both sides — and after
+    /// `EVICTION_STALL_LIMIT` victims would convert a working reclaim into
+    /// an `OOM`. This pins the composition so that regression cannot pass.
+    #[test]
+    fn eviction_progress_probe_watches_bytes_pending_and_hot_keys() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::storage::db::PendingSpill;
+
+        let mut db = Database::new();
+        for i in 0..4u8 {
+            db.set_string(
+                Bytes::copy_from_slice(format!("pp{i}").as_bytes()),
+                Bytes::from_static(b"probe_value_payload"),
+            );
+        }
+
+        let base = EvictionProgress::probe(&db);
+        assert_eq!(base.memory, db.estimated_memory());
+        assert_eq!(base.pending_spill, db.pending_spill_bytes());
+        assert_eq!(base.hot_keys, db.data().len());
+        assert_eq!(
+            EvictionProgress::probe(&db),
+            base,
+            "an untouched database must read as NO progress — that is the \
+             only condition allowed to trip the stall counter"
+        );
+
+        // Signal 1+3: a hot-plane removal.
+        db.remove(b"pp0");
+        let removed = EvictionProgress::probe(&db);
+        assert_ne!(removed, base, "a removal is progress");
+        assert!(removed.hot_keys < base.hot_keys);
+
+        // Signal 2: a spill accepted onto the pending plane. This is the one
+        // a bytes-only probe gets wrong.
+        db.spill_inflight_mark(
+            Bytes::from_static(b"pp1"),
+            PendingSpill {
+                req_id: 1,
+                value_type: ValueType::String,
+                value_bytes: Bytes::from_static(b"probe_value_payload"),
+                ttl_ms: None,
+            },
+        );
+        let queued = EvictionProgress::probe(&db);
+        assert_ne!(queued, removed, "queuing a spill is progress");
+        assert!(
+            queued.pending_spill > removed.pending_spill,
+            "the pending plane must be part of the progress observation"
+        );
+    }
+
+    /// moon#600 under `--disk-offload enable` (sync-spill sink): the durable
+    /// batch path re-picks the identical index head every time, trips
+    /// `stall >= NO_AOF_BATCH_STALL_LIMIT`, and returns 0 — which
+    /// `evict_to_budget` reads as "no progress" and answers OOM even though
+    /// eight live volatile keys were spillable. With the sampler fixed the
+    /// ghost is reaped and those keys are TIERED, not rejected.
+    #[test]
+    fn evict_to_budget_volatile_ttl_index_only_victim_still_spills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let manifest_path = dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = db_with_index_only_victim(8);
+        db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        let config = make_config(1, "volatile-ttl");
+        let mut ctx = SpillContext {
+            shard_dir: dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+            db_index: 0,
+        };
+        let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(Some(&mut ctx)));
+        assert!(
+            result.is_ok(),
+            "live volatile keys are spillable: {result:?}"
+        );
+        assert_eq!(db.len(), 0, "every live victim left RAM");
+        let ci = db.cold_index.as_ref().unwrap();
+        for i in 0..8usize {
+            let key = format!("live_{i:03}");
+            assert!(
+                ci.lookup(key.as_bytes()).is_some(),
+                "{key} must stay cold-readable: a tiered key is NOT an eviction"
+            );
+        }
+        assert!(
+            ci.lookup(&b"ghost"[..]).is_none(),
+            "the ghost was never in RAM and must not be conjured into the cold tier"
+        );
+        assert_eq!(db.expiry_index_len(), 0, "ghost reaped");
+    }
+
+    /// moon#600 + `noeviction`: an index-only victim must not change the
+    /// `noeviction` contract. The policy gate runs before any victim is
+    /// selected, so the answer is still an immediate OOM with nothing
+    /// removed and — importantly — the stale pair left alone: `noeviction`
+    /// promises not to mutate the keyspace, and reaping is reachable only
+    /// through a sampler `noeviction` never runs.
+    #[test]
+    fn noeviction_with_index_only_victim_ooms_without_touching_anything() {
+        let mut db = db_with_index_only_victim(4);
+        let before = db.len();
+        let config = make_config(1, "noeviction");
+        let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
+        assert!(result.is_err(), "noeviction over budget must OOM");
+        assert_eq!(db.len(), before, "noeviction must not remove keys");
+        assert_eq!(
+            db.expiry_index_len(),
+            before + 1,
+            "noeviction never selects a victim, so nothing — not even a stale \
+             pair — is reaped"
         );
     }
 }

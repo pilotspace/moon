@@ -2516,6 +2516,142 @@ wait "$SHUTDOWN_PID" 2>/dev/null || true
 pkill -f "moon.*${PORT_SHUTDOWN}" 2>/dev/null || true
 rm -rf "$SHUTDOWN_DIR"
 
+# ===========================================================================
+# moon#600 -- volatile-ttl eviction liveness and accounting
+#
+# `volatile-ttl` is the only eviction sampler that reads a MAINTAINED INDEX
+# (the deadline index) instead of the keyspace itself, so it is the only one
+# that can hand `evict_to_budget` a key it cannot remove. When that happened
+# the loop never terminated: the shard thread spun, the instance stayed over
+# `maxmemory`, and no client was ever told anything.
+#
+# Two legs, because the DESTINATION of a victim changes what must be counted
+# (moon#599 / #355):
+#
+#   --disk-offload disable : the victim is DROPPED. It leaves the keyspace,
+#                            DBSIZE falls, `evicted_keys` rises.
+#   --disk-offload enable  : the victim is TIERED. It stays readable through
+#                            the cold tier, DBSIZE does NOT move, and it is
+#                            counted by `spilled_keys` -- NOT `evicted_keys`.
+#
+# The invariant that holds in BOTH is `evicted_keys + DBSIZE == keys
+# written`: `evicted_keys` may never grow against a DBSIZE that does not.
+#
+# Each leg runs against its own throwaway instance (a tight `--maxmemory`
+# would evict the data every other section depends on) and cleans up after
+# itself. The results come back in globals on purpose: running a leg in a
+# command substitution would put every PASS/FAIL increment in a subshell and
+# silently discard the whole leg.
+# ===========================================================================
+echo ""
+echo "=== moon#600: volatile-ttl eviction liveness ==="
+
+PORT_EVICT=$((PORT_RUST + 520))
+EVICT_WRITES=6000
+# ~1KB values against a 4mb cap: eviction must run hard, and every key
+# carries a far-future TTL so every key is a legal volatile-ttl victim and
+# none is close enough to expiry to hit the spill TTL floor (moon#553).
+EVICT_VAL=$(head -c 1000 </dev/zero | tr '\0' 'x')
+
+run_volatile_ttl_eviction_leg() {
+    local leg="$1" mode="$2"
+    shift 2
+    local dir
+    dir=$(mktemp -d /tmp/moon-evict-dir.XXXXXX)
+
+    "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 --dir "$dir" \
+        --disk-free-min-pct 0 --maxmemory 4mb --maxmemory-policy volatile-ttl \
+        "$@" >/dev/null 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 50); do
+        redis-cli -p "$PORT_EVICT" PING >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+
+    local pipe errs
+    pipe=$(for i in $(seq 1 "$EVICT_WRITES"); do
+        echo "SET evict:$i $EVICT_VAL EX 3600"
+    done | redis-cli -p "$PORT_EVICT" --pipe 2>&1 || true)
+    errs=$(echo "$pipe" | tr ',' '\n' | awk -F: '/errors/ {gsub(/ /,"",$2); print $2}' | tail -1)
+    assert_eq "moon#600 [$leg]: an evicting policy accepts every write (no OOM)" \
+        "0" "${errs:-unknown}"
+
+    # Liveness. A shard thread spinning inside evict_to_budget never answers
+    # again; `-t 3` bounds the wait so a regression FAILS instead of hanging.
+    local alive
+    alive=$(redis-cli -t 3 -p "$PORT_EVICT" PING 2>&1)
+    assert_eq "moon#600 [$leg]: server still answers after volatile-ttl eviction" \
+        "PONG" "$alive"
+
+    local dbsize evicted spilled info
+    dbsize=$(redis-cli -t 3 -p "$PORT_EVICT" DBSIZE 2>&1)
+    info=$(redis-cli -t 3 -p "$PORT_EVICT" INFO 2>/dev/null | tr -d '\r')
+    evicted=$(echo "$info" | awk -F: '/^evicted_keys:/ {print $2}')
+    spilled=$(echo "$info" | awk -F: '/^spilled_keys:/ {print $2}')
+
+    # Something was actually reclaimed -- the whole point of the loop.
+    if [[ "$evicted" =~ ^[0-9]+$ ]] && [[ "$spilled" =~ ^[0-9]+$ ]] &&
+        ((evicted + spilled > 0)); then
+        PASS=$((PASS + 1))
+        echo "  PASS: moon#600 [$leg]: reclaimed under budget (evicted=$evicted spilled=$spilled)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon#600 [$leg]: nothing reclaimed (evicted='$evicted' spilled='$spilled')"
+    fi
+
+    # moon#599: a TIERED key stays in DBSIZE, a DROPPED key does not. Either
+    # way the two must add up to exactly what was written.
+    if [[ "$dbsize" =~ ^[0-9]+$ ]] && [[ "$evicted" =~ ^[0-9]+$ ]] &&
+        ((evicted + dbsize == EVICT_WRITES)); then
+        PASS=$((PASS + 1))
+        echo "  PASS: moon#600 [$leg]: evicted_keys ($evicted) + DBSIZE ($dbsize) == $EVICT_WRITES"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon#600 [$leg]: evicted_keys='$evicted' + DBSIZE='$dbsize' != $EVICT_WRITES"
+    fi
+
+    if [[ "$mode" == "drop" ]]; then
+        # No cold tier exists, so no victim can be tiered.
+        assert_eq "moon#600 [$leg]: nothing is TIERED without a cold tier" "0" "$spilled"
+        if [[ "$dbsize" =~ ^[0-9]+$ ]] && ((dbsize < EVICT_WRITES)); then
+            PASS=$((PASS + 1))
+            echo "  PASS: moon#600 [$leg]: dropped victims left the keyspace (DBSIZE=$dbsize)"
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#600 [$leg]: DBSIZE='$dbsize' did not fall despite $evicted evictions"
+        fi
+    else
+        # Tiering must actually have happened...
+        if [[ "$spilled" =~ ^[0-9]+$ ]] && ((spilled > 0)); then
+            PASS=$((PASS + 1))
+            echo "  PASS: moon#600 [$leg]: victims were TIERED (spilled_keys=$spilled)"
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#600 [$leg]: expected tiering, spilled_keys='$spilled'"
+        fi
+        # ...and a tiered key is NOT an eviction: it stays counted and stays
+        # readable through the cold tier (#355 / moon#599).
+        assert_eq "moon#600 [$leg]: tiered keys stay in DBSIZE" "$EVICT_WRITES" "$dbsize"
+        # GET, not STRLEN: cold read-through is per-command, and STRLEN does
+        # not do it today (it answers 0 for a tiered key -- tracked separately,
+        # it is not what moon#600 is about). GET is the read-through path.
+        local tiered_read
+        tiered_read=$(redis-cli -t 3 -p "$PORT_EVICT" GET evict:1 2>&1)
+        assert_eq "moon#600 [$leg]: a tiered key is still readable" "$EVICT_VAL" "$tiered_read"
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pkill -f "moon.*${PORT_EVICT}" 2>/dev/null || true
+    rm -rf "$dir"
+}
+
+# Leg 1 -- plain drop. This is the path that used to spin.
+run_volatile_ttl_eviction_leg "no-offload" drop --appendonly no --disk-offload disable
+
+# Leg 2 -- disk offload with an AOF backstop, so victims take the spill path.
+run_volatile_ttl_eviction_leg "disk-offload" tier --appendonly yes --disk-offload enable
+
 # Restart moon with the originally-requested shard count so summary works.
 start_moon_with_shards "$SHARDS" || true
 

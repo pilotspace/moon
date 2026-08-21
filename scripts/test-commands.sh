@@ -70,6 +70,7 @@ while [[ $# -gt 0 ]]; do
             echo "  workspace    - Workspace commands (WS CREATE, WS LIST, WS INFO, WS AUTH, WS DROP)"
             echo "  mq           - Durable Message Queue (MQ CREATE, PUSH, POP, ACK, DLQLEN, TRIGGER)"
             echo "  txn_kv       - KV Transaction Wiring (TXN.BEGIN, TXN.COMMIT, TXN.ABORT lifecycle)"
+            echo "  eviction     - Eviction policy behavior (volatile-ttl victim order, liveness, OOM)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
             exit 0
             ;;
@@ -2701,6 +2702,105 @@ if should_run "txn_kv"; then
     mcli DEL txn_kv_commit_key txn_kv_del_key txn_mq_commit_k txn_mq_abort_k >/dev/null 2>&1 || true
 
     echo "  txn_kv: done"
+fi
+
+# ===========================================================================
+# EVICTION (moon#600) -- volatile-ttl victim selection, liveness, OOM
+#
+# `volatile-ttl` is the only sampler that picks from the maintained deadline
+# index rather than from the keyspace, so it is the only one that can name a
+# victim `evict_to_budget` cannot remove -- which used to spin the shard
+# thread forever instead of returning. These are the client-visible
+# consequences: the nearest deadline goes first, the server keeps answering,
+# and `noeviction` still refuses rather than evicting or spinning.
+#
+# Runs on its OWN instance, started with `--disk-offload disable`: under the
+# default (enabled) a victim is TIERED rather than dropped, so it stays
+# readable and stays in DBSIZE (moon#599 / #355) and victim ORDER is not
+# observable from a client at all. The tiered half of that contract is
+# covered by scripts/test-consistency.sh, which runs both legs.
+# ===========================================================================
+
+if should_run "eviction"; then
+    echo ""
+    echo "=== Eviction (volatile-ttl) ==="
+
+    PORT_EVICT=$((PORT_RUST + 530))
+    EVICT_DIR=$(mktemp -d /tmp/moon-cmd-evict.XXXXXX)
+    ecli() { redis-cli -t 5 -p "$PORT_EVICT" "$@"; }
+
+    "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 --dir "$EVICT_DIR" \
+        --protected-mode no --disk-free-min-pct 0 --appendonly no \
+        --disk-offload disable --maxmemory-policy volatile-ttl >/dev/null 2>&1 &
+    EVICT_PID=$!
+    for _ in $(seq 1 50); do
+        ecli PING >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+
+    # EVICT-01: volatile-ttl evicts the GLOBALLY nearest deadline. Five 64KB
+    # volatile values against a 256KB cap needs a couple of victims, and the
+    # soonest-expiring key must be among the first to go -- not a random
+    # volatile one. The budget is absolute, not derived from `used_memory`:
+    # the memory ledger is published on a chore tick, so a read taken
+    # immediately after the writes can still answer 0.
+    TOTAL=$((TOTAL + 1))
+    EV_VAL=$(head -c 65536 </dev/zero | tr '\0' 'z')
+    for i in 1 2 3 4; do
+        ecli SET "ev:far:$i" "$EV_VAL" EX 3600 >/dev/null 2>&1
+    done
+    ecli SET ev:soonest "$EV_VAL" EX 60 >/dev/null 2>&1
+    ecli CONFIG SET maxmemory 262144 >/dev/null 2>&1 || true
+    ecli SET ev:trigger v >/dev/null 2>&1 || true
+    EV_SOONEST=$(ecli EXISTS ev:soonest 2>&1)
+    EV_SURVIVORS=$(ecli EXISTS ev:far:1 ev:far:2 ev:far:3 ev:far:4 2>&1)
+    if [[ "$EV_SOONEST" == "0" ]] && [[ "$EV_SURVIVORS" =~ ^[1-4]$ ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: volatile-ttl evicts the nearest deadline first ($EV_SURVIVORS far keys kept)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: volatile-ttl victim order wrong: EXISTS ev:soonest=$EV_SOONEST, far survivors=$EV_SURVIVORS"
+    fi
+
+    # EVICT-02: liveness. A shard thread spinning inside evict_to_budget
+    # never answers again; `-t 5` turns that into a FAIL, not a hung suite.
+    TOTAL=$((TOTAL + 1))
+    EV_ALIVE=$(ecli PING 2>&1)
+    if [[ "$EV_ALIVE" == "PONG" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: server stays responsive through volatile-ttl eviction"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: server stopped answering after volatile-ttl eviction: '$EV_ALIVE'"
+    fi
+
+    # EVICT-03: moon#599 accounting -- with no cold tier every victim LEAVES
+    # the keyspace, so evicted_keys moves and spilled_keys does not.
+    TOTAL=$((TOTAL + 1))
+    EV_INFO=$(ecli INFO 2>/dev/null | tr -d '\r')
+    EV_EVICTED=$(echo "$EV_INFO" | awk -F: '/^evicted_keys:/ {print $2}')
+    EV_SPILLED=$(echo "$EV_INFO" | awk -F: '/^spilled_keys:/ {print $2}')
+    if [[ "$EV_EVICTED" =~ ^[0-9]+$ ]] && ((EV_EVICTED > 0)) && [[ "$EV_SPILLED" == "0" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: evicted_keys=$EV_EVICTED, spilled_keys=0 (nothing tiered without disk-offload)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: evicted_keys='$EV_EVICTED' spilled_keys='$EV_SPILLED'"
+    fi
+
+    # EVICT-04: noeviction refuses instead of evicting -- or spinning. The
+    # cap is tightened below what is already resident so the write is over
+    # budget by construction.
+    TOTAL=$((TOTAL + 1))
+    ecli CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1 || true
+    ecli CONFIG SET maxmemory 65536 >/dev/null 2>&1 || true
+    EV_OOM=$(ecli SET ev:refused "$EV_VAL" 2>&1)
+    if echo "$EV_OOM" | grep -qi "OOM"; then
+        PASS=$((PASS + 1)); echo "  PASS: noeviction over budget returns OOM"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: noeviction should return OOM, got: $EV_OOM"
+    fi
+
+    kill "$EVICT_PID" 2>/dev/null || true
+    wait "$EVICT_PID" 2>/dev/null || true
+    pkill -f "moon.*${PORT_EVICT}" 2>/dev/null || true
+    rm -rf "$EVICT_DIR"
+
+    echo "  eviction: done"
 fi
 
 # ===========================================================================
