@@ -2393,7 +2393,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // sends it to `first_key`'s owner, which then executes the whole
             // command against that one slice — so the other key is read from,
             // and written to, the wrong shard's table: acked, invisible, gone.
-            if let Some(err) = crate::server::conn::shared::cross_shard_write_rejection(
+            if let Some(err) = crate::server::conn::shared::cross_shard_multikey_rejection(
                 cmd,
                 cmd_args,
                 ctx.num_shards,

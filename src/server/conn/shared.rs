@@ -1675,7 +1675,12 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
     b"CROSSSLOT Keys in request don't hash to the same shard; \
       co-locate every key of the command with a {hash} tag";
 
-/// Writes whose argv names a key the command does NOT route on.
+/// Commands whose argv names a key the command does NOT route on.
+///
+/// Named for what it detects, not for writes alone: `XREAD` is read-only and
+/// belongs here for the same reason `SINTERSTORE`'s remote SOURCE does — the
+/// routed shard executes the whole command against one slice, so a key it
+/// cannot see reads as absent.
 ///
 /// `extract_primary_key` answers the command's `first_key` — the ROUTING key.
 /// It is not "the key this command writes", and for this family it is not even
@@ -1707,7 +1712,7 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///
 /// Matched on `(len, first byte)` first so a single-key command falls through
 /// after one integer compare and never reaches the key walk.
-fn writes_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
+fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
     let len = cmd.len();
     if len == 0 {
         return false;
@@ -1730,6 +1735,31 @@ fn writes_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         }
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE"),
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
+        // moon#605. These two READ several streams, and the walker reports one
+        // key per stream — so a single-stream `XREAD`/`XREADGROUP` is a no-op
+        // here (one key cannot disagree with itself) and only a multi-stream
+        // invocation can be refused.
+        //
+        // `XREAD` alone would be an under-read: the routed shard answers from
+        // the streams it owns and reports nothing for the rest, which the
+        // client reads as "those are quiet". `XREADGROUP` is worse, and is why
+        // this is not filed as a cosmetic gap — measured at `--shards 4`, 12
+        // pairs:
+        //
+        // ```text
+        // XREADGROUP GROUP g cc COUNT 10 STREAMS a b > >
+        //   -> -ERR The XREADGROUP subcommand requires the key to exist.
+        //   ... and `a`'s entry is now PENDING for consumer `cc`
+        // ```
+        //
+        // `read_group_new` claims the local stream's entries into the PEL and
+        // THEN the command fails on the stream this shard cannot see. The
+        // client is handed an error and never receives the entry, but the
+        // entry is marked delivered-and-unacked: `XREADGROUP >` will never
+        // return it again and only `XPENDING`/`XAUTOCLAIM` recovers it. 10 of
+        // 12 pairs stranded an entry that way.
+        (5, b'x') => cmd.eq_ignore_ascii_case(b"XREAD"),
+        (10, b'x') => cmd.eq_ignore_ascii_case(b"XREADGROUP"),
         _ => false,
     }
 }
@@ -1795,12 +1825,12 @@ fn writes_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
 /// * every key resolves to the same shard — including the degenerate
 ///   `RENAME k k` and any `{hash}`-tagged pair.
 #[must_use]
-pub(crate) fn cross_shard_write_rejection(
+pub(crate) fn cross_shard_multikey_rejection(
     cmd: &[u8],
     args: &[Frame],
     num_shards: usize,
 ) -> Option<Frame> {
-    if num_shards <= 1 || !writes_a_key_it_did_not_route_on(cmd) {
+    if num_shards <= 1 || !touches_a_key_it_did_not_route_on(cmd) {
         return None;
     }
     // The shared key-position walker (moon#582) — the same one ACL and cache
@@ -3113,7 +3143,7 @@ mod cross_shard_write_tests {
     //! destination is SEARCHED for with the routing hash the server itself
     //! uses, so the test cannot pass by accident on a lucky literal.
 
-    use super::{CROSS_SHARD_WRITE_ERROR, cross_shard_write_rejection};
+    use super::{CROSS_SHARD_WRITE_ERROR, cross_shard_multikey_rejection};
     use crate::protocol::Frame;
     use crate::shard::dispatch::key_to_shard;
     use bytes::Bytes;
@@ -3186,7 +3216,7 @@ mod cross_shard_write_tests {
     /// Each family member is refused when — and only when — its keys really
     /// do straddle a shard boundary.
     ///
-    /// Dropping any one arm of `writes_a_key_it_did_not_route_on` makes
+    /// Dropping any one arm of `touches_a_key_it_did_not_route_on` makes
     /// exactly that command fail the first half; widening the guard to a
     /// blanket refusal makes every command fail the rest.
     #[test]
@@ -3196,7 +3226,7 @@ mod cross_shard_write_tests {
         let near = near_to(src);
         for (cmd, shape) in FAMILY {
             let split = argv(shape, src, &far);
-            match cross_shard_write_rejection(cmd.as_bytes(), &split, N) {
+            match cross_shard_multikey_rejection(cmd.as_bytes(), &split, N) {
                 Some(Frame::Error(e)) => assert_eq!(
                     e.as_ref(),
                     CROSS_SHARD_WRITE_ERROR,
@@ -3211,19 +3241,20 @@ mod cross_shard_write_tests {
             // Co-located without a tag: the command works today and must keep
             // working.
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &argv(shape, src, &near), N).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), &argv(shape, src, &near), N)
+                    .is_none(),
                 "{cmd}: a co-located pair must NOT be refused"
             );
             // `{hash}` tags are the documented remedy — they must actually
             // remedy.
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &argv(shape, "{t}:s", "{t}:d"), N)
+                cross_shard_multikey_rejection(cmd.as_bytes(), &argv(shape, "{t}:s", "{t}:d"), N)
                     .is_none(),
                 "{cmd}: a {{hash}}-tagged pair must NOT be refused"
             );
             // One shard: no boundary exists to cross.
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &split, 1).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), &split, 1).is_none(),
                 "{cmd}: a single-shard server has nothing to refuse"
             );
         }
@@ -3243,7 +3274,7 @@ mod cross_shard_write_tests {
             "MSET", "MGET", "DEL", "UNLINK", "EXISTS", "COPY", "BITOP", "MSETNX",
         ] {
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), &two, N).is_none(),
                 "{cmd} is coordinated per-shard and must not be refused here"
             );
         }
@@ -3251,21 +3282,21 @@ mod cross_shard_write_tests {
         // blocking entry points this pre-routing guard cannot reach.
         for cmd in ["LMOVE", "RPOPLPUSH", "BLMOVE", "BRPOPLPUSH"] {
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), &two, N).is_none(),
                 "{cmd} belongs to moon#570, not here"
             );
         }
         // Read-only twins: same routing rule, different (wrong-answer) defect.
         for cmd in ["SINTER", "SUNION", "SDIFF", "PFCOUNT", "LCS", "TOUCH"] {
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), &two, N).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), &two, N).is_none(),
                 "{cmd} is read-only and out of scope for moon#592"
             );
         }
 
         // A SORT with no STORE clause names one key: nothing to straddle.
         let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];
-        assert!(cross_shard_write_rejection(b"SORT", &sort_ro, N).is_none());
+        assert!(cross_shard_multikey_rejection(b"SORT", &sort_ro, N).is_none());
 
         // Malformed argvs must still earn their own arity/syntax errors rather
         // than a misleading CROSSSLOT that sends the client chasing hash tags.
@@ -3283,14 +3314,14 @@ mod cross_shard_write_tests {
         ];
         for (cmd, args) in cases {
             assert!(
-                cross_shard_write_rejection(cmd.as_bytes(), args, N).is_none(),
+                cross_shard_multikey_rejection(cmd.as_bytes(), args, N).is_none(),
                 "{cmd} {args:?}: a malformed argv must keep its own error"
             );
         }
 
         // The degenerate same-key form is one key, never a boundary.
         assert!(
-            cross_shard_write_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
+            cross_shard_multikey_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
             "RENAME k k names one key"
         );
     }

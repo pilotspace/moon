@@ -165,6 +165,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`XREADGROUP` across shards claimed entries it never delivered** (#605). moon routes a command to
+  ONE shard and that shard runs the whole command against its own slice, so the other streams of a
+  multi-stream read are invisible — read as "does not exist". For `XREAD` that was an under-read.
+  For `XREADGROUP` it was data loss. Measured at `--shards 4`, 12 stream pairs:
+
+  ```text
+  XREADGROUP GROUP g cc COUNT 10 STREAMS a b > >
+    -> -ERR The XREADGROUP subcommand requires the key to exist.
+    ... and a's entry is now PENDING for consumer cc
+  ```
+
+  `read_group_new` claims the local stream's entries into the PEL and THEN the command fails on the
+  stream this shard cannot see. The client is handed an error and never receives the entry, but the
+  entry is marked delivered-and-unacked: `XREADGROUP >` never returns it again and only
+  `XPENDING`/`XAUTOCLAIM` recovers it. 10 of 12 pairs stranded an entry that way; plain `XREAD`
+  answered from a subset in 10 of 12.
+
+  **Behaviour change.** A multi-stream `XREAD`/`XREADGROUP` whose streams do not all hash to one
+  shard is now refused before routing, with the same `CROSSSLOT` refusal two-key writes already get
+  (#592) — the refusal happens *before* execution, which is what stops the claim. Non-cluster Redis
+  serves such a read; moon cannot, and answering from a subset is the worse of the two failures.
+  Co-locate the streams with a `{hash}` tag, or run `--shards 1`, and they are served in full as
+  before. Single-stream reads are unaffected: one key cannot disagree with itself.
+
 - **A blocked `XREAD` could be answered with another client's entries, or never answered at all**
   (#620). `wait_id` is `(shard_id << 48) | counter`, minted by the registry of the shard the
   **connection** lives on, while the waiter is queued on the shard that owns the **key** — so two
