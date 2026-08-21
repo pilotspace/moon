@@ -165,6 +165,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A blocked `XREAD` could be answered with another client's entries, or never answered at all**
+  (#620). `wait_id` is `(shard_id << 48) | counter`, minted by the registry of the shard the
+  **connection** lives on, while the waiter is queued on the shard that owns the **key** — so two
+  readers parked on one key from connections on different shards arrive with ids from different
+  high-order spaces, and the queue is not in id order. `try_wake_stream_waiter` assumed it was, in
+  two places: it handed `take_waits` an unsorted slice to binary-search (a search that misses ids
+  which are present, leaving those readers parked until their `BLOCK` budget ran out), and it
+  paired the survivors with their decisions **by position**, sending the entries computed for one
+  reader's cursor to a different reader's socket. In a debug build the mispairing tripped a
+  `debug_assert_eq!` instead, and moon turns a shard-thread panic into a process-wide abort — so
+  every connected client was dropped:
+
+  ```text
+  thread '<unnamed>' panicked at tests/common/mod.rs:527:26:
+  server closed after 0 bytes while 1 replies were expected: ""
+  ```
+
+  The ids are now sorted before the lookup and each entry is paired with its decision **by
+  `wait_id`**, never by position. Only reachable at `--shards >= 2`; the list and zset wakers
+  consume one waiter at a time and were never affected.
+
 - **Crash-matrix tests could silently run two servers on one port** (#489).
   `tests/crash_matrix_per_shard_aof.rs` took a port from a local `unique_port()` — bind `:0`, read
   the port, drop the listener — and then offset it by `+1`/`+2`/`+3` for its other three tests.
