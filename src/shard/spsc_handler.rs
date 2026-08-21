@@ -936,27 +936,13 @@ pub(crate) fn handle_shard_message_shared(
 
                             // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                if crate::blocking::wakeup::is_producer(cmd) {
-                                    let wake_key = args
-                                        .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                        .and_then(|f| crate::server::connection::extract_bytes(f));
-                                    if let Some(key) = wake_key {
-                                        let mut reg = blocking_registry.borrow_mut();
-                                        if crate::blocking::wakeup::is_list_producer(cmd) {
-                                            crate::blocking::wakeup::try_wake_list_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                            crate::blocking::wakeup::try_wake_zset_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        } else {
-                                            crate::blocking::wakeup::try_wake_stream_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        }
-                                    }
-                                }
+                                crate::blocking::wakeup::wake_producer(
+                                    blocking_registry,
+                                    db,
+                                    db_idx,
+                                    cmd,
+                                    args,
+                                );
                             }
 
                             // Auto-index: if HSET succeeded and key matches a vector index prefix,
@@ -1167,27 +1153,13 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        if crate::blocking::wakeup::is_producer(cmd) {
-                            let wake_key = args
-                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                .and_then(|f| crate::server::connection::extract_bytes(f));
-                            if let Some(key) = wake_key {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if crate::blocking::wakeup::is_list_producer(cmd) {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                }
-                            }
-                        }
+                        crate::blocking::wakeup::wake_producer(
+                            blocking_registry,
+                            guard,
+                            db_idx,
+                            cmd,
+                            args,
+                        );
                     }
 
                     results.push(if aof_ok {
@@ -1419,27 +1391,13 @@ pub(crate) fn handle_shard_message_shared(
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        if crate::blocking::wakeup::is_producer(cmd) {
-                            let wake_key = args
-                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                .and_then(|f| crate::server::connection::extract_bytes(f));
-                            if let Some(key) = wake_key {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if crate::blocking::wakeup::is_list_producer(cmd) {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                }
-                            }
-                        }
+                        crate::blocking::wakeup::wake_producer(
+                            blocking_registry,
+                            guard,
+                            db_idx,
+                            cmd,
+                            args,
+                        );
                     }
 
                     results.push(if aof_ok {
@@ -1599,27 +1557,13 @@ pub(crate) fn handle_shard_message_shared(
                             }
 
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                if crate::blocking::wakeup::is_producer(cmd) {
-                                    let wake_key = args
-                                        .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                        .and_then(|f| crate::server::connection::extract_bytes(f));
-                                    if let Some(key) = wake_key {
-                                        let mut reg = blocking_registry.borrow_mut();
-                                        if crate::blocking::wakeup::is_list_producer(cmd) {
-                                            crate::blocking::wakeup::try_wake_list_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                            crate::blocking::wakeup::try_wake_zset_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        } else {
-                                            crate::blocking::wakeup::try_wake_stream_waiter(
-                                                &mut reg, db, db_idx, &key,
-                                            );
-                                        }
-                                    }
-                                }
+                                crate::blocking::wakeup::wake_producer(
+                                    blocking_registry,
+                                    db,
+                                    db_idx,
+                                    cmd,
+                                    args,
+                                );
                             }
 
                             // Fail-loud: mutation applied, but the client must not
@@ -1790,27 +1734,13 @@ pub(crate) fn handle_shard_message_shared(
                             );
                         }
 
-                        if crate::blocking::wakeup::is_producer(cmd) {
-                            let wake_key = args
-                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                .and_then(|f| crate::server::connection::extract_bytes(f));
-                            if let Some(key) = wake_key {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if crate::blocking::wakeup::is_list_producer(cmd) {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                }
-                            }
-                        }
+                        crate::blocking::wakeup::wake_producer(
+                            blocking_registry,
+                            guard,
+                            db_idx,
+                            cmd,
+                            args,
+                        );
                     }
 
                     results.push(if aof_ok {
@@ -2043,27 +1973,13 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        if crate::blocking::wakeup::is_producer(cmd) {
-                            let wake_key = args
-                                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                                .and_then(|f| crate::server::connection::extract_bytes(f));
-                            if let Some(key) = wake_key {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if crate::blocking::wakeup::is_list_producer(cmd) {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, guard, db_idx, &key,
-                                    );
-                                }
-                            }
-                        }
+                        crate::blocking::wakeup::wake_producer(
+                            blocking_registry,
+                            guard,
+                            db_idx,
+                            cmd,
+                            args,
+                        );
                     }
 
                     results.push(if aof_ok {

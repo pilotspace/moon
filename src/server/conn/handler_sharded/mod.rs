@@ -2149,21 +2149,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // moon#595: shared gate — see the twin in
                                     // handler_monoio. Omitting XADD here made a
                                     // locally-owned stream key unwakeable.
-                                    if crate::blocking::wakeup::is_producer(cmd) {
-                                        // Destination for LMOVE/RPOPLPUSH, args[0] otherwise —
-                                        // see the matching comment in handler_monoio (moon#520).
-                                        let idx = crate::blocking::wakeup::producer_wake_key_index(cmd);
-                                        if let Some(key) = cmd_args.get(idx).and_then(|f| extract_bytes(f)) {
-                                            let mut reg = ctx.blocking_registry.borrow_mut();
-                                            if crate::blocking::wakeup::is_list_producer(cmd) {
-                                                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, conn.selected_db, &key);
-                                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, conn.selected_db, &key);
-                                            } else {
-                                                crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, db, conn.selected_db, &key);
-                                            }
-                                        }
-                                    }
+                                    crate::blocking::wakeup::wake_producer(
+                                        &ctx.blocking_registry,
+                                        db,
+                                        conn.selected_db,
+                                        cmd,
+                                        cmd_args,
+                                    );
                                 }
                                 Ok((response, sample_latency, dispatch_start))
                             };

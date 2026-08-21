@@ -2088,6 +2088,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One producer→waiter hook instead of eight hand-copied ones** (#623). Deciding "is this command a
+  producer, which of its arguments names the key it just made non-empty, and which family's queue
+  should be raised" was open-coded at every dispatch site: both connection handlers and six arms of
+  the SPSC handler. Adding a producer command meant finding all eight, and a new execution path that
+  reached none of them looked healthy in review and in CI — that is how `XADD` on a locally owned
+  stream (#595) and every write inside `MULTI`/`EXEC` (#606) each shipped a lost wakeup. The trio is
+  now `wakeup::wake_producer`, called once per site; the per-site success gate (`is_write && !error`,
+  or just `!error`) stays where it is because it legitimately differs between paths. No behaviour
+  change — the mapping and the gates are the ones that were already there, and the existing blocking
+  suites plus new unit tests over the single copy hold it in place.
+
 - **Cross-shard dispatch no longer clones the command name for every command** (#460). `RemoteMeta`
   carried a `Bytes` holding the command name on both handlers. The cross-shard reply loop needed it
   before RESP3 type fidelity landed, to choose the conversion; since then the shape is classified at
