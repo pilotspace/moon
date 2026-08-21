@@ -205,6 +205,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load-bearing by mutation: with `InterceptReplies::push` stripped of its conversion, `INFO`,
   `CLIENT LIST`, `CLIENT INFO` and `CONFIG GET` all revert to the wrong wire type while `LOLWUT`,
   `MEMORY DOCTOR` and `HGETALL` — which reach the dispatch exit — stay correct.
+- **`HSCAN ... NOVALUES` was accepted and silently ignored, so clients that asked for field names
+  got values instead** (#630). The option is how a client says "send me the fields, not the pairs",
+  and it is what `redis-py`'s `hscan(no_values=True)` and `hscan_iter(no_values=True)` pass. Moon
+  returned the field/value interleave anyway:
+
+  ```text
+  HSET h f1 v1 f2 v2
+    redis 8.6.1   HSCAN h 0 NOVALUES  ->  "0"  ["f1", "f2"]
+    moon (before) HSCAN h 0 NOVALUES  ->  "0"  ["f1", "v1", "f2", "v2"]
+  ```
+
+  Nothing errored, so the caller read `v1` and `v2` as **field names** and any `HGET`/`HDEL` built
+  from them addressed fields that do not exist. This is the failure mode that does not look like a
+  bug from either side of the connection.
+
+- **The whole SCAN family accepted unknown options instead of refusing them** (#630). That is what
+  kept the `NOVALUES` drop invisible: it was never "unimplemented and rejected", it was silently
+  agreed to — and every option added later would have inherited the same silence.
+
+  ```text
+                              moon (before)   redis 8.6.1 / moon (after)
+    HSCAN h 0 BOGUSTOKEN      full reply      ERR syntax error
+    SSCAN s 0 BOGUSTOKEN      full reply      ERR syntax error
+    ZSCAN z 0 BOGUSTOKEN      full reply      ERR syntax error
+    SCAN 0 BOGUSTOKEN         full reply      ERR syntax error
+    SCAN 0 COUNT 0            full reply      ERR syntax error
+    SCAN 0 COUNT abc          full reply      ERR value is not an integer or out of range
+    HSCAN h 0 MATCH           full reply      ERR syntax error
+    SSCAN s 0 NOVALUES        full reply      ERR NOVALUES option can only be used in HSCAN
+    SCAN 0 TYPE nosuchtype    empty result    empty result   <- still accepted, matches nothing
+  ```
+
+  `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` had **eight** hand-copied option parsers between them — a
+  `_readonly` twin of each on top of the four — and they had already drifted: `ZSCAN` alone refused
+  a non-numeric `COUNT`, and it answered `wrong number of arguments` where Redis answers `syntax
+  error` for a dangling `MATCH`. All eight are replaced by one parser in
+  `src/command/scan_options.rs`, which knows per command which options are legal (`TYPE` is
+  `SCAN`-only, `NOVALUES` is `HSCAN`-only) and reproduces Redis's error text exactly, including the
+  detail that `COUNT abc` and `COUNT 0` give *different* messages because Redis parses the integer
+  before it judges the range.
 
 - **A fired MQ trigger reached only subscribers that happened to land on the queue's home shard**
   (#474). `fire_pending_mq_triggers` delivered its callback notification with a single

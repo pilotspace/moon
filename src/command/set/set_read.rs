@@ -341,36 +341,16 @@ pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    // Parse optional arguments
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(c) = parse_int(&args[i]) {
-                    if c > 0 {
-                        count = c as usize;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options`.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Set,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
 
     // Get the set
     let members: Vec<Bytes> = match db.get_set(key) {
@@ -698,34 +678,16 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-    let mut i = 2;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(c) = parse_int(&args[i]) {
-                    if c > 0 {
-                        count = c as usize;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options`.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Set,
+        &args[2..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
     let members: Vec<Bytes> = match db.get_set_ref_if_alive(key, now_ms) {
         Ok(Some(sref)) => {
             let mut v = sref.members();

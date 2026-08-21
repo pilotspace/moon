@@ -322,6 +322,42 @@ entries:
     policy: type_only
     contexts: [standalone, pipeline]
 
+  # ── SCAN-family options (moon#630) ────────────────────────────────────
+  # `HSCAN ... NOVALUES` was accepted and DROPPED: the reply carried the
+  # field/value interleave, which a client that passed NOVALUES reads as four
+  # field names. `sorted` because the whole point is the element LIST and not
+  # just its type — the hash is seeded here so the CONTENTS are deterministic,
+  # while the order two servers walk a hash in is not.
+  - name: scan_hscan_novalues
+    setup: ["DEL cm:h", "HSET cm:h f1 v1 f2 v2"]
+    command: "HSCAN cm:h 0 NOVALUES"
+    policy: sorted
+
+  # The refusals. An unknown option used to be swallowed by all four commands,
+  # which is what kept the NOVALUES drop invisible — it was never
+  # "unimplemented and rejected", it was silently agreed to.
+  - name: scan_hscan_unknown_option_is_refused
+    setup: ["DEL cm:h2", "HSET cm:h2 f v"]
+    command: "HSCAN cm:h2 0 BOGUSTOKEN"
+    policy: exact
+
+  - name: scan_novalues_names_hscan_on_the_wrong_command
+    setup: ["DEL cm:s", "SADD cm:s a"]
+    command: "SSCAN cm:s 0 NOVALUES"
+    policy: exact
+
+  - name: scan_count_zero_is_a_syntax_error
+    command: "SCAN 0 COUNT 0"
+    policy: exact
+
+  - name: scan_count_non_numeric_is_the_integer_error
+    command: "SCAN 0 COUNT abc"
+    policy: exact
+
+  - name: scan_unknown_type_name_is_not_an_error
+    command: "SCAN 0 TYPE nosuchtype"
+    policy: type_only
+
   - name: identity_command_getkeys
     command: "COMMAND GETKEYS MSET k1 v1 k2 v2"
     policy: exact

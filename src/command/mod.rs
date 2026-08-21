@@ -21,6 +21,7 @@ pub mod list;
 pub mod metadata;
 pub mod mq;
 pub mod persistence;
+pub mod scan_options;
 pub mod server_admin;
 pub mod set;
 pub mod sorted_set;

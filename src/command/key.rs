@@ -1131,42 +1131,17 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     // non-empty keyspace.
     let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
-    // Parse optional arguments
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-    let mut type_filter: Option<&[u8]> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        let opt = match extract_key(&args[i]) {
-            Some(o) => o,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_key(&args[i]);
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(c) = parse_int(&args[i]) {
-                    if c > 0 {
-                        count = c as usize;
-                    }
-                }
-            }
-        } else if opt.eq_ignore_ascii_case(b"TYPE") {
-            i += 1;
-            if i < args.len() {
-                type_filter = extract_key(&args[i]);
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options`.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Keyspace,
+        &args[1..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
+    let type_filter = opts.type_filter;
 
     let now_ms = db.now_ms();
     scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
@@ -1479,41 +1454,17 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     // non-empty keyspace.
     let cursor = cursor & 0x0000_FFFF_FFFF_FFFF;
 
-    let mut match_pattern: Option<&[u8]> = None;
-    let mut count: usize = 10;
-    let mut type_filter: Option<&[u8]> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        let opt = match extract_key(&args[i]) {
-            Some(o) => o,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"MATCH") {
-            i += 1;
-            if i < args.len() {
-                match_pattern = extract_key(&args[i]);
-            }
-        } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            if i < args.len() {
-                if let Some(c) = parse_int(&args[i]) {
-                    if c > 0 {
-                        count = c as usize;
-                    }
-                }
-            }
-        } else if opt.eq_ignore_ascii_case(b"TYPE") {
-            i += 1;
-            if i < args.len() {
-                type_filter = extract_key(&args[i]);
-            }
-        }
-        i += 1;
-    }
+    // One parser for the whole family — see `command::scan_options`.
+    let opts = match crate::command::scan_options::parse_scan_options(
+        crate::command::scan_options::ScanKind::Keyspace,
+        &args[1..],
+    ) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let match_pattern = opts.pattern;
+    let count = opts.count;
+    let type_filter = opts.type_filter;
 
     scan_core(db, cursor, count, match_pattern, type_filter, now_ms)
 }
