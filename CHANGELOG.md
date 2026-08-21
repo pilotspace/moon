@@ -202,6 +202,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Restarts inside a test keep the original port deliberately — that is the point of a crash-recovery
   test, and by then the port's previous owner is dead.
+- **Two cluster nodes could silently share one client port** (#505). `cluster_client_bootstrap.rs`
+  and `cluster_formation.rs` each carried their own `reserve_cluster_ports`, which probed candidates
+  by binding them, pushed the listeners into a local `held` vec — and then `return`ed, dropping every
+  listener before any moon process bound the port. The scan was also unbounded
+  (`(start..40000).step_by(3)` inside a nominally 300-port window), so a test whose window was busy
+  walked into its neighbour's window by construction.
+
+  moon's client listeners use `SO_REUSEPORT`: a second node on an already-taken port binds
+  **successfully** and the kernel splits incoming connections between the two. A client that
+  connected to what it believed was node A intermittently reached node B, which reset it — no bind
+  error, no log, no panic. `cluster_client_bootstrap` flaked at 25–33% per run, with a different
+  test failing each time.
+
+  Replaced both copies with `common::reserve_cluster_port` + `common::spawn_listening_cluster`. The
+  reservation records the client port AND its `+10000` bus sibling in the same process-wide dedup set
+  `reserve_port` already used, draws client ports from `[20000, 22700)` so the bus space
+  `[30000, 32700)` neither overlaps it nor reaches Linux's ephemeral floor (32768), and panics when its own 100-candidate window is exhausted
+  instead of wandering. The spawn helper adds a post-accept liveness window: moon's cluster bus binds
+  *plainly* and `main.rs` exits(1) on `EADDRINUSE` by design, so the loser of a cross-process client
+  port collision dies on its own and is respawned on a fresh pair.
+
+  The fix the issue proposed — hold the probe listeners until the child has bound — is not available:
+  a plain listener held by the test is exactly what prevents a `SO_REUSEPORT` socket from binding
+  that port. In-process collisions are closed by construction; the cross-process residue is narrowed,
+  not eliminated, and the helper says so.
 
 - **Eighteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
   `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`,
