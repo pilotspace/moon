@@ -68,7 +68,7 @@ pub fn getbit_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
 
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(data) => {
                 if byte_idx >= data.len() {
@@ -262,7 +262,7 @@ pub fn bitcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("BITCOUNT"),
     };
 
-    let data = match db.get_if_alive(key, now_ms) {
+    let data = match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => v.to_vec(),
             None => {
@@ -620,7 +620,7 @@ pub fn bitpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
 
     let data_owned;
-    let data: &[u8] = match db.get_if_alive(key, now_ms) {
+    let data: &[u8] = match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => {
                 data_owned = v.to_vec();

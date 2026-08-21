@@ -723,7 +723,7 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("OBJECT"),
     };
     if subcommand.eq_ignore_ascii_case(b"ENCODING") {
-        match db.get_if_alive(key, now_ms) {
+        match db.get_if_alive_any_plane(key, now_ms) {
             Some(entry) => {
                 let encoding = entry.value.as_redis_value().encoding_name();
                 Frame::BulkString(Bytes::from(encoding))
@@ -731,13 +731,13 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => Frame::Null,
         }
     } else if subcommand.eq_ignore_ascii_case(b"FREQ") {
-        match db.get_if_alive(key, now_ms) {
+        match db.get_if_alive_any_plane(key, now_ms) {
             Some(entry) => Frame::Integer(entry.access_counter() as i64),
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
         }
     } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
         let now = db.now();
-        match db.get_if_alive(key, now_ms) {
+        match db.get_if_alive_any_plane(key, now_ms) {
             Some(entry) => {
                 let last = entry.last_access();
                 // Full u32 epoch-seconds delta; saturate rather than wrap if
@@ -748,7 +748,7 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
         }
     } else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
-        match db.get_if_alive(key, now_ms) {
+        match db.get_if_alive_any_plane(key, now_ms) {
             // Moon doesn't use reference counting — always return 1
             Some(_) => Frame::Integer(1),
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
@@ -1365,7 +1365,7 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1392,7 +1392,7 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1419,7 +1419,7 @@ pub fn type_cmd_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TYPE"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         None => Frame::SimpleString(Bytes::from_static(b"none")),
         Some(entry) => {
             let type_name = entry.value.type_name();

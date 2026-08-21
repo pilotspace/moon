@@ -15,6 +15,44 @@ use crate::storage::stream::Stream as StreamData;
 
 use crate::storage::db::{Database, entry_overhead, list_elem_cost};
 
+/// A live entry sourced from either storage plane (moon#610).
+///
+/// The hot plane hands back a borrow; the cold plane has to materialise the
+/// value, so it hands back an owned `Entry`. Both answer [`Self::entry`],
+/// which is all a read-only command needs — and making the two planes
+/// indistinguishable at the call site is the point: the bug this type exists
+/// to prevent was twenty-five call sites that silently saw only one of them.
+pub enum EntryView<'a> {
+    /// Resident in the hot plane.
+    Hot(&'a Entry),
+    /// Materialised from the cold tier. NOT inserted into the hot plane.
+    Cold(Entry),
+}
+
+impl EntryView<'_> {
+    /// The entry, whichever plane it came from.
+    #[inline]
+    pub fn entry(&self) -> &Entry {
+        match self {
+            Self::Hot(e) => e,
+            Self::Cold(e) => e,
+        }
+    }
+}
+
+/// Deref so a call site that already had an `&Entry` keeps reading exactly as
+/// it did. That keeps the moon#610 conversion a one-word rename per handler
+/// rather than a rewrite of ten command bodies — the smallest diff that can
+/// carry the fix, and the one least likely to change a behaviour by accident.
+impl std::ops::Deref for EntryView<'_> {
+    type Target = Entry;
+
+    #[inline]
+    fn deref(&self) -> &Entry {
+        self.entry()
+    }
+}
+
 impl Database {
     // ── W5: generic typed accessors ─────────────────────────────────────
     //
@@ -441,12 +479,69 @@ impl Database {
 
     /// Read-only get: checks expiry, returns None if expired, but does NOT
     /// remove expired keys or touch LRU. Used with RwLock read path.
+    ///
+    /// **HOT PLANE ONLY.** A key that eviction spilled to the cold tier is
+    /// absent from `data` and this returns `None` for it — indistinguishable
+    /// from "no such key". Any command that would answer differently for a
+    /// tiered key than for a missing one must use
+    /// [`Self::get_if_alive_any_plane`] instead (moon#610).
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
         let entry = self.data.get(key)?;
         if entry.is_expired_at(now_ms) {
             return None;
         }
         Some(entry)
+    }
+
+    /// [`Self::get_if_alive`], but ALSO consulting the cold tier (moon#610).
+    ///
+    /// `get_if_alive` probes only the hot plane, so every read-only command
+    /// built on it answered as though a TIERED key did not exist: measured on
+    /// one instance with identical values and TTLs, `STRLEN` said 0, `TYPE`
+    /// said `none`, `TTL` said -2 and `MGET` said nil for a key `EXISTS`
+    /// answered 1 for and `GET` served in full. `0` and `-2` are exactly what
+    /// a MISSING key returns, so nothing let a client tell the two apart.
+    ///
+    /// Only `get_readonly` had a cold fallback, hand-written at its own call
+    /// site; the other twenty-five call sites did not, and nothing failed.
+    /// That is why the fallback belongs to the accessor: a per-call-site one
+    /// is how this drifted in the first place.
+    ///
+    /// The cold entry is materialised, NOT promoted — `&self` cannot mutate
+    /// the hot plane, and promotion here would also make a read path
+    /// allocate into the keyspace. The same choice `get_ref_if_alive`
+    /// already makes for typed collection access.
+    ///
+    /// WARNING: inherits [`Self::get_cold_value`]'s synchronous disk read on
+    /// a cold hit. Callers on the shard event loop must have released any
+    /// shard guard first — identical to the existing typed-access path.
+    pub fn get_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired_at(now_ms) {
+                return None;
+            }
+            return Some(EntryView::Hot(entry));
+        }
+        // The in-flight spill plane FIRST (#459): a key mid-spill has left
+        // hot RAM but has no `cold_index` entry yet, and this is the only
+        // accessor that hands it back as a whole `Entry` — deadline included.
+        // Reaching it through `get_cold_value` instead yields the value with
+        // the TTL dropped, so `TTL` answers -1 ("no expiry") for a key written
+        // with `EX`: a different wrong answer, not a fix. Measured, not feared.
+        if let Some(entry) = self.spill_inflight_entry(key, now_ms) {
+            return Some(EntryView::Cold(entry));
+        }
+        let value = self.get_cold_value(key, now_ms)?;
+        let mut entry = Entry::new_string(bytes::Bytes::new());
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
+        // Settled in the cold tier: the deadline rides in the cold index, so
+        // restoring it costs no extra disk read.
+        if let Some((loc, _)) = self.cold_lookup_location(key) {
+            if let Some(ttl) = loc.ttl_ms {
+                entry.set_expires_at_ms(ttl);
+            }
+        }
+        Some(EntryView::Cold(entry))
     }
 
     /// Read-only cold storage lookup for evicted keys.

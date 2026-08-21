@@ -156,7 +156,7 @@ pub fn getrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             ));
         }
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => getrange_slice(v, start, end),
             None => Frame::Error(Bytes::from_static(
@@ -391,7 +391,7 @@ pub fn mget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 continue;
             }
         };
-        match db.get_if_alive(key, now_ms) {
+        match db.get_if_alive_any_plane(key, now_ms) {
             Some(entry) => match entry.value.as_bytes_owned() {
                 Some(v) => results.push(Frame::BulkString(v)),
                 None => results.push(Frame::Null),
@@ -411,7 +411,7 @@ pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("STRLEN"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => Frame::Integer(v.len() as i64),
             None => Frame::Error(Bytes::from_static(

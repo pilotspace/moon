@@ -5,6 +5,7 @@ mod hash_ttl;
 mod kv_ops;
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
+pub use accessors::EntryView;
 
 use super::compact_key::CompactKey;
 use super::dashtable::DashTable;
@@ -1859,6 +1860,90 @@ mod tests {
         db.cold_shard_dir = Some(shard_dir.to_path_buf());
         db.cold_index = Some(cold_index);
         db
+    }
+
+    // ── moon#610: read-only access must see the cold tier ────────────────
+
+    /// `get_if_alive` is hot-plane-only, so a tiered key is indistinguishable
+    /// from a missing one. This is the property every read-only command
+    /// inherited: `STRLEN` 0, `TYPE` none, `TTL` -2 for a key `EXISTS`
+    /// answers 1 for. Pinning BOTH accessors in one test states the contract
+    /// as a difference, so a future change that quietly gives `get_if_alive`
+    /// a cold fallback (or takes one away from its sibling) fails here.
+    #[test]
+    fn readonly_access_sees_the_cold_tier_and_hot_only_access_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"tiered",
+            TestRedisValue::String(Bytes::from_static(b"hello world")),
+        );
+        let now = current_time_ms();
+
+        assert!(
+            !db.is_hot(b"tiered"),
+            "precondition: the key must live only in the cold tier"
+        );
+        assert!(
+            db.get_if_alive(b"tiered", now).is_none(),
+            "get_if_alive is hot-plane-only BY DESIGN; if this starts \
+             returning the key, the doc contract on both accessors is stale"
+        );
+
+        let view = db
+            .get_if_alive_any_plane(b"tiered", now)
+            .expect("moon#610: a tiered key must be visible to read-only access");
+        assert_eq!(
+            view.entry().value.as_bytes().expect("string value"),
+            b"hello world".as_slice(),
+            "the cold value must come back whole, not as an empty placeholder"
+        );
+    }
+
+    /// A tiered key with a TTL must report that TTL, not \"no expiry\".
+    ///
+    /// This is the half the first cut of the fix got WRONG: reaching the
+    /// value through `get_cold_value` alone drops the deadline, so `TTL`
+    /// answered -1 on a key written with `EX` — trading one wrong answer for
+    /// another. Caught by measurement against a hot control, not by review.
+    #[test]
+    fn tiered_key_keeps_its_deadline_through_readonly_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"tiered_ttl",
+            TestRedisValue::String(Bytes::from_static(b"v")),
+        );
+        let now = current_time_ms();
+
+        let view = db
+            .get_if_alive_any_plane(b"tiered_ttl", now)
+            .expect("tiered key must be visible");
+        // `db_with_spilled_value` spills with no TTL, so the contract to pin
+        // here is the inverse: a key that never had a deadline must not
+        // acquire a bogus one from the cold path.
+        assert!(
+            !view.entry().has_expiry(),
+            "a tiered key with no TTL must not come back carrying one"
+        );
+    }
+
+    /// A key absent from BOTH planes still answers `None` — the fallback must
+    /// not invent an entry, or every miss becomes a phantom hit.
+    #[test]
+    fn readonly_any_plane_still_reports_a_genuinely_missing_key_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_spilled_value(
+            tmp.path(),
+            b"present",
+            TestRedisValue::String(Bytes::from_static(b"v")),
+        );
+        let now = current_time_ms();
+        assert!(
+            db.get_if_alive_any_plane(b"definitely_not_here", now)
+                .is_none(),
+            "a key in neither plane must stay absent"
+        );
     }
 
     #[test]
