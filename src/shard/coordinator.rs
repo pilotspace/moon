@@ -2021,6 +2021,122 @@ pub async fn coordinate_dbsize(
     Frame::Integer(total)
 }
 
+/// Coordinate RANDOMKEY across all shards.
+///
+/// Asks every shard for BOTH its key count and one random key of its own, then
+/// draws a shard with probability proportional to its count.
+///
+/// The count is what makes the draw key-weighted rather than shard-weighted.
+/// Before moon#629 RANDOMKEY was not in this coordinator at all: it answered
+/// from whichever shard the connection happened to sit on, so it returned Null
+/// while `DBSIZE` reported keys and could never name a key any other shard
+/// owned. Picking a shard *uniformly* would only soften that — Null with
+/// probability `empty_shards / N`, and an over-sample of whichever shard holds
+/// fewest keys. `{hash tag}` co-location makes unequal shards the normal case,
+/// not the pathological one.
+///
+/// Two messages per remote shard, issued back to back and awaited together, so
+/// the latency is one round trip. RANDOMKEY is an introspection command; it is
+/// not on any hot path.
+pub async fn coordinate_randomkey(
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    _shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
+) -> Frame {
+    use rand::RngExt;
+
+    // (key count, that shard's own candidate), local shard first.
+    let mut per_shard: Vec<(u64, Option<Bytes>)> = Vec::with_capacity(num_shards);
+    per_shard.push(crate::shard::slice::with_shard_db(db_index, |db| {
+        // `logical_len` counts hot + cold and `random_key` samples that same
+        // union (#364), so the weight and the candidate describe one keyspace.
+        // Reading both under one borrow also keeps them consistent with each
+        // other: a shard cannot report `n > 0` and no candidate spuriously.
+        (db.logical_len() as u64, db.random_key())
+    }));
+
+    let mut pending: Vec<(channel::OneshotReceiver<Frame>, channel::OneshotReceiver<Frame>)> =
+        Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (size_tx, size_rx) = channel::oneshot();
+        let (key_tx, key_rx) = channel::oneshot();
+        for (cmd, reply_tx) in [
+            (&b"DBSIZE"[..], size_tx),
+            (&b"RANDOMKEY"[..], key_tx),
+        ] {
+            let msg = ShardMessage::Execute {
+                db_index,
+                command: std::sync::Arc::new(Frame::Array(framevec![Frame::BulkString(
+                    Bytes::from_static(cmd)
+                )])),
+                // Never a script: this fan-out builds its own keyspace
+                // command. Fail-closed anyway (moon#569).
+                script_acl: crate::acl::ScriptAcl::deny(),
+                reply_tx,
+            };
+            let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        }
+        pending.push((size_rx, key_rx));
+    }
+
+    for (size_rx, key_rx) in pending {
+        let count = match recv_reply_bounded(size_rx).await {
+            Ok(Frame::Integer(n)) if n > 0 => n as u64,
+            Ok(_) => 0,
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during RANDOMKEY",
+                ));
+            }
+        };
+        let candidate = match recv_reply_bounded(key_rx).await {
+            Ok(Frame::BulkString(key)) => Some(key),
+            Ok(_) => None,
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during RANDOMKEY",
+                ));
+            }
+        };
+        per_shard.push((count, candidate));
+    }
+
+    let total: u64 = per_shard.iter().map(|(n, _)| *n).sum();
+    if total > 0 {
+        let mut pick = rand::rng().random_range(0..total);
+        for (count, candidate) in &per_shard {
+            if pick < *count {
+                if let Some(key) = candidate {
+                    return Frame::BulkString(key.clone());
+                }
+                break;
+            }
+            pick -= *count;
+        }
+    }
+
+    // Reached when the weighted draw landed on a shard whose own reply came
+    // back empty — its last key expired or was deleted between the two
+    // replies — or when every count was zero but some shard answered anyway
+    // (a key created in that same window). Answering Null here with a live
+    // key in hand would recreate the exact defect this coordinator closes, so
+    // take any candidate that exists. Null is correct only when NO shard
+    // produced one.
+    for (_, candidate) in &per_shard {
+        if let Some(key) = candidate {
+            return Frame::BulkString(key.clone());
+        }
+    }
+    Frame::Null
+}
+
 /// Gather per-db `(keys, expires)` across ALL shards for `INFO # Keyspace`.
 ///
 /// Element-wise sum of each shard's per-db counter vector (a key lives on

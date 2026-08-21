@@ -1207,6 +1207,37 @@ if [[ "$SHARDS" -gt 1 ]]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# moon#629: RANDOMKEY must sample the keyspace, not the serving shard
+# ---------------------------------------------------------------------------
+#
+# moon-only: Redis has one keyspace, so there is nothing to diverge. Before the
+# fix RANDOMKEY was absent from the cross-shard coordinator and answered from
+# whichever shard the connection landed on, so with ONE key in the db it
+# returned Null on every connection that did not land on that key's owner --
+# about (SHARDS-1)/SHARDS of them -- while DBSIZE reported the key.
+#
+# One key, N fresh connections, is the discriminating form: each `redis-cli`
+# invocation opens its own connection and SO_REUSEPORT spreads those across the
+# shards, so a shard-local answer shows up as a run of empty replies. A probe
+# with many keys would NOT discriminate: the spread across connections alone
+# would produce a healthy-looking mix of names even while every single reply
+# came from one shard.
+#
+# db 9 so the sweep neither sees nor disturbs the keys the rest of this script
+# is asserting on.
+redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
+redis-cli -p "$PORT_RUST" -n 9 SET rk:solo v &>/dev/null || true
+rk_size=$(redis-cli -p "$PORT_RUST" -n 9 DBSIZE 2>&1 | grep -oE '[0-9]+') || true
+rk_miss=0
+for _ in $(seq 1 20); do
+    rk_got=$(redis-cli -p "$PORT_RUST" -n 9 RANDOMKEY 2>&1)
+    [[ "$rk_got" == "rk:solo" ]] || rk_miss=$((rk_miss + 1))
+done
+assert_eq "moon#629 DBSIZE sees the one key (shards=$SHARDS)" "1" "$rk_size"
+assert_eq "moon#629 RANDOMKEY never misses the only key (shards=$SHARDS)" "0" "$rk_miss"
+redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
+
 route_probe lmpop      "RPUSH %K v1"                 "LMPOP 1 %K LEFT"
 route_probe zmpop      "ZADD %K 1 m"                 "ZMPOP 1 %K MIN"
 route_probe sintercard "SADD %K a b"                 "SINTERCARD 1 %K"

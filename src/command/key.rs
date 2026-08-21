@@ -2626,6 +2626,44 @@ mod tests {
         }
     }
 
+    /// moon#629: consecutive draws must not collapse onto one key.
+    ///
+    /// `random_key` used to index with `current_time_ms() % total`, so every
+    /// call inside the same millisecond returned the SAME key — a client
+    /// polling RANDOMKEY (the normal way to sample a keyspace) saw roughly one
+    /// distinct name per millisecond of wall time however fast it asked. A
+    /// live server measured 10 distinct keys of 64 across 300 draws in 17 ms;
+    /// with the thread RNG it reaches 62.
+    ///
+    /// The bound is deliberately loose (a fair draw over 64 keys reaches ~63
+    /// here, and even a poor RNG clears 20) so the test pins the DEFECT, not a
+    /// particular RNG's quality — it cannot flake on an unlucky sample.
+    #[test]
+    fn randomkey_does_not_repeat_within_a_millisecond() {
+        let mut db = Database::new();
+        for i in 0..64u32 {
+            db.set(
+                Bytes::from(format!("k{i}")),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..300 {
+            match randomkey(&mut db, &[]) {
+                Frame::BulkString(k) => {
+                    seen.insert(k);
+                }
+                other => panic!("RANDOMKEY on a 64-key db answered {other:?}"),
+            }
+        }
+        assert!(
+            seen.len() > 20,
+            "300 draws over 64 keys reached only {} distinct keys — RANDOMKEY \
+             is not drawing at random",
+            seen.len()
+        );
+    }
+
     #[test]
     fn test_touch() {
         let mut db = setup_db_with_key(b"a", b"1");

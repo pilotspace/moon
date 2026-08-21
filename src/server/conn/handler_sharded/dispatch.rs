@@ -1,6 +1,6 @@
 //! Connection-level command dispatchers: CLIENT subcommands, CONFIG, SLOWLOG,
 //! REPLICAOF/REPLCONF, INFO, READONLY, BGSAVE/SAVE/LASTSAVE/BGREWRITEAOF,
-//! cross-shard KEYS/SCAN/DBSIZE.
+//! cross-shard KEYS/SCAN/DBSIZE/RANDOMKEY.
 //!
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
@@ -506,7 +506,7 @@ pub(super) async fn try_handle_shutdown(
     ShutdownOutcome::Exiting
 }
 
-/// Handle cross-shard KEYS, SCAN, DBSIZE aggregation.
+/// Handle cross-shard KEYS, SCAN, DBSIZE, RANDOMKEY, HOTKEYS aggregation.
 /// Returns `true` if consumed.
 pub(super) async fn try_handle_cross_shard_scan(
     cmd: &[u8],
@@ -564,6 +564,23 @@ pub(super) async fn try_handle_cross_shard_scan(
             &(),
         )
         .await;
+        responses.push(response);
+        return true;
+    }
+    if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
+        let mut response = crate::shard::coordinator::coordinate_randomkey(
+            ctx.shard_id,
+            ctx.num_shards,
+            conn.selected_db,
+            &ctx.shard_databases,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
+            &(),
+        )
+        .await;
+        if let Some(ws_id) = conn.workspace_id.as_ref() {
+            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+        }
         responses.push(response);
         return true;
     }
