@@ -1926,6 +1926,9 @@ impl super::Shard {
                         shard_id,
                         cached_clock.ms(),
                         &pubsub_arc,
+                        &remote_sub_map_arc,
+                        &dispatch_tx,
+                        &all_notifiers,
                     );
                 }
                 // Background eviction timer + memory pressure cascade
@@ -2617,6 +2620,9 @@ impl super::Shard {
                         shard_id,
                         cached_clock.ms(),
                         &pubsub_arc,
+                        &remote_sub_map_arc,
+                        &dispatch_tx,
+                        &all_notifiers,
                     );
                 }
                 // WAL fsync + P6 ceiling-trigger + MVCC sweep: every 1s (1000 ticks).

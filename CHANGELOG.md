@@ -165,6 +165,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A fired MQ trigger reached only subscribers that happened to land on the queue's home shard**
+  (#474). `fire_pending_mq_triggers` delivered its callback notification with a single
+  `publish_shared` into the shard's OWN pub/sub registry. Triggers do fire on the queue's home shard
+  — a hash tag routes every workspace key there — but that is a fact about the KEY, not about the
+  SUBSCRIBER: a consumer that subscribes to `mq:trigger:<queue>` lands on whichever shard accepted
+  its connection, and moon keeps one registry per shard. So a consumer was woken only when it had
+  connected to the right shard: always at `--shards 1`, roughly a 1-in-N chance at `--shards N`.
+  Silent by construction — `publish_shared` returns a subscriber count of 0 and the path only
+  `debug!`s it, so a durable-queue consumer simply never woke, with no error and no metric. The
+  trigger now goes out through the same fan-out `PUBLISH` uses (local registry + the
+  remote-subscriber map + one batched `NotifyPublish` per target shard), extracted as
+  `notify_fanout::publish_fanout` so keyspace notifications and MQ triggers share one copy of the
+  rule rather than growing a second. Measured at `--shards 4` with eight queues and one subscriber
+  connection: 4 of 8 delivered before, 8 of 8 after (0 of 8 before under the tokio runtime).
+
 - **`XREADGROUP` across shards claimed entries it never delivered** (#605). moon routes a command to
   ONE shard and that shard runs the whole command against its own slice, so the other streams of a
   multi-stream read are invisible — read as "does not exist". For `XREAD` that was an under-read.
