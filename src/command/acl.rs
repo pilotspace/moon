@@ -46,6 +46,74 @@ pub fn handle_acl(
     match sub.as_str() {
         "WHOAMI" => Frame::BulkString(Bytes::copy_from_slice(current_user.as_bytes())),
 
+        // moon#640. `LIST` already walks this table and renders each user as a
+        // full ACL rule line; `USERS` is the same walk rendering only the name.
+        // Sorted, because `list_users` sorts — a client diffing the set across
+        // calls should not see order churn.
+        "USERS" => {
+            let Ok(table) = acl_table.read() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+            };
+            let names: Vec<Frame> = table
+                .list_users()
+                .iter()
+                .map(|u| Frame::BulkString(Bytes::copy_from_slice(u.username.as_bytes())))
+                .collect();
+            Frame::Array(names.into())
+        }
+
+        // moon#640. Until now the unknown-subcommand error below said
+        // "Try ACL HELP." while `HELP` was itself unknown — the error pointed
+        // the reader at the one subcommand that did not exist.
+        //
+        // This text advertises ONLY what Moon dispatches. Redis 8.6.1 also
+        // lists `DRYRUN`, which Moon does not implement; advertising it would
+        // reproduce the same defect one level up, so it is omitted rather than
+        // listed. `au6` walks every name in this array and asserts it
+        // dispatches, so the two cannot drift.
+        "HELP" => {
+            const LINES: [&str; 22] = [
+                "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "CAT [<category>]",
+                "    List all commands that belong to <category>, or all command categories",
+                "    when no category is specified.",
+                "DELUSER <username> [<username> ...]",
+                "    Delete a list of users.",
+                "GETUSER <username>",
+                "    Get the user's details.",
+                "GENPASS [<bits>]",
+                "    Generate a secure 256-bit user password. The optional `bits` argument can",
+                "    be used to specify a different size.",
+                "LIST",
+                "    Show users details in config file format.",
+                "LOAD",
+                "    Reload users from the ACL file.",
+                "LOG [<count> | RESET]",
+                "    Show the ACL log entries.",
+                "SAVE",
+                "    Save the current config to the ACL file.",
+                "SETUSER <username> <attribute> [<attribute> ...]",
+                "    Create or modify a user with the specified attributes.",
+                "USERS",
+            ];
+            let mut out: Vec<Frame> = LINES
+                .iter()
+                .map(|l| Frame::SimpleString(Bytes::from_static(l.as_bytes())))
+                .collect();
+            out.push(Frame::SimpleString(Bytes::from_static(
+                b"    List all the registered usernames.",
+            )));
+            out.push(Frame::SimpleString(Bytes::from_static(b"WHOAMI")));
+            out.push(Frame::SimpleString(Bytes::from_static(
+                b"    Return the current connection username.",
+            )));
+            out.push(Frame::SimpleString(Bytes::from_static(b"HELP")));
+            out.push(Frame::SimpleString(Bytes::from_static(
+                b"    Print this help.",
+            )));
+            Frame::Array(out.into())
+        }
+
         "LIST" => {
             let Ok(table) = acl_table.read() else {
                 return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));

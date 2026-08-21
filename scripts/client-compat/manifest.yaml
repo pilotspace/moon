@@ -334,6 +334,43 @@ entries:
     command: "XINFO GROUPS shp:st"
     policy: type_only
 
+  # ── ACL / AUTH surface (moon#640) ─────────────────────────────────────
+  # Neither server has a password configured in this harness, which is
+  # precisely the state the AUTH case is about: `AUTH <pw>` used to answer
+  # `+OK` on Moon, so a client probing "does this server require auth?" was
+  # told yes-and-you-are-in on a wide-open server. Both now answer the same
+  # error, byte for byte, so this is an `exact` live assertion.
+  #
+  # `standalone, pipeline` only — inside MULTI, `AUTH` is a member of the
+  # transaction-queueing bypass class tracked by moon#639 (it answers inline
+  # instead of `+QUEUED`), which has nothing to do with the reply itself.
+  - name: auth_without_password_configured
+    command: "AUTH probe-only-not-a-real-credential"
+    policy: exact
+    contexts: [standalone, pipeline]
+
+  - name: acl_users_lists_registered_usernames
+    command: "ACL USERS"
+    policy: sorted
+    contexts: [standalone, pipeline]
+
+  - name: acl_help_is_not_a_missing_subcommand
+    command: "ACL HELP"
+    policy: type_only
+    contexts: [standalone, pipeline]
+    expect_diff:
+      reason: >-
+        FIXED in moon#640 to the extent Moon can: `ACL HELP` was unimplemented
+        while Moon's OWN unknown-subcommand error said "Try ACL HELP.",
+        pointing the reader at the one subcommand that did not exist. Both
+        servers now answer an array of help lines. The remaining divergence is
+        exactly two lines: Redis 8.6.1 advertises `DRYRUN`, which Moon does not
+        implement. Listing it would reproduce the same defect one level up — a
+        help text naming a subcommand that does not dispatch — so it is
+        omitted. Every name Moon's help DOES advertise is asserted to dispatch
+        by acl_auth_surface::au6.
+        Owner: acl-dryrun (unfiled; add DRYRUN, then drop this waiver).
+
   - name: shapes_command_docs
     command: "COMMAND DOCS GET"
     policy: type_only

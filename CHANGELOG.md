@@ -164,6 +164,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **`AUTH <password>` answered `+OK` on a server with no password configured** (#640). That is the
+  standard probe for "does this server require authentication?", so a deployment that MEANT to set
+  `requirepass` and did not looked correctly secured from the client side. The single-argument form
+  is now refused when the `default` user carries `nopass`, in Redis 8.6.1's exact wording:
+
+  ```text
+                              before          after / redis 8.6.1
+  AUTH wrongpass              +OK             -ERR AUTH <password> called without any password
+                                               configured for the default user. Are you sure your
+                                               configuration is correct?
+  AUTH default anything       +OK             +OK          (default is nopass -- redis agrees)
+  AUTH <user> <wrong>         WRONGPASS       WRONGPASS    (unchanged)
+  ```
+
+  Only the one-argument form changed. With `--requirepass` set, moon already matched redis
+  byte-for-byte on all three cases and still does — `acl_auth_surface::au4` is the control that
+  keeps the fix from becoming a regression on the path that was already correct.
+
+- **`ACL USERS` and `ACL HELP` were unimplemented** (#640) — and moon's own unknown-subcommand error
+  said `Try ACL HELP.`, pointing the reader at the one subcommand that did not exist. `ACL USERS`
+  now lists the registered usernames (the same sorted table walk `ACL LIST` already does, rendering
+  only the name). `ACL HELP` answers a help array that advertises **only what moon dispatches**:
+  Redis also lists `DRYRUN`, which moon does not implement, and listing it would reproduce the same
+  defect one level up. `acl_auth_surface::au6` walks every name in the help text and asserts it
+  dispatches, so the two cannot drift.
+
 
 - **`ACL GETUSER`, `XINFO GROUPS`, `COMMAND DOCS` and `COMMAND INFO` sent flat Arrays where RESP3
   Redis sends Maps and Sets** (#631). Unlike #462 no shared conversion could fix these: each reply

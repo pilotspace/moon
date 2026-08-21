@@ -884,6 +884,29 @@ pub fn auth_acl(
                     None,
                 );
             };
+            // moon#640: the single-argument form is refused outright when the
+            // `default` user carries `nopass` — i.e. no password is configured
+            // on this server. `table.authenticate` would return Some for ANY
+            // password in that state (that is what nopass means), so Moon
+            // answered `+OK` to `AUTH hunter2` on a wide-open server.
+            //
+            // `AUTH <pw>` returning OK is how a client, or a human, probes
+            // whether a server requires authentication. Answering OK told a
+            // deployment that MEANT to set `requirepass` and did not that it
+            // was correctly secured. Redis 8.6.1's wording is reproduced
+            // verbatim so a driver matching on the text keeps working.
+            //
+            // Deliberately only the ONE-argument form: `AUTH default <pw>`
+            // succeeds against a nopass default on redis too (measured), and
+            // `au2`/`au3` pin that.
+            if table.get_user("default").is_some_and(|u| u.nopass) {
+                return (
+                    Frame::Error(Bytes::from_static(
+                        b"ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
+                    )),
+                    None,
+                );
+            }
             match table.authenticate("default", &password) {
                 Some(username) => (
                     Frame::SimpleString(Bytes::from_static(b"OK")),
@@ -1806,10 +1829,39 @@ mod tests {
         std::sync::Arc::new(std::sync::RwLock::new(table))
     }
 
+    /// moon#640. This test previously asserted `+OK` — it PINNED the defect:
+    /// on a server with no password configured, `AUTH anypass` succeeded, so
+    /// the standard "does this server require auth?" probe answered
+    /// yes-and-you-are-in on a wide-open server. Redis 8.6.1 errors, and now
+    /// so does Moon.
     #[test]
-    fn test_auth_acl_1arg_nopass() {
+    fn test_auth_acl_1arg_nopass_is_refused() {
         let table = make_acl_table();
         let (resp, user) = auth_acl(&[Frame::BulkString(Bytes::from_static(b"anypass"))], &table);
+        assert!(
+            matches!(resp, Frame::Error(ref s) if s.starts_with(b"ERR AUTH <password> called without any password configured")),
+            "expected redis's no-password-configured error, got {resp:?}"
+        );
+        assert!(
+            user.is_none(),
+            "a refused AUTH must not adopt a user identity"
+        );
+    }
+
+    /// The other half of the same rule: the TWO-argument form still succeeds
+    /// against a nopass `default`, which is what redis answers too. Without
+    /// this, the fix above could be over-applied to both forms and nothing
+    /// would notice.
+    #[test]
+    fn test_auth_acl_2arg_nopass_default_still_succeeds() {
+        let table = make_acl_table();
+        let (resp, user) = auth_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"default")),
+                Frame::BulkString(Bytes::from_static(b"anypass")),
+            ],
+            &table,
+        );
         assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(user, Some("default".to_string()));
     }
