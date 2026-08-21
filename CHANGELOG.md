@@ -219,6 +219,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys whose NAMES differ in length. A hot-vs-hot control settles both — two resident keys differ
   by exactly the 1-byte name-length delta, and judged against its own TTL a tiered key's
   `EXPIRETIME - now` equals its `TTL` exactly, matching the hot control.
+- **The client-compat harness could test a binary that was not the code under test** (#461).
+  `MOON_BIN` defaulted to the first of `target/release/moon` / `target-fast/release-fast/moon`
+  that existed — which is `target/release/moon`, the one this repo explicitly quarantines, while
+  everyday work builds `release-fast`. The harness then reported the resulting divergences as
+  ordinary `FAIL`s with no hint that the binary was stale. Measured cost (2026-08-10, on a tree
+  where the fix was already green): `PASS=94 FAIL=32`, including a divergence from a function
+  deleted hours earlier; the same tree with `MOON_BIN` pinned gave `PASS=128 FAIL=0`. For a
+  harness whose entire value is being the trustworthy oracle-backed verifier, that is the one
+  failure mode it must not have.
+
+  Three changes: the default now resolves to the **newest** of the two build layouts rather than
+  the first found; the resolved path, build time and size are **always** printed before the spawn
+  (so a later crash still leaves the provenance on screen); and a binary older than the newest
+  `.rs` under `src/` warns loudly, or under `--strict` refuses with `ERR_STALE_BINARY` and exit 2.
+  That mirrors the existing `ERR_NO_ORACLE` rule — a differential harness with no oracle proves
+  nothing, and one testing the wrong binary is the same lie with extra steps. Non-strict warns
+  rather than blocks, because an intentionally older binary is a legitimate run (a bisect, or a
+  deliberately pinned `MOON_BIN`).
+
+  A source tree that cannot be scanned reports NOT stale rather than stale, so "unknown" never
+  masquerades as a verdict.
 
 - **`XREAD BLOCK` / `XREADGROUP BLOCK` were a silent no-op: never blocked, never woken** (#595).
   Both readers parsed `BLOCK`, stepped over its value with an `// ignored` comment, and answered

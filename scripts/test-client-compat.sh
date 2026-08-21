@@ -15,15 +15,22 @@
 #   scripts/test-client-compat.sh --filter zrandmember
 #
 # Env:
-#   MOON_BIN    moon binary under test (default: this checkout's release build)
+#   MOON_BIN    moon binary under test (default: the NEWEST of this checkout's
+#               target/release/moon and target-fast/release-fast/moon -- newest,
+#               not first-found, because target/release/moon is quarantined here
+#               while everyday work builds release-fast, so first-found picked
+#               the stale one by construction)
 #   REDIS_BIN   redis-server           (default: from PATH)
 #
 # Exit: 0 all passed or waived · 1 unwaived difference · 2 harness could not run
 #       (ERR_NO_ORACLE | ERR_NO_MOON | ERR_SERVER_TIMEOUT | ERR_BAD_MANIFEST |
-#        ERR_UNREASONED_WAIVER | ERR_STALE_WAIVER)
+#        ERR_UNREASONED_WAIVER | ERR_STALE_WAIVER | ERR_STALE_BINARY)
 #
 # A missing redis-server is a FAILURE, never a skip: a differential harness with
-# no oracle proves nothing, and a green skip would be a lie.
+# no oracle proves nothing, and a green skip would be a lie. For the same reason
+# the resolved binary's path and build time are ALWAYS printed, and a binary
+# older than the newest file under src/ warns (and under --strict refuses with
+# ERR_STALE_BINARY): testing the wrong binary is the same lie with extra steps.
 
 set -uo pipefail
 
