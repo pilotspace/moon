@@ -504,7 +504,7 @@ pub fn make_redis_call_fn(
             // that stronger rule would also catch a single-key write to an
             // undeclared remote key, and is a separate decision with a much
             // wider blast radius (tracked as a follow-up).
-            if let Some(err) = crate::server::conn::shared::cross_shard_write_rejection(
+            if let Some(err) = crate::server::conn::shared::cross_shard_multikey_rejection(
                 &cmd_bytes,
                 &frames[1..],
                 crate::command::connection::shard_count(),
