@@ -83,17 +83,23 @@ fn spec_frame(meta: &CommandMeta) -> Frame {
             cats.push(Frame::SimpleString(Bytes::from_static(name.as_bytes())));
         }
     }
+    // Five of the ten members are Sets on RESP3 — flags, acl-categories, tips,
+    // key-specs, subcommands — measured on redis 8.6.1. The row itself stays
+    // an Array. RESP2 clients are unaffected: the serializer downgrades a Set
+    // to an Array, which is exactly what they were already receiving
+    // (moon#631; item 3 of the `identity_command_info_known_and_unknown`
+    // client-compat waiver).
     Frame::Array(framevec![
         Frame::BulkString(Bytes::from(meta.name.to_ascii_lowercase())),
         Frame::Integer(meta.arity as i64),
-        Frame::Array(flags),
+        Frame::Set(flags),
         Frame::Integer(meta.first_key as i64),
         Frame::Integer(meta.last_key as i64),
         Frame::Integer(meta.step as i64),
-        Frame::Array(cats),
-        Frame::Array(framevec![]), // tips
-        Frame::Array(framevec![]), // key specs
-        Frame::Array(framevec![]), // subcommands
+        Frame::Set(cats),
+        Frame::Set(framevec![]), // tips
+        Frame::Set(framevec![]), // key specs
+        Frame::Set(framevec![]), // subcommands
     ])
 }
 
@@ -211,9 +217,21 @@ fn getkeys(argv: &[Frame]) -> Frame {
     Frame::Array(keys)
 }
 
-/// Minimal but SHAPE-correct docs: name followed by a map. Redis clients parse
-/// the shape to build help/command maps; thin summary text is acceptable, a
-/// wrong shape is not.
+/// One `COMMAND DOCS` entry: the lower-cased name, and the doc Map for it.
+///
+/// Minimal but SHAPE-correct. Redis clients parse the shape to build
+/// help/command maps; thin summary text is acceptable, a wrong shape is not.
+///
+/// `arity` is deliberately ABSENT. Redis carries arity in `COMMAND INFO` and
+/// never in `COMMAND DOCS` — measured on 8.6.1, whose doc map holds only
+/// summary, since, group, complexity and arguments. A client that builds its
+/// command table from `DOCS` reads by name, so a field Redis does not define
+/// there is not extra information; it is a field that means something else
+/// everywhere it does exist (moon#631).
+///
+/// `group`, `complexity` and `arguments` are not emitted either: Moon's
+/// registry does not carry them. Omitting a field it has no value for is the
+/// honest gap; inventing one is not.
 fn docs_for(meta: &CommandMeta) -> (Frame, Frame) {
     let arity_note = if meta.arity < 0 {
         format!("{} (variadic, minimum {})", meta.name, -meta.arity)
@@ -230,10 +248,6 @@ fn docs_for(meta: &CommandMeta) -> (Frame, Frame) {
             (
                 Frame::BulkString(Bytes::from_static(b"since")),
                 Frame::BulkString(Bytes::from_static(b"1.0.0")),
-            ),
-            (
-                Frame::BulkString(Bytes::from_static(b"arity")),
-                Frame::Integer(meta.arity as i64),
             ),
         ]),
     )
@@ -295,26 +309,26 @@ pub fn command(args: &[Frame]) -> Frame {
     }
 
     if sub.eq_ignore_ascii_case(b"DOCS") {
-        let mut out = crate::protocol::FrameVec::new();
+        // A Map keyed by command name, which is what redis 8.6.1 sends on
+        // RESP3; the serializer downgrades it to the flat `[name, doc, …]`
+        // array RESP2 clients expect, so this is one construction for both
+        // protocols (moon#631).
+        let mut out: Vec<(Frame, Frame)> = Vec::new();
         if args.len() == 1 {
-            out.reserve(COMMAND_META.len() * 2);
+            out.reserve(COMMAND_META.len());
             for meta in COMMAND_META.values() {
-                let (n, d) = docs_for(meta);
-                out.push(n);
-                out.push(d);
+                out.push(docs_for(meta));
             }
         } else {
             for a in &args[1..] {
                 if let Some(meta) = extract(a).and_then(|n| crate::command::metadata::lookup(&n)) {
-                    let (n, d) = docs_for(meta);
-                    out.push(n);
-                    out.push(d);
+                    out.push(docs_for(meta));
                 }
                 // Redis omits unknown names from DOCS entirely (unlike INFO,
                 // which is positional and uses a null element).
             }
         }
-        return Frame::Array(out);
+        return Frame::Map(out);
     }
 
     if sub.eq_ignore_ascii_case(b"GETKEYS") {
@@ -404,10 +418,19 @@ mod tests {
             !matches!(info[0], Frame::Null),
             "WATCH is dispatchable and ACL-categorised, so its spec must exist"
         );
-        let Frame::Array(docs) = command(&[bulk("DOCS"), bulk("WATCH")]) else {
-            panic!("COMMAND DOCS must be an array");
+        // A Map keyed by command name since moon#631 — that is what redis
+        // 8.6.1 sends on RESP3, and the serializer still hands RESP2 clients
+        // the flat `[name, doc]` pair this used to assert on directly.
+        let Frame::Map(docs) = command(&[bulk("DOCS"), bulk("WATCH")]) else {
+            panic!("COMMAND DOCS must be a map keyed by command name");
         };
-        assert_eq!(docs.len(), 2, "DOCS is a flat name/doc pair per command");
+        assert_eq!(docs.len(), 1, "one name -> doc entry per requested command");
+        assert_eq!(docs[0].0, bulk("watch"), "keyed by the lower-cased name");
+        assert!(
+            matches!(docs[0].1, Frame::Map(_)),
+            "each doc is itself a map: {:?}",
+            docs[0].1
+        );
     }
 
     #[test]

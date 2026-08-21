@@ -165,6 +165,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ACL GETUSER`, `XINFO GROUPS`, `COMMAND DOCS` and `COMMAND INFO` sent flat Arrays where RESP3
+  Redis sends Maps and Sets** (#631). Unlike #462 no shared conversion could fix these: each reply
+  is *built* by its own handler and the structures are nested rather than flat-to-map — `ACL
+  GETUSER` is a map whose values have per-key types, `XINFO GROUPS` an array OF maps, `COMMAND
+  DOCS` a map OF maps. The handlers now emit the right `Frame` and the serializer downgrades it
+  for RESP2, so one construction serves both protocols. Types swept on the wire against
+  redis-server 8.6.1:
+
+  ```text
+                       redis 8.6.1                              moon before
+  ACL GETUSER default  %{flags:~[…], passwords:*[], commands:$,  *[$,$, $,*[…], $,*[], $,*[$],
+                         keys:$, channels:$, selectors:*[]}         $,*[$], $,$]
+  XINFO GROUPS st      *[%{name:$, consumers::, pending::,       *[*[$,$,$,:,$,:,$,$]]
+                          last-delivered-id:$, entries-read:_,
+                          lag::}]
+  COMMAND DOCS GET     %{get:%{summary:$, since:$, …}}           *[$, %{summary:$, since:$, arity::}]
+  COMMAND INFO GET     *[*[$,:,~[…],:,:,:,~[…],~[],~[…],~[]]]    *[*[$,:,*[…],:,:,:,*[…],*[],*[],*[]]]
+  ```
+
+  Three of these carried **field-set** defects that a Map makes worse than the Array did, because
+  a client reads a map by name rather than by position — so the fields were corrected in the same
+  change, on both protocols:
+
+  ```text
+  ACL GETUSER    dropped `username`   Redis has not sent it since 7.0
+                 added `selectors`    was missing entirely; now the empty list Moon can honestly
+                                      report, so `.get("selectors")` means "none" not "unknown"
+                 keys, channels       ONE space-joined string each, not a list of patterns
+  XINFO GROUPS   added `entries-read` Null — Moon does not track it, and Redis sends Null itself
+                                      whenever it cannot determine the value
+                 added `lag`          computed by counting entries past the group's cursor
+  COMMAND DOCS   dropped `arity`      Redis puts arity in COMMAND INFO and never in DOCS
+  ```
+
+  `COMMAND INFO`'s Set-vs-Array halves were item (3) of the
+  `identity_command_info_known_and_unknown` client-compat waiver; that item is now retired and
+  pinned live instead. What remains waived there is content, not typing: Moon's registry carries
+  thin `acl_categories` and no key specs. `COMMAND DOCS` likewise still omits `group`,
+  `complexity` and `arguments`, which Moon's registry does not carry — omitting a field it has no
+  value for is the gap; inventing one is not.
+
 - **`RANDOMKEY` answered Null while `DBSIZE` reported keys, and never sampled more than one shard**
   (#629). It was missing from the cross-shard coordinator, so it read the shard the connection
   happened to sit on. With one key in the db that is deterministic — on `--shards 4`, three

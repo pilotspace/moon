@@ -93,24 +93,26 @@ pub fn handle_acl(
                         .iter()
                         .map(|h| Frame::BulkString(Bytes::from(format!("#{}", h))))
                         .collect();
-                    let keys: Vec<Frame> = user
+                    // Space-joined into ONE string below, the way Redis
+                    // sends them — collected as `String` here so the join is
+                    // the only place the wire form is decided.
+                    let keys: Vec<String> = user
                         .key_patterns
                         .iter()
                         .map(|kp| {
-                            let pat = if kp.read && kp.write {
+                            if kp.read && kp.write {
                                 format!("~{}", kp.pattern)
                             } else if kp.read {
                                 format!("%R~{}", kp.pattern)
                             } else {
                                 format!("%W~{}", kp.pattern)
-                            };
-                            Frame::BulkString(Bytes::from(pat))
+                            }
                         })
                         .collect();
-                    let channels: Vec<Frame> = user
+                    let channels: Vec<String> = user
                         .channel_patterns
                         .iter()
-                        .map(|cp| Frame::BulkString(Bytes::from(format!("&{}", cp))))
+                        .map(|cp| format!("&{}", cp))
                         .collect();
                     let commands = match &user.allowed_commands {
                         CommandPermissions::AllAllowed => "+@all".to_string(),
@@ -129,19 +131,54 @@ pub fn handle_acl(
                             parts.join(" ")
                         }
                     };
-                    Frame::Array(framevec![
-                        Frame::BulkString(Bytes::from_static(b"username")),
-                        Frame::BulkString(Bytes::from(user.username.clone())),
-                        Frame::BulkString(Bytes::from_static(b"flags")),
-                        Frame::Array(flags.into()),
-                        Frame::BulkString(Bytes::from_static(b"passwords")),
-                        Frame::Array(passwords.into()),
-                        Frame::BulkString(Bytes::from_static(b"keys")),
-                        Frame::Array(keys.into()),
-                        Frame::BulkString(Bytes::from_static(b"channels")),
-                        Frame::Array(channels.into()),
-                        Frame::BulkString(Bytes::from_static(b"commands")),
-                        Frame::BulkString(Bytes::from(commands)),
+                    // The reply is a Map, and the serializer downgrades a Map
+                    // to the flat `[k, v, …]` array on RESP2 — so this one
+                    // construction is correct under both protocols and needs no
+                    // shape-policy entry (moon#631).
+                    //
+                    // Field set, order and value types are transcribed from
+                    // redis-server 8.6.1 on the wire, not from docs:
+                    //
+                    //   %{flags:~[…], passwords:*[], commands:$, keys:$,
+                    //     channels:$, selectors:*[]}
+                    //
+                    // Three of those were wrong here, and a Map makes each one
+                    // WORSE than the old flat array did, because a client reads
+                    // a map by name: `username` is not a field Redis has sent
+                    // since 7.0; `selectors` was missing, so `.get("selectors")`
+                    // returned nothing rather than "this user has none"; and
+                    // `keys`/`channels` are ONE space-joined string, not a list.
+                    Frame::Map(vec![
+                        (
+                            Frame::BulkString(Bytes::from_static(b"flags")),
+                            // Set, not Array: RESP2 sees `*` either way.
+                            Frame::Set(flags.into()),
+                        ),
+                        (
+                            Frame::BulkString(Bytes::from_static(b"passwords")),
+                            Frame::Array(passwords.into()),
+                        ),
+                        (
+                            Frame::BulkString(Bytes::from_static(b"commands")),
+                            Frame::BulkString(Bytes::from(commands)),
+                        ),
+                        (
+                            Frame::BulkString(Bytes::from_static(b"keys")),
+                            Frame::BulkString(Bytes::from(keys.join(" "))),
+                        ),
+                        (
+                            Frame::BulkString(Bytes::from_static(b"channels")),
+                            Frame::BulkString(Bytes::from(channels.join(" "))),
+                        ),
+                        (
+                            // Moon has no ACL selectors. The EMPTY list is the
+                            // honest answer and the one a client can act on;
+                            // omitting the key would read as "this server does
+                            // not support selectors", which is a different
+                            // claim and not one this reply gets to make.
+                            Frame::BulkString(Bytes::from_static(b"selectors")),
+                            Frame::Array(crate::protocol::FrameVec::new()),
+                        ),
                     ])
                 }
             }
@@ -459,17 +496,36 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"alice")),
         ];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        // A Map, with redis 8.6.1's field set and order. Not an Array, and
+        // NOT carrying `username` — Redis dropped that field in 7.0 and a
+        // client reads this reply by key (moon#631). RESP2 clients still see
+        // the flat `[k, v, …]` array: the serializer downgrades the Map.
         match result {
-            Frame::Array(ref fields) => {
-                // Should have username, flags, passwords, keys, channels, commands
-                assert_eq!(fields.len(), 12); // 6 pairs
+            Frame::Map(ref pairs) => {
+                let names: Vec<&[u8]> = pairs
+                    .iter()
+                    .map(|(k, _)| match k {
+                        Frame::BulkString(b) => b.as_ref(),
+                        other => panic!("map key is not a bulk string: {other:?}"),
+                    })
+                    .collect();
                 assert_eq!(
-                    fields[0],
-                    Frame::BulkString(Bytes::from_static(b"username"))
+                    names,
+                    vec![
+                        &b"flags"[..],
+                        b"passwords",
+                        b"commands",
+                        b"keys",
+                        b"channels",
+                        b"selectors",
+                    ]
                 );
-                assert_eq!(fields[1], Frame::BulkString(Bytes::from_static(b"alice")));
+                // `flags` is a Set on the wire under RESP3.
+                assert!(matches!(pairs[0].1, Frame::Set(_)), "{:?}", pairs[0].1);
+                // `keys` is ONE space-joined string, not a list of patterns.
+                assert_eq!(pairs[3].1, Frame::BulkString(Bytes::from_static(b"~*")));
             }
-            _ => panic!("Expected Array from GETUSER, got {:?}", result),
+            _ => panic!("Expected Map from GETUSER, got {:?}", result),
         }
     }
 
