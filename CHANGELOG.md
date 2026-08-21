@@ -165,9 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Ten read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
-  `TTL`, `OBJECT ENCODING`, `GETRANGE`, `GETBIT`, `BITCOUNT`, `BITPOS`, `MGET` and `SUBSTR` all
-  read through `Database::get_if_alive`, which probes the HOT plane and stops. A key that
+- **Fifteen read commands answered as though a TIERED key did not exist** (#610). `STRLEN`, `TYPE`,
+  `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`,
+  `GETRANGE`, `SUBSTR`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO`, `LCS`, `SORT_RO` and
+  `MGET` all read through `Database::get_if_alive`, which probes the HOT plane and stops. A key that
   eviction spilled to the cold tier is absent from `data`, so every one of them returned the
   missing-key answer for a key that is present and readable. Measured on one instance, one shard,
   `--maxmemory 4mb --maxmemory-policy volatile-ttl --disk-offload enable`, 6,000 × 1KB values
@@ -196,6 +197,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it too, because probing `GET` PROMOTES the key and every later row then measures a hot key.
   Re-run with one distinct tiered key per command, all nine wrong answers match the hot control
   and the two that were already correct are unchanged.
+
+  A first pass converted only the commands that first probe happened to cover, which left the
+  `TTL` fix in place while its own siblings `EXPIRETIME`/`PEXPIRETIME` still answered `-2`, plus
+  `BITFIELD_RO` 0, `LCS` 0 and `MEMORY USAGE` an error. Sweeping the accessor's remaining call
+  sites rather than the command list closed those. `KEYS` and `SCAN` were checked and are NOT
+  affected — both list all 6,000 keys — so they are deliberately left alone rather than converted
+  on suspicion.
+
+  Two of the remaining differences turned out to be the PROBE, not the server: comparing absolute
+  `EXPIRETIME` across two keys written at different moments, and comparing `MEMORY USAGE` between
+  keys whose NAMES differ in length. A hot-vs-hot control settles both — two resident keys differ
+  by exactly the 1-byte name-length delta, and judged against its own TTL a tiered key's
+  `EXPIRETIME - now` equals its `TTL` exactly, matching the hot control.
 
 - **`XREAD BLOCK` / `XREADGROUP BLOCK` were a silent no-op: never blocked, never woken** (#595).
   Both readers parsed `BLOCK`, stepped over its value with an `// ignored` comment, and answered

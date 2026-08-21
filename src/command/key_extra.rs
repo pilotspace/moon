@@ -462,7 +462,7 @@ pub fn sort_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 
     use crate::storage::compact_value::RedisValueRef;
-    let elements: Vec<Bytes> = match db.get_if_alive(key, now_ms) {
+    let elements: Vec<Bytes> = match db.get_if_alive_any_plane(key, now_ms) {
         None => return Frame::Array(framevec![]),
         Some(entry) => match entry.value.as_redis_value() {
             RedisValueRef::List(l) => l.iter().cloned().collect(),
@@ -495,7 +495,7 @@ pub fn sort_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 .iter()
                 .map(|elem| {
                     let lookup_key = apply_pattern(pattern, elem);
-                    db.get_if_alive(&lookup_key, now_ms)
+                    db.get_if_alive_any_plane(&lookup_key, now_ms)
                         .and_then(|e| e.value.as_bytes().map(|b| Bytes::copy_from_slice(b)))
                 })
                 .collect()
@@ -568,7 +568,7 @@ pub fn sort_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                     out.push(Frame::BulkString(elements[idx].clone()));
                 } else {
                     let lookup_key = apply_pattern(pat, &elements[idx]);
-                    match db.get_if_alive(&lookup_key, now_ms) {
+                    match db.get_if_alive_any_plane(&lookup_key, now_ms) {
                         Some(e) => match e.value.as_bytes() {
                             Some(v) => out.push(Frame::BulkString(Bytes::copy_from_slice(v))),
                             None => out.push(Frame::Null),

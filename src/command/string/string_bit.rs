@@ -970,7 +970,11 @@ pub fn bitfield_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     };
 
     let empty: &[u8] = &[];
-    let data: &[u8] = match db.get_if_alive(key, now_ms) {
+    // The view must outlive `data`: a HOT view borrows from the table, but a
+    // COLD one OWNS the entry it materialised, so binding it inline would let
+    // `data` outlive the temporary it points into (moon#610).
+    let view = db.get_if_alive_any_plane(key, now_ms);
+    let data: &[u8] = match view.as_ref() {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => v,
             None => {

@@ -548,7 +548,7 @@ pub fn lcs_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u
         i += 1;
     }
 
-    let s1 = match db.get_if_alive(key1, now_ms) {
+    let s1 = match db.get_if_alive_any_plane(key1, now_ms) {
         Some(e) => match e.value.as_bytes() {
             Some(v) => v.to_vec(),
             None => {
@@ -559,7 +559,7 @@ pub fn lcs_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u
         },
         None => Vec::new(),
     };
-    let s2 = match db.get_if_alive(key2, now_ms) {
+    let s2 = match db.get_if_alive_any_plane(key2, now_ms) {
         Some(e) => match e.value.as_bytes() {
             Some(v) => v.to_vec(),
             None => {

@@ -1533,7 +1533,7 @@ pub fn expiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1556,7 +1556,7 @@ pub fn pexpiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    match db.get_if_alive(key, now_ms) {
+    match db.get_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
