@@ -723,3 +723,146 @@ fn me11_queue_semantics_hold_at_four_shards() {
         "a cross-shard write in an aborted transaction must not apply either"
     );
 }
+
+// ---------------------------------------------------------------------------
+// me12 — moon#639. The families me10c merely tolerated must actually QUEUE.
+// ---------------------------------------------------------------------------
+
+/// Leading `*N` of a RESP array reply, or `None` if the reply is not an array.
+fn array_len(reply: &str) -> Option<i64> {
+    let rest = reply.strip_prefix('*')?;
+    let end = rest.find("\r\n")?;
+    rest[..end].parse().ok()
+}
+
+#[test]
+fn me12_intercept_only_commands_queue_and_appear_in_exec() {
+    // me10c pinned the floor: these must not become an ERROR inside EXEC.
+    // This pins the CEILING that Redis actually implements: they must reply
+    // `+QUEUED` and occupy a slot in the EXEC array, like every other command.
+    //
+    // Measured against redis-server 8.6.1 (moon#639): every row below answers
+    // `+QUEUED`. Moon answered with the command's real reply and then returned
+    // `*0` from EXEC — a client that queued three commands read an array of
+    // zero, so `pipeline.execute()` in every library either mis-zips its
+    // results or raises.
+    let m = spawn_moon("1");
+    for cmd in [
+        &["ACL", "WHOAMI"][..],
+        &["ACL", "LIST"][..],
+        &["ACL", "CAT"][..],
+        &["ACL", "GETUSER", "default"][..],
+        &["CONFIG", "GET", "maxmemory"][..],
+        &["CLIENT", "GETNAME"][..],
+        &["CLIENT", "INFO"][..],
+        &["CLUSTER", "INFO"][..],
+        &["SCRIPT", "EXISTS", "deadbeef"][..],
+        &["WAIT", "0", "0"][..],
+        &["PUBSUB", "CHANNELS"][..],
+        &["HELLO", "2"][..],
+    ] {
+        let mut c = Conn::open(m.port);
+        c.send(&["MULTI"]);
+        let queued = c.send(cmd);
+        assert!(
+            queued.starts_with("+QUEUED"),
+            "{cmd:?} must QUEUE inside MULTI, not execute inline. \
+             redis-server 8.6.1 answers +QUEUED; got {queued:?}"
+        );
+        let exec = c.send(&["EXEC"]);
+        assert_eq!(
+            array_len(&exec),
+            Some(1),
+            "EXEC must return one slot for the one queued command {cmd:?}; \
+             a shorter array silently mis-aligns every client that zips \
+             replies to queued commands. got {exec:?}"
+        );
+        assert!(
+            !exec.contains("unknown command") && !exec.contains("EXECABORT"),
+            "{cmd:?} must EXECUTE at EXEC time, not error. got {exec:?}"
+        );
+    }
+}
+
+#[test]
+fn me12b_exec_array_length_equals_the_number_of_queued_commands() {
+    // The mixed case is the one that actually breaks clients: a transaction
+    // interleaving keyspace commands with intercepted ones must return one
+    // slot per queued command, IN ORDER. With the inline bug the intercepted
+    // rows vanished from the array and every later reply shifted up one.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["MULTI"]);
+    for cmd in [
+        &["SET", "me12k", "v1"][..],
+        &["CONFIG", "GET", "maxmemory"][..],
+        &["GET", "me12k"][..],
+        &["CLIENT", "GETNAME"][..],
+        &["INCR", "me12n"][..],
+    ] {
+        let r = c.send(cmd);
+        assert!(r.starts_with("+QUEUED"), "{cmd:?} -> {r:?}");
+    }
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        array_len(&exec),
+        Some(5),
+        "five queued commands must produce a five-element EXEC array; got {exec:?}"
+    );
+    // Order check: the LAST slot is INCR's `:1`. If the intercepted rows were
+    // dropped the array would be short AND this would land in a different
+    // position, so asserting the tail catches a silent re-ordering that a
+    // length check alone would miss.
+    assert!(
+        exec.trim_end().ends_with(":1"),
+        "the final slot must be INCR's reply, in queue order; got {exec:?}"
+    );
+}
+
+#[test]
+fn me12c_config_set_in_multi_does_not_survive_discard() {
+    // The sharpest consequence of executing at queue time: the command TAKES
+    // EFFECT even though the client abandoned the transaction. A client that
+    // builds a MULTI, hits an application-level error, and DISCARDs has every
+    // right to expect the server unchanged.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    let before = c.send(&["CONFIG", "GET", "maxmemory"]);
+
+    c.send(&["MULTI"]);
+    let queued = c.send(&["CONFIG", "SET", "maxmemory", "123456789"]);
+    assert!(
+        queued.starts_with("+QUEUED"),
+        "CONFIG SET must queue, not apply immediately; got {queued:?}"
+    );
+    c.send(&["DISCARD"]);
+
+    let after = c.send(&["CONFIG", "GET", "maxmemory"]);
+    assert_eq!(
+        before, after,
+        "DISCARD must leave maxmemory untouched. Executing CONFIG SET at queue \
+         time makes DISCARD a no-op for the mutation, which is a server-state \
+         change the client explicitly revoked."
+    );
+}
+
+#[test]
+fn me12d_client_setname_in_multi_does_not_survive_discard() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["CLIENT", "SETNAME", "original"]);
+
+    c.send(&["MULTI"]);
+    let queued = c.send(&["CLIENT", "SETNAME", "hijacked"]);
+    assert!(
+        queued.starts_with("+QUEUED"),
+        "CLIENT SETNAME must queue; got {queued:?}"
+    );
+    c.send(&["DISCARD"]);
+
+    let name = c.send(&["CLIENT", "GETNAME"]);
+    assert!(
+        name.contains("original"),
+        "DISCARD must leave the connection name unchanged; got {name:?}"
+    );
+}
