@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).
+  A full VM root does not announce itself: a run reported `VM tokio suite FAILED (rc=1)`
+  with no error text under it, and the next `orb run` answered `sconrpc ready event fired
+  but socket was not connectible` — OrbStack had wedged on a 97%-full root. The visible
+  symptom was three `TRY 1 FAIL / TRY 2 PASS` retries that belonged to a *different* leg,
+  the one that had passed 5885/5885. After reclaiming space the tokio leg ran clean in
+  isolation (5110 passed, 254 skipped).
+
+  The check is now the first gate, ahead of `cargo fmt`, so a doomed run stops in about a
+  second instead of forty minutes in. Thresholds are measured, not guessed (moon-dev:
+  a 124G root, and each of the two leg target dirs 34G warm): refuse below the 8G floor
+  where OrbStack itself wedges; require 36G for a leg whose target dir is absent or a stub
+  (`<5G`); warn below 15G of headroom for a warm leg. A cold leg is charged against the
+  second leg's budget, since it consumes its build before that leg starts. On refusal the
+  biggest consumers and the exact reclaim commands are printed.
+
+  Two deliberate non-behaviours: failure to *measure* never blocks — a pre-flight that
+  cannot read the numbers steps aside rather than grounding a healthy run — and `--quick`
+  skips it, since that mode runs no VM legs. The decision is a pure function, so
+  `scripts/test-ci-local-preflight.sh` exercises every band (including the 3G case that
+  produced the original wedge) without filling a disk, and it runs in the Lint job so the
+  thresholds cannot rot.
+
 ## [0.8.7] — 2026-08-22
 
 ### Fixed
