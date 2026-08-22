@@ -55,6 +55,85 @@ pub fn invalidate_after_write(
     invalidate_keys(table, &keys, writer_client_id);
 }
 
+/// Keys a blocking pop ACTUALLY modified, derived from its REPLY.
+///
+/// Blocking commands cannot reuse [`written_keys`] the way every other write
+/// does, because the arguments name CANDIDATES and only one of them is served.
+/// Both divergences below were measured against redis-server 8.6.1 (moon#644):
+///
+/// ```text
+/// BLPOP k1 k2 0     k1 empty, k2 populated -> redis invalidates k2 ONLY.
+///                   k1 was never touched and a client's cached copy of it is
+///                   still correct; `written_keys` names both.
+/// BLPOP k1 0.1      times out              -> redis invalidates NOTHING.
+///                   `written_keys` names k1 whether or not anything popped.
+/// ```
+///
+/// Over-invalidating is not free here: moon#584 is the issue filed because
+/// moon pushed invalidations for keys a command only READ, and the fix for
+/// that would be undone by a blocking path that invalidates every candidate.
+/// So the served key comes from the reply.
+///
+/// Reply shapes, all pre-RESP3-conversion:
+///
+/// ```text
+/// BLPOP/BRPOP              [key, value]              -> key
+/// BLMPOP/BZMPOP            [key, [entries...]]       -> key
+/// BZPOPMIN/BZPOPMAX        [key, member, score]      -> key
+/// BLMOVE/BRPOPLPUSH        the moved element         -> BOTH args (src, dst)
+/// any of them, timed out   Null / NullArray          -> nothing
+/// ```
+///
+/// `BLMOVE` is the one that cannot read its key off the reply: the reply is
+/// the element, not a key name. It has exactly two keys and modifies BOTH
+/// whenever it serves, so a non-null reply invalidates both arguments —
+/// which is what redis does (measured: `BLMOVE src dst` pushes for src and
+/// for dst).
+pub fn blocking_served_keys(cmd: &[u8], cmd_args: &[Frame], reply: &Frame) -> Vec<Bytes> {
+    // A timeout answers Null (RESP2 `*-1` / `$-1`); nothing was modified.
+    if matches!(reply, Frame::Null | Frame::NullArray) {
+        return Vec::new();
+    }
+    // BLMOVE / BRPOPLPUSH: two fixed keys, both modified, reply is the element.
+    if cmd.eq_ignore_ascii_case(b"BLMOVE") || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        let mut keys = Vec::with_capacity(2);
+        for arg in cmd_args.iter().take(2) {
+            if let Frame::BulkString(k) = arg {
+                keys.push(k.clone());
+            }
+        }
+        return keys;
+    }
+    // Everything else answers an array whose FIRST element is the served key.
+    match reply {
+        Frame::Array(items) => match items.first() {
+            Some(Frame::BulkString(k)) => vec![k.clone()],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Invalidate for a blocking command that has just served a client.
+///
+/// The single seam for the blocking write path. moon#644: this path did not
+/// exist, so every blocking pop modified the keyspace while `invalidate_after_write`
+/// — hand-copied at twelve OTHER call sites — was never reached, and a
+/// tracking client's cache of a `BLPOP`ped key stayed stale forever.
+pub fn invalidate_after_blocking_serve(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    reply: &Frame,
+    writer_client_id: u64,
+) {
+    if !crate::tracking::tracking_active() {
+        return;
+    }
+    let keys = blocking_served_keys(cmd, cmd_args, reply);
+    invalidate_keys(table, &keys, writer_client_id);
+}
+
 /// Invalidate a pre-extracted key list (used by the cross-shard write leg,
 /// where the command frame has been moved into the dispatch message by the
 /// time the reply arrives — keys are captured at enqueue time under the
@@ -267,6 +346,54 @@ mod tests {
     /// extractor return an empty list, so `invalidate_after_write` pushed
     /// nothing and `track_read_keys` registered nothing: a tracking client's
     /// cache of these keys went stale permanently, with no signal.
+    #[test]
+    fn blocking_served_keys_reads_the_reply_not_the_arguments() {
+        use crate::protocol::Frame;
+        let bs = |b: &[u8]| Frame::BulkString(Bytes::copy_from_slice(b));
+
+        // BLPOP k1 k2 -> served k2. The arguments name BOTH; only the reply
+        // says which one actually changed. Invalidating k1 here is the
+        // moon#584 over-invalidation bug, re-introduced on a new path.
+        let args = [bs(b"k1"), bs(b"k2"), bs(b"0")];
+        let reply = Frame::Array(vec![bs(b"k2"), bs(b"v")].into());
+        assert_eq!(
+            blocking_served_keys(b"BLPOP", &args, &reply),
+            vec![Bytes::from_static(b"k2")]
+        );
+
+        // A timeout modified nothing, on either null form.
+        assert!(blocking_served_keys(b"BLPOP", &args, &Frame::NullArray).is_empty());
+        assert!(blocking_served_keys(b"BLPOP", &args, &Frame::Null).is_empty());
+
+        // BLMPOP answers [key, [entries]] — same first-element rule.
+        let mp_args = [bs(b"0"), bs(b"2"), bs(b"a"), bs(b"b"), bs(b"LEFT")];
+        let mp_reply = Frame::Array(vec![bs(b"b"), Frame::Array(vec![bs(b"x")].into())].into());
+        assert_eq!(
+            blocking_served_keys(b"BLMPOP", &mp_args, &mp_reply),
+            vec![Bytes::from_static(b"b")]
+        );
+
+        // BZPOPMIN answers [key, member, score].
+        let z_reply = Frame::Array(vec![bs(b"z1"), bs(b"m"), bs(b"1")].into());
+        assert_eq!(
+            blocking_served_keys(b"BZPOPMIN", &[bs(b"z1"), bs(b"0")], &z_reply),
+            vec![Bytes::from_static(b"z1")]
+        );
+
+        // BLMOVE is the exception: its reply is the ELEMENT, not a key name,
+        // and it modifies both ends. Both arguments, and only on a serve.
+        let mv_args = [bs(b"src"), bs(b"dst"), bs(b"LEFT"), bs(b"RIGHT"), bs(b"0")];
+        assert_eq!(
+            blocking_served_keys(b"BLMOVE", &mv_args, &bs(b"elem")),
+            vec![Bytes::from_static(b"src"), Bytes::from_static(b"dst")]
+        );
+        assert!(blocking_served_keys(b"BLMOVE", &mv_args, &Frame::Null).is_empty());
+        assert_eq!(
+            blocking_served_keys(b"BRPOPLPUSH", &[bs(b"s"), bs(b"d"), bs(b"0")], &bs(b"e")),
+            vec![Bytes::from_static(b"s"), Bytes::from_static(b"d")]
+        );
+    }
+
     #[test]
     fn movablekeys_commands_extract_their_keys() {
         // numkeys-counted vectors
