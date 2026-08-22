@@ -885,6 +885,10 @@ pub(super) async fn try_handle_multi_exec(
                                     ctx,
                                     shutdown,
                                     codec,
+                                    // The outer index this EXEC reply will
+                                    // occupy — a queued HELLO records its
+                                    // protocol switch there, not at 0.
+                                    responses.len(),
                                 )
                                 .await;
                                 crate::shard::coordinator::broadcast_txn_flushes(
@@ -947,6 +951,7 @@ pub(super) async fn try_handle_multi_exec(
                     ctx,
                     shutdown,
                     codec,
+                    responses.len(),
                 )
                 .await;
             }

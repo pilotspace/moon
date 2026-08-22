@@ -440,6 +440,7 @@ pub(super) fn try_handle_hello(
     auth_delay_ms: &mut u64,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     codec: &mut crate::server::codec::RespCodec,
+    switch_index: Option<usize>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"HELLO") {
         return false;
@@ -461,7 +462,17 @@ pub(super) fn try_handle_hello(
         // the index this reply will occupy, so the switch covers HELLO's own
         // answer; replies already queued were produced under the OLD protocol
         // and keep it. See `shared::encode_response_batch`.
-        crate::server::conn::shared::note_protocol_switch(conn, responses.len(), new_proto);
+        //
+        // `switch_index` overrides that and is `Some` only when this HELLO ran
+        // from inside an `EXEC` post-pass (moon#639): there the sink wraps a
+        // LOCAL one-element vec, so `responses.len()` is 0 and would record the
+        // switch at the START of the outer batch — re-encoding replies produced
+        // before HELLO was even queued. The caller passes the outer index the
+        // EXEC reply itself occupies. Switching is whole-reply granular, so the
+        // entire EXEC array encodes in the new protocol; the sharded handler
+        // makes the identical approximation.
+        let at = switch_index.unwrap_or_else(|| responses.len());
+        crate::server::conn::shared::note_protocol_switch(conn, at, new_proto);
         conn.protocol_version = new_proto;
         // Keep the wire codec in lockstep for single-frame encodes.
         codec.set_protocol_version(new_proto);
@@ -1927,6 +1938,7 @@ pub(super) async fn run_txn_connection_intercept(
     peer_addr: &str,
     shutdown: &crate::runtime::cancel::CancellationToken,
     codec: &mut crate::server::codec::RespCodec,
+    switch_index: usize,
 ) -> Frame {
     let proto = conn.protocol_version;
     let mut out: Vec<Frame> = Vec::with_capacity(1);
@@ -1961,6 +1973,7 @@ pub(super) async fn run_txn_connection_intercept(
         &mut auth_delay_ms,
         shaped!(),
         codec,
+        Some(switch_index),
     ) || try_handle_cluster(cmd, cmd_args, ctx, shaped!())
         || try_handle_script(cmd, cmd_args, ctx, shutdown, shaped!()).await
         || try_handle_acl(cmd, cmd_args, conn, ctx, peer_addr, shaped!())
@@ -2006,6 +2019,7 @@ pub(super) async fn fill_txn_intercept_slots(
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     codec: &mut crate::server::codec::RespCodec,
+    switch_index: usize,
 ) {
     let Frame::Array(results) = result else {
         return; // NullArray (aborted) or an error frame: no slots to fill.
@@ -2032,8 +2046,17 @@ pub(super) async fn fill_txn_intercept_slots(
         if !crate::server::conn::shared::is_txn_connection_intercept(c) {
             continue;
         }
-        results[i] =
-            run_txn_connection_intercept(c, a, client_id, conn, ctx, &peer_addr, shutdown, codec)
-                .await;
+        results[i] = run_txn_connection_intercept(
+            c,
+            a,
+            client_id,
+            conn,
+            ctx,
+            &peer_addr,
+            shutdown,
+            codec,
+            switch_index,
+        )
+        .await;
     }
 }

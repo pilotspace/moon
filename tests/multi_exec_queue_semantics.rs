@@ -942,3 +942,54 @@ fn me12f_an_aborted_exec_runs_no_intercepts_either() {
         "an aborted EXEC must not apply a queued CONFIG SET"
     );
 }
+
+// ---------------------------------------------------------------------------
+// me12g — a queued HELLO switches the protocol at the EXEC reply, not at the
+// start of the batch.
+// ---------------------------------------------------------------------------
+
+/// `HELLO 3` runs from the `EXEC` post-pass, where the intercept writes into a
+/// LOCAL one-element vec — so the "index this reply will occupy" it would
+/// otherwise derive is `0`, the START of the outer batch. Recording the switch
+/// there re-encodes replies the client already had answered under RESP2.
+///
+/// The probe sends ONE pipelined batch. `COMMAND DOCS GET` is the
+/// discriminator: RESP2 answers a flat array (`*2`), RESP3 a Map (`%1`). It is
+/// answered before `MULTI` is even read, so its reply can only be RESP2 — a
+/// leading `%` means the switch was recorded at index 0 and the encoder
+/// re-typed a reply the client had already been promised in RESP2.
+///
+/// The discriminator matters more than the assertion here: `HGETALL`, `GEOPOS`,
+/// `ZSCORE` and `CONFIG GET` all LOOK like they would catch it and none of them
+/// do — they are either shaped at push time or answered off the inline path,
+/// so they never occupy a slot in the batch the encoder walks. Measured
+/// 2026-08-22 against a deliberately mutated build; `COMMAND DOCS`,
+/// `XINFO GROUPS` and `XPENDING` were the three that flipped.
+#[test]
+fn me12g_a_queued_hello_does_not_retroactively_upgrade_earlier_replies() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    const BATCH: &[u8] = concat!(
+        "*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$3\r\nGET\r\n",
+        "*1\r\n$5\r\nMULTI\r\n",
+        "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n",
+        "*1\r\n$4\r\nEXEC\r\n",
+    )
+    .as_bytes();
+    let reply = c.send_raw(BATCH);
+    assert!(
+        reply.starts_with('*'),
+        "the COMMAND DOCS answered before MULTI was even read must stay RESP2 \
+         (a flat array); a leading %% means the queued HELLO recorded its \
+         protocol switch at the start of the batch instead of at the EXEC \
+         reply. got {reply:?}"
+    );
+    assert!(
+        reply.contains("+OK\r\n") && reply.contains("+QUEUED\r\n"),
+        "MULTI and the queued HELLO must both be in the same batch reply; got {reply:?}"
+    );
+    assert!(
+        reply.contains("proto"),
+        "the EXEC array must carry HELLO's own answer; got {reply:?}"
+    );
+}

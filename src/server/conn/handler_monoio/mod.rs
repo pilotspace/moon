@@ -1744,6 +1744,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     &mut auth_delay_ms,
                     shaped!(),
                     &mut codec,
+                    None,
                 )
             {
                 continue;

@@ -39,7 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already steers transactional embedders to the sharded handler. `SUBSCRIBE` inside `MULTI` remains
   the inverse divergence: Moon refuses it at queue time, Redis queues it.
 
-  Three client-compat waivers are retired and become live parity assertions
+  A queued `HELLO` records its protocol switch at the index the `EXEC` reply
+  occupies in the outer batch, not at index 0. The intercept post-pass writes
+  into a local one-element buffer, so the index it would otherwise derive is
+  the START of the batch — and `encode_response_batch` would then re-encode
+  replies the client had already been promised in RESP2. `COMMAND DOCS`,
+  `XINFO GROUPS` and `XPENDING` all flip shape when that happens; `HGETALL`,
+  `GEOPOS`, `ZSCORE` and `CONFIG GET` do not, which is why `me12g` uses the
+  first group.
+
+  Two client-compat waivers are retired and become live parity assertions
   (`multi_queues_config_get`, `empty_config_get_in_multi`), and `shapes_acl_getuser`,
   `auth_without_password_configured`, `verbatim_info`, `verbatim_client_list`,
   `acl_users_lists_registered_usernames` and `acl_help_is_not_a_missing_subcommand` regain the
