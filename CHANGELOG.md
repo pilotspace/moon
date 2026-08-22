@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-08-22
+
 ### Security
 - **A blocking command with an oversized timeout killed the whole server.** `BLPOP k 1e300` built
   its deadline with `Duration::from_secs_f64`, which **panics** on a value it cannot represent, and
