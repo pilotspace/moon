@@ -1332,10 +1332,18 @@ assert_eq "COMMAND COUNT is a positive integer" \
 # comparable is the RELATION, and the count of `|` names is the direct
 # evidence: zero of them was the whole defect.
 count_vs_list() {
-    local port="$1" n listed subs
+    local port="$1" n list listed subs
     n="$(redis-cli -p "$port" COMMAND COUNT 2>&1)"
-    listed="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c .)"
-    subs="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c '|')"
+    # ONE capture, then count from it: two round-trips could disagree, and the
+    # `|| true` is load-bearing rather than defensive. `grep -c` exits 1 when it
+    # matches nothing, and under `set -euo pipefail` a bare `x="$(... | grep -c
+    # ...)"` assignment ABORTS on that exit — so on a server publishing zero
+    # subcommands this function died instead of reaching the branch that
+    # reports it, leaving `no-subcommands-published` unreachable. That is the
+    # #634 defect exactly: a gate that cannot report the failure it exists for.
+    list="$(redis-cli -p "$port" COMMAND LIST 2>&1)"
+    listed="$(printf '%s\n' "$list" | grep -c . || true)"
+    subs="$(printf '%s\n' "$list" | grep -c '|' || true)"
     if [[ ! "$n" =~ ^[0-9]+$ ]]; then
         echo "COUNT-NOT-AN-INT:$n"
     elif [[ "$subs" -eq 0 ]]; then

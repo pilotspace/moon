@@ -292,7 +292,7 @@ entries:
       reason: >-
         FIXED in moon#635 to the extent Moon can: `COMMAND LIST` now publishes
         `container|sub` entries at all, where it published ZERO before. What
-        remains is a COUNT gap, not a shape one — 349 names (267 top-level + 82
+        remains is a COUNT gap, not a shape one — 350 names (267 top-level + 83
         subcommands) against redis 8.6.1's 411 (274 + 137) — and `type_only`
         still compares element counts, so it cannot be a live assertion while
         Moon implements fewer commands than redis. That is a permanent

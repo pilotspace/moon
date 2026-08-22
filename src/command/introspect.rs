@@ -304,6 +304,14 @@ fn docs_row(name_lower: String, display: &str, arity: i16) -> (Frame, Frame) {
     } else {
         format!("{display} (arity {arity})")
     };
+    docs_entry(name_lower, arity_note)
+}
+
+/// A doc entry from an already-rendered key and summary. Split out so
+/// `resolve_docs` — whose key and display text are the SAME string — can build
+/// the summary while it still borrows the key, then move the key in, instead of
+/// cloning it (`src/command/` forbids allocation).
+fn docs_entry(name_lower: String, arity_note: String) -> (Frame, Frame) {
     (
         Frame::BulkString(Bytes::from(name_lower)),
         Frame::Map(vec![
@@ -336,8 +344,15 @@ fn resolve_docs(name: &[u8]) -> Option<(Frame, Frame)> {
             let mut key = meta.name.to_ascii_lowercase();
             key.push('|');
             key.push_str(&sub_meta.name.to_ascii_lowercase());
-            let display = key.clone();
-            Some(docs_row(key, &display, sub_meta.arity))
+            let arity = sub_meta.arity;
+            // Built while `key` is still borrowed, so `key` can be MOVED into
+            // the entry rather than cloned for the summary's sake.
+            let arity_note = if arity < 0 {
+                format!("{key} (variadic, minimum {})", -arity)
+            } else {
+                format!("{key} (arity {arity})")
+            };
+            Some(docs_entry(key, arity_note))
         }
     }
 }

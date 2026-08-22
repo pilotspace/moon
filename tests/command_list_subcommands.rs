@@ -232,9 +232,37 @@ fn cl3_every_published_subcommand_actually_dispatches() {
             .starts_with('$')
     );
 
+    // Probing a subcommand means SENDING it, and a handful of them really run:
+    // `CLUSTER RESET`, `CONFIG REWRITE`, `SCRIPT FLUSH`, `FUNCTION FLUSH` and
+    // friends take no required argument, so they execute rather than trip an
+    // arity error. Appending a bogus argument does NOT stop them — measured:
+    // `CLUSTER RESET ZZB` and `CONFIG RESETSTAT ZZB` both answer `+OK` — so the
+    // fix is ordering, not arguments. These run LAST, after every probe whose
+    // answer they could have changed. (Each test owns its servers and drops
+    // them, so the blast radius never leaves this test.)
+    const MUTATES_SERVER_STATE: &[&str] = &[
+        "ACL|LOAD",
+        "ACL|SAVE",
+        "CLIENT|UNPAUSE",
+        "CLUSTER|FAILOVER",
+        "CLUSTER|RESET",
+        "CONFIG|RESETSTAT",
+        "CONFIG|REWRITE",
+        "FUNCTION|FLUSH",
+        "SCRIPT|FLUSH",
+        "SLOWLOG|RESET",
+    ];
+    let is_mutating = |n: &str| {
+        let up = n.to_ascii_uppercase();
+        MUTATES_SERVER_STATE.contains(&up.as_str())
+    };
+
     let list = command_list(&mut c);
+    let mut ordered: Vec<&String> = list.iter().filter(|n| n.contains('|')).collect();
+    ordered.sort_by_key(|n| is_mutating(n));
+
     let mut checked = 0usize;
-    for name in list.iter().filter(|n| n.contains('|')) {
+    for name in ordered {
         let (container, sub) = name.split_once('|').expect("checked above");
         let cont_up = container.to_ascii_uppercase();
         let sub_up = sub.to_ascii_uppercase();
@@ -248,9 +276,18 @@ fn cl3_every_published_subcommand_actually_dispatches() {
             &mut c
         };
 
-        let extra: &[&str] = match cont_up.as_str() {
-            "OBJECT" => &["cl3:k"],
-            "XINFO" => &["cl3:st"],
+        // Arguments exist to make the REPLY unambiguous, not to make the call
+        // succeed. Three shapes need them:
+        //   * OBJECT / XINFO answer a bare arity error, which reads as "exists";
+        //   * COMMAND GETKEYS answers `Unknown subcommand OR wrong number of
+        //     arguments` — ONE string carrying both conditions, so the
+        //     `missing` test below matches "unknown" and calls an implemented
+        //     subcommand absent. That exact mis-read is why GETKEYS was left
+        //     out of the table until review (moon#642).
+        let extra: &[&str] = match (cont_up.as_str(), sub_up.as_str()) {
+            ("COMMAND", "GETKEYS") => &["GET", "cl3:k"],
+            ("OBJECT", _) => &["cl3:k"],
+            ("XINFO", _) => &["cl3:st"],
             _ => &[],
         };
         let mut parts = vec![cont_up.as_str(), sub_up.as_str()];

@@ -797,10 +797,22 @@ pub struct SubcommandMeta {
 /// every one of them answers "This instance has cluster support disabled", so
 /// the real count (18, measured with `--cluster-enabled`) was hidden.
 ///
+/// A THIRD failure mode cost a real entry here, and is why every exclusion is
+/// probed WITH arguments: bare `COMMAND GETKEYS` answers
+/// `ERR Unknown subcommand or wrong number of arguments for 'GETKEYS'`, a
+/// message that blends both conditions into one string. The first sweep read
+/// the "Unknown subcommand" half and recorded GETKEYS as absent — it is
+/// implemented (`COMMAND GETKEYS GET k` answers `k`). Caught in review on
+/// moon#642; the whole redis-minus-moon set was then re-probed with real
+/// arguments and a same-shape bogus control, which confirmed every other
+/// exclusion.
+///
 /// Names Redis has and Moon does NOT are deliberately absent — `ACL DRYRUN`,
-/// `CLIENT UNBLOCK`, `COMMAND GETKEYS`, `SCRIPT KILL`, the `LATENCY` and
-/// `MODULE` families, and eleven `CLUSTER` subcommands. Publishing a name that
-/// does not dispatch is the same defect one level up, and
+/// `CLIENT UNBLOCK`, `COMMAND GETKEYSANDFLAGS`, `SCRIPT KILL`, every `|HELP`,
+/// the `LATENCY` and `MODULE` families (unknown COMMANDS, not subcommands),
+/// `FUNCTION DUMP`/`RESTORE`/`STATS` (which refuse with "not supported in this
+/// release"), and thirteen `CLUSTER` subcommands. Publishing a name that does
+/// not dispatch is the same defect one level up, and
 /// `tests/command_list_subcommands.rs::cl3` fails if any listed name stops
 /// dispatching.
 ///
@@ -864,6 +876,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
     "COMMAND" => &[
         SubcommandMeta { name: "COUNT", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "DOCS", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "GETKEYS", arity: -3, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "INFO", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
     ],
@@ -929,8 +942,20 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
 /// Returns `None` for a bare container name — that resolves through
 /// [`lookup`] like any other command.
 pub fn lookup_subcommand(container: &[u8], sub: &[u8]) -> Option<&'static SubcommandMeta> {
-    let cont = std::str::from_utf8(container).ok()?.to_ascii_uppercase();
-    let subs = SUBCOMMAND_META.get(cont.as_str())?;
+    // Uppercase into a stack buffer rather than `to_ascii_uppercase()`, which
+    // heap-allocates: `src/command/` forbids allocation, and `lookup` above
+    // already solves the identical problem this way. 20 bytes is the same
+    // bound it uses; the longest container here is `FUNCTION` at 8.
+    let len = container.len();
+    if len == 0 || len > 20 {
+        return None;
+    }
+    let mut buf = [0u8; 20];
+    for (i, &b) in container.iter().enumerate() {
+        buf[i] = b.to_ascii_uppercase();
+    }
+    let upper = std::str::from_utf8(&buf[..len]).ok()?;
+    let subs = SUBCOMMAND_META.get(upper)?;
     subs.iter()
         .find(|s| s.name.as_bytes().eq_ignore_ascii_case(sub))
 }

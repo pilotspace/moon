@@ -173,7 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
                    COMMAND COUNT   COMMAND LIST   of which container|sub
     redis 8.6.1          274            411               137
     moon (before)        263            263                 0
-    moon (after)         267            349                82
+    moon (after)         267            350                83
   ```
 
   A client library builds its local command table from `COMMAND LIST`. Against the old Moon it
@@ -191,17 +191,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **`COMMAND COUNT` deliberately does not grow to match `LIST`** — redis counts only top-level
   commands, and the two agreeing is precisely the symptom this fixes.
 
-  The 82 names are **measured, not copied from redis**. Each was probed against a live Moon with a
-  per-container BOGUS control, because five containers answer an unknown subcommand with something
-  other than "unknown subcommand": `MEMORY` says "not supported", `XGROUP` says "not recognized",
-  and `OBJECT` / `XINFO` / `HOTKEYS` answer an ARITY error, which a naive probe reads as "it
-  exists". The first sweep believed all 31 of redis's `CLUSTER` subcommands were present — with
-  cluster support disabled every one answers "This instance has cluster support disabled", hiding
-  the real count of 18. Names Moon does not implement (`ACL DRYRUN`, `CLIENT UNBLOCK`, `SCRIPT
-  KILL`, the `LATENCY` and `MODULE` families, 13 `CLUSTER` subcommands) are deliberately absent,
-  and `command_list_subcommands::cl3` SENDS every published name and fails if one stops
-  dispatching. `HOTKEYS` publishes none: redis models it as a container, Moon takes
-  `HOTKEYS [COUNT n]` with no subcommands at all.
+  The 83 names are **measured, not copied from redis**. Each was probed against a live Moon with a
+  per-container BOGUS control, because a container's refusal of an unknown subcommand is not one
+  string but three shapes: `MEMORY` says "not supported", `XGROUP` says "not recognized", and
+  `OBJECT` / `XINFO` / `HOTKEYS` answer an ARITY error, which a naive probe reads as "it exists".
+  The first sweep believed all 31 of redis's `CLUSTER` subcommands were present — with cluster
+  support disabled every one answers "This instance has cluster support disabled", hiding the real
+  count of 18.
+
+  A third shape cost a real entry, caught in review: bare `COMMAND GETKEYS` answers
+  `ERR Unknown subcommand **or wrong number of arguments** for 'GETKEYS'` — one string carrying
+  both conditions — so the sweep read the first half and recorded an implemented subcommand as
+  absent. Every redis-minus-Moon name was then re-probed WITH real arguments against a same-shape
+  bogus control, which confirmed the other 54 absences and recovered this one.
+
+  Names Moon does not implement (`ACL DRYRUN`, `CLIENT UNBLOCK`, `COMMAND GETKEYSANDFLAGS`,
+  `SCRIPT KILL`, every `|HELP`, the `LATENCY` and `MODULE` families, `FUNCTION DUMP`/`RESTORE`/
+  `STATS`, 13 `CLUSTER` subcommands) are deliberately absent, and `command_list_subcommands::cl3`
+  SENDS every published name and fails if one stops dispatching. `HOTKEYS` publishes none: redis
+  models it as a container, Moon takes `HOTKEYS [COUNT n]` with no subcommands at all.
 
 - **`AUTH <password>` answered `+OK` on a server with no password configured** (#640). That is the
   standard probe for "does this server require authentication?", so a deployment that MEANT to set
