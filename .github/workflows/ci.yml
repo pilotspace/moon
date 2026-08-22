@@ -60,6 +60,10 @@ jobs:
       - run: cargo fmt --check
       - run: bash scripts/audit-unsafe.sh
       - run: bash scripts/audit-unwrap.sh
+      # ci-local.sh's disk pre-flight is pure bash and testable without a
+      # VM. It runs here so the thresholds cannot silently rot — the check
+      # itself only ever runs on a developer's machine.
+      - run: bash scripts/test-ci-local-preflight.sh
       - name: CHANGELOG check
         if: github.event_name == 'pull_request'
         env:
