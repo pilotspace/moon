@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually operates on. Per-key dead space inside a partially-live file is not derivable:
   `ColdLocation` records where an entry is, not how many bytes it occupies.
 
+  The fields split by what their source can answer. `cold_keys`, `cold_files_referenced`,
+  `cold_files_pending_unlink` and `cold_index_bytes` come from `ColdIndex`, which is
+  per-shard state needing no manifest, and publish whenever a sweep has run.
+  `cold_disk_bytes`, `cold_files` and `cold_files_dead` come from the manifest and are
+  **omitted** if any shard's manifest failed to open — a reachable state, since
+  `ShardManifest::open` failing leaves the shard running with disk-offload on, and spill
+  still populates `ColdIndex` because the insert sits outside the manifest branch. Reporting
+  those as `0` would place `cold_disk_bytes:0` beside a non-zero `cold_keys` and present it
+  as an answer. That shard also logs a warning, because cold keys with no manifest will not
+  survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
+
 ### Changed
 - **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).
   A full VM root does not announce itself: a run reported `VM tokio suite FAILED (rc=1)`

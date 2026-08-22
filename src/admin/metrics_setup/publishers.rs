@@ -178,14 +178,19 @@ fn update_moon_memory_bytes() {
     if let Some(shard_dbs) = get_global_shard_databases() {
         let cold = shard_dbs.read_cold_totals();
         if cold.published {
-            gauge!("moon_cold_disk_bytes").set(cold.disk_bytes as f64);
             gauge!("moon_cold_keys").set(cold.keys as f64);
             gauge!("moon_cold_files", "state" => "referenced").set(cold.files_referenced as f64);
-            gauge!("moon_cold_files", "state" => "dead")
-                .set(cold.files.saturating_sub(cold.files_referenced) as f64);
             gauge!("moon_cold_files", "state" => "pending_unlink")
                 .set(cold.files_pending_unlink as f64);
             gauge!("moon_memory_bytes", "kind" => "cold_index").set(cold.index_bytes as f64);
+            // Manifest-derived — same omission rule as INFO. A gauge that
+            // reports 0 bytes for a cold tier that has keys is an alert that
+            // will never fire.
+            if !cold.any_manifest_missing {
+                gauge!("moon_cold_disk_bytes").set(cold.disk_bytes as f64);
+                gauge!("moon_cold_files", "state" => "dead")
+                    .set(cold.files.saturating_sub(cold.files_referenced) as f64);
+            }
         }
     }
 

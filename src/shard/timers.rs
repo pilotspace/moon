@@ -567,6 +567,22 @@ pub(crate) fn publish_cold_stats(
         .store(files_pending_unlink, Ordering::Relaxed);
     slot.disk_bytes.store(disk_bytes, Ordering::Relaxed);
     slot.files.store(files, Ordering::Relaxed);
+    slot.manifest_missing
+        .store(manifest.is_none(), Ordering::Relaxed);
+    if manifest.is_none() && keys > 0 {
+        // Not merely a reporting gap. A shard serving cold keys with no
+        // readable manifest cannot re-index them after a restart, because
+        // `ColdIndex::rebuild_from_manifest` is the only thing that puts them
+        // back — those keys are live now and gone on the next boot. The
+        // missing INFO field is the least of it, so say so at 60s cadence
+        // rather than silently reporting a zero.
+        tracing::warn!(
+            shard = shard_id,
+            cold_keys = keys,
+            "cold tier has keys but this shard has no readable manifest: on-disk \
+             size is unreportable and these keys will NOT survive a restart",
+        );
+    }
     // Last, and `Release` rather than `Relaxed`: this flag is what allows INFO
     // to print the six values above, so it must not become visible before
     // them. With Relaxed on both sides a reader could see the flag on the

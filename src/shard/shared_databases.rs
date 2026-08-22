@@ -90,6 +90,19 @@ pub struct ShardColdStats {
     /// `files - files_referenced` is the dead-file figure: files still on
     /// disk that no live key points at.
     pub files: AtomicUsize,
+    /// This shard had no readable manifest at publish time, so its
+    /// `disk_bytes` / `files` are 0 for lack of a source rather than because
+    /// the tier is empty.
+    ///
+    /// Reachable: `ShardManifest::open` failing leaves the shard running with
+    /// disk-offload ON and no manifest (`event_loop.rs` warns and continues),
+    /// and `Config::disk_offload_spill_inert` gates only on
+    /// `appendonly`/`save` — not on manifest presence. Spill then still
+    /// populates `ColdIndex`, because `ci.insert` sits OUTSIDE the
+    /// `if let Some(manifest)` block in the completion drain. The result would
+    /// be `cold_keys:16847` next to `cold_disk_bytes:0` — precisely the
+    /// confident-wrong-answer this whole section exists to stop reporting.
+    pub manifest_missing: std::sync::atomic::AtomicBool,
     /// Set the first time this shard publishes. Distinguishes "the cold tier
     /// is empty" from "nobody has looked yet".
     ///
@@ -110,6 +123,10 @@ pub struct ColdTierTotals {
     /// Whether ANY shard has published. `false` ⇒ the other fields are
     /// meaningless and INFO omits them entirely.
     pub published: bool,
+    /// Whether ANY shard lacked a manifest. `true` ⇒ `disk_bytes` and `files`
+    /// are not answerable and must be omitted; the index-derived fields stay
+    /// valid, since `ColdIndex` is per-shard state that needs no manifest.
+    pub any_manifest_missing: bool,
     pub keys: usize,
     pub index_bytes: usize,
     pub files_referenced: usize,
@@ -403,6 +420,7 @@ impl ShardDatabases {
             // `publish_cold_stats`, so seeing the flag guarantees seeing that
             // sweep's values rather than the zeros they replaced.
             t.published |= c.published.load(Ordering::Acquire);
+            t.any_manifest_missing |= c.manifest_missing.load(Ordering::Relaxed);
             t.keys = t.keys.saturating_add(c.keys.load(Ordering::Relaxed));
             t.index_bytes = t
                 .index_bytes
@@ -1647,6 +1665,46 @@ mod tests {
         // The field INFO derives rather than publishes: files on disk that no
         // live key references.
         assert_eq!(t.files.saturating_sub(t.files_referenced), 10);
+    }
+
+    /// A shard whose manifest failed to open still spills and still gains
+    /// `ColdIndex` entries, so its `disk_bytes`/`files` are 0 for lack of a
+    /// source. Reporting that as a cold tier of zero bytes, next to a non-zero
+    /// key count, is the confident-wrong-answer this section exists to remove.
+    /// One bad shard poisons only the manifest-derived fields; the
+    /// index-derived ones stay valid because `ColdIndex` needs no manifest.
+    #[test]
+    fn a_shard_without_a_manifest_poisons_only_the_disk_derived_fields() {
+        let shared = new_shared(2, 1);
+        for slot in shared.cold_per_shard.iter() {
+            slot.keys.store(1_000, Ordering::Relaxed);
+            slot.index_bytes.store(4_096, Ordering::Relaxed);
+            slot.files_referenced.store(9, Ordering::Relaxed);
+            slot.files.store(9, Ordering::Relaxed);
+            slot.disk_bytes.store(90_000, Ordering::Relaxed);
+            slot.published
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        let healthy = shared.read_cold_totals();
+        assert!(!healthy.any_manifest_missing);
+        assert_eq!(healthy.disk_bytes, 180_000);
+
+        // Exactly one of two shards loses its manifest.
+        shared.cold_per_shard[1]
+            .manifest_missing
+            .store(true, Ordering::Relaxed);
+
+        let t = shared.read_cold_totals();
+        assert!(
+            t.any_manifest_missing,
+            "one shard without a manifest must taint the total: the surviving \
+             shard's byte count is a fraction of the truth, not the truth"
+        );
+        // Index-derived survive — they never needed the manifest.
+        assert_eq!(t.keys, 2_000);
+        assert_eq!(t.index_bytes, 8_192);
+        assert_eq!(t.files_referenced, 18);
     }
 
     /// A shard that publishes MORE referenced files than the manifest reports
