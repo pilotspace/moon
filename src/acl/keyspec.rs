@@ -1094,6 +1094,10 @@ mod tests {
             "SPUBLISH",
             "SSUBSCRIBE",
             "SUNSUBSCRIBE",
+            // moon#635: PUBSUB introspects CHANNELS, which ACL governs with
+            // `&patterns`, never `~patterns` — same reasoning as the verbs
+            // above it.
+            "PUBSUB",
             // scripting containers (EVAL/EVALSHA/FCALL are movable-key handled)
             "SCRIPT",
             "FUNCTION",
@@ -1109,6 +1113,11 @@ mod tests {
             "REPLCONF",
             "PSYNC",
             "CLUSTER",
+            // moon#635: connection-MODE verbs. Each takes no argument at all
+            // (arity 1), so there is nothing for a key pattern to match.
+            "ASKING",
+            "READONLY",
+            "READWRITE",
             "CDC.READ",
             // moon extensions addressing indexes/graphs/queues, not keys
             "WS",

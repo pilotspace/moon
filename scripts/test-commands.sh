@@ -224,6 +224,28 @@ assert_moon_contains() {
     fi
 }
 
+# As above, but the expectation must be a WHOLE LINE of the reply.
+#
+# `COMMAND LIST` is the case that needs it: since moon#635 publishes
+# `container|sub` entries, a substring match for `pubsub` is satisfied by
+# `pubsub|channels`, so it would stay green with the top-level `pubsub` entry
+# gone. Reach for this whenever one published name is a prefix of another.
+assert_moon_line() {
+    local desc="$1" expected="$2"
+    shift 2
+    TOTAL=$((TOTAL + 1))
+    local moon_out
+    moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
+    if echo "$moon_out" | grep -qxF "$expected"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (expected the whole line '$expected')"
+        echo "    CMD:  redis-cli $*"
+        echo "    GOT:  $(echo "$moon_out" | head -3)"
+    fi
+}
+
 # Assert moon's RAW first reply line, read straight off the socket.
 #
 # Needed because `redis-cli` renders `$-1` (null bulk) and `*-1` (null array)
@@ -852,6 +874,16 @@ if should_run "connection"; then
     # regression to a stub cannot slip past as "ok".
     assert_moon_contains "COMMAND INFO GET names the command" "get" COMMAND INFO GET
     assert_moon_contains "COMMAND LIST includes reset" "reset" COMMAND LIST
+    # moon#635: the container surface. `pubsub` is a command Moon ANSWERS but
+    # never published, so a client building its table from LIST refused to send
+    # it; `config|get` is the subcommand form Moon published none of.
+    # A whole-LINE match, not a substring: now that subcommands are published,
+    # `pubsub|channels` contains "pubsub", so a substring assertion would pass
+    # even with the top-level `pubsub` entry missing — the very thing it exists
+    # to catch.
+    assert_moon_line "COMMAND LIST includes pubsub" "pubsub" COMMAND LIST
+    assert_moon_contains "COMMAND LIST includes container subcommands" "config|get" COMMAND LIST
+    assert_moon_contains "COMMAND INFO resolves a subcommand" "config|get" COMMAND INFO "config|get"
     assert_moon_contains "COMMAND GETKEYS extracts the key" "k1" COMMAND GETKEYS MSET k1 v1 k2 v2
     assert_moon_contains "COMMAND GETKEYS rejects keyless" "no key arguments" COMMAND GETKEYS PING
     # moon#537: `first_key: 0` mirrors redis and means "the keys are not at a
